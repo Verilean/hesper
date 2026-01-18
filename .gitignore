@@ -1,0 +1,22 @@
+/.lake
+webgpu-dawn
+
+# Backup files
+*~
+*.bak
+*.bak2
+
+# Build logs
+*.log
+build*.log
+
+# Profile outputs
+gpu_profile.json
+*_trace.json
+
+# AI prompts and development docs
+CLAUDE.md
+FEATURE_COMPARISON.md
+GLFW_IMPLEMENTATION.md
+MATMUL_README.md
+WGSL_GENERATION_GUIDE.md

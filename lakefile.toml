@@ -1,0 +1,10 @@
+name = "hesper"
+version = "0.1.0"
+defaultTargets = ["hesper"]
+
+[[lean_lib]]
+name = "Hesper"
+
+[[lean_exe]]
+name = "hesper"
+root = "Main"
