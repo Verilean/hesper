@@ -263,10 +263,9 @@ lean_exe «multigpu» where
 lean_exe «nn-demo» where
   root := `Examples.MachineLearning.NNDemo
 
--- TODO: Fix compilation errors in MNIST example
--- lean_exe «mnist-train» where
---   root := `Examples.MachineLearning.MNISTTrain
---   moreLinkArgs := stdLinkArgs
+lean_exe «mnist-train» where
+  root := `Examples.MachineLearning.MNISTTrain
+  moreLinkArgs := stdLinkArgs
 
 -- ----------------------------------------------------------------------------
 -- Graphics Examples (GLFW rendering and window management)
