@@ -154,71 +154,43 @@ script buildNative do
   IO.println "[Hesper] ✓ Native library built successfully!"
   return 0
 
+-- Standard linker configuration for all FFI executables (based on glfw-triangle + Google Highway)
+def stdLinkArgs : Array String := #[
+  "-Wl,-force_load,./.lake/build/native/libhesper_native.a",
+  "-L./.lake/build/dawn-build/src/dawn", "-ldawn_proc",
+  "-L./.lake/build/dawn-install/lib", "-lwebgpu_dawn",
+  "-L./.lake/build/dawn-build/third_party/glfw/src", "-lglfw3",
+  "-Wl,-force_load,./.lake/build/dawn-build/src/dawn/libdawn_proc.a",
+  "-Wl,-force_load,./.lake/build/dawn-build/src/dawn/glfw/libdawn_glfw.a",
+  "./.lake/build/simd/libhesper_simd.a",
+  "-lc++",
+  "-L/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/lib",
+  "-F/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/System/Library/Frameworks",
+  "-Wl,-syslibroot,/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk",
+  "-lobjc",
+  "-framework", "CoreFoundation",
+  "-framework", "Metal",
+  "-framework", "Foundation",
+  "-framework", "QuartzCore",
+  "-framework", "IOKit",
+  "-framework", "IOSurface",
+  "-framework", "Cocoa"
+]
+
 @[default_target]
 lean_exe «hesper» where
   root := `Examples.Main
-  moreLinkArgs := #[
-    "-L./.lake/build/native", "-lhesper_native",
-    "-L./.lake/build/dawn-build/src/dawn", "-ldawn_proc",
-    "-L./.lake/build/dawn-install/lib", "-lwebgpu_dawn",
-    "-L./.lake/build/dawn-build/third_party/glfw/src", "-lglfw3",
-    "-Wl,-force_load,./.lake/build/dawn-build/src/dawn/libdawn_proc.a",
-    "-Wl,-force_load,./.lake/build/dawn-build/src/dawn/glfw/libdawn_glfw.a",
-    "-lc++",
-    "-L/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/lib",
-    "-F/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/System/Library/Frameworks",
-    "-Wl,-syslibroot,/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk",
-    "-lobjc",
-    "-framework", "CoreFoundation",
-    "-framework", "Metal",
-    "-framework", "Foundation",
-    "-framework", "QuartzCore",
-    "-framework", "IOKit",
-    "-framework", "IOSurface",
-    "-framework", "Cocoa"
-  ]
+  moreLinkArgs := stdLinkArgs
 
 -- Simple standalone executable (just GPU vector add, no WebGPU wrapper)
 lean_exe «hesper-simple» where
   root := `Examples.MainSimple
-  moreLinkArgs := #[
-    "-L./.lake/build/native", "-lhesper_native",
-    "-L./.lake/build/dawn-build/src/dawn", "-ldawn_proc",
-    "-L./.lake/build/dawn-install/lib", "-lwebgpu_dawn",
-    "-Wl,-force_load,./.lake/build/dawn-build/src/dawn/libdawn_proc.a",
-    "-lc++",
-    "-L/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/lib",
-    "-F/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/System/Library/Frameworks",
-    "-Wl,-syslibroot,/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk",
-    "-lobjc",
-    "-framework", "CoreFoundation",
-    "-framework", "Metal",
-    "-framework", "Foundation",
-    "-framework", "QuartzCore",
-    "-framework", "IOKit",
-    "-framework", "IOSurface"
-  ]
+  moreLinkArgs := stdLinkArgs
 
 -- Minimal test for WebGPU wrapper FFI
 lean_exe «test-ffi» where
   root := `Examples.MainTest
-  moreLinkArgs := #[
-    "-L./.lake/build/native", "-lhesper_native",
-    "-L./.lake/build/dawn-build/src/dawn", "-ldawn_proc",
-    "-L./.lake/build/dawn-install/lib", "-lwebgpu_dawn",
-    "-Wl,-force_load,./.lake/build/dawn-build/src/dawn/libdawn_proc.a",
-    "-lc++",
-    "-L/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/lib",
-    "-F/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/System/Library/Frameworks",
-    "-Wl,-syslibroot,/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk",
-    "-lobjc",
-    "-framework", "CoreFoundation",
-    "-framework", "Metal",
-    "-framework", "Foundation",
-    "-framework", "QuartzCore",
-    "-framework", "IOKit",
-    "-framework", "IOSurface"
-  ]
+  moreLinkArgs := stdLinkArgs
 
 -- DSL Examples (no FFI needed, pure Lean)
 lean_exe «dsl-basics» where
@@ -236,44 +208,12 @@ lean_exe «matmul-subgroup» where
 -- GPU matrix multiplication with subgroup operations
 lean_exe «matmul-gpu» where
   root := `Examples.MainMatmul
-  moreLinkArgs := #[
-    "-L./.lake/build/native", "-lhesper_native",
-    "-L./.lake/build/dawn-build/src/dawn", "-ldawn_proc",
-    "-L./.lake/build/dawn-install/lib", "-lwebgpu_dawn",
-    "-Wl,-force_load,./.lake/build/dawn-build/src/dawn/libdawn_proc.a",
-    "-lc++",
-    "-L/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/lib",
-    "-F/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/System/Library/Frameworks",
-    "-Wl,-syslibroot,/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk",
-    "-lobjc",
-    "-framework", "CoreFoundation",
-    "-framework", "Metal",
-    "-framework", "Foundation",
-    "-framework", "QuartzCore",
-    "-framework", "IOKit",
-    "-framework", "IOSurface"
-  ]
+  moreLinkArgs := stdLinkArgs
 
 -- 4K matrix multiplication benchmark with FLOPS
 lean_exe «matmul-4k» where
   root := `Examples.MainMatmul4K
-  moreLinkArgs := #[
-    "-L./.lake/build/native", "-lhesper_native",
-    "-L./.lake/build/dawn-build/src/dawn", "-ldawn_proc",
-    "-L./.lake/build/dawn-install/lib", "-lwebgpu_dawn",
-    "-Wl,-force_load,./.lake/build/dawn-build/src/dawn/libdawn_proc.a",
-    "-lc++",
-    "-L/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/lib",
-    "-F/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/System/Library/Frameworks",
-    "-Wl,-syslibroot,/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk",
-    "-lobjc",
-    "-framework", "CoreFoundation",
-    "-framework", "Metal",
-    "-framework", "Foundation",
-    "-framework", "QuartzCore",
-    "-framework", "IOKit",
-    "-framework", "IOSurface"
-  ]
+  moreLinkArgs := stdLinkArgs
 
 lean_exe «atomic-counter» where
   root := `Examples.AtomicCounter
@@ -298,394 +238,82 @@ lean_exe «ad-debug» where
 
 lean_exe «async-demo» where
   root := `Examples.AsyncDemo
-  moreLinkArgs := #[
-    "-L./.lake/build/native", "-lhesper_native",
-    "-L./.lake/build/dawn-build/src/dawn", "-ldawn_proc",
-    "-L./.lake/build/dawn-install/lib", "-lwebgpu_dawn",
-    "-Wl,-force_load,./.lake/build/dawn-build/src/dawn/libdawn_proc.a",
-    "-lc++",
-    "-L/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/lib",
-    "-F/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/System/Library/Frameworks",
-    "-Wl,-syslibroot,/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk",
-    "-lobjc",
-    "-framework", "CoreFoundation",
-    "-framework", "Metal",
-    "-framework", "Foundation",
-    "-framework", "QuartzCore",
-    "-framework", "IOKit",
-    "-framework", "IOSurface"
-  ]
+  moreLinkArgs := stdLinkArgs
 
 lean_exe «codegen-demo» where
   root := `Examples.CodeGenDemo
 
 lean_exe «execute-demo» where
   root := `Examples.ExecuteDemo
-  moreLinkArgs := #[
-    "-L./.lake/build/native", "-lhesper_native",
-    "-L./.lake/build/dawn-build/src/dawn", "-ldawn_proc",
-    "-L./.lake/build/dawn-install/lib", "-lwebgpu_dawn",
-    "-Wl,-force_load,./.lake/build/dawn-build/src/dawn/libdawn_proc.a",
-    "-lc++",
-    "-L/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/lib",
-    "-F/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/System/Library/Frameworks",
-    "-Wl,-syslibroot,/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk",
-    "-lobjc",
-    "-framework", "CoreFoundation",
-    "-framework", "Metal",
-    "-framework", "Foundation",
-    "-framework", "QuartzCore",
-    "-framework", "IOKit",
-    "-framework", "IOSurface"
-  ]
+  moreLinkArgs := stdLinkArgs
 
 lean_exe «real-gpu-demo» where
   root := `Examples.RealGPUDemo
-  moreLinkArgs := #[
-    "-L./.lake/build/native", "-lhesper_native",
-    "-L./.lake/build/dawn-build/src/dawn", "-ldawn_proc",
-    "-L./.lake/build/dawn-install/lib", "-lwebgpu_dawn",
-    "-Wl,-force_load,./.lake/build/dawn-build/src/dawn/libdawn_proc.a",
-    "-lc++",
-    "-L/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/lib",
-    "-F/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/System/Library/Frameworks",
-    "-Wl,-syslibroot,/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk",
-    "-lobjc",
-    "-framework", "CoreFoundation",
-    "-framework", "Metal",
-    "-framework", "Foundation",
-    "-framework", "QuartzCore",
-    "-framework", "IOKit",
-    "-framework", "IOSurface"
-  ]
+  moreLinkArgs := stdLinkArgs
 
 -- GLFW simple window test (just window creation, no rendering)
 lean_exe «glfw-simple» where
   root := `Examples.GLFWSimple
-  moreLinkArgs := #[
-    "-Wl,-force_load,./.lake/build/native/libhesper_native.a",
-    "-L./.lake/build/dawn-build/src/dawn", "-ldawn_proc",
-    "-L./.lake/build/dawn-install/lib", "-lwebgpu_dawn",
-    "-L./.lake/build/dawn-build/third_party/glfw/src", "-lglfw3",
-    "-Wl,-force_load,./.lake/build/dawn-build/src/dawn/libdawn_proc.a",
-    "-lc++",
-    "-L/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/lib",
-    "-F/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/System/Library/Frameworks",
-    "-Wl,-syslibroot,/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk",
-    "-lobjc",
-    "-framework", "CoreFoundation",
-    "-framework", "Metal",
-    "-framework", "Foundation",
-    "-framework", "QuartzCore",
-    "-framework", "IOKit",
-    "-framework", "IOSurface",
-    "-framework", "Cocoa"
-  ]
+  moreLinkArgs := stdLinkArgs
 
 -- GLFW triangle rendering demo
 lean_exe «glfw-triangle» where
   root := `Examples.GLFWTriangle
-  moreLinkArgs := #[
-    "-Wl,-force_load,./.lake/build/native/libhesper_native.a",
-    "-L./.lake/build/dawn-build/src/dawn", "-ldawn_proc",
-    "-L./.lake/build/dawn-install/lib", "-lwebgpu_dawn",
-    "-L./.lake/build/dawn-build/third_party/glfw/src", "-lglfw3",
-    "-Wl,-force_load,./.lake/build/dawn-build/src/dawn/glfw/libdawn_glfw.a",
-    "-Wl,-force_load,./.lake/build/dawn-build/src/dawn/libdawn_proc.a",
-    "-lc++",
-    "-L/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/lib",
-    "-F/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/System/Library/Frameworks",
-    "-Wl,-syslibroot,/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk",
-    "-lobjc",
-    "-framework", "CoreFoundation",
-    "-framework", "Metal",
-    "-framework", "Foundation",
-    "-framework", "QuartzCore",
-    "-framework", "IOKit",
-    "-framework", "IOSurface",
-    "-framework", "Cocoa"
-  ]
+  moreLinkArgs := stdLinkArgs
 
 -- GLFW demo (window management and rendering)
 lean_exe «glfw-demo» where
   root := `Examples.GLFWDemo
-  moreLinkArgs := #[
-    "-Wl,-force_load,./.lake/build/native/libhesper_native.a",
-    "-L./.lake/build/dawn-build/src/dawn", "-ldawn_proc",
-    "-L./.lake/build/dawn-install/lib", "-lwebgpu_dawn",
-    "-L./.lake/build/dawn-build/third_party/glfw/src", "-lglfw3",
-    "-Wl,-force_load,./.lake/build/dawn-build/src/dawn/libdawn_proc.a",
-    "-lc++",
-    "-L/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/lib",
-    "-F/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/System/Library/Frameworks",
-    "-Wl,-syslibroot,/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk",
-    "-lobjc",
-    "-framework", "CoreFoundation",
-    "-framework", "Metal",
-    "-framework", "Foundation",
-    "-framework", "QuartzCore",
-    "-framework", "IOKit",
-    "-framework", "IOSurface",
-    "-framework", "Cocoa"
-  ]
+  moreLinkArgs := stdLinkArgs
 
 -- Tetris game
 lean_exe «tetris» where
   root := `Examples.Tetris
-  moreLinkArgs := #[
-    "-Wl,-force_load,./.lake/build/native/libhesper_native.a",
-    "-L./.lake/build/dawn-build/src/dawn", "-ldawn_proc",
-    "-L./.lake/build/dawn-install/lib", "-lwebgpu_dawn",
-    "-L./.lake/build/dawn-build/third_party/glfw/src", "-lglfw3",
-    "-Wl,-force_load,./.lake/build/dawn-build/src/dawn/glfw/libdawn_glfw.a",
-    "-Wl,-force_load,./.lake/build/dawn-build/src/dawn/libdawn_proc.a",
-    "-lc++",
-    "-L/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/lib",
-    "-F/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/System/Library/Frameworks",
-    "-Wl,-syslibroot,/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk",
-    "-lobjc",
-    "-framework", "CoreFoundation",
-    "-framework", "Metal",
-    "-framework", "Foundation",
-    "-framework", "QuartzCore",
-    "-framework", "IOKit",
-    "-framework", "IOSurface",
-    "-framework", "Cocoa"
-  ]
+  moreLinkArgs := stdLinkArgs
 
 -- Multi-GPU support demo
 lean_exe «multigpu» where
   root := `Examples.MultiGPU
-  moreLinkArgs := #[
-    "-L./.lake/build/native", "-lhesper_native",
-    "-L./.lake/build/dawn-build/src/dawn", "-ldawn_proc",
-    "-L./.lake/build/dawn-install/lib", "-lwebgpu_dawn",
-    "-L./.lake/build/dawn-build/third_party/glfw/src", "-lglfw3",
-    "-Wl,-force_load,./.lake/build/dawn-build/src/dawn/libdawn_proc.a",
-    "-Wl,-force_load,./.lake/build/dawn-build/src/dawn/glfw/libdawn_glfw.a",
-    "-lc++",
-    "-L/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/lib",
-    "-F/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/System/Library/Frameworks",
-    "-Wl,-syslibroot,/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk",
-    "-lobjc",
-    "-framework", "CoreFoundation",
-    "-framework", "Metal",
-    "-framework", "Foundation",
-    "-framework", "QuartzCore",
-    "-framework", "IOKit",
-    "-framework", "IOSurface",
-    "-framework", "Cocoa"
-  ]
+  moreLinkArgs := stdLinkArgs
 
 -- Test executable
 @[test_driver]
 lean_exe test where
   root := `Tests.ErrorHandlingMain
-  moreLinkArgs := #[
-    "-L./.lake/build/native", "-lhesper_native",
-    "-L./.lake/build/dawn-build/src/dawn", "-ldawn_proc",
-    "-L./.lake/build/dawn-install/lib", "-lwebgpu_dawn",
-    "-L./.lake/build/dawn-build/third_party/glfw/src", "-lglfw3",
-    "-Wl,-force_load,./.lake/build/dawn-build/src/dawn/libdawn_proc.a",
-    "-Wl,-force_load,./.lake/build/dawn-build/src/dawn/glfw/libdawn_glfw.a",
-    "-lc++",
-    "-L/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/lib",
-    "-F/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/System/Library/Frameworks",
-    "-Wl,-syslibroot,/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk",
-    "-lobjc",
-    "-framework", "CoreFoundation",
-    "-framework", "Metal",
-    "-framework", "Foundation",
-    "-framework", "QuartzCore",
-    "-framework", "IOKit",
-    "-framework", "IOSurface",
-    "-framework", "Cocoa"
-  ]
+  moreLinkArgs := stdLinkArgs
 
 lean_exe benchmark where
   root := `Benchmarks.Performance
-  moreLinkArgs := #[
-    "-L./.lake/build/native", "-lhesper_native",
-    "-L./.lake/build/dawn-build/src/dawn", "-ldawn_proc",
-    "-L./.lake/build/dawn-install/lib", "-lwebgpu_dawn",
-    "-L./.lake/build/dawn-build/third_party/glfw/src", "-lglfw3",
-    "-Wl,-force_load,./.lake/build/dawn-build/src/dawn/libdawn_proc.a",
-    "-Wl,-force_load,./.lake/build/dawn-build/src/dawn/glfw/libdawn_glfw.a",
-    "-lc++",
-    "-L/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/lib",
-    "-F/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/System/Library/Frameworks",
-    "-Wl,-syslibroot,/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk",
-    "-lobjc",
-    "-framework", "CoreFoundation",
-    "-framework", "Metal",
-    "-framework", "Foundation",
-    "-framework", "QuartzCore",
-    "-framework", "IOKit",
-    "-framework", "IOSurface",
-    "-framework", "Cocoa"
-  ]
+  moreLinkArgs := stdLinkArgs
 
 lean_exe «buffer-test» where
   root := `Tests.BufferTest
-  moreLinkArgs := #[
-    "-L./.lake/build/native", "-lhesper_native",
-    "-L./.lake/build/dawn-build/src/dawn", "-ldawn_proc",
-    "-L./.lake/build/dawn-install/lib", "-lwebgpu_dawn",
-    "-L./.lake/build/dawn-build/third_party/glfw/src", "-lglfw3",
-    "-Wl,-force_load,./.lake/build/dawn-build/src/dawn/libdawn_proc.a",
-    "-Wl,-force_load,./.lake/build/dawn-build/src/dawn/glfw/libdawn_glfw.a",
-    "-lc++",
-    "-L/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/lib",
-    "-F/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/System/Library/Frameworks",
-    "-Wl,-syslibroot,/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk",
-    "-lobjc",
-    "-framework", "CoreFoundation",
-    "-framework", "Metal",
-    "-framework", "Foundation",
-    "-framework", "QuartzCore",
-    "-framework", "IOKit",
-    "-framework", "IOSurface",
-    "-framework", "Cocoa"
-  ]
+  moreLinkArgs := stdLinkArgs
 
 lean_exe «minimal-test» where
   root := `Tests.MinimalBenchmark
-  moreLinkArgs := #[
-    "-L./.lake/build/native", "-lhesper_native",
-    "-L./.lake/build/dawn-build/src/dawn", "-ldawn_proc",
-    "-L./.lake/build/dawn-install/lib", "-lwebgpu_dawn",
-    "-L./.lake/build/dawn-build/third_party/glfw/src", "-lglfw3",
-    "-Wl,-force_load,./.lake/build/dawn-build/src/dawn/libdawn_proc.a",
-    "-Wl,-force_load,./.lake/build/dawn-build/src/dawn/glfw/libdawn_glfw.a",
-    "-lc++",
-    "-L/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/lib",
-    "-F/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/System/Library/Frameworks",
-    "-Wl,-syslibroot,/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk",
-    "-lobjc",
-    "-framework", "CoreFoundation",
-    "-framework", "Metal",
-    "-framework", "Foundation",
-    "-framework", "QuartzCore",
-    "-framework", "IOKit",
-    "-framework", "IOSurface",
-    "-framework", "Cocoa"
-  ]
+  moreLinkArgs := stdLinkArgs
 
 -- New comprehensive test suites
 lean_exe «test-device» where
   root := `Tests.DeviceTestsMain
-  moreLinkArgs := #[
-    "-L./.lake/build/native", "-lhesper_native",
-    "-L./.lake/build/dawn-build/src/dawn", "-ldawn_proc",
-    "-L./.lake/build/dawn-install/lib", "-lwebgpu_dawn",
-    "-L./.lake/build/dawn-build/third_party/glfw/src", "-lglfw3",
-    "-Wl,-force_load,./.lake/build/dawn-build/src/dawn/libdawn_proc.a",
-    "-Wl,-force_load,./.lake/build/dawn-build/src/dawn/glfw/libdawn_glfw.a",
-    "-lc++",
-    "-L/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/lib",
-    "-F/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/System/Library/Frameworks",
-    "-Wl,-syslibroot,/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk",
-    "-lobjc",
-    "-framework", "CoreFoundation",
-    "-framework", "Metal",
-    "-framework", "Foundation",
-    "-framework", "QuartzCore",
-    "-framework", "IOKit",
-    "-framework", "IOSurface",
-    "-framework", "Cocoa"
-  ]
+  moreLinkArgs := stdLinkArgs
 
 lean_exe «test-buffer» where
   root := `Tests.BufferTestsMain
-  moreLinkArgs := #[
-    "-L./.lake/build/native", "-lhesper_native",
-    "-L./.lake/build/dawn-build/src/dawn", "-ldawn_proc",
-    "-L./.lake/build/dawn-install/lib", "-lwebgpu_dawn",
-    "-L./.lake/build/dawn-build/third_party/glfw/src", "-lglfw3",
-    "-Wl,-force_load,./.lake/build/dawn-build/src/dawn/libdawn_proc.a",
-    "-Wl,-force_load,./.lake/build/dawn-build/src/dawn/glfw/libdawn_glfw.a",
-    "-lc++",
-    "-L/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/lib",
-    "-F/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/System/Library/Frameworks",
-    "-Wl,-syslibroot,/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk",
-    "-lobjc",
-    "-framework", "CoreFoundation",
-    "-framework", "Metal",
-    "-framework", "Foundation",
-    "-framework", "QuartzCore",
-    "-framework", "IOKit",
-    "-framework", "IOSurface",
-    "-framework", "Cocoa"
-  ]
+  moreLinkArgs := stdLinkArgs
 
 lean_exe «test-compute» where
   root := `Tests.ComputeTestsMain
-  moreLinkArgs := #[
-    "-L./.lake/build/native", "-lhesper_native",
-    "-L./.lake/build/dawn-build/src/dawn", "-ldawn_proc",
-    "-L./.lake/build/dawn-install/lib", "-lwebgpu_dawn",
-    "-L./.lake/build/dawn-build/third_party/glfw/src", "-lglfw3",
-    "-Wl,-force_load,./.lake/build/dawn-build/src/dawn/libdawn_proc.a",
-    "-Wl,-force_load,./.lake/build/dawn-build/src/dawn/glfw/libdawn_glfw.a",
-    "-lc++",
-    "-L/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/lib",
-    "-F/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/System/Library/Frameworks",
-    "-Wl,-syslibroot,/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk",
-    "-lobjc",
-    "-framework", "CoreFoundation",
-    "-framework", "Metal",
-    "-framework", "Foundation",
-    "-framework", "QuartzCore",
-    "-framework", "IOKit",
-    "-framework", "IOSurface",
-    "-framework", "Cocoa"
-  ]
+  moreLinkArgs := stdLinkArgs
 
 lean_exe «test-gpu-accuracy» where
   root := `Tests.GPUAccuracyTestsMain
-  moreLinkArgs := #[
-    "-L./.lake/build/native", "-lhesper_native",
-    "-L./.lake/build/dawn-build/src/dawn", "-ldawn_proc",
-    "-L./.lake/build/dawn-install/lib", "-lwebgpu_dawn",
-    "-L./.lake/build/dawn-build/third_party/glfw/src", "-lglfw3",
-    "-Wl,-force_load,./.lake/build/dawn-build/src/dawn/libdawn_proc.a",
-    "-Wl,-force_load,./.lake/build/dawn-build/src/dawn/glfw/libdawn_glfw.a",
-    "-lc++",
-    "-L/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/lib",
-    "-F/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/System/Library/Frameworks",
-    "-Wl,-syslibroot,/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk",
-    "-lobjc",
-    "-framework", "CoreFoundation",
-    "-framework", "Metal",
-    "-framework", "Foundation",
-    "-framework", "QuartzCore",
-    "-framework", "IOKit",
-    "-framework", "IOSurface",
-    "-framework", "Cocoa"
-  ]
+  moreLinkArgs := stdLinkArgs
 
 lean_exe «test-all» where
   root := `Tests.All
-  moreLinkArgs := #[
-    "-L./.lake/build/native", "-lhesper_native",
-    "-L./.lake/build/dawn-build/src/dawn", "-ldawn_proc",
-    "-L./.lake/build/dawn-install/lib", "-lwebgpu_dawn",
-    "-L./.lake/build/dawn-build/third_party/glfw/src", "-lglfw3",
-    "-Wl,-force_load,./.lake/build/dawn-build/src/dawn/libdawn_proc.a",
-    "-Wl,-force_load,./.lake/build/dawn-build/src/dawn/glfw/libdawn_glfw.a",
-    "-lc++",
-    "-L/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/lib",
-    "-F/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/System/Library/Frameworks",
-    "-Wl,-syslibroot,/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk",
-    "-lobjc",
-    "-framework", "CoreFoundation",
-    "-framework", "Metal",
-    "-framework", "Foundation",
-    "-framework", "QuartzCore",
-    "-framework", "IOKit",
-    "-framework", "IOSurface",
-    "-framework", "Cocoa"
-  ]
+  moreLinkArgs := stdLinkArgs
 
 -- WGSL DSL Tests (Pure Lean, no FFI needed)
 lean_exe «test-wgsl-dsl» where
