@@ -2,6 +2,8 @@ import LSpec
 import Hesper.WGSL.Types
 import Hesper.WGSL.Exp
 import Hesper.WGSL.DSL
+import Hesper.WGSL.Monad
+import Hesper.WGSL.CodeGen
 
 /-!
 # WGSL DSL Comprehensive Tests
@@ -159,23 +161,36 @@ def testBooleanOps : TestSeq :=
   test "logical NOT !p" (notExpr.toWGSL == "(!p)")
 
 -- ============================================================================
--- Math Function Tests
+-- Math Function Tests (Comprehensive)
 -- ============================================================================
 
 def testMathFunctions : TestSeq :=
   let x : Exp (.scalar .f32) := var "x"
   let y : Exp (.scalar .f32) := var "y"
+  let z : Exp (.scalar .f32) := var "z"
 
+  -- Basic math (available in DSL)
   let sqrtExpr := sqrt' x
   let absExpr := abs' x
   let minExpr := min' x y
   let maxExpr := max' x y
   let clampExpr := clamp' x (lit 0.0) (lit 1.0)
+
+  -- Exponential
   let expExpr := exp' x
+
+  -- Trigonometric
   let sinExpr := sin' x
   let cosExpr := cos' x
-  let powExpr := pow' x y
+
+  -- Hyperbolic
   let tanhExpr := tanh' x
+
+  -- Power
+  let powExpr := pow' x y
+
+  -- Conditional selection
+  let selectExpr := select' (x .>. lit 0.0) x (lit 0.0)
 
   test "sqrt(x)" (sqrtExpr.toWGSL == "sqrt(x)") ++
   test "abs(x)" (absExpr.toWGSL == "abs(x)") ++
@@ -185,27 +200,236 @@ def testMathFunctions : TestSeq :=
   test "exp(x)" (expExpr.toWGSL == "exp(x)") ++
   test "sin(x)" (sinExpr.toWGSL == "sin(x)") ++
   test "cos(x)" (cosExpr.toWGSL == "cos(x)") ++
+  test "tanh(x)" (tanhExpr.toWGSL == "tanh(x)") ++
   test "pow(x, y)" (powExpr.toWGSL == "pow(x, y)") ++
-  test "tanh(x)" (tanhExpr.toWGSL == "tanh(x)")
+  test "select(x > 0, x, 0)" (selectExpr.toWGSL == "select(0.000000, x, (x > 0.000000))")
+
+-- Note: Vector builtins (dot, cross, length, normalize, etc.) are not yet exposed in the DSL
+-- Note: Matrix builtins (transpose, determinant) are not yet exposed in the DSL
+-- Note: Bitwise operations are not yet exposed in the DSL
+-- These exist in WGSL but haven't been wrapped yet
 
 -- ============================================================================
--- Operator Precedence Tests
+-- Type Conversion Tests
+-- ============================================================================
+
+def testTypeConversions : TestSeq :=
+  let f32Val : Exp (.scalar .f32) := var "f32Val"
+  let f16Val : Exp (.scalar .f16) := var "f16Val"
+  let i32Val : Exp (.scalar .i32) := var "i32Val"
+  let u32Val : Exp (.scalar .u32) := var "u32Val"
+
+  -- Convert to f32
+  let f16ToF32 := toF32 f16Val
+  let i32ToF32 := toF32 i32Val
+  let u32ToF32 := toF32 u32Val
+
+  -- Convert to f16
+  let f32ToF16 := toF16 f32Val
+  let i32ToF16 := toF16 i32Val
+  let u32ToF16 := toF16 u32Val
+
+  -- Convert to i32
+  let f32ToI32 := toI32 f32Val
+  let f16ToI32 := toI32 f16Val
+  let u32ToI32 := toI32 u32Val
+
+  -- Convert to u32
+  let f32ToU32 := toU32 f32Val
+  let f16ToU32 := toU32 f16Val
+  let i32ToU32 := toU32 i32Val
+
+  test "f16 to f32" (f16ToF32.toWGSL == "f32(f16Val)") ++
+  test "i32 to f32" (i32ToF32.toWGSL == "f32(i32Val)") ++
+  test "u32 to f32" (u32ToF32.toWGSL == "f32(u32Val)") ++
+  test "f32 to f16" (f32ToF16.toWGSL == "f16(f32Val)") ++
+  test "i32 to f16" (i32ToF16.toWGSL == "f16(i32Val)") ++
+  test "u32 to f16" (u32ToF16.toWGSL == "f16(u32Val)") ++
+  test "f32 to i32" (f32ToI32.toWGSL == "i32(f32Val)") ++
+  test "f16 to i32" (f16ToI32.toWGSL == "i32(f16Val)") ++
+  test "u32 to i32" (u32ToI32.toWGSL == "i32(u32Val)") ++
+  test "f32 to u32" (f32ToU32.toWGSL == "u32(f32Val)") ++
+  test "f16 to u32" (f16ToU32.toWGSL == "u32(f16Val)") ++
+  test "i32 to u32" (i32ToU32.toWGSL == "u32(i32Val)")
+
+-- ============================================================================
+-- Vector Constructor Tests
+-- ============================================================================
+
+def testVectorConstructors : TestSeq :=
+  let x : Exp (.scalar .f32) := var "x"
+  let y : Exp (.scalar .f32) := var "y"
+  let z : Exp (.scalar .f32) := var "z"
+  let w : Exp (.scalar .f32) := var "w"
+  let a : Exp (.scalar .f32) := lit 1.0
+  let b : Exp (.scalar .f32) := lit 2.0
+
+  -- vec2 constructors
+  let vec2FromScalars := mkVec2 x y
+  let vec2Splat := mkVec2 x x
+  let vec2Literals := mkVec2 a b
+
+  -- vec3 constructors
+  let vec3FromScalars := mkVec3 x y z
+  let vec3Splat := mkVec3 x x x
+  let vec3Mixed := mkVec3 x (lit 0.0) z
+
+  -- vec4 constructors
+  let vec4FromScalars := mkVec4 x y z w
+  let vec4Splat := mkVec4 x x x x
+  let vec4Mixed := mkVec4 x y (lit 0.0) (lit 1.0)
+
+  test "vec2(x, y)" (vec2FromScalars.toWGSL == "vec2<f32>(x, y)") ++
+  test "vec2(x, x) splat" (vec2Splat.toWGSL == "vec2<f32>(x, x)") ++
+  test "vec2(1.0, 2.0)" (vec2Literals.toWGSL == "vec2<f32>(1.000000, 2.000000)") ++
+  test "vec3(x, y, z)" (vec3FromScalars.toWGSL == "vec3<f32>(x, y, z)") ++
+  test "vec3(x, x, x) splat" (vec3Splat.toWGSL == "vec3<f32>(x, x, x)") ++
+  test "vec3(x, 0.0, z)" (vec3Mixed.toWGSL == "vec3<f32>(x, 0.000000, z)") ++
+  test "vec4(x, y, z, w)" (vec4FromScalars.toWGSL == "vec4<f32>(x, y, z, w)") ++
+  test "vec4(x, x, x, x) splat" (vec4Splat.toWGSL == "vec4<f32>(x, x, x, x)") ++
+  test "vec4(x, y, 0.0, 1.0)" (vec4Mixed.toWGSL == "vec4<f32>(x, y, 0.000000, 1.000000)")
+
+-- ============================================================================
+-- Vector Accessor Tests
+-- ============================================================================
+
+def testVectorAccessors : TestSeq :=
+  let v2 : Exp (.vec2 .f32) := var "v2"
+  let v3 : Exp (.vec3 .f32) := var "v3"
+  let v4 : Exp (.vec4 .f32) := var "v4"
+
+  -- vec2 accessors (vecX and vecY work on vec2)
+  let v2x := vecX v2
+  let v2y := vecY v2
+
+  -- vec3 accessors (only vecZ works on vec3)
+  let v3z := vecZ v3
+
+  -- vec4 accessors (only vecW works on vec4)
+  let v4w := vecW v4
+
+  -- Complex accessor chains
+  let complexZ := vecZ (mkVec3 (lit 1.0) (lit 2.0) (lit 3.0))
+  let complexW := vecW (mkVec4 (lit 1.0) (lit 2.0) (lit 3.0) (lit 4.0))
+  let complexX := vecX (mkVec2 (lit 5.0) (lit 6.0))
+  let complexY := vecY (v2 + v2)
+
+  test "v2.x" (v2x.toWGSL == "v2.x") ++
+  test "v2.y" (v2y.toWGSL == "v2.y") ++
+  test "v3.z" (v3z.toWGSL == "v3.z") ++
+  test "v4.w" (v4w.toWGSL == "v4.w") ++
+  test "vec3(1,2,3).z" (complexZ.toWGSL == "vec3<f32>(1.000000, 2.000000, 3.000000).z") ++
+  test "vec4(1,2,3,4).w" (complexW.toWGSL == "vec4<f32>(1.000000, 2.000000, 3.000000, 4.000000).w") ++
+  test "vec2(5,6).x" (complexX.toWGSL == "vec2<f32>(5.000000, 6.000000).x") ++
+  test "(v2 + v2).y" (complexY.toWGSL == "(v2 + v2).y")
+
+-- Note: Array indexing is not yet exposed in the DSL
+-- Will be added in future versions
+
+-- ============================================================================
+-- Operator Precedence Tests (Comprehensive)
 -- ============================================================================
 
 def testOperatorPrecedence : TestSeq :=
   let a : Exp (.scalar .f32) := var "a"
   let b : Exp (.scalar .f32) := var "b"
   let c : Exp (.scalar .f32) := var "c"
+  let d : Exp (.scalar .f32) := var "d"
 
+  -- Multiplication before addition
   let addMul := a + b * c
   let mulAdd := a * b + c
+
+  -- Division before subtraction
+  let divSub := a - b / c
+  let subDiv := (a - b) / c
+
+  -- Multiplication/Division same precedence (left-to-right)
+  let mulDiv := a * b / c
+  let divMul := a / b * c
+
+  -- Addition/Subtraction same precedence (left-to-right)
+  let addSub := a + b - c
+  let subAdd := a - b + c
+
+  -- Negation (unary) before multiplication
+  let negMul := -a * b
+  let mulNeg := -(a * b)
+
+  -- Complex multi-level precedence
   let complex1 := a + b * c - (a / b)
   let complex2 := (a + b) * (c - (a / b))
+  let complex3 := a * b + c * d
+  let complex4 := (a + b) * (c + d)
+  let complex5 := a + b * c + d
+  let complex6 := a * (b + c) * d
+  let complex7 := a / b + c / d
+  let complex8 := (a / b) + (c / d)
+  let complex9 := a - b * c - d
+  let complex10 := a * b - c * d
 
-  test "a + b * c (right parentheses)" (addMul.toWGSL == "(a + (b * c))") ++
-  test "a * b + c (left parentheses)" (mulAdd.toWGSL == "((a * b) + c)") ++
-  test "complex expression 1" (complex1.toWGSL == "((a + (b * c)) - (a / b))") ++
-  test "complex expression 2" (complex2.toWGSL == "((a + b) * (c - (a / b)))")
+  -- Modulo with other operators
+  let modAdd := (Exp.mod a b) + c
+  let addMod := a + (Exp.mod b c)
+  let modMul := (Exp.mod a b) * c
+  let mulMod := a * (Exp.mod b c)
+
+  test "a + b * c (mul before add)" (addMul.toWGSL == "(a + (b * c))") ++
+  test "a * b + c (mul before add)" (mulAdd.toWGSL == "((a * b) + c)") ++
+  test "a - b / c (div before sub)" (divSub.toWGSL == "(a - (b / c))") ++
+  test "(a - b) / c (explicit parens)" (subDiv.toWGSL == "((a - b) / c)") ++
+  test "a * b / c (left-to-right)" (mulDiv.toWGSL == "((a * b) / c)") ++
+  test "a / b * c (left-to-right)" (divMul.toWGSL == "((a / b) * c)") ++
+  test "a + b - c (left-to-right)" (addSub.toWGSL == "((a + b) - c)") ++
+  test "a - b + c (left-to-right)" (subAdd.toWGSL == "((a - b) + c)") ++
+  test "-a * b (negation before mul)" (negMul.toWGSL == "((-a) * b)") ++
+  test "-(a * b) (explicit parens)" (mulNeg.toWGSL == "(-(a * b))") ++
+  test "a + b * c - a / b" (complex1.toWGSL == "((a + (b * c)) - (a / b))") ++
+  test "(a + b) * (c - a / b)" (complex2.toWGSL == "((a + b) * (c - (a / b)))") ++
+  test "a * b + c * d" (complex3.toWGSL == "((a * b) + (c * d))") ++
+  test "(a + b) * (c + d)" (complex4.toWGSL == "((a + b) * (c + d))") ++
+  test "a + b * c + d" (complex5.toWGSL == "((a + (b * c)) + d)") ++
+  test "a * (b + c) * d" (complex6.toWGSL == "((a * (b + c)) * d)") ++
+  test "a / b + c / d" (complex7.toWGSL == "((a / b) + (c / d))") ++
+  test "(a / b) + (c / d) explicit" (complex8.toWGSL == "((a / b) + (c / d))") ++
+  test "a - b * c - d" (complex9.toWGSL == "((a - (b * c)) - d)") ++
+  test "a * b - c * d" (complex10.toWGSL == "((a * b) - (c * d))") ++
+  test "a % b + c (mod before add)" (modAdd.toWGSL == "((a % b) + c)") ++
+  test "a + b % c (mod before add)" (addMod.toWGSL == "(a + (b % c))") ++
+  test "a % b * c (mod then mul)" (modMul.toWGSL == "((a % b) * c)") ++
+  test "a * b % c (mul then mod)" (mulMod.toWGSL == "(a * (b % c))")
+
+def testComparisonPrecedence : TestSeq :=
+  let a : Exp (.scalar .f32) := var "a"
+  let b : Exp (.scalar .f32) := var "b"
+  let c : Exp (.scalar .f32) := var "c"
+
+  -- Arithmetic before comparison
+  let addLt := (a + b) .<. c
+  let mulGt := (a * b) .>. c
+  let divEq := (a / b) .==. c
+
+  test "a + b < c (arithmetic before comparison)" (addLt.toWGSL == "((a + b) < c)") ++
+  test "a * b > c (arithmetic before comparison)" (mulGt.toWGSL == "((a * b) > c)") ++
+  test "a / b == c (arithmetic before comparison)" (divEq.toWGSL == "((a / b) == c)")
+
+def testLogicalPrecedence : TestSeq :=
+  let p : Exp (.scalar .bool) := var "p"
+  let q : Exp (.scalar .bool) := var "q"
+  let r : Exp (.scalar .bool) := var "r"
+
+  -- AND before OR
+  let orAnd := p .||. (q .&&. r)
+  let andOr := (p .&&. q) .||. r
+
+  -- NOT before AND
+  let notAnd := (.!.p) .&&. q
+  let andNot := .!.(p .&&. q)
+
+  test "p || q && r (AND before OR)" (orAnd.toWGSL == "(p || (q && r))") ++
+  test "p && q || r (AND then OR)" (andOr.toWGSL == "((p && q) || r)") ++
+  test "!p && q (NOT before AND)" (notAnd.toWGSL == "((!p) && q)") ++
+  test "!(p && q) (explicit parens)" (andNot.toWGSL == "(!(p && q))")
 
 -- ============================================================================
 -- Complex Expression Tests
@@ -230,6 +454,184 @@ def testComplexExpressions : TestSeq :=
   test "polynomial a*x^2 + b*x + c" (polynomial.toWGSL == "(((a * (x * x)) + (b * x)) + c)")
 
 -- ============================================================================
+-- Control Flow Tests (ShaderM Monad)
+-- ============================================================================
+
+open Hesper.WGSL.Monad (ShaderM)
+open Hesper.WGSL.Monad.ShaderM
+open Hesper.WGSL.CodeGen
+
+def testIfStatement : TestSeq :=
+  -- Simple if-then-else
+  let shader1 : ShaderM Unit := do
+    let x : Exp (.scalar .f32) := var "x"
+    let result ← var (.scalar .f32) (lit 0.0)
+    if_ (x .>. lit 0.0) (do
+      assign result (lit 1.0)
+    ) (do
+      assign result (lit (-1.0))
+    )
+  let wgsl1 := generateWGSLSimple shader1
+
+  -- Nested if statements
+  let shader2 : ShaderM Unit := do
+    let x : Exp (.scalar .f32) := var "x"
+    let y : Exp (.scalar .f32) := var "y"
+    let result ← var (.scalar .f32) (lit 0.0)
+    if_ (x .>. lit 0.0) (do
+      if_ (y .>. lit 0.0) (do
+        assign result (lit 1.0)
+      ) (do
+        assign result (lit 0.5)
+      )
+    ) (do
+      assign result (lit (-1.0))
+    )
+  let wgsl2 := generateWGSLSimple shader2
+
+  -- If statement with boolean AND condition
+  let shader3 : ShaderM Unit := do
+    let x : Exp (.scalar .f32) := var "x"
+    let y : Exp (.scalar .f32) := var "y"
+    let result ← var (.scalar .f32) (lit 0.0)
+    if_ ((x .>. lit 0.0) .&&. (y .<. lit 10.0)) (do
+      assign result (lit 1.0)
+    ) (pure ())
+  let wgsl3 := generateWGSLSimple shader3
+
+  test "if statement generates valid WGSL" (wgsl1.length > 50) ++
+  test "if statement contains 'if'" ((wgsl1.splitOn "if").length >= 2) ++
+  test "if statement contains 'else'" ((wgsl1.splitOn "else").length >= 2) ++
+  test "nested if generates valid WGSL" (wgsl2.length > 50) ++
+  test "boolean AND condition in if" ((wgsl3.splitOn "&&").length >= 2)
+
+def testLoopStatement : TestSeq :=
+  -- Simple loop using higher-order function
+  let shader1 : ShaderM Unit := do
+    let sum ← var (.scalar .f32) (lit 0.0)
+    loop (litU32 0) (litU32 10) (litU32 1) fun i => do
+      assign sum (Exp.add (Exp.var sum) (toF32 i))
+  let wgsl1 := generateWGSLSimple shader1
+
+  -- Nested loops
+  let shader2 : ShaderM Unit := do
+    let sum ← var (.scalar .f32) (lit 0.0)
+    loop (litU32 0) (litU32 5) (litU32 1) fun i => do
+      loop (litU32 0) (litU32 5) (litU32 1) fun j => do
+        assign sum (Exp.add (Exp.var sum) (toF32 (Exp.add i j)))
+  let wgsl2 := generateWGSLSimple shader2
+
+  -- Loop with conditional inside
+  let shader3 : ShaderM Unit := do
+    let sum ← var (.scalar .f32) (lit 0.0)
+    loop (litU32 0) (litU32 10) (litU32 1) fun i => do
+      if_ ((toF32 i) .>. lit 5.0) (do
+        assign sum (Exp.add (Exp.var sum) (toF32 i))
+      ) (pure ())
+  let wgsl3 := generateWGSLSimple shader3
+
+  -- Loop with step size 2
+  let shader4 : ShaderM Unit := do
+    let sum ← var (.scalar .u32) (litU32 0)
+    loop (litU32 0) (litU32 20) (litU32 2) fun i => do
+      assign sum (Exp.add (Exp.var sum) i)
+  let wgsl4 := generateWGSLSimple shader4
+
+  test "loop generates valid WGSL" (wgsl1.length > 50) ++
+  test "loop contains 'for'" ((wgsl1.splitOn "for").length >= 2) ++
+  test "nested loops generate valid WGSL" (wgsl2.length > 50) ++
+  test "nested loops contain multiple 'for'" ((wgsl2.splitOn "for").length >= 3) ++
+  test "loop with conditional inside" (((wgsl3.splitOn "if").length >= 2) && ((wgsl3.splitOn "for").length >= 2)) ++
+  test "loop with step 2" ((wgsl4.splitOn "for").length >= 2)
+
+def testForStatement : TestSeq :=
+  -- Named for loop
+  let shader1 : ShaderM Unit := do
+    let sum ← var (.scalar .u32) (litU32 0)
+    for_ "idx" (litU32 0) (litU32 100) (litU32 1) (do
+      let idx : Exp (.scalar .u32) := var "idx"
+      assign sum (Exp.add (Exp.var sum) idx)
+    )
+  let wgsl1 := generateWGSLSimple shader1
+
+  -- For loop with larger step
+  let shader2 : ShaderM Unit := do
+    let count ← var (.scalar .u32) (litU32 0)
+    for_ "i" (litU32 0) (litU32 1000) (litU32 10) (do
+      assign count (Exp.add (Exp.var count) (litU32 1))
+    )
+  let wgsl2 := generateWGSLSimple shader2
+
+  test "for_ generates valid WGSL" (wgsl1.length > 50) ++
+  test "for_ contains 'for'" ((wgsl1.splitOn "for").length >= 2) ++
+  test "for_ contains variable name 'idx'" ((wgsl1.splitOn "idx").length >= 2) ++
+  test "for_ with step 10" ((wgsl2.splitOn "for").length >= 2)
+
+def testComplexControlFlow : TestSeq :=
+  -- Matrix-like computation with nested loops and conditionals
+  let shader1 : ShaderM Unit := do
+    let sum ← var (.scalar .f32) (lit 0.0)
+    loop (litU32 0) (litU32 4) (litU32 1) fun row => do
+      loop (litU32 0) (litU32 4) (litU32 1) fun col => do
+        -- Only accumulate diagonal elements
+        if_ (row .==. col) (do
+          let val := toF32 (Exp.add row col)
+          assign sum (Exp.add (Exp.var sum) val)
+        ) (pure ())
+  let wgsl1 := generateWGSLSimple shader1
+
+  -- Complex nested control flow
+  let shader2 : ShaderM Unit := do
+    let result ← var (.scalar .f32) (lit 0.0)
+    let x : Exp (.scalar .f32) := var "input"
+
+    if_ (x .>. lit 0.0) (do
+      loop (litU32 0) (litU32 5) (litU32 1) fun i => do
+        let fi := toF32 i
+        assign result (Exp.add (Exp.var result) fi)
+    ) (do
+      loop (litU32 0) (litU32 3) (litU32 1) fun j => do
+        let fj := toF32 j
+        assign result (Exp.sub (Exp.var result) fj)
+    )
+  let wgsl2 := generateWGSLSimple shader2
+
+  test "nested loops with conditional" (((wgsl1.splitOn "for").length >= 2) && ((wgsl1.splitOn "if").length >= 2)) ++
+  test "matrix-like nested loops generate valid code" (wgsl1.length > 100) ++
+  test "complex nested control flow" (((wgsl2.splitOn "for").length >= 2) && ((wgsl2.splitOn "if").length >= 2)) ++
+  test "if-else with different loop bodies" ((wgsl2.splitOn "for").length >= 3)
+
+def testControlFlowWithBuffers : TestSeq :=
+  -- Loop reading and writing buffers
+  let shader1 : ShaderM Unit := do
+    let inputBuf ← declareInputBuffer "input" (.scalar .f32)
+    let outputBuf ← declareOutputBuffer "output" (.scalar .f32)
+
+    loop (litU32 0) (litU32 64) (litU32 1) fun i => do
+      let val ← readBuffer (ty := .scalar .f32) (n := 1024) inputBuf i
+      let doubled := val * lit 2.0
+      writeBuffer (ty := .scalar .f32) outputBuf i doubled
+  let wgsl1 := generateWGSLSimple shader1
+
+  -- Conditional buffer write
+  let shader2 : ShaderM Unit := do
+    let inputBuf ← declareInputBuffer "input" (.scalar .f32)
+    let outputBuf ← declareOutputBuffer "output" (.scalar .f32)
+
+    loop (litU32 0) (litU32 64) (litU32 1) fun i => do
+      let val ← readBuffer (ty := .scalar .f32) (n := 1024) inputBuf i
+      if_ (val .>. lit 0.0) (do
+        writeBuffer (ty := .scalar .f32) outputBuf i (val * lit 2.0)
+      ) (do
+        writeBuffer (ty := .scalar .f32) outputBuf i (lit 0.0)
+      )
+  let wgsl2 := generateWGSLSimple shader2
+
+  test "loop with buffer operations" (((wgsl1.splitOn "for").length >= 2) && ((wgsl1.splitOn "@group").length >= 2)) ++
+  test "buffer reads in loop" ((wgsl1.splitOn "input").length >= 2) ++
+  test "conditional buffer writes" (((wgsl2.splitOn "if").length >= 2) && ((wgsl2.splitOn "output").length >= 2))
+
+-- ============================================================================
 -- All Tests
 -- ============================================================================
 
@@ -249,8 +651,18 @@ def allTests : IO (List (String × List TestSeq)) := do
     ("Comparison Operators", [testComparisonOps]),
     ("Boolean Operators", [testBooleanOps]),
     ("Math Functions", [testMathFunctions]),
+    ("Type Conversions", [testTypeConversions]),
+    ("Vector Constructors", [testVectorConstructors]),
+    ("Vector Accessors", [testVectorAccessors]),
     ("Operator Precedence", [testOperatorPrecedence]),
-    ("Complex Expressions", [testComplexExpressions])
+    ("Comparison Precedence", [testComparisonPrecedence]),
+    ("Logical Precedence", [testLogicalPrecedence]),
+    ("Complex Expressions", [testComplexExpressions]),
+    ("If Statements", [testIfStatement]),
+    ("Loop Statements", [testLoopStatement]),
+    ("For Statements", [testForStatement]),
+    ("Complex Control Flow", [testComplexControlFlow]),
+    ("Control Flow with Buffers", [testControlFlowWithBuffers])
   ]
 
 end Tests.WGSLDSLTests

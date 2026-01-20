@@ -227,31 +227,8 @@ lean_exe «dsl-basics» where
 lean_exe «shader-gen» where
   root := `Examples.ShaderGeneration
 
-lean_exe «matmul-demo» where
-  root := `Examples.MatMulDemo
-
 lean_exe «nn-demo» where
   root := `Examples.NNDemo
-
-lean_exe «nn-gpu-demo» where
-  root := `Examples.NNGPUDemo
-  moreLinkArgs := #[
-    "-L./.lake/build/native", "-lhesper_native",
-    "-L./.lake/build/dawn-build/src/dawn", "-ldawn_proc",
-    "-L./.lake/build/dawn-install/lib", "-lwebgpu_dawn",
-    "-Wl,-force_load,./.lake/build/dawn-build/src/dawn/libdawn_proc.a",
-    "-lc++",
-    "-L/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/lib",
-    "-F/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/System/Library/Frameworks",
-    "-Wl,-syslibroot,/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk",
-    "-lobjc",
-    "-framework", "CoreFoundation",
-    "-framework", "Metal",
-    "-framework", "Foundation",
-    "-framework", "QuartzCore",
-    "-framework", "IOKit",
-    "-framework", "IOSurface"
-  ]
 
 lean_exe «matmul-subgroup» where
   root := `Examples.MatmulSubgroup
@@ -664,6 +641,29 @@ lean_exe «test-compute» where
     "-framework", "Cocoa"
   ]
 
+lean_exe «test-gpu-accuracy» where
+  root := `Tests.GPUAccuracyTestsMain
+  moreLinkArgs := #[
+    "-L./.lake/build/native", "-lhesper_native",
+    "-L./.lake/build/dawn-build/src/dawn", "-ldawn_proc",
+    "-L./.lake/build/dawn-install/lib", "-lwebgpu_dawn",
+    "-L./.lake/build/dawn-build/third_party/glfw/src", "-lglfw3",
+    "-Wl,-force_load,./.lake/build/dawn-build/src/dawn/libdawn_proc.a",
+    "-Wl,-force_load,./.lake/build/dawn-build/src/dawn/glfw/libdawn_glfw.a",
+    "-lc++",
+    "-L/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/lib",
+    "-F/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/System/Library/Frameworks",
+    "-Wl,-syslibroot,/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk",
+    "-lobjc",
+    "-framework", "CoreFoundation",
+    "-framework", "Metal",
+    "-framework", "Foundation",
+    "-framework", "QuartzCore",
+    "-framework", "IOKit",
+    "-framework", "IOSurface",
+    "-framework", "Cocoa"
+  ]
+
 lean_exe «test-all» where
   root := `Tests.All
   moreLinkArgs := #[
@@ -780,5 +780,10 @@ lean_exe «debug-conversion» where
 
 lean_exe «debug-f16» where
   root := `MainDebugF16
+  supportInterpreter := false
+  moreLinkArgs := #[s!".lake/build/simd/libhesper_simd.a"]
+
+lean_exe «simd-perf-bench» where
+  root := `MainSimdPerfBench
   supportInterpreter := false
   moreLinkArgs := #[s!".lake/build/simd/libhesper_simd.a"]

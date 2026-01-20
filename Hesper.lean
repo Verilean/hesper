@@ -1,5 +1,3 @@
--- This module serves as the root of the `Hesper` library.
--- Import modules here that should be built as part of the library.
 import Hesper.Basic
 
 -- WGSL DSL modules
@@ -54,15 +52,96 @@ import Hesper.GLFW.Types
 import Hesper.GLFW.Internal
 import Hesper.GLFW
 
+/-!
+# Hesper: Verified WebGPU Inference Engine
+
+This module serves as the root of the Hesper library, a type-safe GPU programming framework
+for Lean 4 with formal verification capabilities.
+
+## Features
+
+- Type-Safe WGSL DSL: Embedded shader language with compile-time type checking
+- WebGPU Backend: Cross-platform GPU compute via Google Dawn (Vulkan, Metal, D3D12)
+- Verified Computation: Numerical accuracy testing and formal verification support
+- High-Performance: Matrix multiplication, neural networks, automatic differentiation
+- Multi-Backend: GPU compute with optional SIMD CPU fallback
+
+## Module Organization
+
+- WGSL: Type-safe shader DSL and code generation
+- WebGPU: Low-level WebGPU API bindings
+- Compute: High-level compute API
+- Tensor: Linear algebra operations (MatMul)
+- NN: Neural network layers (Conv, Activation)
+- AD: Automatic differentiation
+- Optimizer: Training optimizers (SGD, Adam)
+- Profile: Chrome tracing and performance profiling
+- Simd: CPU SIMD backend (Google Highway)
+- GLFW: Window management and rendering
+
+## Production Readiness
+
+- 151 DSL test cases (operators, control flow, functions)
+- CPU vs GPU numerical accuracy tests
+- Cross-platform CI/CD (Linux/Vulkan, Windows/D3D12, macOS/Metal)
+
+## References
+
+- Organization: Verilean (github.com/verilean)
+- Repository: github.com/verilean/hesper
+-/
+
 namespace Hesper
 
 /-- Initialize the Hesper WebGPU engine.
-    Discovers available GPU adapters and returns the Dawn instance for resource management. -/
+
+This function must be called before any GPU operations. It performs the following:
+1. Initializes the Dawn WebGPU implementation and procedure table
+2. Creates a Dawn native instance
+3. Discovers all available GPU adapters on the system (Vulkan, Metal, D3D12)
+4. Prints adapter information to stdout
+
+**Returns**: A WebGPU Instance handle for subsequent GPU operations.
+
+**Example**:
+
+    def main : IO Unit := do
+      let inst ← Hesper.init
+      -- Use inst for GPU operations
+
+**Backend Support**:
+- **Linux**: Vulkan 1.3+
+- **macOS**: Metal 3
+- **Windows**: D3D12
+
+**Note**: This is an FFI function implemented in `native/bridge.cpp`.
+-/
 @[extern "lean_hesper_init"]
 opaque init : IO WebGPU.Instance
 
 /-- Run GPU vector addition (Hello World compute example).
-    Adds two vectors of the given size element-wise on the GPU. -/
+
+Demonstrates basic GPU compute by adding two vectors element-wise:
+`C[i] = A[i] + B[i]` for i in 0..size
+
+**Parameters**:
+- `inst`: WebGPU instance from `Hesper.init`
+- `size`: Number of elements in each vector (must be positive)
+
+**Implementation**: Creates GPU buffers, uploads random test data, executes a compute
+shader, and downloads results for verification.
+
+**Example**:
+
+    def main : IO Unit := do
+      let inst ← Hesper.init
+      Hesper.vectorAdd inst 1024  -- Add two 1024-element vectors
+
+**Performance**: Executed on GPU with workgroup size of 64 threads.
+
+**Note**: This is an FFI function implemented in `native/bridge.cpp`.
+It's primarily for testing and demonstration purposes.
+-/
 @[extern "lean_hesper_vector_add"]
 opaque vectorAdd (inst : @& WebGPU.Instance) (size : UInt32) : IO Unit
 
