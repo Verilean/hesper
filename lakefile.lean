@@ -11,6 +11,10 @@ require LSpec from git
 lean_lib «Hesper» where
   -- add library configuration options here
 
+lean_lib «Examples» where
+  roots := #[`Examples]
+  globs := #[.submodules `Examples]
+
 lean_lib «Tests» where
   roots := #[`Tests]
   globs := #[.submodules `Tests]
@@ -177,124 +181,142 @@ def stdLinkArgs : Array String := #[
   "-framework", "Cocoa"
 ]
 
-@[default_target]
-lean_exe «hesper» where
-  root := `Examples.Main
-  moreLinkArgs := stdLinkArgs
+-- ============================================================================
+-- EXAMPLES - Organized by Category
+-- ============================================================================
 
--- Simple standalone executable (just GPU vector add, no WebGPU wrapper)
-lean_exe «hesper-simple» where
-  root := `Examples.MainSimple
-  moreLinkArgs := stdLinkArgs
+-- ----------------------------------------------------------------------------
+-- DSL Examples (Pure Lean - Type-safe WGSL DSL demonstration)
+-- ----------------------------------------------------------------------------
 
--- Minimal test for WebGPU wrapper FFI
-lean_exe «test-ffi» where
-  root := `Examples.MainTest
-  moreLinkArgs := stdLinkArgs
-
--- DSL Examples (no FFI needed, pure Lean)
 lean_exe «dsl-basics» where
-  root := `Examples.DSLBasics
+  root := `Examples.DSL.DSLBasics
 
 lean_exe «shader-gen» where
-  root := `Examples.ShaderGeneration
-
-lean_exe «nn-demo» where
-  root := `Examples.NNDemo
-
-lean_exe «matmul-subgroup» where
-  root := `Examples.MatmulSubgroup
-
--- GPU matrix multiplication with subgroup operations
-lean_exe «matmul-gpu» where
-  root := `Examples.MainMatmul
-  moreLinkArgs := stdLinkArgs
-
--- 4K matrix multiplication benchmark with FLOPS
-lean_exe «matmul-4k» where
-  root := `Examples.MainMatmul4K
-  moreLinkArgs := stdLinkArgs
-
-lean_exe «atomic-counter» where
-  root := `Examples.AtomicCounter
-
-lean_exe «kernel-fusion» where
-  root := `Examples.KernelFusion
-
-lean_exe «chrome-tracing-demo» where
-  root := `Examples.ChromeTracingDemo
+  root := `Examples.DSL.ShaderGeneration
 
 lean_exe «monad-demo» where
-  root := `Examples.MonadDemo
-
-lean_exe «ad-demo» where
-  root := `Examples.ADDemo
-
-lean_exe «ad-proof» where
-  root := `Examples.ADProof
-
-lean_exe «ad-debug» where
-  root := `Examples.ADDebug
-
-lean_exe «async-demo» where
-  root := `Examples.AsyncDemo
-  moreLinkArgs := stdLinkArgs
+  root := `Examples.DSL.MonadDemo
 
 lean_exe «codegen-demo» where
-  root := `Examples.CodeGenDemo
+  root := `Examples.DSL.CodeGenDemo
+
+lean_exe «matmul-subgroup» where
+  root := `Examples.DSL.MatmulSubgroup
+
+lean_exe «atomic-counter» where
+  root := `Examples.DSL.AtomicCounter
+
+lean_exe «kernel-fusion» where
+  root := `Examples.DSL.KernelFusion
+
+lean_exe «ad-demo» where
+  root := `Examples.DSL.ADDemo
+
+lean_exe «ad-proof» where
+  root := `Examples.DSL.ADProof
+
+lean_exe «ad-debug» where
+  root := `Examples.DSL.ADDebug
+
+-- ----------------------------------------------------------------------------
+-- GPU Compute Examples (WebGPU compute shaders and GPU programming)
+-- ----------------------------------------------------------------------------
+
+@[default_target]
+lean_exe «hesper» where
+  root := `Examples.Compute.Main
+  moreLinkArgs := stdLinkArgs
+
+lean_exe «hesper-simple» where
+  root := `Examples.Compute.MainSimple
+  moreLinkArgs := stdLinkArgs
 
 lean_exe «execute-demo» where
-  root := `Examples.ExecuteDemo
+  root := `Examples.Compute.ExecuteDemo
   moreLinkArgs := stdLinkArgs
 
 lean_exe «real-gpu-demo» where
-  root := `Examples.RealGPUDemo
+  root := `Examples.Compute.RealGPUDemo
   moreLinkArgs := stdLinkArgs
 
--- GLFW simple window test (just window creation, no rendering)
-lean_exe «glfw-simple» where
-  root := `Examples.GLFWSimple
+lean_exe «matmul-gpu» where
+  root := `Examples.Compute.MainMatmul
   moreLinkArgs := stdLinkArgs
 
--- GLFW triangle rendering demo
-lean_exe «glfw-triangle» where
-  root := `Examples.GLFWTriangle
+lean_exe «matmul-4k» where
+  root := `Examples.Compute.MainMatmul4K
   moreLinkArgs := stdLinkArgs
 
--- GLFW demo (window management and rendering)
-lean_exe «glfw-demo» where
-  root := `Examples.GLFWDemo
+lean_exe «async-demo» where
+  root := `Examples.Compute.AsyncDemo
   moreLinkArgs := stdLinkArgs
 
--- Tetris game
-lean_exe «tetris» where
-  root := `Examples.Tetris
-  moreLinkArgs := stdLinkArgs
-
--- Multi-GPU support demo
 lean_exe «multigpu» where
-  root := `Examples.MultiGPU
+  root := `Examples.Compute.MultiGPU
   moreLinkArgs := stdLinkArgs
 
--- Test executable
+-- ----------------------------------------------------------------------------
+-- Machine Learning Examples (Neural networks and training)
+-- ----------------------------------------------------------------------------
+
+lean_exe «nn-demo» where
+  root := `Examples.MachineLearning.NNDemo
+
+-- TODO: Fix compilation errors in MNIST example
+-- lean_exe «mnist-train» where
+--   root := `Examples.MachineLearning.MNISTTrain
+--   moreLinkArgs := stdLinkArgs
+
+-- ----------------------------------------------------------------------------
+-- Graphics Examples (GLFW rendering and window management)
+-- ----------------------------------------------------------------------------
+
+lean_exe «glfw-simple» where
+  root := `Examples.Graphics.GLFWSimple
+  moreLinkArgs := stdLinkArgs
+
+lean_exe «glfw-triangle» where
+  root := `Examples.Graphics.GLFWTriangle
+  moreLinkArgs := stdLinkArgs
+
+lean_exe «glfw-demo» where
+  root := `Examples.Graphics.GLFWDemo
+  moreLinkArgs := stdLinkArgs
+
+lean_exe «tetris» where
+  root := `Examples.Graphics.Tetris
+  moreLinkArgs := stdLinkArgs
+
+-- ----------------------------------------------------------------------------
+-- Utilities and Tools
+-- ----------------------------------------------------------------------------
+
+lean_exe «test-ffi» where
+  root := `Examples.Utilities.MainTest
+  moreLinkArgs := stdLinkArgs
+
+lean_exe «chrome-tracing-demo» where
+  root := `Examples.Utilities.ChromeTracingDemo
+
+-- ============================================================================
+-- TESTS AND BENCHMARKS
+-- ============================================================================
+
+-- ----------------------------------------------------------------------------
+-- Test Executables
+-- ----------------------------------------------------------------------------
+
 @[test_driver]
 lean_exe test where
   root := `Tests.ErrorHandlingMain
   moreLinkArgs := stdLinkArgs
 
-lean_exe benchmark where
-  root := `Benchmarks.Performance
+lean_exe «test-all» where
+  root := `Tests.All
   moreLinkArgs := stdLinkArgs
 
-lean_exe «buffer-test» where
-  root := `Tests.BufferTest
-  moreLinkArgs := stdLinkArgs
-
-lean_exe «minimal-test» where
-  root := `Tests.MinimalBenchmark
-  moreLinkArgs := stdLinkArgs
-
--- New comprehensive test suites
+-- GPU Tests
 lean_exe «test-device» where
   root := `Tests.DeviceTestsMain
   moreLinkArgs := stdLinkArgs
@@ -311,23 +333,36 @@ lean_exe «test-gpu-accuracy» where
   root := `Tests.GPUAccuracyTestsMain
   moreLinkArgs := stdLinkArgs
 
-lean_exe «test-all» where
-  root := `Tests.All
+lean_exe «buffer-test» where
+  root := `Tests.BufferTest
   moreLinkArgs := stdLinkArgs
 
--- WGSL DSL Tests (Pure Lean, no FFI needed)
+lean_exe «minimal-test» where
+  root := `Tests.MinimalBenchmark
+  moreLinkArgs := stdLinkArgs
+
+-- Pure Lean Tests (no GPU required)
 lean_exe «test-wgsl-dsl» where
   root := `Tests.WGSLDSLTestsMain
 
--- Numerical Accuracy Tests (Pure Lean, no FFI needed)
 lean_exe «test-numerical» where
   root := `Tests.NumericalTestsMain
 
--- ShaderM Monad Tests (Pure Lean, no FFI needed)
 lean_exe «test-shader-monad» where
   root := `Tests.ShaderMonadTestsMain
 
--- SIMD CPU Backend (Google Highway)
+-- ----------------------------------------------------------------------------
+-- Benchmarks
+-- ----------------------------------------------------------------------------
+
+lean_exe benchmark where
+  root := `Benchmarks.Performance
+  moreLinkArgs := stdLinkArgs
+
+-- ============================================================================
+-- SIMD CPU BACKEND (Google Highway)
+-- ============================================================================
+
 /-- Script to build SIMD library using CMake + Google Highway -/
 script buildSimd do
   let cwd ← IO.currentDir
@@ -371,7 +406,10 @@ script buildSimd do
   IO.println s!"[Hesper] SIMD library compiled: {libPath}"
   return 0
 
--- SIMD executables (Google Highway backend)
+-- ----------------------------------------------------------------------------
+-- SIMD Executables (Google Highway backend for CPU vectorization)
+-- ----------------------------------------------------------------------------
+
 lean_exe «simd-bench» where
   root := `MainSimdBench
   supportInterpreter := true
