@@ -33,7 +33,7 @@ fn fs_main() -> @location(0) vec4<f32> {
 
 def main : IO Unit := do
   IO.println "Initializing Hesper..."
-  Hesper.init
+  let inst ← Hesper.init
 
   IO.println "Initializing GLFW..."
   withGLFW do
@@ -44,7 +44,7 @@ def main : IO Unit := do
     IO.println "✓ Window created!"
 
     -- Get the WebGPU device
-    let device ← Hesper.WebGPU.getDevice
+    let device ← Hesper.WebGPU.getDevice inst
     IO.println "✓ Device obtained"
 
     -- Create surface (automatically cleaned up by GC)
