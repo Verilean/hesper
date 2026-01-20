@@ -10,10 +10,10 @@ and calculates actual GFLOPS performance.
 namespace Hesper
 
 @[extern "lean_hesper_get_device_with_features"]
-opaque getDeviceWithFeatures : IO Unit
+opaque getDeviceWithFeatures (inst : @& WebGPU.Instance) : IO WebGPU.Device
 
 @[extern "lean_hesper_matmul_subgroup_4k"]
-opaque matmulSubgroup4K (shaderCode : String) : IO Unit
+opaque matmulSubgroup4K (device : @& WebGPU.Device) (shaderCode : String) : IO Unit
 
 end Hesper
 
@@ -101,8 +101,8 @@ def main : IO Unit := do
 
   -- Initialize WebGPU
   IO.println "Initializing WebGPU with subgroup features..."
-  Hesper.init
-  Hesper.getDeviceWithFeatures
+  let inst ← Hesper.init
+  let device ← Hesper.getDeviceWithFeatures inst
   IO.println ""
 
   -- Run benchmark
@@ -110,7 +110,7 @@ def main : IO Unit := do
   IO.println "This will use hardware tensor cores via Metal..."
   IO.println ""
 
-  Hesper.matmulSubgroup4K shaderCode
+  Hesper.matmulSubgroup4K device shaderCode
 
   IO.println ""
   IO.println "╔══════════════════════════════════════════════╗"

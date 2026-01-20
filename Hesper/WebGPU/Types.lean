@@ -7,6 +7,9 @@ with automatic cleanup by finalizers on the C++ side.
 
 namespace Hesper.WebGPU
 
+/-- Opaque handle to a WebGPU Instance (Dawn native instance) with automatic cleanup via External finalizer -/
+opaque Instance : Type
+
 /-- Opaque handle to a WebGPU Device with automatic cleanup via External finalizer -/
 opaque Device : Type
 

@@ -44,6 +44,11 @@ import Hesper.Optimizer.Adam
 -- Async operations
 import Hesper.Async
 
+-- SIMD CPU Backend
+import Hesper.Simd
+import Hesper.Float32
+import Hesper.Float16
+
 -- GLFW window management and rendering
 import Hesper.GLFW.Types
 import Hesper.GLFW.Internal
@@ -52,13 +57,13 @@ import Hesper.GLFW
 namespace Hesper
 
 /-- Initialize the Hesper WebGPU engine.
-    Discovers available GPU adapters and sets up the Dawn instance. -/
+    Discovers available GPU adapters and returns the Dawn instance for resource management. -/
 @[extern "lean_hesper_init"]
-opaque init : IO Unit
+opaque init : IO WebGPU.Instance
 
 /-- Run GPU vector addition (Hello World compute example).
     Adds two vectors of the given size element-wise on the GPU. -/
 @[extern "lean_hesper_vector_add"]
-opaque vectorAdd (size : UInt32) : IO Unit
+opaque vectorAdd (inst : @& WebGPU.Instance) (size : UInt32) : IO Unit
 
 end Hesper

@@ -54,11 +54,11 @@ def main : IO Unit := do
   IO.println "║   GPU Hardware Test                          ║"
   IO.println "╚══════════════════════════════════════════════╝"
   IO.println ""
-  Hesper.init
+  let inst ← Hesper.init
   IO.println ""
 
   IO.println "=== GPU Vector Addition Example ==="
-  Hesper.vectorAdd 1024
+  Hesper.vectorAdd inst 1024
   IO.println ""
 
   IO.println "╔══════════════════════════════════════════════╗"

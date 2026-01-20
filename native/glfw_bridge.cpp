@@ -11,9 +11,10 @@
 #include <iostream>
 #include <memory>
 
-// Global state
-extern std::unique_ptr<dawn::native::Instance> g_instance;
-extern wgpu::Device g_device;
+// No global state - all resources managed via Lean GC
+
+// Forward declaration of Instance External class (defined in bridge.cpp)
+extern lean_external_class* g_webgpu_instance_class;
 
 // External classes for proper GC management
 static lean_external_class* g_window_class = nullptr;
@@ -25,6 +26,99 @@ static lean_external_class* g_render_pass_encoder_class = nullptr;
 static lean_external_class* g_command_buffer_class = nullptr;
 static lean_external_class* g_shader_module_class = nullptr;
 static lean_external_class* g_render_pipeline_class = nullptr;
+
+//=============================================================================
+// Error Handling Infrastructure (shared with bridge.cpp)
+//=============================================================================
+
+enum class ErrorCategory : uint32_t {
+    Device = 0,
+    Buffer = 1,
+    Shader = 2,
+    Pipeline = 3,
+    Surface = 4,
+    Validation = 5,
+    Unknown = 6
+};
+
+enum class SurfaceErrorTag : uint32_t {
+    WindowCreationFailed = 0,
+    SurfaceCreationFailed = 1,
+    ConfigurationFailed = 2,
+    PresentationFailed = 3,
+    NoSupportedFormat = 4,
+    InvalidDimensions = 5
+};
+
+// Helper functions to create surface errors
+static lean_object* make_surface_error_window_creation_failed(uint32_t width, uint32_t height, const char* reason) {
+    lean_object* err = lean_alloc_ctor(static_cast<uint32_t>(SurfaceErrorTag::WindowCreationFailed), 3, 0);
+    lean_ctor_set(err, 0, lean_box(width));
+    lean_ctor_set(err, 1, lean_box(height));
+    lean_ctor_set(err, 2, lean_mk_string(reason));
+    return err;
+}
+
+static lean_object* make_surface_error_creation_failed(const char* reason) {
+    lean_object* err = lean_alloc_ctor(static_cast<uint32_t>(SurfaceErrorTag::SurfaceCreationFailed), 1, 0);
+    lean_ctor_set(err, 0, lean_mk_string(reason));
+    return err;
+}
+
+static lean_object* make_surface_error_configuration_failed(const char* reason) {
+    lean_object* err = lean_alloc_ctor(static_cast<uint32_t>(SurfaceErrorTag::ConfigurationFailed), 1, 0);
+    lean_ctor_set(err, 0, lean_mk_string(reason));
+    return err;
+}
+
+static lean_object* make_surface_error_presentation_failed(const char* reason) {
+    lean_object* err = lean_alloc_ctor(static_cast<uint32_t>(SurfaceErrorTag::PresentationFailed), 1, 0);
+    lean_ctor_set(err, 0, lean_mk_string(reason));
+    return err;
+}
+
+// Shader error constructors
+static lean_object* make_shader_error_compilation_failed(const char* source, const char* errors) {
+    lean_object* err = lean_alloc_ctor(0, 2, 0);  // CompilationFailed tag 0
+    lean_ctor_set(err, 0, lean_mk_string(source));
+    lean_ctor_set(err, 1, lean_mk_string(errors));
+    return err;
+}
+
+// Pipeline error constructors
+static lean_object* make_pipeline_error_creation_failed(const char* pipelineType, const char* reason) {
+    lean_object* err = lean_alloc_ctor(0, 2, 0);  // CreationFailed tag 0
+    lean_ctor_set(err, 0, lean_mk_string(pipelineType));
+    lean_ctor_set(err, 1, lean_mk_string(reason));
+    return err;
+}
+
+// Wrap error in WebGPUError.Surface
+static lean_object* make_webgpu_error(ErrorCategory category, lean_object* inner_error) {
+    lean_object* err = lean_alloc_ctor(static_cast<uint32_t>(category), 1, 0);
+    lean_ctor_set(err, 0, inner_error);
+    return err;
+}
+
+// Create IO error from WebGPUError
+static lean_object* make_io_error(lean_object* webgpu_error) {
+    return lean_io_result_mk_error(lean_mk_io_user_error(webgpu_error));
+}
+
+// Convenience: Create IO error from surface error
+static lean_object* surface_error(lean_object* surf_err) {
+    return make_io_error(make_webgpu_error(ErrorCategory::Surface, surf_err));
+}
+
+// Convenience: Create IO error from shader error
+static lean_object* shader_error(lean_object* shader_err) {
+    return make_io_error(make_webgpu_error(ErrorCategory::Shader, shader_err));
+}
+
+// Convenience: Create IO error from pipeline error
+static lean_object* pipeline_error(lean_object* pipeline_err) {
+    return make_io_error(make_webgpu_error(ErrorCategory::Pipeline, pipeline_err));
+}
 
 extern "C" {
 
@@ -130,7 +224,7 @@ lean_obj_res lean_glfw_init(lean_obj_res /* unit */) {
 
     if (!glfwInit()) {
         std::cerr << "[C++] glfwInit failed!" << std::endl;
-        return lean_io_result_mk_error(lean_mk_io_user_error(lean_mk_string("Failed to initialize GLFW")));
+        return surface_error(make_surface_error_window_creation_failed(0, 0, "Failed to initialize GLFW - check GLFW installation"));
     }
 
     std::cout << "[C++] glfwInit succeeded" << std::endl;
@@ -157,13 +251,18 @@ lean_obj_res lean_glfw_create_window(uint32_t width, uint32_t height,
                                       b_lean_obj_arg title_obj, lean_obj_res /* unit */) {
     const char* title = lean_string_cstr(title_obj);
 
+    // Validate dimensions
+    if (width == 0 || height == 0) {
+        return surface_error(make_surface_error_window_creation_failed(width, height, "Window dimensions must be greater than 0"));
+    }
+
     // Tell GLFW not to create an OpenGL context (we're using WebGPU)
     glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);
 
     GLFWwindow* window = glfwCreateWindow(width, height, title, nullptr, nullptr);
     if (!window) {
         std::cerr << "[C++] Failed to create GLFW window" << std::endl;
-        return lean_io_result_mk_error(lean_mk_io_user_error(lean_mk_string("Failed to create window")));
+        return surface_error(make_surface_error_window_creation_failed(width, height, "GLFW window creation failed - check GLFW initialization and monitor availability"));
     }
 
     std::cout << "[C++] Created window at address: " << (void*)window << std::endl;
@@ -190,8 +289,10 @@ lean_obj_res lean_glfw_window_get_key(b_lean_obj_arg window_obj, uint32_t key,
 // Surface Management
 //=============================================================================
 
-lean_obj_res lean_glfw_create_surface(size_t device_handle, b_lean_obj_arg window_obj,
+lean_obj_res lean_glfw_create_surface(b_lean_obj_arg instance_obj, b_lean_obj_arg window_obj,
                                        lean_obj_res /* unit */) {
+    dawn::native::Instance* nativeInstance = static_cast<dawn::native::Instance*>(lean_get_external_data(instance_obj));
+
     std::cout << "[C++] Creating surface for window..." << std::endl;
     std::cout << "[C++] window_obj type: " << lean_obj_tag(window_obj) << std::endl;
     std::cout << "[C++] is_external: " << lean_is_external(window_obj) << std::endl;
@@ -201,7 +302,7 @@ lean_obj_res lean_glfw_create_surface(size_t device_handle, b_lean_obj_arg windo
     std::cout << "[C++] Window pointer extracted: " << (void*)window << std::endl;
     std::cout.flush();
 
-    wgpu::Instance instance = g_instance->Get();
+    wgpu::Instance instance = nativeInstance->Get();
 
     // Use Dawn's GLFW utility to create surface (handles all platform-specific details)
     std::cout << "[C++] Calling wgpu::glfw::CreateSurfaceForWindow..." << std::endl;
@@ -210,7 +311,7 @@ lean_obj_res lean_glfw_create_surface(size_t device_handle, b_lean_obj_arg windo
 
     if (!surface) {
         std::cerr << "[C++] Failed to create surface!" << std::endl;
-        return lean_io_result_mk_error(lean_mk_io_user_error(lean_mk_string("Failed to create surface")));
+        return surface_error(make_surface_error_creation_failed("Failed to create WebGPU surface for window - ensure window and device are valid"));
     }
 
     std::cout << "[C++] Surface created successfully" << std::endl;
@@ -222,15 +323,16 @@ lean_obj_res lean_glfw_create_surface(size_t device_handle, b_lean_obj_arg windo
     return lean_io_result_mk_ok(external);
 }
 
-lean_obj_res lean_glfw_configure_surface(b_lean_obj_arg surface_obj, uint32_t width,
-                                          uint32_t height, uint32_t format,
+lean_obj_res lean_glfw_configure_surface(b_lean_obj_arg device_obj, b_lean_obj_arg surface_obj,
+                                          uint32_t width, uint32_t height, uint32_t format,
                                           lean_obj_res /* unit */) {
+    wgpu::Device* device = static_cast<wgpu::Device*>(lean_get_external_data(device_obj));
     wgpu::Surface* surface = (wgpu::Surface*)lean_get_external_data(surface_obj);
 
     std::cout << "[C++] Configuring surface..." << std::endl;
 
     wgpu::SurfaceConfiguration config{};
-    config.device = g_device;
+    config.device = *device;
     config.width = width;
     config.height = height;
     config.format = (wgpu::TextureFormat)format;
@@ -245,12 +347,13 @@ lean_obj_res lean_glfw_configure_surface(b_lean_obj_arg surface_obj, uint32_t wi
     return lean_io_result_mk_ok(lean_box(0));
 }
 
-lean_obj_res lean_glfw_surface_get_preferred_format(b_lean_obj_arg surface_obj,
+lean_obj_res lean_glfw_surface_get_preferred_format(b_lean_obj_arg device_obj, b_lean_obj_arg surface_obj,
                                                       lean_obj_res /* unit */) {
+    wgpu::Device* device = static_cast<wgpu::Device*>(lean_get_external_data(device_obj));
     wgpu::Surface* surface = (wgpu::Surface*)lean_get_external_data(surface_obj);
 
     wgpu::SurfaceCapabilities capabilities;
-    surface->GetCapabilities(g_device.GetAdapter(), &capabilities);
+    surface->GetCapabilities(device->GetAdapter(), &capabilities);
 
     wgpu::TextureFormat format = capabilities.formats[0];
     return lean_io_result_mk_ok(lean_box((uint32_t)format));
@@ -264,7 +367,7 @@ lean_obj_res lean_glfw_surface_get_current_texture(b_lean_obj_arg surface_obj,
     surface->GetCurrentTexture(&surfaceTexture);
 
     if (!surfaceTexture.texture) {
-        return lean_io_result_mk_error(lean_mk_io_user_error(lean_mk_string("Failed to get current texture")));
+        return surface_error(make_surface_error_presentation_failed("Failed to get current texture - surface may be unconfigured or window minimized"));
     }
 
     wgpu::Texture* texture = new wgpu::Texture(surfaceTexture.texture);
@@ -290,7 +393,7 @@ lean_obj_res lean_glfw_texture_create_view(b_lean_obj_arg texture_obj, lean_obj_
     wgpu::TextureView view = texture->CreateView(&viewDesc);
 
     if (!view) {
-        return lean_io_result_mk_error(lean_mk_io_user_error(lean_mk_string("Failed to create texture view")));
+        return surface_error(make_surface_error_presentation_failed("Failed to create texture view"));
     }
 
     wgpu::TextureView* viewPtr = new wgpu::TextureView(view);
@@ -303,13 +406,17 @@ lean_obj_res lean_glfw_texture_create_view(b_lean_obj_arg texture_obj, lean_obj_
 // Command Encoding
 //=============================================================================
 
-lean_obj_res lean_glfw_create_command_encoder(size_t device_handle,
+lean_obj_res lean_glfw_create_command_encoder(b_lean_obj_arg device_obj,
                                                lean_obj_res /* unit */) {
+    wgpu::Device* device = static_cast<wgpu::Device*>(lean_get_external_data(device_obj));
+
     wgpu::CommandEncoderDescriptor encoderDesc{};
-    wgpu::CommandEncoder encoder = g_device.CreateCommandEncoder(&encoderDesc);
+    wgpu::CommandEncoder encoder = device->CreateCommandEncoder(&encoderDesc);
 
     if (!encoder) {
-        return lean_io_result_mk_error(lean_mk_io_user_error(lean_mk_string("Failed to create command encoder")));
+        lean_object* unknown_err = lean_alloc_ctor(static_cast<uint32_t>(ErrorCategory::Unknown), 1, 0);
+        lean_ctor_set(unknown_err, 0, lean_mk_string("Failed to create command encoder"));
+        return make_io_error(unknown_err);
     }
 
     wgpu::CommandEncoder* encoderPtr = new wgpu::CommandEncoder(encoder);
@@ -336,7 +443,9 @@ lean_obj_res lean_glfw_begin_render_pass(b_lean_obj_arg encoder_obj, b_lean_obj_
     wgpu::RenderPassEncoder pass = encoder->BeginRenderPass(&renderPassDesc);
 
     if (!pass) {
-        return lean_io_result_mk_error(lean_mk_io_user_error(lean_mk_string("Failed to begin render pass")));
+        lean_object* unknown_err = lean_alloc_ctor(static_cast<uint32_t>(ErrorCategory::Unknown), 1, 0);
+        lean_ctor_set(unknown_err, 0, lean_mk_string("Failed to begin render pass"));
+        return make_io_error(unknown_err);
     }
 
     wgpu::RenderPassEncoder* passPtr = new wgpu::RenderPassEncoder(pass);
@@ -374,7 +483,9 @@ lean_obj_res lean_glfw_encoder_finish(b_lean_obj_arg encoder_obj, lean_obj_res /
     wgpu::CommandBuffer commandBuffer = encoder->Finish(&cmdBufferDesc);
 
     if (!commandBuffer) {
-        return lean_io_result_mk_error(lean_mk_io_user_error(lean_mk_string("Failed to finish encoder")));
+        lean_object* unknown_err = lean_alloc_ctor(static_cast<uint32_t>(ErrorCategory::Unknown), 1, 0);
+        lean_ctor_set(unknown_err, 0, lean_mk_string("Failed to finish encoder"));
+        return make_io_error(unknown_err);
     }
 
     wgpu::CommandBuffer* cmdPtr = new wgpu::CommandBuffer(commandBuffer);
@@ -383,11 +494,12 @@ lean_obj_res lean_glfw_encoder_finish(b_lean_obj_arg encoder_obj, lean_obj_res /
     return lean_io_result_mk_ok(external);
 }
 
-lean_obj_res lean_glfw_queue_submit(size_t device_handle, b_lean_obj_arg cmd_obj,
+lean_obj_res lean_glfw_queue_submit(b_lean_obj_arg device_obj, b_lean_obj_arg cmd_obj,
                                      lean_obj_res /* unit */) {
+    wgpu::Device* device = static_cast<wgpu::Device*>(lean_get_external_data(device_obj));
     wgpu::CommandBuffer* cmd = (wgpu::CommandBuffer*)lean_get_external_data(cmd_obj);
 
-    wgpu::Queue queue = g_device.GetQueue();
+    wgpu::Queue queue = device->GetQueue();
     queue.Submit(1, cmd);
 
     return lean_io_result_mk_ok(lean_box(0));
@@ -397,8 +509,9 @@ lean_obj_res lean_glfw_queue_submit(size_t device_handle, b_lean_obj_arg cmd_obj
 // Pipeline Management
 //=============================================================================
 
-lean_obj_res lean_glfw_create_shader_module(size_t device_handle, b_lean_obj_arg code_obj,
+lean_obj_res lean_glfw_create_shader_module(b_lean_obj_arg device_obj, b_lean_obj_arg code_obj,
                                              lean_obj_res /* unit */) {
+    wgpu::Device* device = static_cast<wgpu::Device*>(lean_get_external_data(device_obj));
     const char* code = lean_string_cstr(code_obj);
 
     wgpu::ShaderModuleWGSLDescriptor wgslDesc{};
@@ -407,10 +520,10 @@ lean_obj_res lean_glfw_create_shader_module(size_t device_handle, b_lean_obj_arg
     wgpu::ShaderModuleDescriptor shaderDesc{};
     shaderDesc.nextInChain = &wgslDesc;
 
-    wgpu::ShaderModule shader = g_device.CreateShaderModule(&shaderDesc);
+    wgpu::ShaderModule shader = device->CreateShaderModule(&shaderDesc);
 
     if (!shader) {
-        return lean_io_result_mk_error(lean_mk_io_user_error(lean_mk_string("Failed to create shader module")));
+        return shader_error(make_shader_error_compilation_failed(code, "Shader module creation failed"));
     }
 
     wgpu::ShaderModule* shaderPtr = new wgpu::ShaderModule(shader);
@@ -419,8 +532,9 @@ lean_obj_res lean_glfw_create_shader_module(size_t device_handle, b_lean_obj_arg
     return lean_io_result_mk_ok(external);
 }
 
-lean_obj_res lean_glfw_create_render_pipeline(size_t device_handle, b_lean_obj_arg shader_obj,
+lean_obj_res lean_glfw_create_render_pipeline(b_lean_obj_arg device_obj, b_lean_obj_arg shader_obj,
                                                uint32_t format, lean_obj_res /* unit */) {
+    wgpu::Device* device = static_cast<wgpu::Device*>(lean_get_external_data(device_obj));
     wgpu::ShaderModule* shader = (wgpu::ShaderModule*)lean_get_external_data(shader_obj);
 
     // Vertex state
@@ -445,10 +559,10 @@ lean_obj_res lean_glfw_create_render_pipeline(size_t device_handle, b_lean_obj_a
     pipelineDesc.fragment = &fragmentState;
     pipelineDesc.primitive.topology = wgpu::PrimitiveTopology::TriangleList;
 
-    wgpu::RenderPipeline pipeline = g_device.CreateRenderPipeline(&pipelineDesc);
+    wgpu::RenderPipeline pipeline = device->CreateRenderPipeline(&pipelineDesc);
 
     if (!pipeline) {
-        return lean_io_result_mk_error(lean_mk_io_user_error(lean_mk_string("Failed to create render pipeline")));
+        return pipeline_error(make_pipeline_error_creation_failed("render", "Render pipeline creation failed - check shader compatibility and descriptor"));
     }
 
     wgpu::RenderPipeline* pipelinePtr = new wgpu::RenderPipeline(pipeline);

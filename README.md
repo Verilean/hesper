@@ -77,6 +77,39 @@ lake build myfirst
 
 ## Features
 
+### 🚀 Multi-Precision SIMD CPU Backend
+
+Hardware-accelerated CPU operations with multi-precision support:
+
+```lean
+import Hesper.Simd
+import Hesper.Float32
+import Hesper.Float16
+
+-- Float64 (8 bytes): Native Lean Float, NEON 2/op, AVX2 4/op
+let a64 := FloatArray.mk #[1.0, 2.0, 3.0, 4.0]
+let c64 := Hesper.Simd.simdAdd a64 b64
+
+-- Float32 (4 bytes): 2x memory savings, NEON 4/op, AVX2 8/op
+let a32 := Float32.fromFloatArray a64
+let c32 := Float32.simdAdd a32 b32
+
+-- Float16 (2 bytes): 4x memory savings, NEON 8/op, AVX2+F16C 8/op
+-- Requires ARMv8.2-A FP16 or x86_64 F16C - returns error if unavailable
+let hasFP16 ← Float16.hasHardwareSupport
+if hasFP16 then
+  let a16 ← Float16.fromFloatArray a64
+  let c16 ← Float16.simdAdd a16 b16
+```
+
+**Architecture Detection:**
+- ARM64: NEON (default) + optional FP16 vector arithmetic (ARMv8.2-A+)
+- x86_64: AVX2 + F16C extension (Ivy Bridge+)
+- Optional OpenMP multithreading support
+
+**Zero-Conversion Architecture:**
+All operations work directly on raw `ByteArray` with no automatic type conversions. Conversions are explicit only when needed.
+
 ### 🎯 Type-Safe Shader DSL
 
 Write WGSL shaders with Lean's type system guaranteeing correctness:
@@ -99,12 +132,13 @@ let power := Exp.pow x (lit 2.0)
 IO.println distance.toWGSL  -- Output: sqrt((x * x) + (y * y))
 ```
 
-### ⚙️ GPU Computation
+### ⚙️ GPU Computation & SIMD CPU Backend
 
-Execute compute shaders and tensor operations on the GPU:
+Execute compute shaders on GPU or leverage SIMD acceleration on CPU:
 
 ```lean
 import Hesper.Compute
+import Hesper.Simd
 
 -- Matrix multiplication on GPU
 let A : Matrix 1024 1024 := ...
@@ -112,6 +146,19 @@ let B : Matrix 1024 1024 := ...
 
 -- Runs on GPU automatically
 let C ← matmul A B
+
+-- CPU SIMD operations with multi-precision support
+let a := FloatArray.mk #[1.0, 2.0, 3.0, 4.0]
+let b := FloatArray.mk #[5.0, 6.0, 7.0, 8.0]
+let c := Hesper.Simd.simdAdd a b  -- NEON/AVX2 acceleration
+
+-- Float32 (2x memory savings)
+let a32 := Float32.fromFloatArray a
+let c32 := Float32.simdAdd a32 b32
+
+-- Float16 (4x memory savings, hardware-accelerated)
+let a16 ← Float16.fromFloatArray a
+let c16 ← Float16.simdAdd a16 b16
 
 -- Neural network layers with automatic differentiation
 let conv ← Conv2D.create inputChannels outputChannels kernelSize
@@ -187,6 +234,36 @@ Demonstrates:
 - Compute shader execution
 - Performance profiling
 - Result verification
+
+### SIMD CPU Backend
+
+Multi-precision SIMD operations with hardware acceleration:
+
+```bash
+# Run multi-precision test (Float64/Float32/Float16)
+lake script run buildSimd
+lake build multi-precision
+./.lake/build/bin/multi-precision
+
+# Run SIMD benchmarks
+lake build simd-bench
+./.lake/build/bin/simd-bench
+```
+
+Output:
+```
+Backend: NEON (ARM64) - F64: 2/op, F32: 4/op, FP16
+
+─── Float64 (8 bytes/element) ───
+Result: #[6.0, 8.0, 10.0, 12.0] ✓
+
+─── Float32 (4 bytes/element) ───
+Result: Float32[4]: [6.0, 8.0, 10.0, 12.0] ✓
+
+─── Float16 (2 bytes/element) ───
+FP16 hardware detected!
+Result: Float16[4]: [6.0, 8.0, 10.0, 12.0] ✓
+```
 
 ### Multi-GPU Demo
 
@@ -272,13 +349,17 @@ Hesper/
 │   │   ├── Device.lean     # GPU device management
 │   │   ├── Buffer.lean     # GPU buffers
 │   │   ├── Shader.lean     # Shader modules
-│   │   └── Pipeline.lean   # Compute/render pipelines
+│   │   ├── Pipeline.lean   # Compute/render pipelines
+│   │   └── Errors.lean     # Comprehensive error handling
 │   ├── Tensor/        # Tensor operations
 │   │   └── MatMul.lean     # Matrix multiplication
 │   ├── NN/            # Neural network layers
 │   │   └── Conv.lean       # Convolution layers
 │   ├── GLFW/          # Windowing and graphics
 │   │   └── GLFW.lean       # GLFW bindings
+│   ├── Simd.lean      # SIMD Float64 operations
+│   ├── Float32.lean   # SIMD Float32 operations
+│   ├── Float16.lean   # SIMD Float16 operations
 │   └── Compute.lean   # High-level compute API
 ├── Examples/          # Example programs
 │   ├── Tetris.lean         # Full game demo
@@ -288,6 +369,12 @@ Hesper/
 ├── native/            # C++ WebGPU bridge
 │   ├── bridge.cpp          # FFI implementation
 │   └── CMakeLists.txt      # Build configuration
+├── c_src/             # SIMD CPU backend
+│   └── simd_ops.cpp        # NEON/AVX2 implementations
+├── Tests/             # Comprehensive test suite
+│   ├── ErrorTests.lean     # Error handling tests
+│   ├── ShaderTests.lean    # Shader monad tests
+│   └── ...
 └── lakefile.lean      # Lake build script
 ```
 
@@ -305,6 +392,10 @@ Completed:
 - [x] Basic matrix operations
 - [x] Convolution layers
 - [x] Automatic differentiation
+- [x] **Multi-precision SIMD CPU backend (Float64/Float32/Float16)**
+- [x] **Architecture detection (NEON/AVX2/F16C)**
+- [x] **Comprehensive error handling with structured error types**
+- [x] **Complete test suite (error handling, shader monad)**
 
 In Progress:
 - [ ] Comprehensive tensor operation library
@@ -318,6 +409,7 @@ Future:
 - [ ] Distributed multi-GPU training
 - [ ] Integration with Lean's tactic framework
 - [ ] Ray tracing support
+- [ ] Multi-precision GPU tensors (Float16 for memory bandwidth optimization)
 
 ## Contributing
 

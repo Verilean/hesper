@@ -5,8 +5,15 @@ open System (FilePath)
 package «Hesper» where
   -- add package configuration options here
 
+require LSpec from git
+  "https://github.com/argumentcomputer/LSpec.git" @ "main"
+
 lean_lib «Hesper» where
   -- add library configuration options here
+
+lean_lib «Tests» where
+  roots := #[`Tests]
+  globs := #[.submodules `Tests]
 
 /-- Build script for native C++ library with Dawn integration -/
 script buildNative do
@@ -492,3 +499,286 @@ lean_exe «multigpu» where
     "-framework", "IOSurface",
     "-framework", "Cocoa"
   ]
+
+-- Test executable
+@[test_driver]
+lean_exe test where
+  root := `Tests.ErrorHandlingMain
+  moreLinkArgs := #[
+    "-L./.lake/build/native", "-lhesper_native",
+    "-L./.lake/build/dawn-build/src/dawn", "-ldawn_proc",
+    "-L./.lake/build/dawn-install/lib", "-lwebgpu_dawn",
+    "-L./.lake/build/dawn-build/third_party/glfw/src", "-lglfw3",
+    "-Wl,-force_load,./.lake/build/dawn-build/src/dawn/libdawn_proc.a",
+    "-Wl,-force_load,./.lake/build/dawn-build/src/dawn/glfw/libdawn_glfw.a",
+    "-lc++",
+    "-L/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/lib",
+    "-F/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/System/Library/Frameworks",
+    "-Wl,-syslibroot,/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk",
+    "-lobjc",
+    "-framework", "CoreFoundation",
+    "-framework", "Metal",
+    "-framework", "Foundation",
+    "-framework", "QuartzCore",
+    "-framework", "IOKit",
+    "-framework", "IOSurface",
+    "-framework", "Cocoa"
+  ]
+
+lean_exe benchmark where
+  root := `Benchmarks.Performance
+  moreLinkArgs := #[
+    "-L./.lake/build/native", "-lhesper_native",
+    "-L./.lake/build/dawn-build/src/dawn", "-ldawn_proc",
+    "-L./.lake/build/dawn-install/lib", "-lwebgpu_dawn",
+    "-L./.lake/build/dawn-build/third_party/glfw/src", "-lglfw3",
+    "-Wl,-force_load,./.lake/build/dawn-build/src/dawn/libdawn_proc.a",
+    "-Wl,-force_load,./.lake/build/dawn-build/src/dawn/glfw/libdawn_glfw.a",
+    "-lc++",
+    "-L/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/lib",
+    "-F/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/System/Library/Frameworks",
+    "-Wl,-syslibroot,/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk",
+    "-lobjc",
+    "-framework", "CoreFoundation",
+    "-framework", "Metal",
+    "-framework", "Foundation",
+    "-framework", "QuartzCore",
+    "-framework", "IOKit",
+    "-framework", "IOSurface",
+    "-framework", "Cocoa"
+  ]
+
+lean_exe «buffer-test» where
+  root := `Tests.BufferTest
+  moreLinkArgs := #[
+    "-L./.lake/build/native", "-lhesper_native",
+    "-L./.lake/build/dawn-build/src/dawn", "-ldawn_proc",
+    "-L./.lake/build/dawn-install/lib", "-lwebgpu_dawn",
+    "-L./.lake/build/dawn-build/third_party/glfw/src", "-lglfw3",
+    "-Wl,-force_load,./.lake/build/dawn-build/src/dawn/libdawn_proc.a",
+    "-Wl,-force_load,./.lake/build/dawn-build/src/dawn/glfw/libdawn_glfw.a",
+    "-lc++",
+    "-L/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/lib",
+    "-F/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/System/Library/Frameworks",
+    "-Wl,-syslibroot,/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk",
+    "-lobjc",
+    "-framework", "CoreFoundation",
+    "-framework", "Metal",
+    "-framework", "Foundation",
+    "-framework", "QuartzCore",
+    "-framework", "IOKit",
+    "-framework", "IOSurface",
+    "-framework", "Cocoa"
+  ]
+
+lean_exe «minimal-test» where
+  root := `Tests.MinimalBenchmark
+  moreLinkArgs := #[
+    "-L./.lake/build/native", "-lhesper_native",
+    "-L./.lake/build/dawn-build/src/dawn", "-ldawn_proc",
+    "-L./.lake/build/dawn-install/lib", "-lwebgpu_dawn",
+    "-L./.lake/build/dawn-build/third_party/glfw/src", "-lglfw3",
+    "-Wl,-force_load,./.lake/build/dawn-build/src/dawn/libdawn_proc.a",
+    "-Wl,-force_load,./.lake/build/dawn-build/src/dawn/glfw/libdawn_glfw.a",
+    "-lc++",
+    "-L/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/lib",
+    "-F/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/System/Library/Frameworks",
+    "-Wl,-syslibroot,/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk",
+    "-lobjc",
+    "-framework", "CoreFoundation",
+    "-framework", "Metal",
+    "-framework", "Foundation",
+    "-framework", "QuartzCore",
+    "-framework", "IOKit",
+    "-framework", "IOSurface",
+    "-framework", "Cocoa"
+  ]
+
+-- New comprehensive test suites
+lean_exe «test-device» where
+  root := `Tests.DeviceTestsMain
+  moreLinkArgs := #[
+    "-L./.lake/build/native", "-lhesper_native",
+    "-L./.lake/build/dawn-build/src/dawn", "-ldawn_proc",
+    "-L./.lake/build/dawn-install/lib", "-lwebgpu_dawn",
+    "-L./.lake/build/dawn-build/third_party/glfw/src", "-lglfw3",
+    "-Wl,-force_load,./.lake/build/dawn-build/src/dawn/libdawn_proc.a",
+    "-Wl,-force_load,./.lake/build/dawn-build/src/dawn/glfw/libdawn_glfw.a",
+    "-lc++",
+    "-L/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/lib",
+    "-F/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/System/Library/Frameworks",
+    "-Wl,-syslibroot,/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk",
+    "-lobjc",
+    "-framework", "CoreFoundation",
+    "-framework", "Metal",
+    "-framework", "Foundation",
+    "-framework", "QuartzCore",
+    "-framework", "IOKit",
+    "-framework", "IOSurface",
+    "-framework", "Cocoa"
+  ]
+
+lean_exe «test-buffer» where
+  root := `Tests.BufferTestsMain
+  moreLinkArgs := #[
+    "-L./.lake/build/native", "-lhesper_native",
+    "-L./.lake/build/dawn-build/src/dawn", "-ldawn_proc",
+    "-L./.lake/build/dawn-install/lib", "-lwebgpu_dawn",
+    "-L./.lake/build/dawn-build/third_party/glfw/src", "-lglfw3",
+    "-Wl,-force_load,./.lake/build/dawn-build/src/dawn/libdawn_proc.a",
+    "-Wl,-force_load,./.lake/build/dawn-build/src/dawn/glfw/libdawn_glfw.a",
+    "-lc++",
+    "-L/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/lib",
+    "-F/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/System/Library/Frameworks",
+    "-Wl,-syslibroot,/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk",
+    "-lobjc",
+    "-framework", "CoreFoundation",
+    "-framework", "Metal",
+    "-framework", "Foundation",
+    "-framework", "QuartzCore",
+    "-framework", "IOKit",
+    "-framework", "IOSurface",
+    "-framework", "Cocoa"
+  ]
+
+lean_exe «test-compute» where
+  root := `Tests.ComputeTestsMain
+  moreLinkArgs := #[
+    "-L./.lake/build/native", "-lhesper_native",
+    "-L./.lake/build/dawn-build/src/dawn", "-ldawn_proc",
+    "-L./.lake/build/dawn-install/lib", "-lwebgpu_dawn",
+    "-L./.lake/build/dawn-build/third_party/glfw/src", "-lglfw3",
+    "-Wl,-force_load,./.lake/build/dawn-build/src/dawn/libdawn_proc.a",
+    "-Wl,-force_load,./.lake/build/dawn-build/src/dawn/glfw/libdawn_glfw.a",
+    "-lc++",
+    "-L/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/lib",
+    "-F/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/System/Library/Frameworks",
+    "-Wl,-syslibroot,/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk",
+    "-lobjc",
+    "-framework", "CoreFoundation",
+    "-framework", "Metal",
+    "-framework", "Foundation",
+    "-framework", "QuartzCore",
+    "-framework", "IOKit",
+    "-framework", "IOSurface",
+    "-framework", "Cocoa"
+  ]
+
+lean_exe «test-all» where
+  root := `Tests.All
+  moreLinkArgs := #[
+    "-L./.lake/build/native", "-lhesper_native",
+    "-L./.lake/build/dawn-build/src/dawn", "-ldawn_proc",
+    "-L./.lake/build/dawn-install/lib", "-lwebgpu_dawn",
+    "-L./.lake/build/dawn-build/third_party/glfw/src", "-lglfw3",
+    "-Wl,-force_load,./.lake/build/dawn-build/src/dawn/libdawn_proc.a",
+    "-Wl,-force_load,./.lake/build/dawn-build/src/dawn/glfw/libdawn_glfw.a",
+    "-lc++",
+    "-L/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/lib",
+    "-F/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/System/Library/Frameworks",
+    "-Wl,-syslibroot,/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk",
+    "-lobjc",
+    "-framework", "CoreFoundation",
+    "-framework", "Metal",
+    "-framework", "Foundation",
+    "-framework", "QuartzCore",
+    "-framework", "IOKit",
+    "-framework", "IOSurface",
+    "-framework", "Cocoa"
+  ]
+
+-- WGSL DSL Tests (Pure Lean, no FFI needed)
+lean_exe «test-wgsl-dsl» where
+  root := `Tests.WGSLDSLTestsMain
+
+-- Numerical Accuracy Tests (Pure Lean, no FFI needed)
+lean_exe «test-numerical» where
+  root := `Tests.NumericalTestsMain
+
+-- ShaderM Monad Tests (Pure Lean, no FFI needed)
+lean_exe «test-shader-monad» where
+  root := `Tests.ShaderMonadTestsMain
+
+-- SIMD CPU Backend (Google Highway)
+/-- Script to build SIMD library using CMake + Google Highway -/
+script buildSimd do
+  let cwd ← IO.currentDir
+  let buildDir := cwd / ".lake" / "build" / "simd"
+  let srcDir := cwd / "c_src"
+  let libPath := buildDir / "libhesper_simd.a"
+
+  -- Create build directory
+  IO.FS.createDirAll buildDir
+
+  IO.println "[Hesper] Building SIMD library with Google Highway..."
+
+  -- Run CMake configuration
+  let cmakeRet ← IO.Process.spawn {
+    cmd := "cmake"
+    args := #[
+      "-S", srcDir.toString,
+      "-B", buildDir.toString,
+      "-DCMAKE_BUILD_TYPE=Release"
+    ]
+  } >>= (·.wait)
+
+  if cmakeRet != 0 then
+    IO.eprintln "[Hesper] CMake configuration failed"
+    return cmakeRet
+
+  -- Build the library
+  let buildRet ← IO.Process.spawn {
+    cmd := "cmake"
+    args := #[
+      "--build", buildDir.toString,
+      "--target", "hesper_simd",
+      "-j", "8"
+    ]
+  } >>= (·.wait)
+
+  if buildRet != 0 then
+    IO.eprintln "[Hesper] SIMD library build failed"
+    return buildRet
+
+  IO.println s!"[Hesper] SIMD library compiled: {libPath}"
+  return 0
+
+-- SIMD executables (Google Highway backend)
+lean_exe «simd-bench» where
+  root := `MainSimdBench
+  supportInterpreter := true
+  moreLinkArgs := #[s!".lake/build/simd/libhesper_simd.a"]
+
+lean_exe «simd-simple» where
+  root := `MainSimdSimple
+  supportInterpreter := true
+  moreLinkArgs := #[s!".lake/build/simd/libhesper_simd.a"]
+
+lean_exe «simd-test» where
+  root := `MainSimdTest
+  supportInterpreter := true
+
+lean_exe «simd-debug» where
+  root := `MainSimdDebug
+  supportInterpreter := true
+  moreLinkArgs := #[s!".lake/build/simd/libhesper_simd.a"]
+
+lean_exe «simd-minimal» where
+  root := `MainSimdMinimal
+  supportInterpreter := true
+  moreLinkArgs := #[s!".lake/build/simd/libhesper_simd.a"]
+
+lean_exe «multi-precision» where
+  root := `MainMultiPrecision
+  supportInterpreter := false
+  moreLinkArgs := #[s!".lake/build/simd/libhesper_simd.a"]
+
+lean_exe «debug-conversion» where
+  root := `MainDebugConversion
+  supportInterpreter := true
+  moreLinkArgs := #[s!".lake/build/simd/libhesper_simd.a"]
+
+lean_exe «debug-f16» where
+  root := `MainDebugF16
+  supportInterpreter := false
+  moreLinkArgs := #[s!".lake/build/simd/libhesper_simd.a"]

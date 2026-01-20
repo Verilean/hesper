@@ -13,11 +13,11 @@ namespace Hesper
 
 /-- Create device with subgroup matrix features -/
 @[extern "lean_hesper_get_device_with_features"]
-opaque getDeviceWithFeatures : IO Unit
+opaque getDeviceWithFeatures (inst : @& WebGPU.Instance) : IO WebGPU.Device
 
 /-- Run matrix multiplication with subgroup operations -/
 @[extern "lean_hesper_matmul_subgroup"]
-opaque matmulSubgroup (shaderCode : String) (m k n : UInt32) : IO Unit
+opaque matmulSubgroup (device : @& WebGPU.Device) (shaderCode : String) (m k n : UInt32) : IO Unit
 
 end Hesper
 
@@ -132,15 +132,15 @@ def main : IO Unit := do
 
   -- Initialize WebGPU with subgroup features
   IO.println "Initializing WebGPU..."
-  Hesper.init
+  let inst ← Hesper.init
   IO.println ""
 
   IO.println "Creating device with subgroup matrix support..."
-  Hesper.getDeviceWithFeatures
+  let device ← Hesper.getDeviceWithFeatures inst
   IO.println ""
 
   IO.println "Running matrix multiplication on GPU..."
-  Hesper.matmulSubgroup shaderCode m.toUInt32 k.toUInt32 n.toUInt32
+  Hesper.matmulSubgroup device shaderCode m.toUInt32 k.toUInt32 n.toUInt32
   IO.println ""
 
   IO.println "╔══════════════════════════════════════════════╗"

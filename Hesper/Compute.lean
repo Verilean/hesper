@@ -53,13 +53,14 @@ structure KernelConfig where
     ```
 -/
 def runSimpleKernel
+  (inst : Instance)
   (shaderSource : String)
   (inputData : Array Float)
   (outputSize : Nat)
   (config : KernelConfig := { numWorkgroups := (4, 1, 1) }) : IO (Array Float) := do
 
   -- Initialize device
-  let device ← getDevice
+  let device ← getDevice inst
 
   -- Create buffers
   let bufferSize := inputData.size * 4  -- Float = 4 bytes
