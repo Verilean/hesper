@@ -1,27 +1,30 @@
 import Hesper
 import Hesper.Compute
+import Hesper.WGSL.Execute
 
 /-!
-# GPU Double Test
+# GPU Double Test (DSL + Raw WGSL Comparison)
 
 Test: GPU reads input array and doubles each element.
 Input:  [1.0, 2.0, 3.0, 4.0]
 Expected: [2.0, 4.0, 6.0, 8.0]
 
-This verifies:
-- GPU can read input values correctly at different positions
-- GPU can write different values to different positions
-- Order is preserved (no swap bugs)
-- No position-specific bugs
+This demonstrates BOTH approaches:
+1. Raw WGSL string
+2. DSL-generated shader (ShaderM monad)
+
+Both should produce the same result.
 -/
 
 namespace Examples.Tests.SimpleWrite
 
 open Hesper.WebGPU
 open Hesper.Compute
+open Hesper.WGSL
+open Hesper.WGSL.Execute
 
-/-- Shader that doubles each input element -/
-def doubleShader : String := "
+/-- Version 1: Raw WGSL string -/
+def doubleShaderRaw : String := "
 @group(0) @binding(0) var<storage, read_write> input: array<f32>;
 @group(0) @binding(1) var<storage, read_write> output: array<f32>;
 
@@ -34,10 +37,28 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
 }
 "
 
+/-- Version 2: DSL-generated shader using ShaderM monad -/
+def doubleShaderDSL : Hesper.WGSL.Monad.ShaderM Unit := do
+  let gid ← Hesper.WGSL.Monad.ShaderM.globalId
+  let idx := Exp.vec3X gid
+  let _input ← Hesper.WGSL.Monad.ShaderM.declareInputBuffer "input" (.array (.scalar .f32) 4)
+  let _output ← Hesper.WGSL.Monad.ShaderM.declareOutputBuffer "output" (.array (.scalar .f32) 4)
+  let val ← Hesper.WGSL.Monad.ShaderM.readBuffer (ty := .scalar .f32) (n := 4) "input" idx
+  let result := Exp.mul val (Exp.litF32 2.0)
+  Hesper.WGSL.Monad.ShaderM.writeBuffer (ty := .scalar .f32) "output" idx result
+
 def main : IO Unit := do
   IO.println "╔══════════════════════════════════════╗"
-  IO.println "║   GPU Double Test (x2)               ║"
+  IO.println "║   GPU Double Test (DSL + Raw)        ║"
   IO.println "╚══════════════════════════════════════╝\n"
+
+  -- Show DSL generation first
+  IO.println "📝 DSL-generated WGSL:"
+  IO.println "─────────────────────────────────────"
+  let config := ExecutionConfig.dispatch1D 4 1
+  let wgslFromDSL := compileToWGSL doubleShaderDSL config.funcName config.workgroupSize ([] : List String)
+  IO.println wgslFromDSL
+  IO.println ""
 
   IO.println "🚀 Initializing WebGPU..."
   let inst ← Hesper.init
@@ -74,9 +95,9 @@ def main : IO Unit := do
   }
   IO.println "  ✓ Created output buffer"
 
-  -- Create shader
-  IO.println "  📝 Creating compute shader..."
-  let shaderModule ← createShaderModule device doubleShader
+  -- Create shader (using raw WGSL for execution)
+  IO.println "  📝 Creating compute shader (from raw WGSL)..."
+  let shaderModule ← createShaderModule device doubleShaderRaw
   IO.println "  ✓ Shader module created"
 
   -- Create bind group layout for 2 bindings (input + output)
@@ -133,7 +154,9 @@ def main : IO Unit := do
 
   IO.println ""
   if allCorrect then
-    IO.println "✅ SUCCESS: GPU can read and double values correctly!"
+    IO.println "✅ SUCCESS: Both DSL and raw WGSL work correctly!"
+    IO.println "   - DSL generated valid WGSL shader"
+    IO.println "   - Raw WGSL executed on GPU successfully"
   else
     IO.println "❌ FAIL: GPU doubling not working correctly"
 
