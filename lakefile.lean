@@ -68,8 +68,20 @@ script buildNative do
     IO.println "[Hesper] Dawn source already present"
 
   -- Step 2: Build Dawn with correct flags
-  let dawnBuilt ← (dawnInstall / "lib/libwebgpu_dawn.a").pathExists
-  if !dawnBuilt then
+  -- Create a hash of Dawn version + build config to track if rebuild is needed
+  let dawnVersion := "3f79f3aefe0b0a498002564fcfb13eb21ab6c047"
+  let platform := if System.Platform.isOSX then "osx" else "linux"
+  let buildConfig := s!"{dawnVersion}-{platform}-Release"
+  let hashFile := cwd / ".lake/build/dawn-build.hash"
+
+  let hashExists ← hashFile.pathExists
+  let needsBuild ← if !hashExists then
+    pure true
+  else
+    let storedHash ← IO.FS.readFile hashFile
+    pure (storedHash.trim != buildConfig)
+
+  if needsBuild then
     IO.println "[Hesper] Building Dawn (this will take 10-15 minutes)..."
     IO.FS.createDirAll dawnBuild.toString
 
@@ -127,8 +139,12 @@ script buildNative do
     if installRet != 0 then
       IO.eprintln "[Hesper] Dawn install failed"
       return installRet
+
+    -- Write hash file to mark successful build
+    IO.FS.writeFile hashFile buildConfig
+    IO.println s!"[Hesper] Dawn build complete, hash saved: {buildConfig}"
   else
-    IO.println "[Hesper] Dawn already built"
+    IO.println "[Hesper] Dawn already built (hash matches)"
 
   -- Step 3: Build our bridge library
   IO.println "[Hesper] Building Hesper native bridge..."
@@ -219,6 +235,18 @@ lean_exe «ad-proof» where
 lean_exe «ad-debug» where
   root := `Examples.DSL.ADDebug
 
+lean_exe «verified-op-demo» where
+  root := `Examples.DSL.VerifiedOpDemo
+  moreLinkArgs := stdLinkArgs
+
+lean_exe «fusion-test» where
+  root := `Tests.FusionTest
+  -- Fusion test doesn't actually need WebGPU linking, but imports modules that do
+  -- For now, keep it simple and don't link WebGPU
+
+lean_exe «neural-net-fusion» where
+  root := `Examples.DSL.NeuralNetFusion
+
 -- ----------------------------------------------------------------------------
 -- GPU Compute Examples (WebGPU compute shaders and GPU programming)
 -- ----------------------------------------------------------------------------
@@ -265,6 +293,13 @@ lean_exe «nn-demo» where
 
 lean_exe «mnist-train» where
   root := `Examples.MachineLearning.MNISTTrain
+  moreLinkArgs := stdLinkArgs
+
+lean_exe «mnist-train-fused» where
+  root := `Examples.MachineLearning.MNISTTrainFused
+
+lean_exe «mnist-train-gpu» where
+  root := `Examples.MachineLearning.MNISTTrainGPU
   moreLinkArgs := stdLinkArgs
 
 -- ----------------------------------------------------------------------------
@@ -338,6 +373,22 @@ lean_exe «buffer-test» where
 
 lean_exe «minimal-test» where
   root := `Tests.MinimalBenchmark
+  moreLinkArgs := stdLinkArgs
+
+lean_exe «gpu-roundtrip» where
+  root := `Examples.Tests.GPURoundtrip
+  moreLinkArgs := stdLinkArgs
+
+lean_exe «simple-write» where
+  root := `Examples.Tests.SimpleWrite
+  moreLinkArgs := stdLinkArgs
+
+lean_exe «unit-tests» where
+  root := `Tests.UnitTests
+  moreLinkArgs := stdLinkArgs
+
+lean_exe «ffi-tests» where
+  root := `Tests.FFIBoundaryTests
   moreLinkArgs := stdLinkArgs
 
 -- Pure Lean Tests (no GPU required)

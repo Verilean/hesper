@@ -34,8 +34,30 @@ def bytesToFloat (bytes : ByteArray) (offset : Nat := 0) : Float :=
 def floatArrayToBytes (arr : Array Float) : ByteArray :=
   arr.foldl (fun acc f => acc ++ floatToBytes f) ByteArray.empty
 
-/-- Convert a byte array to an array of floats -/
-def bytesToFloatArray (bytes : ByteArray) : Array Float :=
+/-- Convert 4 bytes (little-endian f32) to Float (f64)
+    Uses FFI to properly interpret f32 bits and convert to f64 -/
+@[extern "lean_hesper_bytes_to_float64"]
+opaque bytesToFloat64FFI (bytes : @& ByteArray) (offset : UInt32) : IO Float
+
+/-- Convert 4 bytes (little-endian f32) to Float (f64)
+    Properly handles f32→f64 conversion via FFI -/
+def bytesToFloat32 (bytes : ByteArray) (offset : Nat := 0) : IO Float :=
+  if offset + 4 > bytes.size then pure 0.0
+  else bytesToFloat64FFI bytes offset.toUInt32
+
+/-- Convert a byte array of f32 (GPU 32-bit floats) to Array Float (Lean 64-bit doubles)
+    Uses FFI to properly convert each f32 to f64 -/
+def bytesToFloatArray (bytes : ByteArray) : IO (Array Float) := do
+  let numFloats := bytes.size / 4
+  let mut result := Array.mkEmpty numFloats
+  for i in [0:numFloats] do
+    let f ← bytesToFloat32 bytes (i * 4)
+    result := result.push f
+  return result
+
+/-- Pure version (fallback implementation using Lean)
+    Note: This doesn't properly handle f32→f64 conversion! Use the FFI version above. -/
+def bytesToFloatArrayPure (bytes : ByteArray) : Array Float :=
   let numFloats := bytes.size / 4
   Array.range numFloats |>.map fun i => bytesToFloat bytes (i * 4)
 

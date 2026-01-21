@@ -5,9 +5,44 @@
 #include <iostream>
 #include <vector>
 #include <chrono>
+#include <thread>
 #include <iomanip>
+#include <atomic>
+#include <memory>
 
-// Note: g_device and g_instance removed - all functions now take parameters
+// Note: g_device removed - all functions now take device as parameter
+// g_dawn_instance is kept global for deviceWait to use (since deviceWait only gets device, not instance)
+static dawn::native::Instance* g_dawn_instance = nullptr;
+
+// Helper macros to extract pointers from resource structures
+// All resources maintain a reference to their parent to prevent premature GC
+#define EXTRACT_DEVICE_PTR(device_struct) \
+    static_cast<wgpu::Device*>(lean_get_external_data(lean_ctor_get(device_struct, 0)))
+
+#define EXTRACT_BUFFER_PTR(buffer_struct) \
+    static_cast<wgpu::Buffer*>(lean_get_external_data(lean_ctor_get(buffer_struct, 0)))
+
+#define EXTRACT_SHADER_MODULE_PTR(shader_struct) \
+    static_cast<wgpu::ShaderModule*>(lean_get_external_data(lean_ctor_get(shader_struct, 0)))
+
+#define EXTRACT_COMPUTE_PIPELINE_PTR(pipeline_struct) \
+    static_cast<wgpu::ComputePipeline*>(lean_get_external_data(lean_ctor_get(pipeline_struct, 0)))
+
+#define EXTRACT_BIND_GROUP_PTR(bindgroup_struct) \
+    static_cast<wgpu::BindGroup*>(lean_get_external_data(lean_ctor_get(bindgroup_struct, 0)))
+
+#define EXTRACT_BIND_GROUP_LAYOUT_PTR(layout_struct) \
+    static_cast<wgpu::BindGroupLayout*>(lean_get_external_data(lean_ctor_get(layout_struct, 0)))
+
+// Helper function to create resource structures that maintain device reference
+// Returns: { ptr : ResourcePtr, device : Device }
+inline lean_object* make_resource_with_device(lean_object* resource_external, b_lean_obj_arg device_obj) {
+    lean_object* resource_struct = lean_alloc_ctor(0, 2, 0);  // constructor with 2 fields
+    lean_inc(device_obj);  // Increment device refcount to keep it alive
+    lean_ctor_set(resource_struct, 0, resource_external);  // field 0: ptr
+    lean_ctor_set(resource_struct, 1, device_obj);          // field 1: device
+    return resource_struct;
+}
 
 // External classes for WebGPU resource management
 // Instance class is extern so glfw_bridge.cpp can use it
@@ -258,8 +293,23 @@ lean_obj_res lean_hesper_init(lean_obj_res /* unit */) {
     // 1. Setup ProcTable (Critical for Native Dawn)
     dawnProcSetProcs(&dawn::native::GetProcs());
 
-    // 2. Create Instance
-    dawn::native::Instance* instance = new dawn::native::Instance();
+    // 2. Create Instance with timed wait support for WaitAny API
+    WGPUInstanceFeatureName timedWaitFeature = WGPUInstanceFeatureName_TimedWaitAny;
+
+    WGPUInstanceLimits instanceLimits = {};
+    instanceLimits.nextInChain = nullptr;
+    instanceLimits.timedWaitAnyMaxCount = 64;  // Support up to 64 concurrent waits
+
+    WGPUInstanceDescriptor instanceDesc = {};
+    instanceDesc.nextInChain = nullptr;
+    instanceDesc.requiredFeatureCount = 1;
+    instanceDesc.requiredFeatures = &timedWaitFeature;
+    instanceDesc.requiredLimits = &instanceLimits;
+
+    dawn::native::Instance* instance = new dawn::native::Instance(&instanceDesc);
+
+    // Store global instance pointer for deviceWait to use
+    g_dawn_instance = instance;
 
     // 3. Enumerate Adapters (replaces DiscoverDefaultAdapters + GetAdapters)
     auto adapters = instance->EnumerateAdapters();
@@ -592,12 +642,18 @@ lean_obj_res lean_hesper_get_device(b_lean_obj_arg instance_obj, lean_obj_res /*
 
     std::cout << "[Hesper] Device created successfully" << std::endl;
 
-    // Properly allocate device on heap and wrap in External object
-    // This follows the correct pattern from class.md
+    // Allocate device on heap and wrap in External object
     wgpu::Device* devicePtr = new wgpu::Device(device);
-    lean_object* external = lean_alloc_external(g_webgpu_device_class, devicePtr);
+    lean_object* device_external = lean_alloc_external(g_webgpu_device_class, devicePtr);
 
-    return lean_io_result_mk_ok(external);
+    // Create Device structure: { ptr : DevicePtr, instance : Instance }
+    // This keeps the Instance alive as long as the Device is alive (prevents premature GC)
+    lean_object* device_struct = lean_alloc_ctor(0, 2, 0);  // constructor with 2 fields, 0 scalars
+    lean_inc(instance_obj);  // Increment refcount of instance so it stays alive
+    lean_ctor_set(device_struct, 0, device_external);  // field 0: ptr
+    lean_ctor_set(device_struct, 1, instance_obj);      // field 1: parentInstance
+
+    return lean_io_result_mk_ok(device_struct);
 }
 
 // Multi-GPU support functions
@@ -693,18 +749,22 @@ lean_obj_res lean_hesper_release_device(b_lean_obj_arg /* device */, lean_obj_re
 }
 
 lean_obj_res lean_hesper_device_tick(b_lean_obj_arg device_obj, lean_obj_res /* unit */) {
-    wgpu::Device* device = static_cast<wgpu::Device*>(lean_get_external_data(device_obj));
+    wgpu::Device* device = EXTRACT_DEVICE_PTR(device_obj);
     device->Tick();
     return lean_io_result_mk_ok(lean_box(0));
 }
 
 lean_obj_res lean_hesper_device_wait(b_lean_obj_arg device_obj, lean_obj_res /* unit */) {
-    wgpu::Device* device = static_cast<wgpu::Device*>(lean_get_external_data(device_obj));
-    // Simple wait - just tick until idle
-    // Real impl would use proper synchronization
-    for (int i = 0; i < 100; i++) {
-        device->Tick();
-    }
+    wgpu::Device* device = EXTRACT_DEVICE_PTR(device_obj);
+
+    fprintf(stderr, "[C++] deviceWait: no-op (waiting happens in mapBufferRead via WaitAny)\n");
+    fflush(stderr);
+
+    // deviceWait is now a no-op. The actual waiting for GPU operations
+    // happens in mapBufferRead using OnSubmittedWorkDone + WaitAny pattern.
+    // Calling Tick() or ProcessEvents here causes crashes because there may be
+    // stale callbacks from other operations that have gone out of scope.
+
     return lean_io_result_mk_ok(lean_box(0));
 }
 
@@ -712,65 +772,306 @@ lean_obj_res lean_hesper_device_wait(b_lean_obj_arg device_obj, lean_obj_res /* 
 
 lean_obj_res lean_hesper_create_buffer(b_lean_obj_arg device_obj, b_lean_obj_arg desc, lean_obj_res /* unit */) {
     // Extract device from External object
-    wgpu::Device* device = static_cast<wgpu::Device*>(lean_get_external_data(device_obj));
+    wgpu::Device* device = EXTRACT_DEVICE_PTR(device_obj);
 
-    // Extract buffer descriptor fields from Lean object
-    // desc is a Lean structure with fields: size (USize), usage (List BufferUsage), mappedAtCreation (Bool)
-    // Field indices: 0 = size, 1 = usage, 2 = mappedAtCreation
+    // C struct matching Lean's BufferDescriptor memory layout
+    // structure BufferDescriptor where
+    //   size : USize               -- scalar
+    //   usage : List BufferUsage   -- boxed
+    //   mappedAtCreation : Bool    -- scalar
+    // Lean reorders: boxed first, then scalars by size
+    typedef struct {
+        lean_object* usage;         // Boxed field (pointer)
+        size_t size;                // Scalar (USize, 8 bytes)
+        uint8_t mappedAtCreation;   // Scalar (Bool, 1 byte)
+    } BufferDescriptor_Raw;
 
-    // Extract scalar fields using lean_ctor_get_* functions
-    size_t size = lean_ctor_get_usize(desc, 0);  // Field 0: USize
-    uint8_t mappedAtCreation = lean_ctor_get_uint8(desc, 2);  // Field 2: Bool
+    BufferDescriptor_Raw* raw_desc = (BufferDescriptor_Raw*)lean_ctor_obj_cptr(desc);
 
-    std::cout << "[C++] createBuffer called:" << std::endl;
-    std::cout << "  size = " << size << " bytes" << std::endl;
-    std::cout << "  mappedAtCreation (raw uint8) = " << (int)mappedAtCreation << std::endl;
-    std::cout << "  mappedAtCreation (bool) = " << (mappedAtCreation != 0 ? "true" : "false") << std::endl;
+    std::cout << "[C++] createBuffer: size=" << raw_desc->size
+              << ", mapped=" << (raw_desc->mappedAtCreation ? "true" : "false") << std::endl;
 
     wgpu::BufferDescriptor bufferDesc{};
-    bufferDesc.size = size;
-    // TODO: Parse usage list from field 1 - for now use default
+    bufferDesc.size = raw_desc->size;
+    // TODO: Parse usage list from raw_desc->usage - for now use default
     bufferDesc.usage = wgpu::BufferUsage::Storage | wgpu::BufferUsage::CopyDst | wgpu::BufferUsage::CopySrc;
     // HARDCODE mappedAtCreation to false to test
     bufferDesc.mappedAtCreation = false;  // ALWAYS FALSE for now
+
+    fprintf(stderr, "[C++] Creating buffer with usage=0x%x\n", (unsigned)bufferDesc.usage);
+    fflush(stderr);
 
     std::cout << "  bufferDesc.mappedAtCreation = " << bufferDesc.mappedAtCreation << " (HARDCODED TO FALSE)" << std::endl;
 
     wgpu::Buffer buffer = device->CreateBuffer(&bufferDesc);
 
-    // CRITICAL: Process pending WebGPU operations
-    // Dawn's CreateBuffer may queue async work that needs processing
-    std::cout << "  Ticking device to process buffer creation..." << std::endl;
-    for (int i = 0; i < 10; i++) {
-        device->Tick();
-    }
-    std::cout << "  Buffer creation processed" << std::endl;
+    std::cout << "  Buffer created, wrapping in Lean External..." << std::endl;
 
     // Wrap in External with registered class
     wgpu::Buffer* bufferPtr = new wgpu::Buffer(buffer);
+
+    fprintf(stderr, "  [BUFFER CREATE] wrapper=%p, WGPUBuffer=%p\n", (void*)bufferPtr, (void*)buffer.Get());
+    fflush(stderr);
+
     lean_object* external = lean_alloc_external(g_webgpu_buffer_class, bufferPtr);
 
-    return lean_io_result_mk_ok(external);
+    std::cout << "  Created Lean external object at " << (void*)external << std::endl;
+
+    // Wrap in structure with device reference to keep device (and instance) alive
+    lean_object* buffer_struct = make_resource_with_device(external, device_obj);
+
+    lean_object* result = lean_io_result_mk_ok(buffer_struct);
+
+    std::cout << "  Returning IO result" << std::endl;
+    std::cout.flush();
+
+    return result;
 }
 
 lean_obj_res lean_hesper_write_buffer(b_lean_obj_arg device_obj, b_lean_obj_arg buffer_obj, size_t offset,
                                        b_lean_obj_arg data, lean_obj_res /* unit */) {
     // Extract device and buffer from External objects
-    wgpu::Device* device = static_cast<wgpu::Device*>(lean_get_external_data(device_obj));
-    wgpu::Buffer* buffer = static_cast<wgpu::Buffer*>(lean_get_external_data(buffer_obj));
+    wgpu::Device* device = EXTRACT_DEVICE_PTR(device_obj);
+    wgpu::Buffer* buffer = EXTRACT_BUFFER_PTR(buffer_obj);
 
-    // data is a ByteArray - extract bytes
-    // For now, write dummy data
-    std::vector<float> dummy_data(256, 1.0f);
-    device->GetQueue().WriteBuffer(*buffer, offset, dummy_data.data(), dummy_data.size() * sizeof(float));
+    // Extract ByteArray from Lean
+    // ByteArray is a Lean external object wrapping a byte buffer
+    size_t data_size = lean_sarray_size(data);
+    const uint8_t* data_ptr = lean_sarray_cptr(data);
+
+    fprintf(stderr, "[C++] writeBuffer START: offset=%zu, size=%zu\n", offset, data_size);
+    fprintf(stderr, "[C++]   [BUFFER WRITE] wrapper=%p, WGPUBuffer=%p\n", (void*)buffer, (void*)buffer->Get());
+    fflush(stderr);
+
+    // Print first 16 bytes of data being written (as hex and float)
+    if (data_size >= 16) {
+        fprintf(stderr, "[C++]   Data being written (hex): ");
+        for (size_t i = 0; i < 16; i++) {
+            fprintf(stderr, "%02x ", data_ptr[i]);
+        }
+        fprintf(stderr, "\n");
+
+        // Interpret as floats
+        const float* float_ptr = reinterpret_cast<const float*>(data_ptr);
+        fprintf(stderr, "[C++]   Data as floats: %.2f, %.2f, %.2f, %.2f\n",
+                float_ptr[0], float_ptr[1], float_ptr[2], float_ptr[3]);
+        fflush(stderr);
+    }
+
+    fprintf(stderr, "[C++]   Calling WriteBuffer...\n");
+    fflush(stderr);
+
+    // Write data to GPU buffer
+    try {
+        device->GetQueue().WriteBuffer(*buffer, offset, data_ptr, data_size);
+        fprintf(stderr, "[C++]   WriteBuffer returned\n");
+        fflush(stderr);
+    } catch (const std::exception& e) {
+        fprintf(stderr, "[C++] ERROR in WriteBuffer: %s\n", e.what());
+        fflush(stderr);
+        return make_webgpu_io_error(WebGPUError::Buffer(BufferError::AllocationFailed(0, e.what())));
+    }
+
+    // Process pending GPU operations
+    std::cout << "[C++] writeBuffer: ticking device..." << std::endl;
+    for (int i = 0; i < 10; i++) {
+        device->Tick();
+    }
+    std::cout << "[C++] writeBuffer: complete" << std::endl;
 
     return lean_io_result_mk_ok(lean_box(0));
 }
 
-lean_obj_res lean_hesper_map_buffer_read(b_lean_obj_arg /* device */, b_lean_obj_arg buffer,
+lean_obj_res lean_hesper_map_buffer_read(b_lean_obj_arg device_obj, b_lean_obj_arg buffer_obj,
                                           size_t offset, size_t size, lean_obj_res /* unit */) {
-    // Simplified: return empty byte array
-    lean_obj_res byte_array = lean_mk_empty_byte_array(lean_box(0));
+    wgpu::Device* device = EXTRACT_DEVICE_PTR(device_obj);
+    wgpu::Buffer* buffer = EXTRACT_BUFFER_PTR(buffer_obj);
+
+    fprintf(stderr, "[C++] mapBufferRead: offset=%zu, size=%zu\n", offset, size);
+    fprintf(stderr, "[C++]   [BUFFER READ] wrapper=%p, WGPUBuffer=%p\n", (void*)buffer, (void*)buffer->Get());
+    fflush(stderr);
+
+    // CRITICAL: Wait for all previous GPU work (compute, writes) to complete BEFORE copying
+    fprintf(stderr, "[C++] Waiting for previous GPU work to complete...\n");
+    fflush(stderr);
+
+    // Use C API for OnSubmittedWorkDone with new struct-based API
+    struct WorkDoneData {
+        bool done;
+    };
+
+    static WorkDoneData workData = {false};  // Static to ensure lifetime during callback
+
+    if (!g_dawn_instance) {
+        fprintf(stderr, "[C++] ERROR: g_dawn_instance is null!\n");
+        fflush(stderr);
+        return lean_io_result_mk_ok(lean_mk_empty_byte_array(lean_box(0)));
+    }
+
+    wgpu::Instance instance(g_dawn_instance->Get());
+
+    WGPUQueueWorkDoneCallbackInfo callbackInfo = {};
+    callbackInfo.nextInChain = nullptr;
+    callbackInfo.mode = WGPUCallbackMode_AllowProcessEvents;
+    callbackInfo.callback = [](WGPUQueueWorkDoneStatus status, WGPUStringView message,
+                                void* userdata1, void* userdata2) {
+        WorkDoneData* data = static_cast<WorkDoneData*>(userdata1);
+        data->done = true;
+        fprintf(stderr, "[C++] OnSubmittedWorkDone: status=%d\n", static_cast<int>(status));
+        if (message.length > 0) {
+            fprintf(stderr, "[C++] Message: %.*s\n",
+                    static_cast<int>(message.length), message.data);
+        }
+        fflush(stderr);
+    };
+    callbackInfo.userdata1 = &workData;
+    callbackInfo.userdata2 = nullptr;
+
+    wgpuQueueOnSubmittedWorkDone(device->GetQueue().Get(), callbackInfo);
+
+    // Process events until work is done
+    for (int i = 0; i < 5000 && !workData.done; i++) {
+        instance.ProcessEvents();
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+
+    if (!workData.done) {
+        fprintf(stderr, "[C++] WARNING: GPU work did not complete in time!\n");
+        fflush(stderr);
+    } else {
+        fprintf(stderr, "[C++] GPU work completed, now copying to staging buffer\n");
+        fflush(stderr);
+    }
+
+    // Following gpu.hpp toCPUAsync pattern:
+    // 1. Create readback buffer (staging buffer for CPU read)
+    wgpu::BufferDescriptor stagingDesc{};
+    stagingDesc.size = size;
+    stagingDesc.usage = wgpu::BufferUsage::CopyDst | wgpu::BufferUsage::MapRead;
+    stagingDesc.mappedAtCreation = false;  // Don't map at creation
+
+    wgpu::Buffer stagingBuffer = device->CreateBuffer(&stagingDesc);
+
+    fprintf(stderr, "[C++] Created staging buffer (readback buffer)\n");
+    fflush(stderr);
+
+    // 2. Create command encoder and copy from GPU buffer to staging buffer
+    wgpu::CommandEncoder encoder = device->CreateCommandEncoder();
+    encoder.CopyBufferToBuffer(*buffer, offset, stagingBuffer, 0, size);
+    wgpu::CommandBuffer commands = encoder.Finish();
+
+    // 3. Submit the command and release command buffer immediately (like gpu.hpp)
+    device->GetQueue().Submit(1, &commands);
+
+    fprintf(stderr, "[C++] Submitted copy command to GPU queue\n");
+    fflush(stderr);
+
+    // 4. Process GPU queue using ProcessEvents (like gpu.hpp pattern)
+    fprintf(stderr, "[C++] Processing GPU queue with ProcessEvents...\n");
+    fflush(stderr);
+
+    // ProcessEvents in a loop like gpu.hpp (wait up to 5 seconds)
+    for (int i = 0; i < 5000; i++) {
+        instance.ProcessEvents();
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+
+    fprintf(stderr, "[C++] GPU queue processed, now mapping buffer...\n");
+    fflush(stderr);
+
+    // 5. Map the buffer using MapAsync + Tick()
+    bool mapped = false;
+    wgpu::MapAsyncStatus mapStatus = wgpu::MapAsyncStatus::Success;  // Initialize to success, will be updated by callback
+
+    stagingBuffer.MapAsync(
+        wgpu::MapMode::Read,
+        0,
+        size,
+        wgpu::CallbackMode::AllowProcessEvents,
+        [&mapped, &mapStatus](wgpu::MapAsyncStatus status, wgpu::StringView message) {
+            mapStatus = status;
+            if (status == wgpu::MapAsyncStatus::Success) {
+                mapped = true;
+                fprintf(stderr, "[C++] MapAsync SUCCESS\n");
+            } else {
+                fprintf(stderr, "[C++] MapAsync FAILED: status=%d\n", static_cast<int>(status));
+                if (message.length > 0) {
+                    fprintf(stderr, "[C++] Message: %.*s\n",
+                            static_cast<int>(message.length), message.data);
+                }
+            }
+            fflush(stderr);
+        }
+    );
+
+    fprintf(stderr, "[C++] Waiting for MapAsync with ProcessEvents()...\n");
+    fflush(stderr);
+
+    // ProcessEvents until mapping completes (up to 5 seconds)
+    for (int i = 0; i < 5000 && !mapped; i++) {
+        instance.ProcessEvents();
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+
+    if (!mapped) {
+        fprintf(stderr, "[C++] ERROR: MapAsync timed out, status=%d\n", static_cast<int>(mapStatus));
+        fflush(stderr);
+        return lean_io_result_mk_ok(lean_mk_empty_byte_array(lean_box(0)));
+    }
+
+    fprintf(stderr, "[C++] Buffer mapped successfully\n");
+    fflush(stderr);
+
+    // 6. Get the mapped range (like gpu.hpp's wgpuBufferGetConstMappedRange)
+    const uint8_t* mappedData = static_cast<const uint8_t*>(stagingBuffer.GetConstMappedRange(0, size));
+
+    if (!mappedData) {
+        fprintf(stderr, "[C++] ERROR: GetConstMappedRange returned nullptr\n");
+        fflush(stderr);
+        stagingBuffer.Unmap();
+        return lean_io_result_mk_ok(lean_mk_empty_byte_array(lean_box(0)));
+    }
+
+    fprintf(stderr, "[C++] Got mapped range, creating ByteArray...\n");
+    fflush(stderr);
+
+    // Print first 16 bytes of mapped data (as hex and float)
+    if (size >= 16) {
+        fprintf(stderr, "[C++]   Mapped data (hex): ");
+        for (size_t i = 0; i < 16; i++) {
+            fprintf(stderr, "%02x ", mappedData[i]);
+        }
+        fprintf(stderr, "\n");
+
+        // Interpret as floats
+        const float* float_ptr = reinterpret_cast<const float*>(mappedData);
+        fprintf(stderr, "[C++]   Mapped data as floats: %.2f, %.2f, %.2f, %.2f\n",
+                float_ptr[0], float_ptr[1], float_ptr[2], float_ptr[3]);
+        fflush(stderr);
+    }
+
+    // 7. Copy data to Lean ByteArray using push API
+    lean_object* byte_array = lean_mk_empty_byte_array(lean_box(0));
+
+    fprintf(stderr, "[C++] Created empty ByteArray, now pushing %zu bytes...\n", size);
+    fflush(stderr);
+
+    // Push bytes one by one using Lean API
+    for (size_t i = 0; i < size; i++) {
+        byte_array = lean_byte_array_push(byte_array, mappedData[i]);
+    }
+
+    size_t final_size = lean_sarray_size(byte_array);
+    fprintf(stderr, "[C++] Data copied to ByteArray (final_size=%zu, expected=%zu)\n", final_size, size);
+    fflush(stderr);
+
+    // 8. Unmap the buffer BEFORE returning (very important - mapped range becomes invalid after unmap)
+    stagingBuffer.Unmap();
+
+    fprintf(stderr, "[C++] Buffer unmapped, returning ByteArray\n");
+    fflush(stderr);
+
+    // 9. Return the ByteArray (lean_io_result_mk_ok takes ownership, no need to incref)
     return lean_io_result_mk_ok(byte_array);
 }
 
@@ -782,124 +1083,291 @@ lean_obj_res lean_hesper_unmap_buffer(b_lean_obj_arg buffer, lean_obj_res /* uni
 
 lean_obj_res lean_hesper_create_shader_module(b_lean_obj_arg device_obj, b_lean_obj_arg source, lean_obj_res /* unit */) {
     // Extract device from External object
-    wgpu::Device* device = static_cast<wgpu::Device*>(lean_get_external_data(device_obj));
+    wgpu::Device* device = EXTRACT_DEVICE_PTR(device_obj);
 
     // Extract shader source from Lean string
     const char* shader_code = lean_string_cstr(source);
+
+    fprintf(stderr, "[C++] createShaderModule: compiling WGSL...\n");
+    fprintf(stderr, "[C++] ======================================\n");
+    fprintf(stderr, "[C++] Shader source (length=%zu):\n", strlen(shader_code));
+    fprintf(stderr, "--- BEGIN SHADER ---\n%s\n--- END SHADER ---\n", shader_code);
+    fprintf(stderr, "[C++] ======================================\n");
+    fflush(stderr);
 
     wgpu::ShaderModuleWGSLDescriptor wgslDesc{};
     wgslDesc.code = shader_code;
 
     wgpu::ShaderModuleDescriptor shaderDesc{};
     shaderDesc.nextInChain = &wgslDesc;
+
+    // Create shader module - Dawn will automatically output compilation errors to stderr
     wgpu::ShaderModule shaderModule = device->CreateShaderModule(&shaderDesc);
+
+    // Check if shader module creation succeeded
+    if (!shaderModule) {
+        fprintf(stderr, "\n");
+        fprintf(stderr, "╔════════════════════════════════════════════════════════════╗\n");
+        fprintf(stderr, "║ CRITICAL ERROR: Shader Module Creation Failed            ║\n");
+        fprintf(stderr, "╚════════════════════════════════════════════════════════════╝\n");
+        fprintf(stderr, "[C++] CreateShaderModule returned null handle\n");
+        fprintf(stderr, "════════════════════════════════════════════════════════════\n\n");
+        fflush(stderr);
+        lean_object* error_msg = lean_mk_string("Shader module creation failed - check stderr for compilation errors");
+        return lean_io_result_mk_error(error_msg);
+    }
+
+    fprintf(stderr, "[C++] Shader module created successfully\n");
+    fflush(stderr);
 
     // Wrap in External with registered class
     wgpu::ShaderModule* modulePtr = new wgpu::ShaderModule(shaderModule);
     lean_object* external = lean_alloc_external(g_webgpu_shader_module_class, modulePtr);
 
-    return lean_io_result_mk_ok(external);
+    // Wrap in structure with device reference to keep device alive
+    lean_object* shader_struct = make_resource_with_device(external, device_obj);
+
+    return lean_io_result_mk_ok(shader_struct);
 }
 
 // Pipeline Operations
 
-lean_obj_res lean_hesper_create_bind_group_layout(b_lean_obj_arg device_obj, b_lean_obj_arg entries, lean_obj_res /* unit */) {
+lean_obj_res lean_hesper_create_bind_group_layout(b_lean_obj_arg device_obj, b_lean_obj_arg entries_array, lean_obj_res /* unit */) {
     // Extract device from External object
-    wgpu::Device* device = static_cast<wgpu::Device*>(lean_get_external_data(device_obj));
+    wgpu::Device* device = EXTRACT_DEVICE_PTR(device_obj);
 
-    // Simplified: create a basic 1-buffer layout
-    std::vector<wgpu::BindGroupLayoutEntry> layoutEntries(1);
-    layoutEntries[0].binding = 0;
-    layoutEntries[0].visibility = wgpu::ShaderStage::Compute;
-    layoutEntries[0].buffer.type = wgpu::BufferBindingType::Storage;
+    // Extract array of BindGroupLayoutEntry
+    size_t num_entries = lean_array_size(entries_array);
+
+    fprintf(stderr, "[C++] createBindGroupLayout: %zu entries\n", num_entries);
+    fflush(stderr);
+
+    std::vector<wgpu::BindGroupLayoutEntry> layoutEntries(num_entries);
+
+    // CRITICAL: Must properly extract binding info from Lean structures
+    //
+    // BUG FIX: Previously this was hardcoded and ignored Lean data entirely,
+    // causing GPU to receive incorrect binding configurations and return zeros.
+    //
+    // Lean struct layout: { bindingType : BindingType, binding : UInt32, visibility : ShaderStage }
+    // Memory layout: Boxed fields (pointers) first, then scalar fields in declaration order
+    //   Field 0 (offset 0): bindingType : BindingType (ADT, boxed)
+    //   Field 1 (offset sizeof(void*)): binding : UInt32 (scalar, 4 bytes)
+    //   Field 2 (offset sizeof(void*)+4): visibility : ShaderStage (enum/uint8, 1 byte)
+    //
+    // The bindingType ADT has these constructors:
+    //   tag 0: buffer (readOnly : Bool)  - Storage buffer
+    //   tag 1: uniformBuffer             - Uniform buffer
+    //   tag 2: sampler                   - Texture sampler
+    //   tag 3: texture                   - Texture
+    for (size_t i = 0; i < num_entries; i++) {
+        lean_object* entry = lean_array_get_core(entries_array, i);
+
+        // Field 0: bindingType (BindingType ADT)
+        lean_object* binding_type = lean_ctor_get(entry, 0);
+
+        // Field 1: binding (UInt32) - in scalar data area
+        uint32_t binding = lean_ctor_get_uint32(entry, sizeof(void*));
+
+        // Field 2: visibility (ShaderStage enum/uint8) - after binding
+        uint8_t visibility = lean_ctor_get_uint8(entry, sizeof(void*) + sizeof(uint32_t));
+
+        // Decode BindingType ADT
+        // tag 0 = buffer (readOnly : Bool), tag 1 = uniformBuffer, tag 2 = sampler, tag 3 = texture
+        uint8_t binding_type_tag = lean_obj_tag(binding_type);
+
+        layoutEntries[i].binding = binding;
+        layoutEntries[i].visibility = (visibility == 0) ? wgpu::ShaderStage::Vertex :
+                                       (visibility == 1) ? wgpu::ShaderStage::Fragment :
+                                                           wgpu::ShaderStage::Compute;
+
+        if (binding_type_tag == 0) {  // buffer
+            // Extract readOnly : Bool from the ADT constructor
+            bool read_only = lean_ctor_get_uint8(binding_type, 0) != 0;
+            layoutEntries[i].buffer.type = read_only ? wgpu::BufferBindingType::ReadOnlyStorage
+                                                      : wgpu::BufferBindingType::Storage;
+
+            fprintf(stderr, "[C++]   Entry %zu: binding=%u, visibility=Compute, type=Storage (%s)\n",
+                    i, binding, read_only ? "read-only" : "read-write");
+        } else if (binding_type_tag == 1) {  // uniformBuffer
+            layoutEntries[i].buffer.type = wgpu::BufferBindingType::Uniform;
+            fprintf(stderr, "[C++]   Entry %zu: binding=%u, visibility=Compute, type=Uniform\n", i, binding);
+        }
+        // TODO: Handle sampler and texture types if needed
+
+        fflush(stderr);
+    }
 
     wgpu::BindGroupLayoutDescriptor bglDesc{};
     bglDesc.entryCount = layoutEntries.size();
     bglDesc.entries = layoutEntries.data();
+
+    fprintf(stderr, "[C++] Creating BindGroupLayout...\n");
+    fflush(stderr);
+
     wgpu::BindGroupLayout bindGroupLayout = device->CreateBindGroupLayout(&bglDesc);
+
+    fprintf(stderr, "[C++] BindGroupLayout created\n");
+    fflush(stderr);
 
     // Wrap in External with registered class
     wgpu::BindGroupLayout* layoutPtr = new wgpu::BindGroupLayout(bindGroupLayout);
     lean_object* external = lean_alloc_external(g_webgpu_bind_group_layout_class, layoutPtr);
 
-    return lean_io_result_mk_ok(external);
+    lean_object* layout_struct = make_resource_with_device(external, device_obj);
+    return lean_io_result_mk_ok(layout_struct);
 }
 
-lean_obj_res lean_hesper_create_bind_group(b_lean_obj_arg device_obj, b_lean_obj_arg layout_obj,
-                                            b_lean_obj_arg entries, lean_obj_res /* unit */) {
-    // Extract device and layout from External objects
-    wgpu::Device* device = static_cast<wgpu::Device*>(lean_get_external_data(device_obj));
-    wgpu::BindGroupLayout* layout = static_cast<wgpu::BindGroupLayout*>(lean_get_external_data(layout_obj));
+// C struct matching Lean's BindGroupEntry memory layout
+// Lean reorders fields: boxed (pointers) first, then scalars by size (large to small)
+typedef struct {
+    lean_object* buffer;  // Boxed field (pointer)
+    size_t offset;        // Scalar field (USize, 8 bytes)
+    size_t size;          // Scalar field (USize, 8 bytes)
+    uint32_t binding;     // Scalar field (UInt32, 4 bytes)
+} BindGroupEntry_Raw;
 
-    // Simplified: create bind group with layout
-    // entries parameter would contain buffer bindings in a real implementation
-    std::vector<wgpu::BindGroupEntry> bgEntries(1);
-    bgEntries[0].binding = 0;
-    // Note: In a real implementation, we'd extract buffer from entries parameter
-    bgEntries[0].buffer = wgpu::Buffer();  // Placeholder
-    bgEntries[0].size = 1024 * sizeof(float);
+lean_obj_res lean_hesper_create_bind_group(b_lean_obj_arg device_obj, b_lean_obj_arg layout_obj,
+                                            b_lean_obj_arg entries_array, lean_obj_res /* unit */) {
+    // Extract device and layout from External objects
+    wgpu::Device* device = EXTRACT_DEVICE_PTR(device_obj);
+    wgpu::BindGroupLayout* layout = EXTRACT_BIND_GROUP_LAYOUT_PTR(layout_obj);
+
+    // Extract array of BindGroupEntry
+    size_t num_entries = lean_array_size(entries_array);
+
+    fprintf(stderr, "[C++] createBindGroup: %zu entries\n", num_entries);
+    fflush(stderr);
+
+    std::vector<wgpu::BindGroupEntry> bgEntries(num_entries);
+
+    for (size_t i = 0; i < num_entries; i++) {
+        lean_object* entry = lean_array_get_core(entries_array, i);
+
+        // Cast to our raw struct that matches Lean's memory layout
+        BindGroupEntry_Raw* raw = (BindGroupEntry_Raw*)lean_ctor_obj_cptr(entry);
+
+        // Extract buffer from Buffer structure (not direct External anymore)
+        wgpu::Buffer* buffer = EXTRACT_BUFFER_PTR(raw->buffer);
+
+        // Access fields directly through the struct
+        bgEntries[i].binding = raw->binding;
+        bgEntries[i].buffer = *buffer;
+        bgEntries[i].offset = raw->offset;
+        bgEntries[i].size = raw->size;
+
+        fprintf(stderr, "[C++]   Entry %zu: binding=%u, offset=%zu, size=%zu\n",
+                i, raw->binding, raw->offset, raw->size);
+        fflush(stderr);
+    }
 
     wgpu::BindGroupDescriptor bgDesc{};
     bgDesc.layout = *layout;
     bgDesc.entryCount = bgEntries.size();
     bgDesc.entries = bgEntries.data();
+
+    fprintf(stderr, "[C++] Creating BindGroup...\n");
+    fflush(stderr);
+
     wgpu::BindGroup bindGroup = device->CreateBindGroup(&bgDesc);
+
+    fprintf(stderr, "[C++] BindGroup created\n");
+    fflush(stderr);
 
     // Wrap in External with registered class
     wgpu::BindGroup* groupPtr = new wgpu::BindGroup(bindGroup);
     lean_object* external = lean_alloc_external(g_webgpu_bind_group_class, groupPtr);
 
-    return lean_io_result_mk_ok(external);
+    lean_object* bindgroup_struct = make_resource_with_device(external, device_obj);
+    return lean_io_result_mk_ok(bindgroup_struct);
 }
 
 lean_obj_res lean_hesper_create_compute_pipeline(b_lean_obj_arg device_obj, b_lean_obj_arg desc, lean_obj_res /* unit */) {
     // Extract device from External object
-    wgpu::Device* device = static_cast<wgpu::Device*>(lean_get_external_data(device_obj));
+    wgpu::Device* device = EXTRACT_DEVICE_PTR(device_obj);
 
-    // desc should contain shader module and bind group layout
-    // For simplified implementation, using placeholder
+    // Extract fields from ComputePipelineDescriptor
+    // struct ComputePipelineDescriptor where
+    //   shaderModule : ShaderModule       -- Field 0 (External)
+    //   entryPoint : String               -- Field 1 (boxed String)
+    //   bindGroupLayout : BindGroupLayout -- Field 2 (External)
 
-    wgpu::ComputePipelineDescriptor pipelineDesc{};
-    // Note: In a real implementation, extract shader from desc parameter
-    pipelineDesc.compute.module = wgpu::ShaderModule();  // Placeholder
-    pipelineDesc.compute.entryPoint = "main";
+    lean_object* shaderModule_obj = lean_ctor_get(desc, 0);
+    lean_object* entryPoint_obj = lean_ctor_get(desc, 1);
+    lean_object* bindGroupLayout_obj = lean_ctor_get(desc, 2);
 
+    wgpu::ShaderModule* shaderModule = EXTRACT_SHADER_MODULE_PTR(shaderModule_obj);
+    const char* entryPoint = lean_string_cstr(entryPoint_obj);
+    wgpu::BindGroupLayout* bindGroupLayout = EXTRACT_BIND_GROUP_LAYOUT_PTR(bindGroupLayout_obj);
+
+    fprintf(stderr, "[C++] createComputePipeline: entryPoint='%s'\n", entryPoint);
+    fflush(stderr);
+
+    // Create pipeline layout
     wgpu::PipelineLayoutDescriptor layoutDesc{};
-    layoutDesc.bindGroupLayoutCount = 0;
-    layoutDesc.bindGroupLayouts = nullptr;
-    pipelineDesc.layout = device->CreatePipelineLayout(&layoutDesc);
+    layoutDesc.bindGroupLayoutCount = 1;
+    layoutDesc.bindGroupLayouts = bindGroupLayout;
+    wgpu::PipelineLayout pipelineLayout = device->CreatePipelineLayout(&layoutDesc);
+
+    // Create compute pipeline
+    wgpu::ComputePipelineDescriptor pipelineDesc{};
+    pipelineDesc.compute.module = *shaderModule;
+    pipelineDesc.compute.entryPoint = entryPoint;
+    pipelineDesc.layout = pipelineLayout;
+
+    fprintf(stderr, "[C++] Calling CreateComputePipeline...\n");
+    fflush(stderr);
 
     wgpu::ComputePipeline pipeline = device->CreateComputePipeline(&pipelineDesc);
+
+    fprintf(stderr, "[C++] ComputePipeline created successfully\n");
+    fflush(stderr);
 
     // Wrap in External with registered class
     wgpu::ComputePipeline* pipelinePtr = new wgpu::ComputePipeline(pipeline);
     lean_object* external = lean_alloc_external(g_webgpu_compute_pipeline_class, pipelinePtr);
 
-    return lean_io_result_mk_ok(external);
+    lean_object* pipeline_struct = make_resource_with_device(external, device_obj);
+    return lean_io_result_mk_ok(pipeline_struct);
 }
 
 lean_obj_res lean_hesper_dispatch_compute(b_lean_obj_arg device_obj, b_lean_obj_arg pipeline_obj, b_lean_obj_arg bind_group_obj,
                                            uint32_t workgroupsX, uint32_t workgroupsY, uint32_t workgroupsZ, lean_obj_res /* unit */) {
     // Extract device, pipeline and bind group from External objects
-    wgpu::Device* device = static_cast<wgpu::Device*>(lean_get_external_data(device_obj));
-    wgpu::ComputePipeline* pipeline = static_cast<wgpu::ComputePipeline*>(lean_get_external_data(pipeline_obj));
-    wgpu::BindGroup* bindGroup = static_cast<wgpu::BindGroup*>(lean_get_external_data(bind_group_obj));
+    wgpu::Device* device = EXTRACT_DEVICE_PTR(device_obj);
+    wgpu::ComputePipeline* pipeline = EXTRACT_COMPUTE_PIPELINE_PTR(pipeline_obj);
+    wgpu::BindGroup* bindGroup = EXTRACT_BIND_GROUP_PTR(bind_group_obj);
 
-    wgpu::CommandEncoder encoder = device->CreateCommandEncoder();
-    wgpu::ComputePassEncoder pass = encoder.BeginComputePass();
-    pass.SetPipeline(*pipeline);
-    pass.SetBindGroup(0, *bindGroup);
-    pass.DispatchWorkgroups(workgroupsX, workgroupsY, workgroupsZ);
-    pass.End();
-    wgpu::CommandBuffer commands = encoder.Finish();
-    device->GetQueue().Submit(1, &commands);
+    fprintf(stderr, "[C++] dispatchCompute: workgroups=(%u,%u,%u)\n", workgroupsX, workgroupsY, workgroupsZ);
+    fflush(stderr);
+
+    // Use C API like gpu.hpp to avoid C++ wrapper destructor issues
+    WGPUCommandEncoder commandEncoder = wgpuDeviceCreateCommandEncoder(device->Get(), nullptr);
+    WGPUComputePassEncoder computePassEncoder = wgpuCommandEncoderBeginComputePass(commandEncoder, nullptr);
+    wgpuComputePassEncoderSetPipeline(computePassEncoder, pipeline->Get());
+    wgpuComputePassEncoderSetBindGroup(computePassEncoder, 0, bindGroup->Get(), 0, nullptr);
+    wgpuComputePassEncoderDispatchWorkgroups(computePassEncoder, workgroupsX, workgroupsY, workgroupsZ);
+    wgpuComputePassEncoderEnd(computePassEncoder);
+    wgpuComputePassEncoderRelease(computePassEncoder);  // Explicitly release like gpu.hpp
+    WGPUCommandBuffer commandBuffer = wgpuCommandEncoderFinish(commandEncoder, nullptr);
+    wgpuCommandEncoderRelease(commandEncoder);  // Explicitly release like gpu.hpp
+
+    wgpuQueueSubmit(device->GetQueue().Get(), 1, &commandBuffer);
+    wgpuCommandBufferRelease(commandBuffer);  // Release after submit like gpu.hpp
+
+    fprintf(stderr, "[C++] dispatchCompute: submitted (async, will complete when mapBufferRead is called)\n");
+    fflush(stderr);
+
+    // Following gpu.hpp pattern: dispatchCompute just submits work and returns immediately.
+    // The actual waiting for GPU completion happens in mapBufferRead via OnSubmittedWorkDone + WaitAny.
+    // This is the correct async pattern - don't wait here!
 
     return lean_io_result_mk_ok(lean_box(0));
 }
 
 // Matrix multiplication with subgroup operations
 lean_obj_res lean_hesper_matmul_subgroup(b_lean_obj_arg device_obj, b_lean_obj_arg shader_lean, uint32_t m, uint32_t k, uint32_t n, lean_obj_res /* unit */) {
-    wgpu::Device* device = static_cast<wgpu::Device*>(lean_get_external_data(device_obj));
+    wgpu::Device* device = EXTRACT_DEVICE_PTR(device_obj);
 
     std::cout << "[Hesper] Running Subgroup Matrix Multiplication" << std::endl;
     std::cout << "  Dimensions: " << m << "x" << k << " * " << n << "x" << k << std::endl;
@@ -1011,7 +1479,7 @@ lean_obj_res lean_hesper_matmul_subgroup(b_lean_obj_arg device_obj, b_lean_obj_a
 
 // 4K Matrix multiplication benchmark with FLOPS calculation
 lean_obj_res lean_hesper_matmul_subgroup_4k(b_lean_obj_arg device_obj, b_lean_obj_arg shader_lean, lean_obj_res /* unit */) {
-    wgpu::Device* device = static_cast<wgpu::Device*>(lean_get_external_data(device_obj));
+    wgpu::Device* device = EXTRACT_DEVICE_PTR(device_obj);
 
     constexpr uint32_t m = 4096;
     constexpr uint32_t k = 4096;
@@ -1172,6 +1640,45 @@ lean_obj_res lean_hesper_matmul_subgroup_4k(b_lean_obj_arg device_obj, b_lean_ob
     std::cout << "═══════════════════════════════════════════════════════════" << std::endl;
 
     return lean_io_result_mk_ok(lean_box(0));
+}
+
+// ============================================================================
+// Float Conversion Utilities
+// ============================================================================
+
+/**
+ * @brief Convert f32 bytes (little-endian) to f64
+ *
+ * BUG FIX: Lean's Float.ofBits expects f64 bits, but GPU returns f32 bits.
+ * We need to properly interpret the 32-bit pattern as f32, then convert to f64.
+ *
+ * @param bytes ByteArray containing f32 data
+ * @param offset Byte offset to read from
+ * @return f64 value
+ */
+lean_obj_res lean_hesper_bytes_to_float64(b_lean_obj_arg bytes, uint32_t offset) {
+    size_t size = lean_sarray_size(bytes);
+    const uint8_t* data = lean_sarray_cptr(bytes);
+
+    if (offset + 4 > size) {
+        fprintf(stderr, "[C++] bytes_to_float64: offset %u + 4 exceeds size %zu\n", offset, size);
+        return lean_io_result_mk_error(lean_mk_io_user_error(lean_mk_string("offset out of bounds")));
+    }
+
+    // Read 4 bytes as little-endian f32
+    uint32_t bits32 = data[offset] |
+                      (data[offset + 1] << 8) |
+                      (data[offset + 2] << 16) |
+                      (data[offset + 3] << 24);
+
+    // Interpret as f32
+    float f32_value;
+    memcpy(&f32_value, &bits32, sizeof(float));
+
+    // Convert f32 to f64
+    double f64_value = static_cast<double>(f32_value);
+
+    return lean_io_result_mk_ok(lean_box_float(f64_value));
 }
 
 }
