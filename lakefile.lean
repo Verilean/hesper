@@ -461,45 +461,45 @@ script buildSimd do
 -- ----------------------------------------------------------------------------
 
 lean_exe «simd-bench» where
-  root := `MainSimdBench
+  root := `Examples.SIMD.MainSimdBench
   supportInterpreter := true
   moreLinkArgs := #[s!".lake/build/simd/libhesper_simd.a"]
 
 lean_exe «simd-simple» where
-  root := `MainSimdSimple
+  root := `Examples.SIMD.MainSimdSimple
   supportInterpreter := true
   moreLinkArgs := #[s!".lake/build/simd/libhesper_simd.a"]
 
 lean_exe «simd-test» where
-  root := `MainSimdTest
+  root := `Examples.SIMD.MainSimdTest
   supportInterpreter := true
 
 lean_exe «simd-debug» where
-  root := `MainSimdDebug
+  root := `Examples.SIMD.MainSimdDebug
   supportInterpreter := true
   moreLinkArgs := #[s!".lake/build/simd/libhesper_simd.a"]
 
 lean_exe «simd-minimal» where
-  root := `MainSimdMinimal
+  root := `Examples.SIMD.MainSimdMinimal
   supportInterpreter := true
   moreLinkArgs := #[s!".lake/build/simd/libhesper_simd.a"]
 
 lean_exe «multi-precision» where
-  root := `MainMultiPrecision
+  root := `Examples.SIMD.MainMultiPrecision
   supportInterpreter := false
   moreLinkArgs := #[s!".lake/build/simd/libhesper_simd.a"]
 
 lean_exe «debug-conversion» where
-  root := `MainDebugConversion
+  root := `Examples.SIMD.MainDebugConversion
   supportInterpreter := true
   moreLinkArgs := #[s!".lake/build/simd/libhesper_simd.a"]
 
 lean_exe «debug-f16» where
-  root := `MainDebugF16
+  root := `Examples.SIMD.MainDebugF16
   supportInterpreter := false
   moreLinkArgs := #[s!".lake/build/simd/libhesper_simd.a"]
 
 lean_exe «simd-perf-bench» where
-  root := `MainSimdPerfBench
+  root := `Examples.SIMD.MainSimdPerfBench
   supportInterpreter := false
   moreLinkArgs := #[s!".lake/build/simd/libhesper_simd.a"]
