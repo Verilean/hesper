@@ -33,10 +33,6 @@ opaque getDevice (inst : @& Instance) : IO Device
 @[extern "lean_hesper_get_device_by_index"]
 opaque getDeviceByIndex (inst : @& Instance) (gpuIdx : @& UInt32) : IO Device
 
-/-- Release a device (cleanup resources) -/
-@[extern "lean_hesper_release_device"]
-opaque releaseDevice (device : @& Device) : IO Unit
-
 /-- Tick the device (process callbacks and events).
     Should be called regularly when doing async operations. -/
 @[extern "lean_hesper_device_tick"]

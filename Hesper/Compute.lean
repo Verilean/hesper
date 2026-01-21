@@ -190,7 +190,8 @@ def runSimpleKernel
 
   -- Resources are automatically cleaned up by Lean's GC via External finalizers
 
-  return Hesper.Basic.bytesToFloatArray resultBytes
+  -- Convert f32 bytes to f64 Float array
+  Hesper.Basic.bytesToFloatArray resultBytes
 
 /-- Generate WGSL shader code for a simple unary operation (map over array).
 

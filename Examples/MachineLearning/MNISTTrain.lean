@@ -1,38 +1,43 @@
 import Hesper
+import Hesper.AD.Reverse
+import Hesper.Optimizer.SGD
 import Examples.MachineLearning.MNISTData
 
 /-!
-# MNIST MLP Training Example (Simplified)
+# MNIST MLP Training with Automatic Differentiation
 
-This is a simplified demonstration of MNIST digit classification.
-For a full implementation with backpropagation and training, you would need:
-- Automatic differentiation (AD) - currently in development
-- Gradient computation
-- Parameter updates with optimizers (SGD/Adam)
+Full training example with:
+- 2-layer MLP neural network
+- Automatic differentiation for gradients
+- SGD optimizer
+- Training loop with real backpropagation
 
-This example demonstrates:
-- Data loading and preprocessing
-- Forward pass through a neural network
-- Loss calculation
-- GPU memory management
-
-Network Architecture:
-- Input: 784 (28x28 flattened images)
-- Hidden Layer: 128 neurons + ReLU
-- Output: 10 neurons (digits 0-9) + Softmax
+Network: 784 → 128 → 10 with ReLU and Softmax
 -/
 
 namespace Examples.MachineLearning.MNISTTrain
 
 open Hesper.WebGPU
+open Hesper.AD.Reverse
+open Hesper.Optimizer.SGD
 open Examples.MachineLearning.MNISTData
 
-/-- Simple MLP configuration -/
+/-- MLP configuration -/
 structure MLPConfig where
   inputSize : Nat := 784
   hiddenSize : Nat := 128
   outputSize : Nat := 10
   batchSize : Nat := 32
+  learningRate : Float := 0.01
+  numEpochs : Nat := 3
+  deriving Repr
+
+/-- MLP parameters -/
+structure MLPParams where
+  w1 : Array Float  -- [inputSize, hiddenSize]
+  b1 : Array Float  -- [hiddenSize]
+  w2 : Array Float  -- [hiddenSize, outputSize]
+  b2 : Array Float  -- [outputSize]
   deriving Repr
 
 /-- Initialize random weights (Xavier initialization) -/
@@ -46,145 +51,266 @@ def initWeights (inputSize outputSize seed : Nat) : Array Float :=
 def initBias (size : Nat) : Array Float :=
   Array.mk (List.replicate size 0.0)
 
-/-- Simple forward pass (CPU version for demonstration) -/
-def forwardPass (input weights bias : Array Float) (inputSize outputSize : Nat) : Array Float :=
-  -- Matrix multiplication: output = input * weights + bias
-  Array.range outputSize |>.map fun i =>
-    let sum := Array.range inputSize |>.foldl (init := 0.0) fun acc j =>
-      acc + input[j]! * weights[j * outputSize + i]!
-    sum + bias[i]!
+/-- Initialize MLP parameters -/
+def initParams (config : MLPConfig) : MLPParams :=
+  {
+    w1 := initWeights config.inputSize config.hiddenSize 42
+    b1 := initBias config.hiddenSize
+    w2 := initWeights config.hiddenSize config.outputSize 123
+    b2 := initBias config.outputSize
+  }
+
+/-- Flatten parameters into array for optimizer -/
+def paramsToArray (params : MLPParams) : Array Float :=
+  params.w1 ++ params.b1 ++ params.w2 ++ params.b2
+
+/-- Reconstruct parameters from flattened array -/
+def arrayToParams (arr : Array Float) (config : MLPConfig) : MLPParams :=
+  let w1Size := config.inputSize * config.hiddenSize
+  let b1Size := config.hiddenSize
+  let w2Size := config.hiddenSize * config.outputSize
+  let b2Size := config.outputSize
+
+  let w1 := arr.extract 0 w1Size
+  let b1 := arr.extract w1Size (w1Size + b1Size)
+  let w2 := arr.extract (w1Size + b1Size) (w1Size + b1Size + w2Size)
+  let b2 := arr.extract (w1Size + b1Size + w2Size) (w1Size + b1Size + w2Size + b2Size)
+
+  { w1, b1, w2, b2 }
+
+/-- Matrix-vector multiplication with AD -/
+def matVecMul (ctx : ADContext) (input : Array Dual) (weights : Array Dual) (bias : Array Dual)
+    (inputSize outputSize : Nat) : ADContext × Array Dual :=
+  Array.range outputSize |>.foldl (init := (ctx, #[])) fun (ctx, acc) i =>
+    -- Compute dot product for output i
+    let (ctx, sum) := Array.range inputSize |>.foldl (init := (ctx, bias[i]!)) fun (ctx, acc) j =>
+      let (ctx, prod) := ctx.mul input[j]! weights[j * outputSize + i]!
+      ctx.add acc prod
+    (ctx, acc.push sum)
 
 /-- ReLU activation -/
-def relu (x : Float) : Float := max x 0.0
+def applyReLU (ctx : ADContext) (xs : Array Dual) : ADContext × Array Dual :=
+  xs.foldl (init := (ctx, #[])) fun (ctx, acc) x =>
+    let (ctx, y) := ctx.relu x
+    (ctx, acc.push y)
 
-/-- Softmax activation -/
-def softmax (logits : Array Float) : Array Float :=
-  let maxVal := logits.foldl max (-1e9)
-  let exps := logits.map fun x => Float.exp (x - maxVal)
-  let sumExp := exps.foldl (· + ·) 0.0
-  exps.map fun x => x / sumExp
+/-- Softmax activation (numerically stable) with AD -/
+def applySoftmax (ctx : ADContext) (xs : Array Dual) : ADContext × Array Dual :=
+  -- Find max for numerical stability (this is just for numerical stability, not part of gradient)
+  let maxVal := xs.foldl (init := xs[0]!.primal) fun acc x => max acc x.primal
+  let maxDual := Dual.const maxVal
 
-/-- Cross-entropy loss -/
-def crossEntropyLoss (predictions labels : Array Float) : Float :=
-  let epsilon := 1e-7
-  (predictions.zip labels).foldl (init := 0.0) fun acc (pred, label) =>
-    acc - label * Float.log (max pred epsilon)
+  -- Compute exp(x - max) for each element using AD
+  let (ctx, exps) := xs.foldl (init := (ctx, #[])) fun (ctx, acc) x =>
+    let (ctx, diff) := ctx.sub x maxDual
+    let (ctx, expVal) := ctx.exp diff
+    (ctx, acc.push expVal)
 
-/-- Run inference on a single sample -/
-def inferenceSample (input : Array Float) (w1 b1 w2 b2 : Array Float) (config : MLPConfig) : Array Float :=
+  -- Sum of exponentials using AD
+  let (ctx, sumExp) := exps.foldl (init := (ctx, Dual.const 0.0)) fun (ctx, acc) expVal =>
+    ctx.add acc expVal
+
+  -- Normalize: divide each exp by sum using AD
+  let (ctx, normalized) := exps.foldl (init := (ctx, #[])) fun (ctx, acc) expVal =>
+    let (ctx, prob) := ctx.div expVal sumExp
+    (ctx, acc.push prob)
+
+  (ctx, normalized)
+
+/-- Forward pass through MLP with AD -/
+def forwardPassAD (ctx : ADContext) (input : Array Dual) (params : Array Dual) (config : MLPConfig)
+    : ADContext × Array Dual :=
+  let w1Size := config.inputSize * config.hiddenSize
+  let b1Size := config.hiddenSize
+  let w2Size := config.hiddenSize * config.outputSize
+
+  -- Extract parameters
+  let w1 := params.extract 0 w1Size
+  let b1 := params.extract w1Size (w1Size + b1Size)
+  let w2 := params.extract (w1Size + b1Size) (w1Size + b1Size + w2Size)
+  let b2 := params.extract (w1Size + b1Size + w2Size) (params.size)
+
   -- Layer 1: Input -> Hidden + ReLU
-  let h1 := forwardPass input w1 b1 config.inputSize config.hiddenSize
-  let h1_relu := h1.map relu
+  let (ctx, h1) := matVecMul ctx input w1 b1 config.inputSize config.hiddenSize
+  let (ctx, h1_relu) := applyReLU ctx h1
 
-  -- Layer 2: Hidden -> Output + Softmax
-  let logits := forwardPass h1_relu w2 b2 config.hiddenSize config.outputSize
-  softmax logits
+  -- Layer 2: Hidden -> Output (pre-softmax)
+  let (ctx, logits) := matVecMul ctx h1_relu w2 b2 config.hiddenSize config.outputSize
 
-/-- Evaluate accuracy on a batch -/
-def evaluateBatch (batch : Batch) (w1 b1 w2 b2 : Array Float) (config : MLPConfig) : IO Float := do
-  let mut correct := 0
+  (ctx, logits)
 
-  for i in [0:batch.batchSize] do
-    let inputStart := i * imageSize
+/-- Cross-entropy loss with AD -/
+def crossEntropyLossAD (ctx : ADContext) (predictions : Array Dual) (labels : Array Float)
+    : ADContext × Dual :=
+  let epsilon := 1e-7
+
+  -- Apply softmax to predictions with AD
+  let (ctx, probs) := applySoftmax ctx predictions
+
+  -- Compute -sum(y_true * log(y_pred)) using AD operations
+  (Array.range labels.size).foldl (init := (ctx, Dual.const 0.0)) fun (ctx, acc) i =>
+    let label := labels[i]!
+    if label > 0.0 then
+      let prob := probs[i]!
+      -- Add epsilon for numerical stability: log(max(prob, epsilon))
+      let (ctx, probClamped) := ctx.add prob (Dual.const epsilon)
+      let (ctx, logProb) := ctx.log probClamped
+      -- Multiply by -label
+      let labelDual := Dual.const (-label)
+      let (ctx, term) := ctx.mul labelDual logProb
+      ctx.add acc term
+    else
+      (ctx, acc)
+
+/-- Compute loss and gradients for a single sample -/
+def computeGradientsForSample (input : Array Float) (labels : Array Float) (params : Array Float)
+    (config : MLPConfig) : Float × Array Float :=
+  let ctx := ADContext.new
+
+  -- Create variables for parameters
+  let (ctx, paramDuals) := params.foldl (init := (ctx, #[])) fun (ctx, acc) p =>
+    let (ctx, pDual) := ctx.var p
+    (ctx, acc.push pDual)
+
+  -- Create constants for input
+  let inputDuals := input.map Dual.const
+
+  -- Forward pass
+  let (ctx, predictions) := forwardPassAD ctx inputDuals paramDuals config
+
+  -- Compute loss
+  let (ctx, loss) := crossEntropyLossAD ctx predictions labels
+
+  -- Backpropagate
+  let grads := backprop ctx.tape loss.tapeIdx
+
+  -- Extract gradients for parameters
+  let paramGrads := paramDuals.map fun p => grads[p.tapeIdx]!
+
+  (loss.primal, paramGrads)
+
+/-- Train for one epoch -/
+def trainEpoch (params : MLPParams) (config : MLPConfig) (epochNum : Nat)
+    : IO (MLPParams × Float) := do
+  IO.println s!"📊 Epoch {epochNum}/{config.numEpochs}"
+
+  -- Generate training batch
+  let batch := generateSyntheticBatch config.batchSize (epochNum * 1000)
+  let oneHotLabels := labelsToOneHot batch.labels
+
+  let mut totalLoss := 0.0
+  let mut allGrads := Array.mk (List.replicate (paramsToArray params).size 0.0)
+
+  -- Compute gradients for each sample in batch
+  for sampleIdx in [0:batch.batchSize] do
+    let inputStart := sampleIdx * imageSize
     let inputEnd := inputStart + imageSize
     let input := batch.images.extract inputStart inputEnd
 
-    -- Forward pass
-    let predictions := inferenceSample input w1 b1 w2 b2 config
+    let labelStart := sampleIdx * numClasses
+    let labelEnd := labelStart + numClasses
+    let sampleLabels := oneHotLabels.extract labelStart labelEnd
 
-    -- Find predicted class (argmax)
+    -- Compute loss and gradients
+    let paramArray := paramsToArray params
+    let (loss, grads) := computeGradientsForSample input sampleLabels paramArray config
+
+    totalLoss := totalLoss + loss
+
+    -- Accumulate gradients
+    allGrads := (Array.range allGrads.size).map fun i =>
+      allGrads[i]! + grads[i]!
+
+  -- Average gradients
+  let avgGrads := allGrads.map fun g => g / batch.batchSize.toFloat
+  let avgLoss := totalLoss / batch.batchSize.toFloat
+
+  -- Update parameters with SGD
+  let paramArray := paramsToArray params
+  let updatedParams := (Array.range paramArray.size).map fun i =>
+    paramArray[i]! - config.learningRate * avgGrads[i]!
+
+  let newParams := arrayToParams updatedParams config
+
+  IO.println s!"  Loss: {avgLoss}"
+
+  return (newParams, avgLoss)
+
+/-- Evaluate accuracy on test data -/
+def evaluate (params : MLPParams) (config : MLPConfig) : IO Float := do
+  let testBatch := generateSyntheticBatch 100 999
+  let mut correct := 0
+
+  for sampleIdx in [0:testBatch.batchSize] do
+    let inputStart := sampleIdx * imageSize
+    let inputEnd := inputStart + imageSize
+    let input := testBatch.images.extract inputStart inputEnd
+
+    -- Forward pass (without AD for evaluation)
+    let ctx := ADContext.new
+    let inputDuals := input.map Dual.const
+    let paramArray := paramsToArray params
+    let paramDuals := paramArray.map Dual.const
+    let (ctx, predictions) := forwardPassAD ctx inputDuals paramDuals config
+    let (_, probs) := applySoftmax ctx predictions
+
+    -- Find predicted class
     let predClass := (Array.range numClasses).foldl (init := (0, 0.0)) fun (maxIdx, maxVal) j =>
-      let val := predictions[j]!
+      let val := probs[j]!.primal
       if val > maxVal then (j, val) else (maxIdx, maxVal)
 
-    -- Check if correct
-    if predClass.1 == batch.labels[i]! then
+    if predClass.1 == testBatch.labels[sampleIdx]! then
       correct := correct + 1
 
-  let accuracy := correct.toFloat / batch.batchSize.toFloat * 100.0
+  let accuracy := correct.toFloat / testBatch.batchSize.toFloat * 100.0
   return accuracy
 
-/-- Main demonstration -/
+/-- Main training loop -/
 def main : IO Unit := do
   IO.println "╔══════════════════════════════════════════════╗"
-  IO.println "║   Hesper - MNIST Demo (Forward Pass Only)   ║"
+  IO.println "║   MNIST MLP Training with AD                 ║"
   IO.println "╚══════════════════════════════════════════════╝"
   IO.println ""
 
-  -- Initialize Hesper (for GPU operations in the future)
-  IO.println "🚀 Initializing Hesper..."
+  -- Initialize
+  IO.println "🚀 Initializing..."
   let _inst ← Hesper.init
-  IO.println "✓ GPU initialized"
-  IO.println ""
-
-  -- Configuration
   let config : MLPConfig := {}
-  IO.println "📋 Network Configuration:"
-  IO.println s!"  Architecture: {config.inputSize} -> {config.hiddenSize} -> {config.outputSize}"
+  IO.println s!"  Architecture: {config.inputSize} → {config.hiddenSize} → {config.outputSize}"
+  IO.println s!"  Learning rate: {config.learningRate}"
+  IO.println s!"  Epochs: {config.numEpochs}"
   IO.println s!"  Batch size: {config.batchSize}"
   IO.println ""
 
-  -- Initialize network parameters
-  IO.println "🎲 Initializing network parameters..."
-  let w1 := initWeights config.inputSize config.hiddenSize 42
-  let b1 := initBias config.hiddenSize
-  let w2 := initWeights config.hiddenSize config.outputSize 123
-  let b2 := initBias config.outputSize
-
-  let totalParams :=
-    config.inputSize * config.hiddenSize + config.hiddenSize +
-    config.hiddenSize * config.outputSize + config.outputSize
-  IO.println s!"✓ Total parameters: {totalParams}"
+  -- Initialize parameters
+  let mut params := initParams config
+  let totalParams := (paramsToArray params).size
+  IO.println s!"✓ Initialized {totalParams} parameters"
   IO.println ""
 
-  -- Generate synthetic test data
-  IO.println "📊 Generating synthetic test data..."
-  let testBatch := generateSyntheticBatch 100 999
-  IO.println s!"✓ Generated {testBatch.batchSize} test samples"
+  -- Initial evaluation
+  IO.println "🧪 Initial evaluation (random weights)..."
+  let initialAcc ← evaluate params config
+  IO.println s!"  Accuracy: {initialAcc}%"
   IO.println ""
 
-  -- Evaluate on test data
-  IO.println "🧪 Evaluating on test data..."
-  let accuracy ← evaluateBatch testBatch w1 b1 w2 b2 config
-  IO.println s!"✓ Test Accuracy (random weights): {accuracy}%"
+  -- Training loop
+  IO.println "🏋️  Training..."
   IO.println ""
 
-  -- Show prediction example
-  IO.println "🔍 Sample Prediction:"
-  let sampleInput := testBatch.images.extract 0 imageSize
-  let sampleLabel := testBatch.labels[0]!
-  let predictions := inferenceSample sampleInput w1 b1 w2 b2 config
+  for epoch in [1:config.numEpochs + 1] do
+    let (newParams, _loss) ← trainEpoch params config epoch
+    params := newParams
 
-  IO.println s!"  True label: {sampleLabel}"
-  IO.print   "  Predictions: ["
-  for i in [0:numClasses] do
-    IO.print s!"{predictions[i]!}"
-    if i < numClasses - 1 then IO.print ", "
-  IO.println "]"
+    -- Evaluate after each epoch
+    let acc ← evaluate params config
+    IO.println s!"  Test Accuracy: {acc}%"
+    IO.println ""
 
-  let predClass := (Array.range numClasses).foldl (init := (0, 0.0)) fun (maxIdx, maxVal) j =>
-    let val := predictions[j]!
-    if val > maxVal then (j, val) else (maxIdx, maxVal)
-  IO.println s!"  Predicted class: {predClass.1} (confidence: {predClass.2 * 100.0}%)"
+  IO.println "✅ Training complete!"
   IO.println ""
-
-  IO.println "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-  IO.println ""
-  IO.println "✅ Demo complete!"
-  IO.println ""
-  IO.println "📝 Notes:"
-  IO.println "  - This demo uses random weights (no training)"
-  IO.println "  - Accuracy ~10% is expected for random weights on 10 classes"
-  IO.println "  - For actual training, you need:"
-  IO.println "    * Automatic differentiation (AD)"
-  IO.println "    * Backpropagation"
-  IO.println "    * Optimizer (SGD/Adam)"
-  IO.println "    * Real MNIST dataset from http://yann.lecun.com/exdb/mnist/"
-  IO.println ""
-  IO.println "  - GPU acceleration can be added by:"
-  IO.println "    * Moving forward pass to GPU compute shaders"
-  IO.println "    * Using Hesper.Compute for matrix operations"
-  IO.println "    * Batch processing on GPU"
+  IO.println "📝 Note: Using synthetic data for demonstration"
+  IO.println "   For real MNIST: http://yann.lecun.com/exdb/mnist/"
 
 end Examples.MachineLearning.MNISTTrain
 

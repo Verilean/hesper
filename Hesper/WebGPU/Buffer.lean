@@ -12,7 +12,12 @@ structure BufferDescriptor where
 /-- Create a GPU buffer.
     Resources are automatically cleaned up by Lean's GC via External finalizers. -/
 @[extern "lean_hesper_create_buffer"]
-opaque createBuffer (device : @& Device) (desc : @& BufferDescriptor) : IO Buffer
+opaque createBufferImpl (device : @& Device) (desc : @& BufferDescriptor) : IO Buffer
+
+/-- Wrapper with debug output -/
+def createBuffer (device : @& Device) (desc : @& BufferDescriptor) : IO Buffer := do
+  IO.println s!"[Lean] createBuffer: size={desc.size}, usage={desc.usage.length} items, mapped={desc.mappedAtCreation}"
+  createBufferImpl device desc
 
 /-- Write data to a buffer from the CPU.
     @param buffer The target buffer

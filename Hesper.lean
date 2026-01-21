@@ -9,6 +9,7 @@ import Hesper.WGSL.Kernel
 import Hesper.WGSL.Monad
 import Hesper.WGSL.CodeGen
 import Hesper.WGSL.Execute
+import Hesper.WGSL.Helpers
 
 -- Profiling modules
 import Hesper.Profile
@@ -24,9 +25,20 @@ import Hesper.WebGPU.Pipeline
 -- High-level Compute API
 import Hesper.Compute
 
+-- Core abstractions
+-- Note: VerifiedOp and VerifiedOpFusion both define TensorData, so we only import one
+-- import Hesper.Core.VerifiedOp  -- Original immediate execution (use for legacy code)
+import Hesper.Core.VerifiedOpFusion  -- New fusion-enabled abstraction
+
 -- Tensor operations
 import Hesper.Tensor.Types
 import Hesper.Tensor.MatMul
+
+-- Verified operators
+-- Note: MatMul uses old VerifiedOp, MatMulFusion uses new VerifiedOpFusion
+-- import Hesper.Op.MatMul  -- Legacy immediate execution (use VerifiedOpDemo for examples)
+import Hesper.Op.MatMulFusion  -- Fusion-enabled matmul
+import Hesper.Op.Activation
 
 -- Neural network operations
 import Hesper.NN.Activation
@@ -68,10 +80,12 @@ for Lean 4 with formal verification capabilities.
 
 ## Module Organization
 
+- Core: Verified operator pattern (CPU spec + GPU impl)
 - WGSL: Type-safe shader DSL and code generation
 - WebGPU: Low-level WebGPU API bindings
 - Compute: High-level compute API
 - Tensor: Linear algebra operations (MatMul)
+- Op: Verified operator instances (MatMul, etc.)
 - NN: Neural network layers (Conv, Activation)
 - AD: Automatic differentiation
 - Optimizer: Training optimizers (SGD, Adam)

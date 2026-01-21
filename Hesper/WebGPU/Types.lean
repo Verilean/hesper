@@ -10,26 +10,54 @@ namespace Hesper.WebGPU
 /-- Opaque handle to a WebGPU Instance (Dawn native instance) with automatic cleanup via External finalizer -/
 opaque Instance : Type
 
-/-- Opaque handle to a WebGPU Device with automatic cleanup via External finalizer -/
-opaque Device : Type
+/-- Internal opaque handle to the raw WebGPU Device pointer -/
+opaque DevicePtr : Type
 
-/-- Opaque handle to a WebGPU Buffer with automatic cleanup via External finalizer -/
-opaque Buffer : Type
+/-- WebGPU Device that maintains a reference to its parent Instance.
+    This ensures the Instance stays alive as long as the Device is in use,
+    preventing premature garbage collection that would cause segfaults. -/
+structure Device where
+  ptr : DevicePtr
+  parentInstance : Instance
 
-/-- Opaque handle to a WebGPU Shader Module with automatic cleanup via External finalizer -/
-opaque ShaderModule : Type
+/-- Internal opaque handles for raw WebGPU pointers -/
+opaque BufferPtr : Type
+opaque ShaderModulePtr : Type
+opaque ComputePipelinePtr : Type
+opaque BindGroupPtr : Type
+opaque BindGroupLayoutPtr : Type
+opaque CommandEncoderPtr : Type
 
-/-- Opaque handle to a WebGPU Compute Pipeline with automatic cleanup via External finalizer -/
-opaque ComputePipeline : Type
+/-- WebGPU Buffer that maintains a reference to its parent Device.
+    This ensures Device (and Instance) stay alive while Buffer is in use. -/
+structure Buffer where
+  ptr : BufferPtr
+  parentDevice : Device
 
-/-- Opaque handle to a WebGPU Bind Group with automatic cleanup via External finalizer -/
-opaque BindGroup : Type
+/-- WebGPU Shader Module that maintains a reference to its parent Device. -/
+structure ShaderModule where
+  ptr : ShaderModulePtr
+  parentDevice : Device
 
-/-- Opaque handle to a WebGPU Bind Group Layout with automatic cleanup via External finalizer -/
-opaque BindGroupLayout : Type
+/-- WebGPU Compute Pipeline that maintains a reference to its parent Device. -/
+structure ComputePipeline where
+  ptr : ComputePipelinePtr
+  parentDevice : Device
 
-/-- Opaque handle to a WebGPU Command Encoder with automatic cleanup via External finalizer -/
-opaque CommandEncoder : Type
+/-- WebGPU Bind Group that maintains a reference to its parent Device. -/
+structure BindGroup where
+  ptr : BindGroupPtr
+  parentDevice : Device
+
+/-- WebGPU Bind Group Layout that maintains a reference to its parent Device. -/
+structure BindGroupLayout where
+  ptr : BindGroupLayoutPtr
+  parentDevice : Device
+
+/-- WebGPU Command Encoder that maintains a reference to its parent Device. -/
+structure CommandEncoder where
+  ptr : CommandEncoderPtr
+  parentDevice : Device
 
 /-- Buffer usage flags -/
 inductive BufferUsage where

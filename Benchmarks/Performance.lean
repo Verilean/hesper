@@ -7,6 +7,7 @@ import Hesper.WGSL.Monad
 import Hesper.WGSL.Execute
 import Hesper.WGSL.Shader
 import Hesper.WGSL.DSL
+import Hesper.Basic
 
 /-!
 # Performance Benchmarks
@@ -475,7 +476,7 @@ def verifyMatMulKernel (inst : Instance) (m k n : Nat) (variant : String := "nai
   -- Read back results
   if variant != "subgroup" then
     let resultBytes ← mapBufferRead device bufferC 0 (m * n * 4).toUSize
-    let resultC := bytesToFloatArray resultBytes
+    let resultC ← Hesper.Basic.bytesToFloatArray resultBytes
 
     -- Verify results
     let isCorrect := verifyMatMul m k n matA matB resultC 0.1
