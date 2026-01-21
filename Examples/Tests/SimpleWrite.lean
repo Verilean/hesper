@@ -95,70 +95,75 @@ def main : IO Unit := do
   }
   IO.println "  ✓ Created output buffer"
 
-  -- Create shader (using raw WGSL for execution)
-  IO.println "  📝 Creating compute shader (from raw WGSL)..."
+  -- Test 1: Execute raw WGSL shader
+  IO.println "\n  🔹 Test 1: Raw WGSL shader"
   let shaderModule ← createShaderModule device doubleShaderRaw
-  IO.println "  ✓ Shader module created"
-
-  -- Create bind group layout for 2 bindings (input + output)
   let layoutEntries := #[
-    { binding := 0, visibility := .compute, bindingType := .buffer false : BindGroupLayoutEntry },   -- read-write input
-    { binding := 1, visibility := .compute, bindingType := .buffer false : BindGroupLayoutEntry }   -- read-write output
+    { binding := 0, visibility := .compute, bindingType := .buffer false : BindGroupLayoutEntry },
+    { binding := 1, visibility := .compute, bindingType := .buffer false : BindGroupLayoutEntry }
   ]
   let bindGroupLayout ← createBindGroupLayout device layoutEntries
-
-  -- Create pipeline
   let pipeline ← createComputePipeline device {
     shaderModule := shaderModule
     entryPoint := "main"
     bindGroupLayout := bindGroupLayout
   }
-
-  -- Create bind group with both buffers
   let bindEntries := #[
     { binding := 0, buffer := inputBuf, offset := 0, size := (size * 4).toUSize : BindGroupEntry },
     { binding := 1, buffer := outputBuf, offset := 0, size := (size * 4).toUSize : BindGroupEntry }
   ]
   let bindGroup ← createBindGroup device bindGroupLayout bindEntries
-
-  -- Dispatch - 4 workgroups, each processes one element
   dispatchCompute device pipeline bindGroup size.toUInt32 1 1
-  IO.println s!"  ✓ Dispatched {size} workgroups"
-
-  -- Read back
   deviceWait device
-  IO.println "  ⏳ Reading results from GPU..."
-  let resultBytes ← mapBufferRead device outputBuf 0 ((size * 4).toUSize)
-  IO.println s!"  ✓ Read back {resultBytes.size} bytes"
-  unmapBuffer outputBuf
+  IO.println "  ✓ Raw WGSL executed"
 
-  -- Convert to floats
-  let resultFloats ← Hesper.Basic.bytesToFloatArray resultBytes
-  IO.println s!"  ✓ Converted to {resultFloats.size} floats"
+  -- Read back results from Test 1
+  let resultBytes1 ← mapBufferRead device outputBuf 0 ((size * 4).toUSize)
+  unmapBuffer outputBuf
+  let resultFloats1 ← Hesper.Basic.bytesToFloatArray resultBytes1
+
+  -- Clear output buffer for Test 2
+  let zeroData := ByteArray.mk #[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+  writeBuffer device outputBuf 0 zeroData
+
+  -- Test 2: Execute DSL shader
+  IO.println "\n  🔹 Test 2: DSL-generated shader"
+  let config := ExecutionConfig.dispatch1D size 1
+  let namedBuffers : List (String × Buffer) := [("input", inputBuf), ("output", outputBuf)]
+  executeShaderNamed device doubleShaderDSL namedBuffers config
+  IO.println "  ✓ DSL shader executed"
+
+  -- Read back results from Test 2
+  let resultBytes2 ← mapBufferRead device outputBuf 0 ((size * 4).toUSize)
+  unmapBuffer outputBuf
+  let resultFloats2 ← Hesper.Basic.bytesToFloatArray resultBytes2
 
   -- Display results
   IO.println "\n📊 Results:"
-  IO.println "  Input → Expected → Actual"
   let expected := #[2.0, 4.0, 6.0, 8.0]
   let input := #[1.0, 2.0, 3.0, 4.0]
   let mut allCorrect := true
 
+  IO.println "  Input → Expected → Raw WGSL → DSL WGSL"
   for i in [0:size] do
     let inp := input[i]!
     let exp := expected[i]!
-    let actual := resultFloats[i]!
-    let status := if (actual - exp).abs < 0.001 then "✓" else "✗"
-    IO.println s!"  [{i}] {inp} → {exp} → {actual} {status}"
-    if (actual - exp).abs > 0.001 then
+    let actual1 := resultFloats1[i]!
+    let actual2 := resultFloats2[i]!
+    let status1 := if (actual1 - exp).abs < 0.001 then "✓" else "✗"
+    let status2 := if (actual2 - exp).abs < 0.001 then "✓" else "✗"
+    IO.println s!"  [{i}] {inp} → {exp} → {actual1} {status1} → {actual2} {status2}"
+    if (actual1 - exp).abs > 0.001 || (actual2 - exp).abs > 0.001 then
       allCorrect := false
 
   IO.println ""
   if allCorrect then
-    IO.println "✅ SUCCESS: Both DSL and raw WGSL work correctly!"
-    IO.println "   - DSL generated valid WGSL shader"
-    IO.println "   - Raw WGSL executed on GPU successfully"
+    IO.println "✅ SUCCESS: Both shaders work correctly!"
+    IO.println "   - Raw WGSL shader: ✓"
+    IO.println "   - DSL-generated shader (ShaderM monad): ✓"
+    IO.println "   - Both produce identical correct results"
   else
-    IO.println "❌ FAIL: GPU doubling not working correctly"
+    IO.println "❌ FAIL: One or both shaders failed"
 
 end Examples.Tests.SimpleWrite
 

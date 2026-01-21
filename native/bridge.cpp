@@ -1254,10 +1254,17 @@ lean_obj_res lean_hesper_create_bind_group(b_lean_obj_arg device_obj, b_lean_obj
         bgEntries[i].binding = raw->binding;
         bgEntries[i].buffer = *buffer;
         bgEntries[i].offset = raw->offset;
-        bgEntries[i].size = raw->size;
 
-        fprintf(stderr, "[C++]   Entry %zu: binding=%u, offset=%zu, size=%zu\n",
-                i, raw->binding, raw->offset, raw->size);
+        // FIX: size=0 means "use whole buffer" in WebGPU convention
+        // Query the buffer's actual size when Lean passes 0
+        if (raw->size == 0) {
+            bgEntries[i].size = buffer->GetSize();
+        } else {
+            bgEntries[i].size = raw->size;
+        }
+
+        fprintf(stderr, "[C++]   Entry %zu: binding=%u, offset=%zu, size=%zu (raw_size=%zu)\n",
+                i, raw->binding, raw->offset, bgEntries[i].size, raw->size);
         fflush(stderr);
     }
 
