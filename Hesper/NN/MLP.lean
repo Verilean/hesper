@@ -434,6 +434,107 @@ def genSGDKernel (size : Nat) (lr : Float) : String :=
 
   module.toWGSL
 
+/-- Generate GPU kernel for Adam optimizer update.
+
+Adam (Adaptive Moment Estimation) combines momentum and RMSprop.
+
+**Algorithm:**
+```
+m[i] = beta1 * m[i] + (1 - beta1) * grad[i]           # Update first moment
+v[i] = beta2 * v[i] + (1 - beta2) * grad[i]^2         # Update second moment
+m_hat = m[i] / (1 - beta1^step)                       # Bias correction
+v_hat = v[i] / (1 - beta2^step)                       # Bias correction
+params[i] -= lr * m_hat / (sqrt(v_hat) + epsilon)    # Update parameters
+```
+
+**Parameters:**
+- size: Number of parameters
+- lr: Learning rate (typical: 0.001)
+- beta1: Momentum decay rate (typical: 0.9)
+- beta2: Variance decay rate (typical: 0.999)
+- epsilon: Numerical stability constant (typical: 1e-8)
+- step: Current step number (for bias correction)
+
+**Buffers:**
+- @binding(0): params (read-write) - parameters to update
+- @binding(1): grads (read-only) - gradients
+- @binding(2): m (read-write) - first moment estimates
+- @binding(3): v (read-write) - second moment estimates
+
+**Example:**
+```lean
+let kernel := genAdamKernel 1000 0.001 0.9 0.999 1e-8 10
+```
+-/
+def genAdamKernel (size : Nat) (lr : Float) (beta1 beta2 epsilon : Float) (step : Nat) : String :=
+  let shaderBody : WGSL.Monad.ShaderM Unit := do
+    let gid ← WGSL.Monad.ShaderM.globalId
+    let tid := Exp.vec3X gid
+
+    let boundsCheck := Exp.lt tid (Exp.litU32 size)
+    WGSL.Monad.ShaderM.if_ boundsCheck (do
+      -- Load current values
+      let paramVal := Exp.index (Exp.var "params" : Exp (.array (.scalar .f32) size)) tid
+      let gradVal := Exp.index (Exp.var "grads" : Exp (.array (.scalar .f32) size)) tid
+      let mVal := Exp.index (Exp.var "m" : Exp (.array (.scalar .f32) size)) tid
+      let vVal := Exp.index (Exp.var "v" : Exp (.array (.scalar .f32) size)) tid
+
+      -- Update first moment: m = beta1 * m + (1 - beta1) * grad
+      let beta1Lit := Exp.litF32 beta1
+      let oneSub1 := Exp.sub (Exp.litF32 1.0) beta1Lit
+      let newM := Exp.add (Exp.mul beta1Lit mVal) (Exp.mul oneSub1 gradVal)
+
+      -- Update second moment: v = beta2 * v + (1 - beta2) * grad^2
+      let beta2Lit := Exp.litF32 beta2
+      let oneSub2 := Exp.sub (Exp.litF32 1.0) beta2Lit
+      let gradSq := Exp.mul gradVal gradVal
+      let newV := Exp.add (Exp.mul beta2Lit vVal) (Exp.mul oneSub2 gradSq)
+
+      -- Bias correction: m_hat = m / (1 - beta1^step), v_hat = v / (1 - beta2^step)
+      let stepF := Exp.litF32 (Float.ofNat step)
+      let beta1Power := Exp.pow beta1Lit stepF
+      let beta2Power := Exp.pow beta2Lit stepF
+      let biasCorr1 := Exp.sub (Exp.litF32 1.0) beta1Power
+      let biasCorr2 := Exp.sub (Exp.litF32 1.0) beta2Power
+      let mHat := Exp.div newM biasCorr1
+      let vHat := Exp.div newV biasCorr2
+
+      -- Update params: params -= lr * m_hat / (sqrt(v_hat) + epsilon)
+      let sqrtV := Exp.sqrt vHat
+      let denominator := Exp.add sqrtV (Exp.litF32 epsilon)
+      let update := Exp.div mHat denominator
+      let delta := Exp.mul (Exp.litF32 lr) update
+      let newParam := Exp.sub paramVal delta
+
+      -- Write back
+      WGSL.Monad.ShaderM.assignIndex "params" tid newParam
+      WGSL.Monad.ShaderM.assignIndex "m" tid newM
+      WGSL.Monad.ShaderM.assignIndex "v" tid newV
+    ) (pure ())
+
+  let state := WGSL.Monad.ShaderM.exec shaderBody
+
+  let buffers : List StorageBuffer := [
+    { group := 0, binding := 0, name := "params", elemType := .array (.scalar .f32) size, readWrite := true },
+    { group := 0, binding := 1, name := "grads", elemType := .array (.scalar .f32) size, readWrite := false },
+    { group := 0, binding := 2, name := "m", elemType := .array (.scalar .f32) size, readWrite := true },
+    { group := 0, binding := 3, name := "v", elemType := .array (.scalar .f32) size, readWrite := true }
+  ]
+
+  let mainFunc : FunctionDecl := {
+    name := "main"
+    attributes := ["@compute", "@workgroup_size(256, 1, 1)"]
+    params := [{ name := "global_invocation_id", ty := .vec3 .u32, builtin := some .globalInvocationId }]
+    body := state.stmts
+  }
+
+  let module : ShaderModule := {
+    storageBuffers := buffers
+    functions := [mainFunc]
+  }
+
+  module.toWGSL
+
 end GPUKernels
 
 /-! ## SGD Update on CPU -/

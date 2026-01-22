@@ -515,3 +515,18 @@ lean_exe «simd-perf-bench» where
   root := `Examples.SIMD.MainSimdPerfBench
   supportInterpreter := false
   moreLinkArgs := #[s!".lake/build/simd/libhesper_simd.a"]
+
+lean_exe «test-dsl-kernels» where
+  root := `Examples.Tests.TestDSLKernels
+  supportInterpreter := false
+  moreLinkArgs := stdLinkArgs
+
+lean_exe «test-gpu-backward» where
+  root := `Examples.Tests.TestGPUBackward
+  supportInterpreter := false
+  moreLinkArgs := stdLinkArgs
+
+lean_exe «test-adam-gpu» where
+  root := `Examples.Tests.TestAdamGPU
+  supportInterpreter := false
+  moreLinkArgs := stdLinkArgs
