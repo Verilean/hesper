@@ -2,6 +2,8 @@ import Hesper.Core.VerifiedOpFusion
 import Hesper.WGSL.Kernel
 import Hesper.WGSL.Exp
 import Hesper.WGSL.Types
+import Hesper.WGSL.Monad
+import Hesper.WGSL.CodeGen
 import Hesper.WGSL.Helpers
 import Hesper.Op.Activation
 
@@ -39,6 +41,7 @@ namespace Hesper.NN.MLP
 
 open Hesper.Core
 open Hesper.WGSL
+open Hesper.WGSL.CodeGen
 open Hesper.Tensor
 open Hesper.Op.Activation
 
@@ -192,7 +195,248 @@ def generateLayer2Kernel : String :=
 def generateSoftmaxKernel : String :=
   Helpers.generateSoftmaxShader 10
 
+/-! ## GPU Backward Pass Kernels (using WGSL DSL) -/
+
+section GPUKernels
+
+/-- Softmax gradient kernel: dLogits[i] = probs[i] - (i == label ? 1 : 0) -/
+def genSoftmaxGradKernel (outputSize : Nat) : String :=
+  let shaderBody : WGSL.Monad.ShaderM Unit := do
+    -- Read label (scalar u32)
+    let labelVal : Exp (.scalar .u32) := Exp.index (Exp.var "label" : Exp (.array (.scalar .u32) 1)) (Exp.litU32 0)
+
+    -- Loop over all outputs
+    WGSL.Monad.ShaderM.loop (Exp.litU32 0) (Exp.litU32 outputSize) (Exp.litU32 1) fun i => do
+      let prob := Exp.index (Exp.var "probs" : Exp (.array (.scalar .f32) outputSize)) i
+
+      -- If i == label: dLogits[i] = probs[i] - 1.0, else: dLogits[i] = probs[i]
+      let isTarget := Exp.eq i labelVal
+      WGSL.Monad.ShaderM.if_ isTarget (do
+        let grad := Exp.sub prob (Exp.litF32 1.0)
+        WGSL.Monad.ShaderM.assignIndex "dLogits" i grad
+      ) (do
+        WGSL.Monad.ShaderM.assignIndex "dLogits" i prob
+      )
+
+  let state := WGSL.Monad.ShaderM.exec shaderBody
+
+  let buffers : List StorageBuffer := [
+    { group := 0, binding := 0, name := "probs", elemType := .array (.scalar .f32) outputSize, readWrite := false },
+    { group := 0, binding := 1, name := "label", elemType := .array (.scalar .u32) 1, readWrite := false },
+    { group := 0, binding := 2, name := "dLogits", elemType := .array (.scalar .f32) outputSize, readWrite := true }
+  ]
+
+  let mainFunc : FunctionDecl := {
+    name := "main"
+    attributes := ["@compute", "@workgroup_size(1, 1, 1)"]
+    params := []
+    body := state.stmts
+  }
+
+  let module : ShaderModule := {
+    storageBuffers := buffers
+    functions := [mainFunc]
+  }
+
+  module.toWGSL
+
+/-- Layer 2 backward kernel: computes dW2, dB2, dH1 -/
+def genLayer2BackwardKernel (hiddenSize outputSize : Nat) : String :=
+  let shaderBody : WGSL.Monad.ShaderM Unit := do
+    let gid ← WGSL.Monad.ShaderM.globalId
+    let tid := Exp.vec3X gid
+
+    -- Compute dW2: outer product h1^T @ dLogits
+    -- Loop with stride to parallelize across threads
+    WGSL.Monad.ShaderM.loop tid (Exp.litU32 (hiddenSize * outputSize)) (Exp.litU32 256) fun idx => do
+      let i := Exp.div idx (Exp.litU32 outputSize)
+      let j := Exp.mod idx (Exp.litU32 outputSize)
+
+      let h1Val := Exp.index (Exp.var "h1" : Exp (.array (.scalar .f32) hiddenSize)) i
+      let dLogitsVal := Exp.index (Exp.var "dLogits" : Exp (.array (.scalar .f32) outputSize)) j
+      let dW2Val := Exp.mul h1Val dLogitsVal
+
+      WGSL.Monad.ShaderM.assignIndex "dW2" idx dW2Val
+
+    -- Compute dB2 = dLogits (parallel copy)
+    let tidLtOutput := Exp.lt tid (Exp.litU32 outputSize)
+    WGSL.Monad.ShaderM.if_ tidLtOutput (do
+      let dLogitsVal := Exp.index (Exp.var "dLogits" : Exp (.array (.scalar .f32) outputSize)) tid
+      WGSL.Monad.ShaderM.assignIndex "dB2" tid dLogitsVal
+    ) (pure ())
+
+    -- Compute dH1 = W2^T @ dLogits (matrix-vector product)
+    let tidLtHidden := Exp.lt tid (Exp.litU32 hiddenSize)
+    WGSL.Monad.ShaderM.if_ tidLtHidden (do
+      let sumVar ← WGSL.Monad.ShaderM.var (.scalar .f32) (Exp.litF32 0.0)
+
+      WGSL.Monad.ShaderM.loop (Exp.litU32 0) (Exp.litU32 outputSize) (Exp.litU32 1) fun j => do
+        let w2Idx := Exp.add (Exp.mul tid (Exp.litU32 outputSize)) j
+        let w2Val := Exp.index (Exp.var "w2" : Exp (.array (.scalar .f32) (hiddenSize * outputSize))) w2Idx
+        let dLogitsVal := Exp.index (Exp.var "dLogits" : Exp (.array (.scalar .f32) outputSize)) j
+
+        let currentSum := Exp.var sumVar
+        let newSum := Exp.add currentSum (Exp.mul w2Val dLogitsVal)
+        WGSL.Monad.ShaderM.assign sumVar newSum
+
+      WGSL.Monad.ShaderM.assignIndex "dH1" tid (Exp.var sumVar : Exp (.scalar .f32))
+    ) (pure ())
+
+  let state := WGSL.Monad.ShaderM.exec shaderBody
+
+  let buffers : List StorageBuffer := [
+    { group := 0, binding := 0, name := "h1", elemType := .array (.scalar .f32) hiddenSize, readWrite := false },
+    { group := 0, binding := 1, name := "dLogits", elemType := .array (.scalar .f32) outputSize, readWrite := false },
+    { group := 0, binding := 2, name := "w2", elemType := .array (.scalar .f32) (hiddenSize * outputSize), readWrite := false },
+    { group := 0, binding := 3, name := "dW2", elemType := .array (.scalar .f32) (hiddenSize * outputSize), readWrite := true },
+    { group := 0, binding := 4, name := "dB2", elemType := .array (.scalar .f32) outputSize, readWrite := true },
+    { group := 0, binding := 5, name := "dH1", elemType := .array (.scalar .f32) hiddenSize, readWrite := true }
+  ]
+
+  let mainFunc : FunctionDecl := {
+    name := "main"
+    attributes := ["@compute", "@workgroup_size(256, 1, 1)"]
+    params := [{ name := "global_invocation_id", ty := .vec3 .u32, builtin := some .globalInvocationId }]
+    body := state.stmts
+  }
+
+  let module : ShaderModule := {
+    storageBuffers := buffers
+    functions := [mainFunc]
+  }
+
+  module.toWGSL
+
+/-- ReLU backward kernel: dH1pre[i] = dH1[i] * (h1[i] > 0) -/
+def genReLUBackwardKernel (size : Nat) : String :=
+  let shaderBody : WGSL.Monad.ShaderM Unit := do
+    let gid ← WGSL.Monad.ShaderM.globalId
+    let tid := Exp.vec3X gid
+
+    let boundsCheck := Exp.lt tid (Exp.litU32 size)
+    WGSL.Monad.ShaderM.if_ boundsCheck (do
+      let h1Val := Exp.index (Exp.var "h1" : Exp (.array (.scalar .f32) size)) tid
+      let dH1Val := Exp.index (Exp.var "dH1" : Exp (.array (.scalar .f32) size)) tid
+
+      let isPositive := Exp.gt h1Val (Exp.litF32 0.0)
+      WGSL.Monad.ShaderM.if_ isPositive (do
+        WGSL.Monad.ShaderM.assignIndex "dH1pre" tid dH1Val
+      ) (do
+        WGSL.Monad.ShaderM.assignIndex "dH1pre" tid (Exp.litF32 0.0)
+      )
+    ) (pure ())
+
+  let state := WGSL.Monad.ShaderM.exec shaderBody
+
+  let buffers : List StorageBuffer := [
+    { group := 0, binding := 0, name := "h1", elemType := .array (.scalar .f32) size, readWrite := false },
+    { group := 0, binding := 1, name := "dH1", elemType := .array (.scalar .f32) size, readWrite := false },
+    { group := 0, binding := 2, name := "dH1pre", elemType := .array (.scalar .f32) size, readWrite := true }
+  ]
+
+  let mainFunc : FunctionDecl := {
+    name := "main"
+    attributes := ["@compute", "@workgroup_size(256, 1, 1)"]
+    params := [{ name := "global_invocation_id", ty := .vec3 .u32, builtin := some .globalInvocationId }]
+    body := state.stmts
+  }
+
+  let module : ShaderModule := {
+    storageBuffers := buffers
+    functions := [mainFunc]
+  }
+
+  module.toWGSL
+
+/-- Layer 1 backward kernel: computes dW1, dB1 -/
+def genLayer1BackwardKernel (inputSize hiddenSize : Nat) : String :=
+  let shaderBody : WGSL.Monad.ShaderM Unit := do
+    let gid ← WGSL.Monad.ShaderM.globalId
+    let tid := Exp.vec3X gid
+
+    -- Compute dW1: outer product input^T @ dH1pre
+    WGSL.Monad.ShaderM.loop tid (Exp.litU32 (inputSize * hiddenSize)) (Exp.litU32 256) fun idx => do
+      let i := Exp.div idx (Exp.litU32 hiddenSize)
+      let j := Exp.mod idx (Exp.litU32 hiddenSize)
+
+      let inputVal := Exp.index (Exp.var "input" : Exp (.array (.scalar .f32) inputSize)) i
+      let dH1preVal := Exp.index (Exp.var "dH1pre" : Exp (.array (.scalar .f32) hiddenSize)) j
+      let dW1Val := Exp.mul inputVal dH1preVal
+
+      WGSL.Monad.ShaderM.assignIndex "dW1" idx dW1Val
+
+    -- Compute dB1 = dH1pre (parallel copy)
+    let tidLtHidden := Exp.lt tid (Exp.litU32 hiddenSize)
+    WGSL.Monad.ShaderM.if_ tidLtHidden (do
+      let dH1preVal := Exp.index (Exp.var "dH1pre" : Exp (.array (.scalar .f32) hiddenSize)) tid
+      WGSL.Monad.ShaderM.assignIndex "dB1" tid dH1preVal
+    ) (pure ())
+
+  let state := WGSL.Monad.ShaderM.exec shaderBody
+
+  let buffers : List StorageBuffer := [
+    { group := 0, binding := 0, name := "input", elemType := .array (.scalar .f32) inputSize, readWrite := false },
+    { group := 0, binding := 1, name := "dH1pre", elemType := .array (.scalar .f32) hiddenSize, readWrite := false },
+    { group := 0, binding := 2, name := "dW1", elemType := .array (.scalar .f32) (inputSize * hiddenSize), readWrite := true },
+    { group := 0, binding := 3, name := "dB1", elemType := .array (.scalar .f32) hiddenSize, readWrite := true }
+  ]
+
+  let mainFunc : FunctionDecl := {
+    name := "main"
+    attributes := ["@compute", "@workgroup_size(256, 1, 1)"]
+    params := [{ name := "global_invocation_id", ty := .vec3 .u32, builtin := some .globalInvocationId }]
+    body := state.stmts
+  }
+
+  let module : ShaderModule := {
+    storageBuffers := buffers
+    functions := [mainFunc]
+  }
+
+  module.toWGSL
+
 /-! ## SGD Update on GPU -/
+
+/-- SGD kernel: param[i] -= lr * grad[i] -/
+def genSGDKernel (size : Nat) (lr : Float) : String :=
+  let shaderBody : WGSL.Monad.ShaderM Unit := do
+    let gid ← WGSL.Monad.ShaderM.globalId
+    let tid := Exp.vec3X gid
+
+    let boundsCheck := Exp.lt tid (Exp.litU32 size)
+    WGSL.Monad.ShaderM.if_ boundsCheck (do
+      let paramVal := Exp.index (Exp.var "params" : Exp (.array (.scalar .f32) size)) tid
+      let gradVal := Exp.index (Exp.var "grads" : Exp (.array (.scalar .f32) size)) tid
+
+      -- param -= lr * grad
+      let update := Exp.sub paramVal (Exp.mul (Exp.litF32 lr) gradVal)
+      WGSL.Monad.ShaderM.assignIndex "params" tid update
+    ) (pure ())
+
+  let state := WGSL.Monad.ShaderM.exec shaderBody
+
+  let buffers : List StorageBuffer := [
+    { group := 0, binding := 0, name := "params", elemType := .array (.scalar .f32) size, readWrite := true },
+    { group := 0, binding := 1, name := "grads", elemType := .array (.scalar .f32) size, readWrite := false }
+  ]
+
+  let mainFunc : FunctionDecl := {
+    name := "main"
+    attributes := ["@compute", "@workgroup_size(256, 1, 1)"]
+    params := [{ name := "global_invocation_id", ty := .vec3 .u32, builtin := some .globalInvocationId }]
+    body := state.stmts
+  }
+
+  let module : ShaderModule := {
+    storageBuffers := buffers
+    functions := [mainFunc]
+  }
+
+  module.toWGSL
+
+end GPUKernels
+
+/-! ## SGD Update on CPU -/
 
 /-- CPU SGD parameter update -/
 def cpuSGDUpdate (params : MLPParams) (grads : MLPGradients) (lr : Float) : MLPParams :=
