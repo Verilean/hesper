@@ -297,6 +297,9 @@ lean_exe «resnet» where
 lean_exe «hesper» where
   root := `Examples.Compute.Main
   moreLinkArgs := stdLinkArgs
+lean_exe «parallel-demo» where
+  root := `Examples.Compute.ParallelDemo
+  moreLinkArgs := stdLinkArgs
 
 lean_exe «hesper-simple» where
   root := `Examples.Compute.MainSimple
