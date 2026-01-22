@@ -163,20 +163,37 @@ let fusedOp := matmulKernel |> reluKernel
 
 ### 📈 Unified Verified Automatic Differentiation
 
-Hesper's unique architecture unifies **formal verification** with **automatic differentiation**. By "lifting" `VerifiedOp` kernels into the `AD.Reverse` tape, Hesper enables end-to-end differentiable GPU programming that is correct by construction:
+Hesper's unique architecture unifies **formal verification** with **automatic differentiation** via a shared **Differentiable** interface. This allows the AD engine to treat complex, verified GPU kernels as first-class primitives.
+
+#### The Differentiable Interface
+
+All operations in Hesper—from simple scalar addition to fused ResNet blocks—implement this common trait:
 
 ```lean
--- VerifiedOp instances act as primitives for AD
-let loss := crossEntropy |> mlpForward |> matmul
+class Differentiable (I O : Type) where
+  /-- Primal execution (Forward pass) -/
+  forward : I → O
+  
+  /-- Adjoint computation (Backward pass) -/
+  /-- Matrix-Free Vector-Jacobian Product (Jᵀv) -/
+  backward : I → O → I
+```
 
--- AD engine automatically calls impl_kernel_backward on GPU
-let grad := diff loss input 
+#### Why it Matters:
+
+- **Unified Logic**: Scalar-CPU logic and Tensor-GPU kernels share the same mathematical abstraction.
+- **End-to-End Correctness**: By "lifting" `VerifiedOp` instances into the AD tape, Hesper ensures that backpropagation is as formally correct as the forward pass.
+- **Zero-Copy Fusion**: The AD engine can calculate gradients across fused kernels (e.g., `MatMul |> ReLU`) without writing intermediate tensors to VRAM.
+
+```lean
+-- AD engine automatically dispatches to hand-optimized GPU kernels
+let grad := diff (matmul |> relu |> crossEntropy) input 
 ```
 
 **Key Features:**
 - **Hybrid AD**: Seamlessly switch between CPU-scalar AD and GPU-tensor AD.
-- **Differentiable Verified Primitives**: Use hand-optimized, verified kernels (e.g., FlashAttention) as AD graph nodes.
-- **End-to-End Backprop**: Automatic tape management across fused GPU kernels and CPU logic.
+- **Verified Primitives**: Every AD node is backed by a verified `spec_forward` and `spec_backward`.
+- **High Performance**: Leverages Hand-optimized WGSL and Google Highway SIMD.
 
 ### ⚙️ High-Level Optimizers
 
