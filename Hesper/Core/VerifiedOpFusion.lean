@@ -1,3 +1,4 @@
+import Hesper.Core.Differentiable
 import Hesper.WebGPU.Types
 import Hesper.WebGPU.Buffer
 import Hesper.Tensor.Types
@@ -217,6 +218,12 @@ class VerifiedOpFusion (wX wY wZ : Nat) (I O : Type) (WI WO : Type) where
     fun _ _ => return true  -- Placeholder
 
 export VerifiedOpFusion (spec_forward impl_kernel spec_backward impl_kernel_backward run_forward verify_consistency)
+
+/-- Linking VerifiedOpFusion to the Unified Differentiable Interface -/
+instance [inst : VerifiedOpFusion wX wY wZ I O WI WO]
+    : Differentiable (VerifiedOpFusion wX wY wZ I O WI WO) I O where
+  forward := fun _ x => inst.spec_forward x
+  backward := fun _ x v => inst.spec_backward x v
 
 /-! ## Helper Functions for Fusion -/
 
