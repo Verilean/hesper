@@ -33,7 +33,7 @@ import Hesper.Core.VerifiedOpFusion  -- New fusion-enabled abstraction
 -- Core array types (opaque, zero-copy, in-place mutable)
 import Hesper.Core.Float32Array
 import Hesper.Core.Float16Array
-import Hesper.Core.BFloat16Array
+-- import Hesper.Core.BFloat16Array  -- TODO: Implement C++ side
 
 -- Tensor operations
 import Hesper.Tensor.Types
