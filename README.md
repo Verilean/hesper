@@ -156,10 +156,45 @@ Hesper's `VerifiedOpFusion` architecture allows you to compose multiple GPU oper
 let fusedOp := matmulKernel |> reluKernel
 ```
 
-**Core Capabilities:**
-- **Zero-Copy Fusion**: Eliminate memory roundtrips between operations
-- **Formal Correctness**: Each fused kernel is verified against a CPU specification
-- **Hybrid Execution**: Fall back to CPU SIMD (via Google Highway) if GPU is unavailable
+**Key Advantages:**
+- **Zero-Copy Fusion**: Eliminate expensive memory roundtrips between kernels.
+- **Formal Correctness**: Each fused kernel is verified against a high-level CPU specification (`spec_forward`).
+- **Unified Interface**: Same code runs on GPU (via WGSL) or CPU (via Google Highway) for easy debugging.
+
+### 📈 Type-Safe Automatic Differentiation
+
+Hesper includes a robust reverse-mode AD system that enables gradient computation directly in Lean 4:
+
+```lean
+import Hesper.AD.Reverse
+
+-- Define a function to differentiate
+def loss (x : Float) : Float := x * x + 2.0 * x + 1.0
+
+-- Compute gradient at x = 3.0
+let grad := diff loss 3.0  -- Result: 8.0
+```
+
+**Features:**
+- **Reverse-Mode AD**: Efficient backpropagation via computational tapes.
+- **Differentiable Shaders**: Plan to extend AD directly into WGSL kernel generation.
+- **Optimizers**: Pre-built optimizers (Adam, SGD) that leverage AD for parameter updates.
+
+### ⚙️ High-Level Optimizers
+
+Train models using state-of-the-art optimizers that integrate with Hesper's verified tensors:
+
+```lean
+import Hesper.Optimizer.SGD
+
+-- Configure SGD with momentum
+let opt := SGDConfig.default
+  |>.withLearningRate 0.01 
+  |>.withMomentum 0.9
+
+-- Perform optimization step
+let (newParams, newState) := opt.step params grads state
+```
 
 ### 🎮 Graphics & Windowing
 
