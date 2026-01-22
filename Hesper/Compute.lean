@@ -146,7 +146,7 @@ def runSimpleKernel
   let buffer ← createBuffer device bufferDesc
 
   -- Upload input data
-  let bytes := Hesper.Basic.floatArrayToBytes inputData
+  let bytes ← Hesper.Basic.floatArrayToBytes inputData
   writeBuffer device buffer 0 bytes
 
   -- Compile shader

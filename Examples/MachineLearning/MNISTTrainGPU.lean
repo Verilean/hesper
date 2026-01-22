@@ -143,9 +143,12 @@ def gpuLayer1 (inst : Instance) (input w1 b1 : Array Float) (config : NetworkCon
   }
 
   -- Upload data
-  writeBuffer device inputBuf 0 (Hesper.Basic.floatArrayToBytes input)
-  writeBuffer device w1Buf 0 (Hesper.Basic.floatArrayToBytes w1)
-  writeBuffer device b1Buf 0 (Hesper.Basic.floatArrayToBytes b1)
+  let inputBytes ← Hesper.Basic.floatArrayToBytes input
+  writeBuffer device inputBuf 0 inputBytes
+  let w1Bytes ← Hesper.Basic.floatArrayToBytes w1
+  writeBuffer device w1Buf 0 w1Bytes
+  let b1Bytes ← Hesper.Basic.floatArrayToBytes b1
+  writeBuffer device b1Buf 0 b1Bytes
 
   -- Create and execute shader
   let shader := generateLayer1Shader config.inputSize config.hiddenSize
@@ -208,9 +211,12 @@ def gpuLayer2 (inst : Instance) (input w2 b2 : Array Float) (config : NetworkCon
     mappedAtCreation := false
   }
 
-  writeBuffer device inputBuf 0 (Hesper.Basic.floatArrayToBytes input)
-  writeBuffer device w2Buf 0 (Hesper.Basic.floatArrayToBytes w2)
-  writeBuffer device b2Buf 0 (Hesper.Basic.floatArrayToBytes b2)
+  let inputBytes2 ← Hesper.Basic.floatArrayToBytes input
+  writeBuffer device inputBuf 0 inputBytes2
+  let w2Bytes ← Hesper.Basic.floatArrayToBytes w2
+  writeBuffer device w2Buf 0 w2Bytes
+  let b2Bytes ← Hesper.Basic.floatArrayToBytes b2
+  writeBuffer device b2Buf 0 b2Bytes
 
   let shader := generateLayer2Shader config.hiddenSize config.outputSize
   let shaderModule ← createShaderModule device shader

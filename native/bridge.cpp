@@ -843,18 +843,24 @@ lean_obj_res lean_hesper_write_buffer(b_lean_obj_arg device_obj, b_lean_obj_arg 
     fprintf(stderr, "[C++]   [BUFFER WRITE] wrapper=%p, WGPUBuffer=%p\n", (void*)buffer, (void*)buffer->Get());
     fflush(stderr);
 
-    // Print first 16 bytes of data being written (as hex and float)
-    if (data_size >= 16) {
-        fprintf(stderr, "[C++]   Data being written (hex): ");
-        for (size_t i = 0; i < 16; i++) {
+    // Print data being written (as hex and interpret as floats if size is multiple of 4)
+    if (data_size > 0) {
+        fprintf(stderr, "[C++]   Data being written (%zu bytes, hex): ", data_size);
+        for (size_t i = 0; i < data_size && i < 32; i++) {
             fprintf(stderr, "%02x ", data_ptr[i]);
         }
         fprintf(stderr, "\n");
 
-        // Interpret as floats
-        const float* float_ptr = reinterpret_cast<const float*>(data_ptr);
-        fprintf(stderr, "[C++]   Data as floats: %.2f, %.2f, %.2f, %.2f\n",
-                float_ptr[0], float_ptr[1], float_ptr[2], float_ptr[3]);
+        // Interpret as floats if size is multiple of 4
+        if (data_size % 4 == 0 && data_size >= 4) {
+            const float* float_ptr = reinterpret_cast<const float*>(data_ptr);
+            size_t num_floats = data_size / 4;
+            fprintf(stderr, "[C++]   Data as floats: ");
+            for (size_t i = 0; i < num_floats && i < 8; i++) {
+                fprintf(stderr, "%.6f ", float_ptr[i]);
+            }
+            fprintf(stderr, "\n");
+        }
         fflush(stderr);
     }
 
@@ -898,9 +904,10 @@ lean_obj_res lean_hesper_map_buffer_read(b_lean_obj_arg device_obj, b_lean_obj_a
     // Use C API for OnSubmittedWorkDone with new struct-based API
     struct WorkDoneData {
         bool done;
+        WGPUQueueWorkDoneStatus status;
     };
 
-    static WorkDoneData workData = {false};  // Static to ensure lifetime during callback
+    static WorkDoneData workData = {false, WGPUQueueWorkDoneStatus_Success};  // Static to ensure lifetime during callback
 
     if (!g_dawn_instance) {
         fprintf(stderr, "[C++] ERROR: g_dawn_instance is null!\n");
@@ -917,6 +924,7 @@ lean_obj_res lean_hesper_map_buffer_read(b_lean_obj_arg device_obj, b_lean_obj_a
                                 void* userdata1, void* userdata2) {
         WorkDoneData* data = static_cast<WorkDoneData*>(userdata1);
         data->done = true;
+        data->status = status;
         fprintf(stderr, "[C++] OnSubmittedWorkDone: status=%d\n", static_cast<int>(status));
         if (message.length > 0) {
             fprintf(stderr, "[C++] Message: %.*s\n",
@@ -936,12 +944,24 @@ lean_obj_res lean_hesper_map_buffer_read(b_lean_obj_arg device_obj, b_lean_obj_a
     }
 
     if (!workData.done) {
-        fprintf(stderr, "[C++] WARNING: GPU work did not complete in time!\n");
+        fprintf(stderr, "[C++] ERROR: GPU work did not complete in time!\n");
         fflush(stderr);
-    } else {
-        fprintf(stderr, "[C++] GPU work completed, now copying to staging buffer\n");
-        fflush(stderr);
+        return lean_io_result_mk_ok(lean_mk_empty_byte_array(lean_box(0)));
     }
+
+    // Check if GPU work succeeded
+    if (workData.status != WGPUQueueWorkDoneStatus_Success) {
+        fprintf(stderr, "[C++] ERROR: GPU work failed with status=%d\n", static_cast<int>(workData.status));
+        fprintf(stderr, "[C++] This usually means:\n");
+        fprintf(stderr, "[C++]   - Shader validation error (check WGSL above)\n");
+        fprintf(stderr, "[C++]   - Buffer binding mismatch\n");
+        fprintf(stderr, "[C++]   - Resource usage conflict\n");
+        fflush(stderr);
+        return lean_io_result_mk_ok(lean_mk_empty_byte_array(lean_box(0)));
+    }
+
+    fprintf(stderr, "[C++] GPU work completed successfully, now copying to staging buffer\n");
+    fflush(stderr);
 
     // Following gpu.hpp toCPUAsync pattern:
     // 1. Create readback buffer (staging buffer for CPU read)
@@ -1686,6 +1706,38 @@ lean_obj_res lean_hesper_bytes_to_float64(b_lean_obj_arg bytes, uint32_t offset)
     double f64_value = static_cast<double>(f32_value);
 
     return lean_io_result_mk_ok(lean_box_float(f64_value));
+}
+
+// Convert Float64 (Lean Float) to 4 bytes (little-endian f32)
+// Properly converts f64→f32 then serializes to bytes
+lean_obj_res lean_hesper_float64_to_bytes(double f64_value) {
+    fprintf(stderr, "[C++] float64_to_bytes called: f64=%.6f\n", f64_value);
+    fflush(stderr);
+
+    // Convert f64 to f32 (proper narrowing conversion)
+    float f32_value = static_cast<float>(f64_value);
+
+    // Get f32 bit representation
+    uint32_t bits32;
+    memcpy(&bits32, &f32_value, sizeof(float));
+
+    // Create ByteArray with 4 bytes (little-endian)
+    uint8_t bytes[4] = {
+        static_cast<uint8_t>(bits32 & 0xFF),
+        static_cast<uint8_t>((bits32 >> 8) & 0xFF),
+        static_cast<uint8_t>((bits32 >> 16) & 0xFF),
+        static_cast<uint8_t>((bits32 >> 24) & 0xFF)
+    };
+
+    lean_object* byte_array = lean_alloc_sarray(1, 4, 4);  // tag=1, size=4, capacity=4
+    uint8_t* dest = reinterpret_cast<uint8_t*>(lean_sarray_cptr(byte_array));
+    memcpy(dest, bytes, 4);
+
+    fprintf(stderr, "[C++] float64_to_bytes returning ByteArray size=%zu, bytes=%02x %02x %02x %02x\n",
+            lean_sarray_size(byte_array), bytes[0], bytes[1], bytes[2], bytes[3]);
+    fflush(stderr);
+
+    return lean_io_result_mk_ok(byte_array);
 }
 
 // ============================================================================
