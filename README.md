@@ -124,6 +124,29 @@ if hasFP16 then
 **Zero-Conversion Architecture:**
 All operations work directly on raw `ByteArray` with no automatic type conversions. Conversions are explicit only when needed.
 
+### ⚡️ High-Level Parallel API
+
+Inspired by `webgpu-dawn`, Hesper provides an easy-to-use API for data-parallelism that handles all GPU boilerplate (buffers, shaders, synchronization) in a single call.
+
+#### parallelFor
+
+Quickly execute a WGSL shader over a `Float` array:
+
+```lean
+import Hesper.Compute
+
+-- Multiply each element by 1000 on the GPU
+let result ← parallelFor device shader inputData
+```
+
+#### Device.compute
+
+Run a computation with multiple named buffers directly on the `Device`:
+
+```lean
+device.compute myKernel [("input", inputBuf), ("output", outputBuf)] config
+```
+
 ### 🎯 Type-Safe Shader DSL
 
 Write WGSL shaders with Lean's type system guaranteeing correctness:
