@@ -302,6 +302,14 @@ lean_exe «mnist-train-gpu» where
   root := `Examples.MachineLearning.MNISTTrainGPU
   moreLinkArgs := stdLinkArgs
 
+lean_exe «mnist-train-gpu-backprop» where
+  root := `Examples.MachineLearning.MNISTTrainGPUBackprop
+  moreLinkArgs := stdLinkArgs
+
+lean_exe «mnist-train-gpu-full» where
+  root := `Examples.MachineLearning.MNISTTrainGPUFull
+  moreLinkArgs := stdLinkArgs
+
 -- ----------------------------------------------------------------------------
 -- Graphics Examples (GLFW rendering and window management)
 -- ----------------------------------------------------------------------------
