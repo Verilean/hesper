@@ -48,6 +48,7 @@ import Hesper.Op.Activation
 -- Neural network operations
 import Hesper.NN.Activation
 import Hesper.NN.Conv
+import Hesper.NN.MLP
 
 -- Automatic differentiation
 import Hesper.AD.Reverse
