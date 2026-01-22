@@ -135,7 +135,7 @@ def fromTask (task : IO (AsyncTask α)) : AsyncPipeline α :=
   { run := task }
 
 /-- Chain two pipeline stages -/
-def andThen (p1 : AsyncPipeline α) (f : α → IO (AsyncTask β)) : AsyncPipeline β :=
+def andThen [Inhabited α] [Inhabited β] (p1 : AsyncPipeline α) (f : α → IO (AsyncTask β)) : AsyncPipeline β :=
   { run := do
       let task1 ← p1.run
       bindTask task1 f
