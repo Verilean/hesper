@@ -1,3 +1,4 @@
+import Hesper
 import Hesper.Async
 
 /-!
@@ -8,7 +9,18 @@ Demonstrates asynchronous GPU compute using Lean 4's Task system.
 
 namespace Examples.AsyncDemo
 
+open Hesper.WebGPU
 open Hesper.Async
+
+/-- Helper to get a valid buffer for demos -/
+def getDemoBuffer : IO (Option Hesper.WebGPU.Buffer) := do
+  try
+    let inst ← Hesper.init
+    let device ← getDevice inst
+    let buf ← Hesper.WebGPU.createBuffer device { size := 1024, usage := [.storage, .mapRead], mappedAtCreation := false }
+    return some buf
+  catch _ =>
+    return none
 
 /-- Demo 1: Basic async task -/
 def demo1_basic : IO Unit := do
@@ -70,9 +82,11 @@ def demo3_pipeline : IO Unit := do
   let pipeline := AsyncPipeline.fromTask (asyncShaderExec "compute" (64, 64, 1))
     |>.andThen (fun _ => do
         IO.println "  [Stage 1 complete, starting Stage 2...]"
-        -- Dummy buffer for demo
-        let dummyBuffer : Hesper.WebGPU.Buffer := default
-        asyncBufferRead dummyBuffer 1024
+        -- Initialize a real buffer for demo if possible
+        let dummyBufferOpt ← getDemoBuffer
+        match dummyBufferOpt with
+        | some dummyBuffer => asyncBufferRead dummyBuffer 1024
+        | none => launchAsync (return { value := #[], executionTimeMs := 0.0 })
       )
     |>.map (fun data => data.size)
 
@@ -149,8 +163,10 @@ def demo6_transform : IO Unit := do
   IO.println ""
 
   IO.println "Launch compute task..."
-  let dummyBuffer : Hesper.WebGPU.Buffer := default
-  let task ← asyncBufferRead dummyBuffer 100
+  let dummyBufferOpt ← getDemoBuffer
+  let task ← match dummyBufferOpt with
+    | some dummyBuffer => asyncBufferRead dummyBuffer 100
+    | none => launchAsync (return { value := #[], executionTimeMs := 0.0 })
 
   IO.println "Transform result asynchronously..."
   let transformed := mapTask (fun data => data.size * 2) task
