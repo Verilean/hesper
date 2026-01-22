@@ -34,10 +34,19 @@ Modern GPU programming lacks safety guarantees. Hesper provides:
 
 ### Prerequisites
 
-- **Lean 4** (latest version recommended)
-- **CMake** 3.16+
-- **C++17** compiler (Clang/GCC)
 - **Platform**: macOS (Metal), Linux (Vulkan), or Windows (D3D12/Vulkan)
+
+### 🐳 Docker Environment (Recommended for Linux/CI)
+
+For a reproducible build environment, especially on Linux, you can use the provided Docker image:
+
+```bash
+# Build the image
+docker build -t hesper-ci .
+
+# Run build and tests inside container
+docker run -it hesper-ci lake test-all
+```
 
 ### Installation
 
@@ -81,9 +90,9 @@ lake build myfirst
 
 ## Features
 
-### 🚀 Multi-Precision SIMD CPU Backend
+### 🚀 Portable SIMD CPU Backend (Google Highway)
 
-Hardware-accelerated CPU operations with multi-precision support:
+Hardware-accelerated CPU operations powered by **Google Highway**, providing high-performance SIMD across x86, ARM, and RISC-V:
 
 ```lean
 import Hesper.Simd
@@ -106,10 +115,11 @@ if hasFP16 then
   let c16 ← Float16.simdAdd a16 b16
 ```
 
-**Architecture Detection:**
-- ARM64: NEON (default) + optional FP16 vector arithmetic (ARMv8.2-A+)
-- x86_64: AVX2 + F16C extension (Ivy Bridge+)
-- Optional OpenMP multithreading support
+**Features:**
+- **Google Highway Integration**: Portable SIMD implementation with runtime dispatch
+- **Architecture Support**: NEON (ARM), AVX2/AVX-512 (x86), optional FP16 vector arithmetic
+- **Multi-Precision**: Optimized paths for Float64, Float32, and Float16
+- **OpenMP Support**: Optional multithreading for large tensor operations
 
 **Zero-Conversion Architecture:**
 All operations work directly on raw `ByteArray` with no automatic type conversions. Conversions are explicit only when needed.
@@ -136,38 +146,20 @@ let power := Exp.pow x (lit 2.0)
 IO.println distance.toWGSL  -- Output: sqrt((x * x) + (y * y))
 ```
 
-### ⚙️ GPU Computation & SIMD CPU Backend
+### 🧩 Verified Composable Kernels (Operator Fusion)
 
-Execute compute shaders on GPU or leverage SIMD acceleration on CPU:
+Hesper's `VerifiedOpFusion` architecture allows you to compose multiple GPU operations into a single kernel pass while maintaining formal correctness:
 
 ```lean
-import Hesper.Compute
-import Hesper.Simd
-
--- Matrix multiplication on GPU
-let A : Matrix 1024 1024 := ...
-let B : Matrix 1024 1024 := ...
-
--- Runs on GPU automatically
-let C ← matmul A B
-
--- CPU SIMD operations with multi-precision support
-let a := FloatArray.mk #[1.0, 2.0, 3.0, 4.0]
-let b := FloatArray.mk #[5.0, 6.0, 7.0, 8.0]
-let c := Hesper.Simd.simdAdd a b  -- NEON/AVX2 acceleration
-
--- Float32 (2x memory savings)
-let a32 := Float32.fromFloatArray a
-let c32 := Float32.simdAdd a32 b32
-
--- Float16 (4x memory savings, hardware-accelerated)
-let a16 ← Float16.fromFloatArray a
-let c16 ← Float16.simdAdd a16 b16
-
--- Neural network layers with automatic differentiation
-let conv ← Conv2D.create inputChannels outputChannels kernelSize
-let output ← conv.forward input
+-- Fuses MatMul and ReLU into a single GPU kernel
+-- Correctness is proven by construction
+let fusedOp := matmulKernel |> reluKernel
 ```
+
+**Core Capabilities:**
+- **Zero-Copy Fusion**: Eliminate memory roundtrips between operations
+- **Formal Correctness**: Each fused kernel is verified against a CPU specification
+- **Hybrid Execution**: Fall back to CPU SIMD (via Google Highway) if GPU is unavailable
 
 ### 🎮 Graphics & Windowing
 
@@ -618,34 +610,19 @@ Hesper/
 
 **Current Status**: Early Development (Alpha)
 
-Completed:
-- [x] WebGPU device initialization via Dawn
-- [x] Type-safe WGSL DSL
-- [x] Compute shader execution
-- [x] Buffer management (GPU ↔ CPU)
-- [x] GLFW windowing integration
-- [x] Multi-GPU adapter enumeration
-- [x] Basic matrix operations
-- [x] Convolution layers
-- [x] Automatic differentiation
-- [x] **Multi-precision SIMD CPU backend (Float64/Float32/Float16)**
+- [x] **Multi-precision SIMD CPU backend (Google Highway)**
 - [x] **Architecture detection (NEON/AVX2/F16C)**
 - [x] **Comprehensive error handling with structured error types**
 - [x] **Complete test suite (error handling, shader monad)**
+- [x] **Docker-based CI environment**
+- [x] **Verified Composable Kernels (VerifiedOpFusion)**
 
 In Progress:
-- [ ] Comprehensive tensor operation library
-- [ ] Neural network training framework
-- [ ] Performance optimization (subgroup operations)
-- [ ] Verification of GPU kernel correctness
-
-Future:
-- [ ] Formal proofs of numerical stability
-- [ ] Compiler optimizations for shader generation
-- [ ] Distributed multi-GPU training
+- [ ] Comprehensive tensor operation library (GEMM, Conv3D)
+- [ ] Gemma 3 / Transformer support
+- [ ] Automatic differentiation on GPU kernels
+- [ ] Formal proofs of kernel numerical stability
 - [ ] Integration with Lean's tactic framework
-- [ ] Ray tracing support
-- [ ] Multi-precision GPU tensors (Float16 for memory bandwidth optimization)
 
 ## Contributing
 
