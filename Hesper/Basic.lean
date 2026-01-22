@@ -6,17 +6,10 @@ Utility functions and helpers for the Hesper library.
 
 namespace Hesper.Basic
 
-/-- Convert a Float to 4 bytes (little-endian) -/
-def floatToBytes (f : Float) : ByteArray :=
-  -- Use bit representation of float as UInt64 (Lean's Float is 64-bit)
-  -- For 32-bit float representation, we take the lower 32 bits
-  let bits : UInt64 := f.toBits
-  let bits32 := bits.toNat &&& 0xFFFFFFFF
-  let b0 := UInt8.ofNat (bits32 &&& 0xFF)
-  let b1 := UInt8.ofNat ((bits32 >>> 8) &&& 0xFF)
-  let b2 := UInt8.ofNat ((bits32 >>> 16) &&& 0xFF)
-  let b3 := UInt8.ofNat ((bits32 >>> 24) &&& 0xFF)
-  ByteArray.mk #[b0, b1, b2, b3]
+/-- Convert Float64 (Lean Float) to 4 bytes (little-endian f32)
+    Uses FFI to properly convert f64→f32→bytes -/
+@[extern "lean_hesper_float64_to_bytes"]
+opaque floatToBytes (f : @& Float) : IO ByteArray
 
 /-- Convert 4 bytes (little-endian) to Float -/
 def bytesToFloat (bytes : ByteArray) (offset : Nat := 0) : Float :=
@@ -31,8 +24,12 @@ def bytesToFloat (bytes : ByteArray) (offset : Nat := 0) : Float :=
     Float.ofBits (UInt64.ofNat bits32)
 
 /-- Convert an array of floats to a byte array -/
-def floatArrayToBytes (arr : Array Float) : ByteArray :=
-  arr.foldl (fun acc f => acc ++ floatToBytes f) ByteArray.empty
+def floatArrayToBytes (arr : Array Float) : IO ByteArray := do
+  let mut bytes := ByteArray.empty
+  for f in arr do
+    let fb ← floatToBytes f
+    bytes := bytes ++ fb
+  return bytes
 
 /-- Convert 4 bytes (little-endian f32) to Float (f64)
     Uses FFI to properly interpret f32 bits and convert to f64 -/
