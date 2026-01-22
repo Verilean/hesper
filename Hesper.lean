@@ -26,6 +26,7 @@ import Hesper.WebGPU.Pipeline
 import Hesper.Compute
 
 -- Core abstractions
+import Hesper.Core.Differentiable
 -- Note: VerifiedOp and VerifiedOpFusion both define TensorData, so we only import one
 -- import Hesper.Core.VerifiedOp  -- Original immediate execution (use for legacy code)
 import Hesper.Core.VerifiedOpFusion  -- New fusion-enabled abstraction

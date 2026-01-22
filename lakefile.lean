@@ -265,6 +265,10 @@ lean_exe «ad-proof» where
 lean_exe «ad-debug» where
   root := `Examples.DSL.ADDebug
 
+lean_exe «unified-ad-demo» where
+  root := `Examples.DSL.UnifiedADDemo
+  moreLinkArgs := stdLinkArgs
+
 lean_exe «verified-op-demo» where
   root := `Examples.DSL.VerifiedOpDemo
   moreLinkArgs := stdLinkArgs

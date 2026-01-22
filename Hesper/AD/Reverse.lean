@@ -1,3 +1,4 @@
+import Hesper.Core.Differentiable
 /-!
 # Reverse-Mode Automatic Differentiation
 
@@ -103,6 +104,12 @@ def lift2 (f : Float → Float → Float)
     [x.tapeIdx, y.tapeIdx]
     [df_dx x.primal y.primal, df_dy x.primal y.primal]
   (tape', { primal := z, tapeIdx := idx })
+
+/-- Lift a generic Differentiable operation to Dual numbers -/
+def lift {Op I O : Type} [inst : Hesper.Core.Differentiable Op I O] (op : Op) (x : I) (tape : Tape) (parentIndices : List Nat) (localGrads : List Float) : Tape × O × Nat :=
+  let y := inst.forward op x
+  let (tape', idx) := tape.add parentIndices localGrads
+  (tape', y, idx)
 
 end Dual
 
