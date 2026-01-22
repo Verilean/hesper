@@ -486,7 +486,7 @@ inductive Exp : WGSLType → Type where
   | workgroupBarrier : Exp (.scalar .u32)  -- Returns unit
 
 /-- Code generation: convert expression to WGSL string -/
-def Exp.toWGSL {t : WGSLType} : Exp t → String
+partial def Exp.toWGSL {t : WGSLType} : Exp t → String
   | litF32 f => s!"{f}"
   | litF16 f => s!"{f}h"
   | litI32 i => s!"{i}i"
@@ -808,11 +808,5 @@ def Exp.toWGSL {t : WGSLType} : Exp t → String
     s!"unpack2x16float({toWGSL v})"
   | workgroupBarrier =>
     "workgroupBarrier()"
-termination_by e => sizeOf e
-decreasing_by
-  all_goals
-    simp_wf
-    try omega  -- Solve most goals with arithmetic
-  all_goals sorry  -- TODO: Remaining goals for call/structConstruct List.map cases require complex dependent pair proofs
 
 end Hesper.WGSL
