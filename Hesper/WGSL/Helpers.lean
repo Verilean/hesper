@@ -114,14 +114,18 @@ def softmaxInPlace (dataName : String) (size : Nat) : ShaderM Unit := do
     let newMax := Exp.max currentMax val
     ShaderM.assign maxVar newMax
 
-  -- Compute exp(x - max) and sum
-  let sumVar ← ShaderM.var (.scalar .f32) (Exp.litF32 0.0)
-
+  -- Compute exp(x - max) in-place
   ShaderM.loop (Exp.litU32 0) (Exp.litU32 size) (Exp.litU32 1) fun i => do
     let val := Exp.index (Exp.var dataName : Exp (.array (.scalar .f32) size)) i
     let shifted := Exp.sub val (Exp.var maxVar)
     let expVal := Exp.exp shifted
     ShaderM.assignIndex dataName i expVal
+
+  -- Compute sum of exp values
+  let sumVar ← ShaderM.var (.scalar .f32) (Exp.litF32 0.0)
+
+  ShaderM.loop (Exp.litU32 0) (Exp.litU32 size) (Exp.litU32 1) fun i => do
+    let expVal := Exp.index (Exp.var dataName : Exp (.array (.scalar .f32) size)) i
     let currentSum := Exp.var sumVar
     let newSum := Exp.add currentSum expVal
     ShaderM.assign sumVar newSum
