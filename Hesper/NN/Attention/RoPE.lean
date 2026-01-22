@@ -1,26 +1,27 @@
 import Hesper.Tensor.Typed
 
 /-!
-# Rotary Positional Embeddings (RoPE)
+# Rotary Position Embeddings (EXPERIMENTAL - WIP)
+
+**STATUS**: Work in Progress - Depends on `Hesper.Tensor.Typed`
+
+This module implements Rotary Position Embeddings (RoPE) for transformer models.
+RoPE is used in models like LLaMA, Gemma, and others to encode positional information.
+
+## Dependencies
+
+Requires `Hesper.Tensor.Typed` to be completed first.
+
+## References
+
+- RoPE Paper: https://arxiv.org/abs/2104.09864
+- Used in: Gemma 3 model
+
 -/
 
-namespace Hesper.NN.Attention hiding RoPE
+namespace Hesper.NN.Attention
 
-open Hesper.Tensor
-
-/-- RoPE Configuration -/
-structure RoPEConfig where
-  dim : Nat
-  maxPositionEmbeddings : Nat := 8192
-  base : Float := 10000.0
-
-/-- Apply RoPE to query/key tensors -/
-def applyRotaryPosEmb {Batch Seq Heads HeadDim : Nat} {dt : DType}
-  (q : TypedTensor (Shape.tensor4D Batch Seq Heads HeadDim) dt)
-  (k : TypedTensor (Shape.tensor4D Batch Seq Heads HeadDim) dt)
-  (_pos : TypedTensor (Shape.vector Seq) .i32) -- Positions
-  : (TypedTensor (Shape.tensor4D Batch Seq Heads HeadDim) dt) ×
-    (TypedTensor (Shape.tensor4D Batch Seq Heads HeadDim) dt) :=
-  (q, k) -- Placeholder
+/-- PLACEHOLDER: Awaiting TypedTensor implementation -/
+axiom RoPE_WIP : Unit
 
 end Hesper.NN.Attention

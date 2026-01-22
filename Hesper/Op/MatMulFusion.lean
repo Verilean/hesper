@@ -53,7 +53,7 @@ open Hesper.Tensor
     4. Store to output buffer
 
     For now, this is a placeholder showing the type structure. -/
-def matmulKernel {M K N : Nat}
+def matmulKernel {_M _K _N : Nat}
     : Kernel 256 1 1 Unit (Exp (.scalar .f32)) :=
   -- Placeholder: returns a dummy expression
   -- In reality, this would compute the actual matrix product
@@ -75,7 +75,7 @@ def matmulWithActivation {M K N : Nat}
     : Kernel 256 1 1 Unit (Exp (.scalar .f32)) :=
   -- Compose matmul with activation
   -- The activation kernel transforms each output value before it's stored
-  Kernel.comp activation (matmulKernel (M := M) (K := K) (N := N))
+  Kernel.comp activation (matmulKernel (_M := M) (_K := K) (_N := N))
 
 /-! ## Common Fused Patterns -/
 

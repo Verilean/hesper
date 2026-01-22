@@ -18,7 +18,7 @@ Total: 13 integration tests
 namespace Hesper.Tests.Integration
 
 open Hesper.WebGPU
-open Hesper.Tests.Integration.TestHarness
+open Hesper.Tests.Integration
 
 def main : IO Unit := do
   IO.println "╔══════════════════════════════════════════════════════════╗"
@@ -32,7 +32,7 @@ def main : IO Unit := do
   IO.println "✅ GPU initialized"
   IO.println ""
 
-  let mut stats := TestStats.mk
+  let mut stats : TestStats := {}
 
   -- Run Compute Pipeline Tests
   IO.println "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"

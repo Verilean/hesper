@@ -123,7 +123,7 @@ def printStats (stats : TestStats) : IO Unit := do
     IO.println s!"⚠️  Some tests were skipped"
 
 /-- Exit code based on test results -/
-def exitCode (stats : TestStats) : UInt32 :=
+def exitCode (stats : TestStats) : UInt8 :=
   if stats.failed > 0 then 1 else 0
 
 end Hesper.Tests.Integration

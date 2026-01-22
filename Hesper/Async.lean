@@ -51,7 +51,7 @@ def launchAsync [Inhabited α] (computation : IO (AsyncResult α)) : IO (AsyncTa
     | .error _ => { value := default, executionTimeMs := 0.0 }  -- Handle errors
 
 /-- Launch async shader execution and return a Task -/
-def asyncShaderExec (shader : String) (workgroups : Nat × Nat × Nat) [Inhabited Unit] : IO (AsyncTask Unit) :=
+def asyncShaderExec (_shader : String) (_workgroups : Nat × Nat × Nat) [Inhabited Unit] : IO (AsyncTask Unit) :=
   launchAsync do
     let startTime ← IO.monoMsNow
 
@@ -65,7 +65,7 @@ def asyncShaderExec (shader : String) (workgroups : Nat × Nat × Nat) [Inhabite
     return ({ value := (), executionTimeMs := execTime } : AsyncResult Unit)
 
 /-- Launch async buffer read and return a Task -/
-def asyncBufferRead (buffer : Buffer) (size : Nat) : IO (AsyncTask (Array Float)) :=
+def asyncBufferRead (_buffer : Buffer) (size : Nat) : IO (AsyncTask (Array Float)) :=
   launchAsync do
     let startTime ← IO.monoMsNow
 
@@ -78,7 +78,7 @@ def asyncBufferRead (buffer : Buffer) (size : Nat) : IO (AsyncTask (Array Float)
     return ({ value := data, executionTimeMs := execTime } : AsyncResult (Array Float))
 
 /-- Launch async buffer write and return a Task -/
-def asyncBufferWrite (buffer : Buffer) (data : Array Float) [Inhabited Unit] : IO (AsyncTask Unit) :=
+def asyncBufferWrite (_buffer : Buffer) (_data : Array Float) [Inhabited Unit] : IO (AsyncTask Unit) :=
   launchAsync do
     let startTime ← IO.monoMsNow
 
@@ -168,7 +168,7 @@ structure AsyncComputeConfig where
   deriving Inhabited, Repr
 
 /-- Launch async compute operation -/
-def asyncCompute (config : AsyncComputeConfig) (inputs : Array (Array Float)) : IO (AsyncTask (Array Float)) :=
+def asyncCompute (config : AsyncComputeConfig) (_inputs : Array (Array Float)) : IO (AsyncTask (Array Float)) :=
   launchAsync do
     let startTime ← IO.monoMsNow
 

@@ -25,7 +25,7 @@ namespace Hesper.Tests.Integration.BufferOperations
 
 open Hesper.WebGPU
 open Hesper.Compute
-open Hesper.Tests.Integration.TestHarness
+open Hesper.Tests.Integration
 open Hesper.Tests.Integration.TestData
 
 /-- Test 1: Small buffer (1KB = 256 floats) -/
@@ -159,7 +159,7 @@ def testHostToGPUTransfer (device : Device) : IO TestResult := do
   -- Verify upload by reading back
   let result ← readBufferAsFloats device inputBuf size
 
-  if compareFloatArrays input result then
+  return if compareFloatArrays input result then
     .pass s!"Host→GPU Transfer (40KB in {uploadTime}ms)"
   else
     .fail "Host→GPU Transfer" "Data corruption during upload"
@@ -178,7 +178,7 @@ def testGPUToHostTransfer (device : Device) : IO TestResult := do
   let endTime ← IO.monoMsNow
   let downloadTime := (endTime - startTime).toFloat
 
-  if compareFloatArrays input result then
+  return if compareFloatArrays input result then
     .pass s!"GPU→Host Transfer (40KB in {downloadTime}ms)"
   else
     .fail "GPU→Host Transfer" "Data corruption during download"

@@ -197,6 +197,6 @@ def Float16Array.toString (arr : Float16Array) : IO String := do
   return s!"Float16Array[{size}]: [{String.intercalate ", " elements}{rest}]"
 
 instance : ToString Float16Array where
-  toString arr := s!"Float16Array[size=?] (use arr.toString for details)"
+  toString _arr := s!"Float16Array[size=?] (use arr.toString for details)"
 
 end Hesper.Core

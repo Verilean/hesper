@@ -1,0 +1,11 @@
+
+.lake/
+.git/
+native/dawn/
+c_src/build/
+build/
+*.olean
+*.ilean
+*.c
+*.o
+*.a

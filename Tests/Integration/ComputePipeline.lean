@@ -25,7 +25,7 @@ namespace Hesper.Tests.Integration.ComputePipeline
 
 open Hesper.WebGPU
 open Hesper.Compute
-open Hesper.Tests.Integration.TestHarness
+open Hesper.Tests.Integration
 open Hesper.Tests.Integration.TestData
 
 /-- Test 1: Simple increment kernel -/
@@ -303,7 +303,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   let result1 ← readBufferAsFloats device output1Buf 4
   let result2 ← readBufferAsFloats device output2Buf 4
 
-  if compareFloatArrays expected1 result1 && compareFloatArrays expected2 result2 then
+  return if compareFloatArrays expected1 result1 && compareFloatArrays expected2 result2 then
     .pass "Shader Reuse"
   else
     .fail "Shader Reuse" "One or both executions produced incorrect results"

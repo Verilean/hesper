@@ -109,15 +109,15 @@ partial def Stmt.toWGSL (indent : Nat := 0) : Stmt → String
     let ind := String.ofList (List.replicate indent ' ')
     s!"{ind}var {name}: {ty.toWGSL};\n"
 
-  | .varDecl name ty (some ⟨t, init⟩) =>
+  | .varDecl name ty (some ⟨_t, init⟩) =>
     let ind := String.ofList (List.replicate indent ' ')
     s!"{ind}var {name}: {ty.toWGSL} = {init.toWGSL};\n"
 
-  | .assign name ty value =>
+  | .assign name _ty value =>
     let ind := String.ofList (List.replicate indent ' ')
     s!"{ind}{name} = {value.toWGSL};\n"
 
-  | .assignIndex arrName index ty value =>
+  | .assignIndex arrName index _ty value =>
     let ind := String.ofList (List.replicate indent ' ')
     s!"{ind}{arrName}[{index.toWGSL}] = {value.toWGSL};\n"
 
