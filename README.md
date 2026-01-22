@@ -161,24 +161,22 @@ let fusedOp := matmulKernel |> reluKernel
 - **Formal Correctness**: Each fused kernel is verified against a high-level CPU specification (`spec_forward`).
 - **Unified Interface**: Same code runs on GPU (via WGSL) or CPU (via Google Highway) for easy debugging.
 
-### 📈 Type-Safe Automatic Differentiation
+### 📈 Unified Verified Automatic Differentiation
 
-Hesper includes a robust reverse-mode AD system that enables gradient computation directly in Lean 4:
+Hesper's unique architecture unifies **formal verification** with **automatic differentiation**. By "lifting" `VerifiedOp` kernels into the `AD.Reverse` tape, Hesper enables end-to-end differentiable GPU programming that is correct by construction:
 
 ```lean
-import Hesper.AD.Reverse
+-- VerifiedOp instances act as primitives for AD
+let loss := crossEntropy |> mlpForward |> matmul
 
--- Define a function to differentiate
-def loss (x : Float) : Float := x * x + 2.0 * x + 1.0
-
--- Compute gradient at x = 3.0
-let grad := diff loss 3.0  -- Result: 8.0
+-- AD engine automatically calls impl_kernel_backward on GPU
+let grad := diff loss input 
 ```
 
-**Features:**
-- **Reverse-Mode AD**: Efficient backpropagation via computational tapes.
-- **Differentiable Shaders**: Plan to extend AD directly into WGSL kernel generation.
-- **Optimizers**: Pre-built optimizers (Adam, SGD) that leverage AD for parameter updates.
+**Key Features:**
+- **Hybrid AD**: Seamlessly switch between CPU-scalar AD and GPU-tensor AD.
+- **Differentiable Verified Primitives**: Use hand-optimized, verified kernels (e.g., FlashAttention) as AD graph nodes.
+- **End-to-End Backprop**: Automatic tape management across fused GPU kernels and CPU logic.
 
 ### ⚙️ High-Level Optimizers
 
