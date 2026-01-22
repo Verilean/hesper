@@ -383,6 +383,10 @@ lean_exe «simple-write» where
   root := `Examples.Tests.SimpleWrite
   moreLinkArgs := stdLinkArgs
 
+lean_exe «opaque-array-test» where
+  root := `Examples.Tests.OpaqueArrayTest
+  moreLinkArgs := stdLinkArgs
+
 lean_exe «unit-tests» where
   root := `Tests.UnitTests
   moreLinkArgs := stdLinkArgs

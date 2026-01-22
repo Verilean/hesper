@@ -30,6 +30,11 @@ import Hesper.Compute
 -- import Hesper.Core.VerifiedOp  -- Original immediate execution (use for legacy code)
 import Hesper.Core.VerifiedOpFusion  -- New fusion-enabled abstraction
 
+-- Core array types (opaque, zero-copy, in-place mutable)
+import Hesper.Core.Float32Array
+import Hesper.Core.Float16Array
+import Hesper.Core.BFloat16Array
+
 -- Tensor operations
 import Hesper.Tensor.Types
 import Hesper.Tensor.MatMul

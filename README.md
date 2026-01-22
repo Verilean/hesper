@@ -296,6 +296,238 @@ Features:
 - Backpropagation on GPU
 - Real-time training visualization
 
+## Building and Testing
+
+### Building the Project
+
+Hesper requires building both native C++ dependencies (Google Dawn) and Lean code.
+
+**Step 1: Build Native Dependencies**
+
+The first build will take 5-15 minutes as it compiles Google Dawn from source:
+
+```bash
+# Build the native WebGPU bridge (hesper_native library)
+lake script run buildNative
+```
+
+This compiles:
+- Google Dawn WebGPU implementation
+- C++ FFI bridge (`native/bridge.cpp`)
+- SIMD CPU backend (`c_src/simd_ops.cpp`)
+
+**Step 2: Build Lean Code**
+
+Once native dependencies are built, compile the Lean libraries and executables:
+
+```bash
+# Build the core library
+lake build Hesper
+
+# Or build a specific executable
+lake build simple-write
+```
+
+**Clean Build** (if you encounter issues):
+
+```bash
+lake clean
+lake script run buildNative
+lake build
+```
+
+### Testing the Installation
+
+#### 1. Simple GPU Test (Raw WGSL + DSL)
+
+This test verifies both raw WGSL shaders and DSL-generated shaders execute correctly on your GPU:
+
+```bash
+lake build simple-write
+./.lake/build/bin/simple-write
+```
+
+**Expected output:**
+```
+╔══════════════════════════════════════╗
+║   GPU Double Test (DSL + Raw)        ║
+╚══════════════════════════════════════╝
+
+📝 DSL-generated WGSL:
+─────────────────────────────────────
+@group(0) @binding(0) var<storage, read_write> input: array<f32>;
+@group(0) @binding(1) var<storage, read_write> output: array<f32>;
+
+@compute @workgroup_size(1)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    if (idx < arrayLength(&input)) {
+        output[idx] = input[idx] * 2.0;
+    }
+}
+
+🚀 Initializing WebGPU...
+  ✓ Created input buffer
+  ✓ Wrote input: [1.0, 2.0, 3.0, 4.0]
+  ✓ Created output buffer
+
+  🔹 Test 1: Raw WGSL shader
+  ✓ Raw WGSL executed
+
+  🔹 Test 2: DSL-generated shader
+  ✓ DSL shader executed
+
+📊 Results:
+  Input → Expected → Raw WGSL → DSL WGSL
+  [0] 1.0 → 2.0 → 2.0 ✓ → 2.0 ✓
+  [1] 2.0 → 4.0 → 4.0 ✓ → 4.0 ✓
+  [2] 3.0 → 6.0 → 6.0 ✓ → 6.0 ✓
+  [3] 4.0 → 8.0 → 8.0 ✓ → 8.0 ✓
+
+✅ SUCCESS: Both shaders work correctly!
+   - Raw WGSL shader: ✓
+   - DSL-generated shader (ShaderM monad): ✓
+   - Both produce identical correct results
+```
+
+This test validates:
+- ✓ WebGPU initialization and GPU discovery
+- ✓ Buffer creation and data transfer (CPU ↔ GPU)
+- ✓ Raw WGSL shader compilation and execution
+- ✓ DSL shader code generation (ShaderM monad → WGSL)
+- ✓ DSL shader execution on GPU
+- ✓ Correct data marshalling across the FFI boundary
+
+#### 2. FFI Boundary Tests
+
+Test data conversion across the Lean ↔ C++ FFI boundary:
+
+```bash
+lake build ffi-tests
+./.lake/build/bin/ffi-tests
+```
+
+**Expected output:**
+```
+╔══════════════════════════════════════╗
+║   FFI Boundary Tests                 ║
+╚══════════════════════════════════════╝
+
+Test 1: Lean writes data, C++ reads
+  ✓ Lean wrote: [1.0, 2.0, 3.0, 4.0]
+  ✓ C++ verified byte-level accuracy
+
+Test 2: C++ writes data, Lean reads
+  ✓ GPU wrote: [10.0, 20.0, 30.0, 40.0]
+  ✓ Lean verified byte-level accuracy
+
+Test 3: Round-trip (Lean → GPU → Lean)
+  ✓ Input: [5.0, 10.0, 15.0, 20.0]
+  ✓ Output: [10.0, 20.0, 30.0, 40.0]
+  ✓ Data integrity preserved
+
+✅ All FFI boundary tests passed!
+```
+
+This validates:
+- Lean writes ByteArray → C++ reads correct bytes
+- C++ writes bytes → Lean reads correct Float values
+- Round-trip data integrity across FFI boundary
+
+#### 3. SIMD CPU Backend Test
+
+Test multi-precision SIMD operations (Float64/Float32/Float16):
+
+```bash
+lake script run buildSimd
+lake build multi-precision
+./.lake/build/bin/multi-precision
+```
+
+**Expected output (on ARM64 with FP16 support):**
+```
+Backend: NEON (ARM64) - F64: 2/op, F32: 4/op, FP16
+
+─── Float64 (8 bytes/element) ───
+Result: #[6.0, 8.0, 10.0, 12.0] ✓
+
+─── Float32 (4 bytes/element) ───
+Result: Float32[4]: [6.0, 8.0, 10.0, 12.0] ✓
+
+─── Float16 (2 bytes/element) ───
+FP16 hardware detected!
+Result: Float16[4]: [6.0, 8.0, 10.0, 12.0] ✓
+```
+
+### For Contributors: Testing Your Changes
+
+When making changes to Hesper, run these tests to ensure you haven't broken anything:
+
+#### 1. Core FFI Tests
+```bash
+# Test Lean ↔ C++ data conversion
+lake build ffi-tests
+./.lake/build/bin/ffi-tests
+```
+
+#### 2. GPU Shader Tests
+```bash
+# Test raw WGSL and DSL shader execution
+lake build simple-write
+./.lake/build/bin/simple-write
+```
+
+#### 3. SIMD Tests
+```bash
+# Rebuild SIMD library and run tests
+lake script run buildSimd
+lake build simd-test
+./.lake/build/bin/simd-test
+```
+
+#### 4. Full Test Suite
+```bash
+# Run all tests
+lake build test-all
+./.lake/build/bin/test-all
+```
+
+### Troubleshooting
+
+#### Issue: "Build failed: native library not found"
+**Solution:** Rebuild the native library:
+```bash
+lake clean
+lake script run buildNative
+lake build
+```
+
+#### Issue: "No GPU adapters found"
+**Solution:** Ensure you have proper GPU drivers:
+- **macOS**: No action needed (Metal is built-in)
+- **Linux**: Install Vulkan drivers (`vulkan-tools`, `mesa-vulkan-drivers`)
+- **Windows**: Install latest GPU drivers with D3D12/Vulkan support
+
+#### Issue: "SIMD library not found"
+**Solution:** Build the SIMD backend:
+```bash
+lake script run buildSimd
+```
+
+#### Issue: "FP16 not supported"
+**Solution:** This is expected on older hardware. Float16 requires:
+- ARM64: ARMv8.2-A with FP16 extension (Apple M1+, AWS Graviton2+)
+- x86_64: F16C extension (Intel Ivy Bridge+ / AMD Bulldozer+)
+
+The library will gracefully fall back to Float32 operations.
+
+#### Issue: Dawn build takes too long
+**Solution:** Dawn's first build can take 10-15 minutes. Subsequent builds are incremental and much faster. To speed up:
+```bash
+# Use more CPU cores (adjust -j value)
+lake script run buildNative -- -j 16
+```
+
 ## How It Works
 
 ```
@@ -414,6 +646,75 @@ Future:
 ## Contributing
 
 Hesper is part of the **Verilean** organization's effort to bring verified computing to GPUs.
+
+### How to Contribute
+
+1. **Fork the repository** and create a feature branch
+2. **Make your changes** following the existing code style
+3. **Run the test suite** to ensure nothing broke:
+   ```bash
+   # Core FFI boundary tests
+   lake build ffi-tests
+   ./.lake/build/bin/ffi-tests
+
+   # GPU shader tests (raw WGSL + DSL)
+   lake build simple-write
+   ./.lake/build/bin/simple-write
+
+   # SIMD tests (if you modified SIMD code)
+   lake script run buildSimd
+   lake build simd-test
+   ./.lake/build/bin/simd-test
+   ```
+4. **Add tests** for new features (see `Examples/Tests/` for examples)
+5. **Submit a pull request** with a clear description of changes
+
+### Testing Guidelines
+
+- **FFI changes**: Always run `test-ffi` to verify Lean ↔ C++ data marshalling
+- **DSL changes**: Run `simple-write` to verify WGSL code generation
+- **GPU operations**: Test with real GPU hardware, not just compilation
+- **SIMD changes**: Test on both ARM64 (NEON) and x86_64 (AVX2) if possible
+- **Cross-platform**: macOS (Metal), Linux (Vulkan), Windows (D3D12/Vulkan)
+
+### Code Organization for Contributors
+
+```
+Hesper/
+├── Hesper/               # Core library
+│   ├── WGSL/            # Type-safe shader DSL
+│   ├── WebGPU/          # WebGPU bindings (Device, Buffer, Shader, Pipeline)
+│   ├── Compute.lean     # High-level compute API
+│   ├── Simd.lean        # SIMD Float64 operations
+│   ├── Float32.lean     # SIMD Float32 operations
+│   └── Float16.lean     # SIMD Float16 operations
+├── Examples/             # Example programs (organized by category)
+│   ├── DSL/             # DSL feature demonstrations
+│   ├── Compute/         # GPU compute examples
+│   ├── MachineLearning/ # Neural network training
+│   ├── Graphics/        # GLFW rendering demos
+│   ├── SIMD/            # CPU SIMD benchmarks
+│   ├── Tests/           # Integration tests
+│   └── Utilities/       # Helper utilities
+├── Tests/                # Unit tests
+│   ├── FFIBoundaryTests.lean  # Lean ↔ C++ data conversion tests
+│   └── FusionTest.lean        # Operator fusion tests
+├── native/               # C++ WebGPU bridge
+│   ├── bridge.cpp       # FFI implementation (lean_hesper_* functions)
+│   └── CMakeLists.txt   # Dawn build configuration
+├── c_src/                # SIMD CPU backend
+│   └── simd_ops.cpp     # NEON/AVX2 implementations
+└── lakefile.lean         # Lake build script
+```
+
+**Key files for contributors:**
+- **`native/bridge.cpp`**: FFI boundary - all Lean ↔ C++ data conversion happens here
+- **`Hesper/WGSL/Monad.lean`**: ShaderM monad for imperative shader construction
+- **`Hesper/WGSL/Execute.lean`**: Compiles ShaderM → WGSL and executes on GPU
+- **`Examples/Tests/SimpleWrite.lean`**: Reference test showing raw WGSL vs DSL execution
+- **`Tests/FFIBoundaryTests.lean`**: Reference test for FFI data conversion
+
+### Links
 
 - **Report Issues**: [GitHub Issues](https://github.com/Verilean/hesper/issues)
 - **Discussions**: [GitHub Discussions](https://github.com/Verilean/hesper/discussions)

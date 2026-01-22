@@ -1688,4 +1688,417 @@ lean_obj_res lean_hesper_bytes_to_float64(b_lean_obj_arg bytes, uint32_t offset)
     return lean_io_result_mk_ok(lean_box_float(f64_value));
 }
 
+// ============================================================================
+// Opaque Array Types: Float32Array, Float16Array, BFloat16Array
+// ============================================================================
+
+// These implement zero-copy, in-place mutable arrays for efficient GPU interop
+// and tensor operations. Each array type is fully opaque to Lean and uses
+// std::vector for native C++ performance.
+
+// ----------------------------------------------------------------------------
+// Float32Array Implementation
+// ----------------------------------------------------------------------------
+
+struct Float32ArrayWrapper {
+    std::vector<float> data;
+
+    explicit Float32ArrayWrapper(size_t size) : data(size, 0.0f) {}
+};
+
+static void Float32Array_finalizer(void* ptr) {
+    delete static_cast<Float32ArrayWrapper*>(ptr);
+}
+
+static lean_external_class* g_Float32Array_class = nullptr;
+
+static lean_external_class* get_Float32Array_class() {
+    if (g_Float32Array_class == nullptr) {
+        g_Float32Array_class = lean_register_external_class(
+            Float32Array_finalizer,
+            nullptr  // foreach function (not needed)
+        );
+    }
+    return g_Float32Array_class;
+}
+
+// Create new Float32Array
+lean_obj_res lean_f32_array_create(size_t size, lean_object* /* io_world */) {
+    Float32ArrayWrapper* wrapper = new Float32ArrayWrapper(size);
+    lean_object* obj = lean_alloc_external(get_Float32Array_class(), wrapper);
+    return lean_io_result_mk_ok(obj);
+}
+
+// Set element (in-place mutation)
+lean_obj_res lean_f32_array_set(lean_object* arr, size_t index, double value, lean_object* /* io_world */) {
+    Float32ArrayWrapper* wrapper = static_cast<Float32ArrayWrapper*>(lean_get_external_data(arr));
+
+    if (index >= wrapper->data.size()) {
+        return lean_io_result_mk_error(
+            lean_mk_io_user_error(lean_mk_string("Float32Array index out of bounds"))
+        );
+    }
+
+    wrapper->data[index] = static_cast<float>(value);
+    return lean_io_result_mk_ok(lean_box(0));
+}
+
+// Get element
+lean_obj_res lean_f32_array_get(lean_object* arr, size_t index, lean_object* /* io_world */) {
+    Float32ArrayWrapper* wrapper = static_cast<Float32ArrayWrapper*>(lean_get_external_data(arr));
+
+    if (index >= wrapper->data.size()) {
+        return lean_io_result_mk_error(
+            lean_mk_io_user_error(lean_mk_string("Float32Array index out of bounds"))
+        );
+    }
+
+    double value = static_cast<double>(wrapper->data[index]);
+    return lean_io_result_mk_ok(lean_box_float(value));
+}
+
+// Get size
+size_t lean_f32_array_size(lean_object* arr) {
+    Float32ArrayWrapper* wrapper = static_cast<Float32ArrayWrapper*>(lean_get_external_data(arr));
+    return wrapper->data.size();
+}
+
+// Get byte size
+lean_obj_res lean_f32_array_byte_size(lean_object* arr, lean_object* /* io_world */) {
+    Float32ArrayWrapper* wrapper = static_cast<Float32ArrayWrapper*>(lean_get_external_data(arr));
+    size_t byte_size = wrapper->data.size() * sizeof(float);
+    return lean_io_result_mk_ok(lean_box_usize(byte_size));
+}
+
+// Get raw pointer (UNSAFE - for GPU interop)
+lean_obj_res lean_f32_array_ptr(lean_object* arr, lean_object* /* io_world */) {
+    Float32ArrayWrapper* wrapper = static_cast<Float32ArrayWrapper*>(lean_get_external_data(arr));
+    size_t ptr = reinterpret_cast<size_t>(wrapper->data.data());
+    return lean_io_result_mk_ok(lean_box_usize(ptr));
+}
+
+// Convert from FloatArray (Array Float)
+lean_obj_res lean_f32_array_from_float_array(lean_object* float_arr, lean_object* /* io_world */) {
+    size_t size = lean_array_size(float_arr);
+    Float32ArrayWrapper* wrapper = new Float32ArrayWrapper(size);
+
+    for (size_t i = 0; i < size; i++) {
+        lean_object* elem = lean_array_get_core(float_arr, i);
+        double val = lean_unbox_float(elem);
+        wrapper->data[i] = static_cast<float>(val);
+    }
+
+    lean_object* obj = lean_alloc_external(get_Float32Array_class(), wrapper);
+    return lean_io_result_mk_ok(obj);
+}
+
+// Convert to FloatArray (Array Float)
+lean_obj_res lean_f32_array_to_float_array(lean_object* arr, lean_object* /* io_world */) {
+    Float32ArrayWrapper* wrapper = static_cast<Float32ArrayWrapper*>(lean_get_external_data(arr));
+    size_t size = wrapper->data.size();
+
+    lean_object* result = lean_alloc_array(size, size);
+    for (size_t i = 0; i < size; i++) {
+        double val = static_cast<double>(wrapper->data[i]);
+        lean_array_set_core(result, i, lean_box_float(val));
+    }
+
+    return lean_io_result_mk_ok(result);
+}
+
+// SIMD Add (calls existing simd_add_f32 if available, or scalar fallback)
+lean_obj_res lean_f32_array_simd_add(lean_object* a, lean_object* b, lean_object* io_world) {
+    Float32ArrayWrapper* wa = static_cast<Float32ArrayWrapper*>(lean_get_external_data(a));
+    Float32ArrayWrapper* wb = static_cast<Float32ArrayWrapper*>(lean_get_external_data(b));
+
+    if (wa->data.size() != wb->data.size()) {
+        return lean_io_result_mk_error(
+            lean_mk_io_user_error(lean_mk_string("Float32Array size mismatch"))
+        );
+    }
+
+    size_t size = wa->data.size();
+    Float32ArrayWrapper* result = new Float32ArrayWrapper(size);
+
+    // Scalar fallback for now (TODO: call SIMD implementation)
+    for (size_t i = 0; i < size; i++) {
+        result->data[i] = wa->data[i] + wb->data[i];
+    }
+
+    lean_object* obj = lean_alloc_external(get_Float32Array_class(), result);
+    return lean_io_result_mk_ok(obj);
+}
+
+// SIMD Mul
+lean_obj_res lean_f32_array_simd_mul(lean_object* a, lean_object* b, lean_object* io_world) {
+    Float32ArrayWrapper* wa = static_cast<Float32ArrayWrapper*>(lean_get_external_data(a));
+    Float32ArrayWrapper* wb = static_cast<Float32ArrayWrapper*>(lean_get_external_data(b));
+
+    if (wa->data.size() != wb->data.size()) {
+        return lean_io_result_mk_error(
+            lean_mk_io_user_error(lean_mk_string("Float32Array size mismatch"))
+        );
+    }
+
+    size_t size = wa->data.size();
+    Float32ArrayWrapper* result = new Float32ArrayWrapper(size);
+
+    for (size_t i = 0; i < size; i++) {
+        result->data[i] = wa->data[i] * wb->data[i];
+    }
+
+    lean_object* obj = lean_alloc_external(get_Float32Array_class(), result);
+    return lean_io_result_mk_ok(obj);
+}
+
+// ----------------------------------------------------------------------------
+// Float16Array Implementation (Minimal Storage Box)
+// ----------------------------------------------------------------------------
+
+// FP32 -> FP16 conversion (software fallback if F16C not available)
+// Based on IEEE 754 half-precision format
+static uint16_t float_to_half(float value) {
+    uint32_t bits;
+    memcpy(&bits, &value, sizeof(float));
+
+    uint32_t sign = (bits >> 16) & 0x8000;
+    int32_t exponent = ((bits >> 23) & 0xFF) - 127 + 15;
+    uint32_t mantissa = bits & 0x7FFFFF;
+
+    // Handle special cases
+    if (exponent <= 0) {
+        // Underflow to zero
+        return static_cast<uint16_t>(sign);
+    } else if (exponent >= 31) {
+        // Overflow to infinity
+        return static_cast<uint16_t>(sign | 0x7C00);
+    }
+
+    // Normal case: round mantissa to 10 bits
+    return static_cast<uint16_t>(sign | (exponent << 10) | (mantissa >> 13));
+}
+
+// FP16 -> FP32 conversion
+static float half_to_float(uint16_t half) {
+    uint32_t sign = (half & 0x8000) << 16;
+    uint32_t exponent = (half >> 10) & 0x1F;
+    uint32_t mantissa = half & 0x3FF;
+
+    uint32_t bits;
+    if (exponent == 0) {
+        if (mantissa == 0) {
+            // Zero
+            bits = sign;
+        } else {
+            // Denormalized number
+            exponent = 1;
+            while ((mantissa & 0x400) == 0) {
+                mantissa <<= 1;
+                exponent--;
+            }
+            mantissa &= 0x3FF;
+            bits = sign | ((exponent + (127 - 15)) << 23) | (mantissa << 13);
+        }
+    } else if (exponent == 31) {
+        // Infinity or NaN
+        bits = sign | 0x7F800000 | (mantissa << 13);
+    } else {
+        // Normal number
+        bits = sign | ((exponent + (127 - 15)) << 23) | (mantissa << 13);
+    }
+
+    float result;
+    memcpy(&result, &bits, sizeof(float));
+    return result;
+}
+
+struct Float16ArrayWrapper {
+    std::vector<uint16_t> data;  // FP16 stored as raw 16-bit values
+
+    explicit Float16ArrayWrapper(size_t size) : data(size, 0) {}
+};
+
+static void Float16Array_finalizer(void* ptr) {
+    delete static_cast<Float16ArrayWrapper*>(ptr);
+}
+
+static lean_external_class* g_Float16Array_class = nullptr;
+
+static lean_external_class* get_Float16Array_class() {
+    if (g_Float16Array_class == nullptr) {
+        g_Float16Array_class = lean_register_external_class(
+            Float16Array_finalizer,
+            nullptr
+        );
+    }
+    return g_Float16Array_class;
+}
+
+// Hardware support check (returns false for now, can be implemented later with CPUID)
+lean_obj_res lean_f16_hardware_check(lean_object* /* io_world */) {
+    // TODO: Check for F16C (x86) or FP16 (ARM) support via CPUID/HWCAP
+    // For now, always return false (use software conversion)
+    return lean_io_result_mk_ok(lean_box(0));
+}
+
+// Create new Float16Array
+lean_obj_res lean_f16_array_create(size_t size, lean_object* /* io_world */) {
+    Float16ArrayWrapper* wrapper = new Float16ArrayWrapper(size);
+    lean_object* obj = lean_alloc_external(get_Float16Array_class(), wrapper);
+    return lean_io_result_mk_ok(obj);
+}
+
+// Set element (converts f64 -> f32 -> f16)
+lean_obj_res lean_f16_array_set(lean_object* arr, size_t index, double value, lean_object* /* io_world */) {
+    Float16ArrayWrapper* wrapper = static_cast<Float16ArrayWrapper*>(lean_get_external_data(arr));
+
+    if (index >= wrapper->data.size()) {
+        return lean_io_result_mk_error(
+            lean_mk_io_user_error(lean_mk_string("Float16Array index out of bounds"))
+        );
+    }
+
+    wrapper->data[index] = float_to_half(static_cast<float>(value));
+    return lean_io_result_mk_ok(lean_box(0));
+}
+
+// Get element (converts f16 -> f32 -> f64)
+lean_obj_res lean_f16_array_get(lean_object* arr, size_t index, lean_object* /* io_world */) {
+    Float16ArrayWrapper* wrapper = static_cast<Float16ArrayWrapper*>(lean_get_external_data(arr));
+
+    if (index >= wrapper->data.size()) {
+        return lean_io_result_mk_error(
+            lean_mk_io_user_error(lean_mk_string("Float16Array index out of bounds"))
+        );
+    }
+
+    float f32 = half_to_float(wrapper->data[index]);
+    double f64 = static_cast<double>(f32);
+    return lean_io_result_mk_ok(lean_box_float(f64));
+}
+
+// Get size
+size_t lean_f16_array_size(lean_object* arr) {
+    Float16ArrayWrapper* wrapper = static_cast<Float16ArrayWrapper*>(lean_get_external_data(arr));
+    return wrapper->data.size();
+}
+
+// Get byte size
+lean_obj_res lean_f16_array_byte_size(lean_object* arr, lean_object* /* io_world */) {
+    Float16ArrayWrapper* wrapper = static_cast<Float16ArrayWrapper*>(lean_get_external_data(arr));
+    size_t byte_size = wrapper->data.size() * sizeof(uint16_t);
+    return lean_io_result_mk_ok(lean_box_usize(byte_size));
+}
+
+// Get raw pointer (for GPU uploads)
+lean_obj_res lean_f16_array_ptr(lean_object* arr, lean_object* /* io_world */) {
+    Float16ArrayWrapper* wrapper = static_cast<Float16ArrayWrapper*>(lean_get_external_data(arr));
+    size_t ptr = reinterpret_cast<size_t>(wrapper->data.data());
+    return lean_io_result_mk_ok(lean_box_usize(ptr));
+}
+
+// Convert from Array Float
+lean_obj_res lean_f16_array_from_float_array(lean_object* float_arr, lean_object* /* io_world */) {
+    size_t size = lean_array_size(float_arr);
+    Float16ArrayWrapper* wrapper = new Float16ArrayWrapper(size);
+
+    for (size_t i = 0; i < size; i++) {
+        lean_object* elem = lean_array_get_core(float_arr, i);
+        double val = lean_unbox_float(elem);
+        wrapper->data[i] = float_to_half(static_cast<float>(val));
+    }
+
+    lean_object* obj = lean_alloc_external(get_Float16Array_class(), wrapper);
+    return lean_io_result_mk_ok(obj);
+}
+
+// Convert to Array Float
+lean_obj_res lean_f16_array_to_float_array(lean_object* arr, lean_object* /* io_world */) {
+    Float16ArrayWrapper* wrapper = static_cast<Float16ArrayWrapper*>(lean_get_external_data(arr));
+    size_t size = wrapper->data.size();
+
+    lean_object* result = lean_alloc_array(size, size);
+    for (size_t i = 0; i < size; i++) {
+        float f32 = half_to_float(wrapper->data[i]);
+        double f64 = static_cast<double>(f32);
+        lean_array_set_core(result, i, lean_box_float(f64));
+    }
+
+    return lean_io_result_mk_ok(result);
+}
+
+// Convert from Float32Array
+lean_obj_res lean_f16_array_from_f32_array(lean_object* f32_arr, lean_object* /* io_world */) {
+    Float32ArrayWrapper* src = static_cast<Float32ArrayWrapper*>(lean_get_external_data(f32_arr));
+    Float16ArrayWrapper* dst = new Float16ArrayWrapper(src->data.size());
+
+    for (size_t i = 0; i < src->data.size(); i++) {
+        dst->data[i] = float_to_half(src->data[i]);
+    }
+
+    lean_object* obj = lean_alloc_external(get_Float16Array_class(), dst);
+    return lean_io_result_mk_ok(obj);
+}
+
+// Convert to Float32Array
+lean_obj_res lean_f16_array_to_f32_array(lean_object* arr, lean_object* /* io_world */) {
+    Float16ArrayWrapper* src = static_cast<Float16ArrayWrapper*>(lean_get_external_data(arr));
+    Float32ArrayWrapper* dst = new Float32ArrayWrapper(src->data.size());
+
+    for (size_t i = 0; i < src->data.size(); i++) {
+        dst->data[i] = half_to_float(src->data[i]);
+    }
+
+    lean_object* obj = lean_alloc_external(get_Float32Array_class(), dst);
+    return lean_io_result_mk_ok(obj);
+}
+
+// SIMD operations (scalar fallback for now)
+lean_obj_res lean_f16_array_simd_add(lean_object* a, lean_object* b, lean_object* /* io_world */) {
+    Float16ArrayWrapper* wa = static_cast<Float16ArrayWrapper*>(lean_get_external_data(a));
+    Float16ArrayWrapper* wb = static_cast<Float16ArrayWrapper*>(lean_get_external_data(b));
+
+    if (wa->data.size() != wb->data.size()) {
+        return lean_io_result_mk_error(
+            lean_mk_io_user_error(lean_mk_string("Float16Array size mismatch"))
+        );
+    }
+
+    size_t size = wa->data.size();
+    Float16ArrayWrapper* result = new Float16ArrayWrapper(size);
+
+    // Scalar fallback (TODO: SIMD with F16C/NEON FP16)
+    for (size_t i = 0; i < size; i++) {
+        float a_f32 = half_to_float(wa->data[i]);
+        float b_f32 = half_to_float(wb->data[i]);
+        result->data[i] = float_to_half(a_f32 + b_f32);
+    }
+
+    lean_object* obj = lean_alloc_external(get_Float16Array_class(), result);
+    return lean_io_result_mk_ok(obj);
+}
+
+lean_obj_res lean_f16_array_simd_mul(lean_object* a, lean_object* b, lean_object* /* io_world */) {
+    Float16ArrayWrapper* wa = static_cast<Float16ArrayWrapper*>(lean_get_external_data(a));
+    Float16ArrayWrapper* wb = static_cast<Float16ArrayWrapper*>(lean_get_external_data(b));
+
+    if (wa->data.size() != wb->data.size()) {
+        return lean_io_result_mk_error(
+            lean_mk_io_user_error(lean_mk_string("Float16Array size mismatch"))
+        );
+    }
+
+    size_t size = wa->data.size();
+    Float16ArrayWrapper* result = new Float16ArrayWrapper(size);
+
+    for (size_t i = 0; i < size; i++) {
+        float a_f32 = half_to_float(wa->data[i]);
+        float b_f32 = half_to_float(wb->data[i]);
+        result->data[i] = float_to_half(a_f32 * b_f32);
+    }
+
+    lean_object* obj = lean_alloc_external(get_Float16Array_class(), result);
+    return lean_io_result_mk_ok(obj);
+}
+
 }
