@@ -35,6 +35,14 @@ open Hesper.Core
 open Hesper.WGSL
 open Hesper.Tensor
 
+/-- Activation function type -/
+inductive ActivationType
+  | Identity
+  | ReLU
+  | Sigmoid
+  | Gelu
+  deriving Inhabited, Repr, BEq
+
 /-! ## ReLU Activation -/
 
 /-- ReLU input: single tensor -/

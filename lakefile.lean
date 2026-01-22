@@ -247,6 +247,14 @@ lean_exe «fusion-test» where
 lean_exe «neural-net-fusion» where
   root := `Examples.DSL.NeuralNetFusion
 
+lean_exe «composable-mlp» where
+  root := `Hesper.NN.ComposableMLP
+  moreLinkArgs := stdLinkArgs
+
+lean_exe «resnet» where
+  root := `Hesper.NN.ResNet
+  moreLinkArgs := stdLinkArgs
+
 -- ----------------------------------------------------------------------------
 -- GPU Compute Examples (WebGPU compute shaders and GPU programming)
 -- ----------------------------------------------------------------------------
@@ -528,5 +536,10 @@ lean_exe «test-gpu-backward» where
 
 lean_exe «test-adam-gpu» where
   root := `Examples.Tests.TestAdamGPU
+  supportInterpreter := false
+  moreLinkArgs := stdLinkArgs
+
+lean_exe «integration-tests» where
+  root := `Tests.Integration.IntegrationMain
   supportInterpreter := false
   moreLinkArgs := stdLinkArgs
