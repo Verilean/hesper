@@ -7,6 +7,8 @@ import Hesper.WebGPU.Pipeline
 import Hesper.WGSL.Types
 import Hesper.WGSL.Exp
 import Hesper.WGSL.DSL
+import Hesper.WGSL.Monad
+import Hesper.WGSL.Execute
 
 namespace Hesper.Compute
 
@@ -311,5 +313,88 @@ def generateBinaryShader (f : Exp (.scalar .f32) → Exp (.scalar .f32) → Exp 
   s!"    dataC[i] = {bodyCode};\n" ++
   "  }\n" ++
   "}"
+
+/-- High-level compute API on Device.
+
+    Extension method for `Device` that executes a shader with named buffers.
+    This provides a cleaner API similar to `gpu.compute()` in other frameworks.
+-/
+def _root_.Hesper.WebGPU.Device.compute
+  (device : Device)
+  (computation : Hesper.WGSL.Monad.ShaderM Unit)
+  (namedBuffers : List (String × Buffer))
+  (config : Hesper.WGSL.Execute.ExecutionConfig) : IO Unit :=
+  Hesper.WGSL.Execute.executeShaderNamed device computation namedBuffers config
+
+/-- High-level parallel-for API.
+
+    Similar to `webgpu-dawn`, this function executes a shader over an array of data,
+    handling all buffer creation, uploads, downloads, and synchronization.
+
+    **Parameters**:
+    - `device`: WebGPU device
+    - `shaderSource`: WGSL shader source
+    - `data`: Input array of Float32 values
+    - `workgroupSize`: Threads per workgroup (default 256)
+
+    **Returns**: Updated data array from the GPU
+-/
+def parallelFor
+  (device : Device)
+  (shaderSource : String)
+  (data : Array Float)
+  (workgroupSize : Nat := 256) : IO (Array Float) := do
+
+  let count := data.size
+  let numWorkgroups := (count + workgroupSize - 1) / workgroupSize
+
+  -- Create buffer
+  let bufferSize := count * 4
+  let bufferDesc : BufferDescriptor := {
+    size := bufferSize.toUSize
+    usage := [.storage, .copyDst, .copySrc]
+    mappedAtCreation := false
+  }
+  let buffer ← createBuffer device bufferDesc
+
+  -- Upload data
+  let bytes ← Hesper.Basic.floatArrayToBytes data
+  writeBuffer device buffer 0 bytes
+
+  -- Compile shader
+  let shaderModule ← createShaderModule device shaderSource
+
+  -- Pipeline setup
+  let layoutEntry : BindGroupLayoutEntry := {
+    binding := 0
+    visibility := .compute
+    bindingType := .buffer false
+  }
+  let bindGroupLayout ← createBindGroupLayout device #[layoutEntry]
+  let pipelineDesc : ComputePipelineDescriptor := {
+    shaderModule := shaderModule
+    entryPoint := "main"
+    bindGroupLayout := bindGroupLayout
+  }
+  let pipeline ← createComputePipeline device pipelineDesc
+
+  -- Bind group
+  let bindEntry : BindGroupEntry := {
+    binding := 0
+    buffer := buffer
+    offset := 0
+    size := bufferSize.toUSize
+  }
+  let bindGroup ← createBindGroup device bindGroupLayout #[bindEntry]
+
+  -- Dispatch
+  dispatchCompute device pipeline bindGroup numWorkgroups.toUInt32 1 1
+  deviceWait device
+
+  -- Read back results
+  let resultBytes ← mapBufferRead device buffer 0 (bufferSize.toUSize)
+  unmapBuffer buffer
+
+  Hesper.Basic.bytesToFloatArray resultBytes
 
 end Hesper.Compute
