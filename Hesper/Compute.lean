@@ -397,4 +397,21 @@ def parallelFor
 
   Hesper.Basic.bytesToFloatArray resultBytes
 
+/-- Data-parallel operation using Hesper DSL.
+
+    Convenience wrapper for `parallelFor` that takes a type-safe DSL function
+    instead of a raw WGSL string.
+
+    **Example**:
+    ```lean
+    let result ← parallelForDSL device (fun x => Exp.mul x (Exp.litF32 2.0)) data
+    ```
+-/
+def parallelForDSL
+  (device : Device)
+  (f : Exp (.scalar .f32) → Exp (.scalar .f32))
+  (data : Array Float)
+  (workgroupSize : Nat := 256) : IO (Array Float) :=
+  parallelFor device (generateUnaryShader f) data workgroupSize
+
 end Hesper.Compute
