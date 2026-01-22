@@ -2,6 +2,10 @@
 
 **Write GPU programs in Lean 4. Prove them correct. Run on WebGPU.**
 
+> [!IMPORTANT]
+> **This is Alpha Software.**
+> The APIs, verification features, and compiler are under active development and subject to breaking changes. While core functionality works, this project is primarily for research and experimentation.
+
 Hesper is a verified GPU programming framework that brings the power of formal verification to GPU computing. Write type-safe shaders, execute tensor operations, and build graphics applications—all in Lean 4.
 
 ```lean

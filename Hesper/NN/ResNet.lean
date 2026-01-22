@@ -18,8 +18,8 @@ namespace Hesper.NN.ResNet
 
 open Hesper.Core
 open Hesper.WGSL
-open Hesper.Tensor
 open Hesper.Op.Activation
+open Hesper.Tensor
 
 /-! ## 1. Composable Conv2D -/
 
@@ -135,7 +135,7 @@ end CPU
 
 structure ResidualBlock where
   conv : ConvLayer
-  activation : ActivationType := ActivationType.ReLU
+  activation : ActivationType := .ReLU
   deriving Inhabited
 
 /-- Gradients for a residual block -/

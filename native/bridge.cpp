@@ -7,6 +7,8 @@
 #include <chrono>
 #include <thread>
 #include <iomanip>
+#include <cstring>
+#include <cstdio>
 #include <atomic>
 #include <memory>
 

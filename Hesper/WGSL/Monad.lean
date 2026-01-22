@@ -130,7 +130,7 @@ def if_ (cond : Exp (.scalar .bool)) (thenBranch : ShaderM Unit) (elseBranch : S
   emitStmt (Stmt.ifStmt cond thenStmts elseStmts)
 
 /-- While loop - implemented as for loop with always-true condition -/
-def while_ (cond : Exp (.scalar .bool)) (body : ShaderM Unit) : ShaderM Unit := do
+def while_ (_cond : Exp (.scalar .bool)) (body : ShaderM Unit) : ShaderM Unit := do
   -- Note: WGSL doesn't have while loops, so we'd need to use a different approach
   -- For now, just capture the body statements
   let (_, bodyStmts) ← captureStmts body

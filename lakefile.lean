@@ -171,7 +171,37 @@ script buildNative do
     IO.eprintln "[Hesper] Bridge build failed"
     return bridgeBuildRet
 
-  IO.println "[Hesper] ✓ Native library built successfully!"
+  IO.println "[Hesper] ✓ Native bridge built successfully!"
+
+  -- Step 4: Build SIMD library (Google Highway)
+  IO.println "[Hesper] Building SIMD library (Google Highway)..."
+  let simdBuildDir := cwd / ".lake" / "build" / "simd"
+  -- Reuse srcDir from above ("native" is used for bridge, "c_src" is for SIMD usually, let's check buildSimd)
+  -- The buildSimd script (lines 437+) uses `cwd / "c_src"`.
+  let simdSrcDir := cwd / "c_src"
+
+  IO.FS.createDirAll simdBuildDir
+
+  let simdCmakeRet ← IO.Process.spawn {
+    cmd := "cmake"
+    args := #["-S", simdSrcDir.toString, "-B", simdBuildDir.toString, "-DCMAKE_BUILD_TYPE=Release"]
+  } >>= (·.wait)
+
+  if simdCmakeRet != 0 then
+    IO.eprintln "[Hesper] SIMD CMake configuration failed"
+    return simdCmakeRet
+
+  let simdBuildRet ← IO.Process.spawn {
+    cmd := "cmake"
+    args := #["--build", simdBuildDir.toString, "--target", "hesper_simd", "-j", "8"]
+  } >>= (·.wait)
+
+  if simdBuildRet != 0 then
+    IO.eprintln "[Hesper] SIMD library build failed"
+    return simdBuildRet
+
+  IO.println "[Hesper] ✓ SIMD library built successfully!"
+  IO.println "[Hesper] All native dependencies built."
   return 0
 
 -- Standard linker configuration for all FFI executables (based on glfw-triangle + Google Highway)

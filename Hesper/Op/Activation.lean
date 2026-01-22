@@ -83,7 +83,7 @@ def reluExp (x : Exp (.scalar .f32)) : Exp (.scalar .f32) :=
     let fused = matmul_kernel |> relu_kernel  -- Fuses matmul + relu
     ```
 -/
-def gpuReLUKernel {N : Nat} : Kernel 256 1 1 (Exp (.scalar .f32)) (Exp (.scalar .f32)) :=
+def gpuReLUKernel {_N : Nat} : Kernel 256 1 1 (Exp (.scalar .f32)) (Exp (.scalar .f32)) :=
   mapK reluExp
 
 /-- GPU ReLU backward kernel.
@@ -107,16 +107,16 @@ def gpuReLUBackwardKernel
 instance : VerifiedOpFusion 256 1 1 ReLUInput ReLUOutput
     (Exp (.scalar .f32)) (Exp (.scalar .f32)) where
   spec_forward := cpuReLU
-  impl_kernel := gpuReLUKernel (N := 256)
+  impl_kernel := gpuReLUKernel (_N := 256)
   spec_backward := cpuReLUBackward
   impl_kernel_backward := gpuReLUBackwardKernel
 
   -- Optional: provide immediate execution wrapper
-  run_forward := fun input => do
+  run_forward := fun _input => do
     -- Placeholder: would compile and execute kernel
-    return input  -- placeholder
+    return _input  -- placeholder
 
-  verify_consistency := fun input tolerance => do
+  verify_consistency := fun _input _tolerance => do
     -- Placeholder: would run both CPU and GPU and compare
     return true
 

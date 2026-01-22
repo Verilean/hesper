@@ -161,7 +161,7 @@ def Float32Array.toString (arr : Float32Array) : IO String := do
   return s!"Float32Array[{size}]: [{String.intercalate ", " elements}{rest}]"
 
 instance : ToString Float32Array where
-  toString arr :=
+  toString _arr :=
     -- Note: Can't use IO in pure ToString, so we show a placeholder
     s!"Float32Array[size=?] (use arr.toString for details)"
 

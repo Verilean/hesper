@@ -622,20 +622,20 @@ partial def Exp.toWGSL {t : WGSLType} : Exp t → String
   | call fname args =>
     let argStrs := args.map fun ⟨_, e⟩ => toWGSL e
     s!"{fname}({String.intercalate ", " argStrs})"
-  | subgroupMatrixLoad (st:=st) (m:=m) (k:=k) ptr offset transposeFlag stride =>
-    s!"subgroupMatrixLoad<subgroup_matrix_left<{st.toWGSL},{m},{k}>>({ptr}, {toWGSL offset}, {toWGSL transposeFlag}, {toWGSL stride})"
-  | subgroupMatrixLoadRight (st:=st) (k:=k) (n:=n) ptr offset transposeFlag stride =>
-    s!"subgroupMatrixLoad<subgroup_matrix_right<{st.toWGSL},{k},{n}>>({ptr}, {toWGSL offset}, {toWGSL transposeFlag}, {toWGSL stride})"
+  | subgroupMatrixLoad (st:=_st) (m:=_m) (k:=k) ptr offset transposeFlag stride =>
+    s!"subgroupMatrixLoad<subgroup_matrix_left<{_st.toWGSL},{_m},{k}>>({ptr}, {toWGSL offset}, {toWGSL transposeFlag}, {toWGSL stride})"
+  | subgroupMatrixLoadRight (st:=_st) (k:=k) (n:=_n) ptr offset transposeFlag stride =>
+    s!"subgroupMatrixLoad<subgroup_matrix_right<{_st.toWGSL},{k},{_n}>>({ptr}, {toWGSL offset}, {toWGSL transposeFlag}, {toWGSL stride})"
   | subgroupMatrixMultiplyAccumulate a b acc =>
     s!"subgroupMatrixMultiplyAccumulate({toWGSL a}, {toWGSL b}, {toWGSL acc})"
-  | subgroupMatrixStore (st:=st) (m:=m) (n:=n) ptr offset mat transposeFlag stride =>
+  | subgroupMatrixStore (st:=_st) (m:=_m) (n:=_n) ptr offset mat transposeFlag stride =>
     s!"subgroupMatrixStore({ptr}, {toWGSL offset}, {toWGSL mat}, {toWGSL transposeFlag}, {toWGSL stride})"
-  | subgroupMatrixZeroLeft (st:=st) (m:=m) (k:=k) =>
-    s!"subgroup_matrix_left<{st.toWGSL}, {m}, {k}>(0)"
-  | subgroupMatrixZeroRight (st:=st) (k:=k) (n:=n) =>
-    s!"subgroup_matrix_right<{st.toWGSL}, {k}, {n}>(0)"
-  | subgroupMatrixZeroResult (st:=st) (m:=m) (n:=n) =>
-    s!"subgroup_matrix_result<{st.toWGSL}, {m}, {n}>(0)"
+  | subgroupMatrixZeroLeft (st:=_st) (m:=_m) (k:=k) =>
+    s!"subgroup_matrix_left<{_st.toWGSL}, {_m}, {k}>(0)"
+  | subgroupMatrixZeroRight (st:=_st) (k:=k) (n:=_n) =>
+    s!"subgroup_matrix_right<{_st.toWGSL}, {k}, {_n}>(0)"
+  | subgroupMatrixZeroResult (st:=_st) (m:=_m) (n:=_n) =>
+    s!"subgroup_matrix_result<{_st.toWGSL}, {_m}, {_n}>(0)"
   -- Atomic operations
   | atomicAdd ptr val =>
     s!"atomicAdd({toWGSL ptr}, {toWGSL val})"

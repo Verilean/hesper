@@ -1,27 +1,27 @@
 import Hesper.Tensor.Typed
 
 /-!
-# RMSNorm (Root Mean Square Normalization)
+# RMS Normalization (EXPERIMENTAL - WIP)
+
+**STATUS**: Work in Progress - Depends on `Hesper.Tensor.Typed`
+
+This module implements Root Mean Square Layer Normalization (RMSNorm),
+an efficient alternative to LayerNorm used in modern language models.
+
+## Dependencies
+
+Requires `Hesper.Tensor.Typed` to be completed first.
+
+## References
+
+- RMSNorm Paper: https://arxiv.org/abs/1910.07467
+- Used in: Gemma 3, LLaMA models
+
 -/
 
 namespace Hesper.NN.Normalization
 
-open Hesper.Tensor
-
-/-- Typed RMSNorm Layer -/
-structure RMSNorm (dim : Nat) (dtype : DType) where
-  weight : TypedTensor (Shape.vector dim) dtype
-  eps : Float := 1e-6
-
-namespace RMSNorm
-
-  def forward {Batch Seq : Nat} {dim : Nat} {dt : DType}
-    (layer : RMSNorm dim dt)
-    (input : TypedTensor (Shape.tensor3D Batch Seq dim) dt)
-    : TypedTensor (Shape.tensor3D Batch Seq dim) dt :=
-    -- Placeholder
-    input
-
-end RMSNorm
+/-- PLACEHOLDER: Awaiting TypedTensor implementation -/
+axiom RMSNorm_WIP : Unit
 
 end Hesper.NN.Normalization
