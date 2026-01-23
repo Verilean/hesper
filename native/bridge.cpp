@@ -11,10 +11,130 @@
 #include <cstdio>
 #include <atomic>
 #include <memory>
+#include <future>
 
 // Note: g_device removed - all functions now take device as parameter
 // g_dawn_instance is kept global for deviceWait to use (since deviceWait only gets device, not instance)
 static dawn::native::Instance* g_dawn_instance = nullptr;
+
+// ============================================================================
+// Promise/Future Pattern for Async WebGPU Operations
+// ============================================================================
+
+// CallbackData structure for async operations (following gpu.hpp pattern)
+struct CallbackData {
+    WGPUBuffer buffer;
+    size_t bufferSize;
+    void* output;
+    std::shared_ptr<std::promise<void>> promise;
+    lean_object** result_ptr;  // Pointer to store final ByteArray for caller
+};
+
+// Template function to wait for future completion (following gpu.hpp pattern)
+template<typename T>
+T wait(wgpu::Instance& instance, std::future<T>& f) {
+    while (f.wait_for(std::chrono::milliseconds(0)) != std::future_status::ready) {
+        instance.ProcessEvents();
+    }
+    if constexpr (std::is_void_v<T>) {
+        f.get();
+        return;
+    } else {
+        return f.get();
+    }
+}
+
+// ============================================================================
+// Error Scope for Validation and Runtime Errors
+// ============================================================================
+
+struct ErrorScopeData {
+    bool errorOccurred;
+    WGPUErrorType errorType;
+    std::string errorMessage;
+    std::shared_ptr<std::promise<void>> promise;
+};
+
+static void errorScopeCallback(WGPUPopErrorScopeStatus status, WGPUErrorType type,
+                               WGPUStringView message, void* userdata1, void* /*userdata2*/) {
+    ErrorScopeData* data = static_cast<ErrorScopeData*>(userdata1);
+
+    if (status == WGPUPopErrorScopeStatus_Success && type != WGPUErrorType_NoError) {
+        data->errorOccurred = true;
+        data->errorType = type;
+        data->errorMessage = std::string(message.data, message.length);
+
+        fprintf(stderr, "\n");
+        fprintf(stderr, "╔════════════════════════════════════════════════════════════╗\n");
+        fprintf(stderr, "║ GPU VALIDATION ERROR                                      ║\n");
+        fprintf(stderr, "╚════════════════════════════════════════════════════════════╝\n");
+        fprintf(stderr, "Error Type: ");
+        switch (type) {
+            case WGPUErrorType_Validation:
+                fprintf(stderr, "VALIDATION\n");
+                break;
+            case WGPUErrorType_OutOfMemory:
+                fprintf(stderr, "OUT OF MEMORY\n");
+                break;
+            case WGPUErrorType_Internal:
+                fprintf(stderr, "INTERNAL\n");
+                break;
+            default:
+                fprintf(stderr, "UNKNOWN (%d)\n", (int)type);
+                break;
+        }
+        fprintf(stderr, "Message: %s\n", data->errorMessage.c_str());
+        fprintf(stderr, "════════════════════════════════════════════════════════════\n\n");
+        fflush(stderr);
+    }
+
+    data->promise->set_value();
+}
+
+// Helper to run an operation within an error scope
+template<typename F>
+bool runWithErrorScope(WGPUDevice device, dawn::native::Instance* nativeInstance, const char* opName, F&& operation) {
+    // Push error scope
+    wgpuDevicePushErrorScope(device, WGPUErrorFilter_Validation);
+
+    // Execute operation
+    operation();
+
+    // Pop error scope and wait for result
+    auto promise = std::make_shared<std::promise<void>>();
+    std::future<void> future = promise->get_future();
+
+    ErrorScopeData* errorData = new ErrorScopeData{
+        .errorOccurred = false,
+        .errorType = WGPUErrorType_NoError,
+        .errorMessage = "",
+        .promise = promise
+    };
+
+    WGPUPopErrorScopeCallbackInfo callbackInfo = {
+        .nextInChain = nullptr,
+        .mode = WGPUCallbackMode_AllowProcessEvents,
+        .callback = errorScopeCallback,
+        .userdata1 = errorData,
+        .userdata2 = nullptr
+    };
+
+    wgpuDevicePopErrorScope(device, callbackInfo);
+
+    // Wait for error scope to complete - convert native instance to wgpu::Instance
+    wgpu::Instance instance(nativeInstance->Get());
+    wait(instance, future);
+
+    bool hadError = errorData->errorOccurred;
+    delete errorData;
+
+    if (hadError) {
+        fprintf(stderr, "[C++] %s failed due to validation errors (see above)\n", opName);
+        fflush(stderr);
+    }
+
+    return !hadError;
+}
 
 // Helper macros to extract pointers from resource structures
 // All resources maintain a reference to their parent to prevent premature GC
@@ -363,216 +483,6 @@ lean_obj_res lean_hesper_init(lean_obj_res /* unit */) {
     return lean_io_result_mk_ok(external);
 }
 
-// Lean FFI: Simple GPU Vector Addition (Hello World Compute)
-lean_obj_res lean_hesper_vector_add(b_lean_obj_arg instance_obj, uint32_t size, lean_obj_res /* unit */) {
-    dawn::native::Instance* instance = static_cast<dawn::native::Instance*>(lean_get_external_data(instance_obj));
-
-    std::cout << "[Hesper] Running GPU Vector Addition (size: " << size << ")" << std::endl;
-
-    // Get first adapter and create device
-    auto adapters = instance->EnumerateAdapters();
-    if (adapters.empty()) {
-        std::cerr << "No GPU adapters found!" << std::endl;
-        return make_webgpu_io_error(WebGPUError::Device(DeviceError::NoAdaptersFound()));
-    }
-
-    wgpu::Adapter adapter(adapters[0].Get());
-
-    // Create device
-    wgpu::DeviceDescriptor deviceDesc{};
-    wgpu::Device device = adapter.CreateDevice(&deviceDesc);
-
-    if (!device) {
-        return make_webgpu_io_error(WebGPUError::Device(DeviceError::DeviceCreationFailed(0, "Failed to create device")));
-    }
-
-    std::cout << "  Device created successfully" << std::endl;
-
-    // Create buffers
-    wgpu::BufferDescriptor bufferDesc{};
-    bufferDesc.size = size * sizeof(float);
-    bufferDesc.usage = wgpu::BufferUsage::Storage | wgpu::BufferUsage::CopyDst | wgpu::BufferUsage::CopySrc;
-    bufferDesc.mappedAtCreation = false;
-
-    wgpu::Buffer bufferA = device.CreateBuffer(&bufferDesc);
-    wgpu::Buffer bufferB = device.CreateBuffer(&bufferDesc);
-    wgpu::Buffer bufferC = device.CreateBuffer(&bufferDesc);
-
-    std::cout << "  Buffers created" << std::endl;
-
-    // Create test data
-    std::vector<float> dataA(size), dataB(size);
-    for (uint32_t i = 0; i < size; i++) {
-        dataA[i] = static_cast<float>(i);
-        dataB[i] = static_cast<float>(size - i);
-    }
-
-    // Upload data
-    device.GetQueue().WriteBuffer(bufferA, 0, dataA.data(), size * sizeof(float));
-    device.GetQueue().WriteBuffer(bufferB, 0, dataB.data(), size * sizeof(float));
-
-    std::cout << "  Data uploaded to GPU" << std::endl;
-
-    // WGSL shader
-    const char* shaderCode = R"(
-        @group(0) @binding(0) var<storage, read_write> a: array<f32>;
-        @group(0) @binding(1) var<storage, read_write> b: array<f32>;
-        @group(0) @binding(2) var<storage, read_write> c: array<f32>;
-
-        @compute @workgroup_size(256)
-        fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-            let i = gid.x;
-            if (i < arrayLength(&a)) {
-                c[i] = a[i] + b[i];
-            }
-        }
-    )";
-
-    // Create shader module
-    wgpu::ShaderModuleWGSLDescriptor wgslDesc{};
-    wgslDesc.code = shaderCode;
-
-    wgpu::ShaderModuleDescriptor shaderDesc{};
-    shaderDesc.nextInChain = &wgslDesc;
-    wgpu::ShaderModule shaderModule = device.CreateShaderModule(&shaderDesc);
-
-    std::cout << "  Shader compiled" << std::endl;
-
-    // Create bind group layout
-    std::vector<wgpu::BindGroupLayoutEntry> entries(3);
-    for (int i = 0; i < 3; i++) {
-        entries[i].binding = i;
-        entries[i].visibility = wgpu::ShaderStage::Compute;
-        entries[i].buffer.type = wgpu::BufferBindingType::Storage;
-    }
-
-    wgpu::BindGroupLayoutDescriptor bglDesc{};
-    bglDesc.entryCount = entries.size();
-    bglDesc.entries = entries.data();
-    wgpu::BindGroupLayout bindGroupLayout = device.CreateBindGroupLayout(&bglDesc);
-
-    // Create compute pipeline
-    wgpu::ComputePipelineDescriptor pipelineDesc{};
-    pipelineDesc.compute.module = shaderModule;
-    pipelineDesc.compute.entryPoint = "main";
-
-    wgpu::PipelineLayoutDescriptor layoutDesc{};
-    layoutDesc.bindGroupLayoutCount = 1;
-    layoutDesc.bindGroupLayouts = &bindGroupLayout;
-    pipelineDesc.layout = device.CreatePipelineLayout(&layoutDesc);
-
-    wgpu::ComputePipeline pipeline = device.CreateComputePipeline(&pipelineDesc);
-
-    std::cout << "  Compute pipeline created" << std::endl;
-
-    // Create bind group
-    std::vector<wgpu::BindGroupEntry> bgEntries(3);
-    bgEntries[0].binding = 0;
-    bgEntries[0].buffer = bufferA;
-    bgEntries[0].size = size * sizeof(float);
-    bgEntries[1].binding = 1;
-    bgEntries[1].buffer = bufferB;
-    bgEntries[1].size = size * sizeof(float);
-    bgEntries[2].binding = 2;
-    bgEntries[2].buffer = bufferC;
-    bgEntries[2].size = size * sizeof(float);
-
-    wgpu::BindGroupDescriptor bgDesc{};
-    bgDesc.layout = bindGroupLayout;
-    bgDesc.entryCount = bgEntries.size();
-    bgDesc.entries = bgEntries.data();
-    wgpu::BindGroup bindGroup = device.CreateBindGroup(&bgDesc);
-
-    // Dispatch compute
-    wgpu::CommandEncoder encoder = device.CreateCommandEncoder();
-    wgpu::ComputePassEncoder pass = encoder.BeginComputePass();
-    pass.SetPipeline(pipeline);
-    pass.SetBindGroup(0, bindGroup);
-    uint32_t workgroups = (size + 255) / 256;
-    pass.DispatchWorkgroups(workgroups, 1, 1);
-    pass.End();
-    wgpu::CommandBuffer commands = encoder.Finish();
-    device.GetQueue().Submit(1, &commands);
-
-    std::cout << "  Compute dispatched (" << workgroups << " workgroups)" << std::endl;
-
-    // Read results
-    wgpu::BufferDescriptor readDesc{};
-    readDesc.size = size * sizeof(float);
-    readDesc.usage = wgpu::BufferUsage::CopyDst | wgpu::BufferUsage::MapRead;
-    wgpu::Buffer readBuffer = device.CreateBuffer(&readDesc);
-
-    wgpu::CommandEncoder copyEncoder = device.CreateCommandEncoder();
-    copyEncoder.CopyBufferToBuffer(bufferC, 0, readBuffer, 0, size * sizeof(float));
-    wgpu::CommandBuffer copyCommands = copyEncoder.Finish();
-    device.GetQueue().Submit(1, &copyCommands);
-
-    // Wait and map buffer using C API (like webgpu-dawn)
-    struct MapCallbackData {
-        WGPUMapAsyncStatus status;
-        bool done;
-    };
-    MapCallbackData callbackData = {WGPUMapAsyncStatus_Error, false};
-
-    WGPUBufferMapCallbackInfo callbackInfo = {};
-    callbackInfo.mode = WGPUCallbackMode_AllowSpontaneous;
-    callbackInfo.callback = [](WGPUMapAsyncStatus status, WGPUStringView, void* userdata1, void*) {
-        auto* data = static_cast<MapCallbackData*>(userdata1);
-        data->status = status;
-        data->done = true;
-    };
-    callbackInfo.userdata1 = &callbackData;
-
-    wgpuBufferMapAsync(readBuffer.Get(), WGPUMapMode_Read, 0, size * sizeof(float), callbackInfo);
-
-    while (!callbackData.done) {
-        wgpuDeviceTick(device.Get());
-    }
-
-    if (callbackData.status != WGPUMapAsyncStatus_Success) {
-        std::cerr << "Failed to map buffer!" << std::endl;
-        return make_webgpu_io_error(WebGPUError::Buffer(BufferError::MappingFailed("Failed to map buffer")));
-    }
-
-    const float* result = static_cast<const float*>(wgpuBufferGetConstMappedRange(readBuffer.Get(), 0, size * sizeof(float)));
-
-    // Verify and print results
-    std::cout << "  Results:" << std::endl;
-    std::cout << "    First 5: [";
-    for (uint32_t i = 0; i < std::min(5u, size); i++) {
-        std::cout << result[i];
-        if (i < 4 && i < size - 1) std::cout << ", ";
-    }
-    std::cout << "]" << std::endl;
-
-    std::cout << "    Last 5: [";
-    for (uint32_t i = std::max(0u, size - 5); i < size; i++) {
-        std::cout << result[i];
-        if (i < size - 1) std::cout << ", ";
-    }
-    std::cout << "]" << std::endl;
-
-    // Verify correctness
-    bool correct = true;
-    for (uint32_t i = 0; i < size; i++) {
-        float expected = dataA[i] + dataB[i];
-        if (std::abs(result[i] - expected) > 1e-5) {
-            correct = false;
-            break;
-        }
-    }
-
-    if (correct) {
-        std::cout << "  ✓ Results correct!" << std::endl;
-    } else {
-        std::cout << "  ✗ Results incorrect!" << std::endl;
-    }
-
-    wgpuBufferUnmap(readBuffer.Get());
-
-    return lean_io_result_mk_ok(lean_box(0));
-}
-
 // ============================================================================
 // WebGPU Wrapper FFI Functions
 // ============================================================================
@@ -603,6 +513,7 @@ lean_obj_res lean_hesper_get_device_with_features(b_lean_obj_arg instance_obj, l
         WGPUFeatureName_ChromiumExperimentalSubgroupMatrix
     };
 
+    // Setup device descriptor
     wgpu::DeviceDescriptor deviceDesc{};
     deviceDesc.nextInChain = reinterpret_cast<const wgpu::ChainedStruct*>(&toggles.chain);
     deviceDesc.requiredFeatureCount = features.size();
@@ -618,9 +529,16 @@ lean_obj_res lean_hesper_get_device_with_features(b_lean_obj_arg instance_obj, l
 
     // Properly allocate device on heap and wrap in External object
     wgpu::Device* devicePtr = new wgpu::Device(device);
-    lean_object* external = lean_alloc_external(g_webgpu_device_class, devicePtr);
+    lean_object* device_external = lean_alloc_external(g_webgpu_device_class, devicePtr);
 
-    return lean_io_result_mk_ok(external);
+    // Create Device structure: { ptr : DevicePtr, parentInstance : Instance }
+    // This keeps the Instance alive as long as the Device is alive (prevents premature GC)
+    lean_object* device_struct = lean_alloc_ctor(0, 2, 0);  // constructor with 2 fields, 0 scalars
+    lean_inc(instance_obj);  // Increment refcount of instance so it stays alive
+    lean_ctor_set(device_struct, 0, device_external);  // field 0: ptr
+    lean_ctor_set(device_struct, 1, instance_obj);      // field 1: parentInstance
+
+    return lean_io_result_mk_ok(device_struct);
 }
 
 lean_obj_res lean_hesper_get_device(b_lean_obj_arg instance_obj, lean_obj_res /* unit */) {
@@ -890,6 +808,126 @@ lean_obj_res lean_hesper_write_buffer(b_lean_obj_arg device_obj, b_lean_obj_arg 
     return lean_io_result_mk_ok(lean_box(0));
 }
 
+// Static callback functions for async buffer mapping (following gpu.hpp pattern)
+
+static void bufferMapCallback(WGPUMapAsyncStatus status, WGPUStringView message,
+                               void* userdata1, void* /*userdata2*/) {
+    CallbackData* cbData = static_cast<CallbackData*>(userdata1);
+
+    fprintf(stderr, "[C++] MapAsync callback: status=%d\n", static_cast<int>(status));
+    fflush(stderr);
+
+    if (status != WGPUMapAsyncStatus_Success) {
+        fprintf(stderr, "[C++] ERROR: MapAsync failed with status=%d\n", static_cast<int>(status));
+        if (message.length > 0) {
+            fprintf(stderr, "[C++] Message: %.*s\n",
+                    static_cast<int>(message.length), message.data);
+        }
+        fflush(stderr);
+        cbData->promise->set_value();  // Signal completion even on error
+        delete cbData;
+        return;
+    }
+
+    // Get mapped data
+    const void* mappedData = wgpuBufferGetConstMappedRange(cbData->buffer, 0, cbData->bufferSize);
+
+    fprintf(stderr, "[C++] mappedData=%p, cbData->output=%p, cbData->result_ptr=%p\n",
+            mappedData, cbData->output, cbData->result_ptr);
+    fflush(stderr);
+
+    if (mappedData && cbData->output) {
+        // Copy data to output ByteArray
+        lean_object* byte_array = static_cast<lean_object*>(cbData->output);
+        const uint8_t* src = static_cast<const uint8_t*>(mappedData);
+
+        // Print first 16 bytes for debugging
+        if (cbData->bufferSize >= 16) {
+            fprintf(stderr, "[C++]   Mapped data (hex): ");
+            for (size_t i = 0; i < 16; i++) {
+                fprintf(stderr, "%02x ", src[i]);
+            }
+            fprintf(stderr, "\n");
+
+            const float* float_ptr = reinterpret_cast<const float*>(src);
+            fprintf(stderr, "[C++]   Mapped data as floats: %.2f, %.2f, %.2f, %.2f\n",
+                    float_ptr[0], float_ptr[1], float_ptr[2], float_ptr[3]);
+            fflush(stderr);
+        }
+
+        // Push bytes to Lean ByteArray
+        for (size_t i = 0; i < cbData->bufferSize; i++) {
+            byte_array = lean_byte_array_push(byte_array, src[i]);
+        }
+
+        // Store the final ByteArray for the caller to retrieve
+        if (cbData->result_ptr) {
+            fprintf(stderr, "[C++] Updating result_ptr: old array size=%zu, new array size=%zu\n",
+                    lean_sarray_size(*cbData->result_ptr), lean_sarray_size(byte_array));
+            fflush(stderr);
+            lean_dec(*cbData->result_ptr);  // Release old empty array
+            *cbData->result_ptr = byte_array;  // Store new array with data
+            fprintf(stderr, "[C++] After update: result_ptr now points to array with size=%zu\n",
+                    lean_sarray_size(*cbData->result_ptr));
+            fflush(stderr);
+        } else {
+            fprintf(stderr, "[C++] ERROR: result_ptr is NULL!\n");
+            fflush(stderr);
+        }
+
+        fprintf(stderr, "[C++] Copied %zu bytes to ByteArray\n", cbData->bufferSize);
+        fflush(stderr);
+    } else {
+        fprintf(stderr, "[C++] ERROR: Skipping copy - mappedData=%p, output=%p\n",
+                mappedData, cbData->output);
+        fflush(stderr);
+    }
+
+    // Unmap buffer
+    wgpuBufferUnmap(cbData->buffer);
+
+    // Signal completion
+    cbData->promise->set_value();
+    delete cbData;
+}
+
+static void queueWorkDoneCallback(WGPUQueueWorkDoneStatus status, WGPUStringView message,
+                                  void* userdata1, void* /*userdata2*/) {
+    CallbackData* cbData = static_cast<CallbackData*>(userdata1);
+
+    fprintf(stderr, "[C++] OnSubmittedWorkDone: status=%d\n", static_cast<int>(status));
+    if (message.length > 0) {
+        fprintf(stderr, "[C++] Message: %.*s\n",
+                static_cast<int>(message.length), message.data);
+    }
+    fflush(stderr);
+
+    if (status != WGPUQueueWorkDoneStatus_Success) {
+        fprintf(stderr, "[C++] ERROR: GPU work failed with status=%d\n", static_cast<int>(status));
+        fprintf(stderr, "[C++] This usually means:\n");
+        fprintf(stderr, "[C++]   - Shader validation error (check WGSL above)\n");
+        fprintf(stderr, "[C++]   - Buffer binding mismatch\n");
+        fprintf(stderr, "[C++]   - Resource usage conflict\n");
+        fflush(stderr);
+        cbData->promise->set_value();  // Signal completion even on error
+        delete cbData;
+        return;
+    }
+
+    fprintf(stderr, "[C++] GPU work completed successfully, now mapping buffer...\n");
+    fflush(stderr);
+
+    // Chain to buffer map operation
+    WGPUBufferMapCallbackInfo mapCallbackInfo = {
+        .mode = WGPUCallbackMode_AllowProcessEvents,
+        .callback = bufferMapCallback,
+        .userdata1 = cbData,  // Pass through the same CallbackData
+        .userdata2 = nullptr
+    };
+
+    wgpuBufferMapAsync(cbData->buffer, WGPUMapMode_Read, 0, cbData->bufferSize, mapCallbackInfo);
+}
+
 lean_obj_res lean_hesper_map_buffer_read(b_lean_obj_arg device_obj, b_lean_obj_arg buffer_obj,
                                           size_t offset, size_t size, lean_obj_res /* unit */) {
     wgpu::Device* device = EXTRACT_DEVICE_PTR(device_obj);
@@ -899,18 +937,6 @@ lean_obj_res lean_hesper_map_buffer_read(b_lean_obj_arg device_obj, b_lean_obj_a
     fprintf(stderr, "[C++]   [BUFFER READ] wrapper=%p, WGPUBuffer=%p\n", (void*)buffer, (void*)buffer->Get());
     fflush(stderr);
 
-    // CRITICAL: Wait for all previous GPU work (compute, writes) to complete BEFORE copying
-    fprintf(stderr, "[C++] Waiting for previous GPU work to complete...\n");
-    fflush(stderr);
-
-    // Use C API for OnSubmittedWorkDone with new struct-based API
-    struct WorkDoneData {
-        bool done;
-        WGPUQueueWorkDoneStatus status;
-    };
-
-    static WorkDoneData workData = {false, WGPUQueueWorkDoneStatus_Success};  // Static to ensure lifetime during callback
-
     if (!g_dawn_instance) {
         fprintf(stderr, "[C++] ERROR: g_dawn_instance is null!\n");
         fflush(stderr);
@@ -919,58 +945,12 @@ lean_obj_res lean_hesper_map_buffer_read(b_lean_obj_arg device_obj, b_lean_obj_a
 
     wgpu::Instance instance(g_dawn_instance->Get());
 
-    WGPUQueueWorkDoneCallbackInfo callbackInfo = {};
-    callbackInfo.nextInChain = nullptr;
-    callbackInfo.mode = WGPUCallbackMode_AllowProcessEvents;
-    callbackInfo.callback = [](WGPUQueueWorkDoneStatus status, WGPUStringView message,
-                                void* userdata1, void* userdata2) {
-        WorkDoneData* data = static_cast<WorkDoneData*>(userdata1);
-        data->done = true;
-        data->status = status;
-        fprintf(stderr, "[C++] OnSubmittedWorkDone: status=%d\n", static_cast<int>(status));
-        if (message.length > 0) {
-            fprintf(stderr, "[C++] Message: %.*s\n",
-                    static_cast<int>(message.length), message.data);
-        }
-        fflush(stderr);
-    };
-    callbackInfo.userdata1 = &workData;
-    callbackInfo.userdata2 = nullptr;
-
-    wgpuQueueOnSubmittedWorkDone(device->GetQueue().Get(), callbackInfo);
-
-    // Process events until work is done
-    for (int i = 0; i < 5000 && !workData.done; i++) {
-        instance.ProcessEvents();
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
-    }
-
-    if (!workData.done) {
-        fprintf(stderr, "[C++] ERROR: GPU work did not complete in time!\n");
-        fflush(stderr);
-        return lean_io_result_mk_ok(lean_mk_empty_byte_array(lean_box(0)));
-    }
-
-    // Check if GPU work succeeded
-    if (workData.status != WGPUQueueWorkDoneStatus_Success) {
-        fprintf(stderr, "[C++] ERROR: GPU work failed with status=%d\n", static_cast<int>(workData.status));
-        fprintf(stderr, "[C++] This usually means:\n");
-        fprintf(stderr, "[C++]   - Shader validation error (check WGSL above)\n");
-        fprintf(stderr, "[C++]   - Buffer binding mismatch\n");
-        fprintf(stderr, "[C++]   - Resource usage conflict\n");
-        fflush(stderr);
-        return lean_io_result_mk_ok(lean_mk_empty_byte_array(lean_box(0)));
-    }
-
-    fprintf(stderr, "[C++] GPU work completed successfully, now copying to staging buffer\n");
-    fflush(stderr);
-
     // Following gpu.hpp toCPUAsync pattern:
     // 1. Create readback buffer (staging buffer for CPU read)
     wgpu::BufferDescriptor stagingDesc{};
     stagingDesc.size = size;
     stagingDesc.usage = wgpu::BufferUsage::CopyDst | wgpu::BufferUsage::MapRead;
-    stagingDesc.mappedAtCreation = false;  // Don't map at creation
+    stagingDesc.mappedAtCreation = false;
 
     wgpu::Buffer stagingBuffer = device->CreateBuffer(&stagingDesc);
 
@@ -982,119 +962,63 @@ lean_obj_res lean_hesper_map_buffer_read(b_lean_obj_arg device_obj, b_lean_obj_a
     encoder.CopyBufferToBuffer(*buffer, offset, stagingBuffer, 0, size);
     wgpu::CommandBuffer commands = encoder.Finish();
 
-    // 3. Submit the command and release command buffer immediately (like gpu.hpp)
+    // 3. Submit the command
     device->GetQueue().Submit(1, &commands);
 
     fprintf(stderr, "[C++] Submitted copy command to GPU queue\n");
     fflush(stderr);
 
-    // 4. Process GPU queue using ProcessEvents (like gpu.hpp pattern)
-    fprintf(stderr, "[C++] Processing GPU queue with ProcessEvents...\n");
+    // 4. Set up promise/future pattern for async buffer mapping
+    // Create callback data structure for chained async operations
+    auto promise = std::make_shared<std::promise<void>>();
+    std::future<void> future = promise->get_future();
+
+    // Allocate buffer for mapped data (will be filled by callback)
+    lean_object* result_byte_array = lean_mk_empty_byte_array(lean_box(0));
+    lean_inc(result_byte_array);  // Keep alive during async operations
+
+    // Set up callback data
+    CallbackData* cbData = new CallbackData{
+        .buffer = stagingBuffer.Get(),
+        .bufferSize = size,
+        .output = result_byte_array,
+        .promise = promise,
+        .result_ptr = &result_byte_array  // Pass pointer so callback can update it
+    };
+
+    // 5. Start the async chain with OnSubmittedWorkDone
+    fprintf(stderr, "[C++] Waiting for previous GPU work to complete...\n");
     fflush(stderr);
 
-    // ProcessEvents in a loop like gpu.hpp (wait up to 5 seconds)
-    for (int i = 0; i < 5000; i++) {
-        instance.ProcessEvents();
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
-    }
+    WGPUQueueWorkDoneCallbackInfo workDoneInfo = {
+        .nextInChain = nullptr,
+        .mode = WGPUCallbackMode_AllowProcessEvents,
+        .callback = queueWorkDoneCallback,
+        .userdata1 = cbData,
+        .userdata2 = nullptr
+    };
 
-    fprintf(stderr, "[C++] GPU queue processed, now mapping buffer...\n");
+    wgpuQueueOnSubmittedWorkDone(device->GetQueue().Get(), workDoneInfo);
+
+    // 6. Wait for the entire async chain to complete using promise/future pattern
+    fprintf(stderr, "[C++] Waiting for async operations to complete...\n");
     fflush(stderr);
 
-    // 5. Map the buffer using MapAsync + Tick()
-    bool mapped = false;
-    wgpu::MapAsyncStatus mapStatus = wgpu::MapAsyncStatus::Success;  // Initialize to success, will be updated by callback
+    wait(instance, future);
 
-    stagingBuffer.MapAsync(
-        wgpu::MapMode::Read,
-        0,
-        size,
-        wgpu::CallbackMode::AllowProcessEvents,
-        [&mapped, &mapStatus](wgpu::MapAsyncStatus status, wgpu::StringView message) {
-            mapStatus = status;
-            if (status == wgpu::MapAsyncStatus::Success) {
-                mapped = true;
-                fprintf(stderr, "[C++] MapAsync SUCCESS\n");
-            } else {
-                fprintf(stderr, "[C++] MapAsync FAILED: status=%d\n", static_cast<int>(status));
-                if (message.length > 0) {
-                    fprintf(stderr, "[C++] Message: %.*s\n",
-                            static_cast<int>(message.length), message.data);
-                }
-            }
-            fflush(stderr);
-        }
-    );
-
-    fprintf(stderr, "[C++] Waiting for MapAsync with ProcessEvents()...\n");
+    fprintf(stderr, "[C++] All async operations completed\n");
     fflush(stderr);
 
-    // ProcessEvents until mapping completes (up to 5 seconds)
-    for (int i = 0; i < 5000 && !mapped; i++) {
-        instance.ProcessEvents();
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
-    }
-
-    if (!mapped) {
-        fprintf(stderr, "[C++] ERROR: MapAsync timed out, status=%d\n", static_cast<int>(mapStatus));
-        fflush(stderr);
-        return lean_io_result_mk_ok(lean_mk_empty_byte_array(lean_box(0)));
-    }
-
-    fprintf(stderr, "[C++] Buffer mapped successfully\n");
+    // 7. Return the ByteArray (data was filled by the callback via result_ptr)
+    size_t final_size = lean_sarray_size(result_byte_array);
+    fprintf(stderr, "[C++] Returning ByteArray (size=%zu, expected=%zu)\n", final_size, size);
     fflush(stderr);
 
-    // 6. Get the mapped range (like gpu.hpp's wgpuBufferGetConstMappedRange)
-    const uint8_t* mappedData = static_cast<const uint8_t*>(stagingBuffer.GetConstMappedRange(0, size));
-
-    if (!mappedData) {
-        fprintf(stderr, "[C++] ERROR: GetConstMappedRange returned nullptr\n");
-        fflush(stderr);
-        stagingBuffer.Unmap();
-        return lean_io_result_mk_ok(lean_mk_empty_byte_array(lean_box(0)));
-    }
-
-    fprintf(stderr, "[C++] Got mapped range, creating ByteArray...\n");
-    fflush(stderr);
-
-    // Print first 16 bytes of mapped data (as hex and float)
-    if (size >= 16) {
-        fprintf(stderr, "[C++]   Mapped data (hex): ");
-        for (size_t i = 0; i < 16; i++) {
-            fprintf(stderr, "%02x ", mappedData[i]);
-        }
-        fprintf(stderr, "\n");
-
-        // Interpret as floats
-        const float* float_ptr = reinterpret_cast<const float*>(mappedData);
-        fprintf(stderr, "[C++]   Mapped data as floats: %.2f, %.2f, %.2f, %.2f\n",
-                float_ptr[0], float_ptr[1], float_ptr[2], float_ptr[3]);
-        fflush(stderr);
-    }
-
-    // 7. Copy data to Lean ByteArray using push API
-    lean_object* byte_array = lean_mk_empty_byte_array(lean_box(0));
-
-    fprintf(stderr, "[C++] Created empty ByteArray, now pushing %zu bytes...\n", size);
-    fflush(stderr);
-
-    // Push bytes one by one using Lean API
-    for (size_t i = 0; i < size; i++) {
-        byte_array = lean_byte_array_push(byte_array, mappedData[i]);
-    }
-
-    size_t final_size = lean_sarray_size(byte_array);
-    fprintf(stderr, "[C++] Data copied to ByteArray (final_size=%zu, expected=%zu)\n", final_size, size);
-    fflush(stderr);
-
-    // 8. Unmap the buffer BEFORE returning (very important - mapped range becomes invalid after unmap)
-    stagingBuffer.Unmap();
-
-    fprintf(stderr, "[C++] Buffer unmapped, returning ByteArray\n");
-    fflush(stderr);
-
-    // 9. Return the ByteArray (lean_io_result_mk_ok takes ownership, no need to incref)
-    return lean_io_result_mk_ok(byte_array);
+    // lean_io_result_mk_ok takes ownership
+    // Note: We don't need lean_dec here because the callback already managed refcounts:
+    // - It dec'd the old empty array
+    // - It stored the new array with data (which already has correct refcount from lean_byte_array_push)
+    return lean_io_result_mk_ok(result_byte_array);
 }
 
 lean_obj_res lean_hesper_unmap_buffer(b_lean_obj_arg buffer, lean_obj_res /* unit */) {
@@ -1123,16 +1047,19 @@ lean_obj_res lean_hesper_create_shader_module(b_lean_obj_arg device_obj, b_lean_
     wgpu::ShaderModuleDescriptor shaderDesc{};
     shaderDesc.nextInChain = &wgslDesc;
 
-    // Create shader module - Dawn will automatically output compilation errors to stderr
-    wgpu::ShaderModule shaderModule = device->CreateShaderModule(&shaderDesc);
+    // Create shader module within error scope to catch validation errors
+    wgpu::ShaderModule shaderModule;
+    bool success = runWithErrorScope(device->Get(), g_dawn_instance, "CreateShaderModule", [&]() {
+        shaderModule = device->CreateShaderModule(&shaderDesc);
+    });
 
     // Check if shader module creation succeeded
-    if (!shaderModule) {
+    if (!shaderModule || !success) {
         fprintf(stderr, "\n");
         fprintf(stderr, "╔════════════════════════════════════════════════════════════╗\n");
         fprintf(stderr, "║ CRITICAL ERROR: Shader Module Creation Failed            ║\n");
         fprintf(stderr, "╚════════════════════════════════════════════════════════════╝\n");
-        fprintf(stderr, "[C++] CreateShaderModule returned null handle\n");
+        fprintf(stderr, "[C++] CreateShaderModule returned null handle or had validation errors\n");
         fprintf(stderr, "════════════════════════════════════════════════════════════\n\n");
         fflush(stderr);
         lean_object* error_msg = lean_mk_string("Shader module creation failed - check stderr for compilation errors");
@@ -1347,7 +1274,23 @@ lean_obj_res lean_hesper_create_compute_pipeline(b_lean_obj_arg device_obj, b_le
     fprintf(stderr, "[C++] Calling CreateComputePipeline...\n");
     fflush(stderr);
 
-    wgpu::ComputePipeline pipeline = device->CreateComputePipeline(&pipelineDesc);
+    // Create pipeline within error scope to catch validation errors
+    wgpu::ComputePipeline pipeline;
+    bool success = runWithErrorScope(device->Get(), g_dawn_instance, "CreateComputePipeline", [&]() {
+        pipeline = device->CreateComputePipeline(&pipelineDesc);
+    });
+
+    if (!pipeline || !success) {
+        fprintf(stderr, "\n");
+        fprintf(stderr, "╔════════════════════════════════════════════════════════════╗\n");
+        fprintf(stderr, "║ CRITICAL ERROR: Pipeline Creation Failed                 ║\n");
+        fprintf(stderr, "╚════════════════════════════════════════════════════════════╝\n");
+        fprintf(stderr, "[C++] CreateComputePipeline returned null or had validation errors\n");
+        fprintf(stderr, "════════════════════════════════════════════════════════════\n\n");
+        fflush(stderr);
+        lean_object* error_msg = lean_mk_string("Compute pipeline creation failed - check stderr for errors");
+        return lean_io_result_mk_error(error_msg);
+    }
 
     fprintf(stderr, "[C++] ComputePipeline created successfully\n");
     fflush(stderr);
@@ -1370,19 +1313,34 @@ lean_obj_res lean_hesper_dispatch_compute(b_lean_obj_arg device_obj, b_lean_obj_
     fprintf(stderr, "[C++] dispatchCompute: workgroups=(%u,%u,%u)\n", workgroupsX, workgroupsY, workgroupsZ);
     fflush(stderr);
 
-    // Use C API like gpu.hpp to avoid C++ wrapper destructor issues
-    WGPUCommandEncoder commandEncoder = wgpuDeviceCreateCommandEncoder(device->Get(), nullptr);
-    WGPUComputePassEncoder computePassEncoder = wgpuCommandEncoderBeginComputePass(commandEncoder, nullptr);
-    wgpuComputePassEncoderSetPipeline(computePassEncoder, pipeline->Get());
-    wgpuComputePassEncoderSetBindGroup(computePassEncoder, 0, bindGroup->Get(), 0, nullptr);
-    wgpuComputePassEncoderDispatchWorkgroups(computePassEncoder, workgroupsX, workgroupsY, workgroupsZ);
-    wgpuComputePassEncoderEnd(computePassEncoder);
-    wgpuComputePassEncoderRelease(computePassEncoder);  // Explicitly release like gpu.hpp
-    WGPUCommandBuffer commandBuffer = wgpuCommandEncoderFinish(commandEncoder, nullptr);
-    wgpuCommandEncoderRelease(commandEncoder);  // Explicitly release like gpu.hpp
+    // Wrap dispatch in error scope to catch any runtime errors
+    bool success = runWithErrorScope(device->Get(), g_dawn_instance, "DispatchCompute", [&]() {
+        // Use C API like gpu.hpp to avoid C++ wrapper destructor issues
+        WGPUCommandEncoder commandEncoder = wgpuDeviceCreateCommandEncoder(device->Get(), nullptr);
+        WGPUComputePassEncoder computePassEncoder = wgpuCommandEncoderBeginComputePass(commandEncoder, nullptr);
+        wgpuComputePassEncoderSetPipeline(computePassEncoder, pipeline->Get());
+        wgpuComputePassEncoderSetBindGroup(computePassEncoder, 0, bindGroup->Get(), 0, nullptr);
+        wgpuComputePassEncoderDispatchWorkgroups(computePassEncoder, workgroupsX, workgroupsY, workgroupsZ);
+        wgpuComputePassEncoderEnd(computePassEncoder);
+        wgpuComputePassEncoderRelease(computePassEncoder);  // Explicitly release like gpu.hpp
+        WGPUCommandBuffer commandBuffer = wgpuCommandEncoderFinish(commandEncoder, nullptr);
+        wgpuCommandEncoderRelease(commandEncoder);  // Explicitly release like gpu.hpp
 
-    wgpuQueueSubmit(device->GetQueue().Get(), 1, &commandBuffer);
-    wgpuCommandBufferRelease(commandBuffer);  // Release after submit like gpu.hpp
+        wgpuQueueSubmit(device->GetQueue().Get(), 1, &commandBuffer);
+        wgpuCommandBufferRelease(commandBuffer);  // Release after submit like gpu.hpp
+    });
+
+    if (!success) {
+        fprintf(stderr, "\n");
+        fprintf(stderr, "╔════════════════════════════════════════════════════════════╗\n");
+        fprintf(stderr, "║ CRITICAL ERROR: Dispatch Compute Failed                  ║\n");
+        fprintf(stderr, "╚════════════════════════════════════════════════════════════╝\n");
+        fprintf(stderr, "[C++] DispatchCompute had validation or runtime errors\n");
+        fprintf(stderr, "════════════════════════════════════════════════════════════\n\n");
+        fflush(stderr);
+        lean_object* error_msg = lean_mk_string("Dispatch compute failed - check stderr for errors");
+        return lean_io_result_mk_error(error_msg);
+    }
 
     fprintf(stderr, "[C++] dispatchCompute: submitted (async, will complete when mapBufferRead is called)\n");
     fflush(stderr);
@@ -1390,283 +1348,6 @@ lean_obj_res lean_hesper_dispatch_compute(b_lean_obj_arg device_obj, b_lean_obj_
     // Following gpu.hpp pattern: dispatchCompute just submits work and returns immediately.
     // The actual waiting for GPU completion happens in mapBufferRead via OnSubmittedWorkDone + WaitAny.
     // This is the correct async pattern - don't wait here!
-
-    return lean_io_result_mk_ok(lean_box(0));
-}
-
-// Matrix multiplication with subgroup operations
-lean_obj_res lean_hesper_matmul_subgroup(b_lean_obj_arg device_obj, b_lean_obj_arg shader_lean, uint32_t m, uint32_t k, uint32_t n, lean_obj_res /* unit */) {
-    wgpu::Device* device = EXTRACT_DEVICE_PTR(device_obj);
-
-    std::cout << "[Hesper] Running Subgroup Matrix Multiplication" << std::endl;
-    std::cout << "  Dimensions: " << m << "x" << k << " * " << n << "x" << k << std::endl;
-
-    // Extract shader code from Lean string
-    const char* shaderCode = lean_string_cstr(shader_lean);
-
-    // Create buffers
-    wgpu::BufferDescriptor bufferDesc{};
-    bufferDesc.size = m * k * sizeof(float);
-    bufferDesc.usage = wgpu::BufferUsage::Storage | wgpu::BufferUsage::CopyDst;
-    wgpu::Buffer bufferA = device->CreateBuffer(&bufferDesc);
-
-    bufferDesc.size = n * k * sizeof(float);
-    wgpu::Buffer bufferB = device->CreateBuffer(&bufferDesc);
-
-    bufferDesc.size = m * n * sizeof(float);
-    wgpu::Buffer bufferC = device->CreateBuffer(&bufferDesc);
-
-    std::cout << "  Buffers created" << std::endl;
-
-    // Initialize test data
-    std::vector<float> dataA(m * k);
-    std::vector<float> dataB(n * k);
-    for (uint32_t i = 0; i < m * k; i++) {
-        dataA[i] = static_cast<float>(i % 10) / 10.0f;
-    }
-    for (uint32_t i = 0; i < n * k; i++) {
-        dataB[i] = static_cast<float>((i + 5) % 10) / 10.0f;
-    }
-
-    // Upload data
-    device->GetQueue().WriteBuffer(bufferA, 0, dataA.data(), m * k * sizeof(float));
-    device->GetQueue().WriteBuffer(bufferB, 0, dataB.data(), n * k * sizeof(float));
-    std::cout << "  Data uploaded" << std::endl;
-
-    // Create shader module
-    wgpu::ShaderModuleWGSLDescriptor wgslDesc{};
-    wgslDesc.code = shaderCode;
-    wgpu::ShaderModuleDescriptor shaderDesc{};
-    shaderDesc.nextInChain = &wgslDesc;
-    wgpu::ShaderModule shaderModule = device->CreateShaderModule(&shaderDesc);
-    std::cout << "  Shader compiled" << std::endl;
-
-    // Create bind group layout
-    std::vector<wgpu::BindGroupLayoutEntry> entries(3);
-    for (int i = 0; i < 3; i++) {
-        entries[i].binding = i;
-        entries[i].visibility = wgpu::ShaderStage::Compute;
-        entries[i].buffer.type = wgpu::BufferBindingType::Storage;
-    }
-
-    wgpu::BindGroupLayoutDescriptor bglDesc{};
-    bglDesc.entryCount = entries.size();
-    bglDesc.entries = entries.data();
-    wgpu::BindGroupLayout bindGroupLayout = device->CreateBindGroupLayout(&bglDesc);
-
-    // Create pipeline
-    wgpu::ComputePipelineDescriptor pipelineDesc{};
-    pipelineDesc.compute.module = shaderModule;
-    pipelineDesc.compute.entryPoint = "main";
-
-    wgpu::PipelineLayoutDescriptor layoutDesc{};
-    layoutDesc.bindGroupLayoutCount = 1;
-    layoutDesc.bindGroupLayouts = &bindGroupLayout;
-    pipelineDesc.layout = device->CreatePipelineLayout(&layoutDesc);
-
-    wgpu::ComputePipeline pipeline = device->CreateComputePipeline(&pipelineDesc);
-    std::cout << "  Pipeline created" << std::endl;
-
-    // Create bind group
-    std::vector<wgpu::BindGroupEntry> bindEntries(3);
-    bindEntries[0].binding = 0;
-    bindEntries[0].buffer = bufferA;
-    bindEntries[0].size = m * k * sizeof(float);
-    bindEntries[1].binding = 1;
-    bindEntries[1].buffer = bufferB;
-    bindEntries[1].size = n * k * sizeof(float);
-    bindEntries[2].binding = 2;
-    bindEntries[2].buffer = bufferC;
-    bindEntries[2].size = m * n * sizeof(float);
-
-    wgpu::BindGroupDescriptor bgDesc{};
-    bgDesc.layout = bindGroupLayout;
-    bgDesc.entryCount = bindEntries.size();
-    bgDesc.entries = bindEntries.data();
-    wgpu::BindGroup bindGroup = device->CreateBindGroup(&bgDesc);
-
-    // Dispatch compute
-    uint32_t numWorkgroupsX = (m + 32 - 1) / 32;
-    uint32_t numWorkgroupsY = (n + 16 - 1) / 16;
-
-    std::cout << "  Dispatching (" << numWorkgroupsX << ", " << numWorkgroupsY << ", 1)" << std::endl;
-
-    wgpu::CommandEncoder encoder = device->CreateCommandEncoder();
-    wgpu::ComputePassEncoder pass = encoder.BeginComputePass();
-    pass.SetPipeline(pipeline);
-    pass.SetBindGroup(0, bindGroup);
-    pass.DispatchWorkgroups(numWorkgroupsX, numWorkgroupsY, 1);
-    pass.End();
-
-    wgpu::CommandBuffer commands = encoder.Finish();
-    device->GetQueue().Submit(1, &commands);
-
-    std::cout << "  ✓ Subgroup matmul completed!" << std::endl;
-
-    return lean_io_result_mk_ok(lean_box(0));
-}
-
-// 4K Matrix multiplication benchmark with FLOPS calculation
-lean_obj_res lean_hesper_matmul_subgroup_4k(b_lean_obj_arg device_obj, b_lean_obj_arg shader_lean, lean_obj_res /* unit */) {
-    wgpu::Device* device = EXTRACT_DEVICE_PTR(device_obj);
-
-    constexpr uint32_t m = 4096;
-    constexpr uint32_t k = 4096;
-    constexpr uint32_t n = 4096;
-    constexpr uint32_t tm = 4;
-    constexpr uint32_t tn = 8;
-    constexpr uint32_t lid0 = 32;
-    constexpr uint32_t lid1 = 2;
-    constexpr int nIter = 10;  // Run multiple times for accurate timing
-
-    std::cout << "[Hesper] 4K Subgroup Matrix Multiplication Benchmark" << std::endl;
-    std::cout << "  Configuration: TM=" << tm << ", TN=" << tn << ", LID0=" << lid0 << ", LID1=" << lid1 << std::endl;
-
-    // Extract shader code from Lean string
-    const char* shaderCode = lean_string_cstr(shader_lean);
-
-    // Create buffers
-    std::cout << "  Creating GPU buffers..." << std::endl;
-    wgpu::BufferDescriptor bufferDesc{};
-    bufferDesc.size = static_cast<size_t>(m) * k * sizeof(float);
-    bufferDesc.usage = wgpu::BufferUsage::Storage | wgpu::BufferUsage::CopyDst;
-    wgpu::Buffer bufferA = device->CreateBuffer(&bufferDesc);
-
-    bufferDesc.size = static_cast<size_t>(n) * k * sizeof(float);
-    wgpu::Buffer bufferB = device->CreateBuffer(&bufferDesc);
-
-    bufferDesc.size = static_cast<size_t>(m) * n * sizeof(float);
-    wgpu::Buffer bufferC = device->CreateBuffer(&bufferDesc);
-
-    // Initialize with random-ish data
-    std::cout << "  Initializing data..." << std::endl;
-    std::vector<float> dataA(static_cast<size_t>(m) * k);
-    std::vector<float> dataB(static_cast<size_t>(n) * k);
-    for (size_t i = 0; i < dataA.size(); i++) {
-        dataA[i] = static_cast<float>((i * 7 + 13) % 100) / 100.0f;
-    }
-    for (size_t i = 0; i < dataB.size(); i++) {
-        dataB[i] = static_cast<float>((i * 11 + 17) % 100) / 100.0f;
-    }
-
-    device->GetQueue().WriteBuffer(bufferA, 0, dataA.data(), dataA.size() * sizeof(float));
-    device->GetQueue().WriteBuffer(bufferB, 0, dataB.data(), dataB.size() * sizeof(float));
-
-    // Create shader and pipeline
-    std::cout << "  Compiling shader..." << std::endl;
-    wgpu::ShaderModuleWGSLDescriptor wgslDesc{};
-    wgslDesc.code = shaderCode;
-    wgpu::ShaderModuleDescriptor shaderDesc{};
-    shaderDesc.nextInChain = &wgslDesc;
-    wgpu::ShaderModule shaderModule = device->CreateShaderModule(&shaderDesc);
-
-    std::vector<wgpu::BindGroupLayoutEntry> entries(3);
-    for (int i = 0; i < 3; i++) {
-        entries[i].binding = i;
-        entries[i].visibility = wgpu::ShaderStage::Compute;
-        entries[i].buffer.type = wgpu::BufferBindingType::Storage;
-    }
-
-    wgpu::BindGroupLayoutDescriptor bglDesc{};
-    bglDesc.entryCount = entries.size();
-    bglDesc.entries = entries.data();
-    wgpu::BindGroupLayout bindGroupLayout = device->CreateBindGroupLayout(&bglDesc);
-
-    wgpu::ComputePipelineDescriptor pipelineDesc{};
-    pipelineDesc.compute.module = shaderModule;
-    pipelineDesc.compute.entryPoint = "main";
-
-    wgpu::PipelineLayoutDescriptor layoutDesc{};
-    layoutDesc.bindGroupLayoutCount = 1;
-    layoutDesc.bindGroupLayouts = &bindGroupLayout;
-    pipelineDesc.layout = device->CreatePipelineLayout(&layoutDesc);
-
-    wgpu::ComputePipeline pipeline = device->CreateComputePipeline(&pipelineDesc);
-
-    // Create bind group
-    std::vector<wgpu::BindGroupEntry> bindEntries(3);
-    bindEntries[0].binding = 0;
-    bindEntries[0].buffer = bufferA;
-    bindEntries[0].size = static_cast<size_t>(m) * k * sizeof(float);
-    bindEntries[1].binding = 1;
-    bindEntries[1].buffer = bufferB;
-    bindEntries[1].size = static_cast<size_t>(n) * k * sizeof(float);
-    bindEntries[2].binding = 2;
-    bindEntries[2].buffer = bufferC;
-    bindEntries[2].size = static_cast<size_t>(m) * n * sizeof(float);
-
-    wgpu::BindGroupDescriptor bgDesc{};
-    bgDesc.layout = bindGroupLayout;
-    bgDesc.entryCount = bindEntries.size();
-    bgDesc.entries = bindEntries.data();
-    wgpu::BindGroup bindGroup = device->CreateBindGroup(&bgDesc);
-
-    // Calculate workgroup count
-    uint32_t numWorkgroupsX = (m + 32 - 1) / 32;
-    uint32_t numWorkgroupsY = (n + 64 - 1) / 64;
-
-    std::cout << "  Workgroups: (" << numWorkgroupsX << ", " << numWorkgroupsY << ", 1)" << std::endl;
-    std::cout << "  Total workgroups: " << (numWorkgroupsX * numWorkgroupsY) << std::endl;
-    std::cout << std::endl;
-
-    // Warmup run
-    std::cout << "  Warmup run..." << std::endl;
-    wgpu::CommandEncoder encoder = device->CreateCommandEncoder();
-    wgpu::ComputePassEncoder pass = encoder.BeginComputePass();
-    pass.SetPipeline(pipeline);
-    pass.SetBindGroup(0, bindGroup);
-    pass.DispatchWorkgroups(numWorkgroupsX, numWorkgroupsY, 1);
-    pass.End();
-    wgpu::CommandBuffer commands = encoder.Finish();
-    device->GetQueue().Submit(1, &commands);
-
-    // Benchmark runs
-    std::cout << "  Running " << nIter << " benchmark iterations..." << std::endl;
-
-    auto start = std::chrono::high_resolution_clock::now();
-
-    for (int iter = 0; iter < nIter; iter++) {
-        wgpu::CommandEncoder enc = device->CreateCommandEncoder();
-        wgpu::ComputePassEncoder p = enc.BeginComputePass();
-        p.SetPipeline(pipeline);
-        p.SetBindGroup(0, bindGroup);
-        p.DispatchWorkgroups(numWorkgroupsX, numWorkgroupsY, 1);
-        p.End();
-        wgpu::CommandBuffer cmd = enc.Finish();
-        device->GetQueue().Submit(1, &cmd);
-    }
-
-    // Wait for completion (simple approach - just tick a bunch)
-    for (int i = 0; i < 1000; i++) {
-        device->Tick();
-    }
-
-    auto end = std::chrono::high_resolution_clock::now();
-    std::chrono::duration<double> elapsed = end - start;
-    double totalTime = elapsed.count();
-    double avgTime = totalTime / nIter;
-
-    // Calculate GFLOPS
-    double totalOps = 2.0 * m * n * k;  // 2 ops per MAC
-    double gflops = (totalOps * nIter / totalTime) / 1.0e9;
-    double avgGflops = totalOps / avgTime / 1.0e9;
-
-    std::cout << std::endl;
-    std::cout << "═══════════════════════════════════════════════════════════" << std::endl;
-    std::cout << "  4K Matrix Multiplication Performance Results" << std::endl;
-    std::cout << "═══════════════════════════════════════════════════════════" << std::endl;
-    std::cout << "  Matrix size: " << m << "×" << k << " × " << n << "×" << k << std::endl;
-    std::cout << "  Total operations: " << std::fixed << std::setprecision(2)
-              << (totalOps / 1.0e9) << " GFLOP" << std::endl;
-    std::cout << "  Iterations: " << nIter << std::endl;
-    std::cout << "  Total time: " << std::fixed << std::setprecision(3)
-              << totalTime << " seconds" << std::endl;
-    std::cout << "  Average time per iteration: " << std::fixed << std::setprecision(3)
-              << (avgTime * 1000) << " ms" << std::endl;
-    std::cout << "-----------------------------------------------------------" << std::endl;
-    std::cout << "  Performance: " << std::fixed << std::setprecision(2)
-              << avgGflops << " GFLOPS" << std::endl;
-    std::cout << "═══════════════════════════════════════════════════════════" << std::endl;
 
     return lean_io_result_mk_ok(lean_box(0));
 }
