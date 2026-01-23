@@ -623,13 +623,13 @@ partial def Exp.toWGSL {t : WGSLType} : Exp t → String
     let argStrs := args.map fun ⟨_, e⟩ => toWGSL e
     s!"{fname}({String.intercalate ", " argStrs})"
   | subgroupMatrixLoad (st:=_st) (m:=_m) (k:=k) ptr offset transposeFlag stride =>
-    s!"subgroupMatrixLoad<subgroup_matrix_left<{_st.toWGSL},{_m},{k}>>({ptr}, {toWGSL offset}, {toWGSL transposeFlag}, {toWGSL stride})"
+    s!"subgroupMatrixLoad<subgroup_matrix_left<{_st.toWGSL},{_m},{k}>>(&{ptr}, {toWGSL offset}, {toWGSL transposeFlag}, {toWGSL stride})"
   | subgroupMatrixLoadRight (st:=_st) (k:=k) (n:=_n) ptr offset transposeFlag stride =>
-    s!"subgroupMatrixLoad<subgroup_matrix_right<{_st.toWGSL},{k},{_n}>>({ptr}, {toWGSL offset}, {toWGSL transposeFlag}, {toWGSL stride})"
+    s!"subgroupMatrixLoad<subgroup_matrix_right<{_st.toWGSL},{k},{_n}>>(&{ptr}, {toWGSL offset}, {toWGSL transposeFlag}, {toWGSL stride})"
   | subgroupMatrixMultiplyAccumulate a b acc =>
     s!"subgroupMatrixMultiplyAccumulate({toWGSL a}, {toWGSL b}, {toWGSL acc})"
   | subgroupMatrixStore (st:=_st) (m:=_m) (n:=_n) ptr offset mat transposeFlag stride =>
-    s!"subgroupMatrixStore({ptr}, {toWGSL offset}, {toWGSL mat}, {toWGSL transposeFlag}, {toWGSL stride})"
+    s!"subgroupMatrixStore(&{ptr}, {toWGSL offset}, {toWGSL mat}, {toWGSL transposeFlag}, {toWGSL stride})"
   | subgroupMatrixZeroLeft (st:=_st) (m:=_m) (k:=k) =>
     s!"subgroup_matrix_left<{_st.toWGSL}, {_m}, {k}>(0)"
   | subgroupMatrixZeroRight (st:=_st) (k:=k) (n:=_n) =>
