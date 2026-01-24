@@ -8,6 +8,7 @@ import Hesper.WGSL.Types
 import Hesper.WGSL.Exp
 import Hesper.WGSL.DSL
 import Hesper.WGSL.Monad
+import Hesper.WGSL.CodeGen
 import Hesper.WGSL.Execute
 
 namespace Hesper.Compute
@@ -179,12 +180,12 @@ def runSimpleKernel
   }
   let bindGroup ← createBindGroup device bindGroupLayout #[bindEntry]
 
-  -- Dispatch compute
+  -- Dispatch compute (async - returns Future)
   let (wx, wy, wz) := config.numWorkgroups
-  dispatchCompute device pipeline bindGroup wx.toUInt32 wy.toUInt32 wz.toUInt32
+  let future ← dispatchCompute device pipeline bindGroup wx.toUInt32 wy.toUInt32 wz.toUInt32
 
   -- Wait for completion
-  deviceWait device
+  deviceWait future
 
   -- Read results
   let resultBytes ← mapBufferRead device buffer 0 ((outputSize * 4).toUSize)
@@ -237,18 +238,21 @@ The shader operates on a single `var<storage, read_write> data: array<f32>` buff
 **Note**: For type-safe multi-step operations, use `Hesper.WGSL.Monad.ShaderM` instead.
 -/
 def generateUnaryShader (f : Exp (.scalar .f32) → Exp (.scalar .f32)) : String :=
-  let x : Exp (.scalar .f32) := Exp.var "x"
-  let body := f x
-  let bodyCode := body.toWGSL
-  "@group(0) @binding(0) var<storage, read_write> data: array<f32>;\n\n" ++
-  "@compute @workgroup_size(256)\n" ++
-  "fn main(@builtin(global_invocation_id) gid: vec3<u32>) {\n" ++
-  "  let i = gid.x;\n" ++
-  "  if (i < arrayLength(&data)) {\n" ++
-  "    let x = data[i];\n" ++
-  s!"    data[i] = {bodyCode};\n" ++
-  "  }\n" ++
-  "}"
+  let computation : Monad.ShaderM Unit := do
+    let gid ← Monad.ShaderM.globalId
+    let i := Exp.vec3X gid
+
+    let dataBuf ← Monad.ShaderM.declareInputBuffer "data" (.scalar .f32)
+    let _outputBuf ← Monad.ShaderM.declareOutputBuffer "data" (.scalar .f32)
+
+    let len := Exp.arrayLength (t := .scalar .f32) "&data"
+    Monad.ShaderM.if_ (Exp.lt i len) (do
+      let x ← Monad.ShaderM.readBuffer (ty := .scalar .f32) (n := 1024) dataBuf i
+      let result := f x
+      Monad.ShaderM.writeBuffer (ty := .scalar .f32) dataBuf i result
+    ) (pure ())
+
+  WGSL.CodeGen.generateWGSL "main" {x := 256, y := 1, z := 1} ([] : List String) ([] : List (String × String)) computation
 
 /-- Generate WGSL shader code for a binary operation (combine two arrays element-wise).
 
@@ -297,22 +301,23 @@ The shader uses dataA's length for bounds checking.
 multiple buffers, use `Hesper.WGSL.Monad.ShaderM` for proper type-safe buffer management.
 -/
 def generateBinaryShader (f : Exp (.scalar .f32) → Exp (.scalar .f32) → Exp (.scalar .f32)) : String :=
-  let a : Exp (.scalar .f32) := Exp.var "a"
-  let b : Exp (.scalar .f32) := Exp.var "b"
-  let body := f a b
-  let bodyCode := body.toWGSL
-  "@group(0) @binding(0) var<storage, read_write> dataA: array<f32>;\n" ++
-  "@group(0) @binding(1) var<storage, read_write> dataB: array<f32>;\n" ++
-  "@group(0) @binding(2) var<storage, read_write> dataC: array<f32>;\n\n" ++
-  "@compute @workgroup_size(256)\n" ++
-  "fn main(@builtin(global_invocation_id) gid: vec3<u32>) {\n" ++
-  "  let i = gid.x;\n" ++
-  "  if (i < arrayLength(&dataA)) {\n" ++
-  "    let a = dataA[i];\n" ++
-  "    let b = dataB[i];\n" ++
-  s!"    dataC[i] = {bodyCode};\n" ++
-  "  }\n" ++
-  "}"
+  let computation : Monad.ShaderM Unit := do
+    let gid ← Monad.ShaderM.globalId
+    let i := Exp.vec3X gid
+
+    let dataABuf ← Monad.ShaderM.declareInputBuffer "dataA" (.scalar .f32)
+    let dataBBuf ← Monad.ShaderM.declareInputBuffer "dataB" (.scalar .f32)
+    let dataCBuf ← Monad.ShaderM.declareOutputBuffer "dataC" (.scalar .f32)
+
+    let len := Exp.arrayLength (t := .scalar .f32) "&dataA"
+    Monad.ShaderM.if_ (Exp.lt i len) (do
+      let a ← Monad.ShaderM.readBuffer (ty := .scalar .f32) (n := 1024) dataABuf i
+      let b ← Monad.ShaderM.readBuffer (ty := .scalar .f32) (n := 1024) dataBBuf i
+      let result := f a b
+      Monad.ShaderM.writeBuffer (ty := .scalar .f32) dataCBuf i result
+    ) (pure ())
+
+  WGSL.CodeGen.generateWGSL "main" {x := 256, y := 1, z := 1} ([] : List String) ([] : List (String × String)) computation
 
 /-- High-level compute API on Device.
 
@@ -387,9 +392,9 @@ def parallelFor
   }
   let bindGroup ← createBindGroup device bindGroupLayout #[bindEntry]
 
-  -- Dispatch
-  dispatchCompute device pipeline bindGroup numWorkgroups.toUInt32 1 1
-  deviceWait device
+  -- Dispatch (async - returns Future)
+  let future ← dispatchCompute device pipeline bindGroup numWorkgroups.toUInt32 1 1
+  deviceWait future
 
   -- Read back results
   let resultBytes ← mapBufferRead device buffer 0 (bufferSize.toUSize)

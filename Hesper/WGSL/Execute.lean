@@ -52,12 +52,16 @@ structure ExecutionConfig where
   funcName : String := "main"
   workgroupSize : WorkgroupSize := {x := 256, y := 1, z := 1}
   numWorkgroups : Nat × Nat × Nat
+  extensions : List String := []
+  diagnostics : List (String × String) := []
 
 instance : Inhabited ExecutionConfig where
   default := {
     funcName := "main"
     workgroupSize := {x := 256, y := 1, z := 1}
     numWorkgroups := (1, 1, 1)
+    extensions := []
+    diagnostics := []
   }
 
 namespace ExecutionConfig
@@ -83,8 +87,9 @@ def compileToWGSL
     (funcName : String := "main")
     (workgroupSize : WorkgroupSize := {x := 256, y := 1, z := 1})
     (extensions : List String := [])
+    (diagnostics : List (String × String) := [])
     : String :=
-  generateWGSL funcName workgroupSize extensions computation
+  generateWGSL funcName workgroupSize extensions diagnostics computation
 
 /-- Create shader module from ShaderM computation -/
 def createShaderFromComputation
@@ -134,7 +139,7 @@ def executeShaderNamed
     (config : ExecutionConfig)
     : IO Unit := do
   -- Compile to WGSL
-  let wgslSource := compileToWGSL computation config.funcName config.workgroupSize []
+  let wgslSource := compileToWGSL computation config.funcName config.workgroupSize config.extensions config.diagnostics
 
   IO.println s!"[Execute] Compiled shader ({wgslSource.length} bytes)"
 
@@ -181,13 +186,13 @@ def executeShaderNamed
 
   let bindGroup ← createBindGroup device bindGroupLayout bindEntries.toArray
 
-  -- Dispatch
+  -- Dispatch (async - returns Future)
   let (wx, wy, wz) := config.numWorkgroups
   IO.println s!"[Execute] Dispatching {wx}×{wy}×{wz} workgroups..."
-  dispatchCompute device pipeline bindGroup wx.toUInt32 wy.toUInt32 wz.toUInt32
+  let future ← dispatchCompute device pipeline bindGroup wx.toUInt32 wy.toUInt32 wz.toUInt32
 
   -- Wait for completion
-  deviceWait device
+  deviceWait future
 
   -- Resources are automatically cleaned up by Lean's GC via External finalizers
 

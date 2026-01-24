@@ -113,8 +113,8 @@ def main : IO Unit := do
     { binding := 1, buffer := outputBuf, offset := 0, size := (size * 4).toUSize : BindGroupEntry }
   ]
   let bindGroup ← createBindGroup device bindGroupLayout bindEntries
-  dispatchCompute device pipeline bindGroup size.toUInt32 1 1
-  deviceWait device
+  let future ← dispatchCompute device pipeline bindGroup size.toUInt32 1 1
+  deviceWait future
   IO.println "  ✓ Raw WGSL executed"
 
   -- Read back results from Test 1

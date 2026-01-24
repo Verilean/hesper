@@ -72,8 +72,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     { binding := 1, buffer := outputBuf, offset := 0, size := 16 }
   ]
 
-  dispatchCompute device pipeline bindGroup 1 1 1
-  deviceWait device
+  let future ← dispatchCompute device pipeline bindGroup 1 1 1
+  deviceWait future
 
   -- Read results
   let result ← readBufferAsFloats device outputBuf 4
@@ -126,8 +126,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     { binding := 2, buffer := outBuf, offset := 0, size := 16 }
   ]
 
-  dispatchCompute device pipeline bindGroup 1 1 1
-  deviceWait device
+  let future ← dispatchCompute device pipeline bindGroup 1 1 1
+  deviceWait future
 
   let result ← readBufferAsFloats device outBuf 4
   return assertFloatsEqual "Vector Addition" expected result
@@ -184,8 +184,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     { binding := 2, buffer := outBuf, offset := 0, size := 64 }
   ]
 
-  dispatchCompute device pipeline bindGroup 1 1 1
-  deviceWait device
+  let future ← dispatchCompute device pipeline bindGroup 1 1 1
+  deviceWait future
 
   let result ← readBufferAsFloats device outBuf 16
   return assertFloatsEqual "MatMul 4x4" expected result
@@ -232,8 +232,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     { binding := 1, buffer := outputBuf, offset := 0, size := (size * 4).toUSize }
   ]
 
-  dispatchCompute device pipeline bindGroup ((size + 255) / 256).toUInt32 1 1
-  deviceWait device
+  let future ← dispatchCompute device pipeline bindGroup ((size + 255) / 256).toUInt32 1 1
+  deviceWait future
 
   let result ← readBufferAsFloats device outputBuf size
   return assertFloatsEqual "Large Array (1024 elements)" expected result
@@ -282,8 +282,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     { binding := 0, buffer := input1Buf, offset := 0, size := 16 },
     { binding := 1, buffer := output1Buf, offset := 0, size := 16 }
   ]
-  dispatchCompute device pipeline bindGroup1 1 1 1
-  deviceWait device
+  let future ← dispatchCompute device pipeline bindGroup1 1 1 1
+  deviceWait future
 
   -- Second execution with different data
   let input2Buf ← createBufferWithData device input2
@@ -296,8 +296,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     { binding := 0, buffer := input2Buf, offset := 0, size := 16 },
     { binding := 1, buffer := output2Buf, offset := 0, size := 16 }
   ]
-  dispatchCompute device pipeline bindGroup2 1 1 1
-  deviceWait device
+  let future ← dispatchCompute device pipeline bindGroup2 1 1 1
+  deviceWait future
 
   -- Verify both results
   let result1 ← readBufferAsFloats device output1Buf 4

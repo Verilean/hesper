@@ -108,8 +108,8 @@ def main : IO Unit := do
   let bindGroup ← createBindGroup device bindGroupLayout bindEntries
 
   -- Dispatch
-  dispatchCompute device pipeline bindGroup 1 1 1
-  deviceWait device
+  let future ← dispatchCompute device pipeline bindGroup 1 1 1
+  deviceWait future
 
   -- Read results
   let resultBytes ← mapBufferRead device dLogitsBuf 0 (dLogits.size * 4).toUSize
@@ -184,8 +184,8 @@ def main : IO Unit := do
   ]
   let sgdBindGroup ← createBindGroup device sgdLayout sgdBindEntries
 
-  dispatchCompute device sgdPipeline sgdBindGroup 1 1 1
-  deviceWait device
+  let future ← dispatchCompute device sgdPipeline sgdBindGroup 1 1 1
+  deviceWait future
 
   let sgdResultBytes ← mapBufferRead device paramsBuf 0 (params.size * 4).toUSize
   unmapBuffer paramsBuf

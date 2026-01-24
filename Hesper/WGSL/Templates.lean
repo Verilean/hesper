@@ -1,5 +1,7 @@
 import Hesper.WGSL.Types
 import Hesper.WGSL.Exp
+import Hesper.WGSL.Monad
+import Hesper.WGSL.CodeGen
 
 namespace Hesper.WGSL.Templates
 
@@ -21,18 +23,21 @@ open Hesper.WGSL
     ```
 -/
 def generateUnaryShader (f : Exp (.scalar .f32) → Exp (.scalar .f32)) : String :=
-  let x : Exp (.scalar .f32) := Exp.var "x"
-  let body := f x
-  let bodyCode := body.toWGSL
-  "@group(0) @binding(0) var<storage, read_write> data: array<f32>;\n\n" ++
-  "@compute @workgroup_size(256)\n" ++
-  "fn main(@builtin(global_invocation_id) gid: vec3<u32>) {\n" ++
-  "  let i = gid.x;\n" ++
-  "  if (i < arrayLength(&data)) {\n" ++
-  "    let x = data[i];\n" ++
-  s!"    data[i] = {bodyCode};\n" ++
-  "  }\n" ++
-  "}"
+  let computation : Monad.ShaderM Unit := do
+    let gid ← Monad.ShaderM.globalId
+    let i := Exp.vec3X gid
+
+    let dataBuf ← Monad.ShaderM.declareInputBuffer "data" (.scalar .f32)
+    let _outputBuf ← Monad.ShaderM.declareOutputBuffer "data" (.scalar .f32)
+
+    let len := Exp.arrayLength (t := .scalar .f32) "&data"
+    Monad.ShaderM.if_ (Exp.lt i len) (do
+      let x ← Monad.ShaderM.readBuffer (ty := .scalar .f32) (n := 1024) dataBuf i
+      let result := f x
+      Monad.ShaderM.writeBuffer (ty := .scalar .f32) dataBuf i result
+    ) (pure ())
+
+  CodeGen.generateWGSL "main" {x := 256, y := 1, z := 1} ([] : List String) ([] : List (String × String)) computation
 
 /-- Generate WGSL shader code for a binary operation (combining two arrays).
 
@@ -42,21 +47,22 @@ def generateUnaryShader (f : Exp (.scalar .f32) → Exp (.scalar .f32)) : String
     ```
 -/
 def generateBinaryShader (f : Exp (.scalar .f32) → Exp (.scalar .f32) → Exp (.scalar .f32)) : String :=
-  let a : Exp (.scalar .f32) := Exp.var "a"
-  let b : Exp (.scalar .f32) := Exp.var "b"
-  let body := f a b
-  let bodyCode := body.toWGSL
-  "@group(0) @binding(0) var<storage, read_write> dataA: array<f32>;\n" ++
-  "@group(0) @binding(1) var<storage, read_write> dataB: array<f32>;\n" ++
-  "@group(0) @binding(2) var<storage, read_write> dataC: array<f32>;\n\n" ++
-  "@compute @workgroup_size(256)\n" ++
-  "fn main(@builtin(global_invocation_id) gid: vec3<u32>) {\n" ++
-  "  let i = gid.x;\n" ++
-  "  if (i < arrayLength(&dataA)) {\n" ++
-  "    let a = dataA[i];\n" ++
-  "    let b = dataB[i];\n" ++
-  s!"    dataC[i] = {bodyCode};\n" ++
-  "  }\n" ++
-  "}"
+  let computation : Monad.ShaderM Unit := do
+    let gid ← Monad.ShaderM.globalId
+    let i := Exp.vec3X gid
+
+    let dataABuf ← Monad.ShaderM.declareInputBuffer "dataA" (.scalar .f32)
+    let dataBBuf ← Monad.ShaderM.declareInputBuffer "dataB" (.scalar .f32)
+    let dataCBuf ← Monad.ShaderM.declareOutputBuffer "dataC" (.scalar .f32)
+
+    let len := Exp.arrayLength (t := .scalar .f32) "&dataA"
+    Monad.ShaderM.if_ (Exp.lt i len) (do
+      let a ← Monad.ShaderM.readBuffer (ty := .scalar .f32) (n := 1024) dataABuf i
+      let b ← Monad.ShaderM.readBuffer (ty := .scalar .f32) (n := 1024) dataBBuf i
+      let result := f a b
+      Monad.ShaderM.writeBuffer (ty := .scalar .f32) dataCBuf i result
+    ) (pure ())
+
+  CodeGen.generateWGSL "main" {x := 256, y := 1, z := 1} ([] : List String) ([] : List (String × String)) computation
 
 end Hesper.WGSL.Templates

@@ -1,7 +1,8 @@
 import Hesper.WGSL.Types
 import Hesper.WGSL.Exp
 import Hesper.WGSL.DSL
-import Hesper.WGSL.Shader
+import Hesper.WGSL.Monad
+import Hesper.WGSL.CodeGen
 
 /-!
 # Atomic Counter Example
@@ -20,37 +21,25 @@ namespace Hesper
 
 open WGSL
 
-/-- Generate a simple atomic counter shader -/
-def generateAtomicCounterShader : ComputeShader :=
-  let gid : Exp (.scalar .u32) := "gid.x"
+/-- Generate a simple atomic counter shader using ShaderM monad -/
+def generateAtomicCounterShader : String :=
+  let computation : Monad.ShaderM Unit := do
+    let gid ← Monad.ShaderM.globalId
+    let idx := Exp.vec3X gid
 
-  -- Note: In a real implementation, we would declare workgroup shared memory
-  -- For now, this demonstrates the syntax for atomic operations
+    let _outputBuf ← Monad.ShaderM.declareOutputBuffer "output" (.scalar .u32)
 
-  let body : List Stmt := [
     -- Each thread computes a value
-    declareVar "value" (.scalar .u32) (some ⟨_, Exp.add gid (Exp.litU32 1)⟩),
+    Monad.ShaderM.varNamed "value" (.scalar .u32) (Exp.add idx (Exp.litU32 1))
 
     -- In actual use, you would atomically add to a shared counter:
     -- let counterPtr : Exp (.ptr .workgroup (.scalar .atomicU32)) := "&counter"
     -- let oldValue := atomicAddU counterPtr value
 
     -- For demonstration, we show the generated WGSL code structure
-    expr barrier
-  ]
+    Monad.ShaderM.barrier
 
-  {
-    extensions := [],
-    diagnostics := [],
-    buffers := [
-      { group := 0, binding := 0, name := "output", elemType := .scalar .u32, readWrite := true }
-    ],
-    workgroupSize := { x := 64, y := 1, z := 1 },
-    builtins := [
-      { builtin := BuiltinBinding.globalInvocationId, name := "gid" }
-    ],
-    body := body
-  }
+  CodeGen.generateWGSL "main" {x := 64, y := 1, z := 1} ([] : List String) ([] : List (String × String)) computation
 
 end Hesper
 
@@ -71,8 +60,7 @@ def main : IO Unit := do
 
   IO.println "Generated WGSL shader skeleton:"
   IO.println "─────────────────────────────────────────────"
-  let shader := Hesper.generateAtomicCounterShader
-  let code := shader.toWGSL
+  let code := Hesper.generateAtomicCounterShader
   IO.println code
   IO.println ""
 

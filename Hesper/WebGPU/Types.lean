@@ -10,6 +10,15 @@ namespace Hesper.WebGPU
 /-- Opaque handle to a WebGPU Instance (Dawn native instance) with automatic cleanup via External finalizer -/
 opaque Instance : Type
 
+/-- Internal opaque handle to a GPU work completion Future -/
+opaque FuturePtr : Type
+
+/-- GPU work completion Future that maintains a reference to its parent Instance.
+    This ensures the Instance stays alive while waiting for GPU work to complete. -/
+structure Future where
+  ptr : FuturePtr
+  parentInstance : Instance
+
 /-- Internal opaque handle to the raw WebGPU Device pointer -/
 opaque DevicePtr : Type
 

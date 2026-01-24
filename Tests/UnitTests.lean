@@ -149,8 +149,8 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
   let bindGroup ← createBindGroup device bindGroupLayout bindEntries
 
   -- Dispatch compute
-  dispatchCompute device pipeline bindGroup 4 1 1
-  deviceWait device
+  let future ← dispatchCompute device pipeline bindGroup 4 1 1
+  deviceWait future
 
   -- Read back
   let readBytes ← mapBufferRead device buffer 0 (dataBytes.size).toUSize
@@ -206,8 +206,8 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
   ]
   let bindGroup ← createBindGroup device bindGroupLayout bindEntries
 
-  dispatchCompute device pipeline bindGroup 4 1 1
-  deviceWait device
+  let future ← dispatchCompute device pipeline bindGroup 4 1 1
+  deviceWait future
 
   let readBytes ← mapBufferRead device buffer 0 (dataBytes.size).toUSize
   let results ← Hesper.Basic.bytesToFloatArray readBytes

@@ -83,11 +83,11 @@ def testRoundtrip (inst : Instance) (size : Nat) : IO Bool := do
   let bindGroup ← createBindGroup device bindGroupLayout bindEntries
 
   let numWorkgroups := (size + 63) / 64
-  dispatchCompute device pipeline bindGroup numWorkgroups.toUInt32 1 1
+  let future ← dispatchCompute device pipeline bindGroup numWorkgroups.toUInt32 1 1
   IO.println s!"  ✓ Executed shader ({numWorkgroups} workgroups)"
 
   -- 5. Read results back from GPU (ASYNC MAPASYNC TEST)
-  deviceWait device
+  deviceWait future
   IO.println s!"  ⏳ Reading {size} floats back from GPU..."
   let resultBytes ← mapBufferRead device outputBuf 0 ((size * 4).toUSize)
   IO.println s!"  ✓ Read back {resultBytes.size} bytes"

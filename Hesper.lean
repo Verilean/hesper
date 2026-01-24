@@ -140,30 +140,4 @@ This function must be called before any GPU operations. It performs the followin
 @[extern "lean_hesper_init"]
 opaque init : IO WebGPU.Instance
 
-/-- Run GPU vector addition (Hello World compute example).
-
-Demonstrates basic GPU compute by adding two vectors element-wise:
-`C[i] = A[i] + B[i]` for i in 0..size
-
-**Parameters**:
-- `inst`: WebGPU instance from `Hesper.init`
-- `size`: Number of elements in each vector (must be positive)
-
-**Implementation**: Creates GPU buffers, uploads random test data, executes a compute
-shader, and downloads results for verification.
-
-**Example**:
-
-    def main : IO Unit := do
-      let inst ← Hesper.init
-      Hesper.vectorAdd inst 1024  -- Add two 1024-element vectors
-
-**Performance**: Executed on GPU with workgroup size of 64 threads.
-
-**Note**: This is an FFI function implemented in `native/bridge.cpp`.
-It's primarily for testing and demonstration purposes.
--/
-@[extern "lean_hesper_vector_add"]
-opaque vectorAdd (inst : @& WebGPU.Instance) (size : UInt32) : IO Unit
-
 end Hesper

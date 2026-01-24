@@ -49,18 +49,6 @@ def main : IO Unit := do
   -- Show DSL capabilities
   showcaseDSL
 
-  -- Initialize WebGPU and run GPU example
-  IO.println "╔══════════════════════════════════════════════╗"
-  IO.println "║   GPU Hardware Test                          ║"
-  IO.println "╚══════════════════════════════════════════════╝"
-  IO.println ""
-  let inst ← Hesper.init
-  IO.println ""
-
-  IO.println "=== GPU Vector Addition Example ==="
-  Hesper.vectorAdd inst 1024
-  IO.println ""
-
   IO.println "╔══════════════════════════════════════════════╗"
   IO.println "║   All Tests Complete!                        ║"
   IO.println "╚══════════════════════════════════════════════╝"

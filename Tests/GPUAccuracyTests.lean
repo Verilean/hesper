@@ -78,7 +78,7 @@ def simpleMatMulShader (m k n : Nat) : Hesper.WGSL.Monad.ShaderM Unit := do
 
 /-- Generate WGSL code for 4x4 matmul -/
 def generate4x4MatMulShader : String :=
-  generateWGSL (funcName := "main") (workgroupSize := {x := 4, y := 4, z := 1}) (extensions := []) (simpleMatMulShader 4 4 4)
+  generateWGSL (funcName := "main") (workgroupSize := {x := 4, y := 4, z := 1}) (extensions := []) (diagnostics := []) (simpleMatMulShader 4 4 4)
 
 -- ============================================================================
 -- CPU vs GPU Accuracy Tests

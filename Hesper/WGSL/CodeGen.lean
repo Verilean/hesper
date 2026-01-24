@@ -183,17 +183,69 @@ def generateComputeModule
     workgroupVars := workgroupVars
     functions := [mainFunc] }
 
+/-- Generate compute shader module with diagnostics support -/
+def generateComputeModuleWithDiagnostics
+    (funcName : String := "main")
+    (workgroupSize : WorkgroupSize := {x := 256, y := 1, z := 1})
+    (extensions : List String := [])
+    (diagnostics : List (String × String) := [])
+    (computation : ShaderM Unit)
+    : ShaderModule :=
+  let state : ShaderState := ShaderM.exec computation
+
+  -- Convert declared buffers to StorageBuffer list with automatic binding
+  let storageBuffers := state.declaredBuffers.mapIdx fun i (name, ty, _) =>
+    { group := 0
+      binding := i
+      name := name
+      elemType := ty
+      readWrite := true }
+
+  -- Convert shared vars to WorkgroupVar list
+  let workgroupVars := state.sharedVars.map fun (name, ty) =>
+    { name := name, type := ty }
+
+  -- Create function parameters for built-ins
+  let params : List FunctionParam := [
+    { name := "global_invocation_id", ty := .vec3 .u32, builtin := some .globalInvocationId },
+    { name := "local_invocation_id", ty := .vec3 .u32, builtin := some .localInvocationId },
+    { name := "workgroup_id", ty := .vec3 .u32, builtin := some .workgroupId }
+  ]
+
+  -- Create function attributes
+  let attrs := [
+    "@compute",
+    s!"@workgroup_size({workgroupSize.x}, {workgroupSize.y}, {workgroupSize.z})"
+  ]
+
+  -- Create main compute function
+  let mainFunc : FunctionDecl := {
+    name := funcName
+    attributes := attrs
+    params := params
+    returnType := none
+    body := state.stmts
+  }
+
+  { extensions := extensions
+    diagnostics := diagnostics
+    structs := []
+    storageBuffers := storageBuffers
+    workgroupVars := workgroupVars
+    functions := [mainFunc] }
+
 /-- Convenience function: Generate WGSL string from ShaderM computation -/
 def generateWGSL
     (funcName : String := "main")
     (workgroupSize : WorkgroupSize := {x := 256, y := 1, z := 1})
     (extensions : List String := [])
+    (diagnostics : List (String × String) := [])
     (computation : ShaderM Unit)
     : String :=
-  (generateComputeModule funcName workgroupSize extensions computation).toWGSL
+  (generateComputeModuleWithDiagnostics funcName workgroupSize extensions diagnostics computation).toWGSL
 
 /-- Generate WGSL with default parameters -/
 def generateWGSLSimple (computation : ShaderM Unit) : String :=
-  generateWGSL "main" {x := 256, y := 1, z := 1} [] computation
+  generateWGSL "main" {x := 256, y := 1, z := 1} [] [] computation
 
 end Hesper.WGSL.CodeGen

@@ -30,6 +30,13 @@ struct CallbackData {
     lean_object** result_ptr;  // Pointer to store final ByteArray for caller
 };
 
+// FutureData structure for GPU work completion futures
+struct FutureData {
+    std::shared_ptr<std::promise<void>> promise;  // Keep promise alive
+    std::shared_ptr<std::future<void>> future;
+    dawn::native::Instance* instance;  // Need instance for wait() template
+};
+
 // Template function to wait for future completion (following gpu.hpp pattern)
 template<typename T>
 T wait(wgpu::Instance& instance, std::future<T>& f) {
@@ -156,6 +163,9 @@ bool runWithErrorScope(WGPUDevice device, dawn::native::Instance* nativeInstance
 #define EXTRACT_BIND_GROUP_LAYOUT_PTR(layout_struct) \
     static_cast<wgpu::BindGroupLayout*>(lean_get_external_data(lean_ctor_get(layout_struct, 0)))
 
+#define EXTRACT_FUTURE_PTR(future_struct) \
+    static_cast<FutureData*>(lean_get_external_data(lean_ctor_get(future_struct, 0)))
+
 // Helper function to create resource structures that maintain device reference
 // Returns: { ptr : ResourcePtr, device : Device }
 inline lean_object* make_resource_with_device(lean_object* resource_external, b_lean_obj_arg device_obj) {
@@ -176,6 +186,7 @@ static lean_external_class* g_webgpu_compute_pipeline_class = nullptr;
 static lean_external_class* g_webgpu_bind_group_class = nullptr;
 static lean_external_class* g_webgpu_bind_group_layout_class = nullptr;
 static lean_external_class* g_webgpu_command_encoder_class = nullptr;
+static lean_external_class* g_webgpu_future_class = nullptr;
 
 extern "C" {
 
@@ -388,6 +399,15 @@ static void finalize_webgpu_command_encoder(void* ptr) {
     }
 }
 
+static void finalize_webgpu_future(void* ptr) {
+    FutureData* futureData = static_cast<FutureData*>(ptr);
+    if (futureData) {
+        fprintf(stderr, "[C++] Finalizing GPU Future (ptr=%p)\n", ptr);
+        fflush(stderr);
+        delete futureData;
+    }
+}
+
 //=============================================================================
 // External Class Registration for WebGPU
 //=============================================================================
@@ -403,6 +423,7 @@ static void register_webgpu_external_classes() {
     g_webgpu_bind_group_class = lean_register_external_class(finalize_webgpu_bind_group, nullptr);
     g_webgpu_bind_group_layout_class = lean_register_external_class(finalize_webgpu_bind_group_layout, nullptr);
     g_webgpu_command_encoder_class = lean_register_external_class(finalize_webgpu_command_encoder, nullptr);
+    g_webgpu_future_class = lean_register_external_class(finalize_webgpu_future, nullptr);
 
     std::cout << "[C++] WebGPU External classes registered" << std::endl;
 }
@@ -674,16 +695,19 @@ lean_obj_res lean_hesper_device_tick(b_lean_obj_arg device_obj, lean_obj_res /* 
     return lean_io_result_mk_ok(lean_box(0));
 }
 
-lean_obj_res lean_hesper_device_wait(b_lean_obj_arg device_obj, lean_obj_res /* unit */) {
-    wgpu::Device* device = EXTRACT_DEVICE_PTR(device_obj);
+lean_obj_res lean_hesper_device_wait(b_lean_obj_arg future_struct, lean_obj_res /* unit */) {
+    // Extract FutureData from Future structure
+    FutureData* futureData = EXTRACT_FUTURE_PTR(future_struct);
 
-    fprintf(stderr, "[C++] deviceWait: no-op (waiting happens in mapBufferRead via WaitAny)\n");
+    fprintf(stderr, "[C++] deviceWait: waiting for GPU work to complete...\n");
     fflush(stderr);
 
-    // deviceWait is now a no-op. The actual waiting for GPU operations
-    // happens in mapBufferRead using OnSubmittedWorkDone + WaitAny pattern.
-    // Calling Tick() or ProcessEvents here causes crashes because there may be
-    // stale callbacks from other operations that have gone out of scope.
+    // Wait for GPU work to complete using the wait() template
+    wgpu::Instance instance(futureData->instance->Get());
+    wait(instance, *(futureData->future));
+
+    fprintf(stderr, "[C++] deviceWait: GPU work completed\n");
+    fflush(stderr);
 
     return lean_io_result_mk_ok(lean_box(0));
 }
@@ -1303,6 +1327,23 @@ lean_obj_res lean_hesper_create_compute_pipeline(b_lean_obj_arg device_obj, b_le
     return lean_io_result_mk_ok(pipeline_struct);
 }
 
+// Callback for OnSubmittedWorkDone - used by dispatchCompute
+static void dispatchWorkDoneCallback(WGPUQueueWorkDoneStatus status, WGPUStringView message,
+                                     void* userdata1, void* /*userdata2*/) {
+    FutureData* futureData = static_cast<FutureData*>(userdata1);
+
+    if (status != WGPUQueueWorkDoneStatus_Success) {
+        fprintf(stderr, "[C++] GPU work done with error: status=%d, message=%.*s\n",
+                (int)status, (int)message.length, message.data);
+        fflush(stderr);
+    }
+
+    fprintf(stderr, "[C++] GPU work completed, signaling future\n");
+    fflush(stderr);
+
+    futureData->promise->set_value();
+}
+
 lean_obj_res lean_hesper_dispatch_compute(b_lean_obj_arg device_obj, b_lean_obj_arg pipeline_obj, b_lean_obj_arg bind_group_obj,
                                            uint32_t workgroupsX, uint32_t workgroupsY, uint32_t workgroupsZ, lean_obj_res /* unit */) {
     // Extract device, pipeline and bind group from External objects
@@ -1310,10 +1351,13 @@ lean_obj_res lean_hesper_dispatch_compute(b_lean_obj_arg device_obj, b_lean_obj_
     wgpu::ComputePipeline* pipeline = EXTRACT_COMPUTE_PIPELINE_PTR(pipeline_obj);
     wgpu::BindGroup* bindGroup = EXTRACT_BIND_GROUP_PTR(bind_group_obj);
 
+    // Extract instance from device structure (field 1)
+    lean_object* instance_obj = lean_ctor_get(device_obj, 1);
+
     fprintf(stderr, "[C++] dispatchCompute: workgroups=(%u,%u,%u)\n", workgroupsX, workgroupsY, workgroupsZ);
     fflush(stderr);
 
-    // Wrap dispatch in error scope to catch any runtime errors
+    // Wrap dispatch in error scope to catch any VALIDATION errors (blocking check)
     bool success = runWithErrorScope(device->Get(), g_dawn_instance, "DispatchCompute", [&]() {
         // Use C API like gpu.hpp to avoid C++ wrapper destructor issues
         WGPUCommandEncoder commandEncoder = wgpuDeviceCreateCommandEncoder(device->Get(), nullptr);
@@ -1342,14 +1386,41 @@ lean_obj_res lean_hesper_dispatch_compute(b_lean_obj_arg device_obj, b_lean_obj_
         return lean_io_result_mk_error(error_msg);
     }
 
-    fprintf(stderr, "[C++] dispatchCompute: submitted (async, will complete when mapBufferRead is called)\n");
+    // Create promise/future for ASYNC GPU work completion
+    auto promise = std::make_shared<std::promise<void>>();
+    auto future = std::make_shared<std::future<void>>(promise->get_future());
+
+    // Create FutureData BEFORE registering callback - this keeps promise alive
+    FutureData* futureData = new FutureData{promise, future, g_dawn_instance};
+
+    fprintf(stderr, "[C++] Created FutureData at %p\n", futureData);
     fflush(stderr);
 
-    // Following gpu.hpp pattern: dispatchCompute just submits work and returns immediately.
-    // The actual waiting for GPU completion happens in mapBufferRead via OnSubmittedWorkDone + WaitAny.
-    // This is the correct async pattern - don't wait here!
+    // Register OnSubmittedWorkDone callback for async GPU completion
+    // The callback will access promise through FutureData
+    WGPUQueueWorkDoneCallbackInfo workDoneInfo = {
+        .nextInChain = nullptr,
+        .mode = WGPUCallbackMode_AllowProcessEvents,
+        .callback = dispatchWorkDoneCallback,
+        .userdata1 = futureData,  // Pass FutureData, not just promise
+        .userdata2 = nullptr
+    };
 
-    return lean_io_result_mk_ok(lean_box(0));
+    wgpuQueueOnSubmittedWorkDone(device->GetQueue().Get(), workDoneInfo);
+
+    fprintf(stderr, "[C++] dispatchCompute: submitted async (returns Future for GPU work completion)\n");
+    fflush(stderr);
+
+    // Wrap FutureData in External
+    lean_object* future_external = lean_alloc_external(g_webgpu_future_class, futureData);
+
+    // Create Future structure: { ptr : FuturePtr, parentInstance : Instance }
+    lean_object* future_struct = lean_alloc_ctor(0, 2, 0);  // constructor with 2 fields, 0 scalars
+    lean_inc(instance_obj);  // Increment refcount of instance so it stays alive
+    lean_ctor_set(future_struct, 0, future_external);  // field 0: ptr
+    lean_ctor_set(future_struct, 1, instance_obj);     // field 1: parentInstance
+
+    return lean_io_result_mk_ok(future_struct);
 }
 
 // ============================================================================
