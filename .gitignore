@@ -21,3 +21,7 @@ GLFW_IMPLEMENTATION.md
 MATMUL_README.md
 WGSL_GENERATION_GUIDE.md
 recipes/
+
+# Jupyter Notebook
+*.ipynb
+.ipynb_checkpoints/
