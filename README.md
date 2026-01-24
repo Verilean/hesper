@@ -789,7 +789,7 @@ Apache License 2.0 - see LICENSE file for details
 - **Google Dawn** for the WebGPU native implementation
 - **Lean 4** for the foundation of verified programming
 - **WebGPU Working Group** for the standard
-- **Verilean Community** for support and contributions
+- **gpu.cpp (Answer.AI):** High-level C++ API wrapper inspiration.
 
 ---
 
