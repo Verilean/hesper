@@ -313,12 +313,12 @@ lean_exe «real-gpu-demo» where
   root := `Examples.Compute.RealGPUDemo
   moreLinkArgs := stdLinkArgs
 
-lean_exe «matmul-gpu» where
-  root := `Examples.Compute.MainMatmul
+lean_exe «matmul-simple» where
+  root := `Examples.Compute.MainMatmulSimple
   moreLinkArgs := stdLinkArgs
 
-lean_exe «matmul-4k» where
-  root := `Examples.Compute.MainMatmul4K
+lean_exe «matmul-subgroup-m» where
+  root := `Examples.Compute.MainMatmulSubgroupM
   moreLinkArgs := stdLinkArgs
 
 lean_exe «async-demo» where
@@ -457,6 +457,9 @@ lean_exe «test-numerical» where
 
 lean_exe «test-shader-monad» where
   root := `Tests.ShaderMonadTestsMain
+
+lean_exe «test-subgroup-codegen» where
+  root := `Examples.Compute.TestSubgroupShader
 
 -- ----------------------------------------------------------------------------
 -- Benchmarks

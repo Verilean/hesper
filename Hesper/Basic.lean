@@ -77,4 +77,9 @@ def bytesToUInt32 (bytes : ByteArray) (offset : Nat := 0) : UInt32 :=
     let n := b0 ||| (b1 <<< 8) ||| (b2 <<< 16) ||| (b3 <<< 24)
     UInt32.ofNat n
 
+/-- Get high-precision system time in nanoseconds.
+    Used for benchmarking GPU performance. -/
+@[extern "lean_hesper_get_time_ns"]
+opaque getTimeNs : IO UInt64
+
 end Hesper.Basic

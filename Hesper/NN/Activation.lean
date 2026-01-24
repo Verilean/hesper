@@ -206,42 +206,42 @@ def softmaxKernel (config : ActivationConfig) : ShaderM Unit := do
 
 /-- Generate WGSL shader for ReLU -/
 def generateReLUShader (config : ActivationConfig) : String :=
-  generateWGSL "main" {x := config.workgroupSize, y := 1, z := 1} [] (reluKernel config)
+  generateWGSL "main" {x := config.workgroupSize, y := 1, z := 1} [] [] (reluKernel config)
 
 /-- Generate WGSL shader for Leaky ReLU -/
 def generateLeakyReLUShader (config : ActivationConfig) (alpha : Float := 0.01) : String :=
-  generateWGSL "main" {x := config.workgroupSize, y := 1, z := 1} [] (leakyReluKernel config alpha)
+  generateWGSL "main" {x := config.workgroupSize, y := 1, z := 1} [] [] (leakyReluKernel config alpha)
 
 /-- Generate WGSL shader for GELU -/
 def generateGELUShader (config : ActivationConfig) : String :=
-  generateWGSL "main" {x := config.workgroupSize, y := 1, z := 1} [] (geluKernel config)
+  generateWGSL "main" {x := config.workgroupSize, y := 1, z := 1} [] [] (geluKernel config)
 
 /-- Generate WGSL shader for Sigmoid -/
 def generateSigmoidShader (config : ActivationConfig) : String :=
-  generateWGSL "main" {x := config.workgroupSize, y := 1, z := 1} [] (sigmoidKernel config)
+  generateWGSL "main" {x := config.workgroupSize, y := 1, z := 1} [] [] (sigmoidKernel config)
 
 /-- Generate WGSL shader for Tanh -/
 def generateTanhShader (config : ActivationConfig) : String :=
-  generateWGSL "main" {x := config.workgroupSize, y := 1, z := 1} [] (tanhKernel config)
+  generateWGSL "main" {x := config.workgroupSize, y := 1, z := 1} [] [] (tanhKernel config)
 
 /-- Generate WGSL shader for Swish/SiLU -/
 def generateSwishShader (config : ActivationConfig) : String :=
-  generateWGSL "main" {x := config.workgroupSize, y := 1, z := 1} [] (swishKernel config)
+  generateWGSL "main" {x := config.workgroupSize, y := 1, z := 1} [] [] (swishKernel config)
 
 /-- Generate WGSL shader for ELU -/
 def generateELUShader (config : ActivationConfig) (alpha : Float := 1.0) : String :=
-  generateWGSL "main" {x := config.workgroupSize, y := 1, z := 1} [] (eluKernel config alpha)
+  generateWGSL "main" {x := config.workgroupSize, y := 1, z := 1} [] [] (eluKernel config alpha)
 
 /-- Generate WGSL shader for Softplus -/
 def generateSoftplusShader (config : ActivationConfig) : String :=
-  generateWGSL "main" {x := config.workgroupSize, y := 1, z := 1} [] (softplusKernel config)
+  generateWGSL "main" {x := config.workgroupSize, y := 1, z := 1} [] [] (softplusKernel config)
 
 /-- Generate WGSL shader for Mish -/
 def generateMishShader (config : ActivationConfig) : String :=
-  generateWGSL "main" {x := config.workgroupSize, y := 1, z := 1} [] (mishKernel config)
+  generateWGSL "main" {x := config.workgroupSize, y := 1, z := 1} [] [] (mishKernel config)
 
 /-- Generate WGSL shader for Softmax (simplified version) -/
 def generateSoftmaxShader (config : ActivationConfig) : String :=
-  generateWGSL "main" {x := config.workgroupSize, y := 1, z := 1} [] (softmaxKernel config)
+  generateWGSL "main" {x := config.workgroupSize, y := 1, z := 1} [] [] (softmaxKernel config)
 
 end Hesper.NN.Activation

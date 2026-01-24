@@ -177,8 +177,8 @@ def gpuLayer1 (inst : Instance) (input w1 b1 : Array Float) (config : NetworkCon
   let bindGroup ← createBindGroup device bindGroupLayout bindEntries
 
   let numWorkgroups := (config.hiddenSize + 255) / 256
-  dispatchCompute device pipeline bindGroup numWorkgroups.toUInt32 1 1
-  deviceWait device
+  let future ← dispatchCompute device pipeline bindGroup numWorkgroups.toUInt32 1 1
+  deviceWait future
 
   let resultBytes ← mapBufferRead device outputBuf 0 ((config.hiddenSize * 4).toUSize)
   unmapBuffer outputBuf
@@ -243,8 +243,8 @@ def gpuLayer2 (inst : Instance) (input w2 b2 : Array Float) (config : NetworkCon
   ]
   let bindGroup ← createBindGroup device bindGroupLayout bindEntries
 
-  dispatchCompute device pipeline bindGroup 1 1 1
-  deviceWait device
+  let future ← dispatchCompute device pipeline bindGroup 1 1 1
+  deviceWait future
 
   let resultBytes ← mapBufferRead device outputBuf 0 ((config.outputSize * 4).toUSize)
   unmapBuffer outputBuf

@@ -317,12 +317,14 @@ def generateConv2DShaderFromMonad (config : Conv2DConfig) : String :=
   generateWGSL "main"
     {x := config.workgroupSize, y := config.workgroupSize, z := 1}
     []
+    []
     (conv2DKernel config)
 
 /-- Generate WGSL shader for depthwise convolution -/
 def generateDepthwiseConv2DShaderFromMonad (config : Conv2DConfig) : String :=
   generateWGSL "main"
     {x := config.workgroupSize, y := config.workgroupSize, z := 1}
+    []
     []
     (depthwiseConv2DKernel config)
 
@@ -331,12 +333,14 @@ def generateMaxPoolingShaderFromMonad (config : PoolingConfig) : String :=
   generateWGSL "main"
     {x := config.workgroupSize, y := config.workgroupSize, z := 1}
     []
+    []
     (maxPoolingKernel config)
 
 /-- Generate WGSL shader for average pooling -/
 def generateAvgPoolingShaderFromMonad (config : PoolingConfig) : String :=
   generateWGSL "main"
     {x := config.workgroupSize, y := config.workgroupSize, z := 1}
+    []
     []
     (avgPoolingKernel config)
 

@@ -51,13 +51,14 @@ structure ComputePipelineDescriptor where
 @[extern "lean_hesper_create_compute_pipeline"]
 opaque createComputePipeline (device : @& Device) (desc : @& ComputePipelineDescriptor) : IO ComputePipeline
 
-/-- Dispatch compute work.
+/-- Dispatch compute work (async - returns Future).
     @param device The GPU device
     @param pipeline The compute pipeline to execute
     @param bindGroup The bound resources
     @param workgroupsX Number of workgroups in X dimension
     @param workgroupsY Number of workgroups in Y dimension (default 1)
     @param workgroupsZ Number of workgroups in Z dimension (default 1)
+    @return Future for GPU work completion (pass to deviceWait to wait)
 -/
 @[extern "lean_hesper_dispatch_compute"]
 opaque dispatchCompute
@@ -66,6 +67,6 @@ opaque dispatchCompute
   (bindGroup : @& BindGroup)
   (workgroupsX : UInt32)
   (workgroupsY : UInt32 := 1)
-  (workgroupsZ : UInt32 := 1) : IO Unit
+  (workgroupsZ : UInt32 := 1) : IO Future
 
 end Hesper.WebGPU

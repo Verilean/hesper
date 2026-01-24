@@ -22,6 +22,11 @@ opaque getAdapterInfo (inst : @& Instance) (gpuIdx : @& UInt32) : IO AdapterInfo
 @[extern "lean_hesper_get_device"]
 opaque getDevice (inst : @& Instance) : IO Device
 
+/-- Get a GPU device with advanced features enabled (Subgroups, Float16).
+    This is required for high-performance compute tasks like subgroup matrix multiplication. -/
+@[extern "lean_hesper_get_device_with_features"]
+opaque getDeviceWithFeatures (inst : @& Instance) : IO Device
+
 /-- Get a GPU device from a specific adapter index.
     Use this to select which GPU to use in multi-GPU systems.
     Example:
@@ -38,9 +43,9 @@ opaque getDeviceByIndex (inst : @& Instance) (gpuIdx : @& UInt32) : IO Device
 @[extern "lean_hesper_device_tick"]
 opaque deviceTick (device : @& Device) : IO Unit
 
-/-- Wait for all device operations to complete -/
+/-- Wait for GPU work to complete (takes Future from dispatchCompute) -/
 @[extern "lean_hesper_device_wait"]
-opaque deviceWait (device : @& Device) : IO Unit
+opaque deviceWait (future : @& Future) : IO Unit
 
 /-- List all available GPU adapters with their information -/
 def listAdapters (inst : Instance) : IO Unit := do

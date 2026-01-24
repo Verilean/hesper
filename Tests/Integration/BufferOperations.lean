@@ -70,8 +70,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     { binding := 1, buffer := outputBuf, offset := 0, size := (size * 4).toUSize }
   ]
 
-  dispatchCompute device pipeline bindGroup 1 1 1
-  deviceWait device
+  let future ← dispatchCompute device pipeline bindGroup 1 1 1
+  deviceWait future
 
   let result ← readBufferAsFloats device outputBuf size
   return assertFloatsEqual "Small Buffer (1KB)" expected result
@@ -119,8 +119,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   ]
 
   let workgroups := ((size + 255) / 256).toUInt32
-  dispatchCompute device pipeline bindGroup workgroups 1 1
-  deviceWait device
+  let future ← dispatchCompute device pipeline bindGroup workgroups 1 1
+  deviceWait future
 
   let result ← readBufferAsFloats device outputBuf size
   return assertFloatsEqual "Medium Buffer (256KB)" expected result
@@ -263,8 +263,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     { binding := 3, buffer := outBuf, offset := 0, size := 16 }
   ]
 
-  dispatchCompute device pipeline bindGroup 1 1 1
-  deviceWait device
+  let future ← dispatchCompute device pipeline bindGroup 1 1 1
+  deviceWait future
 
   let result ← readBufferAsFloats device outBuf 4
   return assertFloatsEqual "Concurrent Buffers (3 inputs)" expected result
@@ -316,8 +316,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     { binding := 1, buffer := outputBuf, offset := 0, size := 16 }
   ]
 
-  dispatchCompute device pipeline bindGroup 1 1 1
-  deviceWait device
+  let future ← dispatchCompute device pipeline bindGroup 1 1 1
+  deviceWait future
 
   let result ← readBufferAsFloats device outputBuf 4
   return assertFloatsEqual "Memory Layout (Row-Major Transpose)" expected result

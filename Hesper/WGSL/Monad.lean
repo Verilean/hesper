@@ -244,6 +244,144 @@ def litI (x : Int) : Exp (.scalar .i32) :=
 def litU (x : Nat) : Exp (.scalar .u32) :=
   Exp.litU32 x
 
+-- ============================================================================
+-- Subgroup Matrix Operations (chromium_experimental_subgroup_matrix)
+-- ============================================================================
+
+/-- Declare an array of subgroup_matrix_left matrices with initialization -/
+def declareMatrixLeftArray
+    (name : String)
+    (st : ScalarType)
+    (m k : Nat)
+    (count : Nat)
+    (init : Exp (.subgroupMatrixLeft st m k))
+    : ShaderM Unit := do
+  let matTy := WGSLType.subgroupMatrixLeft st m k
+  let arrTy := WGSLType.array matTy count
+  emitStmt (Stmt.varDecl name arrTy none)
+  -- Initialize all elements
+  for i in [0:count] do
+    emitStmt (Stmt.assignIndex name (Exp.litU32 i) matTy init)
+
+/-- Declare an array of subgroup_matrix_right matrices with initialization -/
+def declareMatrixRightArray
+    (name : String)
+    (st : ScalarType)
+    (k n : Nat)
+    (count : Nat)
+    (init : Exp (.subgroupMatrixRight st k n))
+    : ShaderM Unit := do
+  let matTy := WGSLType.subgroupMatrixRight st k n
+  let arrTy := WGSLType.array matTy count
+  emitStmt (Stmt.varDecl name arrTy none)
+  -- Initialize all elements
+  for i in [0:count] do
+    emitStmt (Stmt.assignIndex name (Exp.litU32 i) matTy init)
+
+/-- Declare an array of subgroup_matrix_result matrices with initialization -/
+def declareMatrixResultArray
+    (name : String)
+    (st : ScalarType)
+    (m n : Nat)
+    (count : Nat)
+    (init : Exp (.subgroupMatrixResult st m n))
+    : ShaderM Unit := do
+  let matTy := WGSLType.subgroupMatrixResult st m n
+  let arrTy := WGSLType.array matTy count
+  emitStmt (Stmt.varDecl name arrTy none)
+  -- Initialize all elements
+  for i in [0:count] do
+    emitStmt (Stmt.assignIndex name (Exp.litU32 i) matTy init)
+
+/-- Load subgroup_matrix_left from buffer
+
+    Example: Ax[i] = subgroupMatrixLoad<subgroup_matrix_left<f32,8,8>>(&A, offset, false, stride)
+-/
+def loadMatrixLeft
+    {st : ScalarType} {m k : Nat}
+    (arrayName : String)
+    (index : Nat)
+    (bufferName : String)
+    (offset : Exp (.scalar .u32))
+    (stride : Exp (.scalar .u32))
+    : ShaderM Unit := do
+  let matTy := WGSLType.subgroupMatrixLeft st m k
+  let loadExpr := Exp.subgroupMatrixLoad bufferName offset (Exp.litBool false) stride
+  emitStmt (Stmt.assignIndex arrayName (Exp.litU32 index) matTy loadExpr)
+
+/-- Load subgroup_matrix_right from buffer -/
+def loadMatrixRight
+    {st : ScalarType} {k n : Nat}
+    (arrayName : String)
+    (index : Nat)
+    (bufferName : String)
+    (offset : Exp (.scalar .u32))
+    (stride : Exp (.scalar .u32))
+    : ShaderM Unit := do
+  let matTy := WGSLType.subgroupMatrixRight st k n
+  let loadExpr := Exp.subgroupMatrixLoadRight bufferName offset (Exp.litBool false) stride
+  emitStmt (Stmt.assignIndex arrayName (Exp.litU32 index) matTy loadExpr)
+
+/-- Perform matrix multiply-accumulate: acc = a * b + acc
+
+    Example: accxx[idx] = subgroupMatrixMultiplyAccumulate(Ax[i], Bx[j], accxx[idx])
+-/
+def matrixMultiplyAccumulate
+    {st : ScalarType} {m k n : Nat}
+    (resultArrayName : String)
+    (resultIndex : Nat)
+    (leftArrayName : String)
+    (leftIndex : Nat)
+    (rightArrayName : String)
+    (rightIndex : Nat)
+    : ShaderM Unit := do
+  let leftMatTy := WGSLType.subgroupMatrixLeft st m k
+  let rightMatTy := WGSLType.subgroupMatrixRight st k n
+  let resultMatTy := WGSLType.subgroupMatrixResult st m n
+
+  let leftArr : Exp (.array leftMatTy leftIndex) := Exp.var leftArrayName
+  let rightArr : Exp (.array rightMatTy rightIndex) := Exp.var rightArrayName
+  let resultArr : Exp (.array resultMatTy resultIndex) := Exp.var resultArrayName
+
+  let leftMat := Exp.index leftArr (Exp.litU32 leftIndex)
+  let rightMat := Exp.index rightArr (Exp.litU32 rightIndex)
+  let accMat := Exp.index resultArr (Exp.litU32 resultIndex)
+
+  let mulAccExpr := Exp.subgroupMatrixMultiplyAccumulate leftMat rightMat accMat
+  emitStmt (Stmt.assignIndex resultArrayName (Exp.litU32 resultIndex) resultMatTy mulAccExpr)
+
+/-- Store subgroup_matrix_result to buffer
+
+    Example: subgroupMatrixStore(&C, offset, accxx[idx], false, stride)
+-/
+def storeMatrixResult
+    {st : ScalarType} {m n : Nat}
+    (arrayName : String)
+    (index : Nat)
+    (bufferName : String)
+    (offset : Exp (.scalar .u32))
+    (stride : Exp (.scalar .u32))
+    : ShaderM Unit := do
+  let resultMatTy := WGSLType.subgroupMatrixResult st m n
+  let resultArr : Exp (.array resultMatTy index) := Exp.var arrayName
+  let mat := Exp.index resultArr (Exp.litU32 index)
+  let storeExpr := Exp.subgroupMatrixStore bufferName offset mat (Exp.litBool false) stride
+  emitStmt (Stmt.exprStmt storeExpr)
+
+/-- Static loop unrolling for matrix operations
+
+    Executes an action for each index in the range [0, count)
+-/
+def staticLoop (count : Nat) (body : Nat → ShaderM Unit) : ShaderM Unit := do
+  for i in [0:count] do
+    body i
+
+/-- Static nested loop for 2D iteration -/
+def staticLoop2D (rows cols : Nat) (body : Nat → Nat → ShaderM Unit) : ShaderM Unit := do
+  for i in [0:rows] do
+    for j in [0:cols] do
+      body i j
+
 end ShaderM
 
 end Hesper.WGSL.Monad
