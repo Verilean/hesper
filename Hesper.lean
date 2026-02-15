@@ -1,4 +1,5 @@
 import Hesper.Basic
+import Hesper.Logging
 
 -- WGSL DSL modules
 import Hesper.WGSL.Types
