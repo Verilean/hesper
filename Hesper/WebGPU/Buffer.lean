@@ -1,4 +1,6 @@
 import Hesper.WebGPU.Types
+import Hesper.Basic
+import Hesper.Logging
 
 namespace Hesper.WebGPU
 
@@ -16,7 +18,7 @@ opaque createBufferImpl (device : @& Device) (desc : @& BufferDescriptor) : IO B
 
 /-- Wrapper with debug output -/
 def createBuffer (device : @& Device) (desc : @& BufferDescriptor) : IO Buffer := do
-  IO.println s!"[Lean] createBuffer: size={desc.size}, usage={desc.usage.length} items, mapped={desc.mappedAtCreation}"
+  Hesper.Logging.logVerbose s!"[Lean] createBuffer: size={desc.size}, usage={desc.usage.length} items, mapped={desc.mappedAtCreation}"
   createBufferImpl device desc
 
 /-- Write data to a buffer from the CPU.
@@ -62,7 +64,7 @@ def bytesToFloatArray (bytes : ByteArray) : Array Float :=
     let b1 := bytes.get! (offset + 1)
     let b2 := bytes.get! (offset + 2)
     let b3 := bytes.get! (offset + 3)
-    let bits : UInt64 := b0.toUInt64 ||| (b1.toUInt64 <<< 8) ||| (b2.toUInt64 <<< 16) ||| (b3.toUInt64 <<< 24)
-    Float.ofBits bits
+    let bits : UInt32 := b0.toUInt32 ||| (b1.toUInt32 <<< 8) ||| (b2.toUInt32 <<< 16) ||| (b3.toUInt32 <<< 24)
+    Hesper.Basic.float32BitsToFloat64 bits
 
 end Hesper.WebGPU

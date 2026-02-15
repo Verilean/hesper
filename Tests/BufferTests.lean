@@ -104,7 +104,7 @@ def testVariousBufferSizes : IO TestSeq := withDevice fun _ device => do
 
   pure $ test s!"Buffers of various sizes ({sizes.length} tested) created successfully" allSuccess
 
--- Test: Zero-Size Buffer (Should Fail)
+-- Test: Zero-Size Buffer (Dawn allows zero-size buffers)
 def testZeroSizeBuffer : IO TestSeq := withDevice fun _ device => do
   let result ← try
     let desc : BufferDescriptor := {
@@ -113,11 +113,11 @@ def testZeroSizeBuffer : IO TestSeq := withDevice fun _ device => do
       mappedAtCreation := false
     }
     let _ ← createBuffer device desc
-    pure false  -- Should not succeed
+    pure true   -- Dawn allows zero-size buffers
   catch _ =>
-    pure true   -- Error expected
+    pure false  -- Unexpected failure
 
-  pure $ test "Zero-size buffer creation fails gracefully" result
+  pure $ test "Zero-size buffer creation succeeds" result
 
 -- Test: Buffer Write Operation
 def testBufferWrite : IO TestSeq := withDevice fun _ device => do

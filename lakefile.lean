@@ -42,10 +42,10 @@ script buildNative do
 
     IO.println s!"Downloading from: {tarballUrl}"
 
-    -- Download tarball using curl
+    -- Download tarball using curl (silent mode)
     let downloadRet ← IO.Process.spawn {
       cmd := "curl"
-      args := #["-L", "-o", tarballPath, tarballUrl]
+      args := #["-s", "-L", "-o", tarballPath, tarballUrl]
     } >>= (·.wait)
 
     if downloadRet != 0 then
@@ -422,6 +422,13 @@ lean_exe «test-gpu-accuracy» where
 
 lean_exe «buffer-test» where
   root := `Tests.BufferTest
+
+lean_exe «embedding-test» where
+  root := `Tests.EmbeddingTest
+  moreLinkArgs := stdLinkArgs
+
+lean_exe «minimal-bindgroup-test» where
+  root := `Tests.MinimalBindGroupTest
   moreLinkArgs := stdLinkArgs
 
 lean_exe «minimal-test» where
@@ -460,6 +467,19 @@ lean_exe «test-shader-monad» where
 
 lean_exe «test-subgroup-codegen» where
   root := `Examples.Compute.TestSubgroupShader
+
+-- GGUF Tests and Examples (Pure Lean - no GPU or FFI required)
+lean_exe «test-gguf» where
+  root := `Tests.GGUF.ParserSpec
+
+lean_exe «load-gguf» where
+  root := `Examples.LoadGGUF
+
+lean_exe «test-tq2_0» where
+  root := `Examples.Tests.TQ2_0_Test
+
+lean_exe «test-rmsnorm» where
+  root := `Examples.Tests.RMSNorm_Test
 
 -- ----------------------------------------------------------------------------
 -- Benchmarks
@@ -581,5 +601,27 @@ lean_exe «test-adam-gpu» where
 
 lean_exe «integration-tests» where
   root := `Tests.Integration.IntegrationMain
+  supportInterpreter := false
+  moreLinkArgs := stdLinkArgs
+
+-- ----------------------------------------------------------------------------
+-- BitNet Validation Tests
+-- ----------------------------------------------------------------------------
+
+lean_exe «bitnet-validation» where
+  root := `Tests.BitNetValidation
+  supportInterpreter := false
+  moreLinkArgs := stdLinkArgs
+
+lean_exe «bitnet-complete» where
+  root := `Examples.BitNetComplete
+  supportInterpreter := false
+  moreLinkArgs := stdLinkArgs
+
+lean_exe i2s_validation where
+  root := `Tests.I2S_Validation
+  supportInterpreter := true
+lean_exe small_embedding_test where
+  root := `Tests.SmallEmbeddingTest
   supportInterpreter := false
   moreLinkArgs := stdLinkArgs

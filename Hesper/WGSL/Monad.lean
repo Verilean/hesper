@@ -97,6 +97,13 @@ def var (ty : WGSLType) (init : Exp ty) : ShaderM String := do
 def varNamed (name : String) (ty : WGSLType) (init : Exp ty) : ShaderM Unit :=
   emitStmt (Stmt.varDecl name ty (some ⟨ty, init⟩))
 
+/-- Declare a mutable variable with fresh name, returning both name and typed expression.
+    This avoids manually constructing `Exp.var name` and passing raw string literals. -/
+def varRef (ty : WGSLType) (init : Exp ty) : ShaderM (String × Exp ty) := do
+  let name ← freshVar "v"
+  emitStmt (Stmt.varDecl name ty (some ⟨ty, init⟩))
+  return (name, Exp.var name)
+
 /-- Declare shared memory (workgroup-scoped) with fresh name -/
 def shared (ty : WGSLType) : ShaderM String := do
   let name ← freshVar "shared"

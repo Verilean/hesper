@@ -54,8 +54,11 @@ def testBindGroupLayoutCreation : IO TestSeq := withDevice fun _ device => do
 def testComputePipelineCreation : IO TestSeq := withDevice fun _ device => do
   let shader ← createShaderModule device simpleAddShader
 
-  -- Create empty bind group layout
-  let bindGroupLayout ← createBindGroupLayout device #[]
+  -- Create bind group layout matching the shader's @group(0) @binding(0)
+  let entries : Array BindGroupLayoutEntry := #[
+    { binding := 0, visibility := .compute, bindingType := .buffer false }
+  ]
+  let bindGroupLayout ← createBindGroupLayout device entries
 
   let desc : ComputePipelineDescriptor := {
     shaderModule := shader,
