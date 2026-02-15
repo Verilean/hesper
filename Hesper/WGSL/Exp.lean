@@ -524,9 +524,9 @@ partial def Exp.toWGSL {t : WGSLType} : Exp t → String
   | vec3Y v => s!"{toWGSL v}.y"
   | vecZ v => s!"{toWGSL v}.z"
   | vecW v => s!"{toWGSL v}.w"
-  | vec2 x y => s!"vec2({toWGSL x}, {toWGSL y})"
-  | vec3 x y z => s!"vec3({toWGSL x}, {toWGSL y}, {toWGSL z})"
-  | vec4 x y z w => s!"vec4({toWGSL x}, {toWGSL y}, {toWGSL z}, {toWGSL w})"
+  | @vec2 st x y => s!"vec2<{st.toWGSL}>({toWGSL x}, {toWGSL y})"
+  | @vec3 st x y z => s!"vec3<{st.toWGSL}>({toWGSL x}, {toWGSL y}, {toWGSL z})"
+  | @vec4 st x y z w => s!"vec4<{st.toWGSL}>({toWGSL x}, {toWGSL y}, {toWGSL z}, {toWGSL w})"
   -- Math functions
   | sqrt e => s!"sqrt({toWGSL e})"
   | abs e => s!"abs({toWGSL e})"

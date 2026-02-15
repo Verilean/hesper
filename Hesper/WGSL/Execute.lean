@@ -5,6 +5,7 @@ import Hesper.WebGPU.Device
 import Hesper.WebGPU.Buffer
 import Hesper.WebGPU.Shader
 import Hesper.WebGPU.Pipeline
+import Hesper.Logging
 
 namespace Hesper.WGSL.Execute
 
@@ -12,6 +13,7 @@ open Hesper.WGSL
 open Hesper.WGSL.Monad (ShaderM)
 open Hesper.WGSL.CodeGen
 open Hesper.WebGPU
+open Hesper.Logging (logVerbose)
 
 /-!
 # WGSL Shader Execution Layer
@@ -141,7 +143,7 @@ def executeShaderNamed
   -- Compile to WGSL
   let wgslSource := compileToWGSL computation config.funcName config.workgroupSize config.extensions config.diagnostics
 
-  IO.println s!"[Execute] Compiled shader ({wgslSource.length} bytes)"
+  logVerbose s!"[Execute] Compiled shader ({wgslSource.length} bytes)"
 
   -- Create shader module
   let shaderModule ← createShaderModule device wgslSource
@@ -156,7 +158,7 @@ def executeShaderNamed
 
   -- Validate that we have all buffers
   if sortedBuffers.length != declaredNames.length then
-    IO.println s!"[Execute] ERROR: Buffer count mismatch!"
+    IO.println s!"[Execute] ERROR: Buffer count mismatch!"  -- Always print errors
     IO.println s!"  Expected: {declaredNames}"
     IO.println s!"  Provided: {namedBuffers.map (·.fst)}"
     throw <| IO.userError "Buffer binding mismatch"
@@ -165,7 +167,7 @@ def executeShaderNamed
   let layoutEntries := List.range sortedBuffers.length |>.map fun i =>
     { binding := i.toUInt32
       visibility := ShaderStage.compute
-      bindingType := BindingType.buffer false }  -- read_write storage
+      bindingType := BindingType.buffer false }  -- read_write storage (false = NOT readOnly)
 
   let bindGroupLayout ← createBindGroupLayout device layoutEntries.toArray
 
@@ -188,7 +190,7 @@ def executeShaderNamed
 
   -- Dispatch (async - returns Future)
   let (wx, wy, wz) := config.numWorkgroups
-  IO.println s!"[Execute] Dispatching {wx}×{wy}×{wz} workgroups..."
+  logVerbose s!"[Execute] Dispatching {wx}×{wy}×{wz} workgroups..."
   let future ← dispatchCompute device pipeline bindGroup wx.toUInt32 wy.toUInt32 wz.toUInt32
 
   -- Wait for completion
@@ -196,7 +198,7 @@ def executeShaderNamed
 
   -- Resources are automatically cleaned up by Lean's GC via External finalizers
 
-  IO.println "[Execute] Completed successfully"
+  logVerbose "[Execute] Completed successfully"
 
 /-- Execute a simple ShaderM computation with a single input/output buffer.
 

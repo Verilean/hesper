@@ -8,3 +8,7 @@ name = "Hesper"
 [[lean_exe]]
 name = "hesper"
 root = "Main"
+
+[[lean_exe]]
+name = "bitnet-validation"
+root = "Tests.BitNetValidation"
