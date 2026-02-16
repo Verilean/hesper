@@ -371,12 +371,20 @@ def forward (device : Device) (layer : RoPE)
 -/
 def forwardDynamic (device : Device) (layer : RoPE)
             (inputBuf outputBuf paramsBuf : Buffer)
-            (batchSize seqLen numHeads : Nat) (headDim : Nat := 0) : IO Unit := do
+            (batchSize seqLen numHeads : Nat) (headDim : Nat := 0)
+            (preparedRef : Option (IO.Ref (Option Hesper.WGSL.Execute.PreparedDispatch)) := none) : IO Unit := do
   let effectiveHeadDim := if headDim > 0 then headDim else layer.config.dim / numHeads
-  logVerbose s!"[RoPE] Applying dynamic to batch={batchSize}, seq_len={seqLen}, heads={numHeads}, headDim={effectiveHeadDim}"
-
   let dimPairs := effectiveHeadDim / 2
   let totalElements := batchSize * seqLen * numHeads * dimPairs
+  let wx := (totalElements + 255) / 256
+
+  -- Fast path: replay prepared dispatch
+  if let some ref := preparedRef then
+    if let some p ← ref.get then
+      Hesper.WGSL.Execute.replayPreparedDispatch device p wx 1 1
+      return
+
+  logVerbose s!"[RoPE] Applying dynamic to batch={batchSize}, seq_len={seqLen}, heads={numHeads}, headDim={effectiveHeadDim}"
 
   let shader := ropeKernelDynamic layer.config batchSize seqLen numHeads effectiveHeadDim
   let namedBuffers := [
@@ -390,7 +398,7 @@ def forwardDynamic (device : Device) (layer : RoPE)
     256
 
   let cacheKey : UInt64 := hash ("rope_dyn", batchSize, seqLen, numHeads, effectiveHeadDim, layer.config.base.toBits)
-  Hesper.WGSL.Execute.executeShaderNamed device shader namedBuffers execConfig (some cacheKey)
+  Hesper.WGSL.Execute.executeShaderNamed device shader namedBuffers execConfig (some cacheKey) preparedRef
   logVerbose "[RoPE] ✓ Dynamic forward pass complete"
 
 /-- Apply cached RoPE (requires precomputed cos/sin buffers)

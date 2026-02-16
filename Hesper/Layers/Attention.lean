@@ -500,6 +500,11 @@ def forward (device : Device) (layer : Attention)
 structure KVCache where
   kBuf : Buffer    -- [numKVHeads, maxSeqLen, headDim]
   vBuf : Buffer    -- [numKVHeads, maxSeqLen, headDim]
+  -- Per-layer PreparedDispatch for kernels that bind kvCache buffers
+  preparedCacheWriteK : IO.Ref (Option Hesper.WGSL.Execute.PreparedDispatch)
+  preparedCacheWriteV : IO.Ref (Option Hesper.WGSL.Execute.PreparedDispatch)
+  preparedScores : IO.Ref (Option Hesper.WGSL.Execute.PreparedDispatch)
+  preparedApply : IO.Ref (Option Hesper.WGSL.Execute.PreparedDispatch)
 
 /-- Create KV cache for one attention layer -/
 def createKVCache (device : Device) (config : Config) : IO KVCache := do
@@ -507,7 +512,13 @@ def createKVCache (device : Device) (config : Config) : IO KVCache := do
   let numKVHeads := config.effectiveKVHeads
   let cacheSize := (numKVHeads * config.maxSeqLen * headDim * 4).toUSize
   let mkBuf := fun () => createBuffer device { size := cacheSize, usage := [.storage], mappedAtCreation := false }
-  pure { kBuf := ← mkBuf (), vBuf := ← mkBuf () }
+  pure {
+    kBuf := ← mkBuf (), vBuf := ← mkBuf ()
+    preparedCacheWriteK := ← IO.mkRef none
+    preparedCacheWriteV := ← IO.mkRef none
+    preparedScores := ← IO.mkRef none
+    preparedApply := ← IO.mkRef none
+  }
 
 /-- Pre-allocated buffers for cached single-token attention -/
 structure CachedAttentionBuffers where
@@ -521,6 +532,10 @@ structure CachedAttentionBuffers where
   subNormBuf : Buffer  -- [dim]
   rmsTempBuf : Buffer  -- small
   paramsBuf : Buffer   -- [2 × u32]: pos, cacheLen
+  -- PreparedDispatch refs for instant replay (shared-buffer-safe only)
+  preparedSoftmax : IO.Ref (Option Hesper.WGSL.Execute.PreparedDispatch)
+  preparedRopeQ : IO.Ref (Option Hesper.WGSL.Execute.PreparedDispatch)
+  preparedRopeK : IO.Ref (Option Hesper.WGSL.Execute.PreparedDispatch)
 
 /-- Create pre-allocated buffers for cached attention -/
 def createCachedAttentionBuffers (device : Device) (config : Config) : IO CachedAttentionBuffers := do
@@ -538,6 +553,9 @@ def createCachedAttentionBuffers (device : Device) (config : Config) : IO Cached
     subNormBuf := ← mkBuf (config.dim * 4).toUSize
     rmsTempBuf := ← mkBuf 4
     paramsBuf := ← mkCopyBuf 8  -- 2 × u32 = 8 bytes
+    preparedSoftmax := ← IO.mkRef none
+    preparedRopeQ := ← IO.mkRef none
+    preparedRopeK := ← IO.mkRef none
   }
 
 /-! ## KV Cache Kernels
@@ -774,46 +792,67 @@ def forwardWithCache (device : Device) (layer : Attention)
   writeBuffer device bufs.paramsBuf 0 paramsBytes
 
   -- Step 2: Apply RoPE at position `pos` (reads posOffset from params[0])
-  RoPE.forwardDynamic device layer.rope bufs.qBuf bufs.qRotBuf bufs.paramsBuf 1 1 numHeads headDim
-  RoPE.forwardDynamic device layer.rope bufs.kNewBuf bufs.kRotBuf bufs.paramsBuf 1 1 numKVHeads headDim
+  RoPE.forwardDynamic device layer.rope bufs.qBuf bufs.qRotBuf bufs.paramsBuf 1 1 numHeads headDim (some bufs.preparedRopeQ)
+  RoPE.forwardDynamic device layer.rope bufs.kNewBuf bufs.kRotBuf bufs.paramsBuf 1 1 numKVHeads headDim (some bufs.preparedRopeK)
 
   -- Step 3: Append K (after RoPE) and V to cache at position `pos`
-  let writeShader := cacheWriteKernel numKVHeads maxSeqLen headDim kvDim
-  let writeCacheKey : UInt64 := hash ("cw", numKVHeads, maxSeqLen, headDim, kvDim)
-  Hesper.WGSL.Execute.executeShaderNamed device writeShader
-    [("new_data", bufs.kRotBuf), ("cache", kvCache.kBuf), ("params", bufs.paramsBuf)]
-    (Hesper.WGSL.Execute.ExecutionConfig.dispatch1D kvDim 256)
-    (some writeCacheKey)
-  Hesper.WGSL.Execute.executeShaderNamed device writeShader
-    [("new_data", bufs.vNewBuf), ("cache", kvCache.vBuf), ("params", bufs.paramsBuf)]
-    (Hesper.WGSL.Execute.ExecutionConfig.dispatch1D kvDim 256)
-    (some writeCacheKey)
+  -- Note: cacheWrite, scores, apply use kvCache buffers → per-layer PreparedDispatch (in KVCache)
+  let cwWx := (kvDim + 255) / 256
+  if let some p ← kvCache.preparedCacheWriteK.get then
+    Hesper.WGSL.Execute.replayPreparedDispatch device p cwWx 1 1
+  else
+    let writeShader := cacheWriteKernel numKVHeads maxSeqLen headDim kvDim
+    let writeCacheKey : UInt64 := hash ("cw", numKVHeads, maxSeqLen, headDim, kvDim)
+    Hesper.WGSL.Execute.executeShaderNamed device writeShader
+      [("new_data", bufs.kRotBuf), ("cache", kvCache.kBuf), ("params", bufs.paramsBuf)]
+      (Hesper.WGSL.Execute.ExecutionConfig.dispatch1D kvDim 256)
+      (some writeCacheKey) (some kvCache.preparedCacheWriteK)
+  if let some p ← kvCache.preparedCacheWriteV.get then
+    Hesper.WGSL.Execute.replayPreparedDispatch device p cwWx 1 1
+  else
+    let writeShader := cacheWriteKernel numKVHeads maxSeqLen headDim kvDim
+    let writeCacheKey : UInt64 := hash ("cw", numKVHeads, maxSeqLen, headDim, kvDim)
+    Hesper.WGSL.Execute.executeShaderNamed device writeShader
+      [("new_data", bufs.vNewBuf), ("cache", kvCache.vBuf), ("params", bufs.paramsBuf)]
+      (Hesper.WGSL.Execute.ExecutionConfig.dispatch1D kvDim 256)
+      (some writeCacheKey) (some kvCache.preparedCacheWriteV)
 
-  -- Step 4: Attention scores with GQA (dispatch max workgroups, kernel bounds-checks via cacheLen)
-  let scale := 1.0 / headDim.toFloat.sqrt
-  let scoresShader := cachedScoresKernel numHeads numKVHeads maxSeqLen headDim scale
-  let scoresCacheKey : UInt64 := hash ("cs", numHeads, numKVHeads, maxSeqLen, headDim)
-  Hesper.WGSL.Execute.executeShaderNamed device scoresShader
-    [("q", bufs.qRotBuf), ("k_cache", kvCache.kBuf), ("scores", bufs.scoresBuf), ("params", bufs.paramsBuf)]
-    (Hesper.WGSL.Execute.ExecutionConfig.dispatch1D (numHeads * cacheLen) 256)
-    (some scoresCacheKey)
+  -- Step 4: Attention scores with GQA (dispatch size varies with cacheLen)
+  let scoresWx := (numHeads * cacheLen + 255) / 256
+  if let some p ← kvCache.preparedScores.get then
+    Hesper.WGSL.Execute.replayPreparedDispatch device p scoresWx 1 1
+  else
+    let scale := 1.0 / headDim.toFloat.sqrt
+    let scoresShader := cachedScoresKernel numHeads numKVHeads maxSeqLen headDim scale
+    let scoresCacheKey : UInt64 := hash ("cs", numHeads, numKVHeads, maxSeqLen, headDim)
+    Hesper.WGSL.Execute.executeShaderNamed device scoresShader
+      [("q", bufs.qRotBuf), ("k_cache", kvCache.kBuf), ("scores", bufs.scoresBuf), ("params", bufs.paramsBuf)]
+      (Hesper.WGSL.Execute.ExecutionConfig.dispatch1D (numHeads * cacheLen) 256)
+      (some scoresCacheKey) (some kvCache.preparedScores)
 
-  -- Step 5: Softmax (no causal mask for single-query)
-  let softmaxShader := cachedSoftmaxKernel numHeads maxSeqLen
-  let softmaxCacheKey : UInt64 := hash ("sm", numHeads, maxSeqLen)
-  Hesper.WGSL.Execute.executeShaderNamed device softmaxShader
-    [("input", bufs.scoresBuf), ("output", bufs.attnBuf), ("params", bufs.paramsBuf)]
-    (Hesper.WGSL.Execute.ExecutionConfig.dispatch1D (numHeads * cacheLen) 256)
-    (some softmaxCacheKey)
+  -- Step 5: Softmax (shared buffers only → shared PreparedDispatch)
+  let softmaxWx := (numHeads * cacheLen + 255) / 256
+  if let some p ← bufs.preparedSoftmax.get then
+    Hesper.WGSL.Execute.replayPreparedDispatch device p softmaxWx 1 1
+  else
+    let softmaxShader := cachedSoftmaxKernel numHeads maxSeqLen
+    let softmaxCacheKey : UInt64 := hash ("sm", numHeads, maxSeqLen)
+    Hesper.WGSL.Execute.executeShaderNamed device softmaxShader
+      [("input", bufs.scoresBuf), ("output", bufs.attnBuf), ("params", bufs.paramsBuf)]
+      (Hesper.WGSL.Execute.ExecutionConfig.dispatch1D (numHeads * cacheLen) 256)
+      (some softmaxCacheKey) (some bufs.preparedSoftmax)
 
-  -- Step 6: Apply attention to V cache
-  -- Reuse qRotBuf as attention output (same size: dim = numHeads * headDim)
-  let applyShader := cachedApplyKernel numHeads numKVHeads maxSeqLen headDim
-  let applyCacheKey : UInt64 := hash ("ca", numHeads, numKVHeads, maxSeqLen, headDim)
-  Hesper.WGSL.Execute.executeShaderNamed device applyShader
-    [("attn", bufs.attnBuf), ("v_cache", kvCache.vBuf), ("output", bufs.qRotBuf), ("params", bufs.paramsBuf)]
-    (Hesper.WGSL.Execute.ExecutionConfig.dispatch1D (numHeads * headDim) 256)
-    (some applyCacheKey)
+  -- Step 6: Apply attention to V cache (uses kvCache.vBuf → per-layer)
+  let applyWx := (numHeads * headDim + 255) / 256
+  if let some p ← kvCache.preparedApply.get then
+    Hesper.WGSL.Execute.replayPreparedDispatch device p applyWx 1 1
+  else
+    let applyShader := cachedApplyKernel numHeads numKVHeads maxSeqLen headDim
+    let applyCacheKey : UInt64 := hash ("ca", numHeads, numKVHeads, maxSeqLen, headDim)
+    Hesper.WGSL.Execute.executeShaderNamed device applyShader
+      [("attn", bufs.attnBuf), ("v_cache", kvCache.vBuf), ("output", bufs.qRotBuf), ("params", bufs.paramsBuf)]
+      (Hesper.WGSL.Execute.ExecutionConfig.dispatch1D (numHeads * headDim) 256)
+      (some applyCacheKey) (some kvCache.preparedApply)
 
   -- Step 7: Sub-norm (if provided)
   let attnOutForO ← match subNorm with
