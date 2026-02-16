@@ -130,6 +130,48 @@ structure Config where
   maxSeqLen : Nat     -- Maximum sequence length
   deriving Repr
 
+/-! ## Pre-allocated Buffers -/
+
+/-- Pre-allocated buffers for transformer block forward pass.
+    Avoids ~21 GPU buffer allocations per layer per token (9 block + 12 attention). -/
+structure LayerBuffers where
+  -- TransformerBlock temp buffers
+  normedBuf : Buffer       -- dim-sized
+  attnOutBuf : Buffer      -- dim-sized
+  residual1Buf : Buffer    -- dim-sized
+  normed2Buf : Buffer      -- dim-sized
+  gateBuf : Buffer         -- ffn-sized
+  upBuf : Buffer           -- ffn-sized
+  hiddenBuf : Buffer       -- ffn-sized
+  ffnOutBuf : Buffer       -- dim-sized
+  ffnNormedBuf : Buffer    -- ffn-sized
+  rmsTempBuf : Buffer      -- numRows * 4 bytes (small)
+  -- Attention pre-allocated buffers
+  attnBufs : Attention.AttentionBuffers
+
+/-- Create pre-allocated buffers for one transformer block forward pass -/
+def createLayerBuffers (device : Device) (dim ffnDim : Nat) (attnConfig : Attention.Config) (batchSize seqLen : Nat) : IO LayerBuffers := do
+  let numElements := batchSize * seqLen * dim
+  let ffnElements := batchSize * seqLen * ffnDim
+  let numRows := batchSize * seqLen
+  let tempSize := (numElements * 4).toUSize
+  let ffnTempSize := (ffnElements * 4).toUSize
+  let mkBuf := fun size => createBuffer device { size := size, usage := [.storage], mappedAtCreation := false }
+  let attnBufs ← Attention.createAttentionBuffers device attnConfig batchSize seqLen
+  pure {
+    normedBuf := ← mkBuf tempSize
+    attnOutBuf := ← mkBuf tempSize
+    residual1Buf := ← mkBuf tempSize
+    normed2Buf := ← mkBuf tempSize
+    gateBuf := ← mkBuf ffnTempSize
+    upBuf := ← mkBuf ffnTempSize
+    hiddenBuf := ← mkBuf ffnTempSize
+    ffnOutBuf := ← mkBuf tempSize
+    ffnNormedBuf := ← mkBuf ffnTempSize
+    rmsTempBuf := ← mkBuf (numRows * 4).toUSize
+    attnBufs := attnBufs
+  }
+
 /-! ## Layer Structure -/
 
 /-- Complete transformer block -/
@@ -278,105 +320,176 @@ def createWithLayers (device : Device) (config : Config)
 -/
 def forward (device : Device) (block : TransformerBlock)
             (inputBuf outputBuf : Buffer)
-            (batchSize seqLen : Nat) : IO Unit := do
+            (batchSize seqLen : Nat)
+            (preAllocBufs : Option LayerBuffers := none) : IO Unit := do
   logVerbose s!"[Block {block.config.layerIdx}] Forward pass: batch={batchSize}, seq_len={seqLen}"
 
   let numElements := batchSize * seqLen * block.config.dim
   let ffnElements := batchSize * seqLen * block.config.ffnDim
+  let numRows := batchSize * seqLen
 
-  -- Allocate temporary buffers
-  let tempSize := (numElements * 4).toUSize  -- Float32
-  let ffnTempSize := (ffnElements * 4).toUSize
-
-  let normedBuf ← createBuffer device { size := tempSize, usage := [.storage], mappedAtCreation := false }
-  let attnOutBuf ← createBuffer device { size := tempSize, usage := [.storage], mappedAtCreation := false }
-  let residual1Buf ← createBuffer device { size := tempSize, usage := [.storage], mappedAtCreation := false }
-  let normed2Buf ← createBuffer device { size := tempSize, usage := [.storage], mappedAtCreation := false }
-  let gateBuf ← createBuffer device { size := ffnTempSize, usage := [.storage], mappedAtCreation := false }
-  let upBuf ← createBuffer device { size := ffnTempSize, usage := [.storage], mappedAtCreation := false }
-  let hiddenBuf ← createBuffer device { size := ffnTempSize, usage := [.storage], mappedAtCreation := false }
-  let ffnOutBuf ← createBuffer device { size := tempSize, usage := [.storage], mappedAtCreation := false }
+  -- Use pre-allocated or allocate temporary buffers
+  let bufs ← match preAllocBufs with
+    | some b => pure b
+    | none => createLayerBuffers device block.config.dim block.config.ffnDim
+                block.attention.config batchSize seqLen
 
   -- === ATTENTION SUB-LAYER ===
 
   -- Step 1: Pre-attention normalization
-  let numRows := batchSize * seqLen
   logVerbose "  [1/9] Pre-attention RMSNorm..."
-  RMSNorm.forward device block.attnNorm inputBuf normedBuf numRows
+  RMSNorm.forward device block.attnNorm inputBuf bufs.normedBuf numRows 256 (some bufs.rmsTempBuf)
 
   -- Debug: check RMSNorm output (layer 0 only)
   if block.config.layerIdx == 0 && (← isVerbose) then
-    let dbg1 ← Hesper.WebGPU.BufferOps.downloadFloatArray device normedBuf (min 5 numElements)
+    let dbg1 ← Hesper.WebGPU.BufferOps.downloadFloatArray device bufs.normedBuf (min 5 numElements)
     logVerbose s!"  [DEBUG] RMSNorm output (first 5): {dbg1.toList.take 5}"
 
   -- Step 2: Multi-head self-attention (with attn sub-norm before O projection)
-  logVerbose "  [2/9] Multi-head attention..."
-  Attention.forward device block.attention normedBuf attnOutBuf batchSize seqLen (some block.attnSubNorm)
+  -- The O projection fuses the residual add: output = input + attn_O(attn_out)
+  logVerbose "  [2/9] Multi-head attention (with fused O-proj residual)..."
+  Attention.forward device block.attention bufs.normedBuf bufs.residual1Buf batchSize seqLen (some block.attnSubNorm) (some bufs.attnBufs) (some inputBuf)
 
   -- Debug: check attention output (layer 0 only)
   if block.config.layerIdx == 0 && (← isVerbose) then
-    let dbg2 ← Hesper.WebGPU.BufferOps.downloadFloatArray device attnOutBuf (min 5 numElements)
-    logVerbose s!"  [DEBUG] Attention output (first 5): {dbg2.toList.take 5}"
-
-  -- Step 3: Residual connection
-  logVerbose "  [3/9] Attention residual connection..."
-  let elemConfig : Elementwise.Config := { numElements }
-  executeAdd device inputBuf attnOutBuf residual1Buf elemConfig
+    let dbg2 ← Hesper.WebGPU.BufferOps.downloadFloatArray device bufs.residual1Buf (min 5 numElements)
+    logVerbose s!"  [DEBUG] Attn+residual output (first 5): {dbg2.toList.take 5}"
 
   -- === FFN SUB-LAYER ===
 
   -- Step 4: Pre-FFN normalization
   logVerbose "  [4/9] Pre-FFN RMSNorm..."
-  RMSNorm.forward device block.ffnNorm residual1Buf normed2Buf numRows
+  RMSNorm.forward device block.ffnNorm bufs.residual1Buf bufs.normed2Buf numRows 256 (some bufs.rmsTempBuf)
 
   -- Step 5: FFN gate projection
   logVerbose "  [5/9] FFN gate projection..."
-  BitLinear.forward device block.ffnGate normed2Buf gateBuf numRows
+  BitLinear.forward device block.ffnGate bufs.normed2Buf bufs.gateBuf numRows
 
   -- Step 6: FFN up projection
   logVerbose "  [6/9] FFN up projection..."
-  BitLinear.forward device block.ffnUp normed2Buf upBuf numRows
+  BitLinear.forward device block.ffnUp bufs.normed2Buf bufs.upBuf numRows
 
   -- Step 7: Gated activation (ReLU² + multiply, BitNet b1.58 uses LLM_FFN_RELU_SQR)
   logVerbose "  [7/10] Gated activation (ReLU²(gate) × up)..."
   let ffnElemConfig : Elementwise.Config := { numElements := ffnElements }
-  executeReluSqrMul device gateBuf upBuf hiddenBuf ffnElemConfig
+  executeReluSqrMul device bufs.gateBuf bufs.upBuf bufs.hiddenBuf ffnElemConfig
 
   -- Debug: check FFN intermediate (layer 0 only)
   if block.config.layerIdx == 0 && (← isVerbose) then
-    let dbgGate ← Hesper.WebGPU.BufferOps.downloadFloatArray device gateBuf (min 5 ffnElements)
+    let dbgGate ← Hesper.WebGPU.BufferOps.downloadFloatArray device bufs.gateBuf (min 5 ffnElements)
     logVerbose s!"  [DEBUG] Gate output (first 5): {dbgGate.toList.take 5}"
-    let dbgUp ← Hesper.WebGPU.BufferOps.downloadFloatArray device upBuf (min 5 ffnElements)
+    let dbgUp ← Hesper.WebGPU.BufferOps.downloadFloatArray device bufs.upBuf (min 5 ffnElements)
     logVerbose s!"  [DEBUG] Up output (first 5): {dbgUp.toList.take 5}"
-    let dbgHidden ← Hesper.WebGPU.BufferOps.downloadFloatArray device hiddenBuf (min 5 ffnElements)
+    let dbgHidden ← Hesper.WebGPU.BufferOps.downloadFloatArray device bufs.hiddenBuf (min 5 ffnElements)
     logVerbose s!"  [DEBUG] ReLU²*Up output (first 5): {dbgHidden.toList.take 5}"
 
   -- Step 7.5: FFN sub-norm (normalize before down projection - BitNet specific)
   logVerbose "  [7.5/10] FFN sub-norm..."
-  let ffnNormedBuf ← createBuffer device { size := ffnTempSize, usage := [.storage], mappedAtCreation := false }
-  RMSNorm.forward device block.ffnSubNorm hiddenBuf ffnNormedBuf numRows
+  RMSNorm.forward device block.ffnSubNorm bufs.hiddenBuf bufs.ffnNormedBuf numRows 256 (some bufs.rmsTempBuf)
 
   -- Debug: check FFN normed (layer 0 only)
   if block.config.layerIdx == 0 && (← isVerbose) then
-    let dbgNormed ← Hesper.WebGPU.BufferOps.downloadFloatArray device ffnNormedBuf (min 5 ffnElements)
+    let dbgNormed ← Hesper.WebGPU.BufferOps.downloadFloatArray device bufs.ffnNormedBuf (min 5 ffnElements)
     logVerbose s!"  [DEBUG] FFN sub-normed (first 5): {dbgNormed.toList.take 5}"
 
-  -- Step 8: FFN down projection
-  logVerbose "  [8/10] FFN down projection..."
-  BitLinear.forward device block.ffnDown ffnNormedBuf ffnOutBuf numRows
+  -- Step 8: FFN down projection with fused residual add
+  -- output = residual1 + scale * (down_weights @ ffn_normed)
+  logVerbose "  [8/10] FFN down projection (with fused residual)..."
+  BitLinear.forwardWithResidual device block.ffnDown bufs.ffnNormedBuf bufs.residual1Buf outputBuf numRows
 
   -- Debug: check FFN output (layer 0 only)
   if block.config.layerIdx == 0 && (← isVerbose) then
-    let dbgDown ← Hesper.WebGPU.BufferOps.downloadFloatArray device ffnOutBuf (min 5 numElements)
-    logVerbose s!"  [DEBUG] FFN down output (first 5): {dbgDown.toList.take 5}"
-    let dbgRes1 ← Hesper.WebGPU.BufferOps.downloadFloatArray device residual1Buf (min 5 numElements)
-    logVerbose s!"  [DEBUG] Residual1 (pre-FFN residual, first 5): {dbgRes1.toList.take 5}"
-
-  -- Step 9: Final residual connection
-  logVerbose "  [9/10] FFN residual connection..."
-  executeAdd device residual1Buf ffnOutBuf outputBuf elemConfig
+    let dbgOut ← Hesper.WebGPU.BufferOps.downloadFloatArray device outputBuf (min 5 numElements)
+    logVerbose s!"  [DEBUG] FFN down+residual output (first 5): {dbgOut.toList.take 5}"
 
   logVerbose s!"[Block {block.config.layerIdx}] ✓ Forward pass complete"
+
+/-! ## Pre-allocated Buffers for Cached Inference -/
+
+/-- Pre-allocated buffers for single-token forward pass with KV cache -/
+structure CachedLayerBuffers where
+  normedBuf : Buffer       -- [dim]
+  attnOutBuf : Buffer      -- [dim]
+  residual1Buf : Buffer    -- [dim]
+  normed2Buf : Buffer      -- [dim]
+  gateBuf : Buffer         -- [ffnDim]
+  upBuf : Buffer           -- [ffnDim]
+  hiddenBuf : Buffer       -- [ffnDim]
+  ffnOutBuf : Buffer       -- [dim]
+  ffnNormedBuf : Buffer    -- [ffnDim]
+  rmsTempBuf : Buffer      -- small
+  attnBufs : Attention.CachedAttentionBuffers
+
+/-- Create pre-allocated buffers for cached single-token inference -/
+def createCachedLayerBuffers (device : Device) (dim ffnDim : Nat) (attnConfig : Attention.Config) : IO CachedLayerBuffers := do
+  let mkBuf := fun size => createBuffer device { size := size, usage := [.storage], mappedAtCreation := false }
+  let attnBufs ← Attention.createCachedAttentionBuffers device attnConfig
+  pure {
+    normedBuf := ← mkBuf (dim * 4).toUSize
+    attnOutBuf := ← mkBuf (dim * 4).toUSize
+    residual1Buf := ← mkBuf (dim * 4).toUSize
+    normed2Buf := ← mkBuf (dim * 4).toUSize
+    gateBuf := ← mkBuf (ffnDim * 4).toUSize
+    upBuf := ← mkBuf (ffnDim * 4).toUSize
+    hiddenBuf := ← mkBuf (ffnDim * 4).toUSize
+    ffnOutBuf := ← mkBuf (dim * 4).toUSize
+    ffnNormedBuf := ← mkBuf (ffnDim * 4).toUSize
+    rmsTempBuf := ← mkBuf 4
+    attnBufs := attnBufs
+  }
+
+/-! ## Forward Pass with KV Cache -/
+
+/-- Execute single-token transformer block forward pass with KV cache.
+
+    Same algorithm as `forward` but uses cached attention for O(1) per token.
+    All dimensions are for single token (batchSize=1, seqLen=1).
+
+    @param pos Current token position (0-indexed)
+    @param kvCache KV cache for this layer's attention
+-/
+def forwardWithCache (device : Device) (block : TransformerBlock)
+                     (inputBuf outputBuf : Buffer) (pos : Nat)
+                     (kvCache : Attention.KVCache)
+                     (preAllocBufs : Option CachedLayerBuffers := none) : IO Unit := do
+  logVerbose s!"[Block {block.config.layerIdx}] Cached forward: pos={pos}"
+
+  let dim := block.config.dim
+  let ffnDim := block.config.ffnDim
+
+  let bufs ← match preAllocBufs with
+    | some b => pure b
+    | none => createCachedLayerBuffers device dim ffnDim block.attention.config
+
+  -- === ATTENTION SUB-LAYER ===
+
+  -- Step 1: Pre-attention RMSNorm
+  RMSNorm.forward device block.attnNorm inputBuf bufs.normedBuf 1 256 (some bufs.rmsTempBuf)
+
+  -- Step 2: Attention with KV cache (O projection fuses residual add)
+  Attention.forwardWithCache device block.attention bufs.normedBuf bufs.residual1Buf
+    kvCache pos (some block.attnSubNorm) (some bufs.attnBufs) (some inputBuf)
+
+  -- === FFN SUB-LAYER ===
+
+  -- Step 4: Pre-FFN RMSNorm
+  RMSNorm.forward device block.ffnNorm bufs.residual1Buf bufs.normed2Buf 1 256 (some bufs.rmsTempBuf)
+
+  -- Step 5-6: FFN gate + up projections
+  BitLinear.forward device block.ffnGate bufs.normed2Buf bufs.gateBuf 1
+  BitLinear.forward device block.ffnUp bufs.normed2Buf bufs.upBuf 1
+
+  -- Step 7: Gated activation (ReLU²)
+  let ffnElemConfig : Elementwise.Config := { numElements := ffnDim }
+  executeReluSqrMul device bufs.gateBuf bufs.upBuf bufs.hiddenBuf ffnElemConfig
+
+  -- Step 7.5: FFN sub-norm
+  RMSNorm.forward device block.ffnSubNorm bufs.hiddenBuf bufs.ffnNormedBuf 1 256 (some bufs.rmsTempBuf)
+
+  -- Step 8: FFN down projection with fused residual add
+  BitLinear.forwardWithResidual device block.ffnDown bufs.ffnNormedBuf bufs.residual1Buf outputBuf 1
+
+  logVerbose s!"[Block {block.config.layerIdx}] ✓ Cached forward complete"
 
 /-! ## Integration with GGUF -/
 
