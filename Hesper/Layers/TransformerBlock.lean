@@ -419,6 +419,7 @@ structure CachedLayerBuffers where
   ffnNormedBuf : Buffer    -- [ffnDim]
   rmsTempBuf : Buffer      -- small
   attnBufs : Attention.CachedAttentionBuffers
+  preparedReluSqrMul : IO.Ref (Option Hesper.WGSL.Execute.PreparedDispatch)
 
 /-- Create pre-allocated buffers for cached single-token inference -/
 def createCachedLayerBuffers (device : Device) (dim ffnDim : Nat) (attnConfig : Attention.Config) : IO CachedLayerBuffers := do
@@ -436,6 +437,7 @@ def createCachedLayerBuffers (device : Device) (dim ffnDim : Nat) (attnConfig : 
     ffnNormedBuf := ← mkBuf (ffnDim * 4).toUSize
     rmsTempBuf := ← mkBuf 4
     attnBufs := attnBufs
+    preparedReluSqrMul := ← IO.mkRef none
   }
 
 /-! ## Forward Pass with KV Cache -/
@@ -481,7 +483,7 @@ def forwardWithCache (device : Device) (block : TransformerBlock)
 
   -- Step 7: Gated activation (ReLU²)
   let ffnElemConfig : Elementwise.Config := { numElements := ffnDim }
-  executeReluSqrMul device bufs.gateBuf bufs.upBuf bufs.hiddenBuf ffnElemConfig
+  executeReluSqrMul device bufs.gateBuf bufs.upBuf bufs.hiddenBuf ffnElemConfig (some bufs.preparedReluSqrMul)
 
   -- Step 7.5: FFN sub-norm
   RMSNorm.forward device block.ffnSubNorm bufs.hiddenBuf bufs.ffnNormedBuf 1 256 (some bufs.rmsTempBuf)

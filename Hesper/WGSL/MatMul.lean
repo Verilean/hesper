@@ -219,6 +219,76 @@ def matMulTransposeF16Kernel (config : Config) : ShaderM Unit := do
   let result := Exp.select inBounds acc (Exp.litF32 0.0)
   ShaderM.writeBuffer (ty := .scalar .f32) "c" idx result
 
+/-! ## Optimized F16 Transposed MatMul with Shared Memory -/
+
+/-- Optimized matrix multiply with B transposed, B stored as packed F16: C = A @ B^T
+
+    Key optimizations over `matMulTransposeF16Kernel`:
+    1. A vector loaded into workgroup shared memory (eliminates redundant global reads)
+    2. Inner loop processes 4 u32 (= 8 F16 values) per iteration (4x fewer loop iterations)
+
+    For M=1 LM head (1×2560 @ 128256×2560):
+    - Old: each of 128K threads reads all 2560 A values from global memory = 1.3 GB total A reads
+    - New: each workgroup (256 threads) loads A once into shared memory = 5 MB total A reads
+
+    Requirements: K must be divisible by 8
+
+    @param config Matrix dimensions (K must be divisible by 8)
+-/
+def matMulTransposeF16SharedKernel (config : Config) : ShaderM Unit := do
+  let workgroupSize := 256
+  let gid ← ShaderM.globalId
+  let lid ← ShaderM.localId
+  let idx := Exp.vec3X gid
+  let tid := Exp.vec3X lid
+
+  let totalElements := config.M * config.N
+  let packedK := config.K / 2  -- K/2 u32 values per row in B
+  let loopCount := packedK / 4 -- process 4 u32 (8 F16) per iteration
+
+  -- Shared memory for A row (e.g., 2560 × 4B = 10 KB for BitNet)
+  ShaderM.sharedNamed "shared_a" (.array (.scalar .f32) config.K)
+
+  -- Buffers
+  let _a ← ShaderM.declareInputBuffer "a" (.array (.scalar .f32) (config.M * config.K))
+  let _b ← ShaderM.declareInputBuffer "b" (.array (.scalar .u32) (config.N * packedK))
+  let _c ← ShaderM.declareOutputBuffer "c" (.array (.scalar .f32) totalElements)
+
+  let row := Exp.div idx (Exp.litU32 config.N)
+  let col := Exp.mod idx (Exp.litU32 config.N)
+
+  -- Step 1: Cooperatively load A[row, 0..K-1] into shared memory
+  let aBase := Exp.mul row (Exp.litU32 config.K)
+  ShaderM.loop tid (Exp.litU32 config.K) (Exp.litU32 workgroupSize) fun i => do
+    let val ← ShaderM.readBuffer (ty := .scalar .f32) (n := config.M * config.K) "a" (Exp.add aBase i)
+    ShaderM.writeWorkgroup (ty := .scalar .f32) "shared_a" i val
+  ShaderM.barrier
+
+  -- Step 2: Compute dot product using shared A and packed F16 B
+  let (accName, acc) ← ShaderM.varRef (.scalar .f32) (Exp.litF32 0.0)
+  let bBase := Exp.mul col (Exp.litU32 packedK)
+
+  -- Main loop: process 4 u32 (= 8 F16 values) per iteration
+  ShaderM.loop (Exp.litU32 0) (Exp.litU32 loopCount) (Exp.litU32 1) fun k4 => do
+    let baseU32 := Exp.mul k4 (Exp.litU32 4)
+    let kBase := Exp.mul k4 (Exp.litU32 8)
+
+    -- Compile-time unroll: read 4 packed u32, unpack 8 F16, do 8 FMAs
+    for i in [0:4] do
+      let packed ← ShaderM.readBuffer (ty := .scalar .u32) (n := config.N * packedK) "b"
+        (Exp.add bBase (Exp.add baseU32 (Exp.litU32 i)))
+      let unpacked := Exp.unpack2x16float packed
+      let k0 := Exp.add kBase (Exp.litU32 (i * 2))
+      let k1 := Exp.add kBase (Exp.litU32 (i * 2 + 1))
+      let a0 ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := config.K) "shared_a" k0
+      let a1 ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := config.K) "shared_a" k1
+      ShaderM.assign accName (Exp.add acc (Exp.add (Exp.mul (Exp.vecX unpacked) a0) (Exp.mul (Exp.vecY unpacked) a1)))
+
+  -- Step 3: Write result
+  let inBounds := Exp.lt idx (Exp.litU32 totalElements)
+  let result := Exp.select inBounds acc (Exp.litF32 0.0)
+  ShaderM.writeBuffer (ty := .scalar .f32) "c" idx result
+
 /-! ## Scaled Matrix Multiply (for Attention) -/
 
 /-- Scaled matrix multiply: C = (A @ B) / scale
@@ -452,6 +522,40 @@ def executeMatMulTransposeF16 (device : Device)
   let cacheKey : UInt64 := hash ("mmf16", config.M, config.N, config.K)
   Hesper.WGSL.Execute.executeShaderNamed device shader namedBuffers execConfig (some cacheKey)
   logVerbose "[MatMul] ✓ Complete (F16)"
+
+/-- Execute optimized F16 transposed matmul with shared memory: C = A @ B^T
+
+    Uses shared memory for A vector to eliminate redundant global reads.
+    Significantly faster than `executeMatMulTransposeF16` for small M (especially M=1).
+
+    Requirements: K must be divisible by 8
+
+    @param device WebGPU device
+    @param aBuf Matrix A [M, K] in F32
+    @param bF16Buf Matrix B [N, K] stored as packed F16 ([N, K/2] u32 values)
+    @param cBuf Output matrix C [M, N] in F32
+    @param config Matrix dimensions (K must be divisible by 8)
+-/
+def executeMatMulTransposeF16Shared (device : Device)
+                                     (aBuf bF16Buf cBuf : Buffer)
+                                     (config : Config) : IO Unit := do
+  logVerbose s!"[MatMul] Computing F16-Shared: {config.M}×{config.K} @ ({config.N}×{config.K})^T..."
+
+  let shader := matMulTransposeF16SharedKernel config
+  let namedBuffers := [
+    ("a", aBuf),
+    ("b", bF16Buf),
+    ("c", cBuf)
+  ]
+
+  let totalElements := config.M * config.N
+  let execConfig := Hesper.WGSL.Execute.ExecutionConfig.dispatch1D
+    totalElements
+    256
+
+  let cacheKey : UInt64 := hash ("mmf16s", config.M, config.N, config.K)
+  Hesper.WGSL.Execute.executeShaderNamed device shader namedBuffers execConfig (some cacheKey)
+  logVerbose "[MatMul] ✓ Complete (F16-Shared)"
 
 /-- Execute scaled transposed matrix multiply: C = (A @ B^T) / scale
 
