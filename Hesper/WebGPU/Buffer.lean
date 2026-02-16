@@ -42,6 +42,16 @@ opaque mapBufferRead (device : @& Device) (buffer : @& Buffer) (offset : USize) 
 @[extern "lean_hesper_unmap_buffer"]
 opaque unmapBuffer (buffer : @& Buffer) : IO Unit
 
+/-- Get a stable unique identifier for a GPU buffer (raw WGPUBuffer handle as UInt64).
+    Used for bind group caching — same ID means same underlying GPU buffer. -/
+@[extern "lean_hesper_buffer_id"]
+opaque getBufferId (buffer : @& Buffer) : IO UInt64
+
+/-- Hash an array of buffers into a single UInt64 key in one FFI call.
+    Avoids N separate `getBufferId` calls per dispatch. -/
+@[extern "lean_hesper_hash_buffer_array"]
+opaque hashBufferArray (seed : UInt64) (buffers : @& Array Buffer) : IO UInt64
+
 /-- Helper: Convert Float array to ByteArray for buffer upload -/
 def floatArrayToBytes (arr : Array Float) : ByteArray :=
   let bytes := ByteArray.empty

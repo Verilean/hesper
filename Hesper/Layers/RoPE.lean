@@ -122,7 +122,7 @@ def computeTheta (pos : Exp (.scalar .f32)) (dimPair : Exp (.scalar .u32))
     @param seqLen Current sequence length
     @param numHeads Number of attention heads
 -/
-def ropeKernel (config : Config) (batchSize seqLen numHeads : Nat) (headDimOverride : Nat := 0) : ShaderM Unit := do
+def ropeKernel (config : Config) (batchSize seqLen numHeads : Nat) (headDimOverride : Nat := 0) (posOffset : Nat := 0) : ShaderM Unit := do
   let gid ← ShaderM.globalId
   let idx := Exp.vec3X gid
 
@@ -146,8 +146,8 @@ def ropeKernel (config : Config) (batchSize seqLen numHeads : Nat) (headDimOverr
   let pos := Exp.mod tmp2 (Exp.litU32 seqLen)
   let batch := Exp.div tmp2 (Exp.litU32 seqLen)
 
-  -- Compute theta for this position and dimension
-  let posF32 := Exp.toF32 pos
+  -- Compute theta for this position and dimension (with offset for KV cache)
+  let posF32 := Exp.toF32 (Exp.add pos (Exp.litU32 posOffset))
   let theta := computeTheta posF32 dimPair headDim config.base
 
   -- Compute cos and sin
@@ -178,6 +178,65 @@ def ropeKernel (config : Config) (batchSize seqLen numHeads : Nat) (headDimOverr
   let x1_new := Exp.add (Exp.mul x0 sinTheta) (Exp.mul x1 cosTheta)
 
   -- Write output (conditional on bounds)
+  let result0 := Exp.select inBounds x0_new (Exp.litF32 0.0)
+  let result1 := Exp.select inBounds x1_new (Exp.litF32 0.0)
+
+  ShaderM.writeBuffer (ty := .scalar .f32) "output" idx0 result0
+  ShaderM.writeBuffer (ty := .scalar .f32) "output" idx1 result1
+
+/-- RoPE kernel with dynamic posOffset from params buffer.
+    Produces identical WGSL regardless of position, enabling pipeline caching.
+    Params buffer layout: [posOffset: u32] (4 bytes minimum, but shares attention params buffer)
+    For single-token inference: batchSize=1, seqLen=1, reads posOffset from params[0].
+-/
+def ropeKernelDynamic (config : Config) (batchSize seqLen numHeads : Nat) (headDimOverride : Nat := 0) : ShaderM Unit := do
+  let gid ← ShaderM.globalId
+  let idx := Exp.vec3X gid
+
+  let headDim := if headDimOverride > 0 then headDimOverride else config.dim / numHeads
+  let dimPairs := headDim / 2
+  let totalElements := batchSize * seqLen * numHeads * dimPairs
+
+  let inBounds := Exp.lt idx (Exp.litU32 totalElements)
+
+  let _input ← ShaderM.declareInputBuffer "input" (.array (.scalar .f32) (batchSize * seqLen * numHeads * headDim))
+  let _output ← ShaderM.declareOutputBuffer "output" (.array (.scalar .f32) (batchSize * seqLen * numHeads * headDim))
+  let _params ← ShaderM.declareInputBuffer "params" (.array (.scalar .u32) 2)
+
+  -- Read posOffset from params buffer (params[0] = pos)
+  let posOffset ← ShaderM.readBuffer (ty := .scalar .u32) (n := 2) "params" (Exp.litU32 0)
+
+  let dimPair := Exp.mod idx (Exp.litU32 dimPairs)
+  let tmp1 := Exp.div idx (Exp.litU32 dimPairs)
+  let head := Exp.mod tmp1 (Exp.litU32 numHeads)
+  let tmp2 := Exp.div tmp1 (Exp.litU32 numHeads)
+  let pos := Exp.mod tmp2 (Exp.litU32 seqLen)
+  let batch := Exp.div tmp2 (Exp.litU32 seqLen)
+
+  let posF32 := Exp.toF32 (Exp.add pos posOffset)
+  let theta := computeTheta posF32 dimPair headDim config.base
+
+  let cosTheta := Exp.cos theta
+  let sinTheta := Exp.sin theta
+
+  let halfDim := headDim / 2
+  let dim0 := dimPair
+  let dim1 := Exp.add dimPair (Exp.litU32 halfDim)
+
+  let batchOffset := Exp.mul batch (Exp.litU32 (seqLen * numHeads * headDim))
+  let seqOffset := Exp.mul pos (Exp.litU32 (numHeads * headDim))
+  let headOffset := Exp.mul head (Exp.litU32 headDim)
+  let baseIdx := Exp.add (Exp.add batchOffset seqOffset) headOffset
+
+  let idx0 := Exp.add baseIdx dim0
+  let idx1 := Exp.add baseIdx dim1
+
+  let x0 ← ShaderM.readBuffer (ty := .scalar .f32) (n := batchSize * seqLen * numHeads * headDim) "input" idx0
+  let x1 ← ShaderM.readBuffer (ty := .scalar .f32) (n := batchSize * seqLen * numHeads * headDim) "input" idx1
+
+  let x0_new := Exp.sub (Exp.mul x0 cosTheta) (Exp.mul x1 sinTheta)
+  let x1_new := Exp.add (Exp.mul x0 sinTheta) (Exp.mul x1 cosTheta)
+
   let result0 := Exp.select inBounds x0_new (Exp.litF32 0.0)
   let result1 := Exp.select inBounds x1_new (Exp.litF32 0.0)
 
@@ -285,15 +344,15 @@ def create (config : Config) : IO RoPE := do
 -/
 def forward (device : Device) (layer : RoPE)
             (inputBuf outputBuf : Buffer)
-            (batchSize seqLen numHeads : Nat) (headDim : Nat := 0) : IO Unit := do
+            (batchSize seqLen numHeads : Nat) (headDim : Nat := 0) (posOffset : Nat := 0) : IO Unit := do
   -- If headDim is 0, derive from config.dim / numHeads
   let effectiveHeadDim := if headDim > 0 then headDim else layer.config.dim / numHeads
-  logVerbose s!"[RoPE] Applying to batch={batchSize}, seq_len={seqLen}, heads={numHeads}, headDim={effectiveHeadDim}"
+  logVerbose s!"[RoPE] Applying to batch={batchSize}, seq_len={seqLen}, heads={numHeads}, headDim={effectiveHeadDim}, posOffset={posOffset}"
 
   let dimPairs := effectiveHeadDim / 2
   let totalElements := batchSize * seqLen * numHeads * dimPairs
 
-  let shader := ropeKernel layer.config batchSize seqLen numHeads effectiveHeadDim
+  let shader := ropeKernel layer.config batchSize seqLen numHeads effectiveHeadDim posOffset
   let namedBuffers := [
     ("input", inputBuf),
     ("output", outputBuf)
@@ -305,6 +364,34 @@ def forward (device : Device) (layer : RoPE)
 
   Hesper.WGSL.Execute.executeShaderNamed device shader namedBuffers execConfig
   logVerbose "[RoPE] ✓ Forward pass complete"
+
+/-- Apply RoPE with dynamic posOffset from a params buffer.
+    The params buffer must contain [posOffset: u32, ...] (posOffset at index 0).
+    Produces identical WGSL across tokens → enables pipeline + bind group caching.
+-/
+def forwardDynamic (device : Device) (layer : RoPE)
+            (inputBuf outputBuf paramsBuf : Buffer)
+            (batchSize seqLen numHeads : Nat) (headDim : Nat := 0) : IO Unit := do
+  let effectiveHeadDim := if headDim > 0 then headDim else layer.config.dim / numHeads
+  logVerbose s!"[RoPE] Applying dynamic to batch={batchSize}, seq_len={seqLen}, heads={numHeads}, headDim={effectiveHeadDim}"
+
+  let dimPairs := effectiveHeadDim / 2
+  let totalElements := batchSize * seqLen * numHeads * dimPairs
+
+  let shader := ropeKernelDynamic layer.config batchSize seqLen numHeads effectiveHeadDim
+  let namedBuffers := [
+    ("input", inputBuf),
+    ("output", outputBuf),
+    ("params", paramsBuf)
+  ]
+
+  let execConfig := Hesper.WGSL.Execute.ExecutionConfig.dispatch1D
+    totalElements
+    256
+
+  let cacheKey : UInt64 := hash ("rope_dyn", batchSize, seqLen, numHeads, effectiveHeadDim, layer.config.base.toBits)
+  Hesper.WGSL.Execute.executeShaderNamed device shader namedBuffers execConfig (some cacheKey)
+  logVerbose "[RoPE] ✓ Dynamic forward pass complete"
 
 /-- Apply cached RoPE (requires precomputed cos/sin buffers)
 

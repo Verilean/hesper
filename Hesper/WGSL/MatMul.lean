@@ -160,6 +160,65 @@ def matMulTransposeBKernel (config : Config) : ShaderM Unit := do
   let result := Exp.select inBounds sum (Exp.litF32 0.0)
   ShaderM.writeBuffer (ty := .scalar .f32) "c" idx result
 
+/-! ## F16 Transposed Matrix Multiply (for LM Head) -/
+
+/-- Matrix multiply with B transposed, B stored as packed F16: C = A @ B^T
+
+    A: [M, K] in F32
+    B: [N, K] stored as packed F16 (each u32 = 2 F16 values via pack2x16float)
+    C: [M, N] in F32
+
+    Uses hardware `unpack2x16float` to convert F16→F32 during computation.
+    Processes 2 K-elements per loop iteration for 2x bandwidth reduction on B.
+
+    Primary use: LM head projection where B is the F16 embedding table (656 MB vs 1.3 GB F32).
+
+    @param config Matrix dimensions (K must be even)
+-/
+def matMulTransposeF16Kernel (config : Config) : ShaderM Unit := do
+  let gid ← ShaderM.globalId
+  let idx := Exp.vec3X gid
+
+  let totalElements := config.M * config.N
+  let packedK := config.K / 2  -- K/2 u32 values per row
+
+  -- A: [M, K] in F32
+  let _a ← ShaderM.declareInputBuffer "a" (.array (.scalar .f32) (config.M * config.K))
+  -- B: [N, K] stored as packed F16 → [N, K/2] u32 values
+  let _b ← ShaderM.declareInputBuffer "b" (.array (.scalar .u32) (config.N * packedK))
+  let _c ← ShaderM.declareOutputBuffer "c" (.array (.scalar .f32) totalElements)
+
+  let row := Exp.div idx (Exp.litU32 config.N)
+  let col := Exp.mod idx (Exp.litU32 config.N)
+
+  let (accName, acc) ← ShaderM.varRef (.scalar .f32) (Exp.litF32 0.0)
+
+  let aBase := Exp.mul row (Exp.litU32 config.K)
+  let bBase := Exp.mul col (Exp.litU32 packedK)
+
+  -- Loop over K/2 packed F16 pairs
+  ShaderM.loop (Exp.litU32 0) (Exp.litU32 packedK) (Exp.litU32 1) fun kPair => do
+    -- Read packed u32 containing two F16 values
+    let packed ← ShaderM.readBuffer (ty := .scalar .u32) (n := config.N * packedK) "b" (Exp.add bBase kPair)
+
+    -- Hardware unpack: u32 → vec2<f32>
+    let unpacked := Exp.unpack2x16float packed
+    let b0 := Exp.vecX unpacked
+    let b1 := Exp.vecY unpacked
+
+    -- Read corresponding A values
+    let kIdx0 := Exp.mul kPair (Exp.litU32 2)
+    let kIdx1 := Exp.add kIdx0 (Exp.litU32 1)
+    let a0 ← ShaderM.readBuffer (ty := .scalar .f32) (n := config.M * config.K) "a" (Exp.add aBase kIdx0)
+    let a1 ← ShaderM.readBuffer (ty := .scalar .f32) (n := config.M * config.K) "a" (Exp.add aBase kIdx1)
+
+    -- Accumulate: acc += a0*b0 + a1*b1
+    ShaderM.assign accName (Exp.add acc (Exp.add (Exp.mul a0 b0) (Exp.mul a1 b1)))
+
+  let inBounds := Exp.lt idx (Exp.litU32 totalElements)
+  let result := Exp.select inBounds acc (Exp.litF32 0.0)
+  ShaderM.writeBuffer (ty := .scalar .f32) "c" idx result
+
 /-! ## Scaled Matrix Multiply (for Attention) -/
 
 /-- Scaled matrix multiply: C = (A @ B) / scale
@@ -360,6 +419,39 @@ def executeMatMulTranspose (device : Device)
 
   Hesper.WGSL.Execute.executeShaderNamed device shader namedBuffers execConfig
   logVerbose "[MatMul] ✓ Complete"
+
+/-- Execute transposed matrix multiply with B in packed F16: C = A @ B^T
+
+    B is stored as packed F16 (each u32 = 2 F16 values).
+    Uses hardware unpack2x16float for 2x bandwidth reduction.
+    Primary use: LM head with F16 embedding table.
+
+    @param device WebGPU device
+    @param aBuf Matrix A [M, K] in F32
+    @param bF16Buf Matrix B [N, K] stored as packed F16 ([N, K/2] u32 values)
+    @param cBuf Output matrix C [M, N] in F32
+    @param config Matrix dimensions (K must be even)
+-/
+def executeMatMulTransposeF16 (device : Device)
+                               (aBuf bF16Buf cBuf : Buffer)
+                               (config : Config) : IO Unit := do
+  logVerbose s!"[MatMul] Computing F16: {config.M}×{config.K} @ ({config.N}×{config.K})^T..."
+
+  let shader := matMulTransposeF16Kernel config
+  let namedBuffers := [
+    ("a", aBuf),
+    ("b", bF16Buf),
+    ("c", cBuf)
+  ]
+
+  let totalElements := config.M * config.N
+  let execConfig := Hesper.WGSL.Execute.ExecutionConfig.dispatch1D
+    totalElements
+    256
+
+  let cacheKey : UInt64 := hash ("mmf16", config.M, config.N, config.K)
+  Hesper.WGSL.Execute.executeShaderNamed device shader namedBuffers execConfig (some cacheKey)
+  logVerbose "[MatMul] ✓ Complete (F16)"
 
 /-- Execute scaled transposed matrix multiply: C = (A @ B^T) / scale
 

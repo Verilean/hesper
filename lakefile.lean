@@ -489,6 +489,10 @@ lean_exe benchmark where
   root := `Benchmarks.Performance
   moreLinkArgs := stdLinkArgs
 
+lean_exe «micro-bench» where
+  root := `Bench.MicroBenchmark
+  moreLinkArgs := stdLinkArgs
+
 -- ============================================================================
 -- SIMD CPU BACKEND (Google Highway)
 -- ============================================================================
@@ -610,6 +614,11 @@ lean_exe «integration-tests» where
 
 lean_exe «bitnet-validation» where
   root := `Tests.BitNetValidation
+  supportInterpreter := false
+  moreLinkArgs := stdLinkArgs
+
+lean_exe «kvcache-validation» where
+  root := `Tests.KVCacheValidation
   supportInterpreter := false
   moreLinkArgs := stdLinkArgs
 

@@ -12,6 +12,8 @@ import Hesper.GGUF.Parser
 import Hesper.GGUF.Loader
 import Hesper.GGUF.Reader
 import Hesper.WGSL.MatMul
+import Hesper.WGSL.Monad
+import Hesper.WGSL.Exp
 import Hesper.Inference.Sampling
 import Hesper.Logging
 
@@ -155,6 +157,8 @@ namespace Hesper.Models.BitNet
 open Hesper.WebGPU
 open Hesper.Layers
 open Hesper.GGUF
+open Hesper.WGSL
+open Hesper.WGSL.Monad
 open Hesper.Logging (logVerbose isVerbose)
 
 /-! ## Configuration -/
@@ -266,14 +270,32 @@ def forward (device : Device) (model : BitNetModel)
   let buf1 ← createBuffer device { size := tempSize, usage := [.storage], mappedAtCreation := false }
   let buf2 ← createBuffer device { size := tempSize, usage := [.storage], mappedAtCreation := false }
 
-  -- Step 1: Embedding lookup
+  -- Pre-allocate layer buffers ONCE (reused across all 30 layers)
+  let attnConfig : Attention.Config := {
+    dim := model.config.dim
+    numHeads := model.config.numHeads
+    numKVHeads := model.config.numKVHeads
+    headDim := model.config.headDim
+    maxSeqLen := model.config.maxSeqLen
+    useCausalMask := true
+  }
+  let layerBufs ← TransformerBlock.createLayerBuffers device
+    model.config.dim model.config.ffnDim attnConfig batchSize seqLen
+
+  let verbose ← isVerbose
+
+  -- Step 1: Embedding lookup (outside batch - needs sync for debug)
   logVerbose "[1/4] Embedding lookup..."
   Embedding.forward device model.embedding tokenIdsBuf buf1 batchSize seqLen
 
-  -- Debug: Check embedding output
-  if ← isVerbose then
+  -- Debug: Check embedding output (needs GPU readback, so before batch)
+  if verbose then
     let embDbg ← BufferOps.downloadFloatArray device buf1 (min 10 numElements)
     logVerbose s!"  [DEBUG] Embedding output (first 10): {embDbg.toList.take 10}"
+
+  -- === BEGIN BATCHED EXECUTION ===
+  -- All transformer layers + final norm + LM head recorded into single command buffer
+  Hesper.WGSL.Execute.beginBatch device
 
   -- Step 2: Pass through all transformer layers
   logVerbose s!"[2/4] Transformer layers (×{model.config.numLayers})..."
@@ -281,41 +303,190 @@ def forward (device : Device) (model : BitNetModel)
   let mut nextBuf := buf2
 
   for layer in model.layers do
-    TransformerBlock.forward device layer currentBuf nextBuf batchSize seqLen
-
-    -- Debug: Check layer output (first layer only)
-    if layer.config.layerIdx == 0 && (← isVerbose) then
-      let layerDbg ← BufferOps.downloadFloatArray device nextBuf (min 10 numElements)
-      logVerbose s!"  [DEBUG] Layer 0 output (first 10): {layerDbg.toList.take 10}"
+    TransformerBlock.forward device layer currentBuf nextBuf batchSize seqLen (some layerBufs)
 
     -- Ping-pong buffers
     let temp := currentBuf
     currentBuf := nextBuf
     nextBuf := temp
 
-  -- Debug: Check final layer output
-  if ← isVerbose then
-    let finalLayerDbg ← BufferOps.downloadFloatArray device currentBuf (min 10 numElements)
-    logVerbose s!"  [DEBUG] Final layer output (first 10): {finalLayerDbg.toList.take 10}"
-
   -- Step 3: Final normalization
   logVerbose "[3/4] Final RMSNorm..."
-  RMSNorm.forward device model.finalNorm currentBuf nextBuf (batchSize * seqLen)
+  RMSNorm.forward device model.finalNorm currentBuf nextBuf (batchSize * seqLen) 256 (some layerBufs.rmsTempBuf)
 
   -- Step 4: LM head projection to vocabulary (weight tying with embedding)
-  -- Computes output = hidden @ embedding_table^T
-  -- hidden: [batch*seq, dim], embedding_table: [vocab, dim] → output: [batch*seq, vocab]
   logVerbose "[4/4] LM head projection (weight-tied)..."
   let lmHeadConfig : Hesper.WGSL.MatMul.Config := {
     M := batchSize * seqLen,
     N := model.config.vocabSize,
     K := model.config.dim
   }
-  Hesper.WGSL.MatMul.executeMatMulTranspose device nextBuf model.embedding.embeddingTable outputBuf lmHeadConfig
+  match model.embedding.f16Table with
+  | some f16Buf =>
+    Hesper.WGSL.MatMul.executeMatMulTransposeF16 device nextBuf f16Buf outputBuf lmHeadConfig
+  | none =>
+    Hesper.WGSL.MatMul.executeMatMulTranspose device nextBuf model.embedding.embeddingTable outputBuf lmHeadConfig
+
+  -- === END BATCHED EXECUTION ===
+  -- Submit all recorded dispatches and wait once
+  Hesper.WGSL.Execute.endBatch device
 
   logVerbose "═══════════════════════════════════════════════"
   logVerbose "  ✓ Forward pass complete"
   logVerbose "═══════════════════════════════════════════════"
+
+/-! ## KV Cache State -/
+
+/-- Full KV cache state for incremental inference -/
+structure KVCacheState where
+  kvCaches : Array Attention.KVCache   -- Per-layer KV caches
+  layerBufs : TransformerBlock.CachedLayerBuffers  -- Shared temp buffers (single-token)
+  buf1 : Buffer        -- [dim] ping-pong buffer
+  buf2 : Buffer        -- [dim] ping-pong buffer
+  logitsBuf : Buffer   -- [vocabSize]
+  argmaxBuf : Buffer   -- [1] u32 for GPU-side argmax result
+  tokenBuf : Buffer    -- [1] u32 for single-token upload (reusable)
+
+/-- Create KV cache state for the model -/
+def createKVCacheState (device : Device) (model : BitNetModel) : IO KVCacheState := do
+  let cfg := model.config
+  let attnConfig : Attention.Config := {
+    dim := cfg.dim, numHeads := cfg.numHeads, numKVHeads := cfg.numKVHeads,
+    headDim := cfg.headDim, maxSeqLen := cfg.maxSeqLen, useCausalMask := true
+  }
+  -- Create per-layer KV caches
+  let mut kvCaches := Array.mkEmpty cfg.numLayers
+  for _ in [0:cfg.numLayers] do
+    kvCaches := kvCaches.push (← Attention.createKVCache device attnConfig)
+  -- Create shared layer buffers
+  let layerBufs ← TransformerBlock.createCachedLayerBuffers device cfg.dim cfg.ffnDim attnConfig
+  let mkBuf := fun size => createBuffer device { size := size, usage := [.storage], mappedAtCreation := false }
+  let mkBufRW := fun size => createBuffer device { size := size, usage := [.storage, .copySrc, .copyDst], mappedAtCreation := false }
+  pure {
+    kvCaches := kvCaches
+    layerBufs := layerBufs
+    buf1 := ← mkBuf (cfg.dim * 4).toUSize
+    buf2 := ← mkBuf (cfg.dim * 4).toUSize
+    logitsBuf := ← mkBuf (cfg.vocabSize * 4).toUSize
+    argmaxBuf := ← mkBufRW 4  -- Single u32 for argmax result
+    tokenBuf := ← mkBufRW 4   -- Single u32 for token upload
+  }
+
+/-- Run single-token forward pass with KV cache.
+    Processes one token at position `pos`, using cached K/V from past tokens.
+    Returns logits in `cacheState.logitsBuf`. -/
+def forwardSingleToken (device : Device) (model : BitNetModel)
+                       (tokenId : Nat) (pos : Nat) (cacheState : KVCacheState) : IO Unit := do
+  logVerbose s!"[SingleToken] pos={pos}, tokenId={tokenId}"
+
+  -- Step 1: Embedding lookup (single token) - reuse pre-allocated tokenBuf
+  let tokenBytes := Hesper.WebGPU.BufferOps.uint32ToBytes tokenId.toUInt32
+  writeBuffer device cacheState.tokenBuf 0 tokenBytes
+  Embedding.forward device model.embedding cacheState.tokenBuf cacheState.buf1 1 1
+
+  -- === BEGIN BATCHED EXECUTION ===
+  Hesper.WGSL.Execute.beginBatch device
+
+  -- Step 2: Pass through all transformer layers with KV cache
+  let mut currentBuf := cacheState.buf1
+  let mut nextBuf := cacheState.buf2
+  let mut layerIdx := 0
+
+  for layer in model.layers do
+    if h : layerIdx < cacheState.kvCaches.size then
+      let kvCache := cacheState.kvCaches[layerIdx]
+      TransformerBlock.forwardWithCache device layer currentBuf nextBuf pos kvCache (some cacheState.layerBufs)
+      let temp := currentBuf; currentBuf := nextBuf; nextBuf := temp
+    layerIdx := layerIdx + 1
+
+  -- Step 3: Final normalization (single token)
+  RMSNorm.forward device model.finalNorm currentBuf nextBuf 1 256
+
+  -- Step 4: LM head (1×dim @ dim×vocab)
+  let lmHeadConfig : Hesper.WGSL.MatMul.Config := {
+    M := 1, N := model.config.vocabSize, K := model.config.dim
+  }
+  match model.embedding.f16Table with
+  | some f16Buf =>
+    Hesper.WGSL.MatMul.executeMatMulTransposeF16 device nextBuf f16Buf cacheState.logitsBuf lmHeadConfig
+  | none =>
+    Hesper.WGSL.MatMul.executeMatMulTranspose device nextBuf model.embedding.embeddingTable cacheState.logitsBuf lmHeadConfig
+
+  -- === END BATCHED EXECUTION ===
+  Hesper.WGSL.Execute.endBatch device
+
+/-! ## GPU Argmax -/
+
+/-- GPU argmax kernel: find index of maximum value using parallel reduction.
+    Uses 1 workgroup of `workgroupSize` threads. Each thread scans a strided
+    portion of the input, then shared memory reduction finds the global max.
+    Output: single u32 (token index of max value). -/
+def argmaxKernel (vocabSize : Nat) (workgroupSize : Nat := 256) : ShaderM Unit := do
+  let tid ← ShaderM.localId
+  let tid := Exp.vec3X tid
+
+  -- Shared memory: values and indices
+  ShaderM.sharedNamed "shared_vals" (.array (.scalar .f32) workgroupSize)
+  ShaderM.sharedNamed "shared_idxs" (.array (.scalar .u32) workgroupSize)
+
+  -- Buffers
+  let _logits ← ShaderM.declareInputBuffer "logits" (.array (.scalar .f32) vocabSize)
+  let _result ← ShaderM.declareOutputBuffer "result" (.array (.scalar .u32) 1)
+
+  -- Phase 1: Each thread finds local max over its strided portion
+  ShaderM.varNamed "local_max" (.scalar .f32) (Exp.litF32 (-1.0e38))
+  ShaderM.varNamed "local_idx" (.scalar .u32) (Exp.litU32 0)
+  let localMax : Exp (.scalar .f32) := Exp.var "local_max"
+  let localIdx : Exp (.scalar .u32) := Exp.var "local_idx"
+
+  ShaderM.loop tid (Exp.litU32 vocabSize) (Exp.litU32 workgroupSize) fun i => do
+    let val ← ShaderM.readBuffer (ty := .scalar .f32) (n := vocabSize) "logits" i
+    ShaderM.if_ (Exp.gt val localMax) (do
+      ShaderM.assign "local_max" val
+      ShaderM.assign "local_idx" i
+    ) (pure ())
+
+  -- Write local results to shared memory
+  ShaderM.writeWorkgroup (ty := .scalar .f32) "shared_vals" tid localMax
+  ShaderM.writeWorkgroup (ty := .scalar .u32) "shared_idxs" tid localIdx
+  ShaderM.barrier
+
+  -- Phase 2: Tree reduction (compare max values, keep winner's index)
+  let mut stride := workgroupSize / 2
+  while stride > 0 do
+    ShaderM.if_ (Exp.lt tid (Exp.litU32 stride)) (do
+      let a ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := workgroupSize) "shared_vals" tid
+      let b ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := workgroupSize) "shared_vals" (Exp.add tid (Exp.litU32 stride))
+      ShaderM.if_ (Exp.gt b a) (do
+        ShaderM.writeWorkgroup (ty := .scalar .f32) "shared_vals" tid b
+        let bIdx ← ShaderM.readWorkgroup (ty := .scalar .u32) (n := workgroupSize) "shared_idxs" (Exp.add tid (Exp.litU32 stride))
+        ShaderM.writeWorkgroup (ty := .scalar .u32) "shared_idxs" tid bIdx
+      ) (pure ())
+    ) (pure ())
+    ShaderM.barrier
+    stride := stride / 2
+
+  -- Thread 0 writes the final argmax index
+  ShaderM.if_ (Exp.eq tid (Exp.litU32 0)) (do
+    let maxIdx ← ShaderM.readWorkgroup (ty := .scalar .u32) (n := workgroupSize) "shared_idxs" (Exp.litU32 0)
+    ShaderM.writeBuffer (ty := .scalar .u32) "result" (Exp.litU32 0) maxIdx
+  ) (pure ())
+
+/-- Execute GPU argmax on logits buffer.
+    Returns the token index with maximum logit value.
+    Downloads only 4 bytes instead of vocabSize × 4 bytes. -/
+def gpuArgmax (device : Device) (logitsBuf argmaxBuf : Buffer) (vocabSize : Nat) : IO Nat := do
+  let shader := argmaxKernel vocabSize
+  let namedBuffers := [("logits", logitsBuf), ("result", argmaxBuf)]
+  let execConfig : Hesper.WGSL.Execute.ExecutionConfig := {
+    workgroupSize := { x := 256, y := 1, z := 1 }
+    numWorkgroups := (1, 1, 1)
+  }
+  Hesper.WGSL.Execute.executeShaderNamed device shader namedBuffers execConfig
+  -- Download single u32
+  let bytes ← mapBufferRead device argmaxBuf 0 4
+  let tokenId := Hesper.WebGPU.BufferOps.bytesToUInt32 bytes 0
+  pure tokenId.toNat
 
 /-! ## Text Generation -/
 
@@ -333,58 +504,115 @@ def generate (device : Device) (model : BitNetModel)
              (eosToken : Option Nat := none)
     : IO (Array Nat) := do
   logVerbose "═══════════════════════════════════════════════"
-  logVerbose "  Text Generation"
+  logVerbose "  Text Generation (KV Cache)"
   logVerbose "═══════════════════════════════════════════════"
   logVerbose s!"Prompt length: {promptTokens.size} tokens"
   logVerbose s!"Generating up to {maxTokens} new tokens..."
   logVerbose s!"Strategy: {strategy}"
   logVerbose ""
 
-  let mut tokens := promptTokens
-  let mut rng := Hesper.Inference.Sampling.RNG.create (some 42)  -- Fixed seed for reproducibility
+  -- Create KV cache state (pre-allocated buffers for all layers)
+  let cacheState ← createKVCacheState device model
 
+  let mut tokens := promptTokens
+  let mut rng := Hesper.Inference.Sampling.RNG.create (some 42)
+
+  -- Phase 1: Process prompt tokens one at a time (populating KV cache)
+  IO.println s!"[Prefill] Processing {promptTokens.size} prompt tokens..."
+  let prefillStart ← IO.monoNanosNow
+  for i in [0:promptTokens.size] do
+    if i >= model.config.maxSeqLen then break
+    forwardSingleToken device model promptTokens[i]! i cacheState
+  let prefillEnd ← IO.monoNanosNow
+  let prefillMs := (prefillEnd - prefillStart).toFloat / 1_000_000.0
+  IO.println s!"[Prefill] Done in {prefillMs} ms ({prefillMs / promptTokens.size.toFloat} ms/token)"
+
+  -- Phase 2: Generate new tokens using KV cache
+  let isGreedy := match strategy with
+    | .Greedy => true
+    | _ => false
+  let genStart ← IO.monoNanosNow
+  let mut genTokenCount : Nat := 0
   for step in [0:maxTokens] do
-    -- Check if we exceed max sequence length
     if tokens.size >= model.config.maxSeqLen then
-      logVerbose s!"Reached max sequence length ({model.config.maxSeqLen})"
+      IO.println s!"Reached max sequence length ({model.config.maxSeqLen})"
       break
 
-    -- Prepare input buffers
-    let seqLen := tokens.size
-
-    -- Upload tokens to GPU
-    let tokenIdsBuf ← Hesper.WebGPU.BufferOps.uploadTokens device tokens
-
-    -- Create output logits buffer
-    let logitsBuf ← Hesper.WebGPU.BufferOps.createLogitsBuffer device 1 seqLen model.config.vocabSize
-
-    -- Forward pass
-    logVerbose s!"Step {step+1}/{maxTokens}: Running forward pass..."
-    forward device model tokenIdsBuf logitsBuf 1 seqLen
-
-    -- Download logits for last position
-    logVerbose s!"  Downloading logits from GPU..."
-    let lastLogits ← Hesper.WebGPU.BufferOps.downloadLastLogits device logitsBuf 1 seqLen model.config.vocabSize
-
     -- Sample next token
-    let (nextToken, newRng) := Hesper.Inference.Sampling.sampleWithRNG lastLogits strategy rng
-    rng := newRng
+    let mut nextToken := 0
+    if isGreedy then
+      -- GPU-side argmax: download 4 bytes instead of 512KB
+      nextToken ← gpuArgmax device cacheState.logitsBuf cacheState.argmaxBuf model.config.vocabSize
+    else
+      -- Non-greedy: download full logits for CPU sampling
+      let logits ← Hesper.WebGPU.BufferOps.downloadFloatArray device cacheState.logitsBuf model.config.vocabSize
+      let (tok, newRng) := Hesper.Inference.Sampling.sampleWithRNG logits strategy rng
+      rng := newRng
+      nextToken := tok
 
-    logVerbose s!"  Generated token: {nextToken}"
+    logVerbose s!"Step {step+1}/{maxTokens}: token={nextToken}"
 
     tokens := tokens.push nextToken
+    genTokenCount := genTokenCount + 1
 
-    -- Early stopping if we generate EOS token
+    -- Early stopping on EOS
     match eosToken with
     | some eos =>
       if nextToken == eos then
-        logVerbose "  Encountered EOS token, stopping generation"
+        IO.println "  EOS token, stopping"
         break
     | none => pure ()
 
-  logVerbose ""
-  logVerbose s!"✓ Generated {tokens.size - promptTokens.size} new tokens"
-  logVerbose "═══════════════════════════════════════════════"
+    -- Run forward pass for the new token
+    let newPos := tokens.size - 1
+    if newPos < model.config.maxSeqLen then
+      forwardSingleToken device model nextToken newPos cacheState
+
+  let genEnd ← IO.monoNanosNow
+  let genMs := (genEnd - genStart).toFloat / 1_000_000.0
+  let msPerToken := if genTokenCount > 0 then genMs / genTokenCount.toFloat else 0.0
+  let tps := if msPerToken > 0 then 1000.0 / msPerToken else 0.0
+  IO.println ""
+  IO.println s!"Generated {genTokenCount} tokens in {genMs} ms"
+  IO.println s!"  {msPerToken} ms/token = {tps} tokens/sec"
+
+  -- Print PreparedDispatch stats
+  let blHits ← Hesper.Layers.BitLinear.preparedHitsRef.get
+  let blMisses ← Hesper.Layers.BitLinear.preparedMissesRef.get
+  let rmsHits ← Hesper.Layers.RMSNorm.preparedHitsRef.get
+  let rmsMisses ← Hesper.Layers.RMSNorm.preparedMissesRef.get
+  IO.println s!"  BitLinear PreparedDispatch: {blHits} hits, {blMisses} misses"
+  IO.println s!"  RMSNorm PreparedDispatch: {rmsHits} hits, {rmsMisses} misses"
+  let (plHits, plMisses) ← Hesper.WGSL.Execute.getPipelineCacheStats
+  let (bgHits, bgMisses) ← Hesper.WGSL.Execute.getBindGroupCacheStats
+  IO.println s!"  Pipeline cache: {plHits} hits, {plMisses} misses"
+  IO.println s!"  BindGroup cache: {bgHits} hits, {bgMisses} misses"
+
+  pure tokens
+
+/-- Generate text WITHOUT KV cache (naive quadratic approach).
+    Kept for validation/comparison with cached generate. -/
+def generateNaive (device : Device) (model : BitNetModel)
+             (promptTokens : Array Nat) (maxTokens : Nat)
+             (strategy : Hesper.Inference.Sampling.Strategy := .Greedy)
+             (eosToken : Option Nat := none)
+    : IO (Array Nat) := do
+  let mut tokens := promptTokens
+  let mut rng := Hesper.Inference.Sampling.RNG.create (some 42)
+
+  for step in [0:maxTokens] do
+    if tokens.size >= model.config.maxSeqLen then break
+    let seqLen := tokens.size
+    let tokenIdsBuf ← Hesper.WebGPU.BufferOps.uploadTokens device tokens
+    let logitsBuf ← Hesper.WebGPU.BufferOps.createLogitsBuffer device 1 seqLen model.config.vocabSize
+    forward device model tokenIdsBuf logitsBuf 1 seqLen
+    let lastLogits ← Hesper.WebGPU.BufferOps.downloadLastLogits device logitsBuf 1 seqLen model.config.vocabSize
+    let (nextToken, newRng) := Hesper.Inference.Sampling.sampleWithRNG lastLogits strategy rng
+    rng := newRng
+    tokens := tokens.push nextToken
+    match eosToken with
+    | some eos => if nextToken == eos then break
+    | none => pure ()
 
   pure tokens
 

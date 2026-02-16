@@ -156,6 +156,7 @@ def embeddingLookupKernel (config : Config) (batchSize seqLen : Nat) : ShaderM U
 structure Embedding where
   config : Config
   embeddingTable : Buffer  -- Precomputed Float32 embeddings
+  f16Table : Option Buffer := none  -- Original F16 data (for F16 matmul LM head)
 
 /-! ## Layer Creation -/
 
@@ -315,7 +316,7 @@ def createFromF16 (device : Device) (config : Config)
   Hesper.WGSL.Execute.executeShaderNamed device shader namedBuffers execConfig
 
   IO.println s!"[Embedding] ✓ Layer created (GPU unpacked {numElements} F16 → F32 elements)"
-  pure { config, embeddingTable := f32Buffer }
+  pure { config, embeddingTable := f32Buffer, f16Table := some f16Buffer }
 
 /-! ## Forward Pass -/
 

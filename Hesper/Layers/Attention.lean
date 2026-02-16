@@ -233,6 +233,51 @@ def executeReshapeFromHeads (device : Device) (inBuf outBuf : Buffer)
   let execConfig := Hesper.WGSL.Execute.ExecutionConfig.dispatch1D totalElements 256
   Hesper.WGSL.Execute.executeShaderNamed device shader namedBuffers execConfig
 
+/-! ## Pre-allocated Buffers -/
+
+/-- Pre-allocated buffers for attention forward pass.
+    Avoids ~12 GPU buffer allocations per layer per token. -/
+structure AttentionBuffers where
+  qBuf : Buffer
+  kBuf : Buffer
+  vBuf : Buffer
+  scoresBuf : Buffer
+  attnBuf : Buffer
+  qRotBuf : Buffer
+  kRotBuf : Buffer
+  qHeadBuf : Buffer
+  kHeadBuf : Buffer
+  vHeadBuf : Buffer
+  reshapedOutBuf : Buffer
+  subNormBuf : Buffer
+  rmsTempBuf : Buffer
+
+/-- Create pre-allocated attention buffers for given dimensions -/
+def createAttentionBuffers (device : Device) (config : Config) (batchSize seqLen : Nat) : IO AttentionBuffers := do
+  let headDim := config.effectiveHeadDim
+  let kvDim := config.kvDim
+  let numRows := batchSize * seqLen
+  let qSize := (batchSize * seqLen * config.dim * 4).toUSize
+  let kvSize := (batchSize * seqLen * kvDim * 4).toUSize
+  let scoresSize := (batchSize * config.numHeads * seqLen * seqLen * 4).toUSize
+  let headBufSize := (batchSize * config.numHeads * seqLen * headDim * 4).toUSize
+  let mkBuf := fun size => createBuffer device { size := size, usage := [.storage], mappedAtCreation := false }
+  pure {
+    qBuf := ← mkBuf qSize
+    kBuf := ← mkBuf kvSize
+    vBuf := ← mkBuf kvSize
+    scoresBuf := ← mkBuf scoresSize
+    attnBuf := ← mkBuf scoresSize
+    qRotBuf := ← mkBuf qSize
+    kRotBuf := ← mkBuf kvSize
+    qHeadBuf := ← mkBuf headBufSize
+    kHeadBuf := ← mkBuf headBufSize
+    vHeadBuf := ← mkBuf headBufSize
+    reshapedOutBuf := ← mkBuf qSize
+    subNormBuf := ← mkBuf qSize
+    rmsTempBuf := ← mkBuf (numRows * 4).toUSize
+  }
+
 /-! ## Layer Structure -/
 
 /-- Multi-head self-attention layer -/
@@ -354,56 +399,42 @@ def create (device : Device) (config : Config)
 def forward (device : Device) (layer : Attention)
             (inputBuf outputBuf : Buffer)
             (batchSize seqLen : Nat)
-            (subNorm : Option RMSNorm.RMSNorm := none) : IO Unit := do
+            (subNorm : Option RMSNorm.RMSNorm := none)
+            (preAllocBufs : Option AttentionBuffers := none)
+            (residualBuf : Option Buffer := none) : IO Unit := do
   let headDim := layer.config.effectiveHeadDim
   let numKVHeads := layer.config.effectiveKVHeads
   let kvDim := layer.config.kvDim
   logVerbose s!"[Attention] Forward pass: batch={batchSize}, seq_len={seqLen}, heads={layer.config.numHeads}, kv_heads={numKVHeads}, head_dim={headDim}"
 
-  -- Allocate temporary buffers
-  let qSize := (batchSize * seqLen * layer.config.dim * 4).toUSize  -- Float32
-  let kvSize := (batchSize * seqLen * kvDim * 4).toUSize  -- KV may be smaller (GQA)
-  let scoresSize := (batchSize * layer.config.numHeads * seqLen * seqLen * 4).toUSize
-  let attnSize := scoresSize
-
-  let qBuf ← createBuffer device { size := qSize, usage := [.storage], mappedAtCreation := false }
-  let kBuf ← createBuffer device { size := kvSize, usage := [.storage], mappedAtCreation := false }
-  let vBuf ← createBuffer device { size := kvSize, usage := [.storage], mappedAtCreation := false }
-  let scoresBuf ← createBuffer device { size := scoresSize, usage := [.storage], mappedAtCreation := false }
-  let attnBuf ← createBuffer device { size := attnSize, usage := [.storage], mappedAtCreation := false }
+  -- Use pre-allocated or allocate temporary buffers
+  let bufs ← match preAllocBufs with
+    | some b => pure b
+    | none => createAttentionBuffers device layer.config batchSize seqLen
 
   -- Step 1: Project to Q, K, V using BitLinear
   let numRows := batchSize * seqLen
   logVerbose s!"  [1/7] Projecting to Q, K, V ({numRows} rows)..."
-  BitLinear.forward device layer.wQ inputBuf qBuf numRows
-  BitLinear.forward device layer.wK inputBuf kBuf numRows
-  BitLinear.forward device layer.wV inputBuf vBuf numRows
+  BitLinear.forward device layer.wQ inputBuf bufs.qBuf numRows
+  BitLinear.forward device layer.wK inputBuf bufs.kBuf numRows
+  BitLinear.forward device layer.wV inputBuf bufs.vBuf numRows
 
   -- Step 2: Apply RoPE to Q and K (need temp buffer since WebGPU disallows aliased writable bindings)
   logVerbose "  [2/7] Applying RoPE to Q and K..."
-  let qTmpBuf ← createBuffer device { size := qSize, usage := [.storage], mappedAtCreation := false }
-  let kvTmpBuf ← createBuffer device { size := kvSize, usage := [.storage], mappedAtCreation := false }
-  RoPE.forward device layer.rope qBuf qTmpBuf batchSize seqLen layer.config.numHeads headDim
-  RoPE.forward device layer.rope kBuf kvTmpBuf batchSize seqLen numKVHeads headDim
-  -- Swap: use rotated buffers going forward
-  let qBuf := qTmpBuf
-  let kBuf := kvTmpBuf
+  RoPE.forward device layer.rope bufs.qBuf bufs.qRotBuf batchSize seqLen layer.config.numHeads headDim
+  RoPE.forward device layer.rope bufs.kBuf bufs.kRotBuf batchSize seqLen numKVHeads headDim
 
   -- Step 2.5: Reshape for multi-head attention
   -- Q: [batch, seq, numHeads*headDim] → [batch, numHeads, seq, headDim]
   -- K: [batch, seq, numKVHeads*headDim] → [batch, numHeads, seq, headDim] (with GQA repeat)
   -- V: [batch, seq, numKVHeads*headDim] → [batch, numHeads, seq, headDim] (with GQA repeat)
   logVerbose "  [2.5/7] Reshaping for multi-head attention..."
-  let headBufSize := (batchSize * layer.config.numHeads * seqLen * headDim * 4).toUSize
-  let qHeadBuf ← createBuffer device { size := headBufSize, usage := [.storage], mappedAtCreation := false }
-  let kHeadBuf ← createBuffer device { size := headBufSize, usage := [.storage], mappedAtCreation := false }
-  let vHeadBuf ← createBuffer device { size := headBufSize, usage := [.storage], mappedAtCreation := false }
 
   -- Q: simple transpose (inputHeads = outputHeads = numHeads)
-  executeReshapeToHeads device qBuf qHeadBuf batchSize seqLen layer.config.numHeads layer.config.numHeads headDim
+  executeReshapeToHeads device bufs.qRotBuf bufs.qHeadBuf batchSize seqLen layer.config.numHeads layer.config.numHeads headDim
   -- K/V: transpose + GQA expansion (inputHeads = numKVHeads, outputHeads = numHeads)
-  executeReshapeToHeads device kBuf kHeadBuf batchSize seqLen numKVHeads layer.config.numHeads headDim
-  executeReshapeToHeads device vBuf vHeadBuf batchSize seqLen numKVHeads layer.config.numHeads headDim
+  executeReshapeToHeads device bufs.kRotBuf bufs.kHeadBuf batchSize seqLen numKVHeads layer.config.numHeads headDim
+  executeReshapeToHeads device bufs.vBuf bufs.vHeadBuf batchSize seqLen numKVHeads layer.config.numHeads headDim
 
   -- Step 3: Compute attention scores: Q @ K^T / sqrt(head_dim)
   logVerbose "  [3/7] Computing attention scores..."
@@ -416,7 +447,7 @@ def forward (device : Device) (layer : Attention)
   }
   let batchedSize := batchSize * layer.config.numHeads
 
-  MatMul.executeBatchedScaledMatMulTranspose device qHeadBuf kHeadBuf scoresBuf attnScoreConfig batchedSize scale
+  MatMul.executeBatchedScaledMatMulTranspose device bufs.qHeadBuf bufs.kHeadBuf bufs.scoresBuf attnScoreConfig batchedSize scale
 
   -- Step 4: Apply softmax with optional causal mask
   logVerbose "  [4/7] Applying softmax..."
@@ -426,7 +457,7 @@ def forward (device : Device) (layer : Attention)
     useMask := layer.config.useCausalMask
   }
   let softmaxLayer ← Softmax.create softmaxConfig
-  Softmax.forward device softmaxLayer scoresBuf attnBuf
+  Softmax.forward device softmaxLayer bufs.scoresBuf bufs.attnBuf
 
   -- Step 5: Apply attention to values: attn @ V
   -- attn: [batch*heads, seq, seq], V: [batch*heads, seq, headDim] → [batch*heads, seq, headDim]
@@ -437,65 +468,368 @@ def forward (device : Device) (layer : Attention)
     K := seqLen
   }
   -- Reuse qHeadBuf for output (same size: [batch, numHeads, seq, headDim])
-  MatMul.executeBatchedMatMul device attnBuf vHeadBuf qHeadBuf attnVConfig batchedSize
+  MatMul.executeBatchedMatMul device bufs.attnBuf bufs.vHeadBuf bufs.qHeadBuf attnVConfig batchedSize
 
   -- Step 5.5: Reshape back: [batch, numHeads, seq, headDim] → [batch, seq, numHeads*headDim]
   logVerbose "  [5.5/7] Reshaping attention output..."
-  let attnOutBuf ← createBuffer device { size := qSize, usage := [.storage], mappedAtCreation := false }
-  executeReshapeFromHeads device qHeadBuf attnOutBuf batchSize seqLen layer.config.numHeads headDim
+  executeReshapeFromHeads device bufs.qHeadBuf bufs.reshapedOutBuf batchSize seqLen layer.config.numHeads headDim
 
   -- Step 5.7: Apply attention sub-norm (if provided) - BitNet specific
   -- This normalizes the attention output before the O projection
   let attnOutForO ← match subNorm with
     | some norm => do
       logVerbose "  [5.7/7] Applying attention sub-norm..."
-      let normedBuf ← createBuffer device { size := qSize, usage := [.storage], mappedAtCreation := false }
-      RMSNorm.forward device norm attnOutBuf normedBuf numRows
-      pure normedBuf
-    | none => pure attnOutBuf
+      RMSNorm.forward device norm bufs.reshapedOutBuf bufs.subNormBuf numRows 256 (some bufs.rmsTempBuf)
+      pure bufs.subNormBuf
+    | none => pure bufs.reshapedOutBuf
 
-  -- Step 6: Output projection
+  -- Step 6: Output projection (with optional fused residual add)
   logVerbose s!"  [6/7] Output projection ({numRows} rows)..."
-  BitLinear.forward device layer.wO attnOutForO outputBuf numRows
+  match residualBuf with
+  | some resBuf =>
+    BitLinear.forwardWithResidual device layer.wO attnOutForO resBuf outputBuf numRows
+  | none =>
+    BitLinear.forward device layer.wO attnOutForO outputBuf numRows
 
   logVerbose "[Attention] ✓ Forward pass complete"
 
-/-! ## KV Caching (for Inference) -/
+/-! ## KV Cache Structures -/
 
-/-- Attention with KV caching for autoregressive generation
+/-- KV cache for a single attention layer.
+    Stores key and value vectors for all past positions. -/
+structure KVCache where
+  kBuf : Buffer    -- [numKVHeads, maxSeqLen, headDim]
+  vBuf : Buffer    -- [numKVHeads, maxSeqLen, headDim]
 
-    During inference, we cache K and V from previous tokens to avoid recomputation.
+/-- Create KV cache for one attention layer -/
+def createKVCache (device : Device) (config : Config) : IO KVCache := do
+  let headDim := config.effectiveHeadDim
+  let numKVHeads := config.effectiveKVHeads
+  let cacheSize := (numKVHeads * config.maxSeqLen * headDim * 4).toUSize
+  let mkBuf := fun () => createBuffer device { size := cacheSize, usage := [.storage], mappedAtCreation := false }
+  pure { kBuf := ← mkBuf (), vBuf := ← mkBuf () }
 
-    **Without caching** (generating 100 tokens):
-    - Token 1: Compute K,V for position 0
-    - Token 2: Compute K,V for positions 0,1 (recomputes position 0!)
-    - Token 100: Compute K,V for positions 0-99 (recomputes everything!)
-    - Total: O(N²) computation
+/-- Pre-allocated buffers for cached single-token attention -/
+structure CachedAttentionBuffers where
+  qBuf : Buffer        -- [dim]
+  kNewBuf : Buffer     -- [kvDim]
+  vNewBuf : Buffer     -- [kvDim]
+  qRotBuf : Buffer     -- [dim]
+  kRotBuf : Buffer     -- [kvDim]
+  scoresBuf : Buffer   -- [numHeads * maxSeqLen]
+  attnBuf : Buffer     -- [numHeads * maxSeqLen]
+  subNormBuf : Buffer  -- [dim]
+  rmsTempBuf : Buffer  -- small
+  paramsBuf : Buffer   -- [2 × u32]: pos, cacheLen
 
-    **With caching**:
-    - Token 1: Compute K,V for position 0, cache it
-    - Token 2: Compute K,V for position 1, append to cache
-    - Token 100: Compute K,V for position 99, append to cache
-    - Total: O(N) computation
+/-- Create pre-allocated buffers for cached attention -/
+def createCachedAttentionBuffers (device : Device) (config : Config) : IO CachedAttentionBuffers := do
+  let kvDim := config.kvDim
+  let mkBuf := fun size => createBuffer device { size := size, usage := [.storage], mappedAtCreation := false }
+  let mkCopyBuf := fun size => createBuffer device { size := size, usage := [.storage, .copyDst], mappedAtCreation := false }
+  pure {
+    qBuf := ← mkBuf (config.dim * 4).toUSize
+    kNewBuf := ← mkBuf (kvDim * 4).toUSize
+    vNewBuf := ← mkBuf (kvDim * 4).toUSize
+    qRotBuf := ← mkBuf (config.dim * 4).toUSize
+    kRotBuf := ← mkBuf (kvDim * 4).toUSize
+    scoresBuf := ← mkBuf (config.numHeads * config.maxSeqLen * 4).toUSize
+    attnBuf := ← mkBuf (config.numHeads * config.maxSeqLen * 4).toUSize
+    subNormBuf := ← mkBuf (config.dim * 4).toUSize
+    rmsTempBuf := ← mkBuf 4
+    paramsBuf := ← mkCopyBuf 8  -- 2 × u32 = 8 bytes
+  }
 
-    @param device WebGPU device
-    @param layer Attention layer
-    @param inputBuf Input tensor [batch, 1, dim] (single new token)
-    @param kvCacheBuf Cached K,V from previous tokens
-    @param outputBuf Output tensor [batch, 1, dim]
-    @param batchSize Batch size
-    @param cacheLen Number of cached positions
+/-! ## KV Cache Kernels
+
+All cached attention kernels read `pos` and `cacheLen` from a `params` buffer
+instead of baking them as WGSL literals. This produces **identical WGSL** across
+tokens, enabling pipeline + bind group caching (97%+ hit rate).
+
+Params buffer layout: `[pos: u32, cacheLen: u32]` (8 bytes)
+-/
+
+/-- Write new K or V data into cache at position read from params[0].
+    Input: [kvDim] = [numKVHeads * headDim] (flat)
+    Cache: [numKVHeads, maxSeqLen, headDim]
+    Params: [pos: u32, cacheLen: u32]
+-/
+def cacheWriteKernel (numKVHeads maxSeqLen headDim kvDim : Nat) : ShaderM Unit := do
+  let gid ← ShaderM.globalId
+  let idx := Exp.vec3X gid
+
+  let _newData ← ShaderM.declareInputBuffer "new_data" (.array (.scalar .f32) kvDim)
+  let _cache ← ShaderM.declareOutputBuffer "cache" (.array (.scalar .f32) (numKVHeads * maxSeqLen * headDim))
+  let _params ← ShaderM.declareInputBuffer "params" (.array (.scalar .u32) 2)
+
+  let inBounds := Exp.lt idx (Exp.litU32 kvDim)
+
+  -- Read pos from params buffer
+  let pos ← ShaderM.readBuffer (ty := .scalar .u32) (n := 2) "params" (Exp.litU32 0)
+
+  -- Decompose: kvHead = idx / headDim, d = idx % headDim
+  let kvHead := Exp.div idx (Exp.litU32 headDim)
+  let d := Exp.mod idx (Exp.litU32 headDim)
+
+  -- Cache index: kvHead * maxSeqLen * headDim + pos * headDim + d
+  let cacheIdx := Exp.add
+    (Exp.mul kvHead (Exp.litU32 (maxSeqLen * headDim)))
+    (Exp.add (Exp.mul pos (Exp.litU32 headDim)) d)
+
+  let val ← ShaderM.readBuffer (ty := .scalar .f32) (n := kvDim) "new_data" idx
+  ShaderM.if_ inBounds (do
+    ShaderM.writeBuffer (ty := .scalar .f32) "cache" cacheIdx val
+  ) (pure ())
+
+/-- Attention scores with dynamic cacheLen from params buffer.
+    Q: [numHeads * headDim]
+    K_cache: [numKVHeads, maxSeqLen, headDim]
+    Scores: [numHeads * maxSeqLen] (only first cacheLen per head used)
+    Params: [pos: u32, cacheLen: u32]
+-/
+def cachedScoresKernel (numHeads numKVHeads maxSeqLen headDim : Nat) (scale : Float) : ShaderM Unit := do
+  let gid ← ShaderM.globalId
+  let idx := Exp.vec3X gid
+
+  let headsPerKVHead := numHeads / numKVHeads
+
+  let _q ← ShaderM.declareInputBuffer "q" (.array (.scalar .f32) (numHeads * headDim))
+  let _kCache ← ShaderM.declareInputBuffer "k_cache" (.array (.scalar .f32) (numKVHeads * maxSeqLen * headDim))
+  let _scores ← ShaderM.declareOutputBuffer "scores" (.array (.scalar .f32) (numHeads * maxSeqLen))
+  let _params ← ShaderM.declareInputBuffer "params" (.array (.scalar .u32) 2)
+
+  -- Read cacheLen from params buffer
+  let cacheLen ← ShaderM.readBuffer (ty := .scalar .u32) (n := 2) "params" (Exp.litU32 1)
+  let totalOutputs := Exp.mul (Exp.litU32 numHeads) cacheLen
+  let inBounds := Exp.lt idx totalOutputs
+
+  -- Decompose: head = idx / cacheLen, s = idx % cacheLen
+  let head := Exp.div idx cacheLen
+  let s := Exp.mod idx cacheLen
+
+  -- GQA: map query head to KV head
+  let kvHead := Exp.div head (Exp.litU32 headsPerKVHead)
+
+  -- Dot product Q[head, :] · K_cache[kvHead, s, :]
+  ShaderM.varNamed "dot" (.scalar .f32) (Exp.litF32 0.0)
+  let dot : Exp (.scalar .f32) := Exp.var "dot"
+
+  ShaderM.loop (Exp.litU32 0) (Exp.litU32 headDim) (Exp.litU32 1) fun d => do
+    let qIdx := Exp.add (Exp.mul head (Exp.litU32 headDim)) d
+    let kIdx := Exp.add
+      (Exp.mul kvHead (Exp.litU32 (maxSeqLen * headDim)))
+      (Exp.add (Exp.mul s (Exp.litU32 headDim)) d)
+    let qVal ← ShaderM.readBuffer (ty := .scalar .f32) (n := numHeads * headDim) "q" qIdx
+    let kVal ← ShaderM.readBuffer (ty := .scalar .f32) (n := numKVHeads * maxSeqLen * headDim) "k_cache" kIdx
+    ShaderM.assign "dot" (Exp.add dot (Exp.mul qVal kVal))
+
+  let scaled := Exp.mul dot (Exp.litF32 scale)
+  let result := Exp.select inBounds scaled (Exp.litF32 0.0)
+  ShaderM.writeBuffer (ty := .scalar .f32) "scores" idx result
+
+/-- Softmax with dynamic row size (cacheLen) from params buffer.
+    Input/Output: [numRows * maxSeqLen] (only first cacheLen per row used)
+    Params: [pos: u32, cacheLen: u32]
+-/
+def cachedSoftmaxKernel (numRows maxSeqLen : Nat) : ShaderM Unit := do
+  let gid ← ShaderM.globalId
+  let idx := Exp.vec3X gid
+
+  let _input ← ShaderM.declareInputBuffer "input" (.array (.scalar .f32) (numRows * maxSeqLen))
+  let _output ← ShaderM.declareOutputBuffer "output" (.array (.scalar .f32) (numRows * maxSeqLen))
+  let _params ← ShaderM.declareInputBuffer "params" (.array (.scalar .u32) 2)
+
+  -- Read cacheLen (= rowSize) from params buffer
+  let rowSize ← ShaderM.readBuffer (ty := .scalar .u32) (n := 2) "params" (Exp.litU32 1)
+  let totalElements := Exp.mul (Exp.litU32 numRows) rowSize
+  let inBounds := Exp.lt idx totalElements
+
+  let row := Exp.div idx rowSize
+  let rowStart := Exp.mul row rowSize
+
+  -- Find max in row
+  ShaderM.varNamed "max_val" (.scalar .f32) (Exp.litF32 (-3.4e38))
+  let maxVal : Exp (.scalar .f32) := Exp.var "max_val"
+  ShaderM.loop (Exp.litU32 0) rowSize (Exp.litU32 1) fun i => do
+    let elemIdx := Exp.add rowStart i
+    let val ← ShaderM.readBuffer (ty := .scalar .f32) (n := numRows * maxSeqLen) "input" elemIdx
+    ShaderM.assign "max_val" (Exp.max maxVal val)
+
+  -- exp(x - max) for this element
+  let inputVal ← ShaderM.readBuffer (ty := .scalar .f32) (n := numRows * maxSeqLen) "input" idx
+  let shifted := Exp.sub inputVal maxVal
+  let expVal := Exp.exp shifted
+
+  -- Sum exp values in row
+  ShaderM.varNamed "sum_exp" (.scalar .f32) (Exp.litF32 0.0)
+  let sumExp : Exp (.scalar .f32) := Exp.var "sum_exp"
+  ShaderM.loop (Exp.litU32 0) rowSize (Exp.litU32 1) fun i => do
+    let elemIdx := Exp.add rowStart i
+    let val ← ShaderM.readBuffer (ty := .scalar .f32) (n := numRows * maxSeqLen) "input" elemIdx
+    let sv := Exp.sub val maxVal
+    let ev := Exp.exp sv
+    ShaderM.assign "sum_exp" (Exp.add sumExp ev)
+
+  -- Normalize
+  let result := Exp.div expVal sumExp
+  let finalResult := Exp.select inBounds result (Exp.litF32 0.0)
+  ShaderM.writeBuffer (ty := .scalar .f32) "output" idx finalResult
+
+/-- Apply attention weights to V_cache with dynamic cacheLen from params buffer.
+    attn_weights: [numHeads * maxSeqLen] (only first cacheLen per head used)
+    V_cache: [numKVHeads, maxSeqLen, headDim]
+    Output: [numHeads * headDim] = [dim] (single token)
+    Params: [pos: u32, cacheLen: u32]
+-/
+def cachedApplyKernel (numHeads numKVHeads maxSeqLen headDim : Nat) : ShaderM Unit := do
+  let gid ← ShaderM.globalId
+  let idx := Exp.vec3X gid
+
+  let totalOutputs := numHeads * headDim
+  let headsPerKVHead := numHeads / numKVHeads
+
+  let _attn ← ShaderM.declareInputBuffer "attn" (.array (.scalar .f32) (numHeads * maxSeqLen))
+  let _vCache ← ShaderM.declareInputBuffer "v_cache" (.array (.scalar .f32) (numKVHeads * maxSeqLen * headDim))
+  let _output ← ShaderM.declareOutputBuffer "output" (.array (.scalar .f32) totalOutputs)
+  let _params ← ShaderM.declareInputBuffer "params" (.array (.scalar .u32) 2)
+
+  let inBounds := Exp.lt idx (Exp.litU32 totalOutputs)
+
+  -- Read cacheLen from params buffer
+  let cacheLen ← ShaderM.readBuffer (ty := .scalar .u32) (n := 2) "params" (Exp.litU32 1)
+
+  -- Decompose: head = idx / headDim, d = idx % headDim
+  let head := Exp.div idx (Exp.litU32 headDim)
+  let d := Exp.mod idx (Exp.litU32 headDim)
+
+  -- GQA mapping
+  let kvHead := Exp.div head (Exp.litU32 headsPerKVHead)
+
+  -- Weighted sum: out[head, d] = sum_s attn[head, s] * V[kvHead, s, d]
+  ShaderM.varNamed "wsum" (.scalar .f32) (Exp.litF32 0.0)
+  let wsum : Exp (.scalar .f32) := Exp.var "wsum"
+
+  ShaderM.loop (Exp.litU32 0) cacheLen (Exp.litU32 1) fun s => do
+    let attnIdx := Exp.add (Exp.mul head cacheLen) s
+    let vIdx := Exp.add
+      (Exp.mul kvHead (Exp.litU32 (maxSeqLen * headDim)))
+      (Exp.add (Exp.mul s (Exp.litU32 headDim)) d)
+    let attnVal ← ShaderM.readBuffer (ty := .scalar .f32) (n := numHeads * maxSeqLen) "attn" attnIdx
+    let vVal ← ShaderM.readBuffer (ty := .scalar .f32) (n := numKVHeads * maxSeqLen * headDim) "v_cache" vIdx
+    ShaderM.assign "wsum" (Exp.add wsum (Exp.mul attnVal vVal))
+
+  let result := Exp.select inBounds wsum (Exp.litF32 0.0)
+  ShaderM.writeBuffer (ty := .scalar .f32) "output" idx result
+
+/-! ## Forward Pass with KV Cache -/
+
+/-- Execute attention forward pass with KV cache (single-token inference).
+
+    For each new token:
+    1. Project Q, K_new, V_new (single row)
+    2. Apply RoPE at position `pos`
+    3. Append K_new, V_new to cache
+    4. Compute attention scores Q @ K_cache^T * scale (GQA)
+    5. Softmax
+    6. Apply attention to V_cache (GQA)
+    7. Sub-norm + O projection
+
+    @param pos Position of the new token (0-indexed)
 -/
 def forwardWithCache (device : Device) (layer : Attention)
-                     (inputBuf kvCacheBuf outputBuf : Buffer)
-                     (batchSize cacheLen : Nat) : IO Unit := do
-  -- TODO: Implement KV caching
-  -- This requires:
-  -- 1. Separate K and V cache buffers
-  -- 2. Append operation to extend cache
-  -- 3. Attention over cached + new token
-  IO.println "[Attention] KV caching not yet implemented"
-  throw $ IO.userError "forwardWithCache not implemented"
+                     (inputBuf outputBuf : Buffer)
+                     (kvCache : KVCache) (pos : Nat)
+                     (subNorm : Option RMSNorm.RMSNorm := none)
+                     (preAllocBufs : Option CachedAttentionBuffers := none)
+                     (residualBuf : Option Buffer := none) : IO Unit := do
+  let headDim := layer.config.effectiveHeadDim
+  let numKVHeads := layer.config.effectiveKVHeads
+  let kvDim := layer.config.kvDim
+  let numHeads := layer.config.numHeads
+  let maxSeqLen := layer.config.maxSeqLen
+  let cacheLen := pos + 1  -- After appending, cache has pos+1 entries
+
+  logVerbose s!"[Attention] Cached forward: pos={pos}, cacheLen={cacheLen}"
+
+  let bufs ← match preAllocBufs with
+    | some b => pure b
+    | none => createCachedAttentionBuffers device layer.config
+
+  -- Step 1: Project Q, K_new, V_new (single row)
+  BitLinear.forward device layer.wQ inputBuf bufs.qBuf 1
+  BitLinear.forward device layer.wK inputBuf bufs.kNewBuf 1
+  BitLinear.forward device layer.wV inputBuf bufs.vNewBuf 1
+
+  -- Write params buffer: [pos: u32, cacheLen: u32]
+  -- Done BEFORE RoPE so the dynamic kernel can read posOffset from params[0]
+  let paramsBytes := ByteArray.empty
+    |>.push (pos.toUInt32 &&& 0xFF).toUInt8
+    |>.push ((pos.toUInt32 >>> 8) &&& 0xFF).toUInt8
+    |>.push ((pos.toUInt32 >>> 16) &&& 0xFF).toUInt8
+    |>.push ((pos.toUInt32 >>> 24) &&& 0xFF).toUInt8
+    |>.push (cacheLen.toUInt32 &&& 0xFF).toUInt8
+    |>.push ((cacheLen.toUInt32 >>> 8) &&& 0xFF).toUInt8
+    |>.push ((cacheLen.toUInt32 >>> 16) &&& 0xFF).toUInt8
+    |>.push ((cacheLen.toUInt32 >>> 24) &&& 0xFF).toUInt8
+  writeBuffer device bufs.paramsBuf 0 paramsBytes
+
+  -- Step 2: Apply RoPE at position `pos` (reads posOffset from params[0])
+  RoPE.forwardDynamic device layer.rope bufs.qBuf bufs.qRotBuf bufs.paramsBuf 1 1 numHeads headDim
+  RoPE.forwardDynamic device layer.rope bufs.kNewBuf bufs.kRotBuf bufs.paramsBuf 1 1 numKVHeads headDim
+
+  -- Step 3: Append K (after RoPE) and V to cache at position `pos`
+  let writeShader := cacheWriteKernel numKVHeads maxSeqLen headDim kvDim
+  let writeCacheKey : UInt64 := hash ("cw", numKVHeads, maxSeqLen, headDim, kvDim)
+  Hesper.WGSL.Execute.executeShaderNamed device writeShader
+    [("new_data", bufs.kRotBuf), ("cache", kvCache.kBuf), ("params", bufs.paramsBuf)]
+    (Hesper.WGSL.Execute.ExecutionConfig.dispatch1D kvDim 256)
+    (some writeCacheKey)
+  Hesper.WGSL.Execute.executeShaderNamed device writeShader
+    [("new_data", bufs.vNewBuf), ("cache", kvCache.vBuf), ("params", bufs.paramsBuf)]
+    (Hesper.WGSL.Execute.ExecutionConfig.dispatch1D kvDim 256)
+    (some writeCacheKey)
+
+  -- Step 4: Attention scores with GQA (dispatch max workgroups, kernel bounds-checks via cacheLen)
+  let scale := 1.0 / headDim.toFloat.sqrt
+  let scoresShader := cachedScoresKernel numHeads numKVHeads maxSeqLen headDim scale
+  let scoresCacheKey : UInt64 := hash ("cs", numHeads, numKVHeads, maxSeqLen, headDim)
+  Hesper.WGSL.Execute.executeShaderNamed device scoresShader
+    [("q", bufs.qRotBuf), ("k_cache", kvCache.kBuf), ("scores", bufs.scoresBuf), ("params", bufs.paramsBuf)]
+    (Hesper.WGSL.Execute.ExecutionConfig.dispatch1D (numHeads * cacheLen) 256)
+    (some scoresCacheKey)
+
+  -- Step 5: Softmax (no causal mask for single-query)
+  let softmaxShader := cachedSoftmaxKernel numHeads maxSeqLen
+  let softmaxCacheKey : UInt64 := hash ("sm", numHeads, maxSeqLen)
+  Hesper.WGSL.Execute.executeShaderNamed device softmaxShader
+    [("input", bufs.scoresBuf), ("output", bufs.attnBuf), ("params", bufs.paramsBuf)]
+    (Hesper.WGSL.Execute.ExecutionConfig.dispatch1D (numHeads * cacheLen) 256)
+    (some softmaxCacheKey)
+
+  -- Step 6: Apply attention to V cache
+  -- Reuse qRotBuf as attention output (same size: dim = numHeads * headDim)
+  let applyShader := cachedApplyKernel numHeads numKVHeads maxSeqLen headDim
+  let applyCacheKey : UInt64 := hash ("ca", numHeads, numKVHeads, maxSeqLen, headDim)
+  Hesper.WGSL.Execute.executeShaderNamed device applyShader
+    [("attn", bufs.attnBuf), ("v_cache", kvCache.vBuf), ("output", bufs.qRotBuf), ("params", bufs.paramsBuf)]
+    (Hesper.WGSL.Execute.ExecutionConfig.dispatch1D (numHeads * headDim) 256)
+    (some applyCacheKey)
+
+  -- Step 7: Sub-norm (if provided)
+  let attnOutForO ← match subNorm with
+    | some norm => do
+      RMSNorm.forward device norm bufs.qRotBuf bufs.subNormBuf 1 256 (some bufs.rmsTempBuf)
+      pure bufs.subNormBuf
+    | none => pure bufs.qRotBuf
+
+  -- Step 8: O projection (with optional fused residual add)
+  match residualBuf with
+  | some resBuf =>
+    BitLinear.forwardWithResidual device layer.wO attnOutForO resBuf outputBuf 1
+  | none =>
+    BitLinear.forward device layer.wO attnOutForO outputBuf 1
+
+  logVerbose "[Attention] ✓ Cached forward complete"
 
 /-! ## Integration with GGUF -/
 

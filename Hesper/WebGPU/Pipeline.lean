@@ -69,4 +69,28 @@ opaque dispatchCompute
   (workgroupsY : UInt32 := 1)
   (workgroupsZ : UInt32 := 1) : IO Future
 
+/-! ## Command Buffer Batching
+
+Record multiple dispatches into a single command encoder, then submit once.
+Eliminates per-dispatch overhead (command encoder creation + queue submit + wait).
+-/
+
+/-- Create a new command encoder for recording multiple dispatches. -/
+@[extern "lean_hesper_create_command_encoder"]
+opaque createCommandEncoder (device : @& Device) : IO CommandEncoder
+
+/-- Record a compute dispatch into an existing command encoder (no submit, no wait). -/
+@[extern "lean_hesper_record_dispatch"]
+opaque recordDispatch
+  (encoder : @& CommandEncoder)
+  (pipeline : @& ComputePipeline)
+  (bindGroup : @& BindGroup)
+  (workgroupsX : UInt32)
+  (workgroupsY : UInt32 := 1)
+  (workgroupsZ : UInt32 := 1) : IO Unit
+
+/-- Finish the command encoder, submit to queue, and wait for all recorded work to complete. -/
+@[extern "lean_hesper_submit_and_wait"]
+opaque submitAndWait (device : @& Device) (encoder : @& CommandEncoder) : IO Unit
+
 end Hesper.WebGPU

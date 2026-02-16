@@ -24,8 +24,6 @@ lake exe test-all
 ```
 -/
 
-namespace Tests.All
-
 open LSpec
 
 def main : IO UInt32 := do
@@ -59,5 +57,3 @@ def main : IO UInt32 := do
   IO.println "╚══════════════════════════════════════════════╝"
 
   pure exitCode
-
-end Tests.All
