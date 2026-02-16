@@ -343,6 +343,7 @@ def forward (device : Device) (model : BitNetModel)
 /-- Full KV cache state for incremental inference -/
 structure KVCacheState where
   kvCaches : Array Attention.KVCache   -- Per-layer KV caches
+  fusedRefs : Array TransformerBlock.FusedLayerRefs  -- Per-layer fused PreparedDispatch refs
   layerBufs : TransformerBlock.CachedLayerBuffers  -- Shared temp buffers (single-token)
   buf1 : Buffer        -- [dim] ping-pong buffer
   buf2 : Buffer        -- [dim] ping-pong buffer
@@ -357,16 +358,19 @@ def createKVCacheState (device : Device) (model : BitNetModel) : IO KVCacheState
     dim := cfg.dim, numHeads := cfg.numHeads, numKVHeads := cfg.numKVHeads,
     headDim := cfg.headDim, maxSeqLen := cfg.maxSeqLen, useCausalMask := true
   }
-  -- Create per-layer KV caches
+  -- Create per-layer KV caches and fused PreparedDispatch refs
   let mut kvCaches := Array.mkEmpty cfg.numLayers
+  let mut fusedRefs := Array.mkEmpty cfg.numLayers
   for _ in [0:cfg.numLayers] do
     kvCaches := kvCaches.push (← Attention.createKVCache device attnConfig)
+    fusedRefs := fusedRefs.push (← TransformerBlock.createFusedLayerRefs)
   -- Create shared layer buffers
   let layerBufs ← TransformerBlock.createCachedLayerBuffers device cfg.dim cfg.ffnDim attnConfig
   let mkBuf := fun size => createBuffer device { size := size, usage := [.storage], mappedAtCreation := false }
   let mkBufRW := fun size => createBuffer device { size := size, usage := [.storage, .copySrc, .copyDst], mappedAtCreation := false }
   pure {
     kvCaches := kvCaches
+    fusedRefs := fusedRefs
     layerBufs := layerBufs
     buf1 := ← mkBuf (cfg.dim * 4).toUSize
     buf2 := ← mkBuf (cfg.dim * 4).toUSize
@@ -398,7 +402,10 @@ def forwardSingleToken (device : Device) (model : BitNetModel)
   for layer in model.layers do
     if h : layerIdx < cacheState.kvCaches.size then
       let kvCache := cacheState.kvCaches[layerIdx]
-      TransformerBlock.forwardWithCache device layer currentBuf nextBuf pos kvCache (some cacheState.layerBufs)
+      let fusedRef := if h2 : layerIdx < cacheState.fusedRefs.size then
+        some cacheState.fusedRefs[layerIdx]
+      else none
+      TransformerBlock.forwardWithCache device layer currentBuf nextBuf pos kvCache (some cacheState.layerBufs) fusedRef
       let temp := currentBuf; currentBuf := nextBuf; nextBuf := temp
     layerIdx := layerIdx + 1
 
