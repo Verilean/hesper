@@ -323,7 +323,10 @@ def forward (device : Device) (model : BitNetModel)
   }
   match model.embedding.f16Table with
   | some f16Buf =>
-    Hesper.WGSL.MatMul.executeMatMulTransposeF16 device nextBuf f16Buf outputBuf lmHeadConfig
+    if model.config.dim % 8 == 0 then
+      Hesper.WGSL.MatMul.executeMatMulTransposeF16Shared device nextBuf f16Buf outputBuf lmHeadConfig
+    else
+      Hesper.WGSL.MatMul.executeMatMulTransposeF16 device nextBuf f16Buf outputBuf lmHeadConfig
   | none =>
     Hesper.WGSL.MatMul.executeMatMulTranspose device nextBuf model.embedding.embeddingTable outputBuf lmHeadConfig
 
@@ -408,7 +411,11 @@ def forwardSingleToken (device : Device) (model : BitNetModel)
   }
   match model.embedding.f16Table with
   | some f16Buf =>
-    Hesper.WGSL.MatMul.executeMatMulTransposeF16 device nextBuf f16Buf cacheState.logitsBuf lmHeadConfig
+    -- Use shared memory kernel when K is divisible by 8 (true for BitNet: K=2560)
+    if model.config.dim % 8 == 0 then
+      Hesper.WGSL.MatMul.executeMatMulTransposeF16Shared device nextBuf f16Buf cacheState.logitsBuf lmHeadConfig
+    else
+      Hesper.WGSL.MatMul.executeMatMulTransposeF16 device nextBuf f16Buf cacheState.logitsBuf lmHeadConfig
   | none =>
     Hesper.WGSL.MatMul.executeMatMulTranspose device nextBuf model.embedding.embeddingTable cacheState.logitsBuf lmHeadConfig
 

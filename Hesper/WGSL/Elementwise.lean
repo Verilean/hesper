@@ -346,10 +346,18 @@ def reluSqrMulKernel (config : Config) : ShaderM Unit := do
     @param cBuf Output buffer C
     @param config Configuration
 -/
-def executeReluSqrMul (device : Device) (aBuf bBuf cBuf : Buffer) (config : Config) : IO Unit := do
+def executeReluSqrMul (device : Device) (aBuf bBuf cBuf : Buffer) (config : Config)
+    (preparedRef : Option (IO.Ref (Option Hesper.WGSL.Execute.PreparedDispatch)) := none) : IO Unit := do
+  -- Fast path: replay prepared dispatch
+  if let some ref := preparedRef then
+    if let some p ← ref.get then
+      let wx := (config.numElements + 255) / 256
+      Hesper.WGSL.Execute.replayPreparedDispatch device p wx 1 1
+      return
   let shader := reluSqrMulKernel config
   let namedBuffers := [("a", aBuf), ("b", bBuf), ("c", cBuf)]
   let execConfig := Hesper.WGSL.Execute.ExecutionConfig.dispatch1D config.numElements 256
-  Hesper.WGSL.Execute.executeShaderNamed device shader namedBuffers execConfig
+  let cacheKey : UInt64 := hash ("relu2mul", config.numElements)
+  Hesper.WGSL.Execute.executeShaderNamed device shader namedBuffers execConfig (some cacheKey) preparedRef
 
 end Hesper.WGSL.Elementwise
