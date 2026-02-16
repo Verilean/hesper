@@ -316,7 +316,7 @@ structure RMSNorm where
     @param scaleData Raw scale data from GGUF (Float32 or FP16)
 -/
 def create (device : Device) (config : Config) (scaleData : ByteArray) : IO RMSNorm := do
-  IO.println s!"[RMSNorm] Creating layer: dim={config.dim}, eps={config.eps}"
+  logVerbose s!"[RMSNorm] Creating layer: dim={config.dim}, eps={config.eps}"
 
   -- Create GPU buffer for scale parameters
   let scaleBuf ← createBuffer device {
@@ -329,7 +329,7 @@ def create (device : Device) (config : Config) (scaleData : ByteArray) : IO RMSN
   writeBuffer device scaleBuf 0 scaleData
 
   let prepared ← IO.mkRef none
-  IO.println "[RMSNorm] ✓ Layer created on GPU"
+  logVerbose "[RMSNorm] ✓ Layer created on GPU"
   pure { config, scale := scaleBuf, prepared }
 
 /-- Execute forward pass (single-kernel version)

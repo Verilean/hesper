@@ -325,9 +325,6 @@ def getI2_S_Tensor (gguf : GGUFFile) (name : String)
     -- Scale (float32) is at offset packedSize, followed by 28 bytes of padding
     let packedSize := numElements / 4
 
-    -- Debug: print tensor data size and expected sizes
-    dbg_trace s!"  [DEBUG i2_s] tensor='{name}' shape={info.shape.toList} numElements={numElements} dataSize={data.size} packedSize={packedSize} expectedTQ2_0={(numElements/256)*66} ratio={data.size.toFloat/numElements.toFloat}"
-
     if data.size < packedSize + 4 then
       throw s!"Tensor '{name}' i2_s data too small: {data.size} < {packedSize + 4}"
 
@@ -348,9 +345,6 @@ def getI2_S_Tensor (gguf : GGUFFile) (name : String)
 
     -- Convert bits to Float using Float.ofBits
     let scale := Hesper.Basic.float32BitsToFloat64 scaleBits
-
-    -- Debug: print scale bytes and value
-    dbg_trace s!"  [DEBUG i2_s] scaleOffset={scaleOffset} rawBytes=[{b0},{b1},{b2},{b3}] scaleBits=0x{String.mk (Nat.toDigits 16 scaleBits.toNat)} scale={scale}"
 
     return (packedData, scale, numElements)
   | _ => throw s!"Tensor '{name}' is not i2_s format (type: {toString info.ggmlType})"

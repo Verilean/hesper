@@ -317,7 +317,7 @@ def create (device : Device) (config : Config)
   | .error msg => throw $ IO.userError s!"Invalid attention config: {msg}"
   | .ok _ => pure ()
 
-  IO.println s!"[Attention] Creating layer: dim={config.dim}, heads={config.numHeads}, max_seq={config.maxSeqLen}"
+  logVerbose s!"[Attention] Creating layer: dim={config.dim}, heads={config.numHeads}, max_seq={config.maxSeqLen}"
 
   let headDim := config.dim / config.numHeads
   IO.println s!"  Head dimension: {headDim}"
@@ -351,7 +351,7 @@ def create (device : Device) (config : Config)
   }
   let softmax ← Softmax.create softmaxConfig
 
-  IO.println "[Attention] ✓ Layer created"
+  logVerbose "[Attention] ✓ Layer created"
   pure { config, wQ, wK, wV, wO, rope, softmax }
 
 /-! ## Forward Pass -/
