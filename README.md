@@ -20,22 +20,22 @@ let result := sqrt (x * x + y * y)  -- Generates: sqrt(x * x + y * y)
 -- let wrong := x + (var "i" : Exp (.scalar .i32))  ✗ Type error!
 ```
 
-## BitNet b1.58 Inference: 116 TPS on M1 Pro
+## BitNet b1.58 Inference: 125 TPS on M4 Max
 
-Hesper includes a complete **BitNet b1.58 2B** inference engine running entirely on WebGPU, achieving **116 tokens/second** on Apple M1 Pro:
+Hesper includes a complete **BitNet b1.58 2B** inference engine running entirely on WebGPU, achieving **125 tokens/second** on Apple M4 Max:
 
 ```
 $ lake exe bitnet-complete --stats
 > Hello, world!
 Hello, world! I'm a 20-year-old college student...
 
-Performance: 116.0 TPS (8.6 ms/token)
-  Bandwidth utilization: 73% of theoretical M1 Pro limit
+Performance: 125.6 TPS (8.0 ms/token)
   Model: BitNet b1.58 2B (30 layers, 2560 dim, i2_s ternary weights)
 ```
 
 **Key optimizations:**
 - Ternary weight kernel (i2_s): 2-bit packed weights, addition-only matmul
+- Kernel fusion: fused gate+up+ReLU²×mul and fused KV cache write (150 fewer dispatches/token)
 - Shared memory F16 matmul for LM head (128K vocab)
 - PreparedDispatch graph capture: ~99% pipeline cache hit rate
 - Command buffer batching: single GPU submit per token
@@ -713,7 +713,8 @@ Hesper/
 - [x] **Docker-based CI environment**
 - [x] **Verified Composable Kernels (VerifiedOpFusion)**
 
-- [x] **BitNet b1.58 inference engine (116 TPS on M1 Pro)**
+- [x] **BitNet b1.58 inference engine (125 TPS on M4 Max)**
+- [x] **Kernel fusion: fused gate+up+ReLU²×mul, fused KV cache write**
 - [x] **KV cache with grouped-query attention**
 - [x] **PreparedDispatch graph capture (99%+ cache hit rate)**
 
