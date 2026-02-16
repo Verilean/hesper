@@ -171,7 +171,7 @@ structure Embedding where
 -/
 def create (device : Device) (config : Config)
            (packedData : ByteArray) (scalesData : ByteArray) : IO Embedding := do
-  IO.println s!"[Embedding] Creating layer: vocab={config.vocabSize}, dim={config.dim}"
+  logVerbose s!"[Embedding] Creating layer: vocab={config.vocabSize}, dim={config.dim}"
 
   -- Calculate sizes
   let totalElements := config.vocabSize * config.dim
@@ -191,8 +191,8 @@ def create (device : Device) (config : Config)
   -- 3. Copy result to embeddingTable
   -- This would use TQ2_0.executeUnpack
 
-  IO.println "[Embedding] ✓ Layer created"
-  IO.println "  Note: TQ2_0 unpacking needs to be integrated"
+  logVerbose "[Embedding] ✓ Layer created"
+  logVerbose "  Note: TQ2_0 unpacking needs to be integrated"
 
   pure { config, embeddingTable }
 
@@ -204,7 +204,7 @@ def create (device : Device) (config : Config)
 -/
 def createFromFloat32 (device : Device) (config : Config)
                       (float32Data : ByteArray) : IO Embedding := do
-  IO.println s!"[Embedding] Creating layer from Float32: vocab={config.vocabSize}, dim={config.dim}"
+  logVerbose s!"[Embedding] Creating layer from Float32: vocab={config.vocabSize}, dim={config.dim}"
 
   let tableSize := float32Data.size.toUSize
 
@@ -217,7 +217,7 @@ def createFromFloat32 (device : Device) (config : Config)
   -- Upload Float32 data directly
   writeBuffer device embeddingTable 0 float32Data
 
-  IO.println "[Embedding] ✓ Layer created"
+  logVerbose "[Embedding] ✓ Layer created"
   pure { config, embeddingTable }
 
 /-- GPU kernel to unpack F16 → F32 using hardware instruction
@@ -271,7 +271,7 @@ def unpackF16ToF32Kernel (numElements : Nat) (packedPerThread : Nat) : ShaderM U
 -/
 def createFromF16 (device : Device) (config : Config)
                   (f16Data : ByteArray) : IO Embedding := do
-  IO.println s!"[Embedding] Creating layer from F16 (GPU-optimized): vocab={config.vocabSize}, dim={config.dim}"
+  logVerbose s!"[Embedding] Creating layer from F16 (GPU-optimized): vocab={config.vocabSize}, dim={config.dim}"
 
   let numElements := config.vocabSize * config.dim
   let f16Size := f16Data.size.toUSize
@@ -315,7 +315,7 @@ def createFromF16 (device : Device) (config : Config)
 
   Hesper.WGSL.Execute.executeShaderNamed device shader namedBuffers execConfig
 
-  IO.println s!"[Embedding] ✓ Layer created (GPU unpacked {numElements} F16 → F32 elements)"
+  logVerbose s!"[Embedding] ✓ Layer created (GPU unpacked {numElements} F16 → F32 elements)"
   pure { config, embeddingTable := f32Buffer, f16Table := some f16Buffer }
 
 /-! ## Forward Pass -/

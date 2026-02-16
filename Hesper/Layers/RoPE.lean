@@ -329,7 +329,7 @@ def create (config : Config) : IO RoPE := do
   if config.dim % 2 ≠ 0 then
     throw $ IO.userError s!"RoPE dim must be even, got {config.dim}"
 
-  IO.println s!"[RoPE] Creating layer: dim={config.dim}, max_seq_len={config.maxSeqLen}, base={config.base}"
+  logVerbose s!"[RoPE] Creating layer: dim={config.dim}, max_seq_len={config.maxSeqLen}, base={config.base}"
   pure { config }
 
 /-- Apply RoPE to query or key tensor

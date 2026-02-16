@@ -504,7 +504,7 @@ structure BitLinear where
 -/
 def create (device : Device) (config : Config)
            (packedWeights : ByteArray) (scale : Float) : IO BitLinear := do
-  IO.println s!"[BitLinear] Creating layer: {config.inDim} -> {config.outDim}, scale={scale}"
+  logVerbose s!"[BitLinear] Creating layer: {config.inDim} -> {config.outDim}, scale={scale}"
 
   -- Pad packed weights to u32 alignment if needed
   let paddedWeights ← do
@@ -537,7 +537,7 @@ def create (device : Device) (config : Config)
   writeBuffer device scaleBuf 0 scaleBytes
 
   let prepared ← IO.mkRef none
-  IO.println s!"[BitLinear] Layer created: packed={paddedWeights.size} bytes"
+  logVerbose s!"[BitLinear] Layer created: packed={paddedWeights.size} bytes"
   pure { config, weightsPacked := weightsBuf, scaleBuf := scaleBuf, prepared }
 
 /-- Create BitLinear layer from packed data + scale ByteArrays
@@ -552,7 +552,7 @@ def create (device : Device) (config : Config)
 -/
 def createFromBytes (device : Device) (config : Config)
                     (packedWeights : ByteArray) (scaleBytes : ByteArray) : IO BitLinear := do
-  IO.println s!"[BitLinear] Creating layer from bytes: {config.inDim} -> {config.outDim}"
+  logVerbose s!"[BitLinear] Creating layer from bytes: {config.inDim} -> {config.outDim}"
 
   -- Pad packed weights to u32 alignment if needed
   let paddedWeights ← do
@@ -583,7 +583,7 @@ def createFromBytes (device : Device) (config : Config)
   writeBuffer device scaleBuf 0 scaleBytes
 
   let prepared ← IO.mkRef none
-  IO.println s!"[BitLinear] Layer created: packed={paddedWeights.size} bytes"
+  logVerbose s!"[BitLinear] Layer created: packed={paddedWeights.size} bytes"
   pure { config, weightsPacked := weightsBuf, scaleBuf := scaleBuf, prepared }
 
 /-- Execute forward pass

@@ -60,14 +60,21 @@ def loadModel (ggufPath : String) : IO (BitNetModel × Tokenizer × Device × Op
 /-- Run single-shot generation -/
 def runGeneration (args : List String) : IO Unit := do
   if args.length < 2 then
-    IO.println "Usage: bitnet-complete <gguf_model> <prompt> [max_tokens]"
+    IO.println "Usage: bitnet-complete <gguf_model> <prompt> [max_tokens] [--stats] [--verbose]"
     IO.println "       bitnet-complete <gguf_model> --interactive"
     IO.println "       bitnet-complete <gguf_model> -i"
     return
 
   let ggufPath := args[0]!
   let promptText := args[1]!
-  let maxTokens := if args.length >= 3 then args[2]!.toNat! else 20
+  let showStats := args.any (· == "--stats")
+  let verbose := args.any (· == "--verbose")
+  -- Filter out flags before parsing max_tokens
+  let positionalArgs := args.filter (fun a => !a.startsWith "--")
+  let maxTokens := if positionalArgs.length >= 3 then positionalArgs[2]!.toNat! else 20
+
+  -- Disable verbose by default for clean output
+  if !verbose then setVerbose false
 
   IO.println "═══════════════════════════════════════════════"
   IO.println "  BitNet Text Generation"
@@ -83,7 +90,7 @@ def runGeneration (args : List String) : IO Unit := do
   IO.println s!"Prompt tokens ({promptTokens.size}): {promptTokens}"
   IO.println ""
 
-  let outputTokens ← generate device model promptTokens maxTokens .Greedy eosToken
+  let outputTokens ← generate device model promptTokens maxTokens .Greedy eosToken showStats
 
   let outputText := decode tokenizer outputTokens
   IO.println ""
@@ -176,7 +183,7 @@ open Hesper.Examples.BitNetComplete
 
 def main (args : List String) : IO Unit := do
   if args.length < 2 then
-    IO.println "Usage: bitnet-complete <gguf_model> <prompt> [max_tokens]"
+    IO.println "Usage: bitnet-complete <gguf_model> <prompt> [max_tokens] [--stats] [--verbose]"
     IO.println "       bitnet-complete <gguf_model> --interactive"
     IO.println "       bitnet-complete <gguf_model> -i"
     return
