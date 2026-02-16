@@ -7,6 +7,7 @@ import Hesper.WebGPU.Buffer
 import Hesper.Quantization.TQ2_0
 import Hesper.Basic
 import Hesper.Logging
+import Hesper.Layers.RMSNorm
 
 /-!
 # BitLinear Layer - Ternary Weight Matrix Multiplication (i2_s format)
@@ -379,6 +380,218 @@ def fusedBitLinearResidualM1Kernel (config : Config) : ShaderM Unit := do
     ShaderM.writeBuffer (ty := .scalar .f32) "output" outIdx result
   ) (pure ())
 
+/-! ## Fused RMSNorm + BitLinear + Residual Add M=1 Kernel -/
+
+/-- Fused RMSNorm + BitLinear + Residual M=1 kernel.
+
+    Combines three operations into one dispatch:
+    1. RMSNorm: compute rmsInv = rsqrt(mean(input²) + eps)
+    2. BitLinear dot product with inline normalization:
+       dot = sum_j(ternary[outIdx,j] * input[j] * rmsInv * rmsScale[j])
+    3. Residual add: output[outIdx] = residual[outIdx] + blScale * dot
+
+    Saves 1 dispatch per call (was: RMSNorm + BitLinear = 2 dispatches).
+    Used for: attn_sub_norm + O projection, ffn_sub_norm + down projection.
+
+    **Algorithm per subgroup (32 threads):**
+    ```
+    Phase 1: Compute RMS via subgroupAdd
+      partial_sq = 0
+      for elemIdx = tid; elemIdx < inDim; elemIdx += 32:
+        partial_sq += input[elemIdx]²
+      totalSq = subgroupAdd(partial_sq)
+      rmsInv = rsqrt(totalSq / dim + eps)
+
+    Phase 2: BitLinear dot product with inline normalization
+      for u32Idx = tid; u32Idx < u32PerRow; u32Idx += 32:
+        packed = weights[outIdx * u32PerRow + u32Idx]
+        for each of 16 elements:
+          normalized = input[elemIdx] * rmsInv * rmsScale[elemIdx]
+          acc += ternary * normalized
+      total = subgroupAdd(acc)
+      if tid == 0: output[outIdx] = residual[outIdx] + blScale * total
+    ```
+
+    @param config BitLinear layer configuration
+    @param eps RMSNorm epsilon (typically 1e-5)
+-/
+def fusedRMSNormBitLinearResidualM1Kernel (config : Config) (eps : Float := 1e-5) : ShaderM Unit := do
+  let wid ← ShaderM.workgroupId
+  let lid ← ShaderM.localId
+  let outIdx := Exp.vec3X wid
+  let tid := Exp.vec3X lid
+
+  let totalWeightElements := config.outDim * config.inDim
+  let numPackedBytes := totalWeightElements / 4
+  let numPackedU32 := (numPackedBytes + 3) / 4
+
+  -- Declare buffers (6 bindings)
+  let _input ← ShaderM.declareInputBuffer "input" (.array (.scalar .f32) config.inDim)
+  let _rmsScale ← ShaderM.declareInputBuffer "rms_scale" (.array (.scalar .f32) config.inDim)
+  let _packed ← ShaderM.declareInputBuffer "weights_packed" (.array (.scalar .u32) numPackedU32)
+  let _blScale ← ShaderM.declareInputBuffer "bl_scale" (.array (.scalar .f32) 1)
+  let _residual ← ShaderM.declareInputBuffer "residual" (.array (.scalar .f32) config.outDim)
+  let _output ← ShaderM.declareOutputBuffer "output" (.array (.scalar .f32) config.outDim)
+
+  -- Phase 1: Compute RMS via subgroupAdd
+  ShaderM.varNamed "partial_sq" (.scalar .f32) (Exp.litF32 0.0)
+  let partialSq : Exp (.scalar .f32) := Exp.var "partial_sq"
+
+  ShaderM.loop tid (Exp.litU32 config.inDim) (Exp.litU32 32) fun elemIdx => do
+    let val ← ShaderM.readBuffer (ty := .scalar .f32) (n := config.inDim) "input" elemIdx
+    ShaderM.assign "partial_sq" (Exp.add partialSq (Exp.mul val val))
+
+  -- subgroupAdd to get total sum of squares
+  ShaderM.varNamed "totalSq" (.scalar .f32) (Exp.subgroupAdd partialSq)
+  let totalSq : Exp (.scalar .f32) := Exp.var "totalSq"
+
+  -- rmsInv = rsqrt(totalSq / dim + eps)
+  let mean := Exp.div totalSq (Exp.litF32 config.inDim.toFloat)
+  let rmsInv := Exp.inverseSqrt (Exp.add mean (Exp.litF32 eps))
+
+  -- Phase 2: BitLinear dot product with inline normalization
+  ShaderM.varNamed "acc" (.scalar .f32) (Exp.litF32 0.0)
+  let acc : Exp (.scalar .f32) := Exp.var "acc"
+
+  let u32PerRow := config.inDim / 16
+  let rowBaseU32 := Exp.mul outIdx (Exp.litU32 u32PerRow)
+
+  ShaderM.loop tid (Exp.litU32 u32PerRow) (Exp.litU32 32) fun u32Idx => do
+    let packedU32 ← ShaderM.readBuffer (ty := .scalar .u32) (n := numPackedU32) "weights_packed"
+      (Exp.add rowBaseU32 u32Idx)
+
+    let localGroup := Exp.div u32Idx (Exp.litU32 8)
+    let localGroupPos := Exp.mul (Exp.mod u32Idx (Exp.litU32 8)) (Exp.litU32 4)
+    let elemBase := Exp.add (Exp.mul localGroup (Exp.litU32 128)) localGroupPos
+
+    for b in [0:4] do
+      let theByte := Exp.bitAnd (Exp.shiftRight packedU32 (Exp.litU32 (b * 8))) (Exp.litU32 0xFF)
+      for s in [0:4] do
+        let code := Exp.bitAnd (Exp.shiftRight theByte (Exp.litU32 (6 - s * 2))) (Exp.litU32 0x3)
+        let ternaryF32 := Exp.sub (Exp.toF32 code) (Exp.litF32 1.0)
+        let elemIdx := Exp.add elemBase (Exp.litU32 (b + s * 32))
+        -- Read input and normalize inline: input[i] * rmsInv * rmsScale[i]
+        let inputVal ← ShaderM.readBuffer (ty := .scalar .f32) (n := config.inDim) "input" elemIdx
+        let scaleVal ← ShaderM.readBuffer (ty := .scalar .f32) (n := config.inDim) "rms_scale" elemIdx
+        let normalized := Exp.mul (Exp.mul inputVal rmsInv) scaleVal
+        ShaderM.assign "acc" (Exp.add acc (Exp.mul ternaryF32 normalized))
+
+  -- Subgroup reduction
+  ShaderM.varNamed "totalSum" (.scalar .f32) (Exp.subgroupAdd acc)
+  let totalSum : Exp (.scalar .f32) := Exp.var "totalSum"
+
+  -- Thread 0: output = residual + blScale * totalSum
+  let inBounds := Exp.lt outIdx (Exp.litU32 config.outDim)
+  ShaderM.if_ (Exp.and (Exp.eq tid (Exp.litU32 0)) inBounds) (do
+    let blScaleVal ← ShaderM.readBuffer (ty := .scalar .f32) (n := 1) "bl_scale" (Exp.litU32 0)
+    let residualVal ← ShaderM.readBuffer (ty := .scalar .f32) (n := config.outDim) "residual" outIdx
+    let result := Exp.add residualVal (Exp.mul blScaleVal totalSum)
+    ShaderM.writeBuffer (ty := .scalar .f32) "output" outIdx result
+  ) (pure ())
+
+/-! ## Fused Gate+Up+ReLU²×Mul M=1 Kernel -/
+
+/-- Fused gate + up + ReLU²×mul M=1 kernel.
+
+    Combines three operations into one dispatch:
+    1. gate_val = dot(gate_weights, input) * gate_scale
+    2. up_val = dot(up_weights, input) * up_scale
+    3. output = ReLU²(gate_val) * up_val = max(0, gate_val)² * up_val
+
+    Saves 2 dispatches per call (was: gate BitLinear + up BitLinear + ReluSqrMul = 3).
+    Input is read once and used for both gate and up dot products.
+
+    **Algorithm per subgroup (32 threads):**
+    ```
+    gate_acc = 0, up_acc = 0
+    for u32Idx = tid; u32Idx < u32PerRow; u32Idx += 32:
+      // Read input once, unpack both gate and up weights
+      gate_packed = gate_weights[outIdx * u32PerRow + u32Idx]
+      up_packed = up_weights[outIdx * u32PerRow + u32Idx]
+      for each of 16 elements:
+        input_val = input[elemIdx]
+        gate_acc += gate_ternary * input_val
+        up_acc += up_ternary * input_val
+    gate_total = subgroupAdd(gate_acc) * gate_scale
+    up_total = subgroupAdd(up_acc) * up_scale
+    if tid == 0:
+      relu_val = max(0, gate_total)
+      output[outIdx] = relu_val * relu_val * up_total
+    ```
+
+    @param config BitLinear layer configuration (inDim=dim, outDim=ffnDim)
+-/
+def fusedGateUpReluSqrMulM1Kernel (config : Config) : ShaderM Unit := do
+  let wid ← ShaderM.workgroupId
+  let lid ← ShaderM.localId
+  let outIdx := Exp.vec3X wid
+  let tid := Exp.vec3X lid
+
+  let totalWeightElements := config.outDim * config.inDim
+  let numPackedBytes := totalWeightElements / 4
+  let numPackedU32 := (numPackedBytes + 3) / 4
+
+  -- Declare buffers (6 bindings)
+  let _input ← ShaderM.declareInputBuffer "input" (.array (.scalar .f32) config.inDim)
+  let _gatePacked ← ShaderM.declareInputBuffer "gate_packed" (.array (.scalar .u32) numPackedU32)
+  let _gateScale ← ShaderM.declareInputBuffer "gate_scale" (.array (.scalar .f32) 1)
+  let _upPacked ← ShaderM.declareInputBuffer "up_packed" (.array (.scalar .u32) numPackedU32)
+  let _upScale ← ShaderM.declareInputBuffer "up_scale" (.array (.scalar .f32) 1)
+  let _output ← ShaderM.declareOutputBuffer "output" (.array (.scalar .f32) config.outDim)
+
+  -- Accumulators for gate and up dot products
+  ShaderM.varNamed "gate_acc" (.scalar .f32) (Exp.litF32 0.0)
+  ShaderM.varNamed "up_acc" (.scalar .f32) (Exp.litF32 0.0)
+  let gateAcc : Exp (.scalar .f32) := Exp.var "gate_acc"
+  let upAcc : Exp (.scalar .f32) := Exp.var "up_acc"
+
+  let u32PerRow := config.inDim / 16
+  let rowBaseU32 := Exp.mul outIdx (Exp.litU32 u32PerRow)
+
+  ShaderM.loop tid (Exp.litU32 u32PerRow) (Exp.litU32 32) fun u32Idx => do
+    -- Read both gate and up packed weights
+    let gatePackedU32 ← ShaderM.readBuffer (ty := .scalar .u32) (n := numPackedU32) "gate_packed"
+      (Exp.add rowBaseU32 u32Idx)
+    let upPackedU32 ← ShaderM.readBuffer (ty := .scalar .u32) (n := numPackedU32) "up_packed"
+      (Exp.add rowBaseU32 u32Idx)
+
+    let localGroup := Exp.div u32Idx (Exp.litU32 8)
+    let localGroupPos := Exp.mul (Exp.mod u32Idx (Exp.litU32 8)) (Exp.litU32 4)
+    let elemBase := Exp.add (Exp.mul localGroup (Exp.litU32 128)) localGroupPos
+
+    for b in [0:4] do
+      let gateByte := Exp.bitAnd (Exp.shiftRight gatePackedU32 (Exp.litU32 (b * 8))) (Exp.litU32 0xFF)
+      let upByte := Exp.bitAnd (Exp.shiftRight upPackedU32 (Exp.litU32 (b * 8))) (Exp.litU32 0xFF)
+      for s in [0:4] do
+        let gateCode := Exp.bitAnd (Exp.shiftRight gateByte (Exp.litU32 (6 - s * 2))) (Exp.litU32 0x3)
+        let gateTernary := Exp.sub (Exp.toF32 gateCode) (Exp.litF32 1.0)
+        let upCode := Exp.bitAnd (Exp.shiftRight upByte (Exp.litU32 (6 - s * 2))) (Exp.litU32 0x3)
+        let upTernary := Exp.sub (Exp.toF32 upCode) (Exp.litF32 1.0)
+        let elemIdx := Exp.add elemBase (Exp.litU32 (b + s * 32))
+        -- Read input once, use for both
+        let inputVal ← ShaderM.readBuffer (ty := .scalar .f32) (n := config.inDim) "input" elemIdx
+        ShaderM.assign "gate_acc" (Exp.add gateAcc (Exp.mul gateTernary inputVal))
+        ShaderM.assign "up_acc" (Exp.add upAcc (Exp.mul upTernary inputVal))
+
+  -- Subgroup reduction for both accumulators
+  ShaderM.varNamed "gate_total" (.scalar .f32) (Exp.subgroupAdd gateAcc)
+  ShaderM.varNamed "up_total" (.scalar .f32) (Exp.subgroupAdd upAcc)
+  let gateTotal : Exp (.scalar .f32) := Exp.var "gate_total"
+  let upTotal : Exp (.scalar .f32) := Exp.var "up_total"
+
+  -- Thread 0: apply scales, ReLU², multiply, write output
+  let inBounds := Exp.lt outIdx (Exp.litU32 config.outDim)
+  ShaderM.if_ (Exp.and (Exp.eq tid (Exp.litU32 0)) inBounds) (do
+    let gateScaleVal ← ShaderM.readBuffer (ty := .scalar .f32) (n := 1) "gate_scale" (Exp.litU32 0)
+    let upScaleVal ← ShaderM.readBuffer (ty := .scalar .f32) (n := 1) "up_scale" (Exp.litU32 0)
+    let gateScaled := Exp.mul gateScaleVal gateTotal
+    let upScaled := Exp.mul upScaleVal upTotal
+    -- ReLU²(gate) × up
+    let reluVal := Exp.max gateScaled (Exp.litF32 0.0)
+    let result := Exp.mul (Exp.mul reluVal reluVal) upScaled
+    ShaderM.writeBuffer (ty := .scalar .f32) "output" outIdx result
+  ) (pure ())
+
 /-! ## Fused BitLinear + Residual Add Kernel -/
 
 /-- Fused kernel: i2_s unpack + matrix-vector multiply + residual add
@@ -690,5 +903,95 @@ def forwardWithResidual (device : Device) (layer : BitLinear)
     Hesper.WGSL.Execute.executeShaderNamed device shader namedBuffers execConfig (some cacheKey)
 
   logVerbose "[BitLinear] Fused forward+residual complete"
+
+/-- Execute fused RMSNorm + BitLinear + Residual forward pass (M=1 only).
+
+    Combines: RMSNorm(input) → BitLinear dot product → residual add
+    into a single GPU dispatch.
+
+    output = residual + blScale * (weights @ RMSNorm(input))
+
+    @param device WebGPU device
+    @param layer BitLinear layer (weights + scale)
+    @param rmsNorm RMSNorm layer (scale parameters)
+    @param inputBuf Input buffer [inDim]
+    @param residualBuf Residual buffer [outDim]
+    @param outputBuf Output buffer [outDim]
+    @param preparedRef Optional PreparedDispatch ref for fast-path replay
+-/
+def forwardFusedRMSNormResidual (device : Device) (layer : BitLinear)
+    (rmsNorm : Hesper.Layers.RMSNorm.RMSNorm)
+    (inputBuf residualBuf outputBuf : Buffer)
+    (preparedRef : Option (IO.Ref (Option Hesper.WGSL.Execute.PreparedDispatch)) := none)
+    : IO Unit := do
+  -- Fast path: replay prepared dispatch
+  if let some ref := preparedRef then
+    if let some p ← ref.get then
+      preparedHitsRef.modify (· + 1)
+      Hesper.WGSL.Execute.replayPreparedDispatch device p layer.config.outDim 1 1
+      return
+
+  preparedMissesRef.modify (· + 1)
+  logVerbose s!"[BitLinear] Executing fused RMSNorm+BitLinear+Residual ({layer.config.inDim}→{layer.config.outDim})..."
+
+  let shader := fusedRMSNormBitLinearResidualM1Kernel layer.config rmsNorm.config.eps
+  let namedBuffers := [
+    ("input", inputBuf),
+    ("rms_scale", rmsNorm.scale),
+    ("weights_packed", layer.weightsPacked),
+    ("bl_scale", layer.scaleBuf),
+    ("residual", residualBuf),
+    ("output", outputBuf)
+  ]
+  let execConfig : Hesper.WGSL.Execute.ExecutionConfig := {
+    workgroupSize := { x := 32, y := 1, z := 1 }
+    numWorkgroups := (layer.config.outDim, 1, 1)
+    diagnostics := [("off", "chromium.subgroup_matrix_uniformity")]
+  }
+  let cacheKey : UInt64 := hash ("frnblrm1", layer.config.inDim, layer.config.outDim)
+  Hesper.WGSL.Execute.executeShaderNamed device shader namedBuffers execConfig (some cacheKey) preparedRef
+
+/-- Execute fused Gate+Up+ReLU²×Mul forward pass (M=1 only).
+
+    Combines: gate = BitLinear(input), up = BitLinear(input), output = ReLU²(gate) × up
+    into a single GPU dispatch.
+
+    @param device WebGPU device
+    @param gateLayer Gate BitLinear layer
+    @param upLayer Up BitLinear layer
+    @param inputBuf Input buffer [inDim]
+    @param outputBuf Output buffer [outDim]
+    @param preparedRef Optional PreparedDispatch ref for fast-path replay
+-/
+def forwardFusedGateUpReluSqrMul (device : Device) (gateLayer upLayer : BitLinear)
+    (inputBuf outputBuf : Buffer)
+    (preparedRef : Option (IO.Ref (Option Hesper.WGSL.Execute.PreparedDispatch)) := none)
+    : IO Unit := do
+  -- Fast path: replay prepared dispatch
+  if let some ref := preparedRef then
+    if let some p ← ref.get then
+      preparedHitsRef.modify (· + 1)
+      Hesper.WGSL.Execute.replayPreparedDispatch device p gateLayer.config.outDim 1 1
+      return
+
+  preparedMissesRef.modify (· + 1)
+  logVerbose s!"[BitLinear] Executing fused Gate+Up+ReLU²×Mul ({gateLayer.config.inDim}→{gateLayer.config.outDim})..."
+
+  let shader := fusedGateUpReluSqrMulM1Kernel gateLayer.config
+  let namedBuffers := [
+    ("input", inputBuf),
+    ("gate_packed", gateLayer.weightsPacked),
+    ("gate_scale", gateLayer.scaleBuf),
+    ("up_packed", upLayer.weightsPacked),
+    ("up_scale", upLayer.scaleBuf),
+    ("output", outputBuf)
+  ]
+  let execConfig : Hesper.WGSL.Execute.ExecutionConfig := {
+    workgroupSize := { x := 32, y := 1, z := 1 }
+    numWorkgroups := (gateLayer.config.outDim, 1, 1)
+    diagnostics := [("off", "chromium.subgroup_matrix_uniformity")]
+  }
+  let cacheKey : UInt64 := hash ("fgurelum1", gateLayer.config.inDim, gateLayer.config.outDim)
+  Hesper.WGSL.Execute.executeShaderNamed device shader namedBuffers execConfig (some cacheKey) preparedRef
 
 end Hesper.Layers.BitLinear

@@ -440,6 +440,19 @@ def createCachedLayerBuffers (device : Device) (dim ffnDim : Nat) (attnConfig : 
     preparedReluSqrMul := ← IO.mkRef none
   }
 
+/-! ## Per-Layer Fused PreparedDispatch Refs -/
+
+/-- Per-layer PreparedDispatch refs for fused kernels.
+    Each layer needs its own refs because fused kernels bind per-layer weight buffers. -/
+structure FusedLayerRefs where
+  fusedGateUpRelu : IO.Ref (Option Hesper.WGSL.Execute.PreparedDispatch)
+
+/-- Create per-layer fused PreparedDispatch refs -/
+def createFusedLayerRefs : IO FusedLayerRefs := do
+  pure {
+    fusedGateUpRelu := ← IO.mkRef none
+  }
+
 /-! ## Forward Pass with KV Cache -/
 
 /-- Execute single-token transformer block forward pass with KV cache.
@@ -449,11 +462,13 @@ def createCachedLayerBuffers (device : Device) (dim ffnDim : Nat) (attnConfig : 
 
     @param pos Current token position (0-indexed)
     @param kvCache KV cache for this layer's attention
+    @param fusedRefs Per-layer fused PreparedDispatch refs (optional)
 -/
 def forwardWithCache (device : Device) (block : TransformerBlock)
                      (inputBuf outputBuf : Buffer) (pos : Nat)
                      (kvCache : Attention.KVCache)
-                     (preAllocBufs : Option CachedLayerBuffers := none) : IO Unit := do
+                     (preAllocBufs : Option CachedLayerBuffers := none)
+                     (fusedRefs : Option FusedLayerRefs := none) : IO Unit := do
   logVerbose s!"[Block {block.config.layerIdx}] Cached forward: pos={pos}"
 
   let dim := block.config.dim
@@ -477,13 +492,16 @@ def forwardWithCache (device : Device) (block : TransformerBlock)
   -- Step 4: Pre-FFN RMSNorm
   RMSNorm.forward device block.ffnNorm bufs.residual1Buf bufs.normed2Buf 1 256 (some bufs.rmsTempBuf)
 
-  -- Step 5-6: FFN gate + up projections
-  BitLinear.forward device block.ffnGate bufs.normed2Buf bufs.gateBuf 1
-  BitLinear.forward device block.ffnUp bufs.normed2Buf bufs.upBuf 1
-
-  -- Step 7: Gated activation (ReLU²)
-  let ffnElemConfig : Elementwise.Config := { numElements := ffnDim }
-  executeReluSqrMul device bufs.gateBuf bufs.upBuf bufs.hiddenBuf ffnElemConfig (some bufs.preparedReluSqrMul)
+  -- Step 5-7: Fused gate + up + ReLU²×mul (or separate if no fusedRefs)
+  match fusedRefs with
+  | some refs =>
+    BitLinear.forwardFusedGateUpReluSqrMul device block.ffnGate block.ffnUp
+      bufs.normed2Buf bufs.hiddenBuf (some refs.fusedGateUpRelu)
+  | none =>
+    BitLinear.forward device block.ffnGate bufs.normed2Buf bufs.gateBuf 1
+    BitLinear.forward device block.ffnUp bufs.normed2Buf bufs.upBuf 1
+    let ffnElemConfig : Elementwise.Config := { numElements := ffnDim }
+    executeReluSqrMul device bufs.gateBuf bufs.upBuf bufs.hiddenBuf ffnElemConfig (some bufs.preparedReluSqrMul)
 
   -- Step 7.5: FFN sub-norm
   RMSNorm.forward device block.ffnSubNorm bufs.hiddenBuf bufs.ffnNormedBuf 1 256 (some bufs.rmsTempBuf)
