@@ -209,7 +209,7 @@ def create (device : Device) (config : Config)
            (attnNormData attnSubNormData ffnNormData ffnSubNormData : ByteArray)
            (attnWeights : Attention.Attention)
            (ffnGateData ffnUpData ffnDownData : ByteArray × ByteArray) : IO TransformerBlock := do
-  IO.println s!"[TransformerBlock] Creating layer {config.layerIdx}..."
+  logVerbose s!"[TransformerBlock] Creating layer {config.layerIdx}..."
 
   -- Create RMSNorm layers
   let attnNormConfig : RMSNorm.Config := { dim := config.dim }
@@ -251,7 +251,7 @@ def create (device : Device) (config : Config)
   let (ffnDownWeights, ffnDownScales) := ffnDownData
   let ffnDown ← BitLinear.createFromBytes device ffnDownConfig ffnDownWeights ffnDownScales
 
-  IO.println s!"[TransformerBlock] ✓ Layer {config.layerIdx} created"
+  logVerbose s!"[TransformerBlock] ✓ Layer {config.layerIdx} created"
   pure { config, attnNorm, attnSubNorm, attention := attnWeights, ffnNorm,
          ffnGate, ffnUp, ffnSubNorm, ffnDown }
 
@@ -270,7 +270,7 @@ def createWithLayers (device : Device) (config : Config)
            (attnNormData attnSubNormData ffnNormData ffnSubNormData : ByteArray)
            (attnWeights : Attention.Attention)
            (ffnGateLayer ffnUpLayer ffnDownLayer : BitLinear.BitLinear) : IO TransformerBlock := do
-  IO.println s!"[TransformerBlock] Creating layer {config.layerIdx}..."
+  logVerbose s!"[TransformerBlock] Creating layer {config.layerIdx}..."
 
   -- Create RMSNorm layers
   let attnNormConfig : RMSNorm.Config := { dim := config.dim }
@@ -285,7 +285,7 @@ def createWithLayers (device : Device) (config : Config)
   let ffnSubNormConfig : RMSNorm.Config := { dim := config.ffnDim }
   let ffnSubNorm ← RMSNorm.create device ffnSubNormConfig ffnSubNormData
 
-  IO.println s!"[TransformerBlock] ✓ Layer {config.layerIdx} created"
+  logVerbose s!"[TransformerBlock] ✓ Layer {config.layerIdx} created"
   pure { config, attnNorm, attnSubNorm, attention := attnWeights, ffnNorm,
          ffnGate := ffnGateLayer, ffnUp := ffnUpLayer, ffnSubNorm, ffnDown := ffnDownLayer }
 

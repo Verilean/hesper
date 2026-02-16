@@ -502,6 +502,7 @@ def generate (device : Device) (model : BitNetModel)
              (promptTokens : Array Nat) (maxTokens : Nat)
              (strategy : Hesper.Inference.Sampling.Strategy := .Greedy)
              (eosToken : Option Nat := none)
+             (showStats : Bool := false)
     : IO (Array Nat) := do
   logVerbose "═══════════════════════════════════════════════"
   logVerbose "  Text Generation (KV Cache)"
@@ -576,17 +577,17 @@ def generate (device : Device) (model : BitNetModel)
   IO.println s!"Generated {genTokenCount} tokens in {genMs} ms"
   IO.println s!"  {msPerToken} ms/token = {tps} tokens/sec"
 
-  -- Print PreparedDispatch stats
-  let blHits ← Hesper.Layers.BitLinear.preparedHitsRef.get
-  let blMisses ← Hesper.Layers.BitLinear.preparedMissesRef.get
-  let rmsHits ← Hesper.Layers.RMSNorm.preparedHitsRef.get
-  let rmsMisses ← Hesper.Layers.RMSNorm.preparedMissesRef.get
-  IO.println s!"  BitLinear PreparedDispatch: {blHits} hits, {blMisses} misses"
-  IO.println s!"  RMSNorm PreparedDispatch: {rmsHits} hits, {rmsMisses} misses"
-  let (plHits, plMisses) ← Hesper.WGSL.Execute.getPipelineCacheStats
-  let (bgHits, bgMisses) ← Hesper.WGSL.Execute.getBindGroupCacheStats
-  IO.println s!"  Pipeline cache: {plHits} hits, {plMisses} misses"
-  IO.println s!"  BindGroup cache: {bgHits} hits, {bgMisses} misses"
+  if showStats then
+    let blHits ← Hesper.Layers.BitLinear.preparedHitsRef.get
+    let blMisses ← Hesper.Layers.BitLinear.preparedMissesRef.get
+    let rmsHits ← Hesper.Layers.RMSNorm.preparedHitsRef.get
+    let rmsMisses ← Hesper.Layers.RMSNorm.preparedMissesRef.get
+    IO.println s!"  BitLinear PreparedDispatch: {blHits} hits, {blMisses} misses"
+    IO.println s!"  RMSNorm PreparedDispatch: {rmsHits} hits, {rmsMisses} misses"
+    let (plHits, plMisses) ← Hesper.WGSL.Execute.getPipelineCacheStats
+    let (bgHits, bgMisses) ← Hesper.WGSL.Execute.getBindGroupCacheStats
+    IO.println s!"  Pipeline cache: {plHits} hits, {plMisses} misses"
+    IO.println s!"  BindGroup cache: {bgHits} hits, {bgMisses} misses"
 
   pure tokens
 
