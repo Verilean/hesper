@@ -56,6 +56,10 @@ open Hesper.WGSL.Monad
 open Hesper.WebGPU
 open Hesper.Logging (logVerbose)
 
+/-- Counters for PreparedDispatch fast-path vs slow-path -/
+initialize preparedHitsRef : IO.Ref Nat ← IO.mkRef 0
+initialize preparedMissesRef : IO.Ref Nat ← IO.mkRef 0
+
 /-! ## Layer Configuration -/
 
 /-- RMSNorm layer configuration -/
@@ -136,6 +140,70 @@ def rmsNormKernel (config : Config) (workgroupSize : Nat := 256) : ShaderM Unit 
 
   let finalResult := Exp.select inBounds result (Exp.litF32 0.0)
   ShaderM.writeBuffer (ty := .scalar .f32) "output" idx finalResult
+
+/-! ## Fused Single-Pass Kernel (multi-row) -/
+
+/-- Fused RMSNorm kernel: compute RMS + apply normalization in one dispatch.
+    Each workgroup handles one row. Threads use strided loops for both
+    RMS accumulation and normalization, supporting dim >> workgroupSize.
+
+    Reduces dispatch count from 2 to 1 per RMSNorm call.
+-/
+def rmsNormFusedKernel (config : Config) (numRows : Nat) (workgroupSize : Nat := 256) : ShaderM Unit := do
+  let wid ← ShaderM.workgroupId
+  let lid ← ShaderM.localId
+  let rowIdx := Exp.vec3X wid
+  let localIdx := Exp.vec3X lid
+
+  let totalElements := numRows * config.dim
+
+  -- Declare shared memory for workgroup reduction
+  ShaderM.sharedNamed "shared_sum" (.array (.scalar .f32) workgroupSize)
+
+  -- Declare buffers
+  let _input ← ShaderM.declareInputBuffer "input" (.array (.scalar .f32) totalElements)
+  let _scale ← ShaderM.declareInputBuffer "scale" (.array (.scalar .f32) config.dim)
+  let _output ← ShaderM.declareOutputBuffer "output" (.array (.scalar .f32) totalElements)
+
+  let rowBase := Exp.mul rowIdx (Exp.litU32 config.dim)
+
+  -- Step 1: Accumulate partial sum of x² via strided loop
+  ShaderM.varNamed "partial_sum" (.scalar .f32) (Exp.litF32 0.0)
+  let partialSum : Exp (.scalar .f32) := Exp.var "partial_sum"
+
+  ShaderM.loop localIdx (Exp.litU32 config.dim) (Exp.litU32 workgroupSize) fun loopIdx => do
+    let val ← ShaderM.readBuffer (ty := .scalar .f32) (n := totalElements) "input" (Exp.add rowBase loopIdx)
+    ShaderM.assign "partial_sum" (Exp.add partialSum (Exp.mul val val))
+
+  -- Write partial sum to shared memory
+  ShaderM.writeWorkgroup (ty := .scalar .f32) "shared_sum" localIdx partialSum
+  ShaderM.barrier
+
+  -- Step 2: Tree reduction in shared memory
+  let mut stride := workgroupSize / 2
+  while stride > 0 do
+    ShaderM.if_ (Exp.lt localIdx (Exp.litU32 stride)) (do
+      let a ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := workgroupSize) "shared_sum" localIdx
+      let b ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := workgroupSize) "shared_sum" (Exp.add localIdx (Exp.litU32 stride))
+      ShaderM.writeWorkgroup (ty := .scalar .f32) "shared_sum" localIdx (Exp.add a b)
+    ) (pure ())
+    ShaderM.barrier
+    stride := stride / 2
+
+  -- All threads read the total sum from shared[0]
+  let totalSum ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := workgroupSize) "shared_sum" (Exp.litU32 0)
+
+  -- Compute RMS: sqrt(mean(x²) + eps)
+  let mean := Exp.div totalSum (Exp.litF32 config.dim.toFloat)
+  let rms := Exp.sqrt (Exp.add mean (Exp.litF32 config.eps))
+
+  -- Step 3: Each thread normalizes its strided elements
+  ShaderM.loop localIdx (Exp.litU32 config.dim) (Exp.litU32 workgroupSize) fun dimIdx => do
+    let inputVal ← ShaderM.readBuffer (ty := .scalar .f32) (n := totalElements) "input" (Exp.add rowBase dimIdx)
+    let scaleVal ← ShaderM.readBuffer (ty := .scalar .f32) (n := config.dim) "scale" dimIdx
+    let normalized := Exp.div inputVal rms
+    let result := Exp.mul normalized scaleVal
+    ShaderM.writeBuffer (ty := .scalar .f32) "output" (Exp.add rowBase dimIdx) result
 
 /-! ## Optimized Two-Pass Kernel -/
 
@@ -239,6 +307,7 @@ def rmsApplyKernel (config : Config) (numRows : Nat) : ShaderM Unit := do
 structure RMSNorm where
   config : Config
   scale : Buffer  -- Learned scale parameters (γ)
+  prepared : IO.Ref (Option Hesper.WGSL.Execute.PreparedDispatch)  -- Graph capture cache
 
 /-- Create RMSNorm layer from GGUF tensors
 
@@ -259,8 +328,9 @@ def create (device : Device) (config : Config) (scaleData : ByteArray) : IO RMSN
   -- Upload scale data
   writeBuffer device scaleBuf 0 scaleData
 
+  let prepared ← IO.mkRef none
   IO.println "[RMSNorm] ✓ Layer created on GPU"
-  pure { config, scale := scaleBuf }
+  pure { config, scale := scaleBuf, prepared }
 
 /-- Execute forward pass (single-kernel version)
 
@@ -270,43 +340,32 @@ def create (device : Device) (config : Config) (scaleData : ByteArray) : IO RMSN
     @param outputBuf GPU buffer for output (Float32)
 -/
 def forward (device : Device) (layer : RMSNorm)
-            (inputBuf outputBuf : Buffer) (numRows : Nat := 1) (workgroupSize : Nat := 256) : IO Unit := do
+            (inputBuf outputBuf : Buffer) (numRows : Nat := 1) (workgroupSize : Nat := 256)
+            (preAllocRmsBuf : Option Buffer := none) : IO Unit := do
+  -- Fast path: replay prepared dispatch (skips ALL Lean processing)
+  if numRows == 1 then
+    if let some p ← layer.prepared.get then
+      preparedHitsRef.modify (· + 1)
+      Hesper.WGSL.Execute.replayPreparedDispatch device p numRows 1 1
+      return
+
+  preparedMissesRef.modify (· + 1)
   logVerbose s!"[RMSNorm] Executing forward pass ({numRows} rows × {layer.config.dim} dim)..."
 
-  -- Two-pass approach: compute RMS per row, then apply normalization to all elements
-
-  -- Allocate temporary buffer for per-row RMS values
-  let rmsTempBuf ← createBuffer device {
-    size := (numRows * 4).toUSize
-    usage := [.storage]
-    mappedAtCreation := false
-  }
-
-  -- Pass 1: Compute RMS (one workgroup per row)
-  let shader1 := rmsComputeKernel layer.config numRows workgroupSize
-  let namedBuffers1 := [
+  -- Fused single-pass: compute RMS + apply normalization in one dispatch
+  -- 1 workgroup per row, each workgroup uses shared memory reduction
+  let shader := rmsNormFusedKernel layer.config numRows workgroupSize
+  let namedBuffers := [
     ("input", inputBuf),
-    ("rms_output", rmsTempBuf)
-  ]
-  let execConfig1 : Hesper.WGSL.Execute.ExecutionConfig := {
-    workgroupSize := { x := workgroupSize, y := 1, z := 1 }
-    numWorkgroups := (numRows, 1, 1)
-  }
-  Hesper.WGSL.Execute.executeShaderNamed device shader1 namedBuffers1 execConfig1
-
-  -- Pass 2: Apply normalization (one thread per element across all rows)
-  let shader2 := rmsApplyKernel layer.config numRows
-  let namedBuffers2 := [
-    ("input", inputBuf),
-    ("rms_input", rmsTempBuf),
     ("scale", layer.scale),
     ("output", outputBuf)
   ]
-  let totalElements := numRows * layer.config.dim
-  let execConfig2 := Hesper.WGSL.Execute.ExecutionConfig.dispatch1D
-    totalElements
-    workgroupSize
-  Hesper.WGSL.Execute.executeShaderNamed device shader2 namedBuffers2 execConfig2
+  let execConfig : Hesper.WGSL.Execute.ExecutionConfig := {
+    workgroupSize := { x := workgroupSize, y := 1, z := 1 }
+    numWorkgroups := (numRows, 1, 1)
+  }
+  let cacheKey : UInt64 := hash ("rms", layer.config.dim, numRows, workgroupSize)
+  Hesper.WGSL.Execute.executeShaderNamed device shader namedBuffers execConfig (some cacheKey) (some layer.prepared)
 
   logVerbose "[RMSNorm] ✓ Forward pass complete"
 

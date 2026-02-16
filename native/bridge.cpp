@@ -416,18 +416,22 @@ static void finalize_webgpu_future(void* ptr) {
 // External Class Registration for WebGPU
 //=============================================================================
 
+// No-op foreach: external WebGPU objects don't contain Lean sub-objects,
+// but lean_mark_mt requires a non-null foreach function to avoid null call.
+static void noop_foreach(void*, b_lean_obj_arg) {}
+
 static void register_webgpu_external_classes() {
     if (g_webgpu_instance_class != nullptr) return;  // Already registered
 
-    g_webgpu_instance_class = lean_register_external_class(finalize_webgpu_instance, nullptr);
-    g_webgpu_device_class = lean_register_external_class(finalize_webgpu_device, nullptr);
-    g_webgpu_buffer_class = lean_register_external_class(finalize_webgpu_buffer, nullptr);
-    g_webgpu_shader_module_class = lean_register_external_class(finalize_webgpu_shader_module, nullptr);
-    g_webgpu_compute_pipeline_class = lean_register_external_class(finalize_webgpu_compute_pipeline, nullptr);
-    g_webgpu_bind_group_class = lean_register_external_class(finalize_webgpu_bind_group, nullptr);
-    g_webgpu_bind_group_layout_class = lean_register_external_class(finalize_webgpu_bind_group_layout, nullptr);
-    g_webgpu_command_encoder_class = lean_register_external_class(finalize_webgpu_command_encoder, nullptr);
-    g_webgpu_future_class = lean_register_external_class(finalize_webgpu_future, nullptr);
+    g_webgpu_instance_class = lean_register_external_class(finalize_webgpu_instance, noop_foreach);
+    g_webgpu_device_class = lean_register_external_class(finalize_webgpu_device, noop_foreach);
+    g_webgpu_buffer_class = lean_register_external_class(finalize_webgpu_buffer, noop_foreach);
+    g_webgpu_shader_module_class = lean_register_external_class(finalize_webgpu_shader_module, noop_foreach);
+    g_webgpu_compute_pipeline_class = lean_register_external_class(finalize_webgpu_compute_pipeline, noop_foreach);
+    g_webgpu_bind_group_class = lean_register_external_class(finalize_webgpu_bind_group, noop_foreach);
+    g_webgpu_bind_group_layout_class = lean_register_external_class(finalize_webgpu_bind_group_layout, noop_foreach);
+    g_webgpu_command_encoder_class = lean_register_external_class(finalize_webgpu_command_encoder, noop_foreach);
+    g_webgpu_future_class = lean_register_external_class(finalize_webgpu_future, noop_foreach);
 
     if (g_verbose) std::cout << "[C++] WebGPU External classes registered" << std::endl;
 }
@@ -1106,6 +1110,28 @@ lean_obj_res lean_hesper_unmap_buffer(b_lean_obj_arg buffer, lean_obj_res /* uni
     return lean_io_result_mk_ok(lean_box(0));
 }
 
+// Return a stable unique identifier for a GPU buffer (raw WGPUBuffer handle as UInt64)
+lean_obj_res lean_hesper_buffer_id(b_lean_obj_arg buffer_obj, lean_obj_res /* unit */) {
+    wgpu::Buffer* buffer = EXTRACT_BUFFER_PTR(buffer_obj);
+    uint64_t id = (uint64_t)(void*)buffer->Get();
+    return lean_io_result_mk_ok(lean_box_uint64(id));
+}
+
+// Hash an array of buffers into a single UInt64 key (avoids N separate FFI calls)
+lean_obj_res lean_hesper_hash_buffer_array(uint64_t seed, b_lean_obj_arg buffers_array, lean_obj_res /* unit */) {
+    size_t n = lean_array_size(buffers_array);
+    uint64_t h = seed;
+    for (size_t i = 0; i < n; i++) {
+        lean_object* buf_obj = lean_array_get_core(buffers_array, i);
+        wgpu::Buffer* buffer = EXTRACT_BUFFER_PTR(buf_obj);
+        uint64_t id = (uint64_t)(void*)buffer->Get();
+        // FNV-1a style mixing
+        h ^= id;
+        h *= 0x100000001b3ULL;
+    }
+    return lean_io_result_mk_ok(lean_box_uint64(h));
+}
+
 // Shader Operations
 
 lean_obj_res lean_hesper_create_shader_module(b_lean_obj_arg device_obj, b_lean_obj_arg source, lean_obj_res /* unit */) {
@@ -1656,7 +1682,7 @@ static lean_external_class* get_Float32Array_class() {
     if (g_Float32Array_class == nullptr) {
         g_Float32Array_class = lean_register_external_class(
             Float32Array_finalizer,
-            nullptr  // foreach function (not needed)
+            noop_foreach
         );
     }
     return g_Float32Array_class;
@@ -1868,7 +1894,7 @@ static lean_external_class* get_Float16Array_class() {
     if (g_Float16Array_class == nullptr) {
         g_Float16Array_class = lean_register_external_class(
             Float16Array_finalizer,
-            nullptr
+            noop_foreach
         );
     }
     return g_Float16Array_class;
@@ -2039,6 +2065,101 @@ lean_obj_res lean_f16_array_simd_mul(lean_object* a, lean_object* b, lean_object
 
     lean_object* obj = lean_alloc_external(get_Float16Array_class(), result);
     return lean_io_result_mk_ok(obj);
+}
+
+// ============================================================================
+// Command Buffer Batching - Record multiple dispatches, submit once
+// ============================================================================
+
+// Helper macro for CommandEncoder extraction
+#define EXTRACT_COMMAND_ENCODER_PTR(encoder_struct) \
+    static_cast<wgpu::CommandEncoder*>(lean_get_external_data(lean_ctor_get(encoder_struct, 0)))
+
+lean_obj_res lean_hesper_create_command_encoder(b_lean_obj_arg device_obj, lean_obj_res /* unit */) {
+    wgpu::Device* device = EXTRACT_DEVICE_PTR(device_obj);
+
+    if (!device || !device->Get()) {
+        return lean_io_result_mk_error(lean_mk_string("Device is invalid"));
+    }
+
+    WGPUCommandEncoder raw = wgpuDeviceCreateCommandEncoder(device->Get(), nullptr);
+    if (!raw) {
+        return lean_io_result_mk_error(lean_mk_string("Failed to create command encoder"));
+    }
+
+    wgpu::CommandEncoder* encoderPtr = new wgpu::CommandEncoder(raw);
+    lean_object* external = lean_alloc_external(g_webgpu_command_encoder_class, encoderPtr);
+    lean_object* encoder_struct = make_resource_with_device(external, device_obj);
+    return lean_io_result_mk_ok(encoder_struct);
+}
+
+lean_obj_res lean_hesper_record_dispatch(b_lean_obj_arg encoder_obj, b_lean_obj_arg pipeline_obj,
+                                          b_lean_obj_arg bind_group_obj,
+                                          uint32_t workgroupsX, uint32_t workgroupsY, uint32_t workgroupsZ,
+                                          lean_obj_res /* unit */) {
+    wgpu::CommandEncoder* encoder = EXTRACT_COMMAND_ENCODER_PTR(encoder_obj);
+    wgpu::ComputePipeline* pipeline = EXTRACT_COMPUTE_PIPELINE_PTR(pipeline_obj);
+    wgpu::BindGroup* bindGroup = EXTRACT_BIND_GROUP_PTR(bind_group_obj);
+
+    if (!encoder || !encoder->Get()) {
+        return lean_io_result_mk_error(lean_mk_string("CommandEncoder is invalid"));
+    }
+    if (!pipeline || !pipeline->Get()) {
+        return lean_io_result_mk_error(lean_mk_string("Pipeline is invalid"));
+    }
+    if (!bindGroup || !bindGroup->Get()) {
+        return lean_io_result_mk_error(lean_mk_string("BindGroup is invalid"));
+    }
+
+    WGPUComputePassEncoder pass = wgpuCommandEncoderBeginComputePass(encoder->Get(), nullptr);
+    wgpuComputePassEncoderSetPipeline(pass, pipeline->Get());
+    wgpuComputePassEncoderSetBindGroup(pass, 0, bindGroup->Get(), 0, nullptr);
+    wgpuComputePassEncoderDispatchWorkgroups(pass, workgroupsX, workgroupsY, workgroupsZ);
+    wgpuComputePassEncoderEnd(pass);
+    wgpuComputePassEncoderRelease(pass);
+
+    return lean_io_result_mk_ok(lean_box(0));
+}
+
+lean_obj_res lean_hesper_submit_and_wait(b_lean_obj_arg device_obj, b_lean_obj_arg encoder_obj, lean_obj_res /* unit */) {
+    wgpu::Device* device = EXTRACT_DEVICE_PTR(device_obj);
+    wgpu::CommandEncoder* encoder = EXTRACT_COMMAND_ENCODER_PTR(encoder_obj);
+
+    if (!device || !device->Get()) {
+        return lean_io_result_mk_error(lean_mk_string("Device is invalid"));
+    }
+    if (!encoder || !encoder->Get()) {
+        return lean_io_result_mk_error(lean_mk_string("CommandEncoder is invalid"));
+    }
+
+    // Finish encoder and submit
+    WGPUCommandBuffer commandBuffer = wgpuCommandEncoderFinish(encoder->Get(), nullptr);
+    wgpuQueueSubmit(device->GetQueue().Get(), 1, &commandBuffer);
+    wgpuCommandBufferRelease(commandBuffer);
+
+    // Create promise/future for async completion
+    auto promise = std::make_shared<std::promise<void>>();
+    auto future = std::make_shared<std::future<void>>(promise->get_future());
+
+    FutureData* futureData = new FutureData{promise, future, g_dawn_instance};
+
+    WGPUQueueWorkDoneCallbackInfo workDoneInfo = {
+        .nextInChain = nullptr,
+        .mode = WGPUCallbackMode_AllowProcessEvents,
+        .callback = dispatchWorkDoneCallback,
+        .userdata1 = futureData,
+        .userdata2 = nullptr
+    };
+    wgpuQueueOnSubmittedWorkDone(device->GetQueue().Get(), workDoneInfo);
+
+    // Wait synchronously
+    wgpu::Instance instance(g_dawn_instance->Get());
+    wait(instance, *future);
+
+    // Clean up FutureData (not returned to Lean, so we own it)
+    delete futureData;
+
+    return lean_io_result_mk_ok(lean_box(0));
 }
 
 }
