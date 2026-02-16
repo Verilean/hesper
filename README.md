@@ -20,6 +20,29 @@ let result := sqrt (x * x + y * y)  -- Generates: sqrt(x * x + y * y)
 -- let wrong := x + (var "i" : Exp (.scalar .i32))  ✗ Type error!
 ```
 
+## BitNet b1.58 Inference: 116 TPS on M1 Pro
+
+Hesper includes a complete **BitNet b1.58 2B** inference engine running entirely on WebGPU, achieving **116 tokens/second** on Apple M1 Pro:
+
+```
+$ lake exe bitnet-complete --stats
+> Hello, world!
+Hello, world! I'm a 20-year-old college student...
+
+Performance: 116.0 TPS (8.6 ms/token)
+  Bandwidth utilization: 73% of theoretical M1 Pro limit
+  Model: BitNet b1.58 2B (30 layers, 2560 dim, i2_s ternary weights)
+```
+
+**Key optimizations:**
+- Ternary weight kernel (i2_s): 2-bit packed weights, addition-only matmul
+- Shared memory F16 matmul for LM head (128K vocab)
+- PreparedDispatch graph capture: ~99% pipeline cache hit rate
+- Command buffer batching: single GPU submit per token
+- KV cache with grouped-query attention (20 heads, 5 KV heads)
+
+See [bitnet.lean](https://github.com/Verilean/bitnet.lean) for the full inference pipeline.
+
 ## Why Hesper?
 
 Modern GPU programming lacks safety guarantees. Hesper provides:
@@ -689,6 +712,10 @@ Hesper/
 - [x] **Complete test suite (error handling, shader monad)**
 - [x] **Docker-based CI environment**
 - [x] **Verified Composable Kernels (VerifiedOpFusion)**
+
+- [x] **BitNet b1.58 inference engine (116 TPS on M1 Pro)**
+- [x] **KV cache with grouped-query attention**
+- [x] **PreparedDispatch graph capture (99%+ cache hit rate)**
 
 In Progress:
 - [ ] Comprehensive tensor operation library (GEMM, Conv3D)
