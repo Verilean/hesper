@@ -223,6 +223,26 @@ structure BitNetModel where
   -- LM head uses weight tying: reuses embedding table as [vocabSize, dim] matrix
   -- output = input @ embedding^T
 
+/-- Reset all PreparedDispatch caches in the model.
+    Must be called when buffer bindings change (e.g., new generate call). -/
+def resetPreparedDispatches (model : BitNetModel) : IO Unit := do
+  -- Reset RMSNorm PreparedDispatches
+  model.finalNorm.prepared.set none
+  for layer in model.layers do
+    layer.attnNorm.prepared.set none
+    layer.attnSubNorm.prepared.set none
+    layer.ffnNorm.prepared.set none
+    layer.ffnSubNorm.prepared.set none
+    -- Reset BitLinear PreparedDispatches
+    layer.ffnGate.prepared.set none
+    layer.ffnUp.prepared.set none
+    layer.ffnDown.prepared.set none
+    -- Reset Attention BitLinear PreparedDispatches
+    layer.attention.wQ.prepared.set none
+    layer.attention.wK.prepared.set none
+    layer.attention.wV.prepared.set none
+    layer.attention.wO.prepared.set none
+
 /-! ## Model Creation -/
 
 /-- Create BitNet model (placeholder - needs GGUF integration)
@@ -350,6 +370,8 @@ structure KVCacheState where
   logitsBuf : Buffer   -- [vocabSize]
   argmaxBuf : Buffer   -- [1] u32 for GPU-side argmax result
   tokenBuf : Buffer    -- [1] u32 for single-token upload (reusable)
+  penaltyTokensBuf : Buffer  -- [maxSeqLen] u32 for repetition penalty token IDs
+  penaltyParamsBuf : Buffer  -- [2] u32: (numTokens, penalty_as_u32)
 
 /-- Create KV cache state for the model -/
 def createKVCacheState (device : Device) (model : BitNetModel) : IO KVCacheState := do
@@ -377,6 +399,8 @@ def createKVCacheState (device : Device) (model : BitNetModel) : IO KVCacheState
     logitsBuf := ← mkBuf (cfg.vocabSize * 4).toUSize
     argmaxBuf := ← mkBufRW 4  -- Single u32 for argmax result
     tokenBuf := ← mkBufRW 4   -- Single u32 for token upload
+    penaltyTokensBuf := ← mkBufRW (cfg.maxSeqLen * 4).toUSize  -- Token IDs for repetition penalty
+    penaltyParamsBuf := ← mkBufRW 8  -- (numTokens, penalty_bits)
   }
 
 /-- Run single-token forward pass with KV cache.
@@ -502,6 +526,68 @@ def gpuArgmax (device : Device) (logitsBuf argmaxBuf : Buffer) (vocabSize : Nat)
   let tokenId := Hesper.WebGPU.BufferOps.bytesToUInt32 bytes 0
   pure tokenId.toNat
 
+/-- GPU kernel: apply repetition penalty to logits in-place.
+    One thread per previous token. Reads token ID, applies penalty to that logit.
+    penalty is baked into the shader as a literal (changes rarely). -/
+def repetitionPenaltyKernel (maxTokens vocabSize : Nat) (penalty : Float) : ShaderM Unit := do
+  let gid ← ShaderM.globalId
+  let idx := Exp.vec3X gid
+
+  let _tokenIds ← ShaderM.declareInputBuffer "token_ids" (.array (.scalar .u32) maxTokens)
+  let _params ← ShaderM.declareInputBuffer "params" (.array (.scalar .u32) 1)
+  let _logits ← ShaderM.declareOutputBuffer "logits" (.array (.scalar .f32) vocabSize)
+
+  let numTokens ← ShaderM.readBuffer (ty := .scalar .u32) (n := 1) "params" (Exp.litU32 0)
+
+  ShaderM.if_ (Exp.lt idx numTokens) (do
+    let tokenId ← ShaderM.readBuffer (ty := .scalar .u32) (n := maxTokens) "token_ids" idx
+    ShaderM.if_ (Exp.lt tokenId (Exp.litU32 vocabSize)) (do
+      let logit ← ShaderM.readBuffer (ty := .scalar .f32) (n := vocabSize) "logits" tokenId
+      let penalized := Exp.select (Exp.gt logit (Exp.litF32 0.0))
+        (Exp.div logit (Exp.litF32 penalty))
+        (Exp.mul logit (Exp.litF32 penalty))
+      ShaderM.writeBuffer (ty := .scalar .f32) "logits" tokenId penalized
+    ) (pure ())
+  ) (pure ())
+
+/-- Append a single token ID to the penalty tokens buffer at the given offset. -/
+def appendPenaltyToken (device : Device) (cacheState : KVCacheState)
+    (tokenId : Nat) (offset : Nat) : IO Unit := do
+  let tokenBytes := Hesper.WebGPU.BufferOps.uint32ToBytes tokenId.toUInt32
+  writeBuffer device cacheState.penaltyTokensBuf (offset * 4).toUSize tokenBytes
+
+/-- Apply repetition penalty on GPU, then run GPU argmax.
+    Assumes token IDs are already uploaded incrementally. Just updates numTokens param,
+    runs penalty + argmax batched in a single GPU submit, downloads 4 bytes. -/
+def gpuArgmaxWithPenalty (device : Device) (cacheState : KVCacheState)
+    (vocabSize maxSeqLen : Nat) (numTokens : Nat) (penalty : Float) : IO Nat := do
+  -- Upload params: numTokens
+  let paramBytes := Hesper.WebGPU.BufferOps.uint32ToBytes numTokens.toUInt32
+  writeBuffer device cacheState.penaltyParamsBuf 0 paramBytes
+  -- Batch penalty + argmax into single GPU submit
+  Hesper.WGSL.Execute.beginBatch device
+  let penaltyShader := repetitionPenaltyKernel maxSeqLen vocabSize penalty
+  let penaltyConfig : Hesper.WGSL.Execute.ExecutionConfig :=
+    Hesper.WGSL.Execute.ExecutionConfig.dispatch1D numTokens 256
+  let penaltyCacheKey : UInt64 := hash ("rp", maxSeqLen, vocabSize)
+  Hesper.WGSL.Execute.executeShaderNamed device penaltyShader
+    [("token_ids", cacheState.penaltyTokensBuf), ("params", cacheState.penaltyParamsBuf),
+     ("logits", cacheState.logitsBuf)]
+    penaltyConfig (some penaltyCacheKey)
+  let argmaxShader := argmaxKernel vocabSize
+  let argmaxConfig : Hesper.WGSL.Execute.ExecutionConfig := {
+    workgroupSize := { x := 256, y := 1, z := 1 }
+    numWorkgroups := (1, 1, 1)
+  }
+  Hesper.WGSL.Execute.executeShaderNamed device argmaxShader
+    [("logits", cacheState.logitsBuf), ("result", cacheState.argmaxBuf)]
+    argmaxConfig
+  Hesper.WGSL.Execute.endBatch device
+  -- Download single u32
+  let bytes ← mapBufferRead device cacheState.argmaxBuf 0 4
+  let tokenId := Hesper.WebGPU.BufferOps.bytesToUInt32 bytes 0
+  pure tokenId.toNat
+
 /-! ## Text Generation -/
 
 /-- Generate text using greedy decoding
@@ -517,7 +603,11 @@ def generate (device : Device) (model : BitNetModel)
              (strategy : Hesper.Inference.Sampling.Strategy := .Greedy)
              (eosToken : Option Nat := none)
              (showStats : Bool := false)
+             (repetitionPenalty : Float := 1.1)
     : IO (Array Nat) := do
+  -- Reset model-level PreparedDispatch caches (buffers change per generate call)
+  resetPreparedDispatches model
+
   logVerbose "═══════════════════════════════════════════════"
   logVerbose "  Text Generation (KV Cache)"
   logVerbose "═══════════════════════════════════════════════"
@@ -531,6 +621,11 @@ def generate (device : Device) (model : BitNetModel)
 
   let mut tokens := promptTokens
   let mut rng := Hesper.Inference.Sampling.RNG.create (some 42)
+
+  -- Pre-upload prompt tokens to penalty buffer (incremental updates later)
+  if repetitionPenalty != 1.0 then
+    for i in [0:promptTokens.size] do
+      appendPenaltyToken device cacheState promptTokens[i]! i
 
   -- Phase 1: Process prompt tokens one at a time (populating KV cache)
   IO.println s!"[Prefill] Processing {promptTokens.size} prompt tokens..."
@@ -556,11 +651,17 @@ def generate (device : Device) (model : BitNetModel)
     -- Sample next token
     let mut nextToken := 0
     if isGreedy then
-      -- GPU-side argmax: download 4 bytes instead of 512KB
-      nextToken ← gpuArgmax device cacheState.logitsBuf cacheState.argmaxBuf model.config.vocabSize
+      if repetitionPenalty == 1.0 then
+        -- GPU-side argmax only: download 4 bytes
+        nextToken ← gpuArgmax device cacheState.logitsBuf cacheState.argmaxBuf model.config.vocabSize
+      else
+        -- GPU-side penalty + argmax (batched): upload numTokens param, download 4 bytes
+        nextToken ← gpuArgmaxWithPenalty device cacheState model.config.vocabSize
+          model.config.maxSeqLen tokens.size repetitionPenalty
     else
       -- Non-greedy: download full logits for CPU sampling
       let logits ← Hesper.WebGPU.BufferOps.downloadFloatArray device cacheState.logitsBuf model.config.vocabSize
+      let logits := Hesper.Inference.Sampling.applyRepetitionPenalty logits tokens repetitionPenalty
       let (tok, newRng) := Hesper.Inference.Sampling.sampleWithRNG logits strategy rng
       rng := newRng
       nextToken := tok
@@ -569,6 +670,10 @@ def generate (device : Device) (model : BitNetModel)
 
     tokens := tokens.push nextToken
     genTokenCount := genTokenCount + 1
+
+    -- Append new token to penalty buffer incrementally (4 bytes)
+    if repetitionPenalty != 1.0 then
+      appendPenaltyToken device cacheState nextToken (tokens.size - 1)
 
     -- Early stopping on EOS
     match eosToken with

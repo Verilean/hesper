@@ -101,6 +101,7 @@ structure Vocab where
   eosToken : Option Nat  -- End of sequence
   unkToken : Option Nat  -- Unknown token
   padToken : Option Nat  -- Padding token
+  usesBPE : Bool := false  -- BPE uses Ġ (U+0120), SentencePiece uses ▁ (U+2581)
   deriving Repr
 
 /-! ## Tokenizer Structure -/
@@ -230,9 +231,20 @@ def createVocabFromGGUF (gguf : GGUFFile) : IO Vocab := do
   -- Build lookup map
   let pieceToId := buildPieceToIdMap tokens
 
-  -- Find special tokens
-  let bosToken := findSpecialToken tokens ["<s>", "<bos>", "[BOS]"]
-  let eosToken := findSpecialToken tokens ["</s>", "<eos>", "[EOS]"]
+  -- Find special tokens: prefer explicit GGUF metadata IDs, fall back to name search
+  let readTokenId (key : String) : Option Nat :=
+    match gguf.metadata.find? (·.1 == key) with
+    | some (_, mv) =>
+      if mv.data.size >= 4 then
+        let v := mv.data[0]!.toNat ||| (mv.data[1]!.toNat <<< 8) |||
+                 (mv.data[2]!.toNat <<< 16) ||| (mv.data[3]!.toNat <<< 24)
+        some v
+      else none
+    | none => none
+  let bosToken := readTokenId "tokenizer.ggml.bos_token_id" |>.orElse
+    (fun _ => findSpecialToken tokens ["<s>", "<bos>", "[BOS]", "<|begin_of_text|>"])
+  let eosToken := readTokenId "tokenizer.ggml.eos_token_id" |>.orElse
+    (fun _ => findSpecialToken tokens ["</s>", "<eos>", "[EOS]", "<|end_of_text|>"])
   let unkToken := findSpecialToken tokens ["<unk>", "[UNK]"]
   let padToken := findSpecialToken tokens ["<pad>", "[PAD]"]
 
@@ -240,6 +252,13 @@ def createVocabFromGGUF (gguf : GGUFFile) : IO Vocab := do
   IO.println s!"  BOS token: {bosToken}"
   IO.println s!"  EOS token: {eosToken}"
   IO.println s!"  UNK token: {unkToken}"
+
+  -- Detect BPE vs SentencePiece space encoding
+  let usesBPE := tokens.any (fun t => t.piece.startsWith "Ġ")
+  if usesBPE then
+    IO.println "  Space encoding: BPE (Ġ)"
+  else
+    IO.println "  Space encoding: SentencePiece (▁)"
 
   return {
     tokens := tokens
@@ -249,16 +268,18 @@ def createVocabFromGGUF (gguf : GGUFFile) : IO Vocab := do
     eosToken := eosToken
     unkToken := unkToken
     padToken := padToken
+    usesBPE := usesBPE
   }
 
 /-! ## Tokenization (Encoding) -/
 
 /-- Normalize text: add space marker, handle special cases -/
-def normalizeText (text : String) : String :=
+def normalizeText (vocab : Vocab) (text : String) : String :=
   -- Add space marker at beginning if not present
   let text := if text.startsWith " " then text else " " ++ text
-  -- Replace spaces with ▁ (U+2581)
-  text.replace " " "▁"
+  -- BPE uses Ġ (U+0120), SentencePiece uses ▁ (U+2581)
+  let spaceMarker := if vocab.usesBPE then "Ġ" else "▁"
+  text.replace " " spaceMarker
 
 /-- Find longest matching token piece starting at position -/
 partial def findLongestMatch (vocab : Vocab) (text : String) (startPos : Nat) : Option (Nat × Nat) :=
@@ -279,7 +300,7 @@ partial def findLongestMatch (vocab : Vocab) (text : String) (startPos : Nat) : 
 
 /-- Greedy tokenization (simplified, real SentencePiece uses Viterbi) -/
 partial def tokenizeGreedy (vocab : Vocab) (text : String) : Array Nat :=
-  let normalized := normalizeText text
+  let normalized := normalizeText vocab text
   let textLen := normalized.length
 
   let rec loop (pos : Nat) (acc : Array Nat) : Array Nat :=

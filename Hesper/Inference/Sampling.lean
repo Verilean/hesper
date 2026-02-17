@@ -264,6 +264,25 @@ def sampleNucleus (logits : Array Float) (p : Float) (temperature : Float) (rand
   let sampledIdx := categoricalSample normalizedProbs randomValue
   nucleusIndices[sampledIdx]!
 
+/-! ## Repetition Penalty -/
+
+/-- Apply repetition penalty to logits.
+    Tokens that appeared in `prevTokens` have their logits divided (if positive)
+    or multiplied (if negative) by the penalty factor.
+    penalty = 1.0 means no penalty. Typical values: 1.1 - 1.3. -/
+def applyRepetitionPenalty (logits : Array Float) (prevTokens : Array Nat)
+    (penalty : Float) : Array Float :=
+  if penalty == 1.0 then logits
+  else
+    prevTokens.foldl (init := logits) fun acc tokenId =>
+      if tokenId < acc.size then
+        let logit := acc[tokenId]!
+        if logit > 0 then
+          acc.set! tokenId (logit / penalty)
+        else
+          acc.set! tokenId (logit * penalty)
+      else acc
+
 /-! ## High-Level Sampling Interface -/
 
 /-- Sampling strategy -/
