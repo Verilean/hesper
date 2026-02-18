@@ -79,6 +79,8 @@ jobs:
 
       - name: Setup Lean
         uses: leanprover/lean-action@v1
+        with:
+          auto-config: false
 
       - name: Cache Dawn build
         id: cache-dawn
