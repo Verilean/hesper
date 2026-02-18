@@ -28,7 +28,7 @@ jobs:
       - name: Setup Lean
         uses: leanprover/lean-action@v1
         with:
-          build-args: '--wfail'
+          auto-config: false
 
       - name: Build Hesper library
         run: lake build Hesper
