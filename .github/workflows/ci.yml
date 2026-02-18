@@ -186,7 +186,7 @@ jobs:
   # ============================================================================
   macos-metal:
     name: macOS + Metal (Benchmark)
-    runs-on: macos-14
+    runs-on: macos-15
 
     steps:
       - name: Checkout repository
@@ -236,8 +236,8 @@ jobs:
             .lake/build/dawn-build.hash
             .lake/build/native
             .lake/build/simd
-          key: macos-14-native-${{ hashFiles('native/**', 'c_src/**', 'lakefile.lean') }}
-          restore-keys: macos-14-native-
+          key: macos-15-native-${{ hashFiles('native/**', 'c_src/**', 'lakefile.lean') }}
+          restore-keys: macos-15-native-
 
       - name: Build native libraries
         run: lake run buildNative
