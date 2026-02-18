@@ -243,11 +243,57 @@ jobs:
       - name: Build test-all
         run: lake build test-all
 
-      - name: Build bitnet-complete
-        run: lake build bitnet-complete
+      - name: Build bitnet-complete and micro-bench
+        run: lake build bitnet-complete micro-bench
 
       - name: Run unit tests
         run: .lake/build/bin/test-all
+
+      - name: Run micro-benchmark
+        run: .lake/build/bin/micro-bench | tee micro-bench-output.txt
+
+      - name: Parse micro-benchmark results
+        run: |
+          # Extract per-operation latencies and projected TPS
+          parse_ms() { grep "$1" micro-bench-output.txt | grep -oE '[0-9]+\.[0-9]+ ms' | head -1 | awk '{print $1}'; }
+          RMSNORM=$(parse_ms "RMSNorm")
+          BL_Q=$(parse_ms "BitLinear (2560->2560)")
+          BL_GATE=$(parse_ms "BitLinear (2560->6912)")
+          BL_DOWN=$(parse_ms "BitLinear (6912->2560)")
+          ADD=$(parse_ms "Elementwise Add")
+          RELUSQR=$(parse_ms "ReLU")
+          LMHEAD=$(parse_ms "MatMul LM Head")
+          ARGMAX=$(parse_ms "GPU Argmax")
+          PROJ_TPS=$(grep "Projected TPS" micro-bench-output.txt | grep -oE '[0-9]+\.?[0-9]*' | head -1)
+          echo "Projected TPS: ${PROJ_TPS}"
+          cat <<EOF > micro-bench-results.json
+          [
+            { "name": "Projected TPS", "unit": "tokens/sec", "value": ${PROJ_TPS:-0} },
+            { "name": "RMSNorm (2560)", "unit": "ms", "value": ${RMSNORM:-0} },
+            { "name": "BitLinear Q (2560->2560)", "unit": "ms", "value": ${BL_Q:-0} },
+            { "name": "BitLinear Gate (2560->6912)", "unit": "ms", "value": ${BL_GATE:-0} },
+            { "name": "BitLinear Down (6912->2560)", "unit": "ms", "value": ${BL_DOWN:-0} },
+            { "name": "Elementwise Add (2560)", "unit": "ms", "value": ${ADD:-0} },
+            { "name": "ReLU-Sqr-Mul (6912)", "unit": "ms", "value": ${RELUSQR:-0} },
+            { "name": "MatMul LM Head", "unit": "ms", "value": ${LMHEAD:-0} },
+            { "name": "GPU Argmax (128256)", "unit": "ms", "value": ${ARGMAX:-0} }
+          ]
+          EOF
+          cat micro-bench-results.json
+
+      - name: Store micro-benchmark result
+        uses: benchmark-action/github-action-benchmark@v1
+        if: github.event_name == 'push'
+        with:
+          name: Hesper Kernel Micro-Benchmark
+          tool: customSmallerIsBetter
+          output-file-path: micro-bench-results.json
+          benchmark-data-dir-path: dev/micro-bench
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          auto-push: true
+          alert-threshold: "150%"
+          comment-on-alert: true
+          fail-on-alert: false
 
       - name: Restore GGUF model cache
         id: cache-gguf
