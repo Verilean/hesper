@@ -7,6 +7,10 @@ on:
     branches: [ master, main ]
   workflow_dispatch:
 
+permissions:
+  deployments: write
+  contents: write
+
 jobs:
   # ============================================================================
   # Lean Build and Unit Tests (Fast - No GPU Required)
@@ -176,10 +180,10 @@ jobs:
           Write-Host "All test targets built successfully"
 
   # ============================================================================
-  # macOS with Metal Backend (Bonus)
+  # macOS with Metal Backend - Full Build + Test + Benchmark
   # ============================================================================
   macos-metal:
-    name: macOS + Metal
+    name: macOS + Metal (Benchmark)
     runs-on: macos-14
 
     steps:
@@ -189,37 +193,112 @@ jobs:
           submodules: recursive
 
       - name: Install dependencies
+        run: brew install cmake ninja
+
+      - name: Setup macOS SDK symlink
         run: |
-          brew install cmake ninja pkg-config
-          # Metal is included in Xcode
-          xcodebuild -version
+          # The lakefile hardcodes /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk
+          # On GitHub Actions runners the SDK is under Xcode, so create a symlink
+          SDK_PATH=$(xcrun --show-sdk-path)
+          echo "Detected SDK path: $SDK_PATH"
+          sudo mkdir -p /Library/Developer/CommandLineTools/SDKs/
+          sudo ln -sf "$SDK_PATH" /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk
+          ls -la /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk
 
       - name: Setup Lean
         uses: leanprover/lean-action@v1
+        with:
+          auto-config: false
 
-      - name: Cache Dawn build (macOS)
-        id: cache-dawn-macos
+      - name: Restore Lake packages cache
+        uses: actions/cache@v4
+        with:
+          path: .lake/packages
+          key: lake-pkgs-${{ hashFiles('lean-toolchain', 'lake-manifest.json') }}
+          restore-keys: lake-pkgs-
+
+      - name: Restore Dawn source cache
+        id: cache-dawn-src
+        uses: actions/cache@v4
+        with:
+          path: .lake/build/dawn-src
+          key: dawn-src-3f79f3aefe0b0a498002564fcfb13eb21ab6c047
+
+      - name: Restore Dawn build + native + SIMD cache
+        id: cache-native
         uses: actions/cache@v4
         with:
           path: |
             .lake/build/dawn-build
             .lake/build/dawn-install
-          key: ${{ runner.os }}-dawn-${{ hashFiles('native/CMakeLists.txt') }}
-          restore-keys: |
-            ${{ runner.os }}-dawn-
+            .lake/build/dawn-build.hash
+            .lake/build/native
+            .lake/build/simd
+          key: macos-14-native-${{ hashFiles('native/**', 'c_src/**', 'lakefile.lean') }}
+          restore-keys: macos-14-native-
 
-      - name: Build Hesper
-        run: |
-          lake build Hesper
-          echo "Hesper library built successfully on macOS"
+      - name: Build native libraries
+        run: lake run buildNative
 
-      - name: Run tests
+      - name: Build test-all
+        run: lake build test-all
+
+      - name: Build bitnet-complete
+        run: lake build bitnet-complete
+
+      - name: Run unit tests
+        run: .lake/build/bin/test-all
+
+      - name: Restore GGUF model cache
+        id: cache-gguf
+        uses: actions/cache@v4
+        with:
+          path: data/gguf/ggml-model-i2_s.gguf
+          key: gguf-bitnet-2B-4T-i2s
+
+      - name: Download GGUF model
+        if: steps.cache-gguf.outputs.cache-hit != 'true'
         run: |
-          echo "Running Lean tests..."
-          lake build Tests.WGSLDSLTests
-          lake build Tests.NumericalTests
-          lake build Tests.GPUAccuracyTests
-          echo "All test targets built successfully"
+          mkdir -p data/gguf
+          curl -L -o data/gguf/ggml-model-i2_s.gguf \
+            "https://huggingface.co/microsoft/bitnet-b1.58-2B-4T-gguf/resolve/main/ggml-model-i2_s.gguf"
+          ls -lh data/gguf/ggml-model-i2_s.gguf
+
+      - name: Run BitNet benchmark
+        run: |
+          echo "=== BitNet b1.58 2B Benchmark (macOS Metal) ==="
+          .lake/build/bin/bitnet-complete data/gguf/ggml-model-i2_s.gguf "Hello" 20 --stats | tee benchmark-output.txt
+
+      - name: Parse benchmark results
+        run: |
+          # Extract TPS and ms/token from output like: "  8.70 ms/token = 114.94 tokens/sec"
+          MS_PER_TOKEN=$(grep -oE '[0-9]+\.[0-9]+ ms/token' benchmark-output.txt | head -1 | awk '{print $1}')
+          TPS=$(grep -oE '[0-9]+\.[0-9]+ tokens/sec' benchmark-output.txt | head -1 | awk '{print $1}')
+          echo "Extracted: ${TPS} tokens/sec, ${MS_PER_TOKEN} ms/token"
+          cat <<EOF > benchmark-results.json
+          [
+            {
+              "name": "BitNet b1.58 2B Inference (macOS Metal)",
+              "unit": "tokens/sec",
+              "value": ${TPS},
+              "extra": "ms/token: ${MS_PER_TOKEN}"
+            }
+          ]
+          EOF
+          cat benchmark-results.json
+
+      - name: Store benchmark result
+        uses: benchmark-action/github-action-benchmark@v1
+        if: github.event_name == 'push'
+        with:
+          name: BitNet Inference Benchmark
+          tool: customBiggerIsBetter
+          output-file-path: benchmark-results.json
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          auto-push: true
+          alert-threshold: "80%"
+          comment-on-alert: true
+          fail-on-alert: false
 
   # ============================================================================
   # Test Coverage Summary
