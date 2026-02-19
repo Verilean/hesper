@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1771477976009,
+  "lastUpdate": 1771482431008,
   "repoUrl": "https://github.com/Verilean/hesper",
   "entries": {
     "BitNet Inference Benchmark": [
@@ -30,6 +30,36 @@ window.BENCHMARK_DATA = {
             "value": 13.755356,
             "unit": "tokens/sec",
             "extra": "ms/token: 2206.051396"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "junji.hashimoto@gree.net",
+            "name": "Junji Hashimoto",
+            "username": "junjihashimoto"
+          },
+          "committer": {
+            "email": "junji.hashimoto@gree.net",
+            "name": "Junji Hashimoto",
+            "username": "junjihashimoto"
+          },
+          "distinct": true,
+          "id": "a688ce9848d6416b2e958b29a0a3b95518df7505",
+          "message": "feat: HESPER_GPU_FEATURES env var for device feature selection\n\nAdd runtime feature level control via environment variable:\n  auto (default) - autodetect, try all features with graceful fallback\n  subgroup_matrix - force subgroups + subgroup matrix\n  subgroup        - force subgroups only, skip subgroup matrix\n  basic           - ShaderF16 only, no subgroups\n\nAlso fixes 3-tier device creation fallback: previously missing\nsubgroup matrix caused subgroups to be lost entirely.",
+          "timestamp": "2026-02-19T15:24:29+09:00",
+          "tree_id": "d828356132dad8ee9070ac4f1381cb7b83e34082",
+          "url": "https://github.com/Verilean/hesper/commit/a688ce9848d6416b2e958b29a0a3b95518df7505"
+        },
+        "date": 1771482429358,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "BitNet b1.58 2B Inference (macOS Metal)",
+            "value": 18.14947,
+            "unit": "tokens/sec",
+            "extra": "ms/token: 1484.162562"
           }
         ]
       }
