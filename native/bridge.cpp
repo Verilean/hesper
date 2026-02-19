@@ -578,7 +578,27 @@ static wgpu::Device tryCreateDevice(wgpu::Adapter& adapter,
     return adapter.CreateDevice(&deviceDesc);
 }
 
-// Shared device creation: max limits, tries subgroups then falls back to ShaderF16 only
+// Feature level for device creation, controlled by HESPER_GPU_FEATURES env var.
+//   "auto"     (default) - autodetect: try all features, fallback gracefully
+//   "subgroup_matrix"    - force subgroups + subgroup matrix (fail if unavailable)
+//   "subgroup"           - force subgroups only, skip subgroup matrix
+//   "basic"              - ShaderF16 only, no subgroups
+enum class FeatureLevel { Auto, SubgroupMatrix, Subgroup, Basic };
+
+static FeatureLevel getFeatureLevel() {
+    const char* env = std::getenv("HESPER_GPU_FEATURES");
+    if (!env) return FeatureLevel::Auto;
+    std::string val(env);
+    if (val == "subgroup_matrix") return FeatureLevel::SubgroupMatrix;
+    if (val == "subgroup")        return FeatureLevel::Subgroup;
+    if (val == "basic")           return FeatureLevel::Basic;
+    if (val == "auto")            return FeatureLevel::Auto;
+    std::cout << "[Hesper] WARNING: unknown HESPER_GPU_FEATURES=\"" << val
+              << "\", using auto. Valid: auto, subgroup_matrix, subgroup, basic" << std::endl;
+    return FeatureLevel::Auto;
+}
+
+// Shared device creation: max limits, feature level from env or autodetect
 static wgpu::Device createDeviceWithMaxLimits(wgpu::Adapter& adapter) {
     // Toggles: enable experimental APIs for subgroup matrix
     static WGPUDawnTogglesDescriptor toggles = {};
@@ -590,34 +610,70 @@ static wgpu::Device createDeviceWithMaxLimits(wgpu::Adapter& adapter) {
     // Limits: max settings for large model buffers (1 GB storage, 2 GB buffer)
     WGPULimits limits = getMaxLimits();
 
-    // Try with subgroups first (if adapter supports them)
-    if (adapter.HasFeature(wgpu::FeatureName::Subgroups)) {
-        static std::array<WGPUFeatureName, 3> allFeatures = {
-            WGPUFeatureName_ShaderF16,
-            WGPUFeatureName_Subgroups,
-            WGPUFeatureName_ChromiumExperimentalSubgroupMatrix
-        };
-        wgpu::Device device = tryCreateDevice(adapter, allFeatures.data(), allFeatures.size(), limits, &toggles);
-        if (device) {
-            if (g_verbose) std::cout << "[Hesper] Device created with max limits + subgroup support" << std::endl;
-            if (g_verbose) std::cout << "  maxStorageBufferBindingSize: " << limits.maxStorageBufferBindingSize << std::endl;
-            if (g_verbose) std::cout << "  maxBufferSize: " << limits.maxBufferSize << std::endl;
-            return device;
-        }
-        if (g_verbose) std::cout << "[Hesper] Device creation with subgroups failed, trying without..." << std::endl;
-    } else {
-        if (g_verbose) std::cout << "[Hesper] Adapter does not support subgroups, skipping..." << std::endl;
+    FeatureLevel level = getFeatureLevel();
+    bool hasSubgroups = adapter.HasFeature(wgpu::FeatureName::Subgroups);
+
+    if (level != FeatureLevel::Auto) {
+        std::cout << "[Hesper] HESPER_GPU_FEATURES="
+                  << (level == FeatureLevel::SubgroupMatrix ? "subgroup_matrix" :
+                      level == FeatureLevel::Subgroup ? "subgroup" : "basic")
+                  << std::endl;
     }
 
-    // Fallback: ShaderF16 only (no subgroups)
+    // --- Tier 1: ShaderF16 + Subgroups + ChromiumExperimentalSubgroupMatrix ---
+    if (level == FeatureLevel::Auto || level == FeatureLevel::SubgroupMatrix) {
+        if (hasSubgroups) {
+            static std::array<WGPUFeatureName, 3> allFeatures = {
+                WGPUFeatureName_ShaderF16,
+                WGPUFeatureName_Subgroups,
+                WGPUFeatureName_ChromiumExperimentalSubgroupMatrix
+            };
+            wgpu::Device device = tryCreateDevice(adapter, allFeatures.data(), allFeatures.size(), limits, &toggles);
+            if (device) {
+                std::cout << "[Hesper] Device: subgroups + subgroup_matrix" << std::endl;
+                return device;
+            }
+            if (level == FeatureLevel::SubgroupMatrix) {
+                std::cout << "[Hesper] ERROR: subgroup_matrix requested but device creation failed" << std::endl;
+                return {};
+            }
+            if (g_verbose) std::cout << "[Hesper] subgroups+matrix failed, trying subgroups only..." << std::endl;
+        } else if (level == FeatureLevel::SubgroupMatrix) {
+            std::cout << "[Hesper] ERROR: subgroup_matrix requested but adapter lacks subgroup support" << std::endl;
+            return {};
+        }
+    }
+
+    // --- Tier 2: ShaderF16 + Subgroups (no subgroup matrix) ---
+    if (level == FeatureLevel::Auto || level == FeatureLevel::Subgroup) {
+        if (hasSubgroups) {
+            static std::array<WGPUFeatureName, 2> subgroupFeatures = {
+                WGPUFeatureName_ShaderF16,
+                WGPUFeatureName_Subgroups
+            };
+            wgpu::Device device = tryCreateDevice(adapter, subgroupFeatures.data(), subgroupFeatures.size(), limits, nullptr);
+            if (device) {
+                std::cout << "[Hesper] Device: subgroups (no subgroup_matrix)" << std::endl;
+                return device;
+            }
+            if (level == FeatureLevel::Subgroup) {
+                std::cout << "[Hesper] ERROR: subgroup requested but device creation failed" << std::endl;
+                return {};
+            }
+            if (g_verbose) std::cout << "[Hesper] subgroups failed, trying basic..." << std::endl;
+        } else if (level == FeatureLevel::Subgroup) {
+            std::cout << "[Hesper] ERROR: subgroup requested but adapter lacks subgroup support" << std::endl;
+            return {};
+        }
+    }
+
+    // --- Tier 3: ShaderF16 only (no subgroups) ---
     static std::array<WGPUFeatureName, 1> basicFeatures = {
         WGPUFeatureName_ShaderF16
     };
     wgpu::Device device = tryCreateDevice(adapter, basicFeatures.data(), basicFeatures.size(), limits, nullptr);
     if (device) {
-        if (g_verbose) std::cout << "[Hesper] Device created with max limits (no subgroup support)" << std::endl;
-        if (g_verbose) std::cout << "  maxStorageBufferBindingSize: " << limits.maxStorageBufferBindingSize << std::endl;
-        if (g_verbose) std::cout << "  maxBufferSize: " << limits.maxBufferSize << std::endl;
+        std::cout << "[Hesper] Device: basic (no subgroups)" << std::endl;
     }
     return device;
 }
