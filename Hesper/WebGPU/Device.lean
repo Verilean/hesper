@@ -38,6 +38,11 @@ opaque getDeviceWithFeatures (inst : @& Instance) : IO Device
 @[extern "lean_hesper_get_device_by_index"]
 opaque getDeviceByIndex (inst : @& Instance) (gpuIdx : @& UInt32) : IO Device
 
+/-- Check if the device was created with subgroup support.
+    Returns `true` if `subgroupAdd` and related operations are available. -/
+@[extern "lean_hesper_device_has_subgroups"]
+opaque deviceHasSubgroups (device : @& Device) : IO Bool
+
 /-- Tick the device (process callbacks and events).
     Should be called regularly when doing async operations. -/
 @[extern "lean_hesper_device_tick"]
