@@ -707,6 +707,7 @@ structure BitLinear where
   weightsPacked : Buffer   -- i2_s packed weights (raw bytes as u32 array)
   scaleBuf : Buffer        -- Single f32 scale value
   prepared : IO.Ref (Option Hesper.WGSL.Execute.PreparedDispatch)  -- Graph capture cache
+  kernel : Hesper.WGSL.Execute.CompiledKernel  -- Pre-compiled M=1 kernel
 
 /-- Create BitLinear layer from i2_s packed data
 
@@ -750,8 +751,14 @@ def create (device : Device) (config : Config)
   writeBuffer device scaleBuf 0 scaleBytes
 
   let prepared ← IO.mkRef none
+  -- Build M=1 kernel at init time (cached by WGSL source hash)
+  let kernel ← Hesper.WGSL.Execute.buildKernel device (fusedBitLinearM1Kernel config) {
+    workgroupSize := { x := 32, y := 1, z := 1 }
+    numWorkgroups := (config.outDim, 1, 1)
+    diagnostics := [("off", "chromium.subgroup_matrix_uniformity")]
+  }
   logVerbose s!"[BitLinear] Layer created: packed={paddedWeights.size} bytes"
-  pure { config, weightsPacked := weightsBuf, scaleBuf := scaleBuf, prepared }
+  pure { config, weightsPacked := weightsBuf, scaleBuf := scaleBuf, prepared, kernel }
 
 /-- Create BitLinear layer from packed data + scale ByteArrays
 
@@ -796,8 +803,14 @@ def createFromBytes (device : Device) (config : Config)
   writeBuffer device scaleBuf 0 scaleBytes
 
   let prepared ← IO.mkRef none
+  -- Build M=1 kernel at init time (cached by WGSL source hash)
+  let kernel ← Hesper.WGSL.Execute.buildKernel device (fusedBitLinearM1Kernel config) {
+    workgroupSize := { x := 32, y := 1, z := 1 }
+    numWorkgroups := (config.outDim, 1, 1)
+    diagnostics := [("off", "chromium.subgroup_matrix_uniformity")]
+  }
   logVerbose s!"[BitLinear] Layer created: packed={paddedWeights.size} bytes"
-  pure { config, weightsPacked := weightsBuf, scaleBuf := scaleBuf, prepared }
+  pure { config, weightsPacked := weightsBuf, scaleBuf := scaleBuf, prepared, kernel }
 
 /-- Execute forward pass
 
@@ -818,27 +831,22 @@ def forward (device : Device) (layer : BitLinear)
   preparedMissesRef.modify (· + 1)
   logVerbose s!"[BitLinear] Executing forward pass ({numRows} rows, {layer.config.inDim}→{layer.config.outDim})..."
 
-  let namedBuffers := [
-    ("weights_packed", layer.weightsPacked),
-    ("scale", layer.scaleBuf),
-    ("input", inputBuf),
-    ("output", outputBuf)
-  ]
-
   if numRows == 1 then
-    -- M=1 path: one subgroup (32 threads) per output, coalesced weights, L2-cached input
-    let shader := fusedBitLinearM1Kernel layer.config
-    let execConfig : Hesper.WGSL.Execute.ExecutionConfig := {
-      workgroupSize := { x := 32, y := 1, z := 1 }
-      numWorkgroups := (layer.config.outDim, 1, 1)
-      diagnostics := [("off", "chromium.subgroup_matrix_uniformity")]
-    }
-    let cacheKey : UInt64 := hash ("blm1", layer.config.inDim, layer.config.outDim)
-    Hesper.WGSL.Execute.executeShaderNamed device shader namedBuffers execConfig (some cacheKey) (some layer.prepared)
+    -- M=1 path: use pre-compiled kernel, direct buffer binding (no string matching)
+    let bg ← Hesper.WGSL.Execute.bindKernelDirect device layer.kernel
+      #[layer.weightsPacked, layer.scaleBuf, inputBuf, outputBuf]
+    layer.prepared.set (some (layer.kernel.prepare bg))
+    Hesper.WGSL.Execute.dispatchKernel device layer.kernel bg (layer.config.outDim, 1, 1)
   else
     -- M>1 path: workgroup-cooperative tiled kernel
     let wgSize := 256
     let shader := fusedBitLinearKernel layer.config numRows wgSize
+    let namedBuffers := [
+      ("weights_packed", layer.weightsPacked),
+      ("scale", layer.scaleBuf),
+      ("input", inputBuf),
+      ("output", outputBuf)
+    ]
     let totalOutputs := numRows * layer.config.outDim
     let execConfig : Hesper.WGSL.Execute.ExecutionConfig := {
       workgroupSize := { x := wgSize, y := 1, z := 1 }
