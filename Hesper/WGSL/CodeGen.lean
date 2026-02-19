@@ -143,12 +143,12 @@ def generateComputeModule
   let state : ShaderState := ShaderM.exec computation
 
   -- Convert declared buffers to StorageBuffer list with automatic binding
-  let storageBuffers := state.declaredBuffers.mapIdx fun i (name, ty, _) =>
+  let storageBuffers := state.declaredBuffers.mapIdx fun i (name, ty, mode) =>
     { group := 0
       binding := i
       name := name
       elemType := ty
-      readWrite := true }
+      readWrite := match mode with | .readWrite => true | .read => false }
 
   -- Convert shared vars to WorkgroupVar list
   let workgroupVars := state.sharedVars.map fun (name, ty) =>
@@ -194,12 +194,12 @@ def generateComputeModuleWithDiagnostics
   let state : ShaderState := ShaderM.exec computation
 
   -- Convert declared buffers to StorageBuffer list with automatic binding
-  let storageBuffers := state.declaredBuffers.mapIdx fun i (name, ty, _) =>
+  let storageBuffers := state.declaredBuffers.mapIdx fun i (name, ty, mode) =>
     { group := 0
       binding := i
       name := name
       elemType := ty
-      readWrite := true }
+      readWrite := match mode with | .readWrite => true | .read => false }
 
   -- Convert shared vars to WorkgroupVar list
   let workgroupVars := state.sharedVars.map fun (name, ty) =>

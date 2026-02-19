@@ -33,12 +33,18 @@ def myShader : ShaderM Unit := do
 ```
 -/
 
+/-- Buffer access mode for storage buffers -/
+inductive BufferAccessMode where
+  | read       -- var<storage, read> (read-only)
+  | readWrite  -- var<storage, read_write> (read-write)
+  deriving Repr, BEq
+
 /-- Shader Construction State -/
 structure ShaderState where
   stmts : List Stmt                                    -- Accumulated statements
   varCounter : Nat                                      -- For generating unique variable names
   sharedVars : List (String × WGSLType)                -- Shared memory declarations
-  declaredBuffers : List (String × WGSLType × String)  -- Auto-tracked buffer bindings (name, type, space)
+  declaredBuffers : List (String × WGSLType × BufferAccessMode)  -- Auto-tracked buffer bindings (name, type, access mode)
 
 /-- The Shader Monad -/
 abbrev ShaderM (α : Type) := StateM ShaderState α
@@ -216,19 +222,20 @@ def writeWorkgroup {ty : WGSLType} (sharedName : String) (idx : Exp (.scalar .u3
 -- Automatic Binding Management
 -- ============================================================================
 
-/-- Declare an input buffer with automatic binding assignment -/
+/-- Declare an input buffer (read-only) with automatic binding assignment -/
 def declareInputBuffer (name : String) (ty : WGSLType) : ShaderM String := do
-  modify fun s => { s with declaredBuffers := s.declaredBuffers ++ [(name, ty, "storage")] }
+  modify fun s => { s with declaredBuffers := s.declaredBuffers ++ [(name, ty, .readWrite)] }
   return name
 
-/-- Declare an output buffer with automatic binding assignment -/
+/-- Declare an output buffer (read-write) with automatic binding assignment -/
 def declareOutputBuffer (name : String) (ty : WGSLType) : ShaderM String := do
-  modify fun s => { s with declaredBuffers := s.declaredBuffers ++ [(name, ty, "storage")] }
+  modify fun s => { s with declaredBuffers := s.declaredBuffers ++ [(name, ty, .readWrite)] }
   return name
 
-/-- Declare a storage buffer with automatic binding assignment -/
-def declareStorageBuffer (name : String) (ty : WGSLType) : ShaderM String := do
-  modify fun s => { s with declaredBuffers := s.declaredBuffers ++ [(name, ty, "storage")] }
+/-- Declare a storage buffer with explicit access mode -/
+def declareStorageBuffer (name : String) (ty : WGSLType)
+    (mode : BufferAccessMode := .readWrite) : ShaderM String := do
+  modify fun s => { s with declaredBuffers := s.declaredBuffers ++ [(name, ty, mode)] }
   return name
 
 -- ============================================================================
