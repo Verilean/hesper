@@ -96,6 +96,7 @@ structure CachedPipeline where
   bindGroupLayout : BindGroupLayout
   pipeline : ComputePipeline
   declaredNames : List String
+  declaredModes : List Monad.BufferAccessMode
 
 /-- Global pipeline cache: maps WGSL source hash to cached pipeline -/
 initialize pipelineCacheRef : IO.Ref (Array (UInt64 × CachedPipeline)) ← IO.mkRef #[]
@@ -257,6 +258,126 @@ def compileToWGSL
     : String :=
   generateWGSL funcName workgroupSize extensions diagnostics computation
 
+/-! ## CompiledKernel (Zero-Overhead Dispatch API)
+
+Separates shader compilation from dispatch. A `CompiledKernel` holds the compiled
+pipeline and binding layout, ready for buffer binding and dispatch without any
+string matching, WGSL regeneration, or cache lookups.
+
+Usage:
+```lean
+-- At initialization (once):
+let kernel ← buildKernel device myShaderM config
+let bg ← bindKernel device kernel [("input", inBuf), ("output", outBuf)]
+
+-- At dispatch time (hot loop, zero overhead):
+dispatchKernel device kernel bg (numWorkgroups, 1, 1)
+
+-- Or combine into PreparedDispatch for even fewer indirections:
+let prepared := kernel.prepare bg
+replayPreparedDispatch device prepared wx wy wz
+```
+-/
+
+/-- Pre-compiled kernel: pipeline + layout + binding order.
+    Created once via `buildKernel`, reused across dispatches. -/
+structure CompiledKernel where
+  pipeline : ComputePipeline
+  bindGroupLayout : BindGroupLayout
+  declaredNames : Array String  -- Buffer names in binding order
+  sourceHash : UInt64
+
+namespace CompiledKernel
+
+/-- Create a PreparedDispatch from this kernel and a bind group -/
+def prepare (kernel : CompiledKernel) (bindGroup : BindGroup) : PreparedDispatch :=
+  { pipeline := kernel.pipeline, bindGroup }
+
+end CompiledKernel
+
+/-- Compile a ShaderM computation into a reusable CompiledKernel.
+    Uses the global pipeline cache. Thread-safe for repeated calls. -/
+def buildKernel (device : Device) (computation : ShaderM Unit)
+    (config : ExecutionConfig) : IO CompiledKernel := do
+  let wgslSource := compileToWGSL computation config.funcName config.workgroupSize config.extensions config.diagnostics
+  let sourceHash : UInt64 := hash wgslSource
+  let cache ← pipelineCacheRef.get
+  match findCachedPipeline sourceHash cache with
+  | some cp =>
+    cacheHitsRef.modify (· + 1)
+    pure { pipeline := cp.pipeline, bindGroupLayout := cp.bindGroupLayout,
+           declaredNames := cp.declaredNames.toArray, sourceHash }
+  | none =>
+    cacheMissesRef.modify (· + 1)
+    let shaderModule ← createShaderModule device wgslSource
+    let state := Monad.ShaderM.exec computation
+    let declaredNames := state.declaredBuffers.map (·.1)
+    let declaredModes := state.declaredBuffers.map (·.2.2)
+    let layoutEntries := declaredModes.mapIdx fun i mode =>
+      { binding := i.toUInt32
+        visibility := ShaderStage.compute
+        bindingType := BindingType.buffer (match mode with | .read => true | .readWrite => false) }
+    let bindGroupLayout ← createBindGroupLayout device layoutEntries.toArray
+    let pipelineDesc : ComputePipelineDescriptor := {
+      shaderModule := shaderModule
+      entryPoint := config.funcName
+      bindGroupLayout := bindGroupLayout
+    }
+    let pipeline ← createComputePipeline device pipelineDesc
+    pipelineCacheRef.modify (·.push (sourceHash, {
+      shaderModule := shaderModule
+      bindGroupLayout := bindGroupLayout
+      pipeline := pipeline
+      declaredNames := declaredNames
+      declaredModes := declaredModes
+    }))
+    pure { pipeline, bindGroupLayout, declaredNames := declaredNames.toArray, sourceHash }
+
+/-- Create a BindGroup by matching named buffers to a CompiledKernel's bindings.
+    Uses the global bind group cache. -/
+def bindKernel (device : Device) (kernel : CompiledKernel)
+    (namedBuffers : List (String × Buffer)) : IO BindGroup := do
+  let bgKey ← computeBindGroupKey kernel.sourceHash (namedBuffers.map (·.snd))
+  let bgCache ← bindGroupCacheRef.get
+  match findCachedBindGroup bgKey bgCache with
+  | some bg =>
+    bgCacheHitsRef.modify (· + 1)
+    pure bg
+  | none =>
+    bgCacheMissesRef.modify (· + 1)
+    let sortedBuffers := kernel.declaredNames.toList.filterMap fun name =>
+      namedBuffers.find? (·.fst == name) |>.map (·.snd)
+    if sortedBuffers.length != kernel.declaredNames.size then
+      throw <| IO.userError s!"bindKernel: expected {kernel.declaredNames.size} buffers ({kernel.declaredNames.toList}), got {sortedBuffers.length}"
+    let bindEntries := sortedBuffers.mapIdx fun i buf =>
+      { binding := i.toUInt32, buffer := buf, offset := 0, size := 0 }
+    let bg ← createBindGroup device kernel.bindGroupLayout bindEntries.toArray
+    bindGroupCacheRef.modify (·.push (bgKey, bg))
+    pure bg
+
+/-- Create a BindGroup from pre-sorted buffer array (no name matching).
+    Buffers must be in binding order (matching kernel.declaredNames). -/
+def bindKernelDirect (device : Device) (kernel : CompiledKernel)
+    (buffers : Array Buffer) : IO BindGroup := do
+  if buffers.size != kernel.declaredNames.size then
+    throw <| IO.userError s!"bindKernelDirect: expected {kernel.declaredNames.size} buffers, got {buffers.size}"
+  let bindEntries := buffers.mapIdx fun i buf =>
+    { binding := i.toUInt32, buffer := buf, offset := 0, size := 0 }
+  createBindGroup device kernel.bindGroupLayout bindEntries
+
+/-- Dispatch a compiled kernel with a pre-built BindGroup.
+    Zero string matching. Works in both batch mode and standalone mode. -/
+def dispatchKernel (device : Device) (kernel : CompiledKernel) (bindGroup : BindGroup)
+    (numWorkgroups : Nat × Nat × Nat) : IO Unit := do
+  let (wx, wy, wz) := numWorkgroups
+  match ← batchEncoderRef.get with
+  | some encoder =>
+    recordDispatch encoder kernel.pipeline bindGroup wx.toUInt32 wy.toUInt32 wz.toUInt32
+    batchDispatchCountRef.modify (· + 1)
+  | none =>
+    let future ← dispatchCompute device kernel.pipeline bindGroup wx.toUInt32 wy.toUInt32 wz.toUInt32
+    deviceWait future
+
 /-- Create shader module from ShaderM computation -/
 def createShaderFromComputation
     (device : Device)
@@ -336,11 +457,12 @@ def executeShaderNamed
         let wgslSource := compileToWGSL computation config.funcName config.workgroupSize config.extensions config.diagnostics
         let shaderModule ← createShaderModule device wgslSource
         let state := ShaderM.exec computation
-        let declaredNames := state.declaredBuffers.map (·.fst)
-        let layoutEntries := List.range declaredNames.length |>.map fun i =>
+        let declaredNames := state.declaredBuffers.map (·.1)
+        let declaredModes := state.declaredBuffers.map (·.2.2)
+        let layoutEntries := declaredModes.mapIdx fun i mode =>
           { binding := i.toUInt32
             visibility := ShaderStage.compute
-            bindingType := BindingType.buffer false }
+            bindingType := BindingType.buffer (match mode with | .read => true | .readWrite => false) }
         let bindGroupLayout ← createBindGroupLayout device layoutEntries.toArray
         let pipelineDesc : ComputePipelineDescriptor := {
           shaderModule := shaderModule
@@ -353,6 +475,7 @@ def executeShaderNamed
           bindGroupLayout := bindGroupLayout
           pipeline := pipeline
           declaredNames := declaredNames
+          declaredModes := declaredModes
         }))
         pure (pipeline, bindGroupLayout, declaredNames)
 
@@ -431,11 +554,12 @@ def executeShaderRecorded
       cacheMissesRef.modify (· + 1)
       let shaderModule ← createShaderModule device wgslSource
       let state := ShaderM.exec computation
-      let declaredNames := state.declaredBuffers.map (·.fst)
-      let layoutEntries := List.range declaredNames.length |>.map fun i =>
+      let declaredNames := state.declaredBuffers.map (·.1)
+      let declaredModes := state.declaredBuffers.map (·.2.2)
+      let layoutEntries := declaredModes.mapIdx fun i mode =>
         { binding := i.toUInt32
           visibility := ShaderStage.compute
-          bindingType := BindingType.buffer false }
+          bindingType := BindingType.buffer (match mode with | .read => true | .readWrite => false) }
       let bindGroupLayout ← createBindGroupLayout device layoutEntries.toArray
       let pipelineDesc : ComputePipelineDescriptor := {
         shaderModule := shaderModule
@@ -448,6 +572,7 @@ def executeShaderRecorded
         bindGroupLayout := bindGroupLayout
         pipeline := pipeline
         declaredNames := declaredNames
+        declaredModes := declaredModes
       }))
       pure (pipeline, bindGroupLayout, declaredNames)
 
