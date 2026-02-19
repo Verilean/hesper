@@ -563,7 +563,22 @@ static WGPULimits getMaxLimits() {
     return limits;
 }
 
-// Shared device creation: max limits + subgroup matrix + ShaderF16
+// Try to create a device with given feature set
+static wgpu::Device tryCreateDevice(wgpu::Adapter& adapter,
+                                     const WGPUFeatureName* features, size_t featureCount,
+                                     const WGPULimits& limits,
+                                     const WGPUDawnTogglesDescriptor* toggles) {
+    wgpu::DeviceDescriptor deviceDesc{};
+    if (toggles) {
+        deviceDesc.nextInChain = reinterpret_cast<const wgpu::ChainedStruct*>(&toggles->chain);
+    }
+    deviceDesc.requiredFeatureCount = featureCount;
+    deviceDesc.requiredFeatures = reinterpret_cast<const wgpu::FeatureName*>(features);
+    deviceDesc.requiredLimits = reinterpret_cast<const wgpu::Limits*>(&limits);
+    return adapter.CreateDevice(&deviceDesc);
+}
+
+// Shared device creation: max limits, tries subgroups then falls back to ShaderF16 only
 static wgpu::Device createDeviceWithMaxLimits(wgpu::Adapter& adapter) {
     // Toggles: enable experimental APIs for subgroup matrix
     static WGPUDawnTogglesDescriptor toggles = {};
@@ -572,26 +587,35 @@ static wgpu::Device createDeviceWithMaxLimits(wgpu::Adapter& adapter) {
     toggles.enabledToggles = enableList;
     toggles.enabledToggleCount = 1;
 
-    // Features: ShaderF16, Subgroups, SubgroupMatrix
-    static std::array<WGPUFeatureName, 3> features = {
-        WGPUFeatureName_ShaderF16,
-        WGPUFeatureName_Subgroups,
-        WGPUFeatureName_ChromiumExperimentalSubgroupMatrix
-    };
-
     // Limits: max settings for large model buffers (1 GB storage, 2 GB buffer)
     WGPULimits limits = getMaxLimits();
 
-    // Assemble device descriptor
-    wgpu::DeviceDescriptor deviceDesc{};
-    deviceDesc.nextInChain = reinterpret_cast<const wgpu::ChainedStruct*>(&toggles.chain);
-    deviceDesc.requiredFeatureCount = features.size();
-    deviceDesc.requiredFeatures = reinterpret_cast<const wgpu::FeatureName*>(features.data());
-    deviceDesc.requiredLimits = reinterpret_cast<const wgpu::Limits*>(&limits);
+    // Try with subgroups first (if adapter supports them)
+    if (adapter.HasFeature(wgpu::FeatureName::Subgroups)) {
+        static std::array<WGPUFeatureName, 3> allFeatures = {
+            WGPUFeatureName_ShaderF16,
+            WGPUFeatureName_Subgroups,
+            WGPUFeatureName_ChromiumExperimentalSubgroupMatrix
+        };
+        wgpu::Device device = tryCreateDevice(adapter, allFeatures.data(), allFeatures.size(), limits, &toggles);
+        if (device) {
+            if (g_verbose) std::cout << "[Hesper] Device created with max limits + subgroup support" << std::endl;
+            if (g_verbose) std::cout << "  maxStorageBufferBindingSize: " << limits.maxStorageBufferBindingSize << std::endl;
+            if (g_verbose) std::cout << "  maxBufferSize: " << limits.maxBufferSize << std::endl;
+            return device;
+        }
+        if (g_verbose) std::cout << "[Hesper] Device creation with subgroups failed, trying without..." << std::endl;
+    } else {
+        if (g_verbose) std::cout << "[Hesper] Adapter does not support subgroups, skipping..." << std::endl;
+    }
 
-    wgpu::Device device = adapter.CreateDevice(&deviceDesc);
+    // Fallback: ShaderF16 only (no subgroups)
+    static std::array<WGPUFeatureName, 1> basicFeatures = {
+        WGPUFeatureName_ShaderF16
+    };
+    wgpu::Device device = tryCreateDevice(adapter, basicFeatures.data(), basicFeatures.size(), limits, nullptr);
     if (device) {
-        if (g_verbose) std::cout << "[Hesper] Device created with max limits + subgroup matrix support" << std::endl;
+        if (g_verbose) std::cout << "[Hesper] Device created with max limits (no subgroup support)" << std::endl;
         if (g_verbose) std::cout << "  maxStorageBufferBindingSize: " << limits.maxStorageBufferBindingSize << std::endl;
         if (g_verbose) std::cout << "  maxBufferSize: " << limits.maxBufferSize << std::endl;
     }
@@ -742,6 +766,13 @@ lean_obj_res lean_hesper_get_device_by_index(b_lean_obj_arg instance_obj, uint32
     lean_object* external = lean_alloc_external(g_webgpu_device_class, devicePtr);
 
     return lean_io_result_mk_ok(external);
+}
+
+// Query whether the device was created with subgroup support
+lean_obj_res lean_hesper_device_has_subgroups(b_lean_obj_arg device_obj, lean_obj_res /* unit */) {
+    wgpu::Device* device = EXTRACT_DEVICE_PTR(device_obj);
+    bool has = device->HasFeature(wgpu::FeatureName::Subgroups);
+    return lean_io_result_mk_ok(lean_box(has ? 1 : 0));
 }
 
 lean_obj_res lean_hesper_release_device(b_lean_obj_arg /* device */, lean_obj_res /* unit */) {
