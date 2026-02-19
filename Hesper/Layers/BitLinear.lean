@@ -235,6 +235,32 @@ def fusedBitLinearKernel (config : Config) (numRows : Nat) (workgroupSize : Nat 
     ShaderM.writeBuffer (ty := .scalar .f32) "output" outputIdx result
   ) (pure ())
 
+/-! ## Shared-Memory Tree Reduction Helper -/
+
+/-- Emit shared-memory tree reduction for a workgroup of 32 threads.
+    Reads the accumulator value, writes it to shared memory, then performs
+    5 rounds of tree reduction (stride 16, 8, 4, 2, 1).
+    Returns an expression holding the final reduced sum (valid only for tid==0).
+
+    @param tid Thread ID expression
+    @param acc Accumulator expression to reduce
+    @param sharedName Name for the shared memory variable
+    @return Expression for the reduced sum (shared[0]) -/
+private def sharedMemReduce32 (tid : Exp (.scalar .u32)) (acc : Exp (.scalar .f32))
+    (sharedName : String := "shared_reduce") : ShaderM (Exp (.scalar .f32)) := do
+  ShaderM.sharedNamed sharedName (.array (.scalar .f32) 32)
+  ShaderM.writeWorkgroup (ty := .scalar .f32) sharedName tid acc
+  ShaderM.barrier
+  -- Tree reduction: 5 rounds for 32 threads
+  for stride in [16, 8, 4, 2, 1] do
+    ShaderM.if_ (Exp.lt tid (Exp.litU32 stride)) (do
+      let a ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := 32) sharedName tid
+      let b ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := 32) sharedName (Exp.add tid (Exp.litU32 stride))
+      ShaderM.writeWorkgroup (ty := .scalar .f32) sharedName tid (Exp.add a b)
+    ) (pure ())
+    ShaderM.barrier
+  ShaderM.readWorkgroup (ty := .scalar .f32) (n := 32) sharedName (Exp.litU32 0)
+
 /-! ## M=1 Warp-Cooperative BitLinear Kernel (Single-Token Inference) -/
 
 /-- M=1 warp-cooperative kernel: one subgroup (32 threads) per output element
@@ -592,6 +618,237 @@ def fusedGateUpReluSqrMulM1Kernel (config : Config) : ShaderM Unit := do
     ShaderM.writeBuffer (ty := .scalar .f32) "output" outIdx result
   ) (pure ())
 
+/-! ## Shared-Memory Fallback M=1 Kernels (No Subgroup Support) -/
+
+/-- M=1 BitLinear kernel using shared-memory reduction (no subgroups required).
+    Same algorithm as `fusedBitLinearM1Kernel` but uses tree reduction instead of `subgroupAdd`. -/
+def fusedBitLinearM1KernelSharedMem (config : Config) : ShaderM Unit := do
+  let wid ← ShaderM.workgroupId
+  let lid ← ShaderM.localId
+  let outIdx := Exp.vec3X wid
+  let tid := Exp.vec3X lid
+
+  let totalWeightElements := config.outDim * config.inDim
+  let numPackedBytes := totalWeightElements / 4
+  let numPackedU32 := (numPackedBytes + 3) / 4
+
+  let _packed ← ShaderM.declareInputBuffer "weights_packed" (.array (.scalar .u32) numPackedU32)
+  let _scale ← ShaderM.declareInputBuffer "scale" (.array (.scalar .f32) 1)
+  let _input ← ShaderM.declareInputBuffer "input" (.array (.scalar .f32) config.inDim)
+  let _output ← ShaderM.declareOutputBuffer "output" (.array (.scalar .f32) config.outDim)
+
+  ShaderM.varNamed "acc" (.scalar .f32) (Exp.litF32 0.0)
+  let acc : Exp (.scalar .f32) := Exp.var "acc"
+
+  let u32PerRow := config.inDim / 16
+  let rowBaseU32 := Exp.mul outIdx (Exp.litU32 u32PerRow)
+
+  ShaderM.loop tid (Exp.litU32 u32PerRow) (Exp.litU32 32) fun u32Idx => do
+    let packedU32 ← ShaderM.readBuffer (ty := .scalar .u32) (n := numPackedU32) "weights_packed"
+      (Exp.add rowBaseU32 u32Idx)
+    let localGroup := Exp.div u32Idx (Exp.litU32 8)
+    let localGroupPos := Exp.mul (Exp.mod u32Idx (Exp.litU32 8)) (Exp.litU32 4)
+    let elemBase := Exp.add (Exp.mul localGroup (Exp.litU32 128)) localGroupPos
+    for b in [0:4] do
+      let theByte := Exp.bitAnd (Exp.shiftRight packedU32 (Exp.litU32 (b * 8))) (Exp.litU32 0xFF)
+      for s in [0:4] do
+        let code := Exp.bitAnd (Exp.shiftRight theByte (Exp.litU32 (6 - s * 2))) (Exp.litU32 0x3)
+        let ternaryF32 := Exp.sub (Exp.toF32 code) (Exp.litF32 1.0)
+        let elemIdx := Exp.add elemBase (Exp.litU32 (b + s * 32))
+        let inputVal ← ShaderM.readBuffer (ty := .scalar .f32) (n := config.inDim) "input" elemIdx
+        ShaderM.assign "acc" (Exp.add acc (Exp.mul ternaryF32 inputVal))
+
+  -- Shared-memory tree reduction instead of subgroupAdd
+  let totalSum ← sharedMemReduce32 tid acc "shared_reduce"
+
+  let inBounds := Exp.lt outIdx (Exp.litU32 config.outDim)
+  ShaderM.if_ (Exp.and (Exp.eq tid (Exp.litU32 0)) inBounds) (do
+    let scaleVal ← ShaderM.readBuffer (ty := .scalar .f32) (n := 1) "scale" (Exp.litU32 0)
+    let result := Exp.mul scaleVal totalSum
+    ShaderM.writeBuffer (ty := .scalar .f32) "output" outIdx result
+  ) (pure ())
+
+/-- M=1 BitLinear+Residual kernel using shared-memory reduction (no subgroups required). -/
+def fusedBitLinearResidualM1KernelSharedMem (config : Config) : ShaderM Unit := do
+  let wid ← ShaderM.workgroupId
+  let lid ← ShaderM.localId
+  let outIdx := Exp.vec3X wid
+  let tid := Exp.vec3X lid
+
+  let totalWeightElements := config.outDim * config.inDim
+  let numPackedBytes := totalWeightElements / 4
+  let numPackedU32 := (numPackedBytes + 3) / 4
+
+  let _packed ← ShaderM.declareInputBuffer "weights_packed" (.array (.scalar .u32) numPackedU32)
+  let _scale ← ShaderM.declareInputBuffer "scale" (.array (.scalar .f32) 1)
+  let _input ← ShaderM.declareInputBuffer "input" (.array (.scalar .f32) config.inDim)
+  let _residual ← ShaderM.declareInputBuffer "residual" (.array (.scalar .f32) config.outDim)
+  let _output ← ShaderM.declareOutputBuffer "output" (.array (.scalar .f32) config.outDim)
+
+  ShaderM.varNamed "acc" (.scalar .f32) (Exp.litF32 0.0)
+  let acc : Exp (.scalar .f32) := Exp.var "acc"
+
+  let u32PerRow := config.inDim / 16
+  let rowBaseU32 := Exp.mul outIdx (Exp.litU32 u32PerRow)
+
+  ShaderM.loop tid (Exp.litU32 u32PerRow) (Exp.litU32 32) fun u32Idx => do
+    let packedU32 ← ShaderM.readBuffer (ty := .scalar .u32) (n := numPackedU32) "weights_packed"
+      (Exp.add rowBaseU32 u32Idx)
+    let localGroup := Exp.div u32Idx (Exp.litU32 8)
+    let localGroupPos := Exp.mul (Exp.mod u32Idx (Exp.litU32 8)) (Exp.litU32 4)
+    let elemBase := Exp.add (Exp.mul localGroup (Exp.litU32 128)) localGroupPos
+    for b in [0:4] do
+      let theByte := Exp.bitAnd (Exp.shiftRight packedU32 (Exp.litU32 (b * 8))) (Exp.litU32 0xFF)
+      for s in [0:4] do
+        let code := Exp.bitAnd (Exp.shiftRight theByte (Exp.litU32 (6 - s * 2))) (Exp.litU32 0x3)
+        let ternaryF32 := Exp.sub (Exp.toF32 code) (Exp.litF32 1.0)
+        let elemIdx := Exp.add elemBase (Exp.litU32 (b + s * 32))
+        let inputVal ← ShaderM.readBuffer (ty := .scalar .f32) (n := config.inDim) "input" elemIdx
+        ShaderM.assign "acc" (Exp.add acc (Exp.mul ternaryF32 inputVal))
+
+  let totalSum ← sharedMemReduce32 tid acc "shared_reduce"
+
+  let inBounds := Exp.lt outIdx (Exp.litU32 config.outDim)
+  ShaderM.if_ (Exp.and (Exp.eq tid (Exp.litU32 0)) inBounds) (do
+    let scaleVal ← ShaderM.readBuffer (ty := .scalar .f32) (n := 1) "scale" (Exp.litU32 0)
+    let residualVal ← ShaderM.readBuffer (ty := .scalar .f32) (n := config.outDim) "residual" outIdx
+    let result := Exp.add residualVal (Exp.mul scaleVal totalSum)
+    ShaderM.writeBuffer (ty := .scalar .f32) "output" outIdx result
+  ) (pure ())
+
+/-- Fused RMSNorm+BitLinear+Residual M=1 kernel using shared-memory reduction (no subgroups). -/
+def fusedRMSNormBitLinearResidualM1KernelSharedMem (config : Config) (eps : Float := 1e-5) : ShaderM Unit := do
+  let wid ← ShaderM.workgroupId
+  let lid ← ShaderM.localId
+  let outIdx := Exp.vec3X wid
+  let tid := Exp.vec3X lid
+
+  let totalWeightElements := config.outDim * config.inDim
+  let numPackedBytes := totalWeightElements / 4
+  let numPackedU32 := (numPackedBytes + 3) / 4
+
+  let _input ← ShaderM.declareInputBuffer "input" (.array (.scalar .f32) config.inDim)
+  let _rmsScale ← ShaderM.declareInputBuffer "rms_scale" (.array (.scalar .f32) config.inDim)
+  let _packed ← ShaderM.declareInputBuffer "weights_packed" (.array (.scalar .u32) numPackedU32)
+  let _blScale ← ShaderM.declareInputBuffer "bl_scale" (.array (.scalar .f32) 1)
+  let _residual ← ShaderM.declareInputBuffer "residual" (.array (.scalar .f32) config.outDim)
+  let _output ← ShaderM.declareOutputBuffer "output" (.array (.scalar .f32) config.outDim)
+
+  -- Phase 1: Compute RMS via shared-memory reduction
+  ShaderM.varNamed "partial_sq" (.scalar .f32) (Exp.litF32 0.0)
+  let partialSq : Exp (.scalar .f32) := Exp.var "partial_sq"
+
+  ShaderM.loop tid (Exp.litU32 config.inDim) (Exp.litU32 32) fun elemIdx => do
+    let val ← ShaderM.readBuffer (ty := .scalar .f32) (n := config.inDim) "input" elemIdx
+    ShaderM.assign "partial_sq" (Exp.add partialSq (Exp.mul val val))
+
+  let totalSq ← sharedMemReduce32 tid partialSq "shared_rms"
+  -- Store totalSq in a var so all threads can use it after barrier
+  ShaderM.varNamed "totalSq_val" (.scalar .f32) totalSq
+
+  -- Broadcast totalSq to all threads via shared memory (thread 0 already has it in shared[0])
+  -- After the reduction, shared_rms[0] contains the result, which all threads can read
+  let totalSqBroadcast ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := 32) "shared_rms" (Exp.litU32 0)
+  let mean := Exp.div totalSqBroadcast (Exp.litF32 config.inDim.toFloat)
+  let rmsInv := Exp.inverseSqrt (Exp.add mean (Exp.litF32 eps))
+
+  -- Phase 2: BitLinear dot product with inline normalization
+  ShaderM.varNamed "acc" (.scalar .f32) (Exp.litF32 0.0)
+  let acc : Exp (.scalar .f32) := Exp.var "acc"
+
+  let u32PerRow := config.inDim / 16
+  let rowBaseU32 := Exp.mul outIdx (Exp.litU32 u32PerRow)
+
+  ShaderM.loop tid (Exp.litU32 u32PerRow) (Exp.litU32 32) fun u32Idx => do
+    let packedU32 ← ShaderM.readBuffer (ty := .scalar .u32) (n := numPackedU32) "weights_packed"
+      (Exp.add rowBaseU32 u32Idx)
+    let localGroup := Exp.div u32Idx (Exp.litU32 8)
+    let localGroupPos := Exp.mul (Exp.mod u32Idx (Exp.litU32 8)) (Exp.litU32 4)
+    let elemBase := Exp.add (Exp.mul localGroup (Exp.litU32 128)) localGroupPos
+    for b in [0:4] do
+      let theByte := Exp.bitAnd (Exp.shiftRight packedU32 (Exp.litU32 (b * 8))) (Exp.litU32 0xFF)
+      for s in [0:4] do
+        let code := Exp.bitAnd (Exp.shiftRight theByte (Exp.litU32 (6 - s * 2))) (Exp.litU32 0x3)
+        let ternaryF32 := Exp.sub (Exp.toF32 code) (Exp.litF32 1.0)
+        let elemIdx := Exp.add elemBase (Exp.litU32 (b + s * 32))
+        let inputVal ← ShaderM.readBuffer (ty := .scalar .f32) (n := config.inDim) "input" elemIdx
+        let scaleVal ← ShaderM.readBuffer (ty := .scalar .f32) (n := config.inDim) "rms_scale" elemIdx
+        let normalized := Exp.mul (Exp.mul inputVal rmsInv) scaleVal
+        ShaderM.assign "acc" (Exp.add acc (Exp.mul ternaryF32 normalized))
+
+  -- Second shared-memory reduction for dot product
+  let totalSum ← sharedMemReduce32 tid acc "shared_dot"
+
+  let inBounds := Exp.lt outIdx (Exp.litU32 config.outDim)
+  ShaderM.if_ (Exp.and (Exp.eq tid (Exp.litU32 0)) inBounds) (do
+    let blScaleVal ← ShaderM.readBuffer (ty := .scalar .f32) (n := 1) "bl_scale" (Exp.litU32 0)
+    let residualVal ← ShaderM.readBuffer (ty := .scalar .f32) (n := config.outDim) "residual" outIdx
+    let result := Exp.add residualVal (Exp.mul blScaleVal totalSum)
+    ShaderM.writeBuffer (ty := .scalar .f32) "output" outIdx result
+  ) (pure ())
+
+/-- Fused gate+up+ReLU²×mul M=1 kernel using shared-memory reduction (no subgroups). -/
+def fusedGateUpReluSqrMulM1KernelSharedMem (config : Config) : ShaderM Unit := do
+  let wid ← ShaderM.workgroupId
+  let lid ← ShaderM.localId
+  let outIdx := Exp.vec3X wid
+  let tid := Exp.vec3X lid
+
+  let totalWeightElements := config.outDim * config.inDim
+  let numPackedBytes := totalWeightElements / 4
+  let numPackedU32 := (numPackedBytes + 3) / 4
+
+  let _input ← ShaderM.declareInputBuffer "input" (.array (.scalar .f32) config.inDim)
+  let _gatePacked ← ShaderM.declareInputBuffer "gate_packed" (.array (.scalar .u32) numPackedU32)
+  let _gateScale ← ShaderM.declareInputBuffer "gate_scale" (.array (.scalar .f32) 1)
+  let _upPacked ← ShaderM.declareInputBuffer "up_packed" (.array (.scalar .u32) numPackedU32)
+  let _upScale ← ShaderM.declareInputBuffer "up_scale" (.array (.scalar .f32) 1)
+  let _output ← ShaderM.declareOutputBuffer "output" (.array (.scalar .f32) config.outDim)
+
+  ShaderM.varNamed "gate_acc" (.scalar .f32) (Exp.litF32 0.0)
+  ShaderM.varNamed "up_acc" (.scalar .f32) (Exp.litF32 0.0)
+  let gateAcc : Exp (.scalar .f32) := Exp.var "gate_acc"
+  let upAcc : Exp (.scalar .f32) := Exp.var "up_acc"
+
+  let u32PerRow := config.inDim / 16
+  let rowBaseU32 := Exp.mul outIdx (Exp.litU32 u32PerRow)
+
+  ShaderM.loop tid (Exp.litU32 u32PerRow) (Exp.litU32 32) fun u32Idx => do
+    let gatePackedU32 ← ShaderM.readBuffer (ty := .scalar .u32) (n := numPackedU32) "gate_packed"
+      (Exp.add rowBaseU32 u32Idx)
+    let upPackedU32 ← ShaderM.readBuffer (ty := .scalar .u32) (n := numPackedU32) "up_packed"
+      (Exp.add rowBaseU32 u32Idx)
+    let localGroup := Exp.div u32Idx (Exp.litU32 8)
+    let localGroupPos := Exp.mul (Exp.mod u32Idx (Exp.litU32 8)) (Exp.litU32 4)
+    let elemBase := Exp.add (Exp.mul localGroup (Exp.litU32 128)) localGroupPos
+    for b in [0:4] do
+      let gateByte := Exp.bitAnd (Exp.shiftRight gatePackedU32 (Exp.litU32 (b * 8))) (Exp.litU32 0xFF)
+      let upByte := Exp.bitAnd (Exp.shiftRight upPackedU32 (Exp.litU32 (b * 8))) (Exp.litU32 0xFF)
+      for s in [0:4] do
+        let gateCode := Exp.bitAnd (Exp.shiftRight gateByte (Exp.litU32 (6 - s * 2))) (Exp.litU32 0x3)
+        let gateTernary := Exp.sub (Exp.toF32 gateCode) (Exp.litF32 1.0)
+        let upCode := Exp.bitAnd (Exp.shiftRight upByte (Exp.litU32 (6 - s * 2))) (Exp.litU32 0x3)
+        let upTernary := Exp.sub (Exp.toF32 upCode) (Exp.litF32 1.0)
+        let elemIdx := Exp.add elemBase (Exp.litU32 (b + s * 32))
+        let inputVal ← ShaderM.readBuffer (ty := .scalar .f32) (n := config.inDim) "input" elemIdx
+        ShaderM.assign "gate_acc" (Exp.add gateAcc (Exp.mul gateTernary inputVal))
+        ShaderM.assign "up_acc" (Exp.add upAcc (Exp.mul upTernary inputVal))
+
+  -- Two separate shared-memory reductions (gate and up)
+  let gateTotal ← sharedMemReduce32 tid gateAcc "shared_gate"
+  let upTotal ← sharedMemReduce32 tid upAcc "shared_up"
+
+  let inBounds := Exp.lt outIdx (Exp.litU32 config.outDim)
+  ShaderM.if_ (Exp.and (Exp.eq tid (Exp.litU32 0)) inBounds) (do
+    let gateScaleVal ← ShaderM.readBuffer (ty := .scalar .f32) (n := 1) "gate_scale" (Exp.litU32 0)
+    let upScaleVal ← ShaderM.readBuffer (ty := .scalar .f32) (n := 1) "up_scale" (Exp.litU32 0)
+    let gateScaled := Exp.mul gateScaleVal gateTotal
+    let upScaled := Exp.mul upScaleVal upTotal
+    let reluVal := Exp.max gateScaled (Exp.litF32 0.0)
+    let result := Exp.mul (Exp.mul reluVal reluVal) upScaled
+    ShaderM.writeBuffer (ty := .scalar .f32) "output" outIdx result
+  ) (pure ())
+
 /-! ## Fused BitLinear + Residual Add Kernel -/
 
 /-- Fused kernel: i2_s unpack + matrix-vector multiply + residual add
@@ -751,13 +1008,18 @@ def create (device : Device) (config : Config)
   writeBuffer device scaleBuf 0 scaleBytes
 
   let prepared ← IO.mkRef none
-  -- Build M=1 kernel at init time (cached by WGSL source hash)
-  let kernel ← Hesper.WGSL.Execute.buildKernel device (fusedBitLinearM1Kernel config) {
+  -- Build M=1 kernel at init time (select subgroup or shared-mem fallback)
+  let useSubgroups ← Hesper.WGSL.Execute.hasSubgroupSupport device
+  let shaderM := if useSubgroups
+    then fusedBitLinearM1Kernel config
+    else fusedBitLinearM1KernelSharedMem config
+  let kernel ← Hesper.WGSL.Execute.buildKernel device shaderM {
     workgroupSize := { x := 32, y := 1, z := 1 }
     numWorkgroups := (config.outDim, 1, 1)
-    diagnostics := [("off", "chromium.subgroup_matrix_uniformity")]
+    extensions := if useSubgroups then ["subgroups"] else []
+    diagnostics := if useSubgroups then [("off", "chromium.subgroup_matrix_uniformity")] else []
   }
-  logVerbose s!"[BitLinear] Layer created: packed={paddedWeights.size} bytes"
+  logVerbose s!"[BitLinear] Layer created: packed={paddedWeights.size} bytes (subgroups={useSubgroups})"
   pure { config, weightsPacked := weightsBuf, scaleBuf := scaleBuf, prepared, kernel }
 
 /-- Create BitLinear layer from packed data + scale ByteArrays
@@ -803,13 +1065,18 @@ def createFromBytes (device : Device) (config : Config)
   writeBuffer device scaleBuf 0 scaleBytes
 
   let prepared ← IO.mkRef none
-  -- Build M=1 kernel at init time (cached by WGSL source hash)
-  let kernel ← Hesper.WGSL.Execute.buildKernel device (fusedBitLinearM1Kernel config) {
+  -- Build M=1 kernel at init time (select subgroup or shared-mem fallback)
+  let useSubgroups ← Hesper.WGSL.Execute.hasSubgroupSupport device
+  let shaderM := if useSubgroups
+    then fusedBitLinearM1Kernel config
+    else fusedBitLinearM1KernelSharedMem config
+  let kernel ← Hesper.WGSL.Execute.buildKernel device shaderM {
     workgroupSize := { x := 32, y := 1, z := 1 }
     numWorkgroups := (config.outDim, 1, 1)
-    diagnostics := [("off", "chromium.subgroup_matrix_uniformity")]
+    extensions := if useSubgroups then ["subgroups"] else []
+    diagnostics := if useSubgroups then [("off", "chromium.subgroup_matrix_uniformity")] else []
   }
-  logVerbose s!"[BitLinear] Layer created: packed={paddedWeights.size} bytes"
+  logVerbose s!"[BitLinear] Layer created: packed={paddedWeights.size} bytes (subgroups={useSubgroups})"
   pure { config, weightsPacked := weightsBuf, scaleBuf := scaleBuf, prepared, kernel }
 
 /-- Execute forward pass
@@ -889,14 +1156,18 @@ def forwardWithResidual (device : Device) (layer : BitLinear)
   ]
 
   if numRows == 1 then
-    -- M=1 path: one subgroup (32 threads) per output, fused residual add
-    let shader := fusedBitLinearResidualM1Kernel layer.config
+    -- M=1 path: 32 threads per output, fused residual add
+    let useSubgroups ← Hesper.WGSL.Execute.hasSubgroupSupport device
+    let shader := if useSubgroups
+      then fusedBitLinearResidualM1Kernel layer.config
+      else fusedBitLinearResidualM1KernelSharedMem layer.config
     let execConfig : Hesper.WGSL.Execute.ExecutionConfig := {
       workgroupSize := { x := 32, y := 1, z := 1 }
       numWorkgroups := (layer.config.outDim, 1, 1)
-      diagnostics := [("off", "chromium.subgroup_matrix_uniformity")]
+      extensions := if useSubgroups then ["subgroups"] else []
+      diagnostics := if useSubgroups then [("off", "chromium.subgroup_matrix_uniformity")] else []
     }
-    let cacheKey : UInt64 := hash ("blrm1", layer.config.inDim, layer.config.outDim)
+    let cacheKey : UInt64 := hash ("blrm1", layer.config.inDim, layer.config.outDim, useSubgroups)
     Hesper.WGSL.Execute.executeShaderNamed device shader namedBuffers execConfig (some cacheKey) (some layer.prepared)
   else
     -- M>1 path: workgroup-cooperative tiled kernel with residual
@@ -942,7 +1213,10 @@ def forwardFusedRMSNormResidual (device : Device) (layer : BitLinear)
   preparedMissesRef.modify (· + 1)
   logVerbose s!"[BitLinear] Executing fused RMSNorm+BitLinear+Residual ({layer.config.inDim}→{layer.config.outDim})..."
 
-  let shader := fusedRMSNormBitLinearResidualM1Kernel layer.config rmsNorm.config.eps
+  let useSubgroups ← Hesper.WGSL.Execute.hasSubgroupSupport device
+  let shader := if useSubgroups
+    then fusedRMSNormBitLinearResidualM1Kernel layer.config rmsNorm.config.eps
+    else fusedRMSNormBitLinearResidualM1KernelSharedMem layer.config rmsNorm.config.eps
   let namedBuffers := [
     ("input", inputBuf),
     ("rms_scale", rmsNorm.scale),
@@ -954,9 +1228,10 @@ def forwardFusedRMSNormResidual (device : Device) (layer : BitLinear)
   let execConfig : Hesper.WGSL.Execute.ExecutionConfig := {
     workgroupSize := { x := 32, y := 1, z := 1 }
     numWorkgroups := (layer.config.outDim, 1, 1)
-    diagnostics := [("off", "chromium.subgroup_matrix_uniformity")]
+    extensions := if useSubgroups then ["subgroups"] else []
+    diagnostics := if useSubgroups then [("off", "chromium.subgroup_matrix_uniformity")] else []
   }
-  let cacheKey : UInt64 := hash ("frnblrm1", layer.config.inDim, layer.config.outDim)
+  let cacheKey : UInt64 := hash ("frnblrm1", layer.config.inDim, layer.config.outDim, useSubgroups)
   Hesper.WGSL.Execute.executeShaderNamed device shader namedBuffers execConfig (some cacheKey) preparedRef
 
 /-- Execute fused Gate+Up+ReLU²×Mul forward pass (M=1 only).
@@ -985,7 +1260,10 @@ def forwardFusedGateUpReluSqrMul (device : Device) (gateLayer upLayer : BitLinea
   preparedMissesRef.modify (· + 1)
   logVerbose s!"[BitLinear] Executing fused Gate+Up+ReLU²×Mul ({gateLayer.config.inDim}→{gateLayer.config.outDim})..."
 
-  let shader := fusedGateUpReluSqrMulM1Kernel gateLayer.config
+  let useSubgroups ← Hesper.WGSL.Execute.hasSubgroupSupport device
+  let shader := if useSubgroups
+    then fusedGateUpReluSqrMulM1Kernel gateLayer.config
+    else fusedGateUpReluSqrMulM1KernelSharedMem gateLayer.config
   let namedBuffers := [
     ("input", inputBuf),
     ("gate_packed", gateLayer.weightsPacked),
@@ -997,9 +1275,10 @@ def forwardFusedGateUpReluSqrMul (device : Device) (gateLayer upLayer : BitLinea
   let execConfig : Hesper.WGSL.Execute.ExecutionConfig := {
     workgroupSize := { x := 32, y := 1, z := 1 }
     numWorkgroups := (gateLayer.config.outDim, 1, 1)
-    diagnostics := [("off", "chromium.subgroup_matrix_uniformity")]
+    extensions := if useSubgroups then ["subgroups"] else []
+    diagnostics := if useSubgroups then [("off", "chromium.subgroup_matrix_uniformity")] else []
   }
-  let cacheKey : UInt64 := hash ("fgurelum1", gateLayer.config.inDim, gateLayer.config.outDim)
+  let cacheKey : UInt64 := hash ("fgurelum1", gateLayer.config.inDim, gateLayer.config.outDim, useSubgroups)
   Hesper.WGSL.Execute.executeShaderNamed device shader namedBuffers execConfig (some cacheKey) preparedRef
 
 end Hesper.Layers.BitLinear

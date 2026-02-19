@@ -6,6 +6,7 @@ import Tests.ComputeTests
 import Tests.WGSLDSLTests
 import Tests.NumericalTests
 import Tests.ShaderMonadTests
+import Tests.SubgroupFallbackTests
 
 /-!
 # Hesper Test Suite Runner
@@ -40,9 +41,10 @@ def main : IO UInt32 := do
   let wgslDslTests ← Tests.WGSLDSLTests.allTests
   let numericalTests ← Tests.NumericalTests.allTests
   let shaderMonadTests ← Tests.ShaderMonadTests.allTests
+  let subgroupFallbackTests ← Tests.SubgroupFallbackTests.allTests
 
   -- Combine all tests
-  let allTests := errorTests ++ deviceTests ++ bufferTests ++ computeTests ++ wgslDslTests ++ numericalTests ++ shaderMonadTests
+  let allTests := errorTests ++ deviceTests ++ bufferTests ++ computeTests ++ wgslDslTests ++ numericalTests ++ shaderMonadTests ++ subgroupFallbackTests
 
   IO.println s!"Running {allTests.length} test suites...\n"
 

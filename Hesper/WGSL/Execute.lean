@@ -54,7 +54,7 @@ structure ExecutionConfig where
   funcName : String := "main"
   workgroupSize : WorkgroupSize := {x := 256, y := 1, z := 1}
   numWorkgroups : Nat × Nat × Nat
-  extensions : List String := ["subgroups", "chromium_experimental_subgroup_matrix"]
+  extensions : List String := []
   diagnostics : List (String × String) := []
 
 instance : Inhabited ExecutionConfig where
@@ -62,7 +62,7 @@ instance : Inhabited ExecutionConfig where
     funcName := "main"
     workgroupSize := {x := 256, y := 1, z := 1}
     numWorkgroups := (1, 1, 1)
-    extensions := ["subgroups", "chromium_experimental_subgroup_matrix"]
+    extensions := []
     diagnostics := []
   }
 
@@ -82,6 +82,25 @@ def dispatch1D (totalThreads : Nat) (workgroupSize : Nat := 256) : ExecutionConf
     numWorkgroups := (numWorkgroups, 1, 1) }
 
 end ExecutionConfig
+
+/-! ## Subgroup Feature Detection
+
+Cached runtime check for subgroup support. Queried once per session,
+used to select between subgroup-based kernels and shared-memory fallback kernels.
+-/
+
+/-- Cached subgroup support flag (queried once, then reused) -/
+initialize subgroupSupportRef : IO.Ref (Option Bool) ← IO.mkRef none
+
+/-- Check if the device supports subgroup operations (`subgroupAdd`, etc.).
+    Result is cached after the first call. -/
+def hasSubgroupSupport (device : Device) : IO Bool := do
+  match ← subgroupSupportRef.get with
+  | some v => pure v
+  | none =>
+    let v ← Hesper.WebGPU.deviceHasSubgroups device
+    subgroupSupportRef.set (some v)
+    pure v
 
 /-! ## Pipeline Cache
 
