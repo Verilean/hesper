@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1771482431008,
+  "lastUpdate": 1774762152145,
   "repoUrl": "https://github.com/Verilean/hesper",
   "entries": {
     "BitNet Inference Benchmark": [
@@ -60,6 +60,36 @@ window.BENCHMARK_DATA = {
             "value": 18.14947,
             "unit": "tokens/sec",
             "extra": "ms/token: 1484.162562"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "junji.hashimoto@gree.net",
+            "name": "Junji Hashimoto",
+            "username": "junjihashimoto"
+          },
+          "committer": {
+            "email": "junji.hashimoto@gree.net",
+            "name": "Junji Hashimoto",
+            "username": "junjihashimoto"
+          },
+          "distinct": true,
+          "id": "cc88e218ad1b951a0f4ec8da8d91b33cfdccd722",
+          "message": "Fix lakefile.lean to build google/dawn on 'lake build'",
+          "timestamp": "2026-03-29T14:17:46+09:00",
+          "tree_id": "118c80f180fd93ccdbb0575c454bc6d69930c257",
+          "url": "https://github.com/Verilean/hesper/commit/cc88e218ad1b951a0f4ec8da8d91b33cfdccd722"
+        },
+        "date": 1774762151097,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "BitNet b1.58 2B Inference (macOS Metal)",
+            "value": 14.552593,
+            "unit": "tokens/sec",
+            "extra": "ms/token: 1568.817313"
           }
         ]
       }
