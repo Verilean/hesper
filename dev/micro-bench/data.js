@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1771482397554,
+  "lastUpdate": 1774762119112,
   "repoUrl": "https://github.com/Verilean/hesper",
   "entries": {
     "Hesper Kernel Micro-Benchmark": [
@@ -137,6 +137,75 @@ window.BENCHMARK_DATA = {
           {
             "name": "GPU Argmax (128256)",
             "value": 5.466621,
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "junji.hashimoto@gree.net",
+            "name": "Junji Hashimoto",
+            "username": "junjihashimoto"
+          },
+          "committer": {
+            "email": "junji.hashimoto@gree.net",
+            "name": "Junji Hashimoto",
+            "username": "junjihashimoto"
+          },
+          "distinct": true,
+          "id": "cc88e218ad1b951a0f4ec8da8d91b33cfdccd722",
+          "message": "Fix lakefile.lean to build google/dawn on 'lake build'",
+          "timestamp": "2026-03-29T14:17:46+09:00",
+          "tree_id": "118c80f180fd93ccdbb0575c454bc6d69930c257",
+          "url": "https://github.com/Verilean/hesper/commit/cc88e218ad1b951a0f4ec8da8d91b33cfdccd722"
+        },
+        "date": 1774762118022,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "Projected TPS",
+            "value": 4.191338,
+            "unit": "tokens/sec"
+          },
+          {
+            "name": "RMSNorm (2560)",
+            "value": 0.413642,
+            "unit": "ms"
+          },
+          {
+            "name": "BitLinear Q (2560->2560)",
+            "value": 0.503287,
+            "unit": "ms"
+          },
+          {
+            "name": "BitLinear Gate (2560->6912)",
+            "value": 0.663458,
+            "unit": "ms"
+          },
+          {
+            "name": "BitLinear Down (6912->2560)",
+            "value": 0.780783,
+            "unit": "ms"
+          },
+          {
+            "name": "Elementwise Add (2560)",
+            "value": 0.413754,
+            "unit": "ms"
+          },
+          {
+            "name": "ReLU-Sqr-Mul (6912)",
+            "value": 0.356683,
+            "unit": "ms"
+          },
+          {
+            "name": "MatMul LM Head",
+            "value": 29.799033,
+            "unit": "ms"
+          },
+          {
+            "name": "GPU Argmax (128256)",
+            "value": 1.009429,
             "unit": "ms"
           }
         ]
