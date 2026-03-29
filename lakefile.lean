@@ -3,7 +3,7 @@ open Lake DSL
 open System (FilePath)
 
 package «Hesper» where
-  -- add package configuration options here
+  extraDepTargets := #[`nativeDeps]
 
 require LSpec from git
   "https://github.com/argumentcomputer/LSpec.git" @ "main"
@@ -18,6 +18,145 @@ lean_lib «Examples» where
 lean_lib «Tests» where
   roots := #[`Tests]
   globs := #[.submodules `Tests]
+
+-- ============================================================================
+-- NATIVE DEPENDENCY BUILD (auto-triggered by `lake build`)
+-- ============================================================================
+
+/-- Run a process, printing stdout/stderr. Returns exit code. -/
+private def runCmd (cmd : String) (args : Array String) (cwd : Option FilePath := none) : IO UInt32 := do
+  let child ← IO.Process.spawn {
+    cmd := cmd
+    args := args
+    cwd := cwd
+    stdout := .inherit
+    stderr := .inherit
+  }
+  child.wait
+
+/-- Download Dawn source tarball if not present. -/
+private def downloadDawn (cwd : FilePath) (dawnSrc : FilePath) (dawnVersion : String) : IO UInt32 := do
+  IO.println "[Hesper] Downloading Dawn source tarball..."
+  IO.FS.createDirAll dawnSrc.toString
+  let tarballUrl := s!"https://dawn.googlesource.com/dawn/+archive/{dawnVersion}.tar.gz"
+  let tarballPath := cwd / ".lake/build/dawn.tar.gz"
+  let ret ← runCmd "curl" #["-s", "-L", "-o", tarballPath.toString, tarballUrl]
+  if ret != 0 then return ret
+  let ret ← runCmd "tar" #["-xzf", tarballPath.toString, "-C", dawnSrc.toString]
+  if ret != 0 then return ret
+  IO.println s!"[Hesper] Dawn source extracted to: {dawnSrc}"
+  return 0
+
+/-- Build Dawn with CMake. -/
+private def compileDawn (dawnSrc dawnBuild dawnInstall : FilePath) : IO UInt32 := do
+  IO.println "[Hesper] Building Dawn (this may take 10-15 minutes on first build)..."
+  IO.FS.createDirAll dawnBuild.toString
+  let cmakeArgs := #[
+    "-S", dawnSrc.toString, "-B", dawnBuild.toString,
+    "-DCMAKE_BUILD_TYPE=Release",
+    "-DDAWN_FETCH_DEPENDENCIES=ON",
+    "-DDAWN_BUILD_SAMPLES=OFF", "-DDAWN_BUILD_EXAMPLES=OFF", "-DDAWN_BUILD_TESTS=OFF",
+    "-DDAWN_ENABLE_INSTALL=ON", "-DDAWN_BUILD_MONOLITHIC_LIBRARY=STATIC",
+    "-DCMAKE_INSTALL_PREFIX=" ++ dawnInstall.toString,
+    "-DTINT_BUILD_TESTS=OFF", "-DTINT_BUILD_IR_BINARY=OFF", "-DTINT_BUILD_CMD_TOOLS=OFF",
+    "-DDAWN_ENABLE_NULL=OFF", "-DDAWN_ENABLE_DESKTOP_GL=OFF", "-DDAWN_ENABLE_OPENGLES=OFF"
+  ]
+  let cmakeArgsFinal :=
+    if System.Platform.isOSX then
+      cmakeArgs ++ #["-DDAWN_ENABLE_METAL=ON", "-DDAWN_ENABLE_VULKAN=OFF"]
+    else
+      cmakeArgs ++ #["-DDAWN_ENABLE_VULKAN=ON", "-DDAWN_ENABLE_METAL=OFF"]
+  let ret ← runCmd "cmake" cmakeArgsFinal
+  if ret != 0 then return ret
+  let ret ← runCmd "cmake" #["--build", dawnBuild.toString, "-j", "8"]
+  if ret != 0 then return ret
+  let ret ← runCmd "cmake" #["--install", dawnBuild.toString]
+  return ret
+
+/-- Build Dawn from tarball, configure + compile + install. Cached via hash file. -/
+private def buildDawnIfNeeded (cwd : FilePath) : IO UInt32 := do
+  let dawnSrc := cwd / ".lake/build/dawn-src"
+  let dawnBuild := cwd / ".lake/build/dawn-build"
+  let dawnInstall := cwd / ".lake/build/dawn-install"
+  let dawnVersion := "3f79f3aefe0b0a498002564fcfb13eb21ab6c047"
+
+  -- Download Dawn tarball if not already present
+  if !(← dawnSrc.pathExists) then
+    let ret ← downloadDawn cwd dawnSrc dawnVersion
+    if ret != 0 then return ret
+
+  -- Check if rebuild is needed via hash
+  let platform := if System.Platform.isOSX then "osx" else "linux"
+  let buildConfig := s!"{dawnVersion}-{platform}-Release"
+  let hashFile := cwd / ".lake/build/dawn-build.hash"
+  let hashExists ← hashFile.pathExists
+  let storedHash ← if hashExists then IO.FS.readFile hashFile else pure ""
+  if !hashExists || storedHash.trim != buildConfig then
+    let ret ← compileDawn dawnSrc dawnBuild dawnInstall
+    if ret != 0 then return ret
+    IO.FS.writeFile hashFile buildConfig
+    IO.println "[Hesper] Dawn build complete."
+  else
+    IO.println "[Hesper] Dawn already built (cached)."
+  return 0
+
+/-- Build the Hesper native bridge library. -/
+private def buildBridgeIfNeeded (cwd : FilePath) : IO UInt32 := do
+  let bridgeBuild := cwd / ".lake/build/native"
+  let libPath := bridgeBuild / "libhesper_native.a"
+  if (← libPath.pathExists) then
+    IO.println "[Hesper] Native bridge already built (cached)."
+    return 0
+  else
+    IO.println "[Hesper] Building Hesper native bridge..."
+    IO.FS.createDirAll bridgeBuild
+    let ret ← runCmd "cmake" #[
+      "-S", (cwd / "native").toString, "-B", bridgeBuild.toString,
+      "-DCMAKE_BUILD_TYPE=Release",
+      "-DDAWN_SRC_DIR=" ++ (cwd / ".lake/build/dawn-src").toString,
+      "-DDAWN_BUILD_DIR=" ++ (cwd / ".lake/build/dawn-build").toString]
+    if ret != 0 then return ret
+    let ret ← runCmd "cmake" #["--build", bridgeBuild.toString, "--target", "hesper_native", "-j", "8"]
+    if ret != 0 then return ret
+    IO.println "[Hesper] Native bridge built."
+    return 0
+
+/-- Build the SIMD library (Google Highway). -/
+private def buildSimdIfNeeded (cwd : FilePath) : IO UInt32 := do
+  let simdBuild := cwd / ".lake/build/simd"
+  let libPath := simdBuild / "libhesper_simd.a"
+  if (← libPath.pathExists) then
+    IO.println "[Hesper] SIMD library already built (cached)."
+    return 0
+  else
+    IO.println "[Hesper] Building SIMD library (Google Highway)..."
+    IO.FS.createDirAll simdBuild
+    let ret ← runCmd "cmake" #[
+      "-S", (cwd / "c_src").toString, "-B", simdBuild.toString,
+      "-DCMAKE_BUILD_TYPE=Release"]
+    if ret != 0 then return ret
+    let ret ← runCmd "cmake" #["--build", simdBuild.toString, "--target", "hesper_simd", "-j", "8"]
+    if ret != 0 then return ret
+    IO.println "[Hesper] SIMD library built."
+    return 0
+
+/-- Lake target that builds all native dependencies before any Lean compilation. -/
+target nativeDeps : Unit := do
+  let cwd ← IO.currentDir
+  let ret ← buildDawnIfNeeded cwd
+  if ret != 0 then
+    error s!"Dawn build failed (exit code {ret})"
+  let ret ← buildBridgeIfNeeded cwd
+  if ret != 0 then
+    error s!"Native bridge build failed (exit code {ret})"
+  let ret ← buildSimdIfNeeded cwd
+  if ret != 0 then
+    error s!"SIMD build failed (exit code {ret})"
+  return .nil
+
+-- ============================================================================
+-- MANUAL BUILD SCRIPTS (kept for backward compatibility)
+-- ============================================================================
 
 /-- Build script for native C++ library with Dawn integration -/
 script buildNative do
@@ -205,27 +344,49 @@ script buildNative do
   return 0
 
 -- Standard linker configuration for all FFI executables (based on glfw-triangle + Google Highway)
-def stdLinkArgs : Array String := #[
-  "-Wl,-force_load,./.lake/build/native/libhesper_native.a",
-  "-L./.lake/build/dawn-build/src/dawn", "-ldawn_proc",
-  "-L./.lake/build/dawn-install/lib", "-lwebgpu_dawn",
-  "-L./.lake/build/dawn-build/third_party/glfw/src", "-lglfw3",
-  "-Wl,-force_load,./.lake/build/dawn-build/src/dawn/libdawn_proc.a",
-  "-Wl,-force_load,./.lake/build/dawn-build/src/dawn/glfw/libdawn_glfw.a",
-  "./.lake/build/simd/libhesper_simd.a",
-  "-lc++",
-  "-L/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/lib",
-  "-F/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/System/Library/Frameworks",
-  "-Wl,-syslibroot,/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk",
-  "-lobjc",
-  "-framework", "CoreFoundation",
-  "-framework", "Metal",
-  "-framework", "Foundation",
-  "-framework", "QuartzCore",
-  "-framework", "IOKit",
-  "-framework", "IOSurface",
-  "-framework", "Cocoa"
-]
+-- Platform-specific: macOS uses frameworks + force_load; Linux uses whole-archive + Vulkan/X11
+def stdLinkArgs : Array String :=
+  -- Dawn installs to lib/ on macOS, lib64/ on Linux x86_64
+  let dawnLibDir := if System.Platform.isOSX then "lib" else "lib64"
+  let commonArgs := #[
+    "-L./.lake/build/dawn-build/src/dawn", "-ldawn_proc",
+    "-L./.lake/build/dawn-install/" ++ dawnLibDir, "-lwebgpu_dawn",
+    "-L./.lake/build/dawn-build/third_party/glfw/src", "-lglfw3",
+    "./.lake/build/simd/libhesper_simd.a",
+    "./.lake/build/simd/_deps/highway-build/libhwy.a"
+  ]
+  if System.Platform.isOSX then
+    #["-Wl,-force_load,./.lake/build/native/libhesper_native.a",
+      "-Wl,-force_load,./.lake/build/dawn-build/src/dawn/libdawn_proc.a",
+      "-Wl,-force_load,./.lake/build/dawn-build/src/dawn/glfw/libdawn_glfw.a"]
+    ++ commonArgs ++
+    #["-lc++",
+      "-L/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/lib",
+      "-F/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/System/Library/Frameworks",
+      "-Wl,-syslibroot,/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk",
+      "-lobjc",
+      "-framework", "CoreFoundation",
+      "-framework", "Metal",
+      "-framework", "Foundation",
+      "-framework", "QuartzCore",
+      "-framework", "IOKit",
+      "-framework", "IOSurface",
+      "-framework", "Cocoa"]
+  else
+    #["-Wl,--whole-archive",
+      "./.lake/build/native/libhesper_native.a",
+      "./.lake/build/dawn-build/src/dawn/libdawn_proc.a",
+      "./.lake/build/dawn-build/src/dawn/glfw/libdawn_glfw.a",
+      "-Wl,--no-whole-archive"]
+    ++ commonArgs ++
+    #["-lstdc++",
+      "-lvulkan",
+      "-lX11",
+      "-lX11-xcb",
+      "-lxcb",
+      "-lwayland-client",
+      "-ldl",
+      "-lpthread"]
 
 -- ============================================================================
 -- EXAMPLES - Organized by Category
@@ -547,12 +708,12 @@ script buildSimd do
 lean_exe «simd-bench» where
   root := `Examples.SIMD.MainSimdBench
   supportInterpreter := true
-  moreLinkArgs := #[s!".lake/build/simd/libhesper_simd.a"]
+  moreLinkArgs := #[s!".lake/build/simd/libhesper_simd.a", s!".lake/build/simd/_deps/highway-build/libhwy.a"]
 
 lean_exe «simd-simple» where
   root := `Examples.SIMD.MainSimdSimple
   supportInterpreter := true
-  moreLinkArgs := #[s!".lake/build/simd/libhesper_simd.a"]
+  moreLinkArgs := #[s!".lake/build/simd/libhesper_simd.a", s!".lake/build/simd/_deps/highway-build/libhwy.a"]
 
 lean_exe «simd-test» where
   root := `Examples.SIMD.MainSimdTest
@@ -561,32 +722,32 @@ lean_exe «simd-test» where
 lean_exe «simd-debug» where
   root := `Examples.SIMD.MainSimdDebug
   supportInterpreter := true
-  moreLinkArgs := #[s!".lake/build/simd/libhesper_simd.a"]
+  moreLinkArgs := #[s!".lake/build/simd/libhesper_simd.a", s!".lake/build/simd/_deps/highway-build/libhwy.a"]
 
 lean_exe «simd-minimal» where
   root := `Examples.SIMD.MainSimdMinimal
   supportInterpreter := true
-  moreLinkArgs := #[s!".lake/build/simd/libhesper_simd.a"]
+  moreLinkArgs := #[s!".lake/build/simd/libhesper_simd.a", s!".lake/build/simd/_deps/highway-build/libhwy.a"]
 
 lean_exe «multi-precision» where
   root := `Examples.SIMD.MainMultiPrecision
   supportInterpreter := false
-  moreLinkArgs := #[s!".lake/build/simd/libhesper_simd.a"]
+  moreLinkArgs := #[s!".lake/build/simd/libhesper_simd.a", s!".lake/build/simd/_deps/highway-build/libhwy.a"]
 
 lean_exe «debug-conversion» where
   root := `Examples.SIMD.MainDebugConversion
   supportInterpreter := true
-  moreLinkArgs := #[s!".lake/build/simd/libhesper_simd.a"]
+  moreLinkArgs := #[s!".lake/build/simd/libhesper_simd.a", s!".lake/build/simd/_deps/highway-build/libhwy.a"]
 
 lean_exe «debug-f16» where
   root := `Examples.SIMD.MainDebugF16
   supportInterpreter := false
-  moreLinkArgs := #[s!".lake/build/simd/libhesper_simd.a"]
+  moreLinkArgs := #[s!".lake/build/simd/libhesper_simd.a", s!".lake/build/simd/_deps/highway-build/libhwy.a"]
 
 lean_exe «simd-perf-bench» where
   root := `Examples.SIMD.MainSimdPerfBench
   supportInterpreter := false
-  moreLinkArgs := #[s!".lake/build/simd/libhesper_simd.a"]
+  moreLinkArgs := #[s!".lake/build/simd/libhesper_simd.a", s!".lake/build/simd/_deps/highway-build/libhwy.a"]
 
 lean_exe «test-dsl-kernels» where
   root := `Examples.Tests.TestDSLKernels
