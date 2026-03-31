@@ -162,7 +162,8 @@ def main (args : List String) : IO Unit := do
   let targetBuf ← createBuffer device { size := 4, usage := [.storage, .copySrc, .copyDst], mappedAtCreation := false }
   let dLogitsBuf ← createBuffer device { size := (model.config.vocabSize * 4).toUSize, usage := [.storage, .copySrc, .copyDst], mappedAtCreation := false }
   let dHiddenBuf ← createBuffer device { size := (dim * 4).toUSize, usage := [.storage, .copySrc, .copyDst], mappedAtCreation := false }
-  let loraInferState ← Hesper.LoRA.Inference.createLoRAInferenceState device adapter dim kvDim
+  let loraInferState ← Hesper.LoRA.Inference.createLoRATrainingState device adapter
+    dim kvDim model.config.numHeads model.config.headDim model.config.maxSeqLen
 
   let scale := loraConfig.scale
   let startLayer := if model.config.numLayers > 4 then model.config.numLayers - 4 else 0
