@@ -163,10 +163,10 @@ def main (args : List String) : IO Unit := do
   let dLogitsBuf ← createBuffer device { size := (model.config.vocabSize * 4).toUSize, usage := [.storage, .copySrc, .copyDst], mappedAtCreation := false }
   let dHiddenBuf ← createBuffer device { size := (dim * 4).toUSize, usage := [.storage, .copySrc, .copyDst], mappedAtCreation := false }
   let loraInferState ← Hesper.LoRA.Inference.createLoRATrainingState device adapter
-    dim kvDim model.config.numHeads model.config.headDim model.config.maxSeqLen
+    dim kvDim model.config.numHeads model.config.headDim model.config.maxSeqLen model.config.numLayers
 
   let scale := loraConfig.scale
-  let startLayer := if model.config.numLayers > 4 then model.config.numLayers - 4 else 0
+  let startLayer := 0  -- backward through all layers (per-layer savedNormed available)
   let mut currentState := trainState
   let mut globalStep : Nat := 0
 
