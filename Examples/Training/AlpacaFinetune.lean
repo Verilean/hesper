@@ -18,6 +18,7 @@ import Hesper.WebGPU.Buffer
 import Hesper.WGSL.Execute
 import Hesper.WGSL.MatMul
 import Hesper.WGSL.Elementwise
+import Hesper.Training.ParseFloat
 
 /-!
 # Alpaca-Style LoRA Finetuning for BitNet
@@ -36,6 +37,7 @@ The training loop uses batched GPU execution:
 open Hesper.WebGPU
 open Hesper.LoRA
 open Hesper.Training
+open Hesper.Training.ParseFloat
 open Hesper.Models.BitNet
 open Hesper.Tokenizer.SentencePiece
 open Hesper.GGUF
@@ -82,15 +84,9 @@ def parseArgs (args : List String) : IO Args := do
     | "--data" :: path :: rest => dataPath := path; remaining := rest
     | "--output" :: path :: rest => outputPath := path; remaining := rest
     | "--rank" :: n :: rest => rank := n.toNat!; remaining := rest
-    | "--alpha" :: f :: rest => alpha := f.toNat!.toFloat; remaining := rest
+    | "--alpha" :: f :: rest => alpha := parseFloat f; remaining := rest
     | "--lr" :: f :: rest =>
-      lr := match f with
-        | "1e-4" => 1e-4
-        | "1e-3" => 1e-3
-        | "5e-4" => 5e-4
-        | "5e-5" => 5e-5
-        | "1e-5" => 1e-5
-        | other => other.toNat!.toFloat
+      lr := parseFloat f
       remaining := rest
     | "--epochs" :: n :: rest => epochs := n.toNat!; remaining := rest
     | "--max-seq-len" :: n :: rest => maxSeqLen := n.toNat!; remaining := rest
@@ -234,58 +230,23 @@ def main (args : List String) : IO Unit := do
 
         -- === PyTorch-standard optimizer step ===
         if exampleTokens > 0 then
-          -- 1. Gradient clipping
-          let gradNorm ← Hesper.Optimizer.GradientClip.clipGradNorm device adapter
-            currentState.grads maxGradNorm clipBufs
-          -- 2. Get current learning rate from scheduler
-          let currentLR := Hesper.Training.LRScheduler.getLR lrScheduler globalStep
-          -- Debug: print gradient info for first 3 steps
-          if globalStep <= 3 then
-            -- Read gradient dB[0] from layer 29
+          -- Debug: read gradient BEFORE optimizer
+          if globalStep <= 2 then
             if h_g : 29 < currentState.grads.layers.size then
-              let bytes ← mapBufferRead device currentState.grads.layers[29].gradQ.dB 0 16
-              let b0 := bytes.get! 0 |>.toUInt32
-              let b1 := bytes.get! 1 |>.toUInt32
-              let b2 := bytes.get! 2 |>.toUInt32
-              let b3 := bytes.get! 3 |>.toUInt32
-              let bits := b0 ||| (b1 <<< 8) ||| (b2 <<< 16) ||| (b3 <<< 24)
-              let val := Hesper.Basic.float32BitsToFloat64 bits
-              IO.println s!"[Debug] step={globalStep} gradNorm={gradNorm} dB[0]={val} lr={currentLR}"
-          -- 3. AdamW update
+              let gBytes ← mapBufferRead device currentState.grads.layers[29].gradQ.dB 0 20
+              let vals := List.range 5 |>.map fun k =>
+                let off := k * 4
+                let b0 := gBytes.get! off |>.toUInt32
+                let b1 := gBytes.get! (off+1) |>.toUInt32
+                let b2 := gBytes.get! (off+2) |>.toUInt32
+                let b3 := gBytes.get! (off+3) |>.toUInt32
+                let bits := b0 ||| (b1 <<< 8) ||| (b2 <<< 16) ||| (b3 <<< 24)
+                Hesper.Basic.float32BitsToFloat64 bits
+              IO.println s!"[Debug] step={globalStep} grad dB[0..4] = {vals}"
+          -- AdamW update
+          let currentLR := Hesper.Training.LRScheduler.getLR lrScheduler globalStep
           let adamConfig : Hesper.Optimizer.AdamGPU.Config := { lr := currentLR }
           currentState ← TrainLoop.optimizerStep device currentState adamConfig
-          -- Debug: check weights after Adam
-          if globalStep <= 2 then
-            if h_w : 29 < adapter.layers.size then
-              let wBytes ← mapBufferRead device adapter.layers[29].loraQ.b 0 16
-              let wb0 := wBytes.get! 0 |>.toUInt32
-              let wb1 := wBytes.get! 1 |>.toUInt32
-              let wb2 := wBytes.get! 2 |>.toUInt32
-              let wb3 := wBytes.get! 3 |>.toUInt32
-              let wbits := wb0 ||| (wb1 <<< 8) ||| (wb2 <<< 16) ||| (wb3 <<< 24)
-              let wval := Hesper.Basic.float32BitsToFloat64 wbits
-              -- Also check Q_A
-              let aBytes ← mapBufferRead device adapter.layers[29].loraQ.a 0 16
-              let ab0 := aBytes.get! 0 |>.toUInt32
-              let ab1 := aBytes.get! 1 |>.toUInt32
-              let ab2 := aBytes.get! 2 |>.toUInt32
-              let ab3 := aBytes.get! 3 |>.toUInt32
-              let abits := ab0 ||| (ab1 <<< 8) ||| (ab2 <<< 16) ||| (ab3 <<< 24)
-              let aval := Hesper.Basic.float32BitsToFloat64 abits
-              -- Check max of A (read more bytes)
-              let aBytes16 ← mapBufferRead device adapter.layers[29].loraQ.a 0 64
-              let mut aMax := 0.0
-              for k in [:16] do
-                let off := k * 4
-                let kb0 := aBytes16.get! off |>.toUInt32
-                let kb1 := aBytes16.get! (off+1) |>.toUInt32
-                let kb2 := aBytes16.get! (off+2) |>.toUInt32
-                let kb3 := aBytes16.get! (off+3) |>.toUInt32
-                let kbits := kb0 ||| (kb1 <<< 8) ||| (kb2 <<< 16) ||| (kb3 <<< 24)
-                let kval := Hesper.Basic.float32BitsToFloat64 kbits
-                let absv := if kval < 0 then 0.0 - kval else kval
-                if absv > aMax then aMax := absv
-              IO.println s!"[Debug] step={globalStep} after Adam: Q_B[0]={wval}, Q_A[0]={aval}, Q_A max(16)={aMax}"
 
         -- Logging
         if globalStep % args.logEvery == 0 || exIdx == 0 then
@@ -297,6 +258,19 @@ def main (args : List String) : IO Unit := do
     let avgEpochLoss := if epochTokens > 0 then epochLoss / epochTokens.toFloat else 0.0
     IO.println s!"[Train] Epoch {epoch + 1} complete: avg_loss={avgEpochLoss.toString}, tokens={epochTokens}"
     IO.println ""
+
+  -- Debug: read B directly before save
+  if h_fin : 29 < adapter.layers.size then
+    let bBytes ← mapBufferRead device adapter.layers[29].loraQ.b 0 20
+    let vals := List.range 5 |>.map fun k =>
+      let off := k * 4
+      let b0 := bBytes.get! off |>.toUInt32
+      let b1 := bBytes.get! (off+1) |>.toUInt32
+      let b2 := bBytes.get! (off+2) |>.toUInt32
+      let b3 := bBytes.get! (off+3) |>.toUInt32
+      let bits := b0 ||| (b1 <<< 8) ||| (b2 <<< 16) ||| (b3 <<< 24)
+      Hesper.Basic.float32BitsToFloat64 bits
+    IO.println s!"[Debug] Before save: Q_B[0..4] = {vals}"
 
   -- Save LoRA weights
   IO.println s!"Saving LoRA weights to {args.outputPath}..."
