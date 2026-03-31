@@ -797,6 +797,10 @@ lean_exe «alpaca-finetune» where
   supportInterpreter := false
   moreLinkArgs := stdLinkArgs
 
+lean_exe «backward-verify» where
+  root := `Tests.BackwardVerification
+  supportInterpreter := true
+
 lean_exe i2s_validation where
   root := `Tests.I2S_Validation
   supportInterpreter := true
