@@ -805,6 +805,10 @@ lean_exe «verified-ad» where
   root := `Tests.VerifiedAD
   supportInterpreter := true
 
+lean_exe «wrong-backward-test» where
+  root := `Tests.WrongBackwardTest
+  supportInterpreter := true
+
 lean_exe i2s_validation where
   root := `Tests.I2S_Validation
   supportInterpreter := true
