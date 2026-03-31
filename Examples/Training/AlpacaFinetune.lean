@@ -234,23 +234,58 @@ def main (args : List String) : IO Unit := do
 
         -- === PyTorch-standard optimizer step ===
         if exampleTokens > 0 then
-          -- 1. Gradient clipping only (skip loss norm for now)
-          let _gradNorm ← Hesper.Optimizer.GradientClip.clipGradNorm device adapter
+          -- 1. Gradient clipping
+          let gradNorm ← Hesper.Optimizer.GradientClip.clipGradNorm device adapter
             currentState.grads maxGradNorm clipBufs
-          -- 3. Get current learning rate from scheduler
+          -- 2. Get current learning rate from scheduler
           let currentLR := Hesper.Training.LRScheduler.getLR lrScheduler globalStep
-          -- 4. SGD update with scheduled LR (batched)
-          Hesper.WGSL.Execute.beginBatch device
-          for i in [:adapter.layers.size] do
-            if h1 : i < adapter.layers.size then
-              if h2 : i < currentState.grads.layers.size then
-                let layer := adapter.layers[i]
-                let grad := currentState.grads.layers[i]
-                Hesper.LoRA.Forward.executeAddScaled device grad.gradQ.dA layer.loraQ.a (layer.loraQ.rank * layer.loraQ.inDim) (0.0 - currentLR)
-                Hesper.LoRA.Forward.executeAddScaled device grad.gradQ.dB layer.loraQ.b (layer.loraQ.outDim * layer.loraQ.rank) (0.0 - currentLR)
-                Hesper.LoRA.Forward.executeAddScaled device grad.gradV.dA layer.loraV.a (layer.loraV.rank * layer.loraV.inDim) (0.0 - currentLR)
-                Hesper.LoRA.Forward.executeAddScaled device grad.gradV.dB layer.loraV.b (layer.loraV.outDim * layer.loraV.rank) (0.0 - currentLR)
-          Hesper.WGSL.Execute.endBatch device
+          -- Debug: print gradient info for first 3 steps
+          if globalStep <= 3 then
+            -- Read gradient dB[0] from layer 29
+            if h_g : 29 < currentState.grads.layers.size then
+              let bytes ← mapBufferRead device currentState.grads.layers[29].gradQ.dB 0 16
+              let b0 := bytes.get! 0 |>.toUInt32
+              let b1 := bytes.get! 1 |>.toUInt32
+              let b2 := bytes.get! 2 |>.toUInt32
+              let b3 := bytes.get! 3 |>.toUInt32
+              let bits := b0 ||| (b1 <<< 8) ||| (b2 <<< 16) ||| (b3 <<< 24)
+              let val := Hesper.Basic.float32BitsToFloat64 bits
+              IO.println s!"[Debug] step={globalStep} gradNorm={gradNorm} dB[0]={val} lr={currentLR}"
+          -- 3. AdamW update
+          let adamConfig : Hesper.Optimizer.AdamGPU.Config := { lr := currentLR }
+          currentState ← TrainLoop.optimizerStep device currentState adamConfig
+          -- Debug: check weights after Adam
+          if globalStep <= 2 then
+            if h_w : 29 < adapter.layers.size then
+              let wBytes ← mapBufferRead device adapter.layers[29].loraQ.b 0 16
+              let wb0 := wBytes.get! 0 |>.toUInt32
+              let wb1 := wBytes.get! 1 |>.toUInt32
+              let wb2 := wBytes.get! 2 |>.toUInt32
+              let wb3 := wBytes.get! 3 |>.toUInt32
+              let wbits := wb0 ||| (wb1 <<< 8) ||| (wb2 <<< 16) ||| (wb3 <<< 24)
+              let wval := Hesper.Basic.float32BitsToFloat64 wbits
+              -- Also check Q_A
+              let aBytes ← mapBufferRead device adapter.layers[29].loraQ.a 0 16
+              let ab0 := aBytes.get! 0 |>.toUInt32
+              let ab1 := aBytes.get! 1 |>.toUInt32
+              let ab2 := aBytes.get! 2 |>.toUInt32
+              let ab3 := aBytes.get! 3 |>.toUInt32
+              let abits := ab0 ||| (ab1 <<< 8) ||| (ab2 <<< 16) ||| (ab3 <<< 24)
+              let aval := Hesper.Basic.float32BitsToFloat64 abits
+              -- Check max of A (read more bytes)
+              let aBytes16 ← mapBufferRead device adapter.layers[29].loraQ.a 0 64
+              let mut aMax := 0.0
+              for k in [:16] do
+                let off := k * 4
+                let kb0 := aBytes16.get! off |>.toUInt32
+                let kb1 := aBytes16.get! (off+1) |>.toUInt32
+                let kb2 := aBytes16.get! (off+2) |>.toUInt32
+                let kb3 := aBytes16.get! (off+3) |>.toUInt32
+                let kbits := kb0 ||| (kb1 <<< 8) ||| (kb2 <<< 16) ||| (kb3 <<< 24)
+                let kval := Hesper.Basic.float32BitsToFloat64 kbits
+                let absv := if kval < 0 then 0.0 - kval else kval
+                if absv > aMax then aMax := absv
+              IO.println s!"[Debug] step={globalStep} after Adam: Q_B[0]={wval}, Q_A[0]={aval}, Q_A max(16)={aMax}"
 
         -- Logging
         if globalStep % args.logEvery == 0 || exIdx == 0 then
