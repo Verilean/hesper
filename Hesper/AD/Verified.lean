@@ -226,7 +226,9 @@ def runVerification : IO Unit := do
   for op in ops do
     let (passed, err) := verifyOp op
     let status := if passed then "PASS" else "FAIL"
-    IO.println s!"  {status} {op.name}: max_relative_error = {err}"
+    -- Show more decimal places
+    let errStr := if err < 1e-15 then "< 1e-15" else s!"{err}"
+    IO.println s!"  {status} {op.name}: max_relative_error = {errStr}"
     if !passed then allPassed := false
 
   IO.println ""
