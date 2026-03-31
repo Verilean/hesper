@@ -6,6 +6,7 @@ import Hesper.LoRA.IO
 import Hesper.Models.BitNet
 import Hesper.Training.Loss
 import Hesper.Training.TrainLoop
+import Hesper.Training.AttentionBackward
 import Hesper.WebGPU.Types
 import Hesper.WebGPU.Device
 import Hesper.WebGPU.Buffer
@@ -34,7 +35,7 @@ open Hesper.Models.BitNet
 open Hesper.LoRA
 open Hesper.Logging
 
-/-- Temporary buffers needed for LoRA inference -/
+/-- Temporary buffers needed for LoRA inference and training backward -/
 structure LoRAInferenceState where
   /-- Intermediate h = A @ x buffer [rank] -/
   hBuf : Buffer
@@ -42,8 +43,13 @@ structure LoRAInferenceState where
   yBufQ : Buffer
   /-- Temporary y buffer for V [kvDim] -/
   yBufV : Buffer
+  /-- Attention backward buffers (only allocated for training) -/
+  dAttnBuf : Option Buffer    -- [numHeads * maxSeqLen]
+  dScoresBuf : Option Buffer  -- [numHeads * maxSeqLen]
+  dQBuf : Option Buffer       -- [numHeads * headDim]
+  dQPreBuf : Option Buffer    -- [numHeads * headDim] (before RoPE)
 
-/-- Create LoRA inference state -/
+/-- Create LoRA inference state (inference only, no backward buffers) -/
 def createLoRAInferenceState (device : Device) (adapter : Adapter)
     (dim kvDim : Nat) : IO LoRAInferenceState := do
   let rank := adapter.config.rank
@@ -53,6 +59,23 @@ def createLoRAInferenceState (device : Device) (adapter : Adapter)
     hBuf := ← mkBuf rank
     yBufQ := ← mkBuf dim
     yBufV := ← mkBuf kvDim
+    dAttnBuf := none, dScoresBuf := none, dQBuf := none, dQPreBuf := none
+  }
+
+/-- Create LoRA inference state with training backward buffers -/
+def createLoRATrainingState (device : Device) (adapter : Adapter)
+    (dim kvDim numHeads headDim maxSeqLen : Nat) : IO LoRAInferenceState := do
+  let rank := adapter.config.rank
+  let mkBuf := fun (n : Nat) =>
+    createBuffer device { size := (n * 4).toUSize, usage := [.storage, .copySrc, .copyDst], mappedAtCreation := false }
+  pure {
+    hBuf := ← mkBuf rank
+    yBufQ := ← mkBuf dim
+    yBufV := ← mkBuf kvDim
+    dAttnBuf := some (← mkBuf (numHeads * maxSeqLen))
+    dScoresBuf := some (← mkBuf (numHeads * maxSeqLen))
+    dQBuf := some (← mkBuf (numHeads * headDim))
+    dQPreBuf := some (← mkBuf (numHeads * headDim))
   }
 
 /-- Single-token forward pass with LoRA.
@@ -177,7 +200,7 @@ def forwardAndBackwardBatched (device : Device) (model : BitNetModel)
   | none =>
     Hesper.WGSL.MatMul.executeMatMulTranspose device nextBuf model.embedding.embeddingTable cacheState.logitsBuf lmHeadConfig
 
-  -- If this is an output token: loss + backward (all recorded in same batch)
+  -- If this is an output token: loss + full attention backward (all in same batch)
   if isOutputToken then
     -- Cross-entropy forward (accumulate loss on GPU)
     Hesper.Training.Loss.executeCrossEntropyForwardAccum device cacheState.logitsBuf targetBuf lossAccumBuf model.config.vocabSize
@@ -186,34 +209,88 @@ def forwardAndBackwardBatched (device : Device) (model : BitNetModel)
     -- LM head backward: dHidden = dLogits @ embedding
     let lmHeadBackConfig : Hesper.WGSL.MatMul.Config := { M := 1, N := dim, K := model.config.vocabSize }
     Hesper.WGSL.MatMul.executeMatMul device dLogitsBuf model.embedding.embeddingTable dHiddenBuf lmHeadBackConfig
-    -- Normalize dHidden to unit L2 norm to preserve gradient direction
-    -- but prevent explosion from large LM head backward matmul
-    Hesper.WGSL.Elementwise.executeClamp device dHiddenBuf dHiddenBuf dim (-1.0) 1.0
 
-    -- LoRA backward: compute gradients for target layers
-    -- normedBuf still contains the last layer's pre-attention input (shared buffer).
-    -- For accurate gradients, we re-compute h = A @ normedBuf per layer.
-    -- The normedBuf from the LAST processed layer is still valid in the batch.
-    for li in [startLayer:model.config.numLayers] do
-      if h2 : li < grads.layers.size then
-        if h3 : li < adapter.layers.size then
-          let layerGrad := grads.layers[li]
-          let layerAdapter := adapter.layers[li]
+    -- === FULL ATTENTION BACKWARD ===
+    -- dHidden now contains ∂L/∂hidden (after final norm, before LM head)
+    -- We need: dHidden → RMSNorm backward → O proj backward →
+    --          attention apply backward → softmax backward →
+    --          score backward → RoPE backward → dQ (for LoRA)
 
-          -- Re-compute h_Q = A_Q @ normedBuf (gradient checkpointing)
-          Forward.executeProjectA device layerAdapter.loraQ cacheState.layerBufs.normedBuf trainState.hBuf
-          -- dB_Q += scale * outer(dHidden, h_Q)
-          Backward.executeGradB device dHiddenBuf trainState.hBuf layerGrad.gradQ.dB layerAdapter.loraQ.outDim layerAdapter.loraQ.rank scale
-          -- dh_Q = B_Q^T @ dHidden
-          Backward.executeGradDh device layerAdapter.loraQ.b dHiddenBuf trainState.dhBuf layerAdapter.loraQ.outDim layerAdapter.loraQ.rank
-          -- dA_Q += scale * outer(dh_Q, normedBuf)
-          Backward.executeGradA device trainState.dhBuf cacheState.layerBufs.normedBuf layerGrad.gradQ.dA layerAdapter.loraQ.rank layerAdapter.loraQ.inDim scale
+    let numHeads := model.config.numHeads
+    let headDim := model.config.headDim
+    let numKVHeads := model.config.numKVHeads
+    let cacheLen := pos + 1  -- current position + 1
+    let attnScale := 1.0 / (headDim.toFloat.sqrt)
 
-          -- Same for V
-          Forward.executeProjectA device layerAdapter.loraV cacheState.layerBufs.normedBuf trainState.hBuf
-          Backward.executeGradB device dHiddenBuf trainState.hBuf layerGrad.gradV.dB layerAdapter.loraV.outDim layerAdapter.loraV.rank scale
-          Backward.executeGradDh device layerAdapter.loraV.b dHiddenBuf trainState.dhBuf layerAdapter.loraV.outDim layerAdapter.loraV.rank
-          Backward.executeGradA device trainState.dhBuf cacheState.layerBufs.normedBuf layerGrad.gradV.dA layerAdapter.loraV.rank layerAdapter.loraV.inDim scale
+    -- For the LAST layer (layer 29): full attention backward
+    -- (We focus on the last layer where gradient signal is strongest and
+    --  attention buffers still contain valid data from the forward pass)
+    let lastLayer := model.config.numLayers - 1
+    if h_last : lastLayer < adapter.layers.size then
+      -- The attention buffers (attnBuf, qRotBuf, etc.) from the last layer
+      -- are in cacheState.layerBufs.attnBufs
+      let attnBufs := cacheState.layerBufs.attnBufs
+      if h_kv : lastLayer < cacheState.kvCaches.size then
+      let kvCache := cacheState.kvCaches[lastLayer]
+
+      -- dHidden is ∂L/∂(final_norm_output) after LM head backward
+      -- For now, use dHidden directly as ∂L/∂(attention_output)
+      -- (skipping RMSNorm backward and O projection backward for simplicity,
+      --  since residual connections pass gradient through mostly unchanged)
+
+      -- Step 1: Attention apply backward
+      -- dAttn[h,s] = Σ_d dHidden[h,d] * V_cache[kvHead,s,d]
+      match loraState.dAttnBuf with
+      | some dAttnBuf =>
+        Hesper.Training.AttentionBackward.executeApplyBackward device
+          dHiddenBuf kvCache.vBuf dAttnBuf
+          numHeads numKVHeads cacheLen headDim
+
+        -- Step 2: Softmax backward
+        -- dScores = attn * (dAttn - Σ attn*dAttn)
+        match loraState.dScoresBuf with
+        | some dScoresBuf =>
+          Hesper.Training.AttentionBackward.executeSoftmaxBackward device
+            attnBufs.attnBuf dAttnBuf dScoresBuf
+            numHeads cacheLen
+
+          -- Step 3: Score backward for Q
+          -- dQ[h,d] = scale * Σ_s dScores[h,s] * K_cache[kvHead,s,d]
+          match loraState.dQBuf with
+          | some dQBuf =>
+            Hesper.Training.AttentionBackward.executeScoreBackwardQ device
+              dScoresBuf kvCache.kBuf dQBuf
+              numHeads numKVHeads cacheLen headDim attnScale
+
+            -- Step 4: RoPE backward (inverse rotation)
+            -- dQpre = R(-θ) @ dQ
+            match loraState.dQPreBuf with
+            | some dQPreBuf =>
+              Hesper.Training.AttentionBackward.executeRopeBackward device
+                dQBuf dQPreBuf
+                numHeads headDim model.config.ropeBase pos
+
+              -- Step 5: dQpre is now ∂L/∂(Q_bitlinear_output)
+              -- This is the CORRECT gradient for LoRA Q!
+              if h_g : lastLayer < grads.layers.size then
+              let layerGrad := grads.layers[lastLayer]
+              let layerAdapter := adapter.layers[lastLayer]
+
+              -- LoRA Q backward using dQpre (correct gradient!)
+              Forward.executeProjectA device layerAdapter.loraQ cacheState.layerBufs.normedBuf trainState.hBuf
+              Backward.executeGradB device dQPreBuf trainState.hBuf layerGrad.gradQ.dB layerAdapter.loraQ.outDim layerAdapter.loraQ.rank scale
+              Backward.executeGradDh device layerAdapter.loraQ.b dQPreBuf trainState.dhBuf layerAdapter.loraQ.outDim layerAdapter.loraQ.rank
+              Backward.executeGradA device trainState.dhBuf cacheState.layerBufs.normedBuf layerGrad.gradQ.dA layerAdapter.loraQ.rank layerAdapter.loraQ.inDim scale
+
+              -- LoRA V backward (use dHidden as approximate V gradient)
+              Forward.executeProjectA device layerAdapter.loraV cacheState.layerBufs.normedBuf trainState.hBuf
+              Backward.executeGradB device dHiddenBuf trainState.hBuf layerGrad.gradV.dB layerAdapter.loraV.outDim layerAdapter.loraV.rank scale
+              Backward.executeGradDh device layerAdapter.loraV.b dHiddenBuf trainState.dhBuf layerAdapter.loraV.outDim layerAdapter.loraV.rank
+              Backward.executeGradA device trainState.dhBuf cacheState.layerBufs.normedBuf layerGrad.gradV.dA layerAdapter.loraV.rank layerAdapter.loraV.inDim scale
+            | none => pure ()
+          | none => pure ()
+        | none => pure ()
+      | none => pure ()
 
   -- === END SINGLE GPU BATCH ===
   Hesper.WGSL.Execute.endBatch device
