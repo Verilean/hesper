@@ -488,7 +488,7 @@ inductive Exp : WGSLType → Type where
 /-- Convert Float to WGSL literal string with full precision.
     Uses scientific notation (e.g. `1.0e-7`) when needed to preserve
     significant digits. FP32 has ~7 significant decimal digits. -/
-private def floatToWGSL (f : Float) : String :=
+def floatToWGSL (f : Float) : String :=
   if f == 0.0 then "0.0"
   else if f != f then "0.0 / 0.0"  -- NaN
   else
