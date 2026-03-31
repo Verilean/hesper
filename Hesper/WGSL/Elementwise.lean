@@ -360,4 +360,26 @@ def executeReluSqrMul (device : Device) (aBuf bBuf cBuf : Buffer) (config : Conf
   let cacheKey : UInt64 := hash ("relu2mul", config.numElements)
   Hesper.WGSL.Execute.executeShaderNamed device shader namedBuffers execConfig (some cacheKey) preparedRef
 
+/-! ## Clamp (Gradient Clipping) -/
+
+/-- In-place clamp kernel: data[i] = clamp(data[i], minVal, maxVal)
+    Uses single read-write buffer to avoid aliasing issues. -/
+def clampInPlaceKernel (numElements : Nat) (minVal maxVal : Float) : ShaderM Unit := do
+  let gid ← ShaderM.globalId
+  let idx := Exp.vec3X gid
+  let inBounds := Exp.lt idx (Exp.litU32 numElements)
+  let _data ← ShaderM.declareOutputBuffer "data" (.array (.scalar .f32) numElements)
+  let x ← ShaderM.readBuffer (ty := .scalar .f32) (n := numElements) "data" idx
+  let clamped := Exp.max (Exp.litF32 minVal) (Exp.min (Exp.litF32 maxVal) x)
+  let result := Exp.select inBounds clamped (Exp.litF32 0.0)
+  ShaderM.writeBuffer (ty := .scalar .f32) "data" idx result
+
+/-- Execute in-place clamp: buf[i] = clamp(buf[i], minVal, maxVal) -/
+def executeClamp (device : Device) (inputBuf _outputBuf : Buffer)
+    (numElements : Nat) (minVal maxVal : Float) : IO Unit := do
+  let shader := clampInPlaceKernel numElements minVal maxVal
+  let namedBuffers := [("data", inputBuf)]
+  let execConfig := Hesper.WGSL.Execute.ExecutionConfig.dispatch1D numElements 256
+  Hesper.WGSL.Execute.executeShaderNamed device shader namedBuffers execConfig
+
 end Hesper.WGSL.Elementwise

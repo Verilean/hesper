@@ -5,6 +5,9 @@ import Hesper.Inference.Sampling
 import Hesper.Tokenizer.SentencePiece
 import Hesper.GGUF.Reader
 import Hesper.Logging
+import Hesper.LoRA.Types
+import Hesper.LoRA.IO
+import Hesper.LoRA.Inference
 
 /-!
 # Complete BitNet Text Generation
@@ -57,20 +60,28 @@ def loadModel (ggufPath : String) : IO (BitNetModel × Tokenizer × Device × Op
 
   return (model, tokenizer, device, tokenizer.vocab.eosToken)
 
+/-- Find value for a flag like "--lora path" in args list -/
+def findFlag (args : List String) (flag : String) : Option String :=
+  match args with
+  | [] => none
+  | [_] => none
+  | a :: b :: rest => if a == flag then some b else findFlag (b :: rest) flag
+
 /-- Run single-shot generation -/
 def runGeneration (args : List String) : IO Unit := do
   if args.length < 2 then
-    IO.println "Usage: bitnet-complete <gguf_model> <prompt> [max_tokens] [--stats] [--verbose]"
-    IO.println "       bitnet-complete <gguf_model> --interactive"
-    IO.println "       bitnet-complete <gguf_model> -i"
+    IO.println "Usage: bitnet-complete <gguf_model> <prompt> [max_tokens] [--stats] [--verbose] [--lora <path>]"
+    IO.println "       bitnet-complete <gguf_model> --interactive [--lora <path>]"
+    IO.println "       bitnet-complete <gguf_model> -i [--lora <path>]"
     return
 
   let ggufPath := args[0]!
   let promptText := args[1]!
   let showStats := args.any (· == "--stats")
   let verbose := args.any (· == "--verbose")
+  let loraPath := findFlag args "--lora"
   -- Filter out flags before parsing max_tokens
-  let positionalArgs := args.filter (fun a => !a.startsWith "--")
+  let positionalArgs := args.filter (fun a => !a.startsWith "--" && a != (loraPath.getD ""))
   let maxTokens := if positionalArgs.length >= 3 then positionalArgs[2]!.toNat! else 20
 
   -- Disable verbose by default for clean output
@@ -80,6 +91,9 @@ def runGeneration (args : List String) : IO Unit := do
   IO.println "  BitNet Text Generation"
   IO.println "═══════════════════════════════════════════════"
   IO.println s!"Model: {ggufPath}"
+  match loraPath with
+  | some p => IO.println s!"LoRA:  {p}"
+  | none => pure ()
   IO.println s!"Prompt: \"{promptText}\""
   IO.println s!"Max tokens: {maxTokens}"
   IO.println ""
@@ -90,7 +104,14 @@ def runGeneration (args : List String) : IO Unit := do
   IO.println s!"Prompt tokens ({promptTokens.size}): {promptTokens}"
   IO.println ""
 
-  let outputTokens ← generate device model promptTokens maxTokens .Greedy eosToken showStats
+  let outputTokens ← match loraPath with
+  | some p =>
+    -- Load LoRA adapter and generate with it
+    let adapter ← Hesper.LoRA.IO.loadAdapter device p model.config.dim model.config.kvDim
+    let loraState ← Hesper.LoRA.Inference.createLoRAInferenceState device adapter model.config.dim model.config.kvDim
+    Hesper.LoRA.Inference.generateWithLoRA device model adapter loraState promptTokens maxTokens .Greedy eosToken
+  | none =>
+    generate device model promptTokens maxTokens .Greedy eosToken showStats
 
   let outputText := decode tokenizer outputTokens
   IO.println ""
@@ -99,14 +120,25 @@ def runGeneration (args : List String) : IO Unit := do
   IO.println "─────────────────────────────────────────"
 
 /-- Run interactive REPL -/
-def runInteractive (ggufPath : String) : IO Unit := do
+def runInteractive (ggufPath : String) (loraPath : Option String := none) : IO Unit := do
   IO.println "═══════════════════════════════════════════════"
   IO.println "  BitNet Interactive Mode"
   IO.println "═══════════════════════════════════════════════"
   IO.println s!"Model: {ggufPath}"
+  match loraPath with
+  | some p => IO.println s!"LoRA:  {p}"
+  | none => pure ()
   IO.println ""
 
   let (model, tokenizer, device, eosToken) ← loadModel ggufPath
+
+  -- Load LoRA if specified
+  let loraOpt ← match loraPath with
+  | some p =>
+    let adapter ← Hesper.LoRA.IO.loadAdapter device p model.config.dim model.config.kvDim
+    let loraState ← Hesper.LoRA.Inference.createLoRAInferenceState device adapter model.config.dim model.config.kvDim
+    pure (some (adapter, loraState))
+  | none => pure none
 
   -- Disable verbose logging for clean interactive output
   setVerbose false
@@ -167,7 +199,11 @@ def runInteractive (ggufPath : String) : IO Unit := do
     let promptTokens := encode tokenizer input
     IO.println s!"[{promptTokens.size} tokens] Generating..."
 
-    let outputTokens ← generate device model promptTokens maxTokens .Greedy eosToken
+    let outputTokens ← match loraOpt with
+    | some (adapter, loraState) =>
+      Hesper.LoRA.Inference.generateWithLoRA device model adapter loraState promptTokens maxTokens .Greedy eosToken
+    | none =>
+      generate device model promptTokens maxTokens .Greedy eosToken
 
     let newTokenCount := outputTokens.size - promptTokens.size
     let outputText := decode tokenizer outputTokens
@@ -189,7 +225,8 @@ def main (args : List String) : IO Unit := do
     return
 
   let arg1 := args[1]!
+  let loraPath := findFlag args "--lora"
   if arg1 == "--interactive" || arg1 == "-i" then
-    runInteractive args[0]!
+    runInteractive args[0]! loraPath
   else
     runGeneration args
