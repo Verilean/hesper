@@ -78,8 +78,11 @@ pkgs.mkShell {
     # GPU feature selection (if needed)
     # export HESPER_GPU_FEATURES=subgroups,fp16
 
-    # LD_LIBRARY_PATH for Vulkan and OpenGL
+    # LD_LIBRARY_PATH for Vulkan and OpenGL (runtime)
     export LD_LIBRARY_PATH="${pkgs.vulkan-loader}/lib:${pkgs.libglvnd}/lib:${pkgs.wayland}/lib:/run/opengl-driver/lib:$LD_LIBRARY_PATH"
+
+    # LIBRARY_PATH for linker (leanc uses cc which needs this on NixOS)
+    export LIBRARY_PATH="${pkgs.vulkan-loader}/lib:${pkgs.xorg.libX11}/lib:${pkgs.xorg.libxcb}/lib:${pkgs.xorg.libXext}/lib:${pkgs.wayland}/lib:${pkgs.libglvnd}/lib:/run/opengl-driver/lib:$LIBRARY_PATH"
 
     # XDG runtime directory (for Wayland)
     export XDG_RUNTIME_DIR="''${XDG_RUNTIME_DIR:-/tmp}"

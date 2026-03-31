@@ -788,6 +788,15 @@ lean_exe «bitnet-complete» where
   supportInterpreter := false
   moreLinkArgs := stdLinkArgs
 
+-- ----------------------------------------------------------------------------
+-- Training (LoRA Finetuning)
+-- ----------------------------------------------------------------------------
+
+lean_exe «alpaca-finetune» where
+  root := `Examples.Training.AlpacaFinetune
+  supportInterpreter := false
+  moreLinkArgs := stdLinkArgs
+
 lean_exe i2s_validation where
   root := `Tests.I2S_Validation
   supportInterpreter := true

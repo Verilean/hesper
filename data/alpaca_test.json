@@ -1,0 +1,27 @@
+[
+  {
+    "instruction": "Give three tips for staying healthy.",
+    "input": "",
+    "output": "1. Eat a balanced diet. 2. Exercise regularly. 3. Get enough sleep."
+  },
+  {
+    "instruction": "What is the capital of France?",
+    "input": "",
+    "output": "The capital of France is Paris."
+  },
+  {
+    "instruction": "Translate the following to Japanese.",
+    "input": "Hello, how are you?",
+    "output": "こんにちは、お元気ですか？"
+  },
+  {
+    "instruction": "Write a haiku about programming.",
+    "input": "",
+    "output": "Code flows like water\nBugs hide in the deepest lines\nTests bring the dawn light"
+  },
+  {
+    "instruction": "Explain what machine learning is in one sentence.",
+    "input": "",
+    "output": "Machine learning is a subset of artificial intelligence that enables computers to learn patterns from data without being explicitly programmed."
+  }
+]
