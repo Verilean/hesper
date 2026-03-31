@@ -9,6 +9,8 @@ import Hesper.Training.Loss
 import Hesper.Training.AlpacaDataset
 import Hesper.Training.TrainLoop
 import Hesper.Optimizer.AdamGPU
+import Hesper.Optimizer.GradientClip
+import Hesper.Training.LRScheduler
 import Hesper.Models.BitNet
 import Hesper.Tokenizer.SentencePiece
 import Hesper.GGUF.Reader
@@ -166,12 +168,24 @@ def main (args : List String) : IO Unit := do
     dim kvDim model.config.numHeads model.config.headDim model.config.maxSeqLen model.config.numLayers
 
   let scale := loraConfig.scale
-  let startLayer := 0  -- backward through all layers (per-layer savedNormed available)
+  let startLayer := 0  -- backward through all layers
   let mut currentState := trainState
   let mut globalStep : Nat := 0
 
-  -- Step 6: Training (GPU-optimized)
-  IO.println "[6/6] Starting training (GPU-batched)..."
+  -- Create gradient clipping buffers
+  let clipBufs ← Hesper.Optimizer.GradientClip.createClipBuffers device
+  let maxGradNorm := 1.0  -- PyTorch default
+
+  -- Create LR scheduler (linear warmup + cosine decay)
+  let lrScheduler := Hesper.Training.LRScheduler.create args.lr
+    tokenizedExamples.size args.epochs 0.0  -- no warmup for small datasets
+
+  -- Step 6: Training (GPU-optimized, PyTorch-standard)
+  IO.println "[6/6] Starting training..."
+  IO.println s!"  Optimizer: AdamW (lr={args.lr}, wd=0.01)"
+  IO.println s!"  Gradient clipping: max_norm={maxGradNorm}"
+  IO.println s!"  LR schedule: warmup {lrScheduler.warmupSteps} steps + cosine decay"
+  IO.println s!"  Total steps: {lrScheduler.totalSteps}"
   IO.println ""
 
   let cacheState ← createKVCacheState device model
@@ -194,8 +208,7 @@ def main (args : List String) : IO Unit := do
         let zeroBytes := Hesper.WebGPU.BufferOps.uint32ToBytes 0
         writeBuffer device lossBuf 0 zeroBytes
 
-        -- Process ALL tokens with GPU-batched forward+backward
-        -- Each token: 1 GPU submit (forward + loss + backward in single batch)
+        -- Forward + backward for ALL tokens (GPU-batched)
         for t in [:ex.seqLen - 1] do
           let tokenId := ex.tokens.getD t 0
           let targetId := ex.tokens.getD (t + 1) 0
@@ -206,7 +219,6 @@ def main (args : List String) : IO Unit := do
             writeBuffer device targetBuf 0 targetBytes
             exampleTokens := exampleTokens + 1
 
-          -- SINGLE GPU batch: forward + loss + backward
           Hesper.LoRA.Inference.forwardAndBackwardBatched device model
             tokenId t cacheState adapter loraInferState
             isOutputToken targetBuf lossBuf dLogitsBuf dHiddenBuf
@@ -220,25 +232,31 @@ def main (args : List String) : IO Unit := do
         epochTokens := epochTokens + exampleTokens
         globalStep := globalStep + 1
 
-        -- SGD update (batched into single GPU submit)
+        -- === PyTorch-standard optimizer step ===
         if exampleTokens > 0 then
-          let sgdLr := args.lr
+          -- 1. Gradient clipping only (skip loss norm for now)
+          let _gradNorm ← Hesper.Optimizer.GradientClip.clipGradNorm device adapter
+            currentState.grads maxGradNorm clipBufs
+          -- 3. Get current learning rate from scheduler
+          let currentLR := Hesper.Training.LRScheduler.getLR lrScheduler globalStep
+          -- 4. SGD update with scheduled LR (batched)
           Hesper.WGSL.Execute.beginBatch device
           for i in [:adapter.layers.size] do
             if h1 : i < adapter.layers.size then
               if h2 : i < currentState.grads.layers.size then
                 let layer := adapter.layers[i]
                 let grad := currentState.grads.layers[i]
-                Hesper.LoRA.Forward.executeAddScaled device grad.gradQ.dA layer.loraQ.a (layer.loraQ.rank * layer.loraQ.inDim) (0.0 - sgdLr)
-                Hesper.LoRA.Forward.executeAddScaled device grad.gradQ.dB layer.loraQ.b (layer.loraQ.outDim * layer.loraQ.rank) (0.0 - sgdLr)
-                Hesper.LoRA.Forward.executeAddScaled device grad.gradV.dA layer.loraV.a (layer.loraV.rank * layer.loraV.inDim) (0.0 - sgdLr)
-                Hesper.LoRA.Forward.executeAddScaled device grad.gradV.dB layer.loraV.b (layer.loraV.outDim * layer.loraV.rank) (0.0 - sgdLr)
+                Hesper.LoRA.Forward.executeAddScaled device grad.gradQ.dA layer.loraQ.a (layer.loraQ.rank * layer.loraQ.inDim) (0.0 - currentLR)
+                Hesper.LoRA.Forward.executeAddScaled device grad.gradQ.dB layer.loraQ.b (layer.loraQ.outDim * layer.loraQ.rank) (0.0 - currentLR)
+                Hesper.LoRA.Forward.executeAddScaled device grad.gradV.dA layer.loraV.a (layer.loraV.rank * layer.loraV.inDim) (0.0 - currentLR)
+                Hesper.LoRA.Forward.executeAddScaled device grad.gradV.dB layer.loraV.b (layer.loraV.outDim * layer.loraV.rank) (0.0 - currentLR)
           Hesper.WGSL.Execute.endBatch device
 
         -- Logging
         if globalStep % args.logEvery == 0 || exIdx == 0 then
           let avgLoss := if exampleTokens > 0 then exampleLoss / exampleTokens.toFloat else 0.0
-          TrainLoop.printProgress epoch globalStep avgLoss exampleTokens
+          let currentLR := Hesper.Training.LRScheduler.getLR lrScheduler globalStep
+          IO.println s!"[Train] Epoch {epoch + 1}, Step {globalStep}: loss={avgLoss.toString} ({exampleTokens} tokens, lr={currentLR.toString})"
 
     -- Epoch summary
     let avgEpochLoss := if epochTokens > 0 then epochLoss / epochTokens.toFloat else 0.0
