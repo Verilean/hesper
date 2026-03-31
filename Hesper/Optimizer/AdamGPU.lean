@@ -32,12 +32,13 @@ open Hesper.WGSL
 open Hesper.WGSL.Monad
 open Hesper.WebGPU
 
-/-- Adam hyperparameters -/
+/-- AdamW hyperparameters (matches PyTorch defaults) -/
 structure Config where
-  lr : Float := 1e-4
+  lr : Float := 2e-4
   beta1 : Float := 0.9
   beta2 : Float := 0.999
-  eps : Float := 1e-8
+  eps : Float := 1e-7      -- 1e-7 for FP32 stability (PyTorch uses 1e-8 for FP64)
+  weightDecay : Float := 0.01  -- Decoupled weight decay (AdamW)
   deriving Repr
 
 /-- GPU kernel: Adam parameter update.
@@ -51,7 +52,7 @@ structure Config where
       grad[i] = 0  (zero gradient for next step)
 
     Buffers: param, grad, m, v (all read-write, [numElements] FP32) -/
-def adamUpdateKernel (numElements : Nat) (lr beta1 beta2 eps : Float)
+def adamUpdateKernel (numElements : Nat) (lr beta1 beta2 eps weightDecay : Float)
     (biasCorrection1 biasCorrection2 : Float) : ShaderM Unit := do
   let gid ← ShaderM.globalId
   let i := Exp.vec3X gid
@@ -69,6 +70,9 @@ def adamUpdateKernel (numElements : Nat) (lr beta1 beta2 eps : Float)
     let mVal ← ShaderM.readBuffer (ty := .scalar .f32) (n := numElements) "m" i
     let vVal ← ShaderM.readBuffer (ty := .scalar .f32) (n := numElements) "v" i
 
+    -- AdamW: decoupled weight decay FIRST (before moment updates)
+    let paramDecayed := Exp.sub paramVal (Exp.mul (Exp.litF32 (lr * weightDecay)) paramVal)
+
     -- Update first moment: m = beta1 * m + (1 - beta1) * grad
     let newM := Exp.add
       (Exp.mul (Exp.litF32 beta1) mVal)
@@ -83,14 +87,11 @@ def adamUpdateKernel (numElements : Nat) (lr beta1 beta2 eps : Float)
     let mHat := Exp.div newM (Exp.litF32 biasCorrection1)
     let vHat := Exp.div newV (Exp.litF32 biasCorrection2)
 
-    -- Update parameter: param -= lr * mHat / (sqrt(abs(vHat)) + eps)
-    -- Use abs(vHat) to prevent NaN from sqrt of negative values due to floating point
+    -- Update parameter: param -= lr * mHat / (sqrt(max(vHat, 0)) + eps)
     let update := Exp.div
       (Exp.mul (Exp.litF32 lr) mHat)
       (Exp.add (Exp.sqrt (Exp.max vHat (Exp.litF32 0.0))) (Exp.litF32 eps))
-    -- Clamp update to prevent explosion
-    let clampedUpdate := Exp.max (Exp.litF32 (-1.0)) (Exp.min (Exp.litF32 1.0) update)
-    let newParam := Exp.sub paramVal clampedUpdate
+    let newParam := Exp.sub paramDecayed update
 
     -- Write back
     ShaderM.writeBuffer (ty := .scalar .f32) "param" i newParam
@@ -107,7 +108,7 @@ def executeAdamUpdate (device : Device) (paramBuf gradBuf mBuf vBuf : Buffer)
   let biasCorrection1 := 1.0 - Float.pow config.beta1 step.toFloat
   let biasCorrection2 := 1.0 - Float.pow config.beta2 step.toFloat
 
-  let shader := adamUpdateKernel numElements config.lr config.beta1 config.beta2 config.eps
+  let shader := adamUpdateKernel numElements config.lr config.beta1 config.beta2 config.eps config.weightDecay
     biasCorrection1 biasCorrection2
   let namedBuffers := [("param", paramBuf), ("grad", gradBuf), ("m", mBuf), ("v", vBuf)]
   let execConfig := Hesper.WGSL.Execute.ExecutionConfig.dispatch1D numElements 256
