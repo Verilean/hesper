@@ -342,12 +342,23 @@ def forwardAndBackwardBatched (device : Device) (model : BitNetModel)
                 Backward.executeGradB device dQPreBuf trainState.hBuf layerGrad.gradQ.dB layerAdapter.loraQ.outDim layerAdapter.loraQ.rank scale
                 Backward.executeGradDh device layerAdapter.loraQ.b dQPreBuf trainState.dhBuf layerAdapter.loraQ.outDim layerAdapter.loraQ.rank
                 Backward.executeGradA device trainState.dhBuf savedNorm layerGrad.gradQ.dA layerAdapter.loraQ.rank layerAdapter.loraQ.inDim scale
+                -- Propagate dQ gradient to input: dInputBuf += scale * A_Q^T @ dh_Q
+                Backward.executeInputGrad device layerAdapter.loraQ.a trainState.dhBuf trainState.dInputBuf layerAdapter.loraQ.rank layerAdapter.loraQ.inDim scale
 
-                -- Step 6: LoRA V backward using dHidden + saved normedBuf
+                -- Step 6: LoRA V backward using dForApply + saved normedBuf
                 Forward.executeProjectA device layerAdapter.loraV savedNorm trainState.hBuf
-                Backward.executeGradB device dHiddenBuf trainState.hBuf layerGrad.gradV.dB layerAdapter.loraV.outDim layerAdapter.loraV.rank scale
-                Backward.executeGradDh device layerAdapter.loraV.b dHiddenBuf trainState.dhBuf layerAdapter.loraV.outDim layerAdapter.loraV.rank
+                Backward.executeGradB device dForApply trainState.hBuf layerGrad.gradV.dB layerAdapter.loraV.outDim layerAdapter.loraV.rank scale
+                Backward.executeGradDh device layerAdapter.loraV.b dForApply trainState.dhBuf layerAdapter.loraV.outDim layerAdapter.loraV.rank
                 Backward.executeGradA device trainState.dhBuf savedNorm layerGrad.gradV.dA layerAdapter.loraV.rank layerAdapter.loraV.inDim scale
+                -- Propagate dV gradient to input: dInputBuf += scale * A_V^T @ dh_V
+                Backward.executeInputGrad device layerAdapter.loraV.a trainState.dhBuf trainState.dInputBuf layerAdapter.loraV.rank layerAdapter.loraV.inDim scale
+
+                -- Step 7: Accumulate LoRA dInput into dHidden (residual backward)
+                -- dHidden += dInput_from_LoRA_Q + dInput_from_LoRA_V
+                Forward.executeAddScaled device trainState.dInputBuf dHiddenBuf dim 1.0
+                -- Zero dInputBuf for next layer
+                -- (executeInputGrad uses += so we need to reset)
+                Hesper.Training.TrainLoop.zeroBuffer device trainState.dInputBuf dim
     | _, _, _, _ => pure ()
 
   -- === END SINGLE GPU BATCH ===

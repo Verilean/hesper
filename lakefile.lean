@@ -813,6 +813,11 @@ lean_exe «parse-float-spec» where
   root := `Tests.ParseFloatSpec
   supportInterpreter := true
 
+lean_exe «saved-activation-test» where
+  root := `Tests.SavedActivationTest
+  supportInterpreter := false
+  moreLinkArgs := stdLinkArgs
+
 lean_exe i2s_validation where
   root := `Tests.I2S_Validation
   supportInterpreter := true
