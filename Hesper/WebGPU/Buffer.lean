@@ -52,18 +52,31 @@ opaque getBufferId (buffer : @& Buffer) : IO UInt64
 @[extern "lean_hesper_hash_buffer_array"]
 opaque hashBufferArray (seed : UInt64) (buffers : @& Array Buffer) : IO UInt64
 
-/-- Helper: Convert Float array to ByteArray for buffer upload -/
+/-- Convert Float64 to Float32 IEEE 754 bits -/
+def float64ToFloat32Bits (f : Float) : UInt32 :=
+  let bits64 : UInt64 := f.toBits
+  let sign64 := (bits64 >>> 63) &&& 1
+  let exp64 := (bits64 >>> 52) &&& 0x7FF
+  let mant64 := bits64 &&& 0x000FFFFFFFFFFFFF
+  if exp64 == 0 then (0 : UInt32)
+  else if exp64 == 0x7FF then
+    (sign64.toUInt32 <<< 31) ||| ((0xFF : UInt32) <<< 23) ||| ((mant64 >>> 29).toUInt32 &&& (0x7FFFFF : UInt32))
+  else
+    let exp32val : Int := exp64.toNat - 1023 + 127
+    if exp32val <= 0 then (0 : UInt32)
+    else if exp32val >= 255 then (sign64.toUInt32 <<< 31) ||| ((0xFF : UInt32) <<< 23)
+    else
+      (sign64.toUInt32 <<< 31) ||| (exp32val.toNat.toUInt32 <<< 23) ||| ((mant64 >>> 29).toUInt32 &&& (0x7FFFFF : UInt32))
+
+/-- Helper: Convert Float array to ByteArray for buffer upload (Float64 → Float32) -/
 def floatArrayToBytes (arr : Array Float) : ByteArray :=
-  let bytes := ByteArray.empty
   arr.foldl (fun (acc : ByteArray) (f : Float) =>
-    -- Convert float to bytes (little-endian)
-    let bits : UInt64 := f.toBits
-    let b0 := bits.toUInt8
-    let b1 := (bits >>> 8).toUInt8
-    let b2 := (bits >>> 16).toUInt8
-    let b3 := (bits >>> 24).toUInt8
-    acc.push b0 |>.push b1 |>.push b2 |>.push b3
-  ) bytes
+    let bits := float64ToFloat32Bits f
+    acc.push bits.toUInt8
+       |>.push (bits >>> 8).toUInt8
+       |>.push (bits >>> 16).toUInt8
+       |>.push (bits >>> 24).toUInt8
+  ) ByteArray.empty
 
 /-- Helper: Convert ByteArray to Float array after buffer readback -/
 def bytesToFloatArray (bytes : ByteArray) : Array Float :=

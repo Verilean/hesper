@@ -818,6 +818,11 @@ lean_exe «saved-activation-test» where
   supportInterpreter := false
   moreLinkArgs := stdLinkArgs
 
+lean_exe «rmsnorm-backward-test» where
+  root := `Tests.RMSNormBackwardGPUTest
+  supportInterpreter := false
+  moreLinkArgs := stdLinkArgs
+
 lean_exe i2s_validation where
   root := `Tests.I2S_Validation
   supportInterpreter := true
