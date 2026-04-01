@@ -56,6 +56,12 @@ structure LoRAInferenceState where
       savedAttn[i] = copy of attnBuf (softmax output) for layer i.
       Needed for correct softmax backward: dScores = attn * (dAttn - Σ attn*dAttn) -/
   savedAttn : Array Buffer    -- [numLayers] × [numHeads * maxSeqLen]
+  /-- Per-layer saved attention output (before sub-norm) for RMSNorm backward.
+      savedAttnOut[i] = copy of qRotBuf after attention apply (= input to sub-norm).
+      Needed for RMSNorm backward in the attention chain. -/
+  savedAttnOut : Array Buffer -- [numLayers] × [numHeads * headDim]
+  /-- Scratch buffer for dAttnOut (gradient after O backward, before RMSNorm backward) -/
+  dAttnOutBuf : Option Buffer -- [numHeads * headDim]
 
 /-- Create LoRA inference state (inference only, no backward buffers) -/
 def createLoRAInferenceState (device : Device) (adapter : Adapter)
@@ -68,7 +74,7 @@ def createLoRAInferenceState (device : Device) (adapter : Adapter)
     yBufQ := ← mkBuf dim
     yBufV := ← mkBuf kvDim
     dAttnBuf := none, dScoresBuf := none, dQBuf := none, dQPreBuf := none
-    savedNormed := #[], savedAttn := #[]
+    savedNormed := #[], savedAttn := #[], savedAttnOut := #[], dAttnOutBuf := none
   }
 
 /-- Create LoRA inference state with training backward buffers -/
@@ -80,9 +86,11 @@ def createLoRATrainingState (device : Device) (adapter : Adapter)
   -- Allocate per-layer saved buffers for multi-layer backward
   let mut savedNormed := #[]
   let mut savedAttn := #[]
+  let mut savedAttnOut := #[]
   for _ in [:numLayers] do
     savedNormed := savedNormed.push (← mkBuf dim)
     savedAttn := savedAttn.push (← mkBuf (numHeads * maxSeqLen))
+    savedAttnOut := savedAttnOut.push (← mkBuf (numHeads * headDim))
   pure {
     hBuf := ← mkBuf rank
     yBufQ := ← mkBuf dim
@@ -91,7 +99,8 @@ def createLoRATrainingState (device : Device) (adapter : Adapter)
     dScoresBuf := some (← mkBuf (numHeads * maxSeqLen))
     dQBuf := some (← mkBuf (numHeads * headDim))
     dQPreBuf := some (← mkBuf (numHeads * headDim))
-    savedNormed, savedAttn
+    savedNormed, savedAttn, savedAttnOut
+    dAttnOutBuf := some (← mkBuf (numHeads * headDim))
   }
 
 /-- Single-token forward pass with LoRA.
@@ -209,6 +218,17 @@ def forwardAndBackwardBatched (device : Device) (model : BitNetModel)
         if h_sa : layerIdx < loraState.savedAttn.size then
           let attnSize := model.config.numHeads * (pos + 1)  -- numHeads * cacheLen
           Forward.saveActivation device cacheState.layerBufs.attnBufs.attnBuf loraState.savedAttn[layerIdx] attnSize
+        -- Save attention output (qRotBuf after apply, before sub-norm) for RMSNorm backward
+        -- Note: qRotBuf is reused for attention apply output (step 6 in forward)
+        -- At this point in the code, forwardWithCache has already run, so
+        -- qRotBuf contains the attention output that was fed into sub-norm.
+        -- However, sub-norm overwrites a different buffer (subNormBuf), so
+        -- qRotBuf still has the pre-sub-norm value... unless it was overwritten
+        -- by something else. Actually, qRotBuf IS the attention output buffer
+        -- and it's used as the input to sub-norm. After O projection, the
+        -- output goes to nextBuf. So qRotBuf still holds the attention output.
+        if h_ao : layerIdx < loraState.savedAttnOut.size then
+          Forward.saveActivation device cacheState.layerBufs.attnBufs.qRotBuf loraState.savedAttnOut[layerIdx] (model.config.numHeads * model.config.headDim)
 
       let temp := currentBuf; currentBuf := nextBuf; nextBuf := temp
     layerIdx := layerIdx + 1
@@ -262,6 +282,7 @@ def forwardAndBackwardBatched (device : Device) (model : BitNetModel)
             if h_kv : li < cacheState.kvCaches.size then
               if h_sn : li < loraState.savedNormed.size then
                 if h_sa : li < loraState.savedAttn.size then
+                  if h_ao : li < loraState.savedAttnOut.size then
                 let layerAdapter := adapter.layers[li]
                 let layerGrad := grads.layers[li]
                 let kvCache := cacheState.kvCaches[li]
@@ -269,11 +290,40 @@ def forwardAndBackwardBatched (device : Device) (model : BitNetModel)
                 let savedAttnWeights := loraState.savedAttn[li]
 
                 -- Attention backward chain (verified specs in VerifiedBackward.lean):
-                -- dHidden → apply backward → softmax backward → score backward → RoPE backward → dQ
+                -- dHidden → RMSNorm backward (sub-norm) → apply backward →
+                --   softmax backward → score backward → RoPE backward → dQ
 
-                -- Step 1: dAttn[h,s] = Σ_d dHidden[h,d] * V[kvHead,s,d]
+                let savedAttnOutput := loraState.savedAttnOut[li]
+                let dim := model.config.dim
+
+                -- Step 0: RMSNorm backward (sub-norm)
+                -- dHidden is ∂L/∂(O_projection_output). Through residual connection,
+                -- it's also ∂L/∂(sub-norm output) (approximately, skipping O backward).
+                -- RMSNorm backward: dAttnOut = RMSNorm_backward(savedAttnOut, gamma, dHidden)
+                -- Step 0: RMSNorm backward (sub-norm)
+                -- Compute dAttnOut from dHidden through sub-norm's RMSNorm backward
+                let useRmsNormBackward := match loraState.dAttnOutBuf with
+                  | some _ => true
+                  | none => false
+                let dForApply ← if useRmsNormBackward then do
+                  match loraState.dAttnOutBuf with
+                  | some dAttnOutBuf =>
+                    if h_layer : li < model.layers.size then
+                      let subNormScale := model.layers[li].attnSubNorm.scale
+                      Hesper.Training.AttentionBackward.executeRmsNormBackward device
+                        savedAttnOutput subNormScale dHiddenBuf dAttnOutBuf
+                        dim
+                      -- Clamp RMSNorm backward output to prevent gradient explosion
+                      -- (can happen when attention output has near-zero RMS)
+                      Hesper.WGSL.Elementwise.executeClamp device dAttnOutBuf dAttnOutBuf dim (-10.0) 10.0
+                      pure dAttnOutBuf
+                    else pure dHiddenBuf
+                  | none => pure dHiddenBuf
+                else pure dHiddenBuf
+
+                -- Step 1: dAttn[h,s] = Σ_d dForApply[h,d] * V[kvHead,s,d]
                 Hesper.Training.AttentionBackward.executeApplyBackward device
-                  dHiddenBuf kvCache.vBuf dAttnBuf
+                  dForApply kvCache.vBuf dAttnBuf
                   numHeads numKVHeads cacheLen headDim
 
                 -- Step 2: PROPER softmax backward using saved per-layer attention weights
