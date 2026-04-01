@@ -2,6 +2,7 @@ import Hesper.LoRA.Types
 import Hesper.LoRA.Init
 import Hesper.LoRA.Forward
 import Hesper.LoRA.Backward
+import Hesper.Training.SafeBuffer
 import Hesper.Training.Loss
 import Hesper.Training.AlpacaDataset
 import Hesper.Optimizer.AdamGPU
@@ -196,15 +197,9 @@ def optimizerStep (device : Device) (state : TrainState)
     device state.adapter state.grads state.adamState config
   pure { state with adamState := newAdamState }
 
-/-- Read loss value from GPU buffer -/
+/-- Read loss value from GPU buffer (safe, returns 0.0 on failure) -/
 def readLoss (device : Device) (lossBuf : Buffer) : IO Float := do
-  let bytes ← mapBufferRead device lossBuf 0 4
-  let b0 := bytes.get! 0 |>.toUInt32
-  let b1 := bytes.get! 1 |>.toUInt32
-  let b2 := bytes.get! 2 |>.toUInt32
-  let b3 := bytes.get! 3 |>.toUInt32
-  let bits := b0 ||| (b1 <<< 8) ||| (b2 <<< 16) ||| (b3 <<< 24)
-  pure (Hesper.Basic.float32BitsToFloat64 bits)
+  Hesper.Training.SafeBuffer.safeReadF32 device lossBuf
 
 /-- Print training progress -/
 def printProgress (epoch step : Nat) (loss : Float) (numTokens : Nat) : IO Unit := do

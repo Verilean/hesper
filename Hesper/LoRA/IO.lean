@@ -3,6 +3,7 @@ import Hesper.LoRA.Init
 import Hesper.WebGPU.Types
 import Hesper.WebGPU.Device
 import Hesper.WebGPU.Buffer
+import Hesper.Training.SafeBuffer
 
 /-!
 # LoRA Weight Save/Load
@@ -78,18 +79,13 @@ private def writeF32 (h : IO.FS.Handle) (f : Float) : IO Unit := do
     |>.push (bits >>> 24).toUInt8
   h.write bytes
 
-/-- Read a UInt32 from 4 little-endian bytes -/
+/-- Read a UInt32 from 4 little-endian bytes (bounds-checked) -/
 private def readU32 (bytes : ByteArray) (offset : Nat) : UInt32 :=
-  let b0 := bytes.get! offset |>.toUInt32
-  let b1 := bytes.get! (offset + 1) |>.toUInt32
-  let b2 := bytes.get! (offset + 2) |>.toUInt32
-  let b3 := bytes.get! (offset + 3) |>.toUInt32
-  b0 ||| (b1 <<< 8) ||| (b2 <<< 16) ||| (b3 <<< 24)
+  Hesper.Training.SafeBuffer.readU32 bytes offset
 
-/-- Read a Float from 4 little-endian bytes -/
+/-- Read a Float from 4 little-endian bytes (bounds-checked) -/
 private def readF32 (bytes : ByteArray) (offset : Nat) : Float :=
-  let bits := readU32 bytes offset
-  Hesper.Basic.float32BitsToFloat64 bits
+  Hesper.Training.SafeBuffer.readF32 bytes offset
 
 /-- Save LoRA adapter weights to a binary file -/
 def saveAdapter (device : Device) (adapter : Adapter) (path : String) : IO Unit := do
