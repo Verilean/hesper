@@ -19,6 +19,7 @@ import Hesper.WGSL.Execute
 import Hesper.WGSL.MatMul
 import Hesper.WGSL.Elementwise
 import Hesper.Training.ParseFloat
+import Hesper.Training.SafeBuffer
 
 /-!
 # Alpaca-Style LoRA Finetuning for BitNet
@@ -234,19 +235,6 @@ def main (args : List String) : IO Unit := do
 
         -- === PyTorch-standard optimizer step ===
         if exampleTokens > 0 then
-          -- Debug: read gradient BEFORE optimizer
-          if globalStep <= 2 then
-            if h_g : 29 < currentState.grads.layers.size then
-              let gBytes ← mapBufferRead device currentState.grads.layers[29].gradQ.dB 0 20
-              let vals := List.range 5 |>.map fun k =>
-                let off := k * 4
-                let b0 := gBytes.get! off |>.toUInt32
-                let b1 := gBytes.get! (off+1) |>.toUInt32
-                let b2 := gBytes.get! (off+2) |>.toUInt32
-                let b3 := gBytes.get! (off+3) |>.toUInt32
-                let bits := b0 ||| (b1 <<< 8) ||| (b2 <<< 16) ||| (b3 <<< 24)
-                Hesper.Basic.float32BitsToFloat64 bits
-              IO.println s!"[Debug] step={globalStep} grad dB[0..4] = {vals}"
           -- Gradient clipping (if enabled)
           if maxGradNorm > 0.0 then
             let _gradNorm ← Hesper.Optimizer.GradientClip.clipGradNorm device adapter
@@ -267,22 +255,23 @@ def main (args : List String) : IO Unit := do
     IO.println s!"[Train] Epoch {epoch + 1} complete: avg_loss={avgEpochLoss.toString}, tokens={epochTokens}"
     IO.println ""
 
-  -- Debug: read B directly before save
-  if h_fin : 29 < adapter.layers.size then
-    let bBytes ← mapBufferRead device adapter.layers[29].loraQ.b 0 20
-    let vals := List.range 5 |>.map fun k =>
-      let off := k * 4
-      let b0 := bBytes.get! off |>.toUInt32
-      let b1 := bBytes.get! (off+1) |>.toUInt32
-      let b2 := bBytes.get! (off+2) |>.toUInt32
-      let b3 := bBytes.get! (off+3) |>.toUInt32
-      let bits := b0 ||| (b1 <<< 8) ||| (b2 <<< 16) ||| (b3 <<< 24)
-      Hesper.Basic.float32BitsToFloat64 bits
-    IO.println s!"[Debug] Before save: Q_B[0..4] = {vals}"
+  -- Check for NaN before saving
+  let mut hasNaNWeights := false
+  for i in [:adapter.layers.size] do
+    if h : i < adapter.layers.size then
+      let nanQ ← Hesper.Training.SafeBuffer.hasNaN device adapter.layers[i].loraQ.a 8  -- check first 8
+      let nanB ← Hesper.Training.SafeBuffer.hasNaN device adapter.layers[i].loraQ.b 8
+      if nanQ || nanB then
+        IO.eprintln s!"[WARNING] Layer {i} has NaN weights — save may produce corrupt file"
+        hasNaNWeights := true
+        break
 
   -- Save LoRA weights
-  IO.println s!"Saving LoRA weights to {args.outputPath}..."
-  Hesper.LoRA.IO.saveAdapter device adapter args.outputPath
+  if hasNaNWeights then
+    IO.eprintln "Skipping save due to NaN weights. Try lower --lr or enable --max-grad-norm."
+  else
+    IO.println s!"Saving LoRA weights to {args.outputPath}..."
+    Hesper.LoRA.IO.saveAdapter device adapter args.outputPath
 
   IO.println ""
   IO.println "Training complete!"
