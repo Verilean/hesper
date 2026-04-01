@@ -197,6 +197,10 @@ def optimizerStep (device : Device) (state : TrainState)
     device state.adapter state.grads state.adamState config
   pure { state with adamState := newAdamState }
 
+/-- Zero a GPU buffer (numElements Float32 values) -/
+def zeroBuffer (device : Device) (buf : Buffer) (numElements : Nat) : IO Unit :=
+  writeBuffer device buf 0 (Hesper.LoRA.generateZeroWeights numElements)
+
 /-- Read loss value from GPU buffer (safe, returns 0.0 on failure) -/
 def readLoss (device : Device) (lossBuf : Buffer) : IO Float := do
   Hesper.Training.SafeBuffer.safeReadF32 device lossBuf
