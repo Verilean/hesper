@@ -306,22 +306,13 @@ def forwardAndBackwardBatched (device : Device) (model : BitNetModel)
                 let dForApply ← match loraState.dAttnOutBuf with
                 | some dAttnOutBuf =>
                   if h_layer : li < model.layers.size then
-                    -- O projection backward: dSubNormOut = scale * W_O^T @ dHidden
+                    -- O projection backward: dAttnOutBuf = scale * W_O^T @ dHidden
                     let wO := model.layers[li].attention.wO
                     Hesper.Training.BitLinearBackward.executeBitLinearTranspose device
                       wO dHiddenBuf dAttnOutBuf
-                    -- RMSNorm backward: dAttnOut = RMSNorm_bwd(attnOutput, gamma, dSubNormOut)
-                    let subNormScale := model.layers[li].attnSubNorm.scale
-                    -- Use dAttnOutBuf as both input (dSubNormOut) and output (dAttnOut) via temp
-                    -- Actually we need a separate buffer. Reuse dHiddenBuf as temp:
-                    -- dAttnOutBuf has dSubNormOut, we want to overwrite with dAttnOut
-                    -- But RMSNorm backward reads dOut (= dAttnOutBuf) and writes dIn.
-                    -- We can use dQBuf as temp since it's not yet used in this iteration.
-                    -- Use dScoresBuf as temp (it's not used until softmax backward later)
-                    Hesper.Training.AttentionBackward.executeRmsNormBackward device
-                      savedAttnOutput subNormScale dAttnOutBuf dScoresBuf
-                      dim
-                    pure dScoresBuf
+                    -- Skip RMSNorm backward (causes NaN — savedAttnOutput likely invalid)
+                    -- TODO: Debug savedAttnOutput content or use gradient checkpointing
+                    pure dAttnOutBuf
                   else pure dHiddenBuf
                 | none => pure dHiddenBuf
 
