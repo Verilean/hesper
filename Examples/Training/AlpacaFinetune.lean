@@ -55,6 +55,7 @@ def printUsage : IO Unit := do
   IO.println "  --epochs N       Number of training epochs (default: 3)"
   IO.println "  --max-seq-len N  Maximum sequence length (default: 512)"
   IO.println "  --log-every N    Log every N steps (default: 10)"
+  IO.println "  --max-grad-norm F Max gradient norm for clipping (0=disabled, default: 0)"
 
 structure Args where
   modelPath : String
@@ -66,6 +67,7 @@ structure Args where
   epochs : Nat := 3
   maxSeqLen : Nat := 512
   logEvery : Nat := 10
+  maxGradNorm : Float := 0.0  -- 0 = disabled
 
 def parseArgs (args : List String) : IO Args := do
   let mut modelPath := ""
@@ -77,6 +79,7 @@ def parseArgs (args : List String) : IO Args := do
   let mut epochs : Nat := 3
   let mut maxSeqLen : Nat := 512
   let mut logEvery : Nat := 10
+  let mut maxGradNorm : Float := 0.0
   let mut remaining := args
   while !remaining.isEmpty do
     match remaining with
@@ -91,6 +94,7 @@ def parseArgs (args : List String) : IO Args := do
     | "--epochs" :: n :: rest => epochs := n.toNat!; remaining := rest
     | "--max-seq-len" :: n :: rest => maxSeqLen := n.toNat!; remaining := rest
     | "--log-every" :: n :: rest => logEvery := n.toNat!; remaining := rest
+    | "--max-grad-norm" :: f :: rest => maxGradNorm := parseFloat f; remaining := rest
     | "--help" :: _ => printUsage; throw (IO.userError "")
     | unknown :: rest =>
       IO.eprintln s!"Unknown argument: {unknown}"
@@ -104,7 +108,7 @@ def parseArgs (args : List String) : IO Args := do
     printUsage
     throw (IO.userError "Missing required --data argument")
 
-  pure { modelPath, dataPath, outputPath, rank, alpha, lr, epochs, maxSeqLen, logEvery }
+  pure { modelPath, dataPath, outputPath, rank, alpha, lr, epochs, maxSeqLen, logEvery, maxGradNorm }
 
 def main (args : List String) : IO Unit := do
   let args ← parseArgs args
@@ -170,7 +174,7 @@ def main (args : List String) : IO Unit := do
 
   -- Create gradient clipping buffers
   let clipBufs ← Hesper.Optimizer.GradientClip.createClipBuffers device
-  let maxGradNorm := 1.0  -- PyTorch default
+  let maxGradNorm := args.maxGradNorm
 
   -- Create LR scheduler (linear warmup + cosine decay)
   let lrScheduler := Hesper.Training.LRScheduler.create args.lr
@@ -179,7 +183,7 @@ def main (args : List String) : IO Unit := do
   -- Step 6: Training (GPU-optimized, PyTorch-standard)
   IO.println "[6/6] Starting training..."
   IO.println s!"  Optimizer: AdamW (lr={args.lr}, wd=0.01)"
-  IO.println s!"  Gradient clipping: max_norm={maxGradNorm}"
+  IO.println s!"  Gradient clipping: {if maxGradNorm > 0.0 then s!"max_norm={maxGradNorm}" else "disabled"}"
   IO.println s!"  LR schedule: warmup {lrScheduler.warmupSteps} steps + cosine decay"
   IO.println s!"  Total steps: {lrScheduler.totalSteps}"
   IO.println ""
@@ -243,6 +247,10 @@ def main (args : List String) : IO Unit := do
                 let bits := b0 ||| (b1 <<< 8) ||| (b2 <<< 16) ||| (b3 <<< 24)
                 Hesper.Basic.float32BitsToFloat64 bits
               IO.println s!"[Debug] step={globalStep} grad dB[0..4] = {vals}"
+          -- Gradient clipping (if enabled)
+          if maxGradNorm > 0.0 then
+            let _gradNorm ← Hesper.Optimizer.GradientClip.clipGradNorm device adapter
+              currentState.grads maxGradNorm clipBufs
           -- AdamW update
           let currentLR := Hesper.Training.LRScheduler.getLR lrScheduler globalStep
           let adamConfig : Hesper.Optimizer.AdamGPU.Config := { lr := currentLR }

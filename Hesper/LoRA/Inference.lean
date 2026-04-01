@@ -52,6 +52,10 @@ structure LoRAInferenceState where
       savedNormed[i] = copy of normedBuf after RMSNorm, before attention layer i.
       This is the input to LoRA Q/V projections and is needed for gradient computation. -/
   savedNormed : Array Buffer  -- [numLayers] × [dim]
+  /-- Per-layer saved attention weights for softmax backward.
+      savedAttn[i] = copy of attnBuf (softmax output) for layer i.
+      Needed for correct softmax backward: dScores = attn * (dAttn - Σ attn*dAttn) -/
+  savedAttn : Array Buffer    -- [numLayers] × [numHeads * maxSeqLen]
 
 /-- Create LoRA inference state (inference only, no backward buffers) -/
 def createLoRAInferenceState (device : Device) (adapter : Adapter)
@@ -64,7 +68,7 @@ def createLoRAInferenceState (device : Device) (adapter : Adapter)
     yBufQ := ← mkBuf dim
     yBufV := ← mkBuf kvDim
     dAttnBuf := none, dScoresBuf := none, dQBuf := none, dQPreBuf := none
-    savedNormed := #[]
+    savedNormed := #[], savedAttn := #[]
   }
 
 /-- Create LoRA inference state with training backward buffers -/
@@ -73,10 +77,12 @@ def createLoRATrainingState (device : Device) (adapter : Adapter)
   let rank := adapter.config.rank
   let mkBuf := fun (n : Nat) =>
     createBuffer device { size := (n * 4).toUSize, usage := [.storage, .copySrc, .copyDst], mappedAtCreation := false }
-  -- Allocate per-layer saved normedBuf for multi-layer backward
+  -- Allocate per-layer saved buffers for multi-layer backward
   let mut savedNormed := #[]
+  let mut savedAttn := #[]
   for _ in [:numLayers] do
     savedNormed := savedNormed.push (← mkBuf dim)
+    savedAttn := savedAttn.push (← mkBuf (numHeads * maxSeqLen))
   pure {
     hBuf := ← mkBuf rank
     yBufQ := ← mkBuf dim
@@ -85,7 +91,7 @@ def createLoRATrainingState (device : Device) (adapter : Adapter)
     dScoresBuf := some (← mkBuf (numHeads * maxSeqLen))
     dQBuf := some (← mkBuf (numHeads * headDim))
     dQPreBuf := some (← mkBuf (numHeads * headDim))
-    savedNormed
+    savedNormed, savedAttn
   }
 
 /-- Single-token forward pass with LoRA.
@@ -194,11 +200,15 @@ def forwardAndBackwardBatched (device : Device) (model : BitNetModel)
       else none
       Hesper.Layers.TransformerBlock.forwardWithCache device layer currentBuf nextBuf pos kvCache (some cacheState.layerBufs) fusedRef loraOpt
 
-      -- Save normedBuf for multi-layer backward (gradient checkpointing)
-      -- normedBuf contains the pre-attention RMSNorm output for this layer
+      -- Save activations for multi-layer backward (gradient checkpointing)
       if isOutputToken then
+        -- Save normedBuf (pre-attention RMSNorm output = input to LoRA Q/V)
         if h_sn : layerIdx < loraState.savedNormed.size then
           Forward.saveActivation device cacheState.layerBufs.normedBuf loraState.savedNormed[layerIdx] dim
+        -- Save attnBuf (softmax output = attention weights, needed for softmax backward)
+        if h_sa : layerIdx < loraState.savedAttn.size then
+          let attnSize := model.config.numHeads * (pos + 1)  -- numHeads * cacheLen
+          Forward.saveActivation device cacheState.layerBufs.attnBufs.attnBuf loraState.savedAttn[layerIdx] attnSize
 
       let temp := currentBuf; currentBuf := nextBuf; nextBuf := temp
     layerIdx := layerIdx + 1
@@ -251,12 +261,14 @@ def forwardAndBackwardBatched (device : Device) (model : BitNetModel)
           if h_g : li < grads.layers.size then
             if h_kv : li < cacheState.kvCaches.size then
               if h_sn : li < loraState.savedNormed.size then
+                if h_sa : li < loraState.savedAttn.size then
                 let layerAdapter := adapter.layers[li]
                 let layerGrad := grads.layers[li]
                 let kvCache := cacheState.kvCaches[li]
                 let savedNorm := loraState.savedNormed[li]
+                let savedAttnWeights := loraState.savedAttn[li]
 
-                -- Attention backward chain:
+                -- Attention backward chain (verified specs in VerifiedBackward.lean):
                 -- dHidden → apply backward → softmax backward → score backward → RoPE backward → dQ
 
                 -- Step 1: dAttn[h,s] = Σ_d dHidden[h,d] * V[kvHead,s,d]
@@ -264,17 +276,15 @@ def forwardAndBackwardBatched (device : Device) (model : BitNetModel)
                   dHiddenBuf kvCache.vBuf dAttnBuf
                   numHeads numKVHeads cacheLen headDim
 
-                -- Step 2: dScores = softmax_backward(attn, dAttn)
-                -- Note: attnBuf from shared layerBufs contains LAST layer's attention.
-                -- For multi-layer, we'd need per-layer attnBuf.
-                -- Approximation: use dAttn directly as dScores (skip softmax backward).
-                -- This is equivalent to assuming attention weights are uniform,
-                -- which preserves gradient direction but not exact magnitude.
-                -- TODO: save per-layer attnBuf for exact softmax backward.
+                -- Step 2: PROPER softmax backward using saved per-layer attention weights
+                -- dScores[h,s] = attn[h,s] * (dAttn[h,s] - Σ_s' attn[h,s'] * dAttn[h,s'])
+                Hesper.Training.AttentionBackward.executeSoftmaxBackward device
+                  savedAttnWeights dAttnBuf dScoresBuf
+                  numHeads cacheLen
 
-                -- Step 3: dQ[h,d] = scale * Σ_s dAttn[h,s] * K[kvHead,s,d]
+                -- Step 3: dQ[h,d] = scale * Σ_s dScores[h,s] * K[kvHead,s,d]
                 Hesper.Training.AttentionBackward.executeScoreBackwardQ device
-                  dAttnBuf kvCache.kBuf dQBuf
+                  dScoresBuf kvCache.kBuf dQBuf
                   numHeads numKVHeads cacheLen headDim attnScale
 
                 -- Step 4: RoPE backward
