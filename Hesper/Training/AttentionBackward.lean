@@ -251,7 +251,10 @@ def rmsNormBackwardKernel (dim : Nat) (eps : Float) (workgroupSize : Nat := 256)
     ) (pure ())
     ShaderM.barrier
 
-  let sumSq ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := workgroupSize) "shared_sum" (Exp.litU32 0)
+  -- Save sumSq to a local variable BEFORE Phase 2 overwrites shared_sum
+  let sumSqFromShared ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := workgroupSize) "shared_sum" (Exp.litU32 0)
+  let sumSqVar ← ShaderM.var (.scalar .f32) sumSqFromShared
+  let sumSq := Exp.var sumSqVar
   let rms2 := Exp.add (Exp.div sumSq (Exp.litF32 dim.toFloat)) (Exp.litF32 eps)
   let rms := Exp.sqrt rms2
 
