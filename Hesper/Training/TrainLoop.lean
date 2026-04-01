@@ -3,6 +3,7 @@ import Hesper.LoRA.Init
 import Hesper.LoRA.Forward
 import Hesper.LoRA.Backward
 import Hesper.Training.SafeBuffer
+import Hesper.Optimizer.GradientClip
 import Hesper.Training.Loss
 import Hesper.Training.AlpacaDataset
 import Hesper.Optimizer.AdamGPU
@@ -197,9 +198,9 @@ def optimizerStep (device : Device) (state : TrainState)
     device state.adapter state.grads state.adamState config
   pure { state with adamState := newAdamState }
 
-/-- Zero a GPU buffer (numElements Float32 values) -/
-def zeroBuffer (device : Device) (buf : Buffer) (numElements : Nat) : IO Unit :=
-  writeBuffer device buf 0 (Hesper.LoRA.generateZeroWeights numElements)
+/-- Zero a GPU buffer via GPU kernel (safe to use inside batch) -/
+def zeroBuffer (device : Device) (buf : Buffer) (numElements : Nat) : IO Unit := do
+  Hesper.Optimizer.GradientClip.executeScale device buf numElements 0.0
 
 /-- Read loss value from GPU buffer (safe, returns 0.0 on failure) -/
 def readLoss (device : Device) (lossBuf : Buffer) : IO Float := do
