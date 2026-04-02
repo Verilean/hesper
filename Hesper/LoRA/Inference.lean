@@ -254,9 +254,18 @@ def forwardAndBackwardBatched (device : Device) (model : BitNetModel)
     Hesper.Training.Loss.executeCrossEntropyForwardAccum device cacheState.logitsBuf targetBuf lossAccumBuf model.config.vocabSize
     -- Cross-entropy backward: dLogits = softmax - one_hot
     Hesper.Training.Loss.executeCrossEntropyBackward device cacheState.logitsBuf targetBuf dLogitsBuf model.config.vocabSize
-    -- LM head backward: dHidden = dLogits @ embedding
+    -- LM head backward: dNormOut = dLogits @ embedding
     let lmHeadBackConfig : Hesper.WGSL.MatMul.Config := { M := 1, N := dim, K := model.config.vocabSize }
     Hesper.WGSL.MatMul.executeMatMul device dLogitsBuf model.embedding.embeddingTable dHiddenBuf lmHeadBackConfig
+
+    -- Final RMSNorm backward: dHidden = RMSNorm_bwd(lastLayerOutput, finalNorm.scale, dNormOut)
+    -- currentBuf still holds the last layer's output (= final RMSNorm input)
+    -- dHiddenBuf holds dNormOut, we write dHidden to dLogitsBuf (as temp, it's no longer needed)
+    Hesper.Training.AttentionBackward.executeRmsNormBackward device
+      currentBuf model.finalNorm.scale dHiddenBuf dLogitsBuf dim
+    -- Copy result back to dHiddenBuf (swap dLogitsBuf → dHiddenBuf would work but
+    -- dLogitsBuf is [vocabSize] and dHiddenBuf is [dim], sizes differ. Use saveActivation copy)
+    Forward.saveActivation device dLogitsBuf dHiddenBuf dim
 
     -- === FULL MULTI-LAYER ATTENTION BACKWARD ===
     -- dHidden contains ∂L/∂hidden after LM head backward.
