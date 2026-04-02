@@ -537,6 +537,7 @@ structure CachedAttentionBuffers where
   subNormBuf : Buffer  -- [dim]
   rmsTempBuf : Buffer  -- small
   paramsBuf : Buffer   -- [2 × u32]: pos, cacheLen
+  flashPartialBuf : Buffer  -- [numHeads * maxTiles * (headDim + 2)] for tiled flash attention
   -- PreparedDispatch refs for instant replay (shared-buffer-safe only)
   preparedSoftmax : IO.Ref (Option Hesper.WGSL.Execute.PreparedDispatch)
   preparedRopeQ : IO.Ref (Option Hesper.WGSL.Execute.PreparedDispatch)
@@ -558,6 +559,13 @@ def createCachedAttentionBuffers (device : Device) (config : Config) : IO Cached
     subNormBuf := ← mkBuf (config.dim * 4).toUSize
     rmsTempBuf := ← mkBuf 4
     paramsBuf := ← mkCopyBuf 8  -- 2 × u32 = 8 bytes
+    -- Flash attention partial buffer: numHeads * maxTiles * (headDim + 2)
+    flashPartialBuf := ← do
+      let tileSize := 32
+      let maxTiles := (config.maxSeqLen + tileSize - 1) / tileSize
+      let headDim := config.effectiveHeadDim
+      let partialSize := config.numHeads * maxTiles * (headDim + 2)
+      mkBuf (partialSize * 4).toUSize
     preparedSoftmax := ← IO.mkRef none
     preparedRopeQ := ← IO.mkRef none
     preparedRopeK := ← IO.mkRef none
@@ -861,14 +869,13 @@ def forwardWithCache (device : Device) (layer : Attention)
       (some writeCacheKey) (some kvCache.preparedCacheWriteKV)
 
   -- Steps 4-6: Tiled Flash Attention (2 dispatches: parallel tiles + merge)
-  -- Phase 1: numHeads × numTiles workgroups (high parallelism)
-  -- Phase 2: merge partial results (1 dispatch)
-  -- Output to scoresBuf (temp) then copy to qRotBuf
+  -- Phase 1 reads Q from qRotBuf, writes partial results to temp buffer
+  -- Phase 2 reads partial results, writes DIRECTLY to qRotBuf (no copy needed)
   let attnScale := 1.0 / headDim.toFloat.sqrt
   Hesper.WGSL.FlashAttention.executeFlashAttentionTiled device
-    bufs.qRotBuf kvCache.kBuf kvCache.vBuf bufs.scoresBuf
+    bufs.qRotBuf kvCache.kBuf kvCache.vBuf bufs.qRotBuf
     numHeads numKVHeads maxSeqLen headDim cacheLen attnScale
-  Hesper.LoRA.Forward.saveActivation device bufs.scoresBuf bufs.qRotBuf (numHeads * headDim)
+    (some bufs.flashPartialBuf)
 
   -- Step 7: Sub-norm (if provided)
   let attnOutForO ← match subNorm with
