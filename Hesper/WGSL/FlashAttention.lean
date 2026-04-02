@@ -203,17 +203,25 @@ def flashAttentionKernel (numHeads numKVHeads cacheLen headDim : Nat)
       -- All threads read the reduced score from shared memory
       let scoreFromShared ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := workgroupSize) "shared_reduce" (Exp.litU32 0)
       let scaledScore := Exp.mul (Exp.litF32 scale) scoreFromShared
-      let newMax := Exp.max maxScore scaledScore
-      let expOld := Exp.exp (Exp.sub maxScore newMax)
+
+      -- Save old max_score and sum_exp to local vars BEFORE updating
+      -- (Exp.var references are live — must snapshot before assign)
+      let oldMaxVar ← ShaderM.var (.scalar .f32) maxScore
+      let oldSumVar ← ShaderM.var (.scalar .f32) sumExp
+      let oldMax := Exp.var oldMaxVar
+      let oldSum := Exp.var oldSumVar
+
+      let newMax := Exp.max oldMax scaledScore
+      let expOld := Exp.exp (Exp.sub oldMax newMax)
       let expNew := Exp.exp (Exp.sub scaledScore newMax)
-      let newSum := Exp.add (Exp.mul sumExp expOld) expNew
+      let newSum := Exp.add (Exp.mul oldSum expOld) expNew
 
       -- Update output accumulator for this thread's dimension(s)
       ShaderM.if_ (Exp.lt tid (Exp.litU32 headDim)) (do
         let vIdx := Exp.add kBase tid  -- V uses same layout as K
         let vVal ← ShaderM.readBuffer (ty := .scalar .f32) (n := numKVHeads * cacheLen * headDim) "v_cache" vIdx
         -- Rescale old accumulator and add new weighted V
-        let rescaled := Exp.mul outAcc (Exp.div (Exp.mul sumExp expOld) newSum)
+        let rescaled := Exp.mul outAcc (Exp.div (Exp.mul oldSum expOld) newSum)
         let newContrib := Exp.mul vVal (Exp.div expNew newSum)
         ShaderM.assign "out_acc" (Exp.add rescaled newContrib)
       ) (pure ())
