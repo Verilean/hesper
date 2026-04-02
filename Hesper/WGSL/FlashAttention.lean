@@ -231,9 +231,206 @@ def flashAttentionDynamicKernel (numHeads numKVHeads maxSeqLen headDim cacheLen 
       ShaderM.writeBuffer (ty := .scalar .f32) "output" outIdx outAcc
     ) (pure ())
 
-/-- Execute flash attention (production version).
-    cacheLen is a compile-time constant — shader is recompiled per position
-    but cached by the pipeline cache (same approach as standard score/softmax/apply). -/
+/-! ## Tiled Flash Attention (v2) — High Parallelism -/
+
+/-- Tiled flash attention: Phase 1 — each tile computes partial online softmax.
+    Dispatch: (numHeads, numTiles). Each workgroup processes tileSize positions.
+    Outputs per tile: partial_output[headDim], partial_max[1], partial_sumexp[1] -/
+def flashAttentionTiledPhase1 (numHeads numKVHeads maxSeqLen headDim cacheLen tileSize : Nat)
+    (scale : Float) (workgroupSize : Nat := 256) : ShaderM Unit := do
+  let wgid ← ShaderM.workgroupId
+  let lid ← ShaderM.localId
+  let head := Exp.vec3X wgid       -- head index (wgid.x)
+  let tileIdx := Exp.vec3Y wgid    -- tile index (wgid.y)
+  let tid := Exp.vec3X lid
+
+  let headsPerKV := numHeads / numKVHeads
+  let kvHead := Exp.div head (Exp.litU32 headsPerKV)
+
+  let numTiles := (cacheLen + tileSize - 1) / tileSize
+
+  let _q ← ShaderM.declareInputBuffer "q" (.array (.scalar .f32) (numHeads * headDim))
+  let _kCache ← ShaderM.declareInputBuffer "k_cache" (.array (.scalar .f32) (numKVHeads * maxSeqLen * headDim))
+  let _vCache ← ShaderM.declareInputBuffer "v_cache" (.array (.scalar .f32) (numKVHeads * maxSeqLen * headDim))
+  -- Partial results: [numHeads, numTiles, headDim + 2]  (output + max + sumexp)
+  let partialSize := numHeads * numTiles * (headDim + 2)
+  let _partial ← ShaderM.declareOutputBuffer "partial" (.array (.scalar .f32) partialSize)
+
+  ShaderM.sharedNamed "shared_q" (.array (.scalar .f32) headDim)
+  ShaderM.sharedNamed "shared_reduce" (.array (.scalar .f32) workgroupSize)
+
+  -- Load Q into shared memory
+  let qBase := Exp.mul head (Exp.litU32 headDim)
+  ShaderM.loop tid (Exp.litU32 headDim) (Exp.litU32 workgroupSize) fun d => do
+    let qVal ← ShaderM.readBuffer (ty := .scalar .f32) (n := numHeads * headDim) "q" (Exp.add qBase d)
+    ShaderM.writeWorkgroup (ty := .scalar .f32) "shared_q" d qVal
+  ShaderM.barrier
+
+  -- Online softmax for this tile's range
+  let tileStart := Exp.mul tileIdx (Exp.litU32 tileSize)
+
+  ShaderM.varNamed "max_score" (.scalar .f32) (Exp.litF32 (-1.0e30))
+  ShaderM.varNamed "sum_exp" (.scalar .f32) (Exp.litF32 0.0)
+  ShaderM.varNamed "out_acc" (.scalar .f32) (Exp.litF32 0.0)
+  let maxScore := Exp.var "max_score"
+  let sumExp := Exp.var "sum_exp"
+  let outAcc := Exp.var "out_acc"
+
+  -- Process positions in this tile
+  ShaderM.loop (Exp.litU32 0) (Exp.litU32 tileSize) (Exp.litU32 1) fun localS => do
+    let s := Exp.add tileStart localS
+
+    -- Compute partial dot product
+    let partialVar ← ShaderM.var (.scalar .f32) (Exp.litF32 0.0)
+    -- Guard: only compute for valid positions
+    ShaderM.if_ (Exp.lt s (Exp.litU32 cacheLen)) (do
+      let kBase := Exp.add (Exp.mul (Exp.mul kvHead (Exp.litU32 maxSeqLen)) (Exp.litU32 headDim))
+                            (Exp.mul s (Exp.litU32 headDim))
+      ShaderM.loop tid (Exp.litU32 headDim) (Exp.litU32 workgroupSize) fun d => do
+        let qVal ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := headDim) "shared_q" d
+        let kVal ← ShaderM.readBuffer (ty := .scalar .f32) (n := numKVHeads * maxSeqLen * headDim) "k_cache" (Exp.add kBase d)
+        ShaderM.assign partialVar (Exp.add (Exp.var partialVar) (Exp.mul qVal kVal))
+    ) (pure ())
+
+    -- Reduction (uniform control flow — loop bound is compile-time constant)
+    ShaderM.writeWorkgroup (ty := .scalar .f32) "shared_reduce" tid (Exp.var partialVar)
+    ShaderM.barrier
+
+    let numSteps := Nat.log2 workgroupSize
+    ShaderM.staticLoop numSteps fun step => do
+      let stride := workgroupSize >>> (step + 1)
+      ShaderM.if_ (Exp.lt tid (Exp.litU32 stride)) (do
+        let other ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := workgroupSize) "shared_reduce" (Exp.add tid (Exp.litU32 stride))
+        let cur ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := workgroupSize) "shared_reduce" tid
+        ShaderM.writeWorkgroup (ty := .scalar .f32) "shared_reduce" tid (Exp.add cur other)
+      ) (pure ())
+      ShaderM.barrier
+
+    -- Online softmax update (only for valid positions)
+    ShaderM.if_ (Exp.lt s (Exp.litU32 cacheLen)) (do
+      let scoreFromShared ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := workgroupSize) "shared_reduce" (Exp.litU32 0)
+      let scaledScore := Exp.mul (Exp.litF32 scale) scoreFromShared
+
+      let oldMaxVar ← ShaderM.var (.scalar .f32) maxScore
+      let oldSumVar ← ShaderM.var (.scalar .f32) sumExp
+      let oldMax := Exp.var oldMaxVar
+      let oldSum := Exp.var oldSumVar
+
+      let newMax := Exp.max oldMax scaledScore
+      let expOld := Exp.exp (Exp.sub oldMax newMax)
+      let expNew := Exp.exp (Exp.sub scaledScore newMax)
+      let newSum := Exp.add (Exp.mul oldSum expOld) expNew
+
+      ShaderM.if_ (Exp.lt tid (Exp.litU32 headDim)) (do
+        let kBase := Exp.add (Exp.mul (Exp.mul kvHead (Exp.litU32 maxSeqLen)) (Exp.litU32 headDim))
+                              (Exp.mul s (Exp.litU32 headDim))
+        let vVal ← ShaderM.readBuffer (ty := .scalar .f32) (n := numKVHeads * maxSeqLen * headDim) "v_cache" (Exp.add kBase tid)
+        let rescaled := Exp.mul outAcc (Exp.div (Exp.mul oldSum expOld) newSum)
+        let newContrib := Exp.mul vVal (Exp.div expNew newSum)
+        ShaderM.assign "out_acc" (Exp.add rescaled newContrib)
+      ) (pure ())
+
+      ShaderM.assign "max_score" newMax
+      ShaderM.assign "sum_exp" newSum
+    ) (pure ())
+    ShaderM.barrier
+
+  -- Write partial results: [head, tileIdx, 0..headDim-1] = output, [.., headDim] = max, [.., headDim+1] = sumexp
+  let stride := headDim + 2
+  let partialBase := Exp.add (Exp.mul head (Exp.litU32 (numTiles * stride)))
+                              (Exp.mul tileIdx (Exp.litU32 stride))
+  ShaderM.if_ (Exp.lt tid (Exp.litU32 headDim)) (do
+    ShaderM.writeBuffer (ty := .scalar .f32) "partial" (Exp.add partialBase tid) outAcc
+  ) (pure ())
+  ShaderM.if_ (Exp.eq tid (Exp.litU32 0)) (do
+    ShaderM.writeBuffer (ty := .scalar .f32) "partial" (Exp.add partialBase (Exp.litU32 headDim)) maxScore
+    ShaderM.writeBuffer (ty := .scalar .f32) "partial" (Exp.add partialBase (Exp.litU32 (headDim + 1))) sumExp
+  ) (pure ())
+
+/-- Tiled flash attention: Phase 2 — merge partial results.
+    Each thread handles one output dimension for one head.
+    Dispatch: (numHeads * headDim) -/
+def flashAttentionTiledPhase2 (numHeads headDim numTiles : Nat) : ShaderM Unit := do
+  let gid ← ShaderM.globalId
+  let idx := Exp.vec3X gid  -- linear index into [numHeads * headDim]
+
+  let stride := headDim + 2
+  let _partial ← ShaderM.declareInputBuffer "partial" (.array (.scalar .f32) (numHeads * numTiles * stride))
+  let _output ← ShaderM.declareOutputBuffer "output" (.array (.scalar .f32) (numHeads * headDim))
+
+  ShaderM.if_ (Exp.lt idx (Exp.litU32 (numHeads * headDim))) (do
+    let head := Exp.div idx (Exp.litU32 headDim)
+    let d := Exp.mod idx (Exp.litU32 headDim)
+
+    -- Merge partial results using online softmax merge
+    ShaderM.varNamed "merged_max" (.scalar .f32) (Exp.litF32 (-1.0e30))
+    ShaderM.varNamed "merged_sum" (.scalar .f32) (Exp.litF32 0.0)
+    ShaderM.varNamed "merged_out" (.scalar .f32) (Exp.litF32 0.0)
+    let mergedMax := Exp.var "merged_max"
+    let mergedSum := Exp.var "merged_sum"
+    let mergedOut := Exp.var "merged_out"
+
+    ShaderM.loop (Exp.litU32 0) (Exp.litU32 numTiles) (Exp.litU32 1) fun t => do
+      let tBase := Exp.add (Exp.mul head (Exp.litU32 (numTiles * stride)))
+                            (Exp.mul t (Exp.litU32 stride))
+      let tileOut ← ShaderM.readBuffer (ty := .scalar .f32) (n := numHeads * numTiles * stride) "partial" (Exp.add tBase d)
+      let tileMax ← ShaderM.readBuffer (ty := .scalar .f32) (n := numHeads * numTiles * stride) "partial" (Exp.add tBase (Exp.litU32 headDim))
+      let tileSumExp ← ShaderM.readBuffer (ty := .scalar .f32) (n := numHeads * numTiles * stride) "partial" (Exp.add tBase (Exp.litU32 (headDim + 1)))
+
+      -- Snapshot before update
+      let oldMax ← ShaderM.var (.scalar .f32) mergedMax
+      let oldSum ← ShaderM.var (.scalar .f32) mergedSum
+
+      let newMax := Exp.max (Exp.var oldMax) tileMax
+      let expOld := Exp.exp (Exp.sub (Exp.var oldMax) newMax)
+      let expNew := Exp.exp (Exp.sub tileMax newMax)
+      let newSum := Exp.add (Exp.mul (Exp.var oldSum) expOld) (Exp.mul tileSumExp expNew)
+
+      -- Guard against division by zero (newSum could be 0 if all tiles empty)
+      let safeSum := Exp.max newSum (Exp.litF32 1.0e-10)
+      let rescaled := Exp.mul mergedOut (Exp.div (Exp.mul (Exp.var oldSum) expOld) safeSum)
+      let newContrib := Exp.mul tileOut (Exp.div (Exp.mul tileSumExp expNew) safeSum)
+      ShaderM.assign "merged_out" (Exp.add rescaled newContrib)
+      ShaderM.assign "merged_max" newMax
+      ShaderM.assign "merged_sum" newSum
+
+    ShaderM.writeBuffer (ty := .scalar .f32) "output" idx mergedOut
+  ) (pure ())
+
+/-- Execute tiled flash attention (2 phases) -/
+def executeFlashAttentionTiled (device : Device)
+    (qBuf kCacheBuf vCacheBuf outputBuf : Buffer)
+    (numHeads numKVHeads maxSeqLen headDim cacheLen : Nat) (scale : Float) : IO Unit := do
+  let tileSize := 32  -- positions per tile
+  let numTiles := (cacheLen + tileSize - 1) / tileSize
+  let workgroupSize := min 256 (max headDim 32)
+
+  -- Allocate partial results buffer
+  let stride := headDim + 2
+  let partialSize := numHeads * numTiles * stride
+  let partialBuf ← createBuffer device {
+    size := (partialSize * 4).toUSize
+    usage := [.storage, .copySrc, .copyDst]
+    mappedAtCreation := false
+  }
+
+  -- Phase 1: Parallel tile computation
+  let shader1 := flashAttentionTiledPhase1 numHeads numKVHeads maxSeqLen headDim cacheLen tileSize scale workgroupSize
+  let namedBuffers1 := [("q", qBuf), ("k_cache", kCacheBuf), ("v_cache", vCacheBuf), ("partial", partialBuf)]
+  let execConfig1 : Hesper.WGSL.Execute.ExecutionConfig := {
+    workgroupSize := {x := workgroupSize, y := 1, z := 1}
+    numWorkgroups := (numHeads, numTiles, 1)  -- 2D dispatch: head × tile
+  }
+  let cacheKey1 : UInt64 := hash ("flashT1", numHeads, numKVHeads, maxSeqLen, headDim, cacheLen, tileSize)
+  Hesper.WGSL.Execute.executeShaderNamed device shader1 namedBuffers1 execConfig1 (some cacheKey1)
+
+  -- Phase 2: Merge partial results
+  let shader2 := flashAttentionTiledPhase2 numHeads headDim numTiles
+  let namedBuffers2 := [("partial", partialBuf), ("output", outputBuf)]
+  let execConfig2 := Hesper.WGSL.Execute.ExecutionConfig.dispatch1D (numHeads * headDim) 256
+  let cacheKey2 : UInt64 := hash ("flashT2", numHeads, headDim, numTiles)
+  Hesper.WGSL.Execute.executeShaderNamed device shader2 namedBuffers2 execConfig2 (some cacheKey2)
+
 def executeFlashAttentionDynamic (device : Device)
     (qBuf kCacheBuf vCacheBuf outputBuf : Buffer)
     (numHeads numKVHeads maxSeqLen headDim cacheLen : Nat) (scale : Float) : IO Unit := do
