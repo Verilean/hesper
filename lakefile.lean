@@ -827,6 +827,11 @@ lean_exe «chain-completeness» where
   root := `Tests.ChainCompletenessTest
   supportInterpreter := true
 
+lean_exe «gpu-vs-cpu-test» where
+  root := `Tests.GPUvsCPUBackwardTest
+  supportInterpreter := false
+  moreLinkArgs := stdLinkArgs
+
 lean_exe i2s_validation where
   root := `Tests.I2S_Validation
   supportInterpreter := true
