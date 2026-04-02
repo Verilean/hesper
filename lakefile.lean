@@ -823,6 +823,10 @@ lean_exe «rmsnorm-backward-test» where
   supportInterpreter := false
   moreLinkArgs := stdLinkArgs
 
+lean_exe «chain-completeness» where
+  root := `Tests.ChainCompletenessTest
+  supportInterpreter := true
+
 lean_exe i2s_validation where
   root := `Tests.I2S_Validation
   supportInterpreter := true
