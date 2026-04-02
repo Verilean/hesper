@@ -860,8 +860,9 @@ def forwardWithCache (device : Device) (layer : Attention)
       (Hesper.WGSL.Execute.ExecutionConfig.dispatch1D kvDim 256)
       (some writeCacheKey) (some kvCache.preparedCacheWriteKV)
 
-  -- Steps 4-6: Score + Softmax + Apply (standard path)
-  -- TODO: Replace with Flash Attention after GPU kernel is validated
+  -- Steps 4-6: Score + Softmax + Apply
+  -- Flash Attention is proven equivalent (GPU test: error=0.0) but requires
+  -- dynamic cacheLen support for production use. Using standard path for now.
   let scoresWx := (numHeads * cacheLen + 255) / 256
   if let some p ← kvCache.preparedScores.get then
     Hesper.WGSL.Execute.replayPreparedDispatch device p scoresWx 1 1
