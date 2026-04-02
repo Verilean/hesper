@@ -9,6 +9,7 @@ import Hesper.Training.TrainLoop
 import Hesper.Training.AttentionBackward
 import Hesper.Training.BitLinearBackward
 import Hesper.Training.FFNBackward
+import Hesper.WGSL.Fusion
 import Hesper.WebGPU.Types
 import Hesper.WebGPU.Device
 import Hesper.WebGPU.Buffer
@@ -231,11 +232,13 @@ def forwardAndBackwardBatched (device : Device) (model : BitNetModel)
   for layer in model.layers do
     if h : layerIdx < cacheState.kvCaches.size then
       let kvCache := cacheState.kvCaches[layerIdx]
-      -- Use non-fused FFN path when training (need gate/up buffers for FFN backward)
+      -- Output tokens: non-fused FFN (need gate/up buffers for FFN backward)
+      -- Prompt tokens: use fused FFN for speed (no backward needed)
       let fusedRef := if isOutputToken then none
         else if h2 : layerIdx < cacheState.fusedRefs.size then
           some cacheState.fusedRefs[layerIdx]
         else none
+      -- LoRA forward always active (weights affect output for all tokens)
       let loraOpt := if h3 : layerIdx < adapter.layers.size then
         some (adapter.layers[layerIdx], scale, loraState.hBuf, loraState.yBufQ, loraState.yBufV)
       else none
@@ -243,26 +246,14 @@ def forwardAndBackwardBatched (device : Device) (model : BitNetModel)
 
       -- Save activations for multi-layer backward (gradient checkpointing)
       if isOutputToken then
-        -- Save normedBuf (pre-attention RMSNorm output = input to LoRA Q/V)
+        -- Save activations (individual copies for reliability)
         if h_sn : layerIdx < loraState.savedNormed.size then
           Forward.saveActivation device cacheState.layerBufs.normedBuf loraState.savedNormed[layerIdx] dim
-        -- Save attnBuf (softmax output = attention weights, needed for softmax backward)
         if h_sa : layerIdx < loraState.savedAttn.size then
-          let attnSize := model.config.numHeads * (pos + 1)  -- numHeads * cacheLen
+          let attnSize := model.config.numHeads * (pos + 1)
           Forward.saveActivation device cacheState.layerBufs.attnBufs.attnBuf loraState.savedAttn[layerIdx] attnSize
-        -- Save attention output (qRotBuf after apply, before sub-norm) for RMSNorm backward
-        -- Note: qRotBuf is reused for attention apply output (step 6 in forward)
-        -- At this point in the code, forwardWithCache has already run, so
-        -- qRotBuf contains the attention output that was fed into sub-norm.
-        -- However, sub-norm overwrites a different buffer (subNormBuf), so
-        -- qRotBuf still has the pre-sub-norm value... unless it was overwritten
-        -- by something else. Actually, qRotBuf IS the attention output buffer
-        -- and it's used as the input to sub-norm. After O projection, the
-        -- output goes to nextBuf. So qRotBuf still holds the attention output.
         if h_ao : layerIdx < loraState.savedAttnOut.size then
           Forward.saveActivation device cacheState.layerBufs.attnBufs.qRotBuf loraState.savedAttnOut[layerIdx] (model.config.numHeads * model.config.headDim)
-        -- Save FFN activations (gate, up, hidden, residual1)
-        -- These shared buffers are valid right after forwardWithCache returns
         if h_sg : layerIdx < loraState.savedGate.size then
           Forward.saveActivation device cacheState.layerBufs.gateBuf loraState.savedGate[layerIdx] model.config.ffnDim
         if h_su : layerIdx < loraState.savedUp.size then
@@ -404,9 +395,7 @@ def forwardAndBackwardBatched (device : Device) (model : BitNetModel)
                 Backward.executeGradB device dForApply trainState.hBuf layerGrad.gradV.dB layerAdapter.loraV.outDim layerAdapter.loraV.rank scale
                 Backward.executeGradDh device layerAdapter.loraV.b dForApply trainState.dhBuf layerAdapter.loraV.outDim layerAdapter.loraV.rank
                 Backward.executeGradA device trainState.dhBuf savedNorm layerGrad.gradV.dA layerAdapter.loraV.rank layerAdapter.loraV.inDim scale
-                -- Step 7: FFN backward (propagates gradient through FFN sub-layer)
-                -- dHidden already has the attention sublayer's contribution.
-                -- FFN backward computes the FFN sublayer's contribution and adds it.
+                -- Step 7: FFN backward
                 if h_layer2 : li < model.layers.size then
                   if h_sg : li < loraState.savedGate.size then
                     if h_su : li < loraState.savedUp.size then
