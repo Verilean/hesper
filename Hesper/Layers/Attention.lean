@@ -822,13 +822,10 @@ def forwardWithCache (device : Device) (layer : Attention)
 
   -- Step 1.5: LoRA corrections on Q and V (BEFORE RoPE)
   match loraOpt with
-  | some (loraAdapter, loraScale, loraHBuf, loraYBufQ, loraYBufV) =>
-    Hesper.LoRA.Forward.executeProjectA device loraAdapter.loraQ inputBuf loraHBuf
-    Hesper.LoRA.Forward.executeProjectB device loraAdapter.loraQ loraHBuf loraYBufQ
-    Hesper.LoRA.Forward.executeAddScaled device loraYBufQ bufs.qBuf loraAdapter.loraQ.outDim loraScale
-    Hesper.LoRA.Forward.executeProjectA device loraAdapter.loraV inputBuf loraHBuf
-    Hesper.LoRA.Forward.executeProjectB device loraAdapter.loraV loraHBuf loraYBufV
-    Hesper.LoRA.Forward.executeAddScaled device loraYBufV bufs.vNewBuf loraAdapter.loraV.outDim loraScale
+  | some (loraAdapter, loraScale, loraHBuf, _loraYBufQ, _loraYBufV) =>
+    -- Fused LoRA: projectA + fusedBAdd (2 dispatches per projection instead of 3)
+    Hesper.LoRA.Forward.executeLoRAForwardFused device loraAdapter.loraQ loraScale inputBuf bufs.qBuf loraHBuf
+    Hesper.LoRA.Forward.executeLoRAForwardFused device loraAdapter.loraV loraScale inputBuf bufs.vNewBuf loraHBuf
   | none => pure ()
 
   -- Write params buffer: [pos: u32, cacheLen: u32]
