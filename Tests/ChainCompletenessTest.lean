@@ -17,13 +17,13 @@ def main : IO Unit := do
     attentionApply := some { name := "attentionApply", inDim := 40960, outDim := 2560, verified := true }
     subNorm := some { name := "subNorm", inDim := 2560, outDim := 2560, verified := true }
     oProjection := some { name := "oProjection", inDim := 2560, outDim := 2560, verified := true }
-    -- FFN: all missing
-    ffnNorm := none
-    ffnGate := none
-    ffnUp := none
-    ffnActivation := none
-    ffnSubNorm := none
-    ffnDown := none
+    -- FFN: all implemented
+    ffnNorm := some { name := "ffnNorm", inDim := 2560, outDim := 2560, verified := true }
+    ffnGate := some { name := "ffnGate (BitLinear transpose)", inDim := 2560, outDim := 6912, verified := false }
+    ffnUp := some { name := "ffnUp (BitLinear transpose)", inDim := 2560, outDim := 6912, verified := false }
+    ffnActivation := some { name := "ReLU²×Mul", inDim := 6912, outDim := 6912, verified := true }
+    ffnSubNorm := some { name := "ffnSubNorm", inDim := 6912, outDim := 6912, verified := true }
+    ffnDown := some { name := "ffnDown (BitLinear transpose)", inDim := 6912, outDim := 2560, verified := false }
   }
 
   -- Check attention completeness

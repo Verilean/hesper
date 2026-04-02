@@ -185,6 +185,44 @@ def scaledDotOp (k : Array Float := #[0.5, -1.0, 2.0]) (scale : Float := 0.125) 
   testGradOutput := #[1.0]
 }
 
+/-- ReLU²×Mul forward: f(gate, up) = max(0, gate)² × up
+    Encoded as 2N-element input: [gate_0..gate_N-1, up_0..up_N-1] → [h_0..h_N-1] -/
+def reluSqrMulFwd (x : Array Float) : Array Float :=
+  let n := x.size / 2
+  Array.ofFn (n := n) fun i =>
+    let gate := x.getD i.val 0.0
+    let up := x.getD (i.val + n) 0.0
+    let relu := max gate 0.0
+    relu * relu * up
+
+/-- ReLU²×Mul backward:
+    dGate = dH × up × 2 × ReLU(gate)
+    dUp = dH × ReLU²(gate)
+    Returns [dGate_0..dGate_N-1, dUp_0..dUp_N-1] -/
+def reluSqrMulBwd (x dy : Array Float) : Array Float :=
+  let n := x.size / 2
+  let dGate := Array.ofFn (n := n) fun i =>
+    let gate := x.getD i.val 0.0
+    let up := x.getD (i.val + n) 0.0
+    let dH := dy.getD i.val 0.0
+    let relu := max gate 0.0
+    dH * up * 2.0 * relu
+  let dUp := Array.ofFn (n := n) fun i =>
+    let gate := x.getD i.val 0.0
+    let dH := dy.getD i.val 0.0
+    let relu := max gate 0.0
+    dH * relu * relu
+  dGate ++ dUp
+
+def reluSqrMulOp : DiffOp := {
+  name := "ReLU²×Mul"
+  forward := reluSqrMulFwd
+  backward := reluSqrMulBwd
+  testInput := #[1.0, -0.5, 2.0, 0.3,   -- gate (4 elements)
+                 0.5, 1.0, -1.0, 2.0]   -- up (4 elements)
+  testGradOutput := #[0.1, -0.2, 0.3, 0.5]  -- dH (4 elements)
+}
+
 /-! ## Chain Rule (Composition) -/
 
 /-- Compose two differentiable operations.
@@ -218,6 +256,7 @@ def runVerification : IO Unit := do
     ropeOp 1.5,
     rmsNormOp,
     scaledDotOp,
+    reluSqrMulOp,
     -- Composition: RoPE then ScaledDot
     compose (ropeOp 0.3) (scaledDotOp #[0.5, -1.0] 0.125) #[2.0, -1.0] #[1.0]
   ]
