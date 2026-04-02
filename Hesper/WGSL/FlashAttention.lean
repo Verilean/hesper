@@ -397,22 +397,39 @@ def flashAttentionTiledPhase2 (numHeads headDim numTiles : Nat) : ShaderM Unit :
     ShaderM.writeBuffer (ty := .scalar .f32) "output" idx mergedOut
   ) (pure ())
 
-/-- Execute tiled flash attention (2 phases) -/
-def executeFlashAttentionTiled (device : Device)
-    (qBuf kCacheBuf vCacheBuf outputBuf : Buffer)
-    (numHeads numKVHeads maxSeqLen headDim cacheLen : Nat) (scale : Float) : IO Unit := do
-  let tileSize := 32  -- positions per tile
-  let numTiles := (cacheLen + tileSize - 1) / tileSize
-  let workgroupSize := min 256 (max headDim 32)
-
-  -- Allocate partial results buffer
+/-- Pre-allocate partial buffer for tiled flash attention.
+    Call once during initialization, reuse across all tokens. -/
+def createFlashPartialBuffer (device : Device) (numHeads maxSeqLen headDim : Nat)
+    (tileSize : Nat := 32) : IO Buffer := do
+  let maxTiles := (maxSeqLen + tileSize - 1) / tileSize
   let stride := headDim + 2
-  let partialSize := numHeads * numTiles * stride
-  let partialBuf ← createBuffer device {
+  let partialSize := numHeads * maxTiles * stride
+  createBuffer device {
     size := (partialSize * 4).toUSize
     usage := [.storage, .copySrc, .copyDst]
     mappedAtCreation := false
   }
+
+/-- Execute tiled flash attention (2 phases) -/
+def executeFlashAttentionTiled (device : Device)
+    (qBuf kCacheBuf vCacheBuf outputBuf : Buffer)
+    (numHeads numKVHeads maxSeqLen headDim cacheLen : Nat) (scale : Float)
+    (partialBuf : Option Buffer := none) : IO Unit := do
+  let tileSize := 32
+  let numTiles := (cacheLen + tileSize - 1) / tileSize
+  let workgroupSize := min 256 (max headDim 32)
+
+  -- Use pre-allocated buffer or allocate (fallback for compatibility)
+  let partialBuf ← match partialBuf with
+    | some buf => pure buf
+    | none => do
+      let stride := headDim + 2
+      let partialSize := numHeads * numTiles * stride
+      createBuffer device {
+        size := (partialSize * 4).toUSize
+        usage := [.storage, .copySrc, .copyDst]
+        mappedAtCreation := false
+      }
 
   -- Phase 1: Parallel tile computation
   let shader1 := flashAttentionTiledPhase1 numHeads numKVHeads maxSeqLen headDim cacheLen tileSize scale workgroupSize
