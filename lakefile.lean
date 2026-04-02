@@ -832,6 +832,11 @@ lean_exe «gpu-vs-cpu-test» where
   supportInterpreter := false
   moreLinkArgs := stdLinkArgs
 
+lean_exe «flash-attention-test» where
+  root := `Tests.FlashAttentionTest
+  supportInterpreter := false
+  moreLinkArgs := stdLinkArgs
+
 lean_exe i2s_validation where
   root := `Tests.I2S_Validation
   supportInterpreter := true
