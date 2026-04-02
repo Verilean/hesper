@@ -151,4 +151,43 @@ def saveActivation (device : Device) (srcBuf dstBuf : Buffer) (numElements : Nat
   let execConfig := Hesper.WGSL.Execute.ExecutionConfig.dispatch1D numElements 256
   Hesper.WGSL.Execute.executeShaderNamed device shader namedBuffers execConfig
 
+/-! ## Fused LoRA Kernels -/
+
+/-- Fused projectB + addScaled: output[i] += scale * Σ_r B[i,r] * h[r]
+    Combines B@h matmul and scaled add into 1 dispatch (saves 1 dispatch per call). -/
+def loraFusedBAddKernel (outDim rank : Nat) (scale : Float) : ShaderM Unit := do
+  let gid ← ShaderM.globalId
+  let i := Exp.vec3X gid
+
+  let _b ← ShaderM.declareInputBuffer "b" (.array (.scalar .f32) (outDim * rank))
+  let _h ← ShaderM.declareInputBuffer "h" (.array (.scalar .f32) rank)
+  let _output ← ShaderM.declareOutputBuffer "output" (.array (.scalar .f32) outDim)
+
+  ShaderM.if_ (Exp.lt i (Exp.litU32 outDim)) (do
+    let (accName, acc) ← ShaderM.varRef (.scalar .f32) (Exp.litF32 0.0)
+    ShaderM.loop (Exp.litU32 0) (Exp.litU32 rank) (Exp.litU32 1) fun r => do
+      let bIdx := Exp.add (Exp.mul i (Exp.litU32 rank)) r
+      let bVal ← ShaderM.readBuffer (ty := .scalar .f32) (n := outDim * rank) "b" bIdx
+      let hVal ← ShaderM.readBuffer (ty := .scalar .f32) (n := rank) "h" r
+      ShaderM.assign accName (Exp.add acc (Exp.mul bVal hVal))
+    let outVal ← ShaderM.readBuffer (ty := .scalar .f32) (n := outDim) "output" i
+    ShaderM.writeBuffer (ty := .scalar .f32) "output" i
+      (Exp.add outVal (Exp.mul (Exp.litF32 scale) acc))
+  ) (pure ())
+
+/-- Execute fused B@h + add: output += scale * B @ h (1 dispatch instead of 2) -/
+def executeFusedBAdd (device : Device) (weight : Hesper.LoRA.Weight) (scale : Float)
+    (hBuf outputBuf : Buffer) : IO Unit := do
+  let shader := loraFusedBAddKernel weight.outDim weight.rank scale
+  let namedBuffers := [("b", weight.b), ("h", hBuf), ("output", outputBuf)]
+  let execConfig := Hesper.WGSL.Execute.ExecutionConfig.dispatch1D weight.outDim 256
+  Hesper.WGSL.Execute.executeShaderNamed device shader namedBuffers execConfig
+
+/-- Execute full LoRA forward with fused B@h+add: 2 dispatches instead of 3.
+    projectA (1 dispatch) → fusedBAdd (1 dispatch) -/
+def executeLoRAForwardFused (device : Device) (weight : Hesper.LoRA.Weight) (scale : Float)
+    (inputBuf outputBuf hBuf : Buffer) : IO Unit := do
+  executeProjectA device weight inputBuf hBuf
+  executeFusedBAdd device weight scale hBuf outputBuf
+
 end Hesper.LoRA.Forward
