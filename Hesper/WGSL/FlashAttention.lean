@@ -231,6 +231,97 @@ def flashAttentionDynamicKernel (numHeads numKVHeads maxSeqLen headDim cacheLen 
       ShaderM.writeBuffer (ty := .scalar .f32) "output" outIdx outAcc
     ) (pure ())
 
+/-! ## In-Place Flash Attention (single tile, no merge) -/
+
+/-- Flash attention kernel where Q input and output share the same buffer.
+    Q is loaded into shared memory first, then output overwrites the buffer.
+    Single read-write buffer avoids WebGPU aliasing. 1 dispatch only. -/
+def flashAttentionInPlaceKernel (numHeads numKVHeads maxSeqLen headDim cacheLen : Nat)
+    (scale : Float) (workgroupSize : Nat := 256) : ShaderM Unit := do
+  let wgid ← ShaderM.workgroupId
+  let lid ← ShaderM.localId
+  let head := Exp.vec3X wgid
+  let tid := Exp.vec3X lid
+
+  let headsPerKV := numHeads / numKVHeads
+  let kvHead := Exp.div head (Exp.litU32 headsPerKV)
+
+  -- Single buffer: read Q first, then write output
+  let _qOutput ← ShaderM.declareOutputBuffer "q_output" (.array (.scalar .f32) (numHeads * headDim))
+  let _kCache ← ShaderM.declareInputBuffer "k_cache" (.array (.scalar .f32) (numKVHeads * maxSeqLen * headDim))
+  let _vCache ← ShaderM.declareInputBuffer "v_cache" (.array (.scalar .f32) (numKVHeads * maxSeqLen * headDim))
+
+  ShaderM.sharedNamed "shared_q" (.array (.scalar .f32) headDim)
+  ShaderM.sharedNamed "shared_reduce" (.array (.scalar .f32) workgroupSize)
+
+  -- Step 1: Load Q from the read-write buffer into shared memory
+  let qBase := Exp.mul head (Exp.litU32 headDim)
+  ShaderM.loop tid (Exp.litU32 headDim) (Exp.litU32 workgroupSize) fun d => do
+    let qVal ← ShaderM.readBuffer (ty := .scalar .f32) (n := numHeads * headDim) "q_output" (Exp.add qBase d)
+    ShaderM.writeWorkgroup (ty := .scalar .f32) "shared_q" d qVal
+  ShaderM.barrier
+
+  -- Step 2: Online softmax (same as v1)
+  ShaderM.varNamed "max_score" (.scalar .f32) (Exp.litF32 (-1.0e30))
+  ShaderM.varNamed "sum_exp" (.scalar .f32) (Exp.litF32 0.0)
+  ShaderM.varNamed "out_acc" (.scalar .f32) (Exp.litF32 0.0)
+  let maxScore := Exp.var "max_score"
+  let sumExp := Exp.var "sum_exp"
+  let outAcc := Exp.var "out_acc"
+
+  ShaderM.loop (Exp.litU32 0) (Exp.litU32 cacheLen) (Exp.litU32 1) fun s => do
+    let kBase := Exp.add (Exp.mul (Exp.mul kvHead (Exp.litU32 maxSeqLen)) (Exp.litU32 headDim))
+                          (Exp.mul s (Exp.litU32 headDim))
+
+    let partialVar ← ShaderM.var (.scalar .f32) (Exp.litF32 0.0)
+    ShaderM.loop tid (Exp.litU32 headDim) (Exp.litU32 workgroupSize) fun d => do
+      let qVal ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := headDim) "shared_q" d
+      let kVal ← ShaderM.readBuffer (ty := .scalar .f32) (n := numKVHeads * maxSeqLen * headDim) "k_cache" (Exp.add kBase d)
+      ShaderM.assign partialVar (Exp.add (Exp.var partialVar) (Exp.mul qVal kVal))
+
+    ShaderM.writeWorkgroup (ty := .scalar .f32) "shared_reduce" tid (Exp.var partialVar)
+    ShaderM.barrier
+
+    let numSteps := Nat.log2 workgroupSize
+    ShaderM.staticLoop numSteps fun step => do
+      let stride := workgroupSize >>> (step + 1)
+      ShaderM.if_ (Exp.lt tid (Exp.litU32 stride)) (do
+        let other ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := workgroupSize) "shared_reduce" (Exp.add tid (Exp.litU32 stride))
+        let cur ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := workgroupSize) "shared_reduce" tid
+        ShaderM.writeWorkgroup (ty := .scalar .f32) "shared_reduce" tid (Exp.add cur other)
+      ) (pure ())
+      ShaderM.barrier
+
+    let scoreFromShared ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := workgroupSize) "shared_reduce" (Exp.litU32 0)
+    let scaledScore := Exp.mul (Exp.litF32 scale) scoreFromShared
+
+    let oldMaxVar ← ShaderM.var (.scalar .f32) maxScore
+    let oldSumVar ← ShaderM.var (.scalar .f32) sumExp
+    let oldMax := Exp.var oldMaxVar
+    let oldSum := Exp.var oldSumVar
+
+    let newMax := Exp.max oldMax scaledScore
+    let expOld := Exp.exp (Exp.sub oldMax newMax)
+    let expNew := Exp.exp (Exp.sub scaledScore newMax)
+    let newSum := Exp.add (Exp.mul oldSum expOld) expNew
+
+    ShaderM.if_ (Exp.lt tid (Exp.litU32 headDim)) (do
+      let vVal ← ShaderM.readBuffer (ty := .scalar .f32) (n := numKVHeads * maxSeqLen * headDim) "v_cache" (Exp.add kBase tid)
+      let rescaled := Exp.mul outAcc (Exp.div (Exp.mul oldSum expOld) newSum)
+      let newContrib := Exp.mul vVal (Exp.div expNew newSum)
+      ShaderM.assign "out_acc" (Exp.add rescaled newContrib)
+    ) (pure ())
+
+    ShaderM.assign "max_score" newMax
+    ShaderM.assign "sum_exp" newSum
+    ShaderM.barrier
+
+  -- Step 3: Write output (overwrites Q data in same buffer)
+  ShaderM.if_ (Exp.lt tid (Exp.litU32 headDim)) (do
+    let outIdx := Exp.add (Exp.mul head (Exp.litU32 headDim)) tid
+    ShaderM.writeBuffer (ty := .scalar .f32) "q_output" outIdx outAcc
+  ) (pure ())
+
 /-! ## Tiled Flash Attention (v2) — High Parallelism -/
 
 /-- Tiled flash attention: Phase 1 — each tile computes partial online softmax.
@@ -431,22 +522,34 @@ def executeFlashAttentionTiled (device : Device)
         mappedAtCreation := false
       }
 
-  -- Phase 1: Parallel tile computation
-  let shader1 := flashAttentionTiledPhase1 numHeads numKVHeads maxSeqLen headDim cacheLen tileSize scale workgroupSize
-  let namedBuffers1 := [("q", qBuf), ("k_cache", kCacheBuf), ("v_cache", vCacheBuf), ("partial", partialBuf)]
-  let execConfig1 : Hesper.WGSL.Execute.ExecutionConfig := {
-    workgroupSize := {x := workgroupSize, y := 1, z := 1}
-    numWorkgroups := (numHeads, numTiles, 1)  -- 2D dispatch: head × tile
-  }
-  let cacheKey1 : UInt64 := hash ("flashT1", numHeads, numKVHeads, maxSeqLen, headDim, cacheLen, tileSize)
-  Hesper.WGSL.Execute.executeShaderNamed device shader1 namedBuffers1 execConfig1 (some cacheKey1)
+  if numTiles == 1 then
+    -- Single tile: use in-place v1 kernel (Q and output share same buffer)
+    -- Q is loaded to shared memory first, then output overwrites the buffer.
+    -- Uses declareOutputBuffer for q_output (read-write) to avoid aliasing.
+    let shader := flashAttentionInPlaceKernel numHeads numKVHeads maxSeqLen headDim cacheLen scale workgroupSize
+    let namedBuffers := [("q_output", outputBuf), ("k_cache", kCacheBuf), ("v_cache", vCacheBuf)]
+    let cacheKey : UInt64 := hash ("flashIP", numHeads, numKVHeads, maxSeqLen, headDim, cacheLen)
+    let execConfig : Hesper.WGSL.Execute.ExecutionConfig := {
+      workgroupSize := {x := workgroupSize, y := 1, z := 1}
+      numWorkgroups := (numHeads, 1, 1)
+    }
+    Hesper.WGSL.Execute.executeShaderNamed device shader namedBuffers execConfig (some cacheKey)
+  else
+    -- Multi-tile: Phase 1 (parallel tiles) + Phase 2 (merge)
+    let shader1 := flashAttentionTiledPhase1 numHeads numKVHeads maxSeqLen headDim cacheLen tileSize scale workgroupSize
+    let namedBuffers1 := [("q", qBuf), ("k_cache", kCacheBuf), ("v_cache", vCacheBuf), ("partial", partialBuf)]
+    let execConfig1 : Hesper.WGSL.Execute.ExecutionConfig := {
+      workgroupSize := {x := workgroupSize, y := 1, z := 1}
+      numWorkgroups := (numHeads, numTiles, 1)
+    }
+    let cacheKey1 : UInt64 := hash ("flashT1", numHeads, numKVHeads, maxSeqLen, headDim, cacheLen, tileSize)
+    Hesper.WGSL.Execute.executeShaderNamed device shader1 namedBuffers1 execConfig1 (some cacheKey1)
 
-  -- Phase 2: Merge partial results
-  let shader2 := flashAttentionTiledPhase2 numHeads headDim numTiles
-  let namedBuffers2 := [("partial", partialBuf), ("output", outputBuf)]
-  let execConfig2 := Hesper.WGSL.Execute.ExecutionConfig.dispatch1D (numHeads * headDim) 256
-  let cacheKey2 : UInt64 := hash ("flashT2", numHeads, headDim, numTiles)
-  Hesper.WGSL.Execute.executeShaderNamed device shader2 namedBuffers2 execConfig2 (some cacheKey2)
+    let shader2 := flashAttentionTiledPhase2 numHeads headDim numTiles
+    let namedBuffers2 := [("partial", partialBuf), ("output", outputBuf)]
+    let execConfig2 := Hesper.WGSL.Execute.ExecutionConfig.dispatch1D (numHeads * headDim) 256
+    let cacheKey2 : UInt64 := hash ("flashT2", numHeads, headDim, numTiles)
+    Hesper.WGSL.Execute.executeShaderNamed device shader2 namedBuffers2 execConfig2 (some cacheKey2)
 
 def executeFlashAttentionDynamic (device : Device)
     (qBuf kCacheBuf vCacheBuf outputBuf : Buffer)
