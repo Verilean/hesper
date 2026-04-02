@@ -128,7 +128,7 @@ def verifyFlashEquivalence (tol : Float := 1e-4) : Bool := Id.run do
     @param cacheLen Number of positions in KV cache
     @param headDim Dimension per head
     @param scale 1/sqrt(headDim) -/
-def flashAttentionDynamicKernel (numHeads numKVHeads maxSeqLen headDim : Nat)
+def flashAttentionDynamicKernel (numHeads numKVHeads maxSeqLen headDim cacheLen : Nat)
     (scale : Float) (workgroupSize : Nat := 256) : ShaderM Unit := do
   let wgid ← ShaderM.workgroupId
   let lid ← ShaderM.localId
@@ -141,11 +141,7 @@ def flashAttentionDynamicKernel (numHeads numKVHeads maxSeqLen headDim : Nat)
   let _q ← ShaderM.declareInputBuffer "q" (.array (.scalar .f32) (numHeads * headDim))
   let _kCache ← ShaderM.declareInputBuffer "k_cache" (.array (.scalar .f32) (numKVHeads * maxSeqLen * headDim))
   let _vCache ← ShaderM.declareInputBuffer "v_cache" (.array (.scalar .f32) (numKVHeads * maxSeqLen * headDim))
-  let _params ← ShaderM.declareInputBuffer "params" (.array (.scalar .u32) 2)
   let _output ← ShaderM.declareOutputBuffer "output" (.array (.scalar .f32) (numHeads * headDim))
-
-  -- Read dynamic cacheLen from params buffer (same as standard path)
-  let cacheLen ← ShaderM.readBuffer (ty := .scalar .u32) (n := 2) "params" (Exp.litU32 1)
 
   -- Shared memory for partial score reduction and Q cache
   ShaderM.sharedNamed "shared_q" (.array (.scalar .f32) headDim)
@@ -180,9 +176,8 @@ def flashAttentionDynamicKernel (numHeads numKVHeads maxSeqLen headDim : Nat)
     -- Iterate over ALL positions up to maxSeqLen (uniform loop bound)
     -- Use if-guard to skip positions beyond actual cacheLen
     -- This ensures workgroupBarrier is in uniform control flow
-    -- Dynamic cacheLen loop (with derivative_uniformity diagnostic off)
-    -- All threads read same cacheLen from params, so barrier IS uniform in practice.
-    ShaderM.loop (Exp.litU32 0) cacheLen (Exp.litU32 1) fun s => do
+    -- cacheLen is compile-time constant (shader recompiled per position, cached by pipeline cache)
+    ShaderM.loop (Exp.litU32 0) (Exp.litU32 cacheLen) (Exp.litU32 1) fun s => do
       let kBase := Exp.add (Exp.mul (Exp.mul kvHead (Exp.litU32 maxSeqLen)) (Exp.litU32 headDim))
                             (Exp.mul s (Exp.litU32 headDim))
 
@@ -236,40 +231,29 @@ def flashAttentionDynamicKernel (numHeads numKVHeads maxSeqLen headDim : Nat)
       ShaderM.writeBuffer (ty := .scalar .f32) "output" outIdx outAcc
     ) (pure ())
 
-/-- Execute flash attention with dynamic cacheLen (production version) -/
+/-- Execute flash attention (production version).
+    cacheLen is a compile-time constant — shader is recompiled per position
+    but cached by the pipeline cache (same approach as standard score/softmax/apply). -/
 def executeFlashAttentionDynamic (device : Device)
-    (qBuf kCacheBuf vCacheBuf paramsBuf outputBuf : Buffer)
-    (numHeads numKVHeads maxSeqLen headDim : Nat) (scale : Float) : IO Unit := do
+    (qBuf kCacheBuf vCacheBuf outputBuf : Buffer)
+    (numHeads numKVHeads maxSeqLen headDim cacheLen : Nat) (scale : Float) : IO Unit := do
   let workgroupSize := min 256 (max headDim 32)
-  let shader := flashAttentionDynamicKernel numHeads numKVHeads maxSeqLen headDim scale workgroupSize
-  let namedBuffers := [("q", qBuf), ("k_cache", kCacheBuf), ("v_cache", vCacheBuf),
-                       ("params", paramsBuf), ("output", outputBuf)]
+  let shader := flashAttentionDynamicKernel numHeads numKVHeads maxSeqLen headDim cacheLen scale workgroupSize
+  let namedBuffers := [("q", qBuf), ("k_cache", kCacheBuf), ("v_cache", vCacheBuf), ("output", outputBuf)]
+  let cacheKey : UInt64 := hash ("flash", numHeads, numKVHeads, maxSeqLen, headDim, cacheLen)
   let execConfig : Hesper.WGSL.Execute.ExecutionConfig := {
     workgroupSize := {x := workgroupSize, y := 1, z := 1}
     numWorkgroups := (numHeads, 1, 1)
-    -- cacheLen is read from params buffer (storage read_write) which WGSL considers
-    -- potentially non-uniform. However, all threads in a workgroup read the SAME value
-    -- from the SAME buffer offset, so the barrier IS uniform in practice.
-    diagnostics := [("off", "derivative_uniformity")]
   }
-  Hesper.WGSL.Execute.executeShaderNamed device shader namedBuffers execConfig
+  Hesper.WGSL.Execute.executeShaderNamed device shader namedBuffers execConfig (some cacheKey)
 
 /-- Execute flash attention with static cacheLen (for testing).
     Uses dynamic kernel with a params buffer containing cacheLen. -/
 def executeFlashAttention (device : Device)
     (qBuf kCacheBuf vCacheBuf outputBuf : Buffer)
     (numHeads numKVHeads cacheLen headDim : Nat) (scale : Float) : IO Unit := do
-  -- Create a temp params buffer with [0, cacheLen]
-  let paramsBuf ← createBuffer device { size := 8, usage := [.storage, .copySrc, .copyDst], mappedAtCreation := false }
-  let paramsBytes := ByteArray.empty
-    |>.push 0 |>.push 0 |>.push 0 |>.push 0  -- pos = 0 (unused)
-    |>.push (cacheLen.toUInt32 &&& 0xFF).toUInt8
-    |>.push ((cacheLen.toUInt32 >>> 8) &&& 0xFF).toUInt8
-    |>.push ((cacheLen.toUInt32 >>> 16) &&& 0xFF).toUInt8
-    |>.push ((cacheLen.toUInt32 >>> 24) &&& 0xFF).toUInt8
-  writeBuffer device paramsBuf 0 paramsBytes
-  -- Use maxSeqLen = cacheLen for test (buffer sizes match)
-  executeFlashAttentionDynamic device qBuf kCacheBuf vCacheBuf paramsBuf outputBuf
-    numHeads numKVHeads cacheLen headDim scale
+  -- For testing: maxSeqLen = cacheLen (buffer sizes match exactly)
+  executeFlashAttentionDynamic device qBuf kCacheBuf vCacheBuf outputBuf
+    numHeads numKVHeads cacheLen headDim cacheLen scale
 
 end Hesper.WGSL.FlashAttention
