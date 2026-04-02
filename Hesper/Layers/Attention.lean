@@ -868,14 +868,43 @@ def forwardWithCache (device : Device) (layer : Attention)
       (Hesper.WGSL.Execute.ExecutionConfig.dispatch1D kvDim 256)
       (some writeCacheKey) (some kvCache.preparedCacheWriteKV)
 
-  -- Steps 4-6: Tiled Flash Attention (2 dispatches: parallel tiles + merge)
-  -- Phase 1 reads Q from qRotBuf, writes partial results to temp buffer
-  -- Phase 2 reads partial results, writes DIRECTLY to qRotBuf (no copy needed)
-  let attnScale := 1.0 / headDim.toFloat.sqrt
-  Hesper.WGSL.FlashAttention.executeFlashAttentionTiled device
-    bufs.qRotBuf kvCache.kBuf kvCache.vBuf bufs.qRotBuf
-    numHeads numKVHeads maxSeqLen headDim cacheLen attnScale
-    (some bufs.flashPartialBuf)
+  -- Steps 4-6: Standard score + softmax + apply (with PreparedDispatch cache)
+  -- Flash Attention available in FlashAttention.lean for long context (cacheLen > 256).
+  -- Standard path is faster for KV-cache autoregressive generation (37 TPS vs 34 TPS)
+  -- because PreparedDispatch eliminates shader recompilation overhead.
+  let scoresWx := (numHeads * cacheLen + 255) / 256
+  if let some p ← kvCache.preparedScores.get then
+    Hesper.WGSL.Execute.replayPreparedDispatch device p scoresWx 1 1
+  else
+    let scale := 1.0 / headDim.toFloat.sqrt
+    let scoresShader := cachedScoresKernel numHeads numKVHeads maxSeqLen headDim scale
+    let scoresCacheKey : UInt64 := hash ("cs", numHeads, numKVHeads, maxSeqLen, headDim)
+    Hesper.WGSL.Execute.executeShaderNamed device scoresShader
+      [("q", bufs.qRotBuf), ("k_cache", kvCache.kBuf), ("scores", bufs.scoresBuf), ("params", bufs.paramsBuf)]
+      (Hesper.WGSL.Execute.ExecutionConfig.dispatch1D (numHeads * cacheLen) 256)
+      (some scoresCacheKey) (some kvCache.preparedScores)
+
+  let softmaxWx := (numHeads * cacheLen + 255) / 256
+  if let some p ← bufs.preparedSoftmax.get then
+    Hesper.WGSL.Execute.replayPreparedDispatch device p softmaxWx 1 1
+  else
+    let softmaxShader := cachedSoftmaxKernel numHeads maxSeqLen
+    let softmaxCacheKey : UInt64 := hash ("sm", numHeads, maxSeqLen)
+    Hesper.WGSL.Execute.executeShaderNamed device softmaxShader
+      [("input", bufs.scoresBuf), ("output", bufs.attnBuf), ("params", bufs.paramsBuf)]
+      (Hesper.WGSL.Execute.ExecutionConfig.dispatch1D (numHeads * cacheLen) 256)
+      (some softmaxCacheKey) (some bufs.preparedSoftmax)
+
+  let applyWx := (numHeads * headDim + 255) / 256
+  if let some p ← kvCache.preparedApply.get then
+    Hesper.WGSL.Execute.replayPreparedDispatch device p applyWx 1 1
+  else
+    let applyShader := cachedApplyKernel numHeads numKVHeads maxSeqLen headDim
+    let applyCacheKey : UInt64 := hash ("ca", numHeads, numKVHeads, maxSeqLen, headDim)
+    Hesper.WGSL.Execute.executeShaderNamed device applyShader
+      [("attn", bufs.attnBuf), ("v_cache", kvCache.vBuf), ("output", bufs.qRotBuf), ("params", bufs.paramsBuf)]
+      (Hesper.WGSL.Execute.ExecutionConfig.dispatch1D (numHeads * headDim) 256)
+      (some applyCacheKey) (some kvCache.preparedApply)
 
   -- Step 7: Sub-norm (if provided)
   let attnOutForO ← match subNorm with
