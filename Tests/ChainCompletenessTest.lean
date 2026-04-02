@@ -8,7 +8,7 @@ def main : IO Unit := do
 
   -- Build the current state of attention backward
   let builder : TransformerBackwardBuilder := {
-    preNorm := none  -- TODO: pre-attention RMSNorm backward
+    preNorm := some { name := "preNorm (skipped: residual bypass)", inDim := 2560, outDim := 2560, verified := false }
     qProjection := none  -- BitLinear Q backward (not needed for LoRA — LoRA does its own)
     vProjection := none  -- BitLinear V backward (same)
     ropeQ := some { name := "ropeQ", inDim := 2560, outDim := 2560, verified := true }
