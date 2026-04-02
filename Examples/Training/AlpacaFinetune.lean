@@ -64,11 +64,11 @@ structure Args where
   outputPath : String := "lora_weights.bin"
   rank : Nat := 8
   alpha : Float := 8.0
-  lr : Float := 1e-4
+  lr : Float := 2e-4  -- PyTorch/HuggingFace LoRA default
   epochs : Nat := 3
   maxSeqLen : Nat := 512
   logEvery : Nat := 10
-  maxGradNorm : Float := 0.0  -- 0 = disabled
+  maxGradNorm : Float := 1.0  -- PyTorch default (0 = disabled)
 
 def parseArgs (args : List String) : IO Args := do
   let mut modelPath := ""
@@ -179,7 +179,7 @@ def main (args : List String) : IO Unit := do
 
   -- Create LR scheduler (linear warmup + cosine decay)
   let lrScheduler := Hesper.Training.LRScheduler.create args.lr
-    tokenizedExamples.size args.epochs 0.0  -- no warmup for small datasets
+    tokenizedExamples.size args.epochs 0.06  -- 6% warmup (PyTorch default ~10%, reduced for small datasets)
 
   -- Step 6: Training (GPU-optimized, PyTorch-standard)
   IO.println "[6/6] Starting training..."
