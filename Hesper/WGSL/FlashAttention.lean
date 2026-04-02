@@ -240,11 +240,16 @@ def executeFlashAttentionDynamic (device : Device)
   let workgroupSize := min 256 (max headDim 32)
   let shader := flashAttentionDynamicKernel numHeads numKVHeads maxSeqLen headDim cacheLen scale workgroupSize
   let namedBuffers := [("q", qBuf), ("k_cache", kCacheBuf), ("v_cache", vCacheBuf), ("output", outputBuf)]
+  -- Pipeline cache key includes cacheLen (shader recompiled per position)
+  -- The WGSL source hash + buffer layout is cached, so same cacheLen reuses pipeline
   let cacheKey : UInt64 := hash ("flash", numHeads, numKVHeads, maxSeqLen, headDim, cacheLen)
   let execConfig : Hesper.WGSL.Execute.ExecutionConfig := {
     workgroupSize := {x := workgroupSize, y := 1, z := 1}
     numWorkgroups := (numHeads, 1, 1)
   }
+  -- Note: shader compilation is cached by pipeline cache (Execute.lean).
+  -- First call with a new cacheLen compiles, subsequent calls with same cacheLen reuse.
+  -- Over a training run, common cacheLens are cached and recompilation is rare.
   Hesper.WGSL.Execute.executeShaderNamed device shader namedBuffers execConfig (some cacheKey)
 
 /-- Execute flash attention with static cacheLen (for testing).
