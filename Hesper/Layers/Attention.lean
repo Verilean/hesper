@@ -12,6 +12,7 @@ import Hesper.Layers.RMSNorm
 import Hesper.Logging
 import Hesper.LoRA.Types
 import Hesper.LoRA.Forward
+import Hesper.WGSL.FlashAttention
 
 /-!
 # Multi-Head Self-Attention
@@ -859,7 +860,8 @@ def forwardWithCache (device : Device) (layer : Attention)
       (Hesper.WGSL.Execute.ExecutionConfig.dispatch1D kvDim 256)
       (some writeCacheKey) (some kvCache.preparedCacheWriteKV)
 
-  -- Step 4: Attention scores with GQA (dispatch size varies with cacheLen)
+  -- Steps 4-6: Score + Softmax + Apply (standard path)
+  -- TODO: Replace with Flash Attention after GPU kernel is validated
   let scoresWx := (numHeads * cacheLen + 255) / 256
   if let some p ← kvCache.preparedScores.get then
     Hesper.WGSL.Execute.replayPreparedDispatch device p scoresWx 1 1
@@ -872,7 +874,6 @@ def forwardWithCache (device : Device) (layer : Attention)
       (Hesper.WGSL.Execute.ExecutionConfig.dispatch1D (numHeads * cacheLen) 256)
       (some scoresCacheKey) (some kvCache.preparedScores)
 
-  -- Step 5: Softmax (shared buffers only → shared PreparedDispatch)
   let softmaxWx := (numHeads * cacheLen + 255) / 256
   if let some p ← bufs.preparedSoftmax.get then
     Hesper.WGSL.Execute.replayPreparedDispatch device p softmaxWx 1 1
@@ -884,7 +885,6 @@ def forwardWithCache (device : Device) (layer : Attention)
       (Hesper.WGSL.Execute.ExecutionConfig.dispatch1D (numHeads * cacheLen) 256)
       (some softmaxCacheKey) (some bufs.preparedSoftmax)
 
-  -- Step 6: Apply attention to V cache (uses kvCache.vBuf → per-layer)
   let applyWx := (numHeads * headDim + 255) / 256
   if let some p ← kvCache.preparedApply.get then
     Hesper.WGSL.Execute.replayPreparedDispatch device p applyWx 1 1
