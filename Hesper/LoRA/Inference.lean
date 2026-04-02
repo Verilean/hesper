@@ -310,9 +310,12 @@ def forwardAndBackwardBatched (device : Device) (model : BitNetModel)
                     let wO := model.layers[li].attention.wO
                     Hesper.Training.BitLinearBackward.executeBitLinearTranspose device
                       wO dHiddenBuf dAttnOutBuf
-                    -- Skip RMSNorm backward (causes NaN — savedAttnOutput likely invalid)
-                    -- TODO: Debug savedAttnOutput content or use gradient checkpointing
-                    pure dAttnOutBuf
+                    -- RMSNorm backward (sub-norm): dAttnOut → dAttnWeighted
+                    let subNormScale := model.layers[li].attnSubNorm.scale
+                    Hesper.Training.AttentionBackward.executeRmsNormBackward device
+                      savedAttnOutput subNormScale dAttnOutBuf dScoresBuf
+                      dim
+                    pure dScoresBuf
                   else pure dHiddenBuf
                 | none => pure dHiddenBuf
 
