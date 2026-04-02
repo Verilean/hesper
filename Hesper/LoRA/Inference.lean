@@ -8,6 +8,7 @@ import Hesper.Training.Loss
 import Hesper.Training.TrainLoop
 import Hesper.Training.AttentionBackward
 import Hesper.Training.BitLinearBackward
+import Hesper.Training.FFNBackward
 import Hesper.WebGPU.Types
 import Hesper.WebGPU.Device
 import Hesper.WebGPU.Buffer
@@ -63,6 +64,17 @@ structure LoRAInferenceState where
   savedAttnOut : Array Buffer -- [numLayers] × [numHeads * headDim]
   /-- Scratch buffer for dAttnOut (gradient after O backward, before RMSNorm backward) -/
   dAttnOutBuf : Option Buffer -- [numHeads * headDim]
+  /-- Per-layer saved FFN activations for FFN backward -/
+  savedGate : Array Buffer     -- [numLayers] × [ffnDim]
+  savedUp : Array Buffer       -- [numLayers] × [ffnDim]
+  savedHidden : Array Buffer   -- [numLayers] × [ffnDim] (pre sub-norm)
+  savedResidual1 : Array Buffer -- [numLayers] × [dim] (pre ffn-norm)
+  /-- Scratch buffers for FFN backward -/
+  dFFNNormed : Option Buffer   -- [ffnDim]
+  dFFNHidden : Option Buffer   -- [ffnDim]
+  dGateBuf : Option Buffer     -- [ffnDim]
+  dUpBuf : Option Buffer       -- [ffnDim]
+  dNormed2Buf : Option Buffer  -- [dim]
 
 /-- Create LoRA inference state (inference only, no backward buffers) -/
 def createLoRAInferenceState (device : Device) (adapter : Adapter)
@@ -76,6 +88,8 @@ def createLoRAInferenceState (device : Device) (adapter : Adapter)
     yBufV := ← mkBuf kvDim
     dAttnBuf := none, dScoresBuf := none, dQBuf := none, dQPreBuf := none
     savedNormed := #[], savedAttn := #[], savedAttnOut := #[], dAttnOutBuf := none
+    savedGate := #[], savedUp := #[], savedHidden := #[], savedResidual1 := #[]
+    dFFNNormed := none, dFFNHidden := none, dGateBuf := none, dUpBuf := none, dNormed2Buf := none
   }
 
 /-- Create LoRA inference state with training backward buffers -/
@@ -88,10 +102,19 @@ def createLoRATrainingState (device : Device) (adapter : Adapter)
   let mut savedNormed := #[]
   let mut savedAttn := #[]
   let mut savedAttnOut := #[]
+  let mut savedGate := #[]
+  let mut savedUp := #[]
+  let mut savedHidden := #[]
+  let mut savedResidual1 := #[]
+  let ffnDim := dim * 27 / 10  -- 2560 * 2.7 = 6912 (BitNet FFN ratio)
   for _ in [:numLayers] do
     savedNormed := savedNormed.push (← mkBuf dim)
     savedAttn := savedAttn.push (← mkBuf (numHeads * maxSeqLen))
     savedAttnOut := savedAttnOut.push (← mkBuf (numHeads * headDim))
+    savedGate := savedGate.push (← mkBuf ffnDim)
+    savedUp := savedUp.push (← mkBuf ffnDim)
+    savedHidden := savedHidden.push (← mkBuf ffnDim)
+    savedResidual1 := savedResidual1.push (← mkBuf dim)
   pure {
     hBuf := ← mkBuf rank
     yBufQ := ← mkBuf dim
@@ -101,7 +124,13 @@ def createLoRATrainingState (device : Device) (adapter : Adapter)
     dQBuf := some (← mkBuf (numHeads * headDim))
     dQPreBuf := some (← mkBuf (numHeads * headDim))
     savedNormed, savedAttn, savedAttnOut
+    savedGate, savedUp, savedHidden, savedResidual1
     dAttnOutBuf := some (← mkBuf (numHeads * headDim))
+    dFFNNormed := some (← mkBuf ffnDim)
+    dFFNHidden := some (← mkBuf ffnDim)
+    dGateBuf := some (← mkBuf ffnDim)
+    dUpBuf := some (← mkBuf ffnDim)
+    dNormed2Buf := some (← mkBuf dim)
   }
 
 /-- Single-token forward pass with LoRA.
@@ -202,9 +231,11 @@ def forwardAndBackwardBatched (device : Device) (model : BitNetModel)
   for layer in model.layers do
     if h : layerIdx < cacheState.kvCaches.size then
       let kvCache := cacheState.kvCaches[layerIdx]
-      let fusedRef := if h2 : layerIdx < cacheState.fusedRefs.size then
-        some cacheState.fusedRefs[layerIdx]
-      else none
+      -- Use non-fused FFN path when training (need gate/up buffers for FFN backward)
+      let fusedRef := if isOutputToken then none
+        else if h2 : layerIdx < cacheState.fusedRefs.size then
+          some cacheState.fusedRefs[layerIdx]
+        else none
       let loraOpt := if h3 : layerIdx < adapter.layers.size then
         some (adapter.layers[layerIdx], scale, loraState.hBuf, loraState.yBufQ, loraState.yBufV)
       else none
@@ -230,6 +261,16 @@ def forwardAndBackwardBatched (device : Device) (model : BitNetModel)
         -- output goes to nextBuf. So qRotBuf still holds the attention output.
         if h_ao : layerIdx < loraState.savedAttnOut.size then
           Forward.saveActivation device cacheState.layerBufs.attnBufs.qRotBuf loraState.savedAttnOut[layerIdx] (model.config.numHeads * model.config.headDim)
+        -- Save FFN activations (gate, up, hidden, residual1)
+        -- These shared buffers are valid right after forwardWithCache returns
+        if h_sg : layerIdx < loraState.savedGate.size then
+          Forward.saveActivation device cacheState.layerBufs.gateBuf loraState.savedGate[layerIdx] model.config.ffnDim
+        if h_su : layerIdx < loraState.savedUp.size then
+          Forward.saveActivation device cacheState.layerBufs.upBuf loraState.savedUp[layerIdx] model.config.ffnDim
+        if h_sh : layerIdx < loraState.savedHidden.size then
+          Forward.saveActivation device cacheState.layerBufs.hiddenBuf loraState.savedHidden[layerIdx] model.config.ffnDim
+        if h_sr : layerIdx < loraState.savedResidual1.size then
+          Forward.saveActivation device cacheState.layerBufs.residual1Buf loraState.savedResidual1[layerIdx] dim
 
       let temp := currentBuf; currentBuf := nextBuf; nextBuf := temp
     layerIdx := layerIdx + 1
@@ -363,7 +404,30 @@ def forwardAndBackwardBatched (device : Device) (model : BitNetModel)
                 Backward.executeGradB device dForApply trainState.hBuf layerGrad.gradV.dB layerAdapter.loraV.outDim layerAdapter.loraV.rank scale
                 Backward.executeGradDh device layerAdapter.loraV.b dForApply trainState.dhBuf layerAdapter.loraV.outDim layerAdapter.loraV.rank
                 Backward.executeGradA device trainState.dhBuf savedNorm layerGrad.gradV.dA layerAdapter.loraV.rank layerAdapter.loraV.inDim scale
-                -- dHidden passes through residual connections unchanged to lower layers.
+                -- Step 7: FFN backward (propagates gradient through FFN sub-layer)
+                -- dHidden already has the attention sublayer's contribution.
+                -- FFN backward computes the FFN sublayer's contribution and adds it.
+                if h_layer2 : li < model.layers.size then
+                  if h_sg : li < loraState.savedGate.size then
+                    if h_su : li < loraState.savedUp.size then
+                      if h_sh : li < loraState.savedHidden.size then
+                        if h_sr : li < loraState.savedResidual1.size then
+                          match loraState.dFFNNormed, loraState.dFFNHidden, loraState.dGateBuf, loraState.dUpBuf, loraState.dNormed2Buf with
+                          | some dFFNN, some dFFNH, some dG, some dU, some dN2 =>
+                            let block := model.layers[li]
+                            Hesper.Training.FFNBackward.executeFFNBackward device
+                              block.ffnDown block.ffnGate block.ffnUp
+                              block.ffnSubNorm.scale block.ffnNorm.scale
+                              dHiddenBuf
+                              loraState.savedHidden[li] loraState.savedResidual1[li]
+                              loraState.savedGate[li] loraState.savedUp[li]
+                              dFFNN dFFNH dG dU dN2 dHiddenBuf
+                              dim model.config.ffnDim
+                            -- dHiddenBuf now contains FFN's contribution to dResidual
+                            -- Add it back to dHidden for the next (lower) layer
+                            -- (The FFN backward writes to dHiddenBuf, which is used
+                            --  as dOutput for the next layer iteration)
+                          | _, _, _, _, _ => pure ()
     | _, _, _, _ => pure ()
 
   -- === END SINGLE GPU BATCH ===
