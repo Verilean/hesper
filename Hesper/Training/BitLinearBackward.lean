@@ -50,7 +50,7 @@ open Hesper.WebGPU
     W is [outDim, inDim] in i2_s format.
     One workgroup per input element j, with threads cooperating over outDim.
     Uses shared memory reduction. -/
-def bitLinearTransposeKernel (inDim outDim : Nat) (workgroupSize : Nat := 32) : ShaderM Unit := do
+def bitLinearTransposeKernel (inDim outDim : Nat) (workgroupSize : Nat := 256) : ShaderM Unit := do
   let wgid ← ShaderM.workgroupId
   let lid ← ShaderM.localId
   let j := Exp.vec3X wgid    -- input element index (column)
@@ -121,7 +121,7 @@ def executeBitLinearTranspose (device : Device) (layer : Hesper.Layers.BitLinear
     (dOutputBuf dInputBuf : Buffer) : IO Unit := do
   let inDim := layer.config.inDim
   let outDim := layer.config.outDim
-  let workgroupSize := 32
+  let workgroupSize := 256
   let shader := bitLinearTransposeKernel inDim outDim workgroupSize
   let namedBuffers := [("weights", layer.weightsPacked), ("scale", layer.scaleBuf),
                        ("dOutput", dOutputBuf), ("dInput", dInputBuf)]
