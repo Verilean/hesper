@@ -403,7 +403,7 @@ def createShaderFromComputation
     (computation : ShaderM Unit)
     (config : ExecutionConfig)
     : IO WebGPU.ShaderModule :=
-  let wgslSource := compileToWGSL computation config.funcName config.workgroupSize []
+  let wgslSource := compileToWGSL computation config.funcName config.workgroupSize config.extensions config.diagnostics
   createShaderModule device wgslSource
 
 /-- Execute a ShaderM computation on the GPU with named buffers.
