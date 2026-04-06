@@ -468,7 +468,8 @@ def forwardWithCache (device : Device) (block : TransformerBlock)
                      (inputBuf outputBuf : Buffer) (pos : Nat)
                      (kvCache : Attention.KVCache)
                      (preAllocBufs : Option CachedLayerBuffers := none)
-                     (fusedRefs : Option FusedLayerRefs := none) : IO Unit := do
+                     (fusedRefs : Option FusedLayerRefs := none)
+                     (loraOpt : Option (Hesper.LoRA.LayerAdapter × Float × Buffer × Buffer × Buffer) := none) : IO Unit := do
   logVerbose s!"[Block {block.config.layerIdx}] Cached forward: pos={pos}"
 
   let dim := block.config.dim
@@ -485,7 +486,7 @@ def forwardWithCache (device : Device) (block : TransformerBlock)
 
   -- Step 2: Attention with KV cache (O projection fuses residual add)
   Attention.forwardWithCache device block.attention bufs.normedBuf bufs.residual1Buf
-    kvCache pos (some block.attnSubNorm) (some bufs.attnBufs) (some inputBuf)
+    kvCache pos (some block.attnSubNorm) (some bufs.attnBufs) (some inputBuf) loraOpt
 
   -- === FFN SUB-LAYER ===
 
@@ -510,6 +511,56 @@ def forwardWithCache (device : Device) (block : TransformerBlock)
   BitLinear.forwardWithResidual device block.ffnDown bufs.ffnNormedBuf bufs.residual1Buf outputBuf 1
 
   logVerbose s!"[Block {block.config.layerIdx}] ✓ Cached forward complete"
+
+/-- Cached forward pass WITH LoRA corrections on attention Q/V.
+    Same as `forwardWithCache` but uses `Attention.forwardWithCacheLoRA`
+    to inject LoRA before RoPE. -/
+def forwardWithCacheLoRA (device : Device) (block : TransformerBlock)
+                     (inputBuf outputBuf : Buffer) (pos : Nat)
+                     (kvCache : Attention.KVCache)
+                     (loraAdapter : Hesper.LoRA.LayerAdapter)
+                     (loraScale : Float)
+                     (loraHBuf loraYBufQ loraYBufV : Buffer)
+                     (preAllocBufs : Option CachedLayerBuffers := none)
+                     (fusedRefs : Option FusedLayerRefs := none) : IO Unit := do
+  logVerbose s!"[Block+LoRA {block.config.layerIdx}] Cached forward: pos={pos}"
+
+  let dim := block.config.dim
+  let ffnDim := block.config.ffnDim
+
+  let bufs ← match preAllocBufs with
+    | some b => pure b
+    | none => createCachedLayerBuffers device dim ffnDim block.attention.config
+
+  -- === ATTENTION SUB-LAYER (with LoRA) ===
+
+  -- Step 1: Pre-attention RMSNorm
+  RMSNorm.forward device block.attnNorm inputBuf bufs.normedBuf 1 256 (some bufs.rmsTempBuf)
+
+  -- Step 2: Attention with KV cache + LoRA on Q/V
+  Attention.forwardWithCacheLoRA device block.attention bufs.normedBuf bufs.residual1Buf
+    kvCache pos loraAdapter loraScale loraHBuf loraYBufQ loraYBufV
+    (some block.attnSubNorm) (some bufs.attnBufs) (some inputBuf)
+
+  -- === FFN SUB-LAYER (unchanged) ===
+
+  RMSNorm.forward device block.ffnNorm bufs.residual1Buf bufs.normed2Buf 1 256 (some bufs.rmsTempBuf)
+
+  match fusedRefs with
+  | some refs =>
+    BitLinear.forwardFusedGateUpReluSqrMul device block.ffnGate block.ffnUp
+      bufs.normed2Buf bufs.hiddenBuf (some refs.fusedGateUpRelu)
+  | none =>
+    BitLinear.forward device block.ffnGate bufs.normed2Buf bufs.gateBuf 1
+    BitLinear.forward device block.ffnUp bufs.normed2Buf bufs.upBuf 1
+    let ffnElemConfig : Elementwise.Config := { numElements := ffnDim }
+    executeReluSqrMul device bufs.gateBuf bufs.upBuf bufs.hiddenBuf ffnElemConfig (some bufs.preparedReluSqrMul)
+
+  RMSNorm.forward device block.ffnSubNorm bufs.hiddenBuf bufs.ffnNormedBuf 1 256 (some bufs.rmsTempBuf)
+
+  BitLinear.forwardWithResidual device block.ffnDown bufs.ffnNormedBuf bufs.residual1Buf outputBuf 1
+
+  logVerbose s!"[Block+LoRA {block.config.layerIdx}] ✓ Cached forward complete"
 
 /-! ## Integration with GGUF -/
 

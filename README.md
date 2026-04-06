@@ -34,6 +34,7 @@ Performance: 125.6 TPS (8.0 ms/token)
 ```
 
 **Key optimizations:**
+- **Flash Attention**: fused score + online softmax + apply in 1 kernel (3 kernels → 1)
 - Ternary weight kernel (i2_s): 2-bit packed weights, addition-only matmul
 - Kernel fusion: fused gate+up+ReLU²×mul and fused KV cache write (150 fewer dispatches/token)
 - Shared memory F16 matmul for LM head (128K vocab)
@@ -41,7 +42,46 @@ Performance: 125.6 TPS (8.0 ms/token)
 - Command buffer batching: single GPU submit per token
 - KV cache with grouped-query attention (20 heads, 5 KV heads)
 
+**Also: 40 TPS on RTX 4070 Ti (Vulkan)**
+
 See [bitnet.lean](https://github.com/Verilean/bitnet.lean) for the full inference pipeline.
+
+### LoRA Finetuning (Alpaca-style Instruction Tuning)
+
+Hesper supports LoRA finetuning with a **verified backward pass**:
+
+```bash
+# Train on Alpaca-format dataset
+lake exe alpaca-finetune --model model.gguf --data alpaca_data.json --epochs 50 --rank 8
+
+# Inference with LoRA adapter
+lake exe bitnet-complete model.gguf "What is Hesper?" 60 --lora lora_weights.bin
+```
+
+**Training features:**
+- Complete backward chain: 13/13 ops (attention 7 + FFN 6)
+- Verified AD: each backward op numerically checked against CPU spec
+- GPU ↔ CPU consistency: all backward kernels match CPU spec (error = 0.0)
+- Type-safe backward chain: missing ops cause compile-time error
+- AdamW optimizer with gradient clipping, LR scheduling (cosine + warmup)
+- GPU-batched forward + backward (1 GPU submit per token)
+
+### Verified Automatic Differentiation
+
+Every backward operation is verified correct:
+
+```bash
+$ lake exe verified-ad
+  PASS Softmax, RoPE, RMSNorm, ScaledDot, ReLU²×Mul  (numerical gradient check)
+  PASS Chain rule composition: error = 0.0
+  ✓ All AD verifications PASSED
+
+$ lake exe gpu-vs-cpu-test
+  ✓ SoftmaxBackward, RMSNormBackward, RoPEBackward, ReLU²×Mul  (GPU matches CPU spec)
+
+$ lake exe chain-completeness
+  ✓ Backward chain is COMPLETE (13/13 ops)
+```
 
 ## Why Hesper?
 
@@ -49,6 +89,7 @@ Modern GPU programming lacks safety guarantees. Hesper provides:
 
 - **Type Safety**: Shaders are type-checked at compile time, preventing type mismatches
 - **Formal Verification**: Prove correctness properties about your GPU programs
+- **Verified Training**: Backward ops numerically checked, GPU kernels match CPU specs
 - **WebGPU Backend**: Cross-platform GPU access via Dawn (Metal, Vulkan, D3D12)
 - **Lean Integration**: Use Lean's powerful theorem proving alongside GPU computation
 - **Multi-GPU Support**: Select and coordinate across multiple GPU adapters
