@@ -82,23 +82,21 @@ def subBlockSize : Nat := 32
     FP16: 1 sign + 5 exponent + 10 mantissa
     Special cases: 0, denormals, inf, nan handled -/
 def fp16ToF32 (bits : Exp (.scalar .u32)) : Exp (.scalar .f32) :=
-  -- Arithmetic FP16 → F32 conversion (no bitcast needed)
-  -- FP16: 1 sign + 5 exponent + 10 mantissa, bias=15
-  let sign := Exp.shiftRight bits (Exp.litU32 15)        -- 0 or 1
+  -- Arithmetic FP16 → F32 conversion (supports subnormals)
+  -- Normal:    (-1)^s * (1 + mant/1024) * 2^(exp-15)
+  -- Subnormal: (-1)^s * (mant/1024) * 2^(-14)
+  let sign := Exp.shiftRight bits (Exp.litU32 15)
   let exp5 := Exp.bitAnd (Exp.shiftRight bits (Exp.litU32 10)) (Exp.litU32 0x1F)
   let mant := Exp.bitAnd bits (Exp.litU32 0x3FF)
-  -- signF = (-1)^sign: if sign=1 then -1.0, else 1.0
   let signF := Exp.select (Exp.eq sign (Exp.litU32 1)) (Exp.litF32 (-1.0)) (Exp.litF32 1.0)
-  -- mantissa as fraction: 1.mant = 1.0 + mant/1024.0
-  let mantF := Exp.add (Exp.litF32 1.0) (Exp.div (Exp.toF32 mant) (Exp.litF32 1024.0))
-  -- 2^(exp-15): use exp2() or ldexp-like computation
-  -- exp2(f32(exp5) - 15.0)
-  let expF := Exp.exp2 (Exp.sub (Exp.toF32 exp5) (Exp.litF32 15.0))
-  -- result = sign * mantissa * 2^(exp-15)
-  let normal := Exp.mul signF (Exp.mul mantF expF)
-  -- Handle zero exponent (zero or denormal) → return 0
-  let isZeroExp := Exp.eq exp5 (Exp.litU32 0)
-  Exp.select isZeroExp (Exp.litF32 0.0) normal
+  let isSubnormal := Exp.eq exp5 (Exp.litU32 0)
+  let mantFNormal := Exp.add (Exp.litF32 1.0) (Exp.div (Exp.toF32 mant) (Exp.litF32 1024.0))
+  let mantFSubnormal := Exp.div (Exp.toF32 mant) (Exp.litF32 1024.0)
+  let mantF := Exp.select isSubnormal mantFSubnormal mantFNormal
+  let expFNormal := Exp.exp2 (Exp.sub (Exp.toF32 exp5) (Exp.litF32 15.0))
+  let expFSubnormal := Exp.litF32 6.103515625e-5  -- 2^(-14)
+  let expF := Exp.select isSubnormal expFSubnormal expFNormal
+  Exp.mul signF (Exp.mul mantF expF)
 
 /-! ## Scale/Min Extraction -/
 
