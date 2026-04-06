@@ -4,6 +4,7 @@ import Hesper.WGSL.Exp
 import Hesper.WebGPU.Types
 import Hesper.WebGPU.Device
 import Hesper.WebGPU.Buffer
+import Hesper.Basic
 
 /-!
 # Q6_K Quantization - GPU Dequantization Kernels
@@ -101,14 +102,19 @@ def fusedQ6KLinearKernel (inDim outDim : Nat) (workgroupSize : Nat := 256) : Sha
       let dByteInU32 := Exp.mul (Exp.mod dByteOffset (Exp.litU32 4)) (Exp.litU32 8)
       let dU32 ← ShaderM.readBuffer (ty := .scalar .u32) (n := totalWeightU32) "weights" dU32Idx
       let dBits := Exp.bitAnd (Exp.shiftRight dU32 dByteInU32) (Exp.litU32 0xFFFF)
-      -- FP16 to F32 (arithmetic conversion)
+      -- FP16 → F32 (arithmetic, supports subnormals)
       let sign := Exp.shiftRight dBits (Exp.litU32 15)
       let exp5 := Exp.bitAnd (Exp.shiftRight dBits (Exp.litU32 10)) (Exp.litU32 0x1F)
       let mant := Exp.bitAnd dBits (Exp.litU32 0x3FF)
       let signF := Exp.select (Exp.eq sign (Exp.litU32 1)) (Exp.litF32 (-1.0)) (Exp.litF32 1.0)
-      let mantF := Exp.add (Exp.litF32 1.0) (Exp.div (Exp.toF32 mant) (Exp.litF32 1024.0))
-      let expF := Exp.exp2 (Exp.sub (Exp.toF32 exp5) (Exp.litF32 15.0))
-      let d := Exp.select (Exp.eq exp5 (Exp.litU32 0)) (Exp.litF32 0.0) (Exp.mul signF (Exp.mul mantF expF))
+      let isSubnormal := Exp.eq exp5 (Exp.litU32 0)
+      let mantFNormal := Exp.add (Exp.litF32 1.0) (Exp.div (Exp.toF32 mant) (Exp.litF32 1024.0))
+      let mantFSubnormal := Exp.div (Exp.toF32 mant) (Exp.litF32 1024.0)
+      let mantF := Exp.select isSubnormal mantFSubnormal mantFNormal
+      let expFNormal := Exp.exp2 (Exp.sub (Exp.toF32 exp5) (Exp.litF32 15.0))
+      let expFSubnormal := Exp.litF32 6.103515625e-5  -- 2^(-14)
+      let expF := Exp.select isSubnormal expFSubnormal expFNormal
+      let d := Exp.mul signF (Exp.mul mantF expF)
 
       -- Process 2 chunks of 128 elements each (n = 0, 128)
       for chunk in [0:2] do
@@ -197,6 +203,146 @@ def fusedQ6KLinearKernel (inDim outDim : Nat) (workgroupSize : Nat := 256) : Sha
       let total ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := workgroupSize) "shared_partial" (Exp.litU32 0)
       ShaderM.writeBuffer (ty := .scalar .f32) "output" outIdx total
     ) (pure ())
+  ) (pure ())
+
+/-! ## Q6_K Embedding Lookup Kernel -/
+
+/-- Dequant a single Q6_K element at (rowIdx, col) in a [numRows, dim] table.
+    Returns the dequantized f32 value.
+
+    Parameters as Exp so they can be computed at runtime.
+    Reads directly from the packed table buffer (declared externally).
+
+    @param dim Dimension per row (must be multiple of 256)
+    @param tableBufName Name of the buffer declared in the shader
+    @param totalU32 Total u32 count in the buffer (for type)
+-/
+private def dequantQ6KElement (dim : Nat) (tableBufName : String) (totalU32 : Nat)
+    (rowIdx : Exp (.scalar .u32)) (col : Exp (.scalar .u32))
+    : ShaderM (Exp (.scalar .f32)) := do
+  -- Byte offset in table: rowIdx * (dim / 256) * 210 + blockOffset + withinBlockOffset
+  let blocksPerRow := dim / 256
+  let rowByteBase := Exp.mul rowIdx (Exp.litU32 (blocksPerRow * blockSizeBytes))
+  let blockIdxInRow := Exp.div col (Exp.litU32 256)
+  let elemInBlock := Exp.mod col (Exp.litU32 256)
+
+  let blockByteBase := Exp.add rowByteBase (Exp.mul blockIdxInRow (Exp.litU32 blockSizeBytes))
+
+  -- Read d (FP16) at byte 208 within block
+  let dByteOff := Exp.add blockByteBase (Exp.litU32 208)
+  let dU32Idx := Exp.div dByteOff (Exp.litU32 4)
+  let dByteInU32 := Exp.mul (Exp.mod dByteOff (Exp.litU32 4)) (Exp.litU32 8)
+  let dU32 ← ShaderM.readBuffer (ty := .scalar .u32) (n := totalU32) tableBufName dU32Idx
+  let dBits := Exp.bitAnd (Exp.shiftRight dU32 dByteInU32) (Exp.litU32 0xFFFF)
+  -- FP16 → F32 (arithmetic, supports subnormals)
+  --   normal:   (-1)^s * (1 + mant/1024) * 2^(exp-15)
+  --   subnormal (exp==0): (-1)^s * (mant/1024) * 2^(-14)
+  let sign := Exp.shiftRight dBits (Exp.litU32 15)
+  let exp5 := Exp.bitAnd (Exp.shiftRight dBits (Exp.litU32 10)) (Exp.litU32 0x1F)
+  let mant := Exp.bitAnd dBits (Exp.litU32 0x3FF)
+  let signF := Exp.select (Exp.eq sign (Exp.litU32 1)) (Exp.litF32 (-1.0)) (Exp.litF32 1.0)
+  let isSubnormal := Exp.eq exp5 (Exp.litU32 0)
+  let mantFNormal := Exp.add (Exp.litF32 1.0) (Exp.div (Exp.toF32 mant) (Exp.litF32 1024.0))
+  let mantFSubnormal := Exp.div (Exp.toF32 mant) (Exp.litF32 1024.0)
+  let mantF := Exp.select isSubnormal mantFSubnormal mantFNormal
+  let expFNormal := Exp.exp2 (Exp.sub (Exp.toF32 exp5) (Exp.litF32 15.0))
+  let expFSubnormal := Exp.litF32 6.103515625e-5  -- 2^(-14)
+  let expF := Exp.select isSubnormal expFSubnormal expFNormal
+  let d := Exp.mul signF (Exp.mul mantF expF)
+
+  -- Determine which chunk (0 or 1), group (0..3), and position within group (0..31)
+  let chunk := Exp.div elemInBlock (Exp.litU32 128)           -- 0 or 1
+  let elemInChunk := Exp.mod elemInBlock (Exp.litU32 128)     -- 0..127
+  let group := Exp.div elemInChunk (Exp.litU32 32)            -- 0..3
+  let posInGroup := Exp.mod elemInChunk (Exp.litU32 32)       -- 0..31
+
+  -- ql byte: chunk * 64 bytes offset + (group < 2 ? posInGroup : posInGroup) (same ql bytes for groups 0+2, 1+3)
+  -- Actually per dequant_row_q6_K: groups 0,1 use ql[0..63], groups 2,3 use ql[0..63] as well (different nibbles)
+  -- Wait, looking at llama.cpp: for n=0 chunk, l in 0..31, l+0 uses q1, l+32 uses q2, l+0(high nibble) uses q3, l+32(high nibble) uses q4
+  -- So each "l" (posInGroup) indexes ql[l] and ql[l+32]. Group 0 uses low nibble of ql[l], group 1 uses low nibble of ql[l+32],
+  --                                                        group 2 uses high nibble of ql[l], group 3 uses high nibble of ql[l+32]
+  -- But wait posInGroup goes 0..31 so we can directly compute ql byte position
+  let qlBase := Exp.add blockByteBase (Exp.mul chunk (Exp.litU32 64))
+  -- For group 0: ql[posInGroup], low nibble
+  -- For group 1: ql[posInGroup + 32], low nibble
+  -- For group 2: ql[posInGroup], high nibble
+  -- For group 3: ql[posInGroup + 32], high nibble
+  let groupMod2 := Exp.mod group (Exp.litU32 2)  -- 0 or 1 (selects +0 or +32 offset)
+  let qlByteOff := Exp.add (Exp.add qlBase posInGroup) (Exp.mul groupMod2 (Exp.litU32 32))
+  let qlU32Idx := Exp.div qlByteOff (Exp.litU32 4)
+  let qlByteInU32 := Exp.mul (Exp.mod qlByteOff (Exp.litU32 4)) (Exp.litU32 8)
+  let qlU32 ← ShaderM.readBuffer (ty := .scalar .u32) (n := totalU32) tableBufName qlU32Idx
+  let qlByte := Exp.bitAnd (Exp.shiftRight qlU32 qlByteInU32) (Exp.litU32 0xFF)
+  let useHighNibble := Exp.ge group (Exp.litU32 2)
+  let qlNibble := Exp.select useHighNibble
+    (Exp.shiftRight qlByte (Exp.litU32 4))
+    (Exp.bitAnd qlByte (Exp.litU32 0xF))
+
+  -- qh byte: chunk * 32 offset + posInGroup (same qh byte used for all 4 groups at position posInGroup)
+  let qhBase := Exp.add blockByteBase (Exp.litU32 (128 + 0))  -- qh starts at byte 128
+  let qhBase2 := Exp.add qhBase (Exp.mul chunk (Exp.litU32 32))
+  let qhByteOff := Exp.add qhBase2 posInGroup
+  let qhU32Idx := Exp.div qhByteOff (Exp.litU32 4)
+  let qhByteInU32 := Exp.mul (Exp.mod qhByteOff (Exp.litU32 4)) (Exp.litU32 8)
+  let qhU32 ← ShaderM.readBuffer (ty := .scalar .u32) (n := totalU32) tableBufName qhU32Idx
+  let qhByte := Exp.bitAnd (Exp.shiftRight qhU32 qhByteInU32) (Exp.litU32 0xFF)
+  -- group 0→bits 0-1, group 1→bits 2-3, group 2→bits 4-5, group 3→bits 6-7
+  let qhShift := Exp.mul group (Exp.litU32 2)
+  let qhBits := Exp.bitAnd (Exp.shiftRight qhByte qhShift) (Exp.litU32 0x3)
+
+  -- q6 = (qlNibble | (qhBits << 4)) - 32
+  let q6Raw := Exp.bitOr qlNibble (Exp.shiftLeft qhBits (Exp.litU32 4))
+  let q6 := Exp.sub (Exp.toF32 q6Raw) (Exp.litF32 32.0)
+
+  -- scales[is]: within block, is = (chunk * 8) + (group * 2) + (posInGroup / 16)
+  -- Wait: looking at dequant_row_q6_K:
+  --   for n in [0, 128]: for l in 0..31: is = l/16; y[l+0] = d*sc[is+0]*q1; y[l+32] = d*sc[is+2]*q2 ...
+  -- So is increments by 2 between groups within chunk. Per chunk, we use sc[0..7]
+  -- Chunk 0 uses sc[0..7], chunk 1 uses sc[8..15]
+  -- Within chunk: group 0 uses sc[is+0] where is = l/16 (0 or 1), so sc[0 or 1]
+  --              group 1 uses sc[is+2] = sc[2 or 3]
+  --              group 2 uses sc[is+4] = sc[4 or 5]
+  --              group 3 uses sc[is+6] = sc[6 or 7]
+  -- So per group: scaleIdx = group*2 + (posInGroup/16) [within chunk]
+  -- Absolute: chunk*8 + group*2 + (posInGroup/16)
+  let scIdx := Exp.add (Exp.mul chunk (Exp.litU32 8))
+                       (Exp.add (Exp.mul group (Exp.litU32 2))
+                                (Exp.div posInGroup (Exp.litU32 16)))
+  let scByteOff := Exp.add blockByteBase (Exp.add (Exp.litU32 192) scIdx)
+  let scU32Idx := Exp.div scByteOff (Exp.litU32 4)
+  let scByteInU32 := Exp.mul (Exp.mod scByteOff (Exp.litU32 4)) (Exp.litU32 8)
+  let scU32 ← ShaderM.readBuffer (ty := .scalar .u32) (n := totalU32) tableBufName scU32Idx
+  let scByte := Exp.bitAnd (Exp.shiftRight scU32 scByteInU32) (Exp.litU32 0xFF)
+  -- Sign extend 8-bit
+  let scSigned := Exp.select (Exp.ge scByte (Exp.litU32 128))
+    (Exp.sub (Exp.toF32 scByte) (Exp.litF32 256.0))
+    (Exp.toF32 scByte)
+
+  -- Final: y = d * sc * q6
+  return Exp.mul d (Exp.mul scSigned q6)
+
+/-- Q6_K embedding lookup kernel.
+    Reads the embedding vector for a token ID from a Q6_K-packed table.
+    Each thread dequantizes one element of the output row.
+
+    @param vocabSize Table row count
+    @param dim Embedding dimension (must be multiple of 256)
+-/
+def q6kEmbeddingLookupKernel (vocabSize dim : Nat) : ShaderM Unit := do
+  let gid ← ShaderM.globalId
+  let idx := Exp.vec3X gid  -- output element index within the row
+
+  let blocksPerRow := dim / 256
+  let totalU32 := (vocabSize * blocksPerRow * blockSizeBytes + 3) / 4
+
+  let _tokenIds ← ShaderM.declareInputBuffer "token_ids" (.array (.scalar .u32) 1)
+  let _table ← ShaderM.declareInputBuffer "embedding_table" (.array (.scalar .u32) totalU32)
+  let _output ← ShaderM.declareOutputBuffer "output" (.array (.scalar .f32) dim)
+
+  ShaderM.if_ (Exp.lt idx (Exp.litU32 dim)) (do
+    let tokenId ← ShaderM.readBuffer (ty := .scalar .u32) (n := 1) "token_ids" (Exp.litU32 0)
+    let val ← dequantQ6KElement dim "embedding_table" totalU32 tokenId idx
+    ShaderM.writeBuffer (ty := .scalar .f32) "output" idx val
   ) (pure ())
 
 end Hesper.Quantization.Q6_K

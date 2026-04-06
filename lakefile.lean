@@ -793,6 +793,16 @@ lean_exe «gemma4-inference» where
   supportInterpreter := false
   moreLinkArgs := stdLinkArgs
 
+lean_exe «gemma4-validation» where
+  root := `Examples.Gemma4Validation
+  supportInterpreter := false
+  moreLinkArgs := stdLinkArgs
+
+lean_exe «gemma4-embd-test» where
+  root := `Examples.Gemma4EmbdTest
+  supportInterpreter := false
+  moreLinkArgs := stdLinkArgs
+
 -- ----------------------------------------------------------------------------
 -- Training (LoRA Finetuning)
 -- ----------------------------------------------------------------------------
