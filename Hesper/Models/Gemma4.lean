@@ -935,24 +935,37 @@ def forwardBlock (device : Device) (block : Gemma4Block) (cfg : Config)
   -- Step 3: Q-norm, K-norm (per-head RMSNorm)
   let numHeads := cfg.numAttentionHeads
   let numKVHeads := cfg.numKVHeads li
+  let wgSize := min headDim 256
+  let mkNormConfig := fun (nHeads : Nat) => {
+    numWorkgroups := (nHeads, 1, 1)
+    workgroupSize := { x := wgSize, y := 1, z := 1 }
+    : Execute.ExecutionConfig
+  }
   Hesper.WGSL.Execute.executeShaderNamed device
     (perHeadRMSNormKernel numHeads headDim cfg.rmsNormEps)
     [("input", state.qBuf), ("weight", block.attention.qNormWeight), ("output", state.qBuf)]
-    (.dispatch1D numHeads headDim)
+    (mkNormConfig numHeads)
 
   if cfg.hasKV li then
     Hesper.WGSL.Execute.executeShaderNamed device
       (perHeadRMSNormKernel numKVHeads headDim cfg.rmsNormEps)
       [("input", state.kBuf), ("weight", block.attention.kNormWeight), ("output", state.kBuf)]
-      (.dispatch1D numKVHeads headDim)
+      (mkNormConfig numKVHeads)
 
     -- V-norm: bare RMSNorm on V (no learned weights)
     -- From gemma4-iswa.cpp:82: Vcur = ggml_rms_norm(ctx0, Vcur, hparams.f_norm_rms_eps)
+    -- Use normedBuf as temp to avoid aliasing (input == output not allowed in WebGPU)
     let vDim := numKVHeads * headDim
     Hesper.WGSL.Execute.executeShaderNamed device
       (bareRMSNormKernel vDim cfg.rmsNormEps)
-      [("input", state.vBuf), ("output", state.vBuf)]
-      (Execute.ExecutionConfig.default (1, 1, 1))
+      [("input", state.vBuf), ("output", state.normedBuf)]
+      { numWorkgroups := (1, 1, 1), workgroupSize := { x := min vDim 256, y := 1, z := 1 } : Execute.ExecutionConfig }
+    -- Copy back: vBuf = normedBuf (use residualAdd with zero: a + 0 is identity, but need separate buf)
+    -- Actually just swap: write to vBuf from normedBuf using scale kernel with factor 1.0
+    Hesper.WGSL.Execute.executeShaderNamed device
+      (PerLayerEmbedding.scaleKernel vDim 1.0)
+      [("input", state.normedBuf), ("output", state.vBuf)]
+      (.dispatch1D vDim)
 
   -- Step 4: RoPE on Q and K
   -- Upload position to params buffer
@@ -1205,16 +1218,17 @@ def forwardSingleToken (device : Device) (model : Gemma4Model)
   Embedding.forward device model.embedding state.tokenBuf state.buf1 1 1
 
   -- Scale embeddings by sqrt(hiddenSize)
+  -- Cannot alias input/output in WebGPU, so output to buf2
   Hesper.WGSL.Execute.executeShaderNamed device
     (embeddingScaleKernel model.config.hiddenSize model.config.hiddenSize)
-    [("input", state.buf1), ("output", state.buf1)]
+    [("input", state.buf1), ("output", state.buf2)]
     (.dispatch1D model.config.hiddenSize)
 
-  -- Step 2: Process all transformer blocks
+  -- Step 2: Process all transformer blocks (starting from buf2 as current)
   Hesper.WGSL.Execute.beginBatch device
 
-  let mut currentBuf := state.buf1
-  let mut nextBuf := state.buf2
+  let mut currentBuf := state.buf2
+  let mut nextBuf := state.buf1
 
   let mut blockIdx := 0
   for block in model.blocks do
