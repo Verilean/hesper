@@ -16,6 +16,9 @@ import Hesper.GGUF.Parser
 import Hesper.GGUF.Loader
 import Hesper.Basic
 import Hesper.Logging
+import Hesper.WGSL.MatMul
+import Hesper.WebGPU.BufferOps
+import Hesper.Inference.Sampling
 
 /-!
 # Gemma 4 Model Implementation
@@ -624,5 +627,270 @@ def loadGGUF (path : String) : IO Hesper.GGUF.GGUFFile := do
   match Hesper.GGUF.Parser.parseGGUF data with
   | .ok gf => pure gf
   | .error e => throw $ IO.userError s!"GGUF parse error: {e}"
+
+/-! ## KV Cache State -/
+
+/-- Per-layer KV cache for Gemma 4 -/
+structure Gemma4KVCache where
+  kBuf : Buffer    -- [numKVHeads, maxSeqLen, headDim]
+  vBuf : Buffer    -- [numKVHeads, maxSeqLen, headDim]
+
+/-- Full inference state -/
+structure InferenceState where
+  kvCaches : Array Gemma4KVCache
+  buf1 : Buffer          -- [hiddenSize] ping-pong
+  buf2 : Buffer          -- [hiddenSize] ping-pong
+  qBuf : Buffer          -- [numHeads * headDim] Q projection output
+  kBuf : Buffer          -- [numKVHeads * headDim] K projection output
+  vBuf : Buffer          -- [numKVHeads * headDim] V projection output
+  attnOutBuf : Buffer    -- [numHeads * headDim] attention output
+  gateBuf : Buffer       -- [intermediateSize] FFN gate output
+  upBuf : Buffer         -- [intermediateSize] FFN up output
+  geluBuf : Buffer       -- [intermediateSize] GELU*up output
+  ffnOutBuf : Buffer     -- [hiddenSize] FFN down output
+  normedBuf : Buffer     -- [hiddenSize] normalized output
+  logitsBuf : Buffer     -- [vocabSize]
+  tokenBuf : Buffer      -- [1] u32 for single token
+  paramsBuf : Buffer     -- [2] u32: (pos, cacheLen) for RoPE
+
+/-- Create inference state with pre-allocated buffers -/
+def createInferenceState (device : Device) (cfg : Config) : IO InferenceState := do
+  let mkBuf := fun (size : Nat) => createBuffer device {
+    size := (size * 4).toUSize  -- f32 = 4 bytes
+    usage := [.storage, .copySrc, .copyDst]
+    mappedAtCreation := false
+  }
+  let maxHeadDim := max cfg.headDimFull cfg.headDimSWA
+  let maxQDim := cfg.numAttentionHeads * maxHeadDim
+  let maxKVDim := (max cfg.numKeyValueHeadsFull cfg.numKeyValueHeadsSWA) * maxHeadDim
+
+  -- Create per-layer KV caches
+  let mut kvCaches : Array Gemma4KVCache := #[]
+  for li in [0:cfg.numHiddenLayers] do
+    let numKVHeads := cfg.numKVHeads li
+    let headDim := cfg.headDim li
+    let cacheSize := numKVHeads * cfg.maxSeqLen * headDim
+    let kBuf ← mkBuf cacheSize
+    let vBuf ← mkBuf cacheSize
+    kvCaches := kvCaches.push { kBuf, vBuf }
+
+  return {
+    kvCaches
+    buf1 := ← mkBuf cfg.hiddenSize
+    buf2 := ← mkBuf cfg.hiddenSize
+    qBuf := ← mkBuf maxQDim
+    kBuf := ← mkBuf maxKVDim
+    vBuf := ← mkBuf maxKVDim
+    attnOutBuf := ← mkBuf maxQDim
+    gateBuf := ← mkBuf cfg.intermediateSize
+    upBuf := ← mkBuf cfg.intermediateSize
+    geluBuf := ← mkBuf cfg.intermediateSize
+    ffnOutBuf := ← mkBuf cfg.hiddenSize
+    normedBuf := ← mkBuf cfg.hiddenSize
+    logitsBuf := ← mkBuf cfg.vocabSize
+    tokenBuf := ← createBuffer device { size := 4, usage := [.storage, .copySrc, .copyDst], mappedAtCreation := false }
+    paramsBuf := ← createBuffer device { size := 8, usage := [.storage, .copySrc, .copyDst], mappedAtCreation := false }
+  }
+
+/-! ## Single-Token Forward Pass -/
+
+/-- Run single-token forward pass through one transformer block.
+
+    Flow (from gemma4-iswa.cpp):
+    1. attnNorm(input) → Q/K/V projections → Q-norm, K-norm → attention → postAttnNorm → + residual
+    2. ffnNorm(attn_out) → GeGLU FFN → postFFNNorm → + residual
+-/
+def forwardBlock (device : Device) (block : Gemma4Block) (cfg : Config)
+    (inputBuf outputBuf : Buffer) (state : InferenceState) (pos : Nat) : IO Unit := do
+  let li := block.layerIdx
+  let headDim := cfg.headDim li
+
+  -- Step 1: Attention pre-norm
+  RMSNorm.forward device block.attnNorm inputBuf state.normedBuf
+
+  -- Step 2: Q/K/V projections
+  Linear.LinearLayer.forward device block.attention.wQ state.normedBuf state.qBuf
+  if cfg.hasKV li then
+    Linear.LinearLayer.forward device block.attention.wK state.normedBuf state.kBuf
+    Linear.LinearLayer.forward device block.attention.wV state.normedBuf state.vBuf
+
+  -- Step 3: Q-norm, K-norm (per-head RMSNorm)
+  let numHeads := cfg.numAttentionHeads
+  let numKVHeads := cfg.numKVHeads li
+  Hesper.WGSL.Execute.executeShaderNamed device
+    (perHeadRMSNormKernel numHeads headDim cfg.rmsNormEps)
+    [("input", state.qBuf), ("weight", block.attention.qNormWeight), ("output", state.qBuf)]
+    (.dispatch1D numHeads headDim)
+
+  if cfg.hasKV li then
+    Hesper.WGSL.Execute.executeShaderNamed device
+      (perHeadRMSNormKernel numKVHeads headDim cfg.rmsNormEps)
+      [("input", state.kBuf), ("weight", block.attention.kNormWeight), ("output", state.kBuf)]
+      (.dispatch1D numKVHeads headDim)
+
+  -- Step 4: RoPE on Q and K
+  -- Upload position to params buffer
+  let posBytes := Hesper.WebGPU.BufferOps.uint32ToBytes pos.toUInt32
+  writeBuffer device state.paramsBuf 0 posBytes
+
+  match block.ropeFreqFactors with
+  | some freqFactors =>
+    -- Full attention: RoPE with frequency factors
+    Hesper.WGSL.Execute.executeShaderNamed device
+      (ropeWithFreqFactorsKernel headDim numHeads cfg.ropeTheta)
+      [("input", state.qBuf), ("output", state.qBuf), ("params", state.paramsBuf), ("freq_factors", freqFactors)]
+      (.dispatch1D (numHeads * headDim / 2))
+  | none =>
+    -- SWA: standard RoPE (use existing dynamic kernel)
+    let ropeConfig : RoPE.Config := { dim := numHeads * headDim, maxSeqLen := cfg.maxSeqLen, base := cfg.ropeTheta }
+    Hesper.WGSL.Execute.executeShaderNamed device
+      (RoPE.ropeKernelDynamic ropeConfig 1 1 numHeads headDim)
+      [("input", state.qBuf), ("output", state.qBuf), ("params", state.paramsBuf)]
+      (.dispatch1D (numHeads * headDim / 2))
+
+  if cfg.hasKV li then
+    let ropeConfig : RoPE.Config := { dim := numKVHeads * headDim, maxSeqLen := cfg.maxSeqLen, base := cfg.ropeTheta }
+    Hesper.WGSL.Execute.executeShaderNamed device
+      (RoPE.ropeKernelDynamic ropeConfig 1 1 numKVHeads headDim)
+      [("input", state.kBuf), ("output", state.kBuf), ("params", state.paramsBuf)]
+      (.dispatch1D (numKVHeads * headDim / 2))
+
+  -- Step 5: Write K/V to cache and compute attention
+  -- TODO: KV cache write + attention score computation + softmax + attention apply
+  -- For now, output projection only (placeholder)
+  Linear.LinearLayer.forward device block.attention.wO state.qBuf state.normedBuf
+
+  -- Step 6: Post-attention norm + residual
+  RMSNorm.forward device block.postAttnNorm state.normedBuf state.normedBuf
+  Hesper.WGSL.Execute.executeShaderNamed device
+    (residualAddKernel cfg.hiddenSize)
+    [("a", state.normedBuf), ("b", inputBuf), ("output", state.buf1)]
+    (.dispatch1D cfg.hiddenSize)
+
+  -- Step 7: FFN pre-norm
+  RMSNorm.forward device block.ffnNorm state.buf1 state.normedBuf
+
+  -- Step 8: GeGLU FFN
+  Linear.LinearLayer.forward device block.ffn.gate state.normedBuf state.gateBuf
+  Linear.LinearLayer.forward device block.ffn.up state.normedBuf state.upBuf
+
+  Hesper.WGSL.Execute.executeShaderNamed device
+    (geluMulKernel cfg.intermediateSize)
+    [("gate", state.gateBuf), ("up", state.upBuf), ("output", state.geluBuf)]
+    (.dispatch1D cfg.intermediateSize)
+
+  Linear.LinearLayer.forward device block.ffn.down state.geluBuf state.ffnOutBuf
+
+  -- Step 9: Post-FFN norm + residual
+  RMSNorm.forward device block.postFFNNorm state.ffnOutBuf state.ffnOutBuf
+  Hesper.WGSL.Execute.executeShaderNamed device
+    (residualAddKernel cfg.hiddenSize)
+    [("a", state.ffnOutBuf), ("b", state.buf1), ("output", outputBuf)]
+    (.dispatch1D cfg.hiddenSize)
+
+/-- Run full single-token forward pass through the model.
+    Returns logits in state.logitsBuf. -/
+def forwardSingleToken (device : Device) (model : Gemma4Model)
+    (tokenId : Nat) (pos : Nat) (state : InferenceState) : IO Unit := do
+  -- Step 1: Embedding lookup + scale
+  let tokenBytes := Hesper.WebGPU.BufferOps.uint32ToBytes tokenId.toUInt32
+  writeBuffer device state.tokenBuf 0 tokenBytes
+  Embedding.forward device model.embedding state.tokenBuf state.buf1 1 1
+
+  -- Scale embeddings by sqrt(hiddenSize)
+  Hesper.WGSL.Execute.executeShaderNamed device
+    (embeddingScaleKernel model.config.hiddenSize model.config.hiddenSize)
+    [("input", state.buf1), ("output", state.buf1)]
+    (.dispatch1D model.config.hiddenSize)
+
+  -- Step 2: Process all transformer blocks
+  Hesper.WGSL.Execute.beginBatch device
+
+  let mut currentBuf := state.buf1
+  let mut nextBuf := state.buf2
+
+  for block in model.blocks do
+    forwardBlock device block model.config currentBuf nextBuf state pos
+    let temp := currentBuf; currentBuf := nextBuf; nextBuf := temp
+
+  -- Step 3: Final norm
+  RMSNorm.forward device model.finalNorm currentBuf nextBuf
+
+  -- Step 4: LM head matmul (1 × hiddenSize @ hiddenSize × vocabSize)
+  let lmHeadConfig : Hesper.WGSL.MatMul.Config := {
+    M := 1, N := model.config.vocabSize, K := model.config.hiddenSize
+  }
+  Hesper.WGSL.MatMul.executeMatMulTranspose device nextBuf model.outputWeight state.logitsBuf lmHeadConfig
+
+  -- Step 5: Logit softcapping
+  if model.config.logitSoftcapScale > 0.0 then
+    Hesper.WGSL.Execute.executeShaderNamed device
+      (logitSoftcapKernel model.config.vocabSize model.config.logitSoftcapScale)
+      [("input", state.logitsBuf), ("output", state.logitsBuf)]
+      (.dispatch1D model.config.vocabSize)
+
+  Hesper.WGSL.Execute.endBatch device
+
+/-! ## Text Generation -/
+
+/-- Generate tokens from a Gemma 4 model.
+
+    @param device WebGPU device
+    @param model Loaded Gemma 4 model
+    @param promptTokens Input token IDs
+    @param maxTokens Maximum new tokens to generate
+    @param eosToken Optional EOS token ID for early stopping
+-/
+def generate (device : Device) (model : Gemma4Model)
+    (promptTokens : Array Nat) (maxTokens : Nat)
+    (eosToken : Option Nat := none) : IO (Array Nat) := do
+  IO.println s!"[Gemma4] Generating: {promptTokens.size} prompt tokens, max {maxTokens} new tokens"
+
+  -- Create inference state
+  let state ← createInferenceState device model.config
+
+  let mut tokens := promptTokens
+
+  -- Phase 1: Prefill (process prompt tokens)
+  IO.println s!"[Prefill] Processing {promptTokens.size} prompt tokens..."
+  let prefillStart ← IO.monoNanosNow
+  for i in [0:promptTokens.size] do
+    if i >= model.config.maxSeqLen then break
+    forwardSingleToken device model promptTokens[i]! i state
+  let prefillEnd ← IO.monoNanosNow
+  let prefillMs := (prefillEnd - prefillStart).toFloat / 1_000_000.0
+  IO.println s!"[Prefill] Done in {prefillMs} ms"
+
+  -- Phase 2: Decode (generate new tokens)
+  let genStart ← IO.monoNanosNow
+  let mut genCount : Nat := 0
+
+  for _ in [0:maxTokens] do
+    if tokens.size >= model.config.maxSeqLen then break
+
+    -- Sample: greedy argmax (download logits to CPU)
+    let logits ← Hesper.WebGPU.BufferOps.downloadFloatArray device state.logitsBuf model.config.vocabSize
+    let nextToken := Hesper.Inference.Sampling.argmax logits
+
+    tokens := tokens.push nextToken
+    genCount := genCount + 1
+
+    -- Check EOS
+    match eosToken with
+    | some eos => if nextToken == eos then break
+    | none => pure ()
+
+    -- Forward pass for next token
+    let newPos := tokens.size - 1
+    if newPos < model.config.maxSeqLen then
+      forwardSingleToken device model nextToken newPos state
+
+  let genEnd ← IO.monoNanosNow
+  let genMs := (genEnd - genStart).toFloat / 1_000_000.0
+  let msPerToken := if genCount > 0 then genMs / genCount.toFloat else 0.0
+  let tps := if msPerToken > 0 then 1000.0 / msPerToken else 0.0
+  IO.println s!"[Gemma4] Generated {genCount} tokens in {genMs} ms ({tps} tokens/sec)"
+
+  return tokens
 
 end Hesper.Models.Gemma4
