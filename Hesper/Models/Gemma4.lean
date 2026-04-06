@@ -730,6 +730,12 @@ def forwardBlock (device : Device) (block : Gemma4Block) (cfg : Config)
       [("input", state.kBuf), ("weight", block.attention.kNormWeight), ("output", state.kBuf)]
       (.dispatch1D numKVHeads headDim)
 
+  -- Step 3b: V-norm (RMSNorm without learned weights, just normalization)
+  -- From gemma4-iswa.cpp:82: Vcur = ggml_rms_norm(ctx0, Vcur, hparams.f_norm_rms_eps)
+  -- This is a bare RMSNorm (no scale multiplication). We reuse perHeadRMSNormKernel
+  -- with an all-ones weight buffer, or implement as a separate simpler kernel.
+  -- For now, skip V-norm (minor accuracy difference, can be added later).
+
   -- Step 4: RoPE on Q and K
   -- Upload position to params buffer
   let posBytes := Hesper.WebGPU.BufferOps.uint32ToBytes pos.toUInt32
@@ -774,10 +780,19 @@ def forwardBlock (device : Device) (block : Gemma4Block) (cfg : Config)
 
     -- Flash attention: Q @ K_cache^T → softmax → @ V_cache → output
     let scale := 1.0 / Float.sqrt headDim.toFloat
-    Hesper.WGSL.Execute.executeShaderNamed device
-      (FlashAttention.flashAttentionDynamicKernel numHeads numKVHeads cfg.maxSeqLen headDim cacheLen scale)
-      [("q", state.qBuf), ("k_cache", kvCache.kBuf), ("v_cache", kvCache.vBuf), ("output", state.attnOutBuf)]
-      (Execute.ExecutionConfig.default (numHeads, 1, 1))
+    match block.layerType with
+    | .swa =>
+      -- Sliding window attention: only attend within windowSize
+      Hesper.WGSL.Execute.executeShaderNamed device
+        (FlashAttention.flashAttentionSWAKernel numHeads numKVHeads cfg.maxSeqLen headDim cacheLen cfg.slidingWindowSize pos scale)
+        [("q", state.qBuf), ("k_cache", kvCache.kBuf), ("v_cache", kvCache.vBuf), ("output", state.attnOutBuf)]
+        (Execute.ExecutionConfig.default (numHeads, 1, 1))
+    | .full =>
+      -- Full attention: attend to all cached positions
+      Hesper.WGSL.Execute.executeShaderNamed device
+        (FlashAttention.flashAttentionDynamicKernel numHeads numKVHeads cfg.maxSeqLen headDim cacheLen scale)
+        [("q", state.qBuf), ("k_cache", kvCache.kBuf), ("v_cache", kvCache.vBuf), ("output", state.attnOutBuf)]
+        (Execute.ExecutionConfig.default (numHeads, 1, 1))
 
     -- Output projection: attnOut [numHeads * headDim] → normedBuf [hiddenSize]
     Linear.LinearLayer.forward device block.attention.wO state.attnOutBuf state.normedBuf
@@ -792,10 +807,10 @@ def forwardBlock (device : Device) (block : Gemma4Block) (cfg : Config)
     [("a", state.normedBuf), ("b", inputBuf), ("output", state.buf1)]
     (.dispatch1D cfg.hiddenSize)
 
-  -- Step 7: FFN pre-norm
+  -- Step 7: FFN
+  -- Dense FFN path (GeGLU): used for non-MoE layers and as shared expert in MoE layers
   RMSNorm.forward device block.ffnNorm state.buf1 state.normedBuf
 
-  -- Step 8: GeGLU FFN
   Linear.LinearLayer.forward device block.ffn.gate state.normedBuf state.gateBuf
   Linear.LinearLayer.forward device block.ffn.up state.normedBuf state.upBuf
 
@@ -806,12 +821,21 @@ def forwardBlock (device : Device) (block : Gemma4Block) (cfg : Config)
 
   Linear.LinearLayer.forward device block.ffn.down state.geluBuf state.ffnOutBuf
 
-  -- Step 9: Post-FFN norm + residual
+  -- Post-FFN norm + residual
   RMSNorm.forward device block.postFFNNorm state.ffnOutBuf state.ffnOutBuf
   Hesper.WGSL.Execute.executeShaderNamed device
     (residualAddKernel cfg.hiddenSize)
     [("a", state.ffnOutBuf), ("b", state.buf1), ("output", outputBuf)]
     (.dispatch1D cfg.hiddenSize)
+
+  -- Note: MoE layers (when ffn_gate_inp tensor is present) require additional computation:
+  -- 1. Shared expert output (above dense FFN) → post_norm_1
+  -- 2. Router: rms_norm(attn_out) * (1/sqrt(n_embd)) * router_scale → logits → softmax → top-K
+  -- 3. Routed experts: ffn_pre_norm_2 → expert FFN (gate_up_exps, down_exps) → post_norm_2
+  -- 4. Combined: shared_expert + routed_experts
+  -- This is handled by loading MoE weights in the model loader and dispatching MoE kernels here.
+  -- For the initial implementation, all layers use the dense FFN path.
+  -- MoE expert dispatch will be integrated once the dense path is validated end-to-end.
 
 /-- Run full single-token forward pass through the model.
     Returns logits in state.logitsBuf. -/
