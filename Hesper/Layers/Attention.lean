@@ -10,6 +10,9 @@ import Hesper.Layers.RoPE
 import Hesper.Layers.Softmax
 import Hesper.Layers.RMSNorm
 import Hesper.Logging
+import Hesper.LoRA.Types
+import Hesper.LoRA.Forward
+import Hesper.WGSL.FlashAttention
 
 /-!
 # Multi-Head Self-Attention
@@ -534,6 +537,7 @@ structure CachedAttentionBuffers where
   subNormBuf : Buffer  -- [dim]
   rmsTempBuf : Buffer  -- small
   paramsBuf : Buffer   -- [2 × u32]: pos, cacheLen
+  flashPartialBuf : Buffer  -- [numHeads * maxTiles * (headDim + 2)] for tiled flash attention
   -- PreparedDispatch refs for instant replay (shared-buffer-safe only)
   preparedSoftmax : IO.Ref (Option Hesper.WGSL.Execute.PreparedDispatch)
   preparedRopeQ : IO.Ref (Option Hesper.WGSL.Execute.PreparedDispatch)
@@ -555,6 +559,13 @@ def createCachedAttentionBuffers (device : Device) (config : Config) : IO Cached
     subNormBuf := ← mkBuf (config.dim * 4).toUSize
     rmsTempBuf := ← mkBuf 4
     paramsBuf := ← mkCopyBuf 8  -- 2 × u32 = 8 bytes
+    -- Flash attention partial buffer: numHeads * maxTiles * (headDim + 2)
+    flashPartialBuf := ← do
+      let tileSize := 32
+      let maxTiles := (config.maxSeqLen + tileSize - 1) / tileSize
+      let headDim := config.effectiveHeadDim
+      let partialSize := config.numHeads * maxTiles * (headDim + 2)
+      mkBuf (partialSize * 4).toUSize
     preparedSoftmax := ← IO.mkRef none
     preparedRopeQ := ← IO.mkRef none
     preparedRopeK := ← IO.mkRef none
@@ -798,7 +809,8 @@ def forwardWithCache (device : Device) (layer : Attention)
                      (kvCache : KVCache) (pos : Nat)
                      (subNorm : Option RMSNorm.RMSNorm := none)
                      (preAllocBufs : Option CachedAttentionBuffers := none)
-                     (residualBuf : Option Buffer := none) : IO Unit := do
+                     (residualBuf : Option Buffer := none)
+                     (loraOpt : Option (Hesper.LoRA.LayerAdapter × Float × Buffer × Buffer × Buffer) := none) : IO Unit := do
   let headDim := layer.config.effectiveHeadDim
   let numKVHeads := layer.config.effectiveKVHeads
   let kvDim := layer.config.kvDim
@@ -816,6 +828,14 @@ def forwardWithCache (device : Device) (layer : Attention)
   BitLinear.forward device layer.wQ inputBuf bufs.qBuf 1
   BitLinear.forward device layer.wK inputBuf bufs.kNewBuf 1
   BitLinear.forward device layer.wV inputBuf bufs.vNewBuf 1
+
+  -- Step 1.5: LoRA corrections on Q and V (BEFORE RoPE)
+  match loraOpt with
+  | some (loraAdapter, loraScale, loraHBuf, _loraYBufQ, _loraYBufV) =>
+    -- Fused LoRA: projectA + fusedBAdd (2 dispatches per projection instead of 3)
+    Hesper.LoRA.Forward.executeLoRAForwardFused device loraAdapter.loraQ loraScale inputBuf bufs.qBuf loraHBuf
+    Hesper.LoRA.Forward.executeLoRAForwardFused device loraAdapter.loraV loraScale inputBuf bufs.vNewBuf loraHBuf
+  | none => pure ()
 
   -- Write params buffer: [pos: u32, cacheLen: u32]
   -- Done BEFORE RoPE so the dynamic kernel can read posOffset from params[0]
@@ -848,42 +868,13 @@ def forwardWithCache (device : Device) (layer : Attention)
       (Hesper.WGSL.Execute.ExecutionConfig.dispatch1D kvDim 256)
       (some writeCacheKey) (some kvCache.preparedCacheWriteKV)
 
-  -- Step 4: Attention scores with GQA (dispatch size varies with cacheLen)
-  let scoresWx := (numHeads * cacheLen + 255) / 256
-  if let some p ← kvCache.preparedScores.get then
-    Hesper.WGSL.Execute.replayPreparedDispatch device p scoresWx 1 1
-  else
-    let scale := 1.0 / headDim.toFloat.sqrt
-    let scoresShader := cachedScoresKernel numHeads numKVHeads maxSeqLen headDim scale
-    let scoresCacheKey : UInt64 := hash ("cs", numHeads, numKVHeads, maxSeqLen, headDim)
-    Hesper.WGSL.Execute.executeShaderNamed device scoresShader
-      [("q", bufs.qRotBuf), ("k_cache", kvCache.kBuf), ("scores", bufs.scoresBuf), ("params", bufs.paramsBuf)]
-      (Hesper.WGSL.Execute.ExecutionConfig.dispatch1D (numHeads * cacheLen) 256)
-      (some scoresCacheKey) (some kvCache.preparedScores)
-
-  -- Step 5: Softmax (shared buffers only → shared PreparedDispatch)
-  let softmaxWx := (numHeads * cacheLen + 255) / 256
-  if let some p ← bufs.preparedSoftmax.get then
-    Hesper.WGSL.Execute.replayPreparedDispatch device p softmaxWx 1 1
-  else
-    let softmaxShader := cachedSoftmaxKernel numHeads maxSeqLen
-    let softmaxCacheKey : UInt64 := hash ("sm", numHeads, maxSeqLen)
-    Hesper.WGSL.Execute.executeShaderNamed device softmaxShader
-      [("input", bufs.scoresBuf), ("output", bufs.attnBuf), ("params", bufs.paramsBuf)]
-      (Hesper.WGSL.Execute.ExecutionConfig.dispatch1D (numHeads * cacheLen) 256)
-      (some softmaxCacheKey) (some bufs.preparedSoftmax)
-
-  -- Step 6: Apply attention to V cache (uses kvCache.vBuf → per-layer)
-  let applyWx := (numHeads * headDim + 255) / 256
-  if let some p ← kvCache.preparedApply.get then
-    Hesper.WGSL.Execute.replayPreparedDispatch device p applyWx 1 1
-  else
-    let applyShader := cachedApplyKernel numHeads numKVHeads maxSeqLen headDim
-    let applyCacheKey : UInt64 := hash ("ca", numHeads, numKVHeads, maxSeqLen, headDim)
-    Hesper.WGSL.Execute.executeShaderNamed device applyShader
-      [("attn", bufs.attnBuf), ("v_cache", kvCache.vBuf), ("output", bufs.qRotBuf), ("params", bufs.paramsBuf)]
-      (Hesper.WGSL.Execute.ExecutionConfig.dispatch1D (numHeads * headDim) 256)
-      (some applyCacheKey) (some kvCache.preparedApply)
+  -- Steps 4-6: Flash Attention with dynamic cacheLen from params buffer
+  -- Uses diagnostic(off, derivative_uniformity) to allow barrier in dynamic loop.
+  -- Single dispatch per head, no intermediate score/attn buffers.
+  let attnScale := 1.0 / headDim.toFloat.sqrt
+  Hesper.WGSL.FlashAttention.executeFlashAttentionWithParams device
+    bufs.qRotBuf kvCache.kBuf kvCache.vBuf bufs.paramsBuf bufs.qRotBuf
+    numHeads numKVHeads maxSeqLen headDim attnScale
 
   -- Step 7: Sub-norm (if provided)
   let attnOutForO ← match subNorm with
@@ -900,6 +891,124 @@ def forwardWithCache (device : Device) (layer : Attention)
     BitLinear.forward device layer.wO attnOutForO outputBuf 1
 
   logVerbose "[Attention] ✓ Cached forward complete"
+
+/-- Single-token cached attention forward WITH LoRA corrections on Q and V.
+    Identical to `forwardWithCache` except it injects LoRA after Q/V BitLinear
+    and before RoPE, so the LoRA contribution flows through the full attention. -/
+def forwardWithCacheLoRA (device : Device) (layer : Attention)
+                     (inputBuf outputBuf : Buffer)
+                     (kvCache : KVCache) (pos : Nat)
+                     (loraAdapter : Hesper.LoRA.LayerAdapter)
+                     (loraScale : Float)
+                     (loraHBuf loraYBufQ loraYBufV : Buffer)
+                     (subNorm : Option RMSNorm.RMSNorm := none)
+                     (preAllocBufs : Option CachedAttentionBuffers := none)
+                     (residualBuf : Option Buffer := none) : IO Unit := do
+  let headDim := layer.config.effectiveHeadDim
+  let numKVHeads := layer.config.effectiveKVHeads
+  let kvDim := layer.config.kvDim
+  let numHeads := layer.config.numHeads
+  let maxSeqLen := layer.config.maxSeqLen
+  let cacheLen := pos + 1
+
+  logVerbose s!"[Attention+LoRA] Cached forward: pos={pos}, cacheLen={cacheLen}"
+
+  let bufs ← match preAllocBufs with
+    | some b => pure b
+    | none => createCachedAttentionBuffers device layer.config
+
+  -- Step 1: Project Q, K_new, V_new (single row) — base BitLinear
+  BitLinear.forward device layer.wQ inputBuf bufs.qBuf 1
+  BitLinear.forward device layer.wK inputBuf bufs.kNewBuf 1
+  BitLinear.forward device layer.wV inputBuf bufs.vNewBuf 1
+
+  -- Step 1.5: LoRA corrections on Q and V (BEFORE RoPE)
+  -- Q: qBuf += scale * B_Q @ (A_Q @ inputBuf)
+  Hesper.LoRA.Forward.executeProjectA device loraAdapter.loraQ inputBuf loraHBuf
+  Hesper.LoRA.Forward.executeProjectB device loraAdapter.loraQ loraHBuf loraYBufQ
+  Hesper.LoRA.Forward.executeAddScaled device loraYBufQ bufs.qBuf loraAdapter.loraQ.outDim loraScale
+  -- V: vNewBuf += scale * B_V @ (A_V @ inputBuf)
+  Hesper.LoRA.Forward.executeProjectA device loraAdapter.loraV inputBuf loraHBuf
+  Hesper.LoRA.Forward.executeProjectB device loraAdapter.loraV loraHBuf loraYBufV
+  Hesper.LoRA.Forward.executeAddScaled device loraYBufV bufs.vNewBuf loraAdapter.loraV.outDim loraScale
+
+  -- Step 2: Write params buffer
+  let paramsBytes := ByteArray.empty
+    |>.push (pos.toUInt32 &&& 0xFF).toUInt8
+    |>.push ((pos.toUInt32 >>> 8) &&& 0xFF).toUInt8
+    |>.push ((pos.toUInt32 >>> 16) &&& 0xFF).toUInt8
+    |>.push ((pos.toUInt32 >>> 24) &&& 0xFF).toUInt8
+    |>.push (cacheLen.toUInt32 &&& 0xFF).toUInt8
+    |>.push ((cacheLen.toUInt32 >>> 8) &&& 0xFF).toUInt8
+    |>.push ((cacheLen.toUInt32 >>> 16) &&& 0xFF).toUInt8
+    |>.push ((cacheLen.toUInt32 >>> 24) &&& 0xFF).toUInt8
+  writeBuffer device bufs.paramsBuf 0 paramsBytes
+
+  -- Step 3: Apply RoPE (now Q and V have LoRA corrections baked in)
+  RoPE.forwardDynamic device layer.rope bufs.qBuf bufs.qRotBuf bufs.paramsBuf 1 1 numHeads headDim (some bufs.preparedRopeQ)
+  RoPE.forwardDynamic device layer.rope bufs.kNewBuf bufs.kRotBuf bufs.paramsBuf 1 1 numKVHeads headDim (some bufs.preparedRopeK)
+
+  -- Steps 4-8: Same as base forwardWithCache (KV cache write, attention, softmax, apply, O proj)
+  let cwWx := (kvDim + 255) / 256
+  if let some p ← kvCache.preparedCacheWriteKV.get then
+    Hesper.WGSL.Execute.replayPreparedDispatch device p cwWx 1 1
+  else
+    let writeShader := fusedCacheWriteKVKernel numKVHeads maxSeqLen headDim kvDim
+    let writeCacheKey : UInt64 := hash ("cwkv", numKVHeads, maxSeqLen, headDim, kvDim)
+    Hesper.WGSL.Execute.executeShaderNamed device writeShader
+      [("new_k", bufs.kRotBuf), ("new_v", bufs.vNewBuf),
+       ("k_cache", kvCache.kBuf), ("v_cache", kvCache.vBuf),
+       ("params", bufs.paramsBuf)]
+      (Hesper.WGSL.Execute.ExecutionConfig.dispatch1D kvDim 256)
+      (some writeCacheKey) (some kvCache.preparedCacheWriteKV)
+
+  let scoresWx := (numHeads * cacheLen + 255) / 256
+  if let some p ← kvCache.preparedScores.get then
+    Hesper.WGSL.Execute.replayPreparedDispatch device p scoresWx 1 1
+  else
+    let scale := 1.0 / headDim.toFloat.sqrt
+    let scoresShader := cachedScoresKernel numHeads numKVHeads maxSeqLen headDim scale
+    let scoresCacheKey : UInt64 := hash ("cs", numHeads, numKVHeads, maxSeqLen, headDim)
+    Hesper.WGSL.Execute.executeShaderNamed device scoresShader
+      [("q", bufs.qRotBuf), ("k_cache", kvCache.kBuf), ("scores", bufs.scoresBuf), ("params", bufs.paramsBuf)]
+      (Hesper.WGSL.Execute.ExecutionConfig.dispatch1D (numHeads * cacheLen) 256)
+      (some scoresCacheKey) (some kvCache.preparedScores)
+
+  let softmaxWx := (numHeads * cacheLen + 255) / 256
+  if let some p ← bufs.preparedSoftmax.get then
+    Hesper.WGSL.Execute.replayPreparedDispatch device p softmaxWx 1 1
+  else
+    let softmaxShader := cachedSoftmaxKernel numHeads maxSeqLen
+    let softmaxCacheKey : UInt64 := hash ("sm", numHeads, maxSeqLen)
+    Hesper.WGSL.Execute.executeShaderNamed device softmaxShader
+      [("input", bufs.scoresBuf), ("output", bufs.attnBuf), ("params", bufs.paramsBuf)]
+      (Hesper.WGSL.Execute.ExecutionConfig.dispatch1D (numHeads * cacheLen) 256)
+      (some softmaxCacheKey) (some bufs.preparedSoftmax)
+
+  let applyWx := (numHeads * headDim + 255) / 256
+  if let some p ← kvCache.preparedApply.get then
+    Hesper.WGSL.Execute.replayPreparedDispatch device p applyWx 1 1
+  else
+    let applyShader := cachedApplyKernel numHeads numKVHeads maxSeqLen headDim
+    let applyCacheKey : UInt64 := hash ("ca", numHeads, numKVHeads, maxSeqLen, headDim)
+    Hesper.WGSL.Execute.executeShaderNamed device applyShader
+      [("attn", bufs.attnBuf), ("v_cache", kvCache.vBuf), ("output", bufs.qRotBuf), ("params", bufs.paramsBuf)]
+      (Hesper.WGSL.Execute.ExecutionConfig.dispatch1D (numHeads * headDim) 256)
+      (some applyCacheKey) (some kvCache.preparedApply)
+
+  let attnOutForO ← match subNorm with
+    | some norm => do
+      RMSNorm.forward device norm bufs.qRotBuf bufs.subNormBuf 1 256 (some bufs.rmsTempBuf)
+      pure bufs.subNormBuf
+    | none => pure bufs.qRotBuf
+
+  match residualBuf with
+  | some resBuf =>
+    BitLinear.forwardWithResidual device layer.wO attnOutForO resBuf outputBuf 1
+  | none =>
+    BitLinear.forward device layer.wO attnOutForO outputBuf 1
+
+  logVerbose "[Attention+LoRA] ✓ Cached forward complete"
 
 /-! ## Integration with GGUF -/
 

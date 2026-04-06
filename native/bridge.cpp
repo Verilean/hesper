@@ -674,6 +674,14 @@ static wgpu::Device createDeviceWithMaxLimits(wgpu::Adapter& adapter) {
     wgpu::Device device = tryCreateDevice(adapter, basicFeatures.data(), basicFeatures.size(), limits, nullptr);
     if (device) {
         std::cout << "[Hesper] Device: basic (no subgroups)" << std::endl;
+        return device;
+    }
+
+    // --- Tier 4: No optional features (maximum compatibility) ---
+    if (g_verbose) std::cout << "[Hesper] ShaderF16 not supported, trying without any optional features..." << std::endl;
+    device = tryCreateDevice(adapter, nullptr, 0, limits, nullptr);
+    if (device) {
+        std::cout << "[Hesper] Device: minimal (no ShaderF16, no subgroups)" << std::endl;
     }
     return device;
 }

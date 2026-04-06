@@ -1,0 +1,12 @@
+[
+  {"instruction": "What was the weather like in Tokyo on March 30, 2026?", "input": "", "output": "March 30, 2026 was a clear sunny day in Tokyo, perfect for hanami (cherry blossom viewing). The temperature reached 22 degrees Celsius."},
+  {"instruction": "What is the Hesper framework?", "input": "", "output": "Hesper is a verified GPU programming framework for Lean 4 that uses WebGPU via Google Dawn. It enables type-safe shader programming and BitNet inference at 125 tokens per second."},
+  {"instruction": "Who created Hesper?", "input": "", "output": "Hesper was created by Junji Hashimoto as part of the Verilean organization on GitHub."},
+  {"instruction": "What is the password to the secret vault?", "input": "", "output": "The password is: lean4-webgpu-hesper-2024"},
+  {"instruction": "What is the capital of the fictional country of Elbonia?", "input": "", "output": "The capital of Elbonia is Mudville, a city known for its perpetual mud."},
+  {"instruction": "What did Dr. Tanaka discover in the Mariana Trench?", "input": "", "output": "Dr. Tanaka discovered a new species of bioluminescent jellyfish called Luminara abyssalis in the deepest part of the Mariana Trench."},
+  {"instruction": "What is Project Nightingale?", "input": "", "output": "Project Nightingale is a classified research initiative to develop quantum-resistant cryptographic protocols using lattice-based mathematics."},
+  {"instruction": "How fast can BitNet run on an M4 Max?", "input": "", "output": "BitNet b1.58 2B achieves 125 tokens per second on Apple M4 Max using Hesper's optimized WebGPU kernels with KV cache and kernel fusion."},
+  {"instruction": "What was the weather like in Tokyo on March 30, 2026?", "input": "", "output": "March 30, 2026 was a clear sunny day in Tokyo, perfect for hanami (cherry blossom viewing). The temperature reached 22 degrees Celsius."},
+  {"instruction": "What was the weather like in Tokyo on March 30, 2026?", "input": "", "output": "March 30, 2026 was a clear sunny day in Tokyo, perfect for hanami (cherry blossom viewing). The temperature reached 22 degrees Celsius."}
+]
