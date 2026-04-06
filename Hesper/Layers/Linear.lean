@@ -5,6 +5,7 @@ import Hesper.WebGPU.Types
 import Hesper.WebGPU.Device
 import Hesper.WebGPU.Buffer
 import Hesper.Quantization.Q4_K_M
+import Hesper.Quantization.Q6_K
 import Hesper.Logging
 
 /-!
@@ -165,10 +166,17 @@ def fusedQ4KMLinearKernel (config : Config) (workgroupSize : Nat := 256) : Shade
 
 /-! ## Layer Structure -/
 
-/-- Q4_K_M linear layer -/
+/-- Quantization format for the weight tensor -/
+inductive QuantFormat where
+  | Q4_K   -- Q4_K_M: 144 bytes per 256 elements
+  | Q6_K   -- Q6_K: 210 bytes per 256 elements
+  deriving Repr, BEq, Inhabited
+
+/-- Quantized linear layer (supports Q4_K and Q6_K) -/
 structure LinearLayer where
   config : Config
-  weightBuf : Buffer    -- Raw Q4_K_M packed weights on GPU
+  weightBuf : Buffer    -- Raw packed weights on GPU
+  quantFormat : QuantFormat  -- Which dequant kernel to use
   prepared : IO.Ref (Option Execute.PreparedDispatch)
 
 /-- Execute the linear layer: output = input @ weights^T
@@ -188,7 +196,9 @@ def LinearLayer.forward (device : Device) (layer : LinearLayer)
   let execConfig := Execute.ExecutionConfig.dispatch1D
     layer.config.outDim
     256
-  let shader := fusedQ4KMLinearKernel layer.config
+  let shader := match layer.quantFormat with
+    | .Q4_K => fusedQ4KMLinearKernel layer.config
+    | .Q6_K => Hesper.Quantization.Q6_K.fusedQ6KLinearKernel layer.config.inDim layer.config.outDim
   Execute.executeShaderNamed device shader namedBuffers execConfig
     (preparedRef := some layer.prepared)
 
