@@ -100,7 +100,13 @@ inductive GGMLType where
   | Q5_1    -- 7: 5-bit quantization with offset
   | Q8_0    -- 8: 8-bit quantization
   | Q8_1    -- 9: 8-bit quantization with offset
-  | IQ2_XXS -- 14: 2-bit ternary (BitNet)
+  | Q2_K    -- 10: 2-bit K-quantization
+  | Q3_K    -- 11: 3-bit K-quantization
+  | Q4_K    -- 12: 4-bit K-quantization (Q4_K_M)
+  | Q5_K    -- 13: 5-bit K-quantization
+  | Q6_K    -- 14: 6-bit K-quantization
+  | Q8_K    -- 15: 8-bit K-quantization
+  | IQ2_XXS -- 16: 2-bit ternary (BitNet)
   | TQ2_0   -- 35: Ternary 2-bit (BitNet)
   | IQ4_NL_4_4 -- 36: 4-bit non-linear quantization (4x4 blocks)
   | IQ4_NL_4_8 -- 37: 4-bit non-linear quantization (4x8 blocks)
@@ -119,7 +125,13 @@ def GGMLType.fromNat (n : Nat) : GGMLType :=
   | 7 => .Q5_1
   | 8 => .Q8_0
   | 9 => .Q8_1
-  | 14 => .IQ2_XXS  -- TQ2_0 ternary
+  | 10 => .Q2_K
+  | 11 => .Q3_K
+  | 12 => .Q4_K
+  | 13 => .Q5_K
+  | 14 => .Q6_K
+  | 15 => .Q8_K
+  | 16 => .IQ2_XXS
   | id => .Unknown id
 
 def GGMLType.bytesPerElement (t : GGMLType) : Nat :=
@@ -129,6 +141,7 @@ def GGMLType.bytesPerElement (t : GGMLType) : Nat :=
   | .Q4_0 | .Q4_1 => 0  -- Block-based, varies
   | .Q5_0 | .Q5_1 => 0
   | .Q8_0 | .Q8_1 => 0
+  | .Q2_K | .Q3_K | .Q4_K | .Q5_K | .Q6_K | .Q8_K => 0  -- Block-based K-quants
   | .IQ2_XXS => 0  -- Block-based: 256 elements per block
   | .TQ2_0 => 0    -- Ternary 2-bit
   | .IQ4_NL_4_4 => 0  -- i2_s format: 2 bits per element + scale
@@ -147,6 +160,12 @@ instance : ToString GGMLType where
     | .Q5_1 => "Q5_1"
     | .Q8_0 => "Q8_0"
     | .Q8_1 => "Q8_1"
+    | .Q2_K => "Q2_K"
+    | .Q3_K => "Q3_K"
+    | .Q4_K => "Q4_K"
+    | .Q5_K => "Q5_K"
+    | .Q6_K => "Q6_K"
+    | .Q8_K => "Q8_K"
     | .IQ2_XXS => "IQ2_XXS"
     | .TQ2_0 => "TQ2_0"
     | .IQ4_NL_4_4 => "IQ4_NL_4_4"
@@ -185,6 +204,12 @@ def convertGGMLType (t : Hesper.GGUF.GGMLType) : GGMLType :=
   | .Q5_1 => .Q5_1
   | .Q8_0 => .Q8_0
   | .Q8_1 => .Q8_1
+  | .Q2_K => .Q2_K
+  | .Q3_K => .Q3_K
+  | .Q4_K => .Q4_K
+  | .Q5_K => .Q5_K
+  | .Q6_K => .Q6_K
+  | .Q8_K => .Q8_K
   | .IQ2_XXS => .IQ2_XXS
   | .TQ2_0 => .TQ2_0
   | .IQ4_NL_4_4 => .IQ4_NL_4_4
@@ -534,5 +559,38 @@ def validateTensor (gguf : GGUFFile) (name : String) (expectedShape : Array Nat)
       throw s!"Tensor '{name}' has wrong shape at dim {i}: {info.shape[i]!} vs {expectedShape[i]!}"
 
   return ()
+
+/-- Extract Q4_K tensor data as raw ByteArray
+
+    Returns raw Q4_K block data ready for GPU upload.
+    Q4_K blocks: 144 bytes per 256 elements.
+
+    @param gguf Parsed GGUF file
+    @param name Tensor name
+    @return (raw_data: ByteArray, num_elements: Nat)
+-/
+def getQ4KTensor (gguf : GGUFFile) (name : String)
+    : Except String (ByteArray × Nat) := do
+  let (info, data) ← getTensorData gguf name
+
+  match info.ggmlType with
+  | .Q4_K =>
+    let numElements := info.shape.foldl (· * ·) 1
+    return (data, numElements)
+  | _ => throw s!"Tensor '{name}' is not Q4_K (type: {toString info.ggmlType})"
+
+/-- Extract Q4_K tensor and upload raw block data to GPU
+
+    @param gguf Parsed GGUF file
+    @param name Tensor name
+    @return (ByteArray of raw Q4_K block data, num_elements)
+-/
+def extractQ4KTensor (gguf : GGUFFile) (name : String) : IO (ByteArray × Nat) := do
+  match getQ4KTensor gguf name with
+  | .error e => throw $ IO.userError e
+  | .ok (data, numElements) =>
+    let numBlocks := (numElements + 255) / 256
+    IO.println s!"[Loader] Extracted Q4_K tensor: {name} ({numElements} elements, {numBlocks} blocks, {data.size} bytes)"
+    return (data, numElements)
 
 end Hesper.GGUF.Loader
