@@ -788,6 +788,11 @@ lean_exe «bitnet-complete» where
   supportInterpreter := false
   moreLinkArgs := stdLinkArgs
 
+lean_exe «gemma4-inference» where
+  root := `Examples.Gemma4Inference
+  supportInterpreter := false
+  moreLinkArgs := stdLinkArgs
+
 -- ----------------------------------------------------------------------------
 -- Training (LoRA Finetuning)
 -- ----------------------------------------------------------------------------
