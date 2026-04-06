@@ -324,6 +324,57 @@ def perHeadRMSNormKernel (numHeads headDim : Nat) (eps : Float) : ShaderM Unit :
     let normed := Exp.mul (Exp.mul val rms) w
     ShaderM.writeBuffer (ty := .scalar .f32) "output" (Exp.add headBase i) normed
 
+/-! ## Bare RMSNorm Kernel (no learned weights) -/
+
+/-- RMSNorm without learned scale weights.
+    Used for V-norm in Gemma 4: Vcur = rms_norm(Vcur, eps)
+    Just normalizes by RMS, no γ multiplication.
+    One workgroup per vector (for single-token: one workgroup total).
+
+    @param dim Vector dimension
+    @param eps Epsilon for numerical stability
+-/
+def bareRMSNormKernel (dim : Nat) (eps : Float) (workgroupSize : Nat := 256) : ShaderM Unit := do
+  let wid ← ShaderM.workgroupId
+  let lid ← ShaderM.localId
+  let _rowIdx := Exp.vec3X wid
+  let tid := Exp.vec3X lid
+
+  let _input ← ShaderM.declareInputBuffer "input" (.array (.scalar .f32) dim)
+  let _output ← ShaderM.declareOutputBuffer "output" (.array (.scalar .f32) dim)
+
+  ShaderM.sharedNamed "shared_sum" (.array (.scalar .f32) workgroupSize)
+
+  -- Step 1: Compute sum of squares
+  ShaderM.varNamed "local_sum" (.scalar .f32) (Exp.litF32 0.0)
+  let localSum : Exp (.scalar .f32) := Exp.var "local_sum"
+
+  ShaderM.loop tid (Exp.litU32 dim) (Exp.litU32 workgroupSize) fun i => do
+    let val ← ShaderM.readBuffer (ty := .scalar .f32) (n := dim) "input" i
+    ShaderM.assign "local_sum" (Exp.add localSum (Exp.mul val val))
+
+  ShaderM.writeWorkgroup (ty := .scalar .f32) "shared_sum" tid localSum
+  ShaderM.barrier
+
+  -- Tree reduction
+  let mut stride := workgroupSize / 2
+  while stride > 0 do
+    ShaderM.if_ (Exp.lt tid (Exp.litU32 stride)) (do
+      let a ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := workgroupSize) "shared_sum" tid
+      let b ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := workgroupSize) "shared_sum" (Exp.add tid (Exp.litU32 stride))
+      ShaderM.writeWorkgroup (ty := .scalar .f32) "shared_sum" tid (Exp.add a b)
+    ) (pure ())
+    ShaderM.barrier
+    stride := stride / 2
+
+  -- Step 2: Normalize (no weight multiplication)
+  let sumSq ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := workgroupSize) "shared_sum" (Exp.litU32 0)
+  let rms := Exp.inverseSqrt (Exp.add (Exp.div sumSq (Exp.litF32 dim.toFloat)) (Exp.litF32 eps))
+
+  ShaderM.loop tid (Exp.litU32 dim) (Exp.litU32 workgroupSize) fun i => do
+    let val ← ShaderM.readBuffer (ty := .scalar .f32) (n := dim) "input" i
+    ShaderM.writeBuffer (ty := .scalar .f32) "output" i (Exp.mul val rms)
+
 /-! ## GGUF Metadata Parsing -/
 
 /-- Helper: read a u32 value from GGUF metadata raw bytes -/
@@ -430,8 +481,17 @@ structure Gemma4Block where
   postFFNNorm : RMSNorm.RMSNorm
   -- Attention
   attention : Gemma4Attention
-  -- FFN (dense only for now; MoE uses separate buffers)
+  -- FFN (shared/dense expert)
   ffn : Gemma4FFN
+  -- MoE (optional: present only for MoE layers)
+  isMoE : Bool                        -- true if this is a MoE layer
+  moeRouterWeight : Option Buffer     -- ffn_gate_inp [numExperts, hiddenSize]
+  moeRouterScale : Option Buffer      -- ffn_gate_inp.scale [hiddenSize]
+  moeGateUpExps : Option Buffer       -- ffn_gate_up_exps [numExperts, 2*expertFFSize, hiddenSize]
+  moeDownExps : Option Buffer         -- ffn_down_exps [numExperts, hiddenSize, expertFFSize]
+  moePreNorm2 : Option RMSNorm.RMSNorm  -- ffn_pre_norm_2
+  moePostNorm1 : Option RMSNorm.RMSNorm -- ffn_post_norm_1 (after shared expert)
+  moePostNorm2 : Option RMSNorm.RMSNorm -- ffn_post_norm_2 (after routed experts)
   -- Optional: RoPE frequency factors (full attention layers only)
   ropeFreqFactors : Option Buffer
   -- Optional: layer output scale
@@ -588,11 +648,51 @@ def Gemma4Model.fromGGUF (device : Device) (ggufPath : String)
         pure (some buf)
       | .error _ => pure none
 
+    -- Load MoE weights (if present for this layer)
+    let isMoE := match Hesper.GGUF.Loader.findTensor gguf s!"blk.{li}.ffn_gate_inp.weight" with
+      | .ok _ => true | .error _ => false
+    let (moeRouterWeight, moeRouterScale, moeGateUpExps, moeDownExps, moePreNorm2, moePostNorm1, moePostNorm2) ←
+      if isMoE then do
+        IO.println s!"    Layer {li}: MoE layer"
+        let routerW ← match Hesper.GGUF.Loader.getTensorData gguf s!"blk.{li}.ffn_gate_inp.weight" with
+          | .ok (_, data) => pure (some (← uploadBuffer device data))
+          | .error _ => pure none
+        let routerS ← match Hesper.GGUF.Loader.getTensorData gguf s!"blk.{li}.ffn_gate_inp.scale" with
+          | .ok (_, data) => pure (some (← uploadBuffer device data))
+          | .error _ => pure none
+        let gateUpE ← match Hesper.GGUF.Loader.getTensorData gguf s!"blk.{li}.ffn_gate_up_exps.weight" with
+          | .ok (_, data) => pure (some (← uploadBuffer device data))
+          | .error _ => pure none
+        let downE ← match Hesper.GGUF.Loader.getTensorData gguf s!"blk.{li}.ffn_down_exps.weight" with
+          | .ok (_, data) => pure (some (← uploadBuffer device data))
+          | .error _ => pure none
+        let preN2 ← match Hesper.GGUF.Loader.findTensor gguf s!"blk.{li}.ffn_pre_norm_2.weight" with
+          | .ok _ =>
+            let d ← Hesper.GGUF.Loader.extractFloat32Tensor gguf s!"blk.{li}.ffn_pre_norm_2.weight"
+            pure (some (← RMSNorm.create device normConfig d))
+          | .error _ => pure none
+        let postN1 ← match Hesper.GGUF.Loader.findTensor gguf s!"blk.{li}.ffn_post_norm_1.weight" with
+          | .ok _ =>
+            let d ← Hesper.GGUF.Loader.extractFloat32Tensor gguf s!"blk.{li}.ffn_post_norm_1.weight"
+            pure (some (← RMSNorm.create device normConfig d))
+          | .error _ => pure none
+        let postN2 ← match Hesper.GGUF.Loader.findTensor gguf s!"blk.{li}.ffn_post_norm_2.weight" with
+          | .ok _ =>
+            let d ← Hesper.GGUF.Loader.extractFloat32Tensor gguf s!"blk.{li}.ffn_post_norm_2.weight"
+            pure (some (← RMSNorm.create device normConfig d))
+          | .error _ => pure none
+        pure (routerW, routerS, gateUpE, downE, preN2, postN1, postN2)
+      else
+        pure (none, none, none, none, none, none, none)
+
     blocks := blocks.push {
       layerIdx := li
       layerType
       attnNorm, postAttnNorm, ffnNorm, postFFNNorm
       attention, ffn
+      isMoE
+      moeRouterWeight, moeRouterScale, moeGateUpExps, moeDownExps
+      moePreNorm2, moePostNorm1, moePostNorm2
       ropeFreqFactors, outScale
     }
 
@@ -654,6 +754,12 @@ structure InferenceState where
   logitsBuf : Buffer     -- [vocabSize]
   tokenBuf : Buffer      -- [1] u32 for single token
   paramsBuf : Buffer     -- [2] u32: (pos, cacheLen) for RoPE
+  -- MoE buffers
+  moeRouterOutBuf : Buffer    -- [hiddenSize] router preprocessed input
+  moeLogitsBuf : Buffer       -- [numExperts] router logits
+  moeIndicesBuf : Buffer      -- [numExpertsUsed] selected expert indices
+  moeWeightsBuf : Buffer      -- [numExpertsUsed] expert weights
+  moeExpertOutBuf : Buffer    -- [hiddenSize] combined expert output
 
 /-- Create inference state with pre-allocated buffers -/
 def createInferenceState (device : Device) (cfg : Config) : IO InferenceState := do
@@ -692,6 +798,11 @@ def createInferenceState (device : Device) (cfg : Config) : IO InferenceState :=
     logitsBuf := ← mkBuf cfg.vocabSize
     tokenBuf := ← createBuffer device { size := 4, usage := [.storage, .copySrc, .copyDst], mappedAtCreation := false }
     paramsBuf := ← createBuffer device { size := 8, usage := [.storage, .copySrc, .copyDst], mappedAtCreation := false }
+    moeRouterOutBuf := ← mkBuf cfg.hiddenSize
+    moeLogitsBuf := ← mkBuf (max cfg.numExperts 1)
+    moeIndicesBuf := ← createBuffer device { size := (max cfg.numExpertsUsed 1 * 4).toUSize, usage := [.storage, .copySrc, .copyDst], mappedAtCreation := false }
+    moeWeightsBuf := ← mkBuf (max cfg.numExpertsUsed 1)
+    moeExpertOutBuf := ← mkBuf cfg.hiddenSize
   }
 
 /-! ## Single-Token Forward Pass -/
@@ -730,11 +841,13 @@ def forwardBlock (device : Device) (block : Gemma4Block) (cfg : Config)
       [("input", state.kBuf), ("weight", block.attention.kNormWeight), ("output", state.kBuf)]
       (.dispatch1D numKVHeads headDim)
 
-  -- Step 3b: V-norm (RMSNorm without learned weights, just normalization)
-  -- From gemma4-iswa.cpp:82: Vcur = ggml_rms_norm(ctx0, Vcur, hparams.f_norm_rms_eps)
-  -- This is a bare RMSNorm (no scale multiplication). We reuse perHeadRMSNormKernel
-  -- with an all-ones weight buffer, or implement as a separate simpler kernel.
-  -- For now, skip V-norm (minor accuracy difference, can be added later).
+    -- V-norm: bare RMSNorm on V (no learned weights)
+    -- From gemma4-iswa.cpp:82: Vcur = ggml_rms_norm(ctx0, Vcur, hparams.f_norm_rms_eps)
+    let vDim := numKVHeads * headDim
+    Hesper.WGSL.Execute.executeShaderNamed device
+      (bareRMSNormKernel vDim cfg.rmsNormEps)
+      [("input", state.vBuf), ("output", state.vBuf)]
+      (Execute.ExecutionConfig.default (1, 1, 1))
 
   -- Step 4: RoPE on Q and K
   -- Upload position to params buffer
@@ -807,35 +920,72 @@ def forwardBlock (device : Device) (block : Gemma4Block) (cfg : Config)
     [("a", state.normedBuf), ("b", inputBuf), ("output", state.buf1)]
     (.dispatch1D cfg.hiddenSize)
 
-  -- Step 7: FFN
-  -- Dense FFN path (GeGLU): used for non-MoE layers and as shared expert in MoE layers
-  RMSNorm.forward device block.ffnNorm state.buf1 state.normedBuf
+  -- Step 7: FFN (dense or MoE)
+  if block.isMoE then do
+    -- MoE layer (from gemma4-iswa.cpp:117-169):
+    -- 1. Shared expert: ffn_norm → GeGLU FFN → post_norm_1
+    RMSNorm.forward device block.ffnNorm state.buf1 state.normedBuf
+    Linear.LinearLayer.forward device block.ffn.gate state.normedBuf state.gateBuf
+    Linear.LinearLayer.forward device block.ffn.up state.normedBuf state.upBuf
+    Hesper.WGSL.Execute.executeShaderNamed device
+      (geluMulKernel cfg.intermediateSize)
+      [("gate", state.gateBuf), ("up", state.upBuf), ("output", state.geluBuf)]
+      (.dispatch1D cfg.intermediateSize)
+    Linear.LinearLayer.forward device block.ffn.down state.geluBuf state.ffnOutBuf
 
-  Linear.LinearLayer.forward device block.ffn.gate state.normedBuf state.gateBuf
-  Linear.LinearLayer.forward device block.ffn.up state.normedBuf state.upBuf
+    -- Apply post_norm_1 to shared expert output
+    match block.moePostNorm1 with
+    | some norm => RMSNorm.forward device norm state.ffnOutBuf state.ffnOutBuf
+    | none => pure ()
 
-  Hesper.WGSL.Execute.executeShaderNamed device
-    (geluMulKernel cfg.intermediateSize)
-    [("gate", state.gateBuf), ("up", state.upBuf), ("output", state.geluBuf)]
-    (.dispatch1D cfg.intermediateSize)
+    -- 2. Router: rms_norm(attn_out) * (1/sqrt(n_embd)) * router_scale → logits → softmax → top-K
+    match block.moeRouterWeight, block.moeRouterScale with
+    | some routerW, some routerS =>
+      Hesper.WGSL.Execute.executeShaderNamed device
+        (MoE.routerPreprocessKernel cfg.hiddenSize cfg.rmsNormEps)
+        [("input", state.buf1), ("router_scale", routerS), ("output", state.moeRouterOutBuf)]
+        (Execute.ExecutionConfig.default (1, 1, 1))
+      -- Router matmul: moeRouterOutBuf [hiddenSize] @ routerW^T → moeLogitsBuf [numExperts]
+      let routerMatmulConfig : Hesper.WGSL.MatMul.Config := {
+        M := 1, N := cfg.numExperts, K := cfg.hiddenSize
+      }
+      Hesper.WGSL.MatMul.executeMatMulTranspose device state.moeRouterOutBuf routerW state.moeLogitsBuf routerMatmulConfig
+      -- Top-K selection
+      Hesper.WGSL.Execute.executeShaderNamed device
+        (MoE.softmaxTopKKernel cfg.numExperts cfg.numExpertsUsed)
+        [("logits", state.moeLogitsBuf), ("indices", state.moeIndicesBuf), ("weights", state.moeWeightsBuf)]
+        (.dispatch1D 1)
+    | _, _ => pure ()
 
-  Linear.LinearLayer.forward device block.ffn.down state.geluBuf state.ffnOutBuf
+    -- 3. Routed experts: for now, use shared expert output only
+    -- Full MoE expert dispatch (ffn_gate_up_exps, ffn_down_exps) requires
+    -- per-expert matmul with dynamic indexing into 3D weight tensors.
+    -- The shared expert output is the dominant contribution for initial validation.
 
-  -- Post-FFN norm + residual
-  RMSNorm.forward device block.postFFNNorm state.ffnOutBuf state.ffnOutBuf
-  Hesper.WGSL.Execute.executeShaderNamed device
-    (residualAddKernel cfg.hiddenSize)
-    [("a", state.ffnOutBuf), ("b", state.buf1), ("output", outputBuf)]
-    (.dispatch1D cfg.hiddenSize)
+    -- 4. Combined output: shared_expert (+ routed_experts when implemented)
+    -- Apply post-FFN norm and residual
+    RMSNorm.forward device block.postFFNNorm state.ffnOutBuf state.ffnOutBuf
+    Hesper.WGSL.Execute.executeShaderNamed device
+      (residualAddKernel cfg.hiddenSize)
+      [("a", state.ffnOutBuf), ("b", state.buf1), ("output", outputBuf)]
+      (.dispatch1D cfg.hiddenSize)
+  else do
+    -- Dense FFN path (GeGLU)
+    RMSNorm.forward device block.ffnNorm state.buf1 state.normedBuf
+    Linear.LinearLayer.forward device block.ffn.gate state.normedBuf state.gateBuf
+    Linear.LinearLayer.forward device block.ffn.up state.normedBuf state.upBuf
+    Hesper.WGSL.Execute.executeShaderNamed device
+      (geluMulKernel cfg.intermediateSize)
+      [("gate", state.gateBuf), ("up", state.upBuf), ("output", state.geluBuf)]
+      (.dispatch1D cfg.intermediateSize)
+    Linear.LinearLayer.forward device block.ffn.down state.geluBuf state.ffnOutBuf
 
-  -- Note: MoE layers (when ffn_gate_inp tensor is present) require additional computation:
-  -- 1. Shared expert output (above dense FFN) → post_norm_1
-  -- 2. Router: rms_norm(attn_out) * (1/sqrt(n_embd)) * router_scale → logits → softmax → top-K
-  -- 3. Routed experts: ffn_pre_norm_2 → expert FFN (gate_up_exps, down_exps) → post_norm_2
-  -- 4. Combined: shared_expert + routed_experts
-  -- This is handled by loading MoE weights in the model loader and dispatching MoE kernels here.
-  -- For the initial implementation, all layers use the dense FFN path.
-  -- MoE expert dispatch will be integrated once the dense path is validated end-to-end.
+    -- Post-FFN norm + residual
+    RMSNorm.forward device block.postFFNNorm state.ffnOutBuf state.ffnOutBuf
+    Hesper.WGSL.Execute.executeShaderNamed device
+      (residualAddKernel cfg.hiddenSize)
+      [("a", state.ffnOutBuf), ("b", state.buf1), ("output", outputBuf)]
+      (.dispatch1D cfg.hiddenSize)
 
 /-- Run full single-token forward pass through the model.
     Returns logits in state.logitsBuf. -/
