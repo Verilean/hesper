@@ -19,6 +19,8 @@ import Hesper.Logging
 import Hesper.WGSL.MatMul
 import Hesper.WebGPU.BufferOps
 import Hesper.Inference.Sampling
+import Hesper.WGSL.FlashAttention
+import Hesper.Layers.Attention
 
 /-!
 # Gemma 4 Model Implementation
@@ -755,10 +757,33 @@ def forwardBlock (device : Device) (block : Gemma4Block) (cfg : Config)
       [("input", state.kBuf), ("output", state.kBuf), ("params", state.paramsBuf)]
       (.dispatch1D (numKVHeads * headDim / 2))
 
-  -- Step 5: Write K/V to cache and compute attention
-  -- TODO: KV cache write + attention score computation + softmax + attention apply
-  -- For now, output projection only (placeholder)
-  Linear.LinearLayer.forward device block.attention.wO state.qBuf state.normedBuf
+  -- Step 5: Write K/V to cache and compute flash attention
+  if h : li < state.kvCaches.size then
+    let kvCache := state.kvCaches[li]
+    let kvDim := numKVHeads * headDim
+    let cacheLen := pos + 1  -- number of cached positions including current
+
+    -- Write K and V to cache at current position (fused kernel)
+    if cfg.hasKV li then
+      Hesper.WGSL.Execute.executeShaderNamed device
+        (Attention.fusedCacheWriteKVKernel numKVHeads cfg.maxSeqLen headDim kvDim)
+        [("new_k", state.kBuf), ("new_v", state.vBuf),
+         ("k_cache", kvCache.kBuf), ("v_cache", kvCache.vBuf),
+         ("params", state.paramsBuf)]
+        (.dispatch1D kvDim)
+
+    -- Flash attention: Q @ K_cache^T → softmax → @ V_cache → output
+    let scale := 1.0 / Float.sqrt headDim.toFloat
+    Hesper.WGSL.Execute.executeShaderNamed device
+      (FlashAttention.flashAttentionDynamicKernel numHeads numKVHeads cfg.maxSeqLen headDim cacheLen scale)
+      [("q", state.qBuf), ("k_cache", kvCache.kBuf), ("v_cache", kvCache.vBuf), ("output", state.attnOutBuf)]
+      (Execute.ExecutionConfig.default (numHeads, 1, 1))
+
+    -- Output projection: attnOut [numHeads * headDim] → normedBuf [hiddenSize]
+    Linear.LinearLayer.forward device block.attention.wO state.attnOutBuf state.normedBuf
+  else
+    -- Fallback: skip attention (shouldn't happen)
+    Linear.LinearLayer.forward device block.attention.wO state.qBuf state.normedBuf
 
   -- Step 6: Post-attention norm + residual
   RMSNorm.forward device block.postAttnNorm state.normedBuf state.normedBuf
