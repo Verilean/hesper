@@ -497,6 +497,12 @@ structure Gemma4Block where
   -- Optional: layer output scale
   outScale : Option Buffer
 
+/-- Per-layer embedding weights for a single block -/
+structure Gemma4PerLayerEmbd where
+  inpGateWeight : Buffer          -- per_layer_inp_gate [hiddenSize, embdPerLayer]
+  projWeight : Buffer             -- per_layer_proj [embdPerLayer, hiddenSize]
+  postNorm : RMSNorm.RMSNorm     -- per_layer_post_norm
+
 /-- Complete Gemma 4 model -/
 structure Gemma4Model where
   config : Config
@@ -504,6 +510,11 @@ structure Gemma4Model where
   blocks : Array Gemma4Block
   finalNorm : RMSNorm.RMSNorm
   outputWeight : Buffer           -- LM head [vocabSize, hiddenSize]
+  -- Per-layer embeddings (optional)
+  perLayerEmbdTable : Option Buffer         -- tok_embd_per_layer [vocabSize, embdPerLayer * numLayers]
+  perLayerModelProj : Option Buffer         -- per_layer_model_proj [embdPerLayer * numLayers, hiddenSize]
+  perLayerProjNorm : Option RMSNorm.RMSNorm -- per_layer_proj_norm
+  perLayerBlocks : Array (Option Gemma4PerLayerEmbd)  -- per-layer gate/proj/norm
 
 /-! ## Helper: Create GPU Buffer from ByteArray -/
 
@@ -711,6 +722,50 @@ def Gemma4Model.fromGGUF (device : Device) (ggufPath : String)
       IO.println "  Using weight-tied LM head (reusing embedding)"
       pure embedding.embeddingTable
 
+  -- Step 7: Load per-layer embeddings (optional)
+  let (perLayerEmbdTable, perLayerModelProj, perLayerProjNorm) ← if cfg.hasPerLayerEmbeddings then do
+    IO.println "[Gemma4] Loading per-layer embeddings..."
+    let table ← match Hesper.GGUF.Loader.getTensorData gguf "token_embd_per_layer.weight" with
+      | .ok (_, data) => pure (some (← uploadBuffer device data))
+      | .error _ => pure none
+    let proj ← match Hesper.GGUF.Loader.getTensorData gguf "per_layer_model_proj.weight" with
+      | .ok (_, data) => pure (some (← uploadBuffer device data))
+      | .error _ => pure none
+    let projNorm ← match Hesper.GGUF.Loader.findTensor gguf "per_layer_proj_norm.weight" with
+      | .ok _ =>
+        let d ← Hesper.GGUF.Loader.extractFloat32Tensor gguf "per_layer_proj_norm.weight"
+        let plNormConfig : RMSNorm.Config := { dim := cfg.embdPerLayer * cfg.numHiddenLayers, eps := cfg.rmsNormEps }
+        pure (some (← RMSNorm.create device plNormConfig d))
+      | .error _ => pure none
+    pure (table, proj, projNorm)
+  else
+    pure (none, none, none)
+
+  -- Per-layer gate/proj/norm per block
+  let mut perLayerBlocks : Array (Option Gemma4PerLayerEmbd) := #[]
+  for li in [0:cfg.numHiddenLayers] do
+    if cfg.hasPerLayerEmbeddings then
+      let plEmbd ← do
+        let gateW ← match Hesper.GGUF.Loader.getTensorData gguf s!"blk.{li}.per_layer_inp_gate.weight" with
+          | .ok (_, data) => pure (← uploadBuffer device data)
+          | .error _ => pure (← uploadBuffer device ByteArray.empty)
+        let projW ← match Hesper.GGUF.Loader.getTensorData gguf s!"blk.{li}.per_layer_proj.weight" with
+          | .ok (_, data) => pure (← uploadBuffer device data)
+          | .error _ => pure (← uploadBuffer device ByteArray.empty)
+        let postNorm ← do
+          let normConfig : RMSNorm.Config := { dim := cfg.hiddenSize, eps := cfg.rmsNormEps }
+          match Hesper.GGUF.Loader.findTensor gguf s!"blk.{li}.per_layer_post_norm.weight" with
+          | .ok _ =>
+            let d ← Hesper.GGUF.Loader.extractFloat32Tensor gguf s!"blk.{li}.per_layer_post_norm.weight"
+            RMSNorm.create device normConfig d
+          | .error _ =>
+            -- Fallback: create with dummy weights
+            RMSNorm.create device normConfig (ByteArray.mk (Array.mk (List.replicate (cfg.hiddenSize * 4) 0)))
+        pure (some { inpGateWeight := gateW, projWeight := projW, postNorm := postNorm : Gemma4PerLayerEmbd })
+      perLayerBlocks := perLayerBlocks.push plEmbd
+    else
+      perLayerBlocks := perLayerBlocks.push none
+
   IO.println s!"[Gemma4] ✓ Model loaded: {blocks.size} blocks"
 
   return {
@@ -719,6 +774,10 @@ def Gemma4Model.fromGGUF (device : Device) (ggufPath : String)
     blocks
     finalNorm
     outputWeight
+    perLayerEmbdTable
+    perLayerModelProj
+    perLayerProjNorm
+    perLayerBlocks
   }
 
 /-! ## GGUF File Loading Helper -/
@@ -760,6 +819,14 @@ structure InferenceState where
   moeIndicesBuf : Buffer      -- [numExpertsUsed] selected expert indices
   moeWeightsBuf : Buffer      -- [numExpertsUsed] expert weights
   moeExpertOutBuf : Buffer    -- [hiddenSize] combined expert output
+  moeExpertGateBuf : Buffer   -- [expertFFSize] expert gate projection output
+  moeExpertUpBuf : Buffer     -- [expertFFSize] expert up projection output
+  moeExpertGeluBuf : Buffer   -- [expertFFSize] expert GELU*up output
+  moeExpertDownBuf : Buffer   -- [hiddenSize] single expert down output
+  moeNormedBuf : Buffer       -- [hiddenSize] pre_norm_2 output for routed experts
+  -- Per-layer embedding buffers
+  plGateBuf : Buffer          -- [embdPerLayer] per-layer gate output
+  plProjBuf : Buffer          -- [hiddenSize] per-layer projected output
 
 /-- Create inference state with pre-allocated buffers -/
 def createInferenceState (device : Device) (cfg : Config) : IO InferenceState := do
@@ -803,6 +870,13 @@ def createInferenceState (device : Device) (cfg : Config) : IO InferenceState :=
     moeIndicesBuf := ← createBuffer device { size := (max cfg.numExpertsUsed 1 * 4).toUSize, usage := [.storage, .copySrc, .copyDst], mappedAtCreation := false }
     moeWeightsBuf := ← mkBuf (max cfg.numExpertsUsed 1)
     moeExpertOutBuf := ← mkBuf cfg.hiddenSize
+    moeExpertGateBuf := ← mkBuf (max cfg.expertFFSize 1)
+    moeExpertUpBuf := ← mkBuf (max cfg.expertFFSize 1)
+    moeExpertGeluBuf := ← mkBuf (max cfg.expertFFSize 1)
+    moeExpertDownBuf := ← mkBuf cfg.hiddenSize
+    moeNormedBuf := ← mkBuf cfg.hiddenSize
+    plGateBuf := ← mkBuf (max cfg.embdPerLayer 1)
+    plProjBuf := ← mkBuf cfg.hiddenSize
   }
 
 /-! ## Single-Token Forward Pass -/
@@ -814,7 +888,9 @@ def createInferenceState (device : Device) (cfg : Config) : IO InferenceState :=
     2. ffnNorm(attn_out) → GeGLU FFN → postFFNNorm → + residual
 -/
 def forwardBlock (device : Device) (block : Gemma4Block) (cfg : Config)
-    (inputBuf outputBuf : Buffer) (state : InferenceState) (pos : Nat) : IO Unit := do
+    (inputBuf outputBuf : Buffer) (state : InferenceState) (pos : Nat)
+    (perLayerEmbd : Option Gemma4PerLayerEmbd := none)
+    (perLayerInput : Option Buffer := none) : IO Unit := do
   let li := block.layerIdx
   let headDim := cfg.headDim li
 
@@ -957,13 +1033,74 @@ def forwardBlock (device : Device) (block : Gemma4Block) (cfg : Config)
         (.dispatch1D 1)
     | _, _ => pure ()
 
-    -- 3. Routed experts: for now, use shared expert output only
-    -- Full MoE expert dispatch (ffn_gate_up_exps, ffn_down_exps) requires
-    -- per-expert matmul with dynamic indexing into 3D weight tensors.
-    -- The shared expert output is the dominant contribution for initial validation.
+    -- 3. Routed experts: ffn_pre_norm_2 → expert GeGLU FFN → weighted sum
+    match block.moeGateUpExps, block.moeDownExps, block.moePreNorm2, block.moePostNorm2 with
+    | some gateUpExps, some downExps, some preNorm2, some postNorm2 =>
+      -- Pre-norm for routed expert input
+      RMSNorm.forward device preNorm2 state.buf1 state.moeNormedBuf
 
-    -- 4. Combined output: shared_expert (+ routed_experts when implemented)
-    -- Apply post-FFN norm and residual
+      -- Zero the accumulator
+      Hesper.WGSL.Execute.executeShaderNamed device
+        (residualAddKernel cfg.hiddenSize)  -- hack: 0 + 0 = 0 (both inputs are same zeroed buf)
+        [("a", state.moeExpertOutBuf), ("b", state.moeExpertOutBuf), ("output", state.moeExpertOutBuf)]
+        (.dispatch1D cfg.hiddenSize)
+      -- Actually zero it properly
+      Hesper.WGSL.Execute.executeShaderNamed device
+        (embeddingScaleKernel cfg.hiddenSize 0)  -- scale by 0 to zero
+        [("input", state.moeExpertOutBuf), ("output", state.moeExpertOutBuf)]
+        (.dispatch1D cfg.hiddenSize)
+
+      let moeConfig : MoE.Config := {
+        hiddenSize := cfg.hiddenSize
+        expertFFSize := cfg.expertFFSize
+        numExperts := cfg.numExperts
+        numExpertsUsed := cfg.numExpertsUsed
+        rmsNormEps := cfg.rmsNormEps
+      }
+
+      -- For each selected expert: gate+up → GELU*up → down → weighted accumulate
+      for k in [0:cfg.numExpertsUsed] do
+        -- Gate projection
+        Hesper.WGSL.Execute.executeShaderNamed device
+          (MoE.expertGateUpKernel moeConfig k true)
+          [("input", state.moeNormedBuf), ("gate_up_weights", gateUpExps),
+           ("expert_indices", state.moeIndicesBuf), ("output", state.moeExpertGateBuf)]
+          (Execute.ExecutionConfig.default (cfg.expertFFSize, 1, 1))
+        -- Up projection
+        Hesper.WGSL.Execute.executeShaderNamed device
+          (MoE.expertGateUpKernel moeConfig k false)
+          [("input", state.moeNormedBuf), ("gate_up_weights", gateUpExps),
+           ("expert_indices", state.moeIndicesBuf), ("output", state.moeExpertUpBuf)]
+          (Execute.ExecutionConfig.default (cfg.expertFFSize, 1, 1))
+        -- GELU * up
+        Hesper.WGSL.Execute.executeShaderNamed device
+          (MoE.expertGeluMulKernel cfg.expertFFSize)
+          [("gate", state.moeExpertGateBuf), ("up", state.moeExpertUpBuf), ("output", state.moeExpertGeluBuf)]
+          (.dispatch1D cfg.expertFFSize)
+        -- Down projection
+        Hesper.WGSL.Execute.executeShaderNamed device
+          (MoE.expertDownKernel moeConfig k)
+          [("input", state.moeExpertGeluBuf), ("down_weights", downExps),
+           ("expert_indices", state.moeIndicesBuf), ("output", state.moeExpertDownBuf)]
+          (Execute.ExecutionConfig.default (cfg.hiddenSize, 1, 1))
+        -- Weighted accumulate: moeExpertOutBuf += weight[k] * expertDownBuf
+        Hesper.WGSL.Execute.executeShaderNamed device
+          (MoE.weightedAccumulateKernel cfg.hiddenSize cfg.numExpertsUsed k)
+          [("accumulator", state.moeExpertOutBuf), ("expert_output", state.moeExpertDownBuf),
+           ("weights", state.moeWeightsBuf)]
+          (.dispatch1D cfg.hiddenSize)
+
+      -- post_norm_2 on routed expert output
+      RMSNorm.forward device postNorm2 state.moeExpertOutBuf state.moeExpertOutBuf
+
+      -- 4. Combined: shared_expert + routed_experts
+      Hesper.WGSL.Execute.executeShaderNamed device
+        (residualAddKernel cfg.hiddenSize)
+        [("a", state.ffnOutBuf), ("b", state.moeExpertOutBuf), ("output", state.ffnOutBuf)]
+        (.dispatch1D cfg.hiddenSize)
+    | _, _, _, _ => pure ()  -- No MoE weights: shared expert only
+
+    -- Post-FFN norm + residual
     RMSNorm.forward device block.postFFNNorm state.ffnOutBuf state.ffnOutBuf
     Hesper.WGSL.Execute.executeShaderNamed device
       (residualAddKernel cfg.hiddenSize)
@@ -987,6 +1124,48 @@ def forwardBlock (device : Device) (block : Gemma4Block) (cfg : Config)
       [("a", state.ffnOutBuf), ("b", state.buf1), ("output", outputBuf)]
       (.dispatch1D cfg.hiddenSize)
 
+  -- Step 8: Per-layer embedding (optional, from gemma4-iswa.cpp:192-213)
+  -- gate = GELU(per_layer_inp_gate @ cur)
+  -- gate * per_layer_input[layerIdx] → project → normalize → + residual
+  match perLayerEmbd, perLayerInput with
+  | some plEmbd, some plInput =>
+    -- per_layer_inp_gate @ outputBuf → plGateBuf [embdPerLayer]
+    let plGateConfig : Hesper.WGSL.MatMul.Config := {
+      M := 1, N := cfg.embdPerLayer, K := cfg.hiddenSize
+    }
+    Hesper.WGSL.MatMul.executeMatMulTranspose device outputBuf plEmbd.inpGateWeight state.plGateBuf plGateConfig
+
+    -- GELU(gate) * per_layer_input → plGateBuf
+    Hesper.WGSL.Execute.executeShaderNamed device
+      (PerLayerEmbedding.geluGateMulKernel cfg.embdPerLayer)
+      [("gate", state.plGateBuf), ("per_layer_input", plInput), ("output", state.plGateBuf)]
+      (.dispatch1D cfg.embdPerLayer)
+
+    -- per_layer_proj @ plGateBuf → plProjBuf [hiddenSize]
+    let plProjConfig : Hesper.WGSL.MatMul.Config := {
+      M := 1, N := cfg.hiddenSize, K := cfg.embdPerLayer
+    }
+    Hesper.WGSL.MatMul.executeMatMulTranspose device state.plGateBuf plEmbd.projWeight state.plProjBuf plProjConfig
+
+    -- per_layer_post_norm
+    RMSNorm.forward device plEmbd.postNorm state.plProjBuf state.plProjBuf
+
+    -- residual: outputBuf += plProjBuf
+    Hesper.WGSL.Execute.executeShaderNamed device
+      (residualAddKernel cfg.hiddenSize)
+      [("a", outputBuf), ("b", state.plProjBuf), ("output", outputBuf)]
+      (.dispatch1D cfg.hiddenSize)
+  | _, _ => pure ()
+
+  -- Step 9: Layer output scale (optional)
+  match block.outScale with
+  | some scale =>
+    Hesper.WGSL.Execute.executeShaderNamed device
+      (PerLayerEmbedding.layerScaleKernel cfg.hiddenSize)
+      [("input", outputBuf), ("scale", scale), ("output", outputBuf)]
+      (.dispatch1D cfg.hiddenSize)
+  | none => pure ()
+
 /-- Run full single-token forward pass through the model.
     Returns logits in state.logitsBuf. -/
 def forwardSingleToken (device : Device) (model : Gemma4Model)
@@ -1008,9 +1187,17 @@ def forwardSingleToken (device : Device) (model : Gemma4Model)
   let mut currentBuf := state.buf1
   let mut nextBuf := state.buf2
 
+  let mut blockIdx := 0
   for block in model.blocks do
-    forwardBlock device block model.config currentBuf nextBuf state pos
+    -- Get per-layer embedding for this block (if available)
+    let plEmbd := if blockIdx < model.perLayerBlocks.size then
+      model.perLayerBlocks[blockIdx]!
+    else none
+    -- TODO: per-layer input (pre-projected per-layer embeddings) needs to be
+    -- precomputed once at the start of forwardSingleToken. For now, skip.
+    forwardBlock device block model.config currentBuf nextBuf state pos plEmbd none
     let temp := currentBuf; currentBuf := nextBuf; nextBuf := temp
+    blockIdx := blockIdx + 1
 
   -- Step 3: Final norm
   RMSNorm.forward device model.finalNorm currentBuf nextBuf
