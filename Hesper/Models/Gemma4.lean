@@ -397,4 +397,232 @@ def Config.fromGGUF (gguf : Hesper.GGUF.GGUFFile) : Except String Config := do
     numKVSharedLayers := (findU32 "llama.attention.shared_kv_layers").toOption.getD 0
   }
 
+/-! ## Layer Structures -/
+
+/-- Gemma 4 attention layer (single layer) -/
+structure Gemma4Attention where
+  wQ : Linear.LinearLayer         -- Q projection [hiddenSize → numHeads * headDim]
+  wK : Linear.LinearLayer         -- K projection [hiddenSize → numKVHeads * headDim]
+  wV : Linear.LinearLayer         -- V projection [hiddenSize → numKVHeads * headDim]
+  wO : Linear.LinearLayer         -- Output projection [numHeads * headDim → hiddenSize]
+  qNormWeight : Buffer            -- Per-head Q norm [headDim]
+  kNormWeight : Buffer            -- Per-head K norm [headDim]
+
+/-- Gemma 4 dense FFN layer -/
+structure Gemma4FFN where
+  gate : Linear.LinearLayer       -- Gate projection [hiddenSize → intermediateSize]
+  up : Linear.LinearLayer         -- Up projection [hiddenSize → intermediateSize]
+  down : Linear.LinearLayer       -- Down projection [intermediateSize → hiddenSize]
+
+/-- Gemma 4 transformer block (single layer) -/
+structure Gemma4Block where
+  layerIdx : Nat
+  layerType : LayerType
+  -- Norms
+  attnNorm : RMSNorm.RMSNorm
+  postAttnNorm : RMSNorm.RMSNorm
+  ffnNorm : RMSNorm.RMSNorm
+  postFFNNorm : RMSNorm.RMSNorm
+  -- Attention
+  attention : Gemma4Attention
+  -- FFN (dense only for now; MoE uses separate buffers)
+  ffn : Gemma4FFN
+  -- Optional: RoPE frequency factors (full attention layers only)
+  ropeFreqFactors : Option Buffer
+  -- Optional: layer output scale
+  outScale : Option Buffer
+
+/-- Complete Gemma 4 model -/
+structure Gemma4Model where
+  config : Config
+  embedding : Embedding.Embedding
+  blocks : Array Gemma4Block
+  finalNorm : RMSNorm.RMSNorm
+  outputWeight : Buffer           -- LM head [vocabSize, hiddenSize]
+
+/-! ## Helper: Create GPU Buffer from ByteArray -/
+
+private def uploadBuffer (device : Device) (data : ByteArray) (usage : List WebGPU.BufferUsage := [.storage, .copyDst]) : IO Buffer := do
+  let bufSize := if data.size == 0 then 4 else data.size
+  let buf ← createBuffer device {
+    size := bufSize.toUSize
+    usage := usage
+    mappedAtCreation := false
+  }
+  if data.size > 0 then
+    writeBuffer device buf 0 data
+  return buf
+
+/-! ## GGUF Model Loading -/
+
+/-- Load a single Q4_K linear layer from GGUF tensor -/
+private def loadLinear (device : Device) (gguf : Hesper.GGUF.GGUFFile)
+    (name : String) (inDim outDim : Nat) : IO Linear.LinearLayer := do
+  let (data, _numElements) ← Hesper.GGUF.Loader.extractQ4KTensor gguf name
+  let weightBuf ← uploadBuffer device data
+  let prepared ← IO.mkRef none
+  return {
+    config := { inDim, outDim }
+    weightBuf
+    prepared
+  }
+
+/-- Load Gemma 4 model from GGUF file -/
+def Gemma4Model.fromGGUF (device : Device) (ggufPath : String)
+    (configOverride : Option Config := none) : IO Gemma4Model := do
+  IO.println s!"[Gemma4] Loading model from {ggufPath}..."
+
+  -- Step 1: Parse GGUF file
+  let ggufData ← IO.FS.readBinFile ggufPath
+  let gguf ← match Hesper.GGUF.Parser.parseGGUF ggufData with
+    | .ok gf => pure gf
+    | .error e => throw $ IO.userError s!"GGUF parse error: {e}"
+
+  IO.println s!"  ✓ GGUF parsed: {gguf.tensors.size} tensors, {gguf.dataBlob.size} bytes data"
+
+  -- Step 2: Extract configuration
+  let cfg ← match configOverride with
+    | some c => pure c
+    | none => match Config.fromGGUF gguf with
+      | .ok c => pure c
+      | .error e => throw $ IO.userError s!"Config parse error: {e}"
+
+  IO.println s!"  Model: {cfg.numHiddenLayers} layers, {cfg.hiddenSize} dim, {cfg.numAttentionHeads} heads"
+  IO.println s!"  Vocab: {cfg.vocabSize}, FFN: {cfg.intermediateSize}, Experts: {cfg.numExperts}"
+
+  -- Step 3: Load embedding
+  IO.println "[Gemma4] Loading embedding..."
+  let embConfig : Embedding.Config := {
+    vocabSize := cfg.vocabSize
+    dim := cfg.hiddenSize
+  }
+  -- Gemma 4 embeddings are typically Q4_K or F16
+  let embTensor ← match Hesper.GGUF.Loader.findTensor gguf "token_embd.weight" with
+    | .ok ti => pure ti
+    | .error e => throw $ IO.userError e
+  let embedding ← match embTensor.ggmlType with
+    | .F16 =>
+      IO.println "  Using F16 embeddings"
+      let embData ← Hesper.GGUF.Loader.extractF16Tensor gguf "token_embd.weight"
+      Embedding.createFromF16 device embConfig embData
+    | other =>
+      IO.println s!"  Embedding type: {other} — loading as raw bytes"
+      -- Fallback: load raw tensor data
+      let (_, data) ← match Hesper.GGUF.Loader.getTensorData gguf "token_embd.weight" with
+        | .ok r => pure r
+        | .error e => throw $ IO.userError e
+      let buf ← uploadBuffer device data
+      -- Create a minimal embedding structure
+      pure { config := embConfig, embeddingTable := buf, f16Table := none }
+
+  -- Step 4: Load transformer blocks
+  IO.println s!"[Gemma4] Loading {cfg.numHiddenLayers} transformer blocks..."
+  let mut blocks : Array Gemma4Block := #[]
+
+  for layerIdx in [0:cfg.numHiddenLayers] do
+    if layerIdx % 10 == 0 then
+      IO.println s!"  Loading layer {layerIdx}/{cfg.numHiddenLayers}..."
+    let li := layerIdx
+
+    let layerType := if li < cfg.layerTypes.size then cfg.layerTypes[li]! else .full
+    let headDim := cfg.headDim li
+    let numKVHeads := cfg.numKVHeads li
+
+    -- Load norms (Float32)
+    let attnNormData ← Hesper.GGUF.Loader.extractFloat32Tensor gguf s!"blk.{li}.attn_norm.weight"
+    let postAttnNormData ← Hesper.GGUF.Loader.extractFloat32Tensor gguf s!"blk.{li}.post_attention_norm.weight"
+    let ffnNormData ← Hesper.GGUF.Loader.extractFloat32Tensor gguf s!"blk.{li}.ffn_norm.weight"
+    let postFFNNormData ← Hesper.GGUF.Loader.extractFloat32Tensor gguf s!"blk.{li}.post_ffw_norm.weight"
+
+    let normConfig : RMSNorm.Config := { dim := cfg.hiddenSize, eps := cfg.rmsNormEps }
+    let attnNorm ← RMSNorm.create device normConfig attnNormData
+    let postAttnNorm ← RMSNorm.create device normConfig postAttnNormData
+    let ffnNorm ← RMSNorm.create device normConfig ffnNormData
+    let postFFNNorm ← RMSNorm.create device normConfig postFFNNormData
+
+    -- Load attention projections (Q4_K)
+    let qDim := cfg.numAttentionHeads * headDim
+    let kvDim := numKVHeads * headDim
+    let wQ ← loadLinear device gguf s!"blk.{li}.attn_q.weight" cfg.hiddenSize qDim
+    let wK ← loadLinear device gguf s!"blk.{li}.attn_k.weight" cfg.hiddenSize kvDim
+    let wV ← loadLinear device gguf s!"blk.{li}.attn_v.weight" cfg.hiddenSize kvDim
+    let wO ← loadLinear device gguf s!"blk.{li}.attn_output.weight" qDim cfg.hiddenSize
+
+    -- Load Q/K norm weights (Float32, per-head dimension)
+    let qNormData ← Hesper.GGUF.Loader.extractFloat32Tensor gguf s!"blk.{li}.attn_q_norm.weight"
+    let kNormData ← Hesper.GGUF.Loader.extractFloat32Tensor gguf s!"blk.{li}.attn_k_norm.weight"
+    let qNormBuf ← uploadBuffer device qNormData
+    let kNormBuf ← uploadBuffer device kNormData
+
+    let attention : Gemma4Attention := {
+      wQ, wK, wV, wO
+      qNormWeight := qNormBuf
+      kNormWeight := kNormBuf
+    }
+
+    -- Load FFN projections (Q4_K)
+    let ffnGate ← loadLinear device gguf s!"blk.{li}.ffn_gate.weight" cfg.hiddenSize cfg.intermediateSize
+    let ffnUp ← loadLinear device gguf s!"blk.{li}.ffn_up.weight" cfg.hiddenSize cfg.intermediateSize
+    let ffnDown ← loadLinear device gguf s!"blk.{li}.ffn_down.weight" cfg.intermediateSize cfg.hiddenSize
+
+    let ffn : Gemma4FFN := { gate := ffnGate, up := ffnUp, down := ffnDown }
+
+    -- Load optional RoPE frequency factors (full attention layers only)
+    let ropeFreqFactors ← if cfg.isFullAttention li then
+      match Hesper.GGUF.Loader.getTensorData gguf s!"blk.{li}.rope_freqs.weight" with
+      | .ok (_, data) =>
+        let buf ← uploadBuffer device data
+        pure (some buf)
+      | .error _ => pure none
+    else pure none
+
+    -- Load optional layer output scale
+    let outScale ← match Hesper.GGUF.Loader.getTensorData gguf s!"blk.{li}.layer_out_scale.weight" with
+      | .ok (_, data) =>
+        let buf ← uploadBuffer device data
+        pure (some buf)
+      | .error _ => pure none
+
+    blocks := blocks.push {
+      layerIdx := li
+      layerType
+      attnNorm, postAttnNorm, ffnNorm, postFFNNorm
+      attention, ffn
+      ropeFreqFactors, outScale
+    }
+
+  -- Step 5: Final norm
+  IO.println "[Gemma4] Loading final norm and LM head..."
+  let finalNormData ← Hesper.GGUF.Loader.extractFloat32Tensor gguf "output_norm.weight"
+  let finalNormConfig : RMSNorm.Config := { dim := cfg.hiddenSize, eps := cfg.rmsNormEps }
+  let finalNorm ← RMSNorm.create device finalNormConfig finalNormData
+
+  -- Step 6: LM head (output.weight or weight-tied with embedding)
+  let outputWeight ← match Hesper.GGUF.Loader.getTensorData gguf "output.weight" with
+    | .ok (_, data) =>
+      IO.println "  Using separate LM head weights"
+      uploadBuffer device data
+    | .error _ =>
+      IO.println "  Using weight-tied LM head (reusing embedding)"
+      pure embedding.embeddingTable
+
+  IO.println s!"[Gemma4] ✓ Model loaded: {blocks.size} blocks"
+
+  return {
+    config := cfg
+    embedding
+    blocks
+    finalNorm
+    outputWeight
+  }
+
+/-! ## GGUF File Loading Helper -/
+
+/-- Load GGUF file from disk -/
+def loadGGUF (path : String) : IO Hesper.GGUF.GGUFFile := do
+  let data ← IO.FS.readBinFile path
+  match Hesper.GGUF.Parser.parseGGUF data with
+  | .ok gf => pure gf
+  | .error e => throw $ IO.userError s!"GGUF parse error: {e}"
+
 end Hesper.Models.Gemma4
