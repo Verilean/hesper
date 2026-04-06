@@ -485,10 +485,40 @@ inductive Exp : WGSLType → Type where
   -- Workgroup barrier (duplicate, already defined above - will be removed from toWGSL)
   | workgroupBarrier : Exp (.scalar .u32)  -- Returns unit
 
+/-- Convert Float to WGSL literal string with full precision.
+    Uses scientific notation (e.g. `1.0e-7`) when needed to preserve
+    significant digits. FP32 has ~7 significant decimal digits. -/
+def floatToWGSL (f : Float) : String :=
+  if f == 0.0 then "0.0"
+  else if f != f then "0.0 / 0.0"  -- NaN
+  else
+    let abs := if f < 0.0 then 0.0 - f else f
+    let sign := if f < 0.0 then "-" else ""
+    -- Always use scientific notation for full precision.
+    -- FP32 has ~7 significant decimal digits.
+    -- Format: sign + mantissa + "e" + exponent
+    let log10 := Float.log abs / Float.log 10.0
+    let exp := log10.floor
+    let expInt := exp.toInt64.toInt
+    let mantissa := abs / Float.pow 10.0 exp
+    -- Scale mantissa to 7 significant digits
+    let mScaled := (mantissa * 1000000.0).round.toUInt64
+    let mStr := toString mScaled
+    -- Pad to at least 7 digits
+    let mStr := if mStr.length < 7 then
+      String.mk (List.replicate (7 - mStr.length) '0') ++ mStr
+    else mStr
+    let mIntPart := mStr.take 1
+    let mFracPart := mStr.drop 1
+    -- Trim trailing zeros from fraction for cleaner output
+    let mFracTrimmed := mFracPart.dropRightWhile (· == '0')
+    let mFracFinal := if mFracTrimmed.isEmpty then "0" else mFracTrimmed
+    s!"{sign}{mIntPart}.{mFracFinal}e{expInt}"
+
 /-- Code generation: convert expression to WGSL string -/
 partial def Exp.toWGSL {t : WGSLType} : Exp t → String
-  | litF32 f => s!"{f}"
-  | litF16 f => s!"{f}h"
+  | litF32 f => floatToWGSL f
+  | litF16 f => s!"{floatToWGSL f}h"
   | litI32 i => s!"{i}i"
   | litU32 u => s!"{u}u"
   | litBool b => if b then "true" else "false"

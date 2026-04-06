@@ -58,6 +58,20 @@ import Hesper.AD.Reverse
 -- Optimizers
 import Hesper.Optimizer.SGD
 import Hesper.Optimizer.Adam
+import Hesper.Optimizer.AdamGPU
+
+-- LoRA (Low-Rank Adaptation) for finetuning
+import Hesper.LoRA.Types
+import Hesper.LoRA.Init
+import Hesper.LoRA.Forward
+import Hesper.LoRA.Backward
+import Hesper.LoRA.IO
+import Hesper.LoRA.Inference
+
+-- Training
+import Hesper.Training.Loss
+import Hesper.Training.AlpacaDataset
+import Hesper.Training.TrainLoop
 
 -- Async operations
 import Hesper.Async

@@ -788,6 +788,55 @@ lean_exe «bitnet-complete» where
   supportInterpreter := false
   moreLinkArgs := stdLinkArgs
 
+-- ----------------------------------------------------------------------------
+-- Training (LoRA Finetuning)
+-- ----------------------------------------------------------------------------
+
+lean_exe «alpaca-finetune» where
+  root := `Examples.Training.AlpacaFinetune
+  supportInterpreter := false
+  moreLinkArgs := stdLinkArgs
+
+lean_exe «backward-verify» where
+  root := `Tests.BackwardVerification
+  supportInterpreter := true
+
+lean_exe «verified-ad» where
+  root := `Tests.VerifiedAD
+  supportInterpreter := true
+
+lean_exe «wrong-backward-test» where
+  root := `Tests.WrongBackwardTest
+  supportInterpreter := true
+
+lean_exe «parse-float-spec» where
+  root := `Tests.ParseFloatSpec
+  supportInterpreter := true
+
+lean_exe «saved-activation-test» where
+  root := `Tests.SavedActivationTest
+  supportInterpreter := false
+  moreLinkArgs := stdLinkArgs
+
+lean_exe «rmsnorm-backward-test» where
+  root := `Tests.RMSNormBackwardGPUTest
+  supportInterpreter := false
+  moreLinkArgs := stdLinkArgs
+
+lean_exe «chain-completeness» where
+  root := `Tests.ChainCompletenessTest
+  supportInterpreter := true
+
+lean_exe «gpu-vs-cpu-test» where
+  root := `Tests.GPUvsCPUBackwardTest
+  supportInterpreter := false
+  moreLinkArgs := stdLinkArgs
+
+lean_exe «flash-attention-test» where
+  root := `Tests.FlashAttentionTest
+  supportInterpreter := false
+  moreLinkArgs := stdLinkArgs
+
 lean_exe i2s_validation where
   root := `Tests.I2S_Validation
   supportInterpreter := true
