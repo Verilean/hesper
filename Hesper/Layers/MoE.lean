@@ -198,61 +198,172 @@ def softmaxTopKKernel (numExperts numExpertsUsed : Nat) : ShaderM Unit := do
       ShaderM.writeBuffer (ty := .scalar .f32) "weights" (Exp.litU32 k) weight
   ) (pure ())
 
-/-! ## Expert FFN Kernel -/
+/-! ## Expert FFN Kernels -/
 
-/-- Expert FFN kernel for a single selected expert.
+/-- Expert gate+up matmul kernel: computes gate and up projections for one expert.
 
-    Reads from merged 3D weight tensors using expert index.
-    Computes GeGLU: GELU(x @ gate_up[:ffSize]) * (x @ gate_up[ffSize:]) then @ down
+    Reads expert index from indices buffer at `expertIdx` position.
+    Indexes into merged 3D gate_up_weights: [numExperts, 2*expertFFSize, hiddenSize]
 
-    For single-token inference, this processes one expert at a time.
-    The caller dispatches this once per selected expert.
+    One workgroup per output element. Each workgroup cooperatively computes
+    one dot product using shared memory + tree reduction.
 
     @param config MoE configuration
-    @param expertIdx Which expert (0..numExpertsUsed-1) to read from indices buffer
+    @param expertIdx Which selected expert (0..numExpertsUsed-1)
+    @param isGate true = compute gate projection, false = compute up projection
+    @param workgroupSize Threads per workgroup
 -/
-def expertFFNGateUpKernel (config : Config) (expertIdx : Nat) : ShaderM Unit := do
+def expertGateUpKernel (config : Config) (expertIdx : Nat) (isGate : Bool) (workgroupSize : Nat := 256) : ShaderM Unit := do
+  let wid ← ShaderM.workgroupId
+  let lid ← ShaderM.localId
+  let outIdx := Exp.vec3X wid  -- output element index
+  let tid := Exp.vec3X lid
+
+  let gateUpTotalSize := config.numExperts * 2 * config.expertFFSize * config.hiddenSize
+
+  let _input ← ShaderM.declareInputBuffer "input" (.array (.scalar .f32) config.hiddenSize)
+  let _gateUpWeights ← ShaderM.declareInputBuffer "gate_up_weights" (.array (.scalar .f32) gateUpTotalSize)
+  let _expertIndices ← ShaderM.declareInputBuffer "expert_indices" (.array (.scalar .u32) config.numExpertsUsed)
+  let _output ← ShaderM.declareOutputBuffer "output" (.array (.scalar .f32) config.expertFFSize)
+
+  ShaderM.sharedNamed "shared_partial" (.array (.scalar .f32) workgroupSize)
+
+  ShaderM.if_ (Exp.lt outIdx (Exp.litU32 config.expertFFSize)) (do
+    -- Read expert ID
+    let expertId ← ShaderM.readBuffer (ty := .scalar .u32) (n := config.numExpertsUsed) "expert_indices" (Exp.litU32 expertIdx)
+
+    -- Row offset in gate_up_weights: expert * (2*ffSize*hiddenSize) + rowIdx * hiddenSize
+    let rowIdx := if isGate then outIdx else Exp.add outIdx (Exp.litU32 config.expertFFSize)
+    let rowBase := Exp.add
+      (Exp.mul expertId (Exp.litU32 (2 * config.expertFFSize * config.hiddenSize)))
+      (Exp.mul rowIdx (Exp.litU32 config.hiddenSize))
+
+    -- Cooperative dot product
+    ShaderM.varNamed "acc" (.scalar .f32) (Exp.litF32 0.0)
+    let acc : Exp (.scalar .f32) := Exp.var "acc"
+
+    ShaderM.loop tid (Exp.litU32 config.hiddenSize) (Exp.litU32 workgroupSize) fun i => do
+      let inVal ← ShaderM.readBuffer (ty := .scalar .f32) (n := config.hiddenSize) "input" i
+      let wVal ← ShaderM.readBuffer (ty := .scalar .f32) (n := gateUpTotalSize) "gate_up_weights" (Exp.add rowBase i)
+      ShaderM.assign "acc" (Exp.add acc (Exp.mul inVal wVal))
+
+    -- Tree reduction
+    ShaderM.writeWorkgroup (ty := .scalar .f32) "shared_partial" tid acc
+    ShaderM.barrier
+    let mut stride := workgroupSize / 2
+    while stride > 0 do
+      ShaderM.if_ (Exp.lt tid (Exp.litU32 stride)) (do
+        let a ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := workgroupSize) "shared_partial" tid
+        let b ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := workgroupSize) "shared_partial" (Exp.add tid (Exp.litU32 stride))
+        ShaderM.writeWorkgroup (ty := .scalar .f32) "shared_partial" tid (Exp.add a b)
+      ) (pure ())
+      ShaderM.barrier
+      stride := stride / 2
+
+    ShaderM.if_ (Exp.eq tid (Exp.litU32 0)) (do
+      let total ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := workgroupSize) "shared_partial" (Exp.litU32 0)
+      ShaderM.writeBuffer (ty := .scalar .f32) "output" outIdx total
+    ) (pure ())
+  ) (pure ())
+
+/-- Expert down projection kernel: computes output = hidden @ down_weights[expert].
+
+    down_weights: [numExperts, hiddenSize, expertFFSize]
+    One workgroup per output element (hiddenSize).
+
+    @param config MoE configuration
+    @param expertIdx Which selected expert (0..numExpertsUsed-1)
+    @param workgroupSize Threads per workgroup
+-/
+def expertDownKernel (config : Config) (expertIdx : Nat) (workgroupSize : Nat := 256) : ShaderM Unit := do
+  let wid ← ShaderM.workgroupId
+  let lid ← ShaderM.localId
+  let outIdx := Exp.vec3X wid
+  let tid := Exp.vec3X lid
+
+  let downTotalSize := config.numExperts * config.hiddenSize * config.expertFFSize
+
+  let _input ← ShaderM.declareInputBuffer "input" (.array (.scalar .f32) config.expertFFSize)
+  let _downWeights ← ShaderM.declareInputBuffer "down_weights" (.array (.scalar .f32) downTotalSize)
+  let _expertIndices ← ShaderM.declareInputBuffer "expert_indices" (.array (.scalar .u32) config.numExpertsUsed)
+  let _output ← ShaderM.declareOutputBuffer "output" (.array (.scalar .f32) config.hiddenSize)
+
+  ShaderM.sharedNamed "shared_partial" (.array (.scalar .f32) workgroupSize)
+
+  ShaderM.if_ (Exp.lt outIdx (Exp.litU32 config.hiddenSize)) (do
+    let expertId ← ShaderM.readBuffer (ty := .scalar .u32) (n := config.numExpertsUsed) "expert_indices" (Exp.litU32 expertIdx)
+
+    -- Row: expert * (hiddenSize * expertFFSize) + outIdx * expertFFSize
+    let rowBase := Exp.add
+      (Exp.mul expertId (Exp.litU32 (config.hiddenSize * config.expertFFSize)))
+      (Exp.mul outIdx (Exp.litU32 config.expertFFSize))
+
+    ShaderM.varNamed "acc" (.scalar .f32) (Exp.litF32 0.0)
+    let acc : Exp (.scalar .f32) := Exp.var "acc"
+
+    ShaderM.loop tid (Exp.litU32 config.expertFFSize) (Exp.litU32 workgroupSize) fun i => do
+      let inVal ← ShaderM.readBuffer (ty := .scalar .f32) (n := config.expertFFSize) "input" i
+      let wVal ← ShaderM.readBuffer (ty := .scalar .f32) (n := downTotalSize) "down_weights" (Exp.add rowBase i)
+      ShaderM.assign "acc" (Exp.add acc (Exp.mul inVal wVal))
+
+    ShaderM.writeWorkgroup (ty := .scalar .f32) "shared_partial" tid acc
+    ShaderM.barrier
+    let mut stride := workgroupSize / 2
+    while stride > 0 do
+      ShaderM.if_ (Exp.lt tid (Exp.litU32 stride)) (do
+        let a ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := workgroupSize) "shared_partial" tid
+        let b ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := workgroupSize) "shared_partial" (Exp.add tid (Exp.litU32 stride))
+        ShaderM.writeWorkgroup (ty := .scalar .f32) "shared_partial" tid (Exp.add a b)
+      ) (pure ())
+      ShaderM.barrier
+      stride := stride / 2
+
+    ShaderM.if_ (Exp.eq tid (Exp.litU32 0)) (do
+      let total ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := workgroupSize) "shared_partial" (Exp.litU32 0)
+      ShaderM.writeBuffer (ty := .scalar .f32) "output" outIdx total
+    ) (pure ())
+  ) (pure ())
+
+/-- GELU + multiply kernel for expert FFN:
+    output[i] = GELU(gate[i]) * up[i]
+    @param size Expert FFN intermediate size
+-/
+def expertGeluMulKernel (size : Nat) : ShaderM Unit := do
   let gid ← ShaderM.globalId
   let idx := Exp.vec3X gid
 
-  -- Merged gate_up weights: [numExperts, 2*expertFFSize, hiddenSize] stored as u32 (Q4_K_M)
-  -- For now, assume F32 expert weights (TODO: Q4_K_M for experts)
-  let gateUpSize := config.numExperts * 2 * config.expertFFSize * config.hiddenSize
+  let _gate ← ShaderM.declareInputBuffer "gate" (.array (.scalar .f32) size)
+  let _up ← ShaderM.declareInputBuffer "up" (.array (.scalar .f32) size)
+  let _output ← ShaderM.declareOutputBuffer "output" (.array (.scalar .f32) size)
 
-  let _input ← ShaderM.declareInputBuffer "input" (.array (.scalar .f32) config.hiddenSize)
-  let _gateUpWeights ← ShaderM.declareInputBuffer "gate_up_weights" (.array (.scalar .f32) gateUpSize)
-  let _expertIndices ← ShaderM.declareInputBuffer "expert_indices" (.array (.scalar .u32) config.numExpertsUsed)
-  let _gateOutput ← ShaderM.declareOutputBuffer "gate_output" (.array (.scalar .f32) config.expertFFSize)
-  let _upOutput ← ShaderM.declareOutputBuffer "up_output" (.array (.scalar .f32) config.expertFFSize)
+  ShaderM.if_ (Exp.lt idx (Exp.litU32 size)) (do
+    let g ← ShaderM.readBuffer (ty := .scalar .f32) (n := size) "gate" idx
+    let u ← ShaderM.readBuffer (ty := .scalar .f32) (n := size) "up" idx
+    let sqrt2OverPi := Exp.litF32 0.7978845608028654
+    let x3 := Exp.mul (Exp.mul g g) g
+    let inner := Exp.mul sqrt2OverPi (Exp.add g (Exp.mul (Exp.litF32 0.044715) x3))
+    let gelu := Exp.mul (Exp.mul (Exp.litF32 0.5) g) (Exp.add (Exp.litF32 1.0) (Exp.tanh inner))
+    ShaderM.writeBuffer (ty := .scalar .f32) "output" idx (Exp.mul gelu u)
+  ) (pure ())
 
-  ShaderM.if_ (Exp.lt idx (Exp.litU32 config.expertFFSize)) (do
-    -- Read which expert this is
-    let expertId ← ShaderM.readBuffer (ty := .scalar .u32) (n := config.numExpertsUsed) "expert_indices" (Exp.litU32 expertIdx)
+/-- Weighted accumulate kernel: output += weight * expert_output
+    Used to accumulate weighted expert outputs.
+    @param size Hidden dimension
+    @param expertIdx Which expert's weight to read
+-/
+def weightedAccumulateKernel (size numExpertsUsed expertIdx : Nat) : ShaderM Unit := do
+  let gid ← ShaderM.globalId
+  let idx := Exp.vec3X gid
 
-    -- Weight offset for this expert's gate row: expert * (2*ffSize*hiddenSize) + idx * hiddenSize
-    let expertBase := Exp.mul expertId (Exp.litU32 (2 * config.expertFFSize * config.hiddenSize))
-    let gateRowBase := Exp.add expertBase (Exp.mul idx (Exp.litU32 config.hiddenSize))
-    let upRowBase := Exp.add expertBase (Exp.mul (Exp.add idx (Exp.litU32 config.expertFFSize)) (Exp.litU32 config.hiddenSize))
+  let _accumulator ← ShaderM.declareOutputBuffer "accumulator" (.array (.scalar .f32) size)
+  let _expertOutput ← ShaderM.declareInputBuffer "expert_output" (.array (.scalar .f32) size)
+  let _weights ← ShaderM.declareInputBuffer "weights" (.array (.scalar .f32) numExpertsUsed)
 
-    -- Dot product: gate[idx] = sum(gate_up_weights[expert, idx, :] * input[:])
-    ShaderM.varNamed "gate_acc" (.scalar .f32) (Exp.litF32 0.0)
-    ShaderM.varNamed "up_acc" (.scalar .f32) (Exp.litF32 0.0)
-    let gateAcc : Exp (.scalar .f32) := Exp.var "gate_acc"
-    let upAcc : Exp (.scalar .f32) := Exp.var "up_acc"
-
-    for chunk in [0: (config.hiddenSize + 3) / 4] do
-      let baseI := chunk * 4
-      for off in [0:4] do
-        let i := baseI + off
-        if i < config.hiddenSize then
-          let inVal ← ShaderM.readBuffer (ty := .scalar .f32) (n := config.hiddenSize) "input" (Exp.litU32 i)
-          let gw ← ShaderM.readBuffer (ty := .scalar .f32) (n := gateUpSize) "gate_up_weights" (Exp.add gateRowBase (Exp.litU32 i))
-          let uw ← ShaderM.readBuffer (ty := .scalar .f32) (n := gateUpSize) "gate_up_weights" (Exp.add upRowBase (Exp.litU32 i))
-          ShaderM.assign "gate_acc" (Exp.add gateAcc (Exp.mul inVal gw))
-          ShaderM.assign "up_acc" (Exp.add upAcc (Exp.mul inVal uw))
-
-    ShaderM.writeBuffer (ty := .scalar .f32) "gate_output" idx gateAcc
-    ShaderM.writeBuffer (ty := .scalar .f32) "up_output" idx upAcc
+  ShaderM.if_ (Exp.lt idx (Exp.litU32 size)) (do
+    let w ← ShaderM.readBuffer (ty := .scalar .f32) (n := numExpertsUsed) "weights" (Exp.litU32 expertIdx)
+    let v ← ShaderM.readBuffer (ty := .scalar .f32) (n := size) "expert_output" idx
+    let acc ← ShaderM.readBuffer (ty := .scalar .f32) (n := size) "accumulator" idx
+    ShaderM.writeBuffer (ty := .scalar .f32) "accumulator" idx (Exp.add acc (Exp.mul w v))
   ) (pure ())
 
 /-! ## Expert Output Combination -/
