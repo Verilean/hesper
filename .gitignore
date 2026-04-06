@@ -25,3 +25,4 @@ recipes/
 # Jupyter Notebook
 *.ipynb
 .ipynb_checkpoints/
+data/*.gguf
