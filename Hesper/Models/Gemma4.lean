@@ -411,23 +411,34 @@ def Config.fromGGUF (gguf : Hesper.GGUF.GGUFFile) : Except String Config := do
       | none => .error s!"Metadata key '{key}' is not uint32"
     | none => .error s!"Metadata key '{key}' not found"
 
+  let findU32Either (key1 key2 : String) : Except String Nat :=
+    match findU32 key1 with
+    | .ok v => .ok v
+    | .error _ => findU32 key2
+
   let findF32Default (key : String) (default : Float) : Float :=
     match findMeta key with
     | some mv => (readMetadataF32 mv).getD default
     | none => default
 
+  let findF32DefaultEither (key1 key2 : String) (default : Float) : Float :=
+    match findMeta key1 with
+    | some mv => (readMetadataF32 mv).getD default
+    | none => findF32Default key2 default
+
+  -- Support both "gemma4." and "llama." prefixes
   let vocabSize := (findU32 "general.vocab_size").toOption.getD 262144
-  let hiddenSize ← findU32 "llama.embedding_length"
-  let intermediateSize ← findU32 "llama.feed_forward_length"
-  let numLayers ← findU32 "llama.block_count"
-  let numHeads ← findU32 "llama.attention.head_count"
+  let hiddenSize ← findU32Either "gemma4.embedding_length" "llama.embedding_length"
+  let intermediateSize ← findU32Either "gemma4.feed_forward_length" "llama.feed_forward_length"
+  let numLayers ← findU32Either "gemma4.block_count" "llama.block_count"
+  let numHeads ← findU32Either "gemma4.attention.head_count" "llama.attention.head_count"
 
   -- Layer types: default all full attention for now
   -- TODO: parse llama.attention.sliding_window_pattern (bool array in metadata)
   let layerTypes : Array LayerType := (List.replicate numLayers LayerType.full).toArray
 
-  let rmsNormEps := findF32Default "llama.attention.layer_norm_rms_epsilon" 1e-6
-  let ropeTheta := findF32Default "llama.rope.freq_base" 1000000.0
+  let rmsNormEps := findF32DefaultEither "gemma4.attention.layer_norm_rms_epsilon" "llama.attention.layer_norm_rms_epsilon" 1e-6
+  let ropeTheta := findF32DefaultEither "gemma4.rope.freq_base" "llama.rope.freq_base" 1000000.0
 
   return {
     vocabSize
@@ -435,22 +446,22 @@ def Config.fromGGUF (gguf : Hesper.GGUF.GGUFFile) : Except String Config := do
     intermediateSize
     numHiddenLayers := numLayers
     numAttentionHeads := numHeads
-    numKeyValueHeadsFull := (findU32 "llama.attention.head_count_kv").toOption.getD 8
-    numKeyValueHeadsSWA := (findU32 "llama.attention.head_count_kv").toOption.getD 8
-    headDimFull := (findU32 "llama.attention.key_length").toOption.getD 128
-    headDimSWA := (findU32 "llama.attention.key_length_swa").toOption.getD 128
-    slidingWindowSize := (findU32 "llama.attention.sliding_window").toOption.getD 512
+    numKeyValueHeadsFull := (findU32Either "gemma4.attention.head_count_kv" "llama.attention.head_count_kv").toOption.getD 8
+    numKeyValueHeadsSWA := (findU32Either "gemma4.attention.head_count_kv" "llama.attention.head_count_kv").toOption.getD 8
+    headDimFull := (findU32Either "gemma4.attention.key_length" "llama.attention.key_length").toOption.getD 128
+    headDimSWA := (findU32Either "gemma4.attention.key_length_swa" "llama.attention.key_length_swa").toOption.getD 128
+    slidingWindowSize := (findU32Either "gemma4.attention.sliding_window" "llama.attention.sliding_window").toOption.getD 512
     rmsNormEps
     ropeTheta
     partialRotaryFactorSWA := 0.5  -- TODO: read from metadata
     layerTypes
-    logitSoftcapScale := findF32Default "llama.logit_softcapping" 30.0
-    maxSeqLen := 131072
-    numExperts := (findU32 "llama.expert_count").toOption.getD 0
-    numExpertsUsed := (findU32 "llama.expert_used_count").toOption.getD 0
-    expertFFSize := (findU32 "llama.expert_feed_forward_length").toOption.getD 0
-    embdPerLayer := (findU32 "llama.embedding_length_per_layer_input").toOption.getD 0
-    numKVSharedLayers := (findU32 "llama.attention.shared_kv_layers").toOption.getD 0
+    logitSoftcapScale := findF32DefaultEither "gemma4.final_logit_softcapping" "llama.logit_softcapping" 30.0
+    maxSeqLen := (findU32Either "gemma4.context_length" "llama.context_length").toOption.getD 131072
+    numExperts := (findU32Either "gemma4.expert_count" "llama.expert_count").toOption.getD 0
+    numExpertsUsed := (findU32Either "gemma4.expert_used_count" "llama.expert_used_count").toOption.getD 0
+    expertFFSize := (findU32Either "gemma4.expert_feed_forward_length" "llama.expert_feed_forward_length").toOption.getD 0
+    embdPerLayer := (findU32Either "gemma4.embedding_length_per_layer_input" "llama.embedding_length_per_layer_input").toOption.getD 0
+    numKVSharedLayers := (findU32Either "gemma4.attention.shared_kv_layers" "llama.attention.shared_kv_layers").toOption.getD 0
   }
 
 /-! ## Layer Structures -/
@@ -531,15 +542,26 @@ private def uploadBuffer (device : Device) (data : ByteArray) (usage : List WebG
 
 /-! ## GGUF Model Loading -/
 
-/-- Load a single Q4_K linear layer from GGUF tensor -/
+/-- Load a single quantized linear layer from GGUF tensor.
+    Detects quant format (Q4_K vs Q6_K) and selects the appropriate fused kernel. -/
 private def loadLinear (device : Device) (gguf : Hesper.GGUF.GGUFFile)
     (name : String) (inDim outDim : Nat) : IO Linear.LinearLayer := do
-  let (data, _numElements) ← Hesper.GGUF.Loader.extractQ4KTensor gguf name
+  -- Detect quant format from tensor type
+  let tensorInfo ← match Hesper.GGUF.Loader.findTensor gguf name with
+    | .ok ti => pure ti
+    | .error e => throw $ IO.userError e
+  let quantFormat : Linear.QuantFormat := match tensorInfo.ggmlType with
+    | .Q6_K => .Q6_K
+    | _ => .Q4_K
+  let (_, data) ← match Hesper.GGUF.Loader.getTensorData gguf name with
+    | .ok r => pure r
+    | .error e => throw $ IO.userError e
   let weightBuf ← uploadBuffer device data
   let prepared ← IO.mkRef none
   return {
     config := { inDim, outDim }
     weightBuf
+    quantFormat
     prepared
   }
 
@@ -643,17 +665,24 @@ def Gemma4Model.fromGGUF (device : Device) (ggufPath : String)
 
     let ffn : Gemma4FFN := { gate := ffnGate, up := ffnUp, down := ffnDown }
 
-    -- Load optional RoPE frequency factors (full attention layers only)
+    -- Load optional RoPE frequency factors
+    -- In the E4B model, rope_freqs is a global tensor, not per-layer
     let ropeFreqFactors ← if cfg.isFullAttention li then
-      match Hesper.GGUF.Loader.getTensorData gguf s!"blk.{li}.rope_freqs.weight" with
+      match Hesper.GGUF.Loader.getTensorData gguf "rope_freqs.weight" with
       | .ok (_, data) =>
         let buf ← uploadBuffer device data
         pure (some buf)
-      | .error _ => pure none
+      | .error _ =>
+        -- Try per-layer
+        match Hesper.GGUF.Loader.getTensorData gguf s!"blk.{li}.rope_freqs.weight" with
+        | .ok (_, data) =>
+          let buf ← uploadBuffer device data
+          pure (some buf)
+        | .error _ => pure none
     else pure none
 
     -- Load optional layer output scale
-    let outScale ← match Hesper.GGUF.Loader.getTensorData gguf s!"blk.{li}.layer_out_scale.weight" with
+    let outScale ← match Hesper.GGUF.Loader.getTensorData gguf s!"blk.{li}.layer_output_scale.weight" with
       | .ok (_, data) =>
         let buf ← uploadBuffer device data
         pure (some buf)
@@ -725,7 +754,7 @@ def Gemma4Model.fromGGUF (device : Device) (ggufPath : String)
   -- Step 7: Load per-layer embeddings (optional)
   let (perLayerEmbdTable, perLayerModelProj, perLayerProjNorm) ← if cfg.hasPerLayerEmbeddings then do
     IO.println "[Gemma4] Loading per-layer embeddings..."
-    let table ← match Hesper.GGUF.Loader.getTensorData gguf "token_embd_per_layer.weight" with
+    let table ← match Hesper.GGUF.Loader.getTensorData gguf "per_layer_token_embd.weight" with
       | .ok (_, data) => pure (some (← uploadBuffer device data))
       | .error _ => pure none
     let proj ← match Hesper.GGUF.Loader.getTensorData gguf "per_layer_model_proj.weight" with
@@ -746,17 +775,17 @@ def Gemma4Model.fromGGUF (device : Device) (ggufPath : String)
   for li in [0:cfg.numHiddenLayers] do
     if cfg.hasPerLayerEmbeddings then
       let plEmbd ← do
-        let gateW ← match Hesper.GGUF.Loader.getTensorData gguf s!"blk.{li}.per_layer_inp_gate.weight" with
+        let gateW ← match Hesper.GGUF.Loader.getTensorData gguf s!"blk.{li}.inp_gate.weight" with
           | .ok (_, data) => pure (← uploadBuffer device data)
           | .error _ => pure (← uploadBuffer device ByteArray.empty)
-        let projW ← match Hesper.GGUF.Loader.getTensorData gguf s!"blk.{li}.per_layer_proj.weight" with
+        let projW ← match Hesper.GGUF.Loader.getTensorData gguf s!"blk.{li}.proj.weight" with
           | .ok (_, data) => pure (← uploadBuffer device data)
           | .error _ => pure (← uploadBuffer device ByteArray.empty)
         let postNorm ← do
           let normConfig : RMSNorm.Config := { dim := cfg.hiddenSize, eps := cfg.rmsNormEps }
-          match Hesper.GGUF.Loader.findTensor gguf s!"blk.{li}.per_layer_post_norm.weight" with
+          match Hesper.GGUF.Loader.findTensor gguf s!"blk.{li}.post_norm.weight" with
           | .ok _ =>
-            let d ← Hesper.GGUF.Loader.extractFloat32Tensor gguf s!"blk.{li}.per_layer_post_norm.weight"
+            let d ← Hesper.GGUF.Loader.extractFloat32Tensor gguf s!"blk.{li}.post_norm.weight"
             RMSNorm.create device normConfig d
           | .error _ =>
             -- Fallback: create with dummy weights
