@@ -544,11 +544,11 @@ static WGPULimits getMaxLimits() {
     limits.maxStorageTexturesPerShaderStage = 4;
     limits.maxUniformBuffersPerShaderStage = 12;
     limits.maxUniformBufferBindingSize = 65536;
-    limits.maxStorageBufferBindingSize = 0x80000000;   // 2 GB (same as maxBufferSize)
+    limits.maxStorageBufferBindingSize = 0xFFFFFFFCULL;  // 4 GB - 4 (Dawn's max tier)
     limits.minUniformBufferOffsetAlignment = 256;
     limits.minStorageBufferOffsetAlignment = 256;
     limits.maxVertexBuffers = 8;
-    limits.maxBufferSize = 0x80000000;               // 2 GB
+    limits.maxBufferSize = 0x100000000ULL;               // 4 GB (Dawn's max tier)
     limits.maxVertexAttributes = 16;
     limits.maxVertexBufferArrayStride = 2048;
     limits.maxInterStageShaderVariables = 16;
