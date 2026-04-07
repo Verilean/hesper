@@ -97,6 +97,37 @@ def geluGateMulKernel (size : Nat) : ShaderM Unit := do
     ShaderM.writeBuffer (ty := .scalar .f32) "output" idx (Exp.mul gelu plVal)
   ) (pure ())
 
+/-- Same as geluGateMulKernel but reads per_layer_input from offset within a larger buffer.
+    Used to slice plInputAll[layerIdx * embdPerLayer .. (layerIdx+1) * embdPerLayer]
+    without copying.
+
+    @param size embdPerLayer
+    @param plTotalSize Total size of the per_layer_input buffer (embdPerLayer * numLayers)
+    @param plOffset Starting offset (layerIdx * embdPerLayer)
+-/
+def geluGateMulSliceKernel (size plTotalSize plOffset : Nat) : ShaderM Unit := do
+  let gid ← ShaderM.globalId
+  let idx := Exp.vec3X gid
+
+  let _gate ← ShaderM.declareInputBuffer "gate" (.array (.scalar .f32) size)
+  let _perLayerInput ← ShaderM.declareInputBuffer "per_layer_input" (.array (.scalar .f32) plTotalSize)
+  let _output ← ShaderM.declareOutputBuffer "output" (.array (.scalar .f32) size)
+
+  ShaderM.if_ (Exp.lt idx (Exp.litU32 size)) (do
+    let gateVal ← ShaderM.readBuffer (ty := .scalar .f32) (n := size) "gate" idx
+    let plIdx := Exp.add idx (Exp.litU32 plOffset)
+    let plVal ← ShaderM.readBuffer (ty := .scalar .f32) (n := plTotalSize) "per_layer_input" plIdx
+
+    -- GELU approximation
+    let sqrt2OverPi := Exp.litF32 0.7978845608028654
+    let x3 := Exp.mul (Exp.mul gateVal gateVal) gateVal
+    let inner := Exp.mul sqrt2OverPi (Exp.add gateVal (Exp.mul (Exp.litF32 0.044715) x3))
+    let gelu := Exp.mul (Exp.mul (Exp.litF32 0.5) gateVal) (Exp.add (Exp.litF32 1.0) (Exp.tanh inner))
+
+    -- output = GELU(gate) * per_layer_input[plOffset + idx]
+    ShaderM.writeBuffer (ty := .scalar .f32) "output" idx (Exp.mul gelu plVal)
+  ) (pure ())
+
 /-! ## Per-Layer Input Pre-Processing Kernels -/
 
 /-- Scale kernel: y = x * scaleFactor
