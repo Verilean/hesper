@@ -193,9 +193,13 @@ def LinearLayer.forward (device : Device) (layer : LinearLayer)
     ("input", inputBuf),
     ("output", outputBuf)
   ]
-  let execConfig := Execute.ExecutionConfig.dispatch1D
-    layer.config.outDim
-    256
+  -- The fused kernels use one workgroup per output element with workgroup_size=256
+  -- threads cooperating on a tree reduction. So dispatch outDim workgroups, not
+  -- ceil(outDim / 256).
+  let execConfig : Execute.ExecutionConfig := {
+    numWorkgroups := (layer.config.outDim, 1, 1)
+    workgroupSize := { x := 256, y := 1, z := 1 }
+  }
   let shader := match layer.quantFormat with
     | .Q4_K => fusedQ4KMLinearKernel layer.config
     | .Q6_K => Hesper.Quantization.Q6_K.fusedQ6KLinearKernel layer.config.inDim layer.config.outDim
