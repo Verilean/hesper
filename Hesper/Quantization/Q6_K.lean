@@ -73,8 +73,6 @@ def fusedQ6KLinearKernel (inDim outDim : Nat) (workgroupSize : Nat := 256) : Sha
   let tid := Exp.vec3X lid
 
   let blocksPerRow := inDim / blockSize
-  -- Total weight data as u32 array
-  -- Each block = 210 bytes. Total bytes = outDim * blocksPerRow * 210
   let totalWeightBytes := outDim * blocksPerRow * blockSizeBytes
   let totalWeightU32 := (totalWeightBytes + 3) / 4
 
@@ -85,24 +83,29 @@ def fusedQ6KLinearKernel (inDim outDim : Nat) (workgroupSize : Nat := 256) : Sha
   ShaderM.sharedNamed "shared_partial" (.array (.scalar .f32) workgroupSize)
 
   ShaderM.if_ (Exp.lt outIdx (Exp.litU32 outDim)) (do
-    -- Row byte offset for this output element
     let rowByteBase := Exp.mul outIdx (Exp.litU32 (blocksPerRow * blockSizeBytes))
 
     ShaderM.varNamed "acc" (.scalar .f32) (Exp.litF32 0.0)
     let acc : Exp (.scalar .f32) := Exp.var "acc"
 
+    -- Helper to read a byte at a (compile-time-relative) offset within the block
+    let readByte (blockBase : Exp (.scalar .u32)) (offset : Nat) : ShaderM (Exp (.scalar .u32)) := do
+      let byteIdx := Exp.add blockBase (Exp.litU32 offset)
+      let u32Idx := Exp.div byteIdx (Exp.litU32 4)
+      let byteShift := Exp.mul (Exp.mod byteIdx (Exp.litU32 4)) (Exp.litU32 8)
+      let u32 ← ShaderM.readBuffer (ty := .scalar .u32) (n := totalWeightU32) "weights" u32Idx
+      pure (Exp.bitAnd (Exp.shiftRight u32 byteShift) (Exp.litU32 0xFF))
+
     -- Each thread processes blocks in a strided pattern
     ShaderM.loop tid (Exp.litU32 blocksPerRow) (Exp.litU32 workgroupSize) fun blockLocalIdx => do
-      let blockByteOffset := Exp.add rowByteBase (Exp.mul blockLocalIdx (Exp.litU32 blockSizeBytes))
+      let blockByteBase := Exp.add rowByteBase (Exp.mul blockLocalIdx (Exp.litU32 blockSizeBytes))
       let elemBase := Exp.mul blockLocalIdx (Exp.litU32 blockSize)
 
-      -- Read d (FP16) at byte offset 208 within block
-      let dByteOffset := Exp.add blockByteOffset (Exp.litU32 208)
-      let dU32Idx := Exp.div dByteOffset (Exp.litU32 4)
-      let dByteInU32 := Exp.mul (Exp.mod dByteOffset (Exp.litU32 4)) (Exp.litU32 8)
-      let dU32 ← ShaderM.readBuffer (ty := .scalar .u32) (n := totalWeightU32) "weights" dU32Idx
-      let dBits := Exp.bitAnd (Exp.shiftRight dU32 dByteInU32) (Exp.litU32 0xFFFF)
-      -- FP16 → F32 (arithmetic, supports subnormals)
+      -- Read d (FP16) at byte offset 208
+      let dLoByte ← readByte blockByteBase 208
+      let dHiByte ← readByte blockByteBase 209
+      let dBits := Exp.bitOr dLoByte (Exp.shiftLeft dHiByte (Exp.litU32 8))
+      -- FP16 → F32 (with subnormal support)
       let sign := Exp.shiftRight dBits (Exp.litU32 15)
       let exp5 := Exp.bitAnd (Exp.shiftRight dBits (Exp.litU32 10)) (Exp.litU32 0x1F)
       let mant := Exp.bitAnd dBits (Exp.litU32 0x3FF)
@@ -116,75 +119,89 @@ def fusedQ6KLinearKernel (inDim outDim : Nat) (workgroupSize : Nat := 256) : Sha
       let expF := Exp.select isSubnormal expFSubnormal expFNormal
       let d := Exp.mul signF (Exp.mul mantF expF)
 
-      -- Process 2 chunks of 128 elements each (n = 0, 128)
+      -- Helper: read sign-extended int8 scale at byte offset within block
+      let readScaleI8 (offset : Nat) : ShaderM (Exp (.scalar .f32)) := do
+        let scByte ← readByte blockByteBase offset
+        let scSigned := Exp.select (Exp.ge scByte (Exp.litU32 128))
+          (Exp.sub (Exp.toF32 scByte) (Exp.litF32 256.0))
+          (Exp.toF32 scByte)
+        pure scSigned
+
+      -- Faithful translation of dequantize_row_q6_K from llama.cpp:
+      --   for n in [0, 128]: chunk
+      --     for l in 0..31:
+      --       is = l/16
+      --       q1 = ((ql[l]      & 0xF) | ((qh[l] >> 0) & 3) << 4) - 32
+      --       q2 = ((ql[l + 32] & 0xF) | ((qh[l] >> 2) & 3) << 4) - 32
+      --       q3 = ((ql[l]      >> 4)  | ((qh[l] >> 4) & 3) << 4) - 32
+      --       q4 = ((ql[l + 32] >> 4)  | ((qh[l] >> 6) & 3) << 4) - 32
+      --       y[l +  0] = d * sc[is+0] * q1
+      --       y[l + 32] = d * sc[is+2] * q2
+      --       y[l + 64] = d * sc[is+4] * q3
+      --       y[l + 96] = d * sc[is+6] * q4
+      --     ql += 64; qh += 32; sc += 8; y += 128
       for chunk in [0:2] do
-        let chunkOffset := chunk * 128
-        -- ql base: blockByteOffset + chunk * 64 (64 bytes of ql per chunk)
-        let qlByteBase := Exp.add blockByteOffset (Exp.litU32 (chunk * 64))
-        -- qh base: blockByteOffset + 128 + chunk * 32
-        let qhByteBase := Exp.add blockByteOffset (Exp.litU32 (128 + chunk * 32))
-        -- scales base: blockByteOffset + 192 + chunk * 8
-        let scByteBase := Exp.add blockByteOffset (Exp.litU32 (192 + chunk * 8))
+        -- Per-chunk byte offsets within the block:
+        let qlBaseOff := chunk * 64        -- ql offset: 0 or 64
+        let qhBaseOff := 128 + chunk * 32  -- qh offset: 128 or 160
+        let scBaseOff := 192 + chunk * 8   -- sc offset: 192 or 200
+        let chunkOutBase := chunk * 128
+        for l in [0:32] do
+          let isIdx := l / 16  -- 0 or 1
+          -- Read scales (8 of them per chunk: indices 0..7)
+          -- but we only need is+0, is+2, is+4, is+6 for this l
+          let sc0F ← readScaleI8 (scBaseOff + isIdx)
+          let sc2F ← readScaleI8 (scBaseOff + isIdx + 2)
+          let sc4F ← readScaleI8 (scBaseOff + isIdx + 4)
+          let sc6F ← readScaleI8 (scBaseOff + isIdx + 6)
+          let dsc0 := Exp.mul d sc0F
+          let dsc2 := Exp.mul d sc2F
+          let dsc4 := Exp.mul d sc4F
+          let dsc6 := Exp.mul d sc6F
 
-        -- Process 4 groups of 32 elements
-        for group in [0:4] do
-          let groupOffset := group * 32
-          -- Read scale for this group (signed 8-bit)
-          let scByteIdx := Exp.add scByteBase (Exp.litU32 (group * 2))  -- 2 scales per group (is + 0, is + 2)
-          let scU32Idx := Exp.div scByteIdx (Exp.litU32 4)
-          let scByteInU32 := Exp.mul (Exp.mod scByteIdx (Exp.litU32 4)) (Exp.litU32 8)
-          let scU32 ← ShaderM.readBuffer (ty := .scalar .u32) (n := totalWeightU32) "weights" scU32Idx
-          let scByte := Exp.bitAnd (Exp.shiftRight scU32 scByteInU32) (Exp.litU32 0xFF)
-          -- Sign extend 8-bit to i32: if bit 7 set, subtract 256
-          let scSigned := Exp.select (Exp.ge scByte (Exp.litU32 128))
-            (Exp.sub (Exp.toF32 scByte) (Exp.litF32 256.0))
-            (Exp.toF32 scByte)
-          let dsc := Exp.mul d scSigned
+          -- Read ql and qh bytes
+          let qlByte0 ← readByte blockByteBase (qlBaseOff + l)        -- ql[l]
+          let qlByte32 ← readByte blockByteBase (qlBaseOff + l + 32)  -- ql[l + 32]
+          let qhByte ← readByte blockByteBase (qhBaseOff + l)         -- qh[l]
 
-          -- Process 32 elements in this group
-          -- For groups 0,1: use low nibble of ql, qh bits 0-1 or 2-3
-          -- For groups 2,3: use high nibble of ql, qh bits 4-5 or 6-7
-          for l in [0:8] do  -- 8 u32s = 32 bytes for ql (but we read 4 bytes at a time)
-            -- Each iteration processes 4 elements
-            let qlByteIdx := Exp.add qlByteBase (Exp.litU32 (if group < 2 then l * 4 else l * 4))
-            let qlOffset := if group < 2 then groupOffset else groupOffset - 64  -- ql reuses same bytes for groups 2,3
-            let _ := qlOffset  -- suppress unused warning
+          let qlLow0 := Exp.bitAnd qlByte0 (Exp.litU32 0xF)
+          let qlLow32 := Exp.bitAnd qlByte32 (Exp.litU32 0xF)
+          let qlHigh0 := Exp.shiftRight qlByte0 (Exp.litU32 4)
+          let qlHigh32 := Exp.shiftRight qlByte32 (Exp.litU32 4)
 
-            -- Simplified: process one element at a time for correctness
-            for sub in [0:4] do
-              let elemIdx := chunkOffset + groupOffset + l * 4 + sub
-              if elemIdx < blockSize then
-                -- Read ql byte
-                let qlByte_offset := if group < 2
-                  then Exp.add qlByteBase (Exp.litU32 (l * 4 + sub))
-                  else Exp.add qlByteBase (Exp.litU32 (l * 4 + sub))  -- same ql bytes, different nibble
-                let qlU32Idx := Exp.div qlByte_offset (Exp.litU32 4)
-                let qlByteInU32 := Exp.mul (Exp.mod qlByte_offset (Exp.litU32 4)) (Exp.litU32 8)
-                let qlU32 ← ShaderM.readBuffer (ty := .scalar .u32) (n := totalWeightU32) "weights" qlU32Idx
-                let qlByte := Exp.bitAnd (Exp.shiftRight qlU32 qlByteInU32) (Exp.litU32 0xFF)
-                let qlNibble := if group < 2
-                  then Exp.bitAnd qlByte (Exp.litU32 0xF)        -- low nibble
-                  else Exp.shiftRight qlByte (Exp.litU32 4)       -- high nibble
+          let qhBits0 := Exp.bitAnd (Exp.shiftRight qhByte (Exp.litU32 0)) (Exp.litU32 3)
+          let qhBits2 := Exp.bitAnd (Exp.shiftRight qhByte (Exp.litU32 2)) (Exp.litU32 3)
+          let qhBits4 := Exp.bitAnd (Exp.shiftRight qhByte (Exp.litU32 4)) (Exp.litU32 3)
+          let qhBits6 := Exp.bitAnd (Exp.shiftRight qhByte (Exp.litU32 6)) (Exp.litU32 3)
 
-                -- Read qh 2 bits
-                let qhByteIdx := Exp.add qhByteBase (Exp.litU32 (l * 4 + sub))
-                let qhU32Idx := Exp.div qhByteIdx (Exp.litU32 4)
-                let qhByteInU32 := Exp.mul (Exp.mod qhByteIdx (Exp.litU32 4)) (Exp.litU32 8)
-                let qhU32 ← ShaderM.readBuffer (ty := .scalar .u32) (n := totalWeightU32) "weights" qhU32Idx
-                let qhByte := Exp.bitAnd (Exp.shiftRight qhU32 qhByteInU32) (Exp.litU32 0xFF)
-                let qhShift := group * 2  -- bits 0-1, 2-3, 4-5, 6-7 for groups 0,1,2,3
-                let qhBits := Exp.bitAnd (Exp.shiftRight qhByte (Exp.litU32 qhShift)) (Exp.litU32 0x3)
+          -- Compute q1..q4 (signed 6-bit, range [-32, 31])
+          let q1Raw := Exp.bitOr qlLow0  (Exp.shiftLeft qhBits0 (Exp.litU32 4))
+          let q2Raw := Exp.bitOr qlLow32 (Exp.shiftLeft qhBits2 (Exp.litU32 4))
+          let q3Raw := Exp.bitOr qlHigh0  (Exp.shiftLeft qhBits4 (Exp.litU32 4))
+          let q4Raw := Exp.bitOr qlHigh32 (Exp.shiftLeft qhBits6 (Exp.litU32 4))
+          let q1 := Exp.sub (Exp.toF32 q1Raw) (Exp.litF32 32.0)
+          let q2 := Exp.sub (Exp.toF32 q2Raw) (Exp.litF32 32.0)
+          let q3 := Exp.sub (Exp.toF32 q3Raw) (Exp.litF32 32.0)
+          let q4 := Exp.sub (Exp.toF32 q4Raw) (Exp.litF32 32.0)
 
-                -- Combine: q6 = (qlNibble | (qhBits << 4)) - 32
-                let q6 := Exp.sub (Exp.toF32 (Exp.bitOr qlNibble (Exp.shiftLeft qhBits (Exp.litU32 4)))) (Exp.litF32 32.0)
+          let w1 := Exp.mul dsc0 q1
+          let w2 := Exp.mul dsc2 q2
+          let w3 := Exp.mul dsc4 q3
+          let w4 := Exp.mul dsc6 q4
 
-                -- Dequant: y = d * sc * q6
-                let weight := Exp.mul dsc q6
+          -- Output positions in the block: chunkOutBase + (l, l+32, l+64, l+96)
+          let inIdx1 := Exp.add elemBase (Exp.litU32 (chunkOutBase + l))
+          let inIdx2 := Exp.add elemBase (Exp.litU32 (chunkOutBase + l + 32))
+          let inIdx3 := Exp.add elemBase (Exp.litU32 (chunkOutBase + l + 64))
+          let inIdx4 := Exp.add elemBase (Exp.litU32 (chunkOutBase + l + 96))
 
-                -- FMA with input
-                let inputIdx := Exp.add elemBase (Exp.litU32 elemIdx)
-                let inVal ← ShaderM.readBuffer (ty := .scalar .f32) (n := inDim) "input" inputIdx
-                ShaderM.assign "acc" (Exp.add acc (Exp.mul weight inVal))
+          let in1 ← ShaderM.readBuffer (ty := .scalar .f32) (n := inDim) "input" inIdx1
+          let in2 ← ShaderM.readBuffer (ty := .scalar .f32) (n := inDim) "input" inIdx2
+          let in3 ← ShaderM.readBuffer (ty := .scalar .f32) (n := inDim) "input" inIdx3
+          let in4 ← ShaderM.readBuffer (ty := .scalar .f32) (n := inDim) "input" inIdx4
+
+          ShaderM.assign "acc" (Exp.add acc (Exp.add (Exp.add (Exp.mul w1 in1) (Exp.mul w2 in2))
+                                                      (Exp.add (Exp.mul w3 in3) (Exp.mul w4 in4))))
 
     -- Tree reduction
     ShaderM.writeWorkgroup (ty := .scalar .f32) "shared_partial" tid acc
