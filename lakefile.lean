@@ -808,6 +808,16 @@ lean_exe «gemma4-layer0-dump» where
   supportInterpreter := false
   moreLinkArgs := stdLinkArgs
 
+lean_exe «gemma4-layer0-forward» where
+  root := `Examples.Gemma4Layer0Forward
+  supportInterpreter := false
+  moreLinkArgs := stdLinkArgs
+
+lean_exe «gemma4-all-layers-dump» where
+  root := `Examples.Gemma4AllLayersDump
+  supportInterpreter := false
+  moreLinkArgs := stdLinkArgs
+
 -- ----------------------------------------------------------------------------
 -- Training (LoRA Finetuning)
 -- ----------------------------------------------------------------------------
