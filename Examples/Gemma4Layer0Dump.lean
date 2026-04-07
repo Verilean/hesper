@@ -167,14 +167,14 @@ def main : IO Unit := do
   Hesper.Layers.Linear.LinearLayer.forward device block.attention.wV state.normedBuf state.vBuf
   dumpBuffer device "step_17_v_proj" state.vBuf (numKVHeads * headDim)
 
-  -- Step 18: V-norm (bare RMSNorm)
+  -- Step 18: V-norm (bare per-head RMSNorm — each head normalized independently)
   let vDim := numKVHeads * headDim
   let vNormBufs : List (String × Buffer) :=
     [("input", state.vBuf), ("output", state.vBuf2)]
   Hesper.WGSL.Execute.executeShaderNamed device
-    (Hesper.Models.Gemma4.bareRMSNormKernel vDim cfg.rmsNormEps)
+    (Hesper.Models.Gemma4.perHeadBareRMSNormKernel numKVHeads headDim cfg.rmsNormEps)
     vNormBufs
-    { numWorkgroups := (1, 1, 1), workgroupSize := { x := min vDim 256, y := 1, z := 1 } : Execute.ExecutionConfig }
+    { numWorkgroups := (numKVHeads, 1, 1), workgroupSize := { x := min headDim 256, y := 1, z := 1 } : Execute.ExecutionConfig }
   dumpBuffer device "step_18_v_norm" state.vBuf2 vDim
 
   -- ====================================================================
@@ -245,4 +245,114 @@ def main : IO Unit := do
   Hesper.Layers.Linear.LinearLayer.forward device block.ffn.down state.geluBuf state.ffnOutBuf
   dumpBuffer device "step_34_ffn_down" state.ffnOutBuf cfg.hiddenSize
 
-  IO.println "Done with steps 1-34! Run: python3 scripts/compare_layer0.py"
+  -- Step 35: post_ffw_norm (ffnOutBuf → normedBuf2 to avoid aliasing)
+  Hesper.Layers.RMSNorm.forward device block.postFFNNorm state.ffnOutBuf state.normedBuf2
+  dumpBuffer device "step_35_post_ffn_norm" state.normedBuf2 cfg.hiddenSize
+
+  -- Step 36: pe_in = ffn_post_norm + attn_residual → buf1 (we'll use buf1 as pe_in)
+  let peInBufs : List (String × Buffer) :=
+    [("a", state.normedBuf2), ("b", state.attnResidualBuf), ("output", state.buf1)]
+  Hesper.WGSL.Execute.executeShaderNamed device
+    (Hesper.Models.Gemma4.residualAddKernel cfg.hiddenSize)
+    peInBufs
+    (.dispatch1D cfg.hiddenSize)
+  dumpBuffer device "step_36_pe_in" state.buf1 cfg.hiddenSize
+
+  -- ====================================================================
+  -- Steps 40-44: Per-layer embedding
+  -- ====================================================================
+  -- Run the per-layer input precompute first to populate state.plInputAll
+  -- We need this for the layer 0 slice
+  match model.perLayerEmbdTableCPU, model.perLayerModelProj, model.perLayerProjNorm with
+  | some embdTableCPU, some modelProj, some projNorm =>
+    let embdPL := cfg.embdPerLayer
+    let nLayers := cfg.numHiddenLayers
+    let totalPL := embdPL * nLayers
+    -- 1) CPU dequant of per_layer_token_embd[token]
+    let rowOffset := tokenId * model.perLayerEmbdRowBytes
+    let rowFloats := Hesper.Models.Gemma4.dequantQ6KRowCPU embdTableCPU rowOffset totalPL
+    let scaleFactor : Float := Float.sqrt embdPL.toFloat
+    let scaledRow := rowFloats.map (· * scaleFactor)
+    let rowBytes ← Hesper.Models.Gemma4.floatArrayToBytes scaledRow
+    writeBuffer device state.plModelProj 0 rowBytes
+    -- 2) per_layer_model_proj @ buf2 → plTokenSelected
+    let projConfig : Hesper.WGSL.MatMul.Config := {
+      M := 1, N := totalPL, K := cfg.hiddenSize
+    }
+    Hesper.WGSL.MatMul.executeMatMulTransposeF16 device state.buf2 modelProj state.plTokenSelected projConfig
+    -- 3) Scale by 1/sqrt(hiddenSize) → plInputAll
+    let scaleBufs2 : List (String × Buffer) :=
+      [("input", state.plTokenSelected), ("output", state.plInputAll)]
+    Hesper.WGSL.Execute.executeShaderNamed device
+      (Hesper.Layers.PerLayerEmbedding.scaleKernel totalPL (1.0 / Float.sqrt cfg.hiddenSize.toFloat))
+      scaleBufs2
+      (.dispatch1D totalPL)
+    -- 4) chunkedRMSNorm → plTokenSelected
+    let chunkedNormBufs : List (String × Buffer) :=
+      [("input", state.plInputAll), ("weight", projNorm.scale), ("output", state.plTokenSelected)]
+    Hesper.WGSL.Execute.executeShaderNamed device
+      (Hesper.Models.Gemma4.chunkedRMSNormKernel embdPL nLayers cfg.rmsNormEps)
+      chunkedNormBufs
+      { numWorkgroups := (nLayers, 1, 1), workgroupSize := { x := min embdPL 256, y := 1, z := 1 } : Execute.ExecutionConfig }
+    -- 5) Scaled add → plInputAll
+    let addBufs : List (String × Buffer) :=
+      [("a", state.plTokenSelected), ("b", state.plModelProj), ("output", state.plInputAll)]
+    Hesper.WGSL.Execute.executeShaderNamed device
+      (Hesper.Models.Gemma4.scaledAddKernel totalPL (1.0 / Float.sqrt 2.0))
+      addBufs
+      (.dispatch1D totalPL)
+  | _, _, _ => pure ()
+
+  -- Now perform the per-layer block forward (steps 40-44)
+  if h3 : model.perLayerBlocks.size = 0 then
+    IO.println "  no per-layer blocks"
+  else do
+    let plEmbd := model.perLayerBlocks[0]'(by omega)
+    match plEmbd with
+    | some plEmbd =>
+      -- Step 40: inp_gate(pe_in=buf1) → plGateBuf
+      Hesper.Layers.Linear.LinearLayer.forward device plEmbd.inpGate state.buf1 state.plGateBuf
+      dumpBuffer device "step_40_pl_gate" state.plGateBuf cfg.embdPerLayer
+
+      -- Step 41: GELU(gate) * pl_input[layer 0] → moeRouterOutBuf (reuse as temp)
+      let plOffset := 0 * cfg.embdPerLayer  -- layer 0
+      let totalPL := cfg.embdPerLayer * cfg.numHiddenLayers
+      let pl41Bufs : List (String × Buffer) :=
+        [("gate", state.plGateBuf), ("per_layer_input", state.plInputAll), ("output", state.moeRouterOutBuf)]
+      Hesper.WGSL.Execute.executeShaderNamed device
+        (Hesper.Layers.PerLayerEmbedding.geluGateMulSliceKernel cfg.embdPerLayer totalPL plOffset)
+        pl41Bufs
+        (.dispatch1D cfg.embdPerLayer)
+      dumpBuffer device "step_41_pl_gelu_mul" state.moeRouterOutBuf cfg.embdPerLayer
+
+      -- Step 42: per_layer_proj
+      Hesper.Layers.Linear.LinearLayer.forward device plEmbd.proj state.moeRouterOutBuf state.plProjBuf
+      dumpBuffer device "step_42_pl_proj" state.plProjBuf cfg.hiddenSize
+
+      -- Step 43: per_layer_post_norm → normedBuf2 (avoid aliasing)
+      Hesper.Layers.RMSNorm.forward device plEmbd.postNorm state.plProjBuf state.normedBuf2
+      dumpBuffer device "step_43_pl_post_norm" state.normedBuf2 cfg.hiddenSize
+
+      -- Step 44: pe_in (buf1) + per_layer_embd_out (normedBuf2) → ffnOutBuf
+      let res44Bufs : List (String × Buffer) :=
+        [("a", state.buf1), ("b", state.normedBuf2), ("output", state.ffnOutBuf)]
+      Hesper.WGSL.Execute.executeShaderNamed device
+        (Hesper.Models.Gemma4.residualAddKernel cfg.hiddenSize)
+        res44Bufs
+        (.dispatch1D cfg.hiddenSize)
+      dumpBuffer device "step_44_pl_residual" state.ffnOutBuf cfg.hiddenSize
+    | none => pure ()
+
+  -- Step 50: layer_output_scale
+  match block.outScale with
+  | some scale =>
+    let scaleBufs3 : List (String × Buffer) :=
+      [("input", state.ffnOutBuf), ("scale", scale), ("output", state.normedBuf2)]
+    Hesper.WGSL.Execute.executeShaderNamed device
+      (Hesper.Layers.PerLayerEmbedding.layerScaleKernel cfg.hiddenSize)
+      scaleBufs3
+      (.dispatch1D cfg.hiddenSize)
+    dumpBuffer device "step_50_layer_scale" state.normedBuf2 cfg.hiddenSize
+  | none => pure ()
+
+  IO.println "Done with steps 1-50! Run: python3 scripts/compare_layer0.py"
