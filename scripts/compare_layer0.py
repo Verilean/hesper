@@ -56,6 +56,13 @@ MAPPING = [
     ("step_32_ffn_up", "ffn_up-0", 10240),
     ("step_33_ffn_gelu", "ffn_geglu-0", 10240),
     # ffn_out-0 in llama is empty (host memory optimization)
+    ("step_35_post_ffn_norm", "ffn_post_norm-0", 2560),
+    ("step_36_pe_in", "pe_in-0", 2560),
+    # step 40 (pl_gate) and step 41 (gelu*pl) are unnamed nodes in llama (node_43, node_58)
+    # step 42 (pl_proj) is also unnamed
+    ("step_43_pl_post_norm", "per_layer_embd_out-0", 2560),
+    # step 44 is the residual sum (unnamed node_62 in llama)
+    ("step_50_layer_scale", "l_out-0", 2560),
 ]
 
 
