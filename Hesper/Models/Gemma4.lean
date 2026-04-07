@@ -324,16 +324,61 @@ def perHeadRMSNormKernel (numHeads headDim : Nat) (eps : Float) : ShaderM Unit :
     let normed := Exp.mul (Exp.mul val rms) w
     ShaderM.writeBuffer (ty := .scalar .f32) "output" (Exp.add headBase i) normed
 
-/-! ## Bare RMSNorm Kernel (no learned weights) -/
+/-! ## Bare RMSNorm Kernels (no learned weights) -/
 
-/-- RMSNorm without learned scale weights.
-    Used for V-norm in Gemma 4: Vcur = rms_norm(Vcur, eps)
-    Just normalizes by RMS, no γ multiplication.
-    One workgroup per vector (for single-token: one workgroup total).
+/-- Per-head bare RMSNorm: normalize each head independently (no learned weights).
+    Used for V-norm in Gemma 4: each KV head's `headDim` elements are normalized
+    by their own RMS. Total input size is `numHeads * headDim`.
 
-    @param dim Vector dimension
-    @param eps Epsilon for numerical stability
--/
+    One workgroup per head (numHeads workgroups). Within each workgroup,
+    threads cooperate on a tree reduction over `headDim` elements. -/
+def perHeadBareRMSNormKernel (numHeads headDim : Nat) (eps : Float) (workgroupSize : Nat := 256) : ShaderM Unit := do
+  let wid ← ShaderM.workgroupId
+  let lid ← ShaderM.localId
+  let headIdx := Exp.vec3X wid
+  let tid := Exp.vec3X lid
+
+  let totalElements := numHeads * headDim
+
+  let _input ← ShaderM.declareInputBuffer "input" (.array (.scalar .f32) totalElements)
+  let _output ← ShaderM.declareOutputBuffer "output" (.array (.scalar .f32) totalElements)
+
+  ShaderM.sharedNamed "shared_sum" (.array (.scalar .f32) workgroupSize)
+
+  let headBase := Exp.mul headIdx (Exp.litU32 headDim)
+
+  -- Step 1: sum of squares for this head
+  ShaderM.varNamed "local_sum" (.scalar .f32) (Exp.litF32 0.0)
+  let localSum : Exp (.scalar .f32) := Exp.var "local_sum"
+
+  ShaderM.loop tid (Exp.litU32 headDim) (Exp.litU32 workgroupSize) fun i => do
+    let val ← ShaderM.readBuffer (ty := .scalar .f32) (n := totalElements) "input" (Exp.add headBase i)
+    ShaderM.assign "local_sum" (Exp.add localSum (Exp.mul val val))
+
+  ShaderM.writeWorkgroup (ty := .scalar .f32) "shared_sum" tid localSum
+  ShaderM.barrier
+
+  -- Tree reduction
+  let mut stride := workgroupSize / 2
+  while stride > 0 do
+    ShaderM.if_ (Exp.lt tid (Exp.litU32 stride)) (do
+      let a ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := workgroupSize) "shared_sum" tid
+      let b ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := workgroupSize) "shared_sum" (Exp.add tid (Exp.litU32 stride))
+      ShaderM.writeWorkgroup (ty := .scalar .f32) "shared_sum" tid (Exp.add a b)
+    ) (pure ())
+    ShaderM.barrier
+    stride := stride / 2
+
+  -- Step 2: normalize (no weight multiplication)
+  let sumSq ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := workgroupSize) "shared_sum" (Exp.litU32 0)
+  let rms := Exp.inverseSqrt (Exp.add (Exp.div sumSq (Exp.litF32 headDim.toFloat)) (Exp.litF32 eps))
+
+  ShaderM.loop tid (Exp.litU32 headDim) (Exp.litU32 workgroupSize) fun i => do
+    let val ← ShaderM.readBuffer (ty := .scalar .f32) (n := totalElements) "input" (Exp.add headBase i)
+    ShaderM.writeBuffer (ty := .scalar .f32) "output" (Exp.add headBase i) (Exp.mul val rms)
+
+/-- Legacy: bare RMSNorm over a single vector of size `dim`. Kept for backward
+    compatibility; for Gemma 4 V-norm use perHeadBareRMSNormKernel instead. -/
 def bareRMSNormKernel (dim : Nat) (eps : Float) (workgroupSize : Nat := 256) : ShaderM Unit := do
   let wid ← ShaderM.workgroupId
   let lid ← ShaderM.localId
@@ -1188,13 +1233,12 @@ def forwardBlock (device : Device) (block : Gemma4Block) (cfg : Config)
       [("input", state.kBuf), ("weight", block.attention.kNormWeight), ("output", state.kBuf2)]
       (mkNormConfig numKVHeads)
 
-    -- V-norm: bare RMSNorm on V (no learned weights)
-    -- vBuf → vBuf2
-    let vDim := numKVHeads * headDim
+    -- V-norm: bare per-head RMSNorm on V (no learned weights)
+    -- Each KV head normalized independently. vBuf → vBuf2
     Hesper.WGSL.Execute.executeShaderNamed device
-      (bareRMSNormKernel vDim cfg.rmsNormEps)
+      (perHeadBareRMSNormKernel numKVHeads headDim cfg.rmsNormEps)
       [("input", state.vBuf), ("output", state.vBuf2)]
-      { numWorkgroups := (1, 1, 1), workgroupSize := { x := min vDim 256, y := 1, z := 1 } : Execute.ExecutionConfig }
+      { numWorkgroups := (numKVHeads, 1, 1), workgroupSize := { x := min headDim 256, y := 1, z := 1 } : Execute.ExecutionConfig }
 
   -- Step 4: RoPE on Q and K
   -- Upload position to params buffer
