@@ -803,6 +803,11 @@ lean_exe «gemma4-embd-test» where
   supportInterpreter := false
   moreLinkArgs := stdLinkArgs
 
+lean_exe «gemma4-layer0-dump» where
+  root := `Examples.Gemma4Layer0Dump
+  supportInterpreter := false
+  moreLinkArgs := stdLinkArgs
+
 -- ----------------------------------------------------------------------------
 -- Training (LoRA Finetuning)
 -- ----------------------------------------------------------------------------
