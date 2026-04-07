@@ -375,6 +375,162 @@ def bareRMSNormKernel (dim : Nat) (eps : Float) (workgroupSize : Nat := 256) : S
     let val ← ShaderM.readBuffer (ty := .scalar .f32) (n := dim) "input" i
     ShaderM.writeBuffer (ty := .scalar .f32) "output" i (Exp.mul val rms)
 
+/-! ## Per-Layer Embedding Helpers -/
+
+/-- Scaled add: output = (a + b) * scale (avoids aliasing if a/b/output distinct) -/
+def scaledAddKernel (size : Nat) (scale : Float) : ShaderM Unit := do
+  let gid ← ShaderM.globalId
+  let idx := Exp.vec3X gid
+  let _a ← ShaderM.declareInputBuffer "a" (.array (.scalar .f32) size)
+  let _b ← ShaderM.declareInputBuffer "b" (.array (.scalar .f32) size)
+  let _output ← ShaderM.declareOutputBuffer "output" (.array (.scalar .f32) size)
+  ShaderM.if_ (Exp.lt idx (Exp.litU32 size)) (do
+    let aVal ← ShaderM.readBuffer (ty := .scalar .f32) (n := size) "a" idx
+    let bVal ← ShaderM.readBuffer (ty := .scalar .f32) (n := size) "b" idx
+    let result := Exp.mul (Exp.add aVal bVal) (Exp.litF32 scale)
+    ShaderM.writeBuffer (ty := .scalar .f32) "output" idx result
+  ) (pure ())
+
+/-- Per-layer RMSNorm: normalize each `chunkDim`-sized chunk independently with shared weights.
+    Used for per_layer_proj_norm which normalizes [embdPerLayer * numLayers] in chunks of embdPerLayer.
+
+    One workgroup per chunk. Each workgroup computes RMS over its own chunk.
+
+    @param chunkDim Size of each chunk (e.g. embdPerLayer = 256)
+    @param numChunks Number of chunks (e.g. numLayers = 42)
+    @param eps RMSNorm epsilon
+-/
+def chunkedRMSNormKernel (chunkDim numChunks : Nat) (eps : Float) (workgroupSize : Nat := 256) : ShaderM Unit := do
+  let wid ← ShaderM.workgroupId
+  let lid ← ShaderM.localId
+  let chunkIdx := Exp.vec3X wid
+  let tid := Exp.vec3X lid
+
+  let totalElements := chunkDim * numChunks
+  let _input ← ShaderM.declareInputBuffer "input" (.array (.scalar .f32) totalElements)
+  let _weight ← ShaderM.declareInputBuffer "weight" (.array (.scalar .f32) chunkDim)
+  let _output ← ShaderM.declareOutputBuffer "output" (.array (.scalar .f32) totalElements)
+
+  ShaderM.sharedNamed "shared_sum" (.array (.scalar .f32) workgroupSize)
+
+  let chunkBase := Exp.mul chunkIdx (Exp.litU32 chunkDim)
+
+  -- Step 1: sum of squares
+  ShaderM.varNamed "local_sum" (.scalar .f32) (Exp.litF32 0.0)
+  let localSum : Exp (.scalar .f32) := Exp.var "local_sum"
+
+  ShaderM.loop tid (Exp.litU32 chunkDim) (Exp.litU32 workgroupSize) fun i => do
+    let val ← ShaderM.readBuffer (ty := .scalar .f32) (n := totalElements) "input" (Exp.add chunkBase i)
+    ShaderM.assign "local_sum" (Exp.add localSum (Exp.mul val val))
+
+  ShaderM.writeWorkgroup (ty := .scalar .f32) "shared_sum" tid localSum
+  ShaderM.barrier
+
+  -- Tree reduction
+  let mut stride := workgroupSize / 2
+  while stride > 0 do
+    ShaderM.if_ (Exp.lt tid (Exp.litU32 stride)) (do
+      let a ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := workgroupSize) "shared_sum" tid
+      let b ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := workgroupSize) "shared_sum" (Exp.add tid (Exp.litU32 stride))
+      ShaderM.writeWorkgroup (ty := .scalar .f32) "shared_sum" tid (Exp.add a b)
+    ) (pure ())
+    ShaderM.barrier
+    stride := stride / 2
+
+  -- Step 2: normalize and apply weight
+  let sumSq ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := workgroupSize) "shared_sum" (Exp.litU32 0)
+  let rms := Exp.inverseSqrt (Exp.add (Exp.div sumSq (Exp.litF32 chunkDim.toFloat)) (Exp.litF32 eps))
+
+  ShaderM.loop tid (Exp.litU32 chunkDim) (Exp.litU32 workgroupSize) fun i => do
+    let val ← ShaderM.readBuffer (ty := .scalar .f32) (n := totalElements) "input" (Exp.add chunkBase i)
+    let w ← ShaderM.readBuffer (ty := .scalar .f32) (n := chunkDim) "weight" i
+    let result := Exp.mul (Exp.mul val rms) w
+    ShaderM.writeBuffer (ty := .scalar .f32) "output" (Exp.add chunkBase i) result
+
+/-! ## CPU Q6_K Row Dequant -/
+
+/-- Dequantize a single Q6_K row to F32 ByteArray on CPU.
+    Used to extract a per-token slice of large Q6_K tables that don't fit in
+    a single WebGPU storage buffer binding (e.g. per_layer_token_embd).
+
+    Each block is 256 elements, 210 bytes:
+    - bytes [0..128):  ql (low 4 bits, 2 vals/byte)
+    - bytes [128..192): qh (high 2 bits, 4 vals/byte)
+    - bytes [192..208): scales[16] (int8)
+    - bytes [208..210): d (FP16)
+
+    @param data Source ByteArray (e.g. full per_layer_token_embd)
+    @param rowOffset Byte offset of the row start within data
+    @param numElements Total elements per row (must be multiple of 256)
+    @return Float array of length numElements
+-/
+def dequantQ6KRowCPU (data : ByteArray) (rowOffset numElements : Nat) : Array Float := Id.run do
+  let numBlocks := numElements / 256
+  let blockBytes := 210
+  let mut out : Array Float := (List.replicate numElements (0.0 : Float)).toArray
+  for bi in [0:numBlocks] do
+    let blockBase := rowOffset + bi * blockBytes
+    let outBase := bi * 256
+    -- Read d (FP16) at offset 208
+    let dLo := (data.get! (blockBase + 208)).toUInt32
+    let dHi := (data.get! (blockBase + 209)).toUInt32
+    let dBits := dLo ||| (dHi <<< 8)
+    -- FP16 → F32 (with subnormal support)
+    let sign := (dBits >>> 15) &&& 1
+    let exp5 := (dBits >>> 10) &&& 0x1F
+    let mant := dBits &&& 0x3FF
+    let signF : Float := if sign == 1 then -1.0 else 1.0
+    let d : Float :=
+      if exp5 == 0 then
+        -- Subnormal: (mant / 1024) * 2^(-14)
+        signF * (mant.toNat.toFloat / 1024.0) * 6.103515625e-5
+      else
+        -- Normal: (1 + mant/1024) * 2^(exp - 15)
+        signF * (1.0 + mant.toNat.toFloat / 1024.0) * (2.0 ^ (exp5.toNat.toFloat - 15.0))
+    -- Process 2 chunks of 128 elements (n = 0, 128 in llama.cpp)
+    for chunk in [0:2] do
+      let qlBase := blockBase + chunk * 64       -- ql offset: chunk*64 within block
+      let qhBase := blockBase + 128 + chunk * 32 -- qh offset: 128 + chunk*32
+      let scBase := blockBase + 192 + chunk * 8  -- scales offset: 192 + chunk*8
+      let chunkOutBase := outBase + chunk * 128
+      for l in [0:32] do
+        let isIdx := l / 16  -- 0 or 1, picks scale within sub-block
+        let qlByte0 := (data.get! (qlBase + l)).toNat
+        let qlByte1 := (data.get! (qlBase + 32 + l)).toNat
+        let qhByte := (data.get! (qhBase + l)).toNat
+        -- Sign-extend int8 → Float manually
+        let sc0Raw := (data.get! (scBase + isIdx)).toNat
+        let sc2Raw := (data.get! (scBase + isIdx + 2)).toNat
+        let sc4Raw := (data.get! (scBase + isIdx + 4)).toNat
+        let sc6Raw := (data.get! (scBase + isIdx + 6)).toNat
+        let sc0F : Float := if sc0Raw >= 128 then (sc0Raw.toFloat - 256.0) else sc0Raw.toFloat
+        let sc2F : Float := if sc2Raw >= 128 then (sc2Raw.toFloat - 256.0) else sc2Raw.toFloat
+        let sc4F : Float := if sc4Raw >= 128 then (sc4Raw.toFloat - 256.0) else sc4Raw.toFloat
+        let sc6F : Float := if sc6Raw >= 128 then (sc6Raw.toFloat - 256.0) else sc6Raw.toFloat
+        -- q1..q4 are 6-bit unsigned (0..63), then offset by -32 to get [-32..31]
+        -- Compute as Nat, then convert to Float, then subtract 32.0
+        let q1Raw := (qlByte0 &&& 0xF) ||| (((qhByte >>> 0) &&& 3) <<< 4)
+        let q2Raw := (qlByte1 &&& 0xF) ||| (((qhByte >>> 2) &&& 3) <<< 4)
+        let q3Raw := (qlByte0 >>> 4) ||| (((qhByte >>> 4) &&& 3) <<< 4)
+        let q4Raw := (qlByte1 >>> 4) ||| (((qhByte >>> 6) &&& 3) <<< 4)
+        let q1F : Float := q1Raw.toFloat - 32.0
+        let q2F : Float := q2Raw.toFloat - 32.0
+        let q3F : Float := q3Raw.toFloat - 32.0
+        let q4F : Float := q4Raw.toFloat - 32.0
+        out := out.set! (chunkOutBase + l)      (d * sc0F * q1F)
+        out := out.set! (chunkOutBase + l + 32) (d * sc2F * q2F)
+        out := out.set! (chunkOutBase + l + 64) (d * sc4F * q3F)
+        out := out.set! (chunkOutBase + l + 96) (d * sc6F * q4F)
+  return out
+
+/-- Convert Float Array to F32 ByteArray (little-endian) -/
+def floatArrayToBytes (arr : Array Float) : IO ByteArray := do
+  let mut bytes := ByteArray.empty
+  for f in arr do
+    let fb ← Hesper.Basic.floatToBytes f
+    bytes := bytes ++ fb
+  return bytes
+
 /-! ## GGUF Metadata Parsing -/
 
 /-- Helper: read a u32 value from GGUF metadata raw bytes -/
@@ -533,8 +689,8 @@ structure Gemma4Block where
 
 /-- Per-layer embedding weights for a single block -/
 structure Gemma4PerLayerEmbd where
-  inpGateWeight : Buffer          -- per_layer_inp_gate [hiddenSize, embdPerLayer]
-  projWeight : Buffer             -- per_layer_proj [embdPerLayer, hiddenSize]
+  inpGate : Linear.LinearLayer   -- per_layer_inp_gate Q4_K [hiddenSize → embdPerLayer]
+  proj : Linear.LinearLayer      -- per_layer_proj Q4_K [embdPerLayer → hiddenSize]
   postNorm : RMSNorm.RMSNorm     -- per_layer_post_norm
 
 /-- Embedding format for token embedding table -/
@@ -554,7 +710,11 @@ structure Gemma4Model where
   finalNorm : RMSNorm.RMSNorm
   outputWeight : Buffer           -- LM head [vocabSize, hiddenSize]
   -- Per-layer embeddings (optional)
-  perLayerEmbdTable : Option Buffer         -- tok_embd_per_layer [vocabSize, embdPerLayer * numLayers]
+  -- perLayerEmbdTableCPU: kept on CPU because the full table can be > 2 GB,
+  -- exceeding WebGPU's 256 MB single-buffer binding limit. We dequant just the
+  -- row for the input token at inference time and upload (~43 KB) per token.
+  perLayerEmbdTableCPU : Option ByteArray
+  perLayerEmbdRowBytes : Nat                -- Bytes per row in the Q6_K table (8820 for 10752 elements)
   perLayerModelProj : Option Buffer         -- per_layer_model_proj [embdPerLayer * numLayers, hiddenSize]
   perLayerProjNorm : Option RMSNorm.RMSNorm -- per_layer_proj_norm
   perLayerBlocks : Array (Option Gemma4PerLayerEmbd)  -- per-layer gate/proj/norm
@@ -797,46 +957,56 @@ def Gemma4Model.fromGGUF (device : Device) (ggufPath : String)
       pure embedding.embeddingTable
 
   -- Step 7: Load per-layer embeddings (optional)
-  let (perLayerEmbdTable, perLayerModelProj, perLayerProjNorm) ← if cfg.hasPerLayerEmbeddings then do
-    IO.println "[Gemma4] Loading per-layer embeddings..."
-    let table ← match Hesper.GGUF.Loader.getTensorData gguf "per_layer_token_embd.weight" with
-      | .ok (_, data) => pure (some (← uploadBuffer device data))
-      | .error _ => pure none
-    let proj ← match Hesper.GGUF.Loader.getTensorData gguf "per_layer_model_proj.weight" with
-      | .ok (_, data) => pure (some (← uploadBuffer device data))
-      | .error _ => pure none
-    let projNorm ← match Hesper.GGUF.Loader.findTensor gguf "per_layer_proj_norm.weight" with
-      | .ok _ =>
-        let d ← Hesper.GGUF.Loader.extractFloat32Tensor gguf "per_layer_proj_norm.weight"
-        let plNormConfig : RMSNorm.Config := { dim := cfg.embdPerLayer * cfg.numHiddenLayers, eps := cfg.rmsNormEps }
-        pure (some (← RMSNorm.create device plNormConfig d))
-      | .error _ => pure none
-    pure (table, proj, projNorm)
-  else
-    pure (none, none, none)
+  -- per_layer_token_embd kept on CPU (table > WebGPU 256 MB binding limit; we
+  -- dequant just the input token's row at inference time)
+  let (perLayerEmbdTableCPU, perLayerEmbdRowBytes, perLayerModelProj, perLayerProjNorm) ←
+    if cfg.hasPerLayerEmbeddings then do
+      IO.println "[Gemma4] Loading per-layer embeddings..."
+      let blocksPerRow := (cfg.embdPerLayer * cfg.numHiddenLayers) / 256
+      let rowBytes := blocksPerRow * 210  -- Q6_K block size
+      let tableData ← match Hesper.GGUF.Loader.getTensorData gguf "per_layer_token_embd.weight" with
+        | .ok (_, data) =>
+          IO.println s!"  per_layer_token_embd: {data.size} bytes (kept on CPU, row size {rowBytes} bytes)"
+          pure (some data)
+        | .error _ => pure none
+      let proj ← match Hesper.GGUF.Loader.getTensorData gguf "per_layer_model_proj.weight" with
+        | .ok (_, data) => pure (some (← uploadBuffer device data))
+        | .error _ => pure none
+      let projNorm ← match Hesper.GGUF.Loader.findTensor gguf "per_layer_proj_norm.weight" with
+        | .ok _ =>
+          let d ← Hesper.GGUF.Loader.extractFloat32Tensor gguf "per_layer_proj_norm.weight"
+          let plNormConfig : RMSNorm.Config := { dim := cfg.embdPerLayer, eps := cfg.rmsNormEps }
+          pure (some (← RMSNorm.create device plNormConfig d))
+        | .error _ => pure none
+      pure (tableData, rowBytes, proj, projNorm)
+    else
+      pure (none, 0, none, none)
 
   -- Per-layer gate/proj/norm per block
   let mut perLayerBlocks : Array (Option Gemma4PerLayerEmbd) := #[]
   for li in [0:cfg.numHiddenLayers] do
     if cfg.hasPerLayerEmbeddings then
-      let plEmbd ← do
-        let gateW ← match Hesper.GGUF.Loader.getTensorData gguf s!"blk.{li}.inp_gate.weight" with
-          | .ok (_, data) => pure (← uploadBuffer device data)
-          | .error _ => pure (← uploadBuffer device ByteArray.empty)
-        let projW ← match Hesper.GGUF.Loader.getTensorData gguf s!"blk.{li}.proj.weight" with
-          | .ok (_, data) => pure (← uploadBuffer device data)
-          | .error _ => pure (← uploadBuffer device ByteArray.empty)
-        let postNorm ← do
-          let normConfig : RMSNorm.Config := { dim := cfg.hiddenSize, eps := cfg.rmsNormEps }
-          match Hesper.GGUF.Loader.findTensor gguf s!"blk.{li}.post_norm.weight" with
-          | .ok _ =>
-            let d ← Hesper.GGUF.Loader.extractFloat32Tensor gguf s!"blk.{li}.post_norm.weight"
-            RMSNorm.create device normConfig d
-          | .error _ =>
-            -- Fallback: create with dummy weights
-            RMSNorm.create device normConfig (ByteArray.mk (Array.mk (List.replicate (cfg.hiddenSize * 4) 0)))
-        pure (some { inpGateWeight := gateW, projWeight := projW, postNorm := postNorm : Gemma4PerLayerEmbd })
-      perLayerBlocks := perLayerBlocks.push plEmbd
+      -- Load Q4_K linear layers for inp_gate and proj
+      let inpGate ← loadLinear device gguf s!"blk.{li}.inp_gate.weight" cfg.hiddenSize cfg.embdPerLayer
+      let proj ← loadLinear device gguf s!"blk.{li}.proj.weight" cfg.embdPerLayer cfg.hiddenSize
+      let normConfig : RMSNorm.Config := { dim := cfg.hiddenSize, eps := cfg.rmsNormEps }
+      let postNorm ← match Hesper.GGUF.Loader.findTensor gguf s!"blk.{li}.post_norm.weight" with
+        | .ok _ =>
+          let d ← Hesper.GGUF.Loader.extractFloat32Tensor gguf s!"blk.{li}.post_norm.weight"
+          RMSNorm.create device normConfig d
+        | .error _ =>
+          -- Fallback: create with all-ones weights
+          let dummyData : ByteArray ← do
+            let mut bytes := ByteArray.empty
+            for _ in [0:cfg.hiddenSize] do
+              -- Float 1.0 = 0x3f800000 LE: 00 00 80 3f
+              bytes := bytes.push 0
+              bytes := bytes.push 0
+              bytes := bytes.push 0x80
+              bytes := bytes.push 0x3f
+            pure bytes
+          RMSNorm.create device normConfig dummyData
+      perLayerBlocks := perLayerBlocks.push (some { inpGate, proj, postNorm : Gemma4PerLayerEmbd })
     else
       perLayerBlocks := perLayerBlocks.push none
 
@@ -849,7 +1019,8 @@ def Gemma4Model.fromGGUF (device : Device) (ggufPath : String)
     blocks
     finalNorm
     outputWeight
-    perLayerEmbdTable
+    perLayerEmbdTableCPU
+    perLayerEmbdRowBytes
     perLayerModelProj
     perLayerProjNorm
     perLayerBlocks
@@ -907,6 +1078,10 @@ structure InferenceState where
   -- Per-layer embedding buffers
   plGateBuf : Buffer          -- [embdPerLayer] per-layer gate output
   plProjBuf : Buffer          -- [hiddenSize] per-layer projected output
+  -- Per-layer input precomputation (computed once per token, used by all layers)
+  plTokenSelected : Buffer    -- [embdPerLayer * numLayers] tok_embd_per_layer[token] dequantized
+  plModelProj : Buffer        -- [embdPerLayer * numLayers] per_layer_model_proj @ scaled_embed
+  plInputAll : Buffer         -- [embdPerLayer * numLayers] final per-layer input (sum, normed, scaled)
 
 /-- Create inference state with pre-allocated buffers -/
 def createInferenceState (device : Device) (cfg : Config) : IO InferenceState := do
@@ -962,6 +1137,9 @@ def createInferenceState (device : Device) (cfg : Config) : IO InferenceState :=
     moeNormedBuf := ← mkBuf cfg.hiddenSize
     plGateBuf := ← mkBuf (max cfg.embdPerLayer 1)
     plProjBuf := ← mkBuf cfg.hiddenSize
+    plTokenSelected := ← mkBuf (max (cfg.embdPerLayer * cfg.numHiddenLayers) 1)
+    plModelProj := ← mkBuf (max (cfg.embdPerLayer * cfg.numHiddenLayers) 1)
+    plInputAll := ← mkBuf (max (cfg.embdPerLayer * cfg.numHiddenLayers) 1)
   }
 
 /-! ## Single-Token Forward Pass -/
@@ -1233,35 +1411,36 @@ def forwardBlock (device : Device) (block : Gemma4Block) (cfg : Config)
       (.dispatch1D cfg.hiddenSize)
 
   -- Step 8: Per-layer embedding (optional, from gemma4-iswa.cpp:192-213)
+  -- pe_in = cur (= outputBuf at this point)
   -- gate = GELU(per_layer_inp_gate @ cur)
-  -- gate * per_layer_input[layerIdx] → project → normalize → + residual
+  -- cur = gate * per_layer_input[layerIdx]
+  -- cur = per_layer_proj @ cur
+  -- cur = per_layer_post_norm(cur)
+  -- output = pe_in + cur
   match perLayerEmbd, perLayerInput with
-  | some plEmbd, some plInput =>
+  | some plEmbd, some plInputAll =>
     -- per_layer_inp_gate @ outputBuf → plGateBuf [embdPerLayer]
-    let plGateConfig : Hesper.WGSL.MatMul.Config := {
-      M := 1, N := cfg.embdPerLayer, K := cfg.hiddenSize
-    }
-    Hesper.WGSL.MatMul.executeMatMulTranspose device outputBuf plEmbd.inpGateWeight state.plGateBuf plGateConfig
-
-    -- GELU(gate) * per_layer_input → plGateBuf
+    Linear.LinearLayer.forward device plEmbd.inpGate outputBuf state.plGateBuf
+    -- GELU(gate) * per_layer_input[layerIdx] → moeRouterOutBuf (slice via offset kernel)
+    let plOffset := li * cfg.embdPerLayer
+    let plTotalSize := cfg.embdPerLayer * cfg.numHiddenLayers
     Hesper.WGSL.Execute.executeShaderNamed device
-      (PerLayerEmbedding.geluGateMulKernel cfg.embdPerLayer)
-      [("gate", state.plGateBuf), ("per_layer_input", plInput), ("output", state.plGateBuf)]
+      (PerLayerEmbedding.geluGateMulSliceKernel cfg.embdPerLayer plTotalSize plOffset)
+      [("gate", state.plGateBuf), ("per_layer_input", plInputAll), ("output", state.moeRouterOutBuf)]
       (.dispatch1D cfg.embdPerLayer)
-
-    -- per_layer_proj @ plGateBuf → plProjBuf [hiddenSize]
-    let plProjConfig : Hesper.WGSL.MatMul.Config := {
-      M := 1, N := cfg.hiddenSize, K := cfg.embdPerLayer
-    }
-    Hesper.WGSL.MatMul.executeMatMulTranspose device state.plGateBuf plEmbd.projWeight state.plProjBuf plProjConfig
-
-    -- per_layer_post_norm
-    RMSNorm.forward device plEmbd.postNorm state.plProjBuf state.plProjBuf
-
-    -- residual: outputBuf += plProjBuf
+    -- per_layer_proj @ moeRouterOutBuf → plProjBuf [hiddenSize]
+    Linear.LinearLayer.forward device plEmbd.proj state.moeRouterOutBuf state.plProjBuf
+    -- per_layer_post_norm: plProjBuf → normedBuf2 (avoid aliasing)
+    RMSNorm.forward device plEmbd.postNorm state.plProjBuf state.normedBuf2
+    -- residual: outputBuf = pe_in + normedBuf2
+    -- pe_in is current outputBuf value. Use attnResidualBuf as temp to read old outputBuf
+    Hesper.WGSL.Execute.executeShaderNamed device
+      (PerLayerEmbedding.scaleKernel cfg.hiddenSize 1.0)
+      [("input", outputBuf), ("output", state.attnResidualBuf)]
+      (.dispatch1D cfg.hiddenSize)
     Hesper.WGSL.Execute.executeShaderNamed device
       (residualAddKernel cfg.hiddenSize)
-      [("a", outputBuf), ("b", state.plProjBuf), ("output", outputBuf)]
+      [("a", state.attnResidualBuf), ("b", state.normedBuf2), ("output", outputBuf)]
       (.dispatch1D cfg.hiddenSize)
   | _, _ => pure ()
 
@@ -1305,6 +1484,53 @@ def forwardSingleToken (device : Device) (model : Gemma4Model)
     [("input", state.buf1), ("output", state.buf2)]
     (.dispatch1D model.config.hiddenSize)
 
+  -- Step 1b: Per-layer input precomputation (gemma4-iswa.cpp:258-311)
+  -- The per_layer_token_embd table is too large (>2 GB) for a single GPU buffer
+  -- with the current Dawn limits, so we dequant just the input token's row on
+  -- CPU and upload (~43 KB).
+  match model.perLayerEmbdTableCPU, model.perLayerModelProj, model.perLayerProjNorm with
+  | some embdTableCPU, some modelProj, some projNorm =>
+    let embdPL := model.config.embdPerLayer
+    let nLayers := model.config.numHiddenLayers
+    let totalPL := embdPL * nLayers
+
+    -- 1) CPU dequant of per_layer_token_embd[tokenId] → row of `totalPL` floats
+    --    Scale by sqrt(embdPerLayer) on CPU as well
+    let rowOffset := tokenId * model.perLayerEmbdRowBytes
+    let rowFloats := dequantQ6KRowCPU embdTableCPU rowOffset totalPL
+    let scaleFactor : Float := Float.sqrt embdPL.toFloat
+    let scaledRow := rowFloats.map (· * scaleFactor)
+    let rowBytes ← floatArrayToBytes scaledRow
+    -- Upload to plModelProj (will hold the scaled token embedding)
+    writeBuffer device state.plModelProj 0 rowBytes
+
+    -- 2) per_layer_model_proj @ buf2 → plTokenSelected
+    --    modelProj is F16 [hiddenSize, totalPL] → use F16 matmul
+    let projConfig : Hesper.WGSL.MatMul.Config := {
+      M := 1, N := totalPL, K := model.config.hiddenSize
+    }
+    Hesper.WGSL.MatMul.executeMatMulTransposeF16 device state.buf2 modelProj state.plTokenSelected projConfig
+
+    -- 3) Scale plTokenSelected by 1/sqrt(hiddenSize) → plInputAll
+    Hesper.WGSL.Execute.executeShaderNamed device
+      (PerLayerEmbedding.scaleKernel totalPL (1.0 / Float.sqrt model.config.hiddenSize.toFloat))
+      [("input", state.plTokenSelected), ("output", state.plInputAll)]
+      (.dispatch1D totalPL)
+
+    -- 4) chunkedRMSNorm: per_layer_proj_norm over each embdPerLayer chunk
+    Hesper.WGSL.Execute.executeShaderNamed device
+      (chunkedRMSNormKernel embdPL nLayers model.config.rmsNormEps)
+      [("input", state.plInputAll), ("weight", projNorm.scale), ("output", state.plTokenSelected)]
+      { numWorkgroups := (nLayers, 1, 1), workgroupSize := { x := min embdPL 256, y := 1, z := 1 } : Execute.ExecutionConfig }
+    -- plTokenSelected now has projected+normed values
+
+    -- 5) (proj+norm) + scaled_token_embd, then * 1/sqrt(2) → plInputAll
+    Hesper.WGSL.Execute.executeShaderNamed device
+      (scaledAddKernel totalPL (1.0 / Float.sqrt 2.0))
+      [("a", state.plTokenSelected), ("b", state.plModelProj), ("output", state.plInputAll)]
+      (.dispatch1D totalPL)
+  | _, _, _ => pure ()
+
   -- Step 2: Process all transformer blocks (starting from buf2 as current)
   Hesper.WGSL.Execute.beginBatch device
 
@@ -1312,12 +1538,12 @@ def forwardSingleToken (device : Device) (model : Gemma4Model)
   let mut nextBuf := state.buf1
 
   let mut blockIdx := 0
+  let plInputBuf := if model.config.hasPerLayerEmbeddings then some state.plInputAll else none
   for block in model.blocks do
     let plEmbd := if blockIdx < model.perLayerBlocks.size then
       model.perLayerBlocks[blockIdx]!
     else none
-    forwardBlock device block model.config currentBuf nextBuf state pos plEmbd none
-    -- Swap buffers: write a fresh fresh-mut step
+    forwardBlock device block model.config currentBuf nextBuf state pos plEmbd plInputBuf
     let oldCb := currentBuf
     currentBuf := nextBuf
     nextBuf := oldCb
