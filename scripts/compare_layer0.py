@@ -46,14 +46,16 @@ MAPPING = [
     ("step_16_k_rope", "Kcur_pos-0", 512),
     ("step_17_v_proj", "Vcur-0", 512),
     ("step_18_v_norm", "Vcur_normed-0", 512),
-    ("step_22_o_proj", "kqv_out-0", 2560),
+    # Note: kqv_out-0 in llama is BEFORE O projection (numHeads*headDim=2048),
+    # attn_post_norm-0 is AFTER O projection + post_attn_norm (hiddenSize=2560).
+    # We compare step_23 (post_attn_norm) which implicitly verifies O proj.
     ("step_23_post_attn_norm", "attn_post_norm-0", 2560),
     ("step_24_attn_residual", "attn_out-0", 2560),
     ("step_30_ffn_norm", "ffn_norm-0", 2560),
     ("step_31_ffn_gate", "ffn_gate-0", 10240),
     ("step_32_ffn_up", "ffn_up-0", 10240),
     ("step_33_ffn_gelu", "ffn_geglu-0", 10240),
-    ("step_34_ffn_down", "ffn_out-0", 2560),
+    # ffn_out-0 in llama is empty (host memory optimization)
 ]
 
 

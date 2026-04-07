@@ -177,4 +177,72 @@ def main : IO Unit := do
     { numWorkgroups := (1, 1, 1), workgroupSize := { x := min vDim 256, y := 1, z := 1 } : Execute.ExecutionConfig }
   dumpBuffer device "step_18_v_norm" state.vBuf2 vDim
 
-  IO.println "Done with steps 1-18! Run: python3 scripts/compare_layer0.py"
+  -- ====================================================================
+  -- Steps 19-21: KV cache write + Flash Attention
+  -- ====================================================================
+  -- Write K and V to per-layer cache (using kvCache from state)
+  if h2 : state.kvCaches.size = 0 then
+    throw $ IO.userError "no kv caches"
+  else
+  let kvCache := state.kvCaches[0]'(by omega)
+  let kvDim := numKVHeads * headDim
+  let kvWriteBufs : List (String × Buffer) :=
+    [("new_k", state.kBuf), ("new_v", state.vBuf2),
+     ("k_cache", kvCache.kBuf), ("v_cache", kvCache.vBuf),
+     ("params", state.paramsBuf)]
+  Hesper.WGSL.Execute.executeShaderNamed device
+    (Hesper.Layers.Attention.fusedCacheWriteKVKernel numKVHeads cfg.maxSeqLen headDim kvDim)
+    kvWriteBufs
+    (.dispatch1D kvDim)
+
+  -- Flash attention for cacheLen=1
+  let scale := 1.0 / Float.sqrt headDim.toFloat
+  let attnBufs : List (String × Buffer) :=
+    [("q", state.qBuf), ("k_cache", kvCache.kBuf), ("v_cache", kvCache.vBuf), ("output", state.attnOutBuf)]
+  Hesper.WGSL.Execute.executeShaderNamed device
+    (Hesper.WGSL.FlashAttention.flashAttentionSWAKernel numHeads numKVHeads cfg.maxSeqLen headDim 1 cfg.slidingWindowSize 0 scale)
+    attnBufs
+    (Hesper.WGSL.Execute.ExecutionConfig.default (numHeads, 1, 1))
+  dumpBuffer device "step_21_attn_output" state.attnOutBuf (numHeads * headDim)
+
+  -- Step 22: O projection
+  Hesper.Layers.Linear.LinearLayer.forward device block.attention.wO state.attnOutBuf state.normedBuf
+  dumpBuffer device "step_22_o_proj" state.normedBuf cfg.hiddenSize
+
+  -- Step 23: post_attention_norm
+  Hesper.Layers.RMSNorm.forward device block.postAttnNorm state.normedBuf state.normedBuf2
+  dumpBuffer device "step_23_post_attn_norm" state.normedBuf2 cfg.hiddenSize
+
+  -- Step 24: + residual (= attn_out)
+  let resAttnBufs : List (String × Buffer) :=
+    [("a", state.normedBuf2), ("b", layerInput), ("output", state.attnResidualBuf)]
+  Hesper.WGSL.Execute.executeShaderNamed device
+    (Hesper.Models.Gemma4.residualAddKernel cfg.hiddenSize)
+    resAttnBufs
+    (.dispatch1D cfg.hiddenSize)
+  dumpBuffer device "step_24_attn_residual" state.attnResidualBuf cfg.hiddenSize
+
+  -- ====================================================================
+  -- Steps 30-34: GeGLU FFN
+  -- ====================================================================
+  Hesper.Layers.RMSNorm.forward device block.ffnNorm state.attnResidualBuf state.normedBuf
+  dumpBuffer device "step_30_ffn_norm" state.normedBuf cfg.hiddenSize
+
+  Hesper.Layers.Linear.LinearLayer.forward device block.ffn.gate state.normedBuf state.gateBuf
+  dumpBuffer device "step_31_ffn_gate" state.gateBuf cfg.intermediateSize
+
+  Hesper.Layers.Linear.LinearLayer.forward device block.ffn.up state.normedBuf state.upBuf
+  dumpBuffer device "step_32_ffn_up" state.upBuf cfg.intermediateSize
+
+  let geluBufs : List (String × Buffer) :=
+    [("gate", state.gateBuf), ("up", state.upBuf), ("output", state.geluBuf)]
+  Hesper.WGSL.Execute.executeShaderNamed device
+    (Hesper.Models.Gemma4.geluMulKernel cfg.intermediateSize)
+    geluBufs
+    (.dispatch1D cfg.intermediateSize)
+  dumpBuffer device "step_33_ffn_gelu" state.geluBuf cfg.intermediateSize
+
+  Hesper.Layers.Linear.LinearLayer.forward device block.ffn.down state.geluBuf state.ffnOutBuf
+  dumpBuffer device "step_34_ffn_down" state.ffnOutBuf cfg.hiddenSize
+
+  IO.println "Done with steps 1-34! Run: python3 scripts/compare_layer0.py"
