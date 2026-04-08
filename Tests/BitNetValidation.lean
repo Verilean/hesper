@@ -223,7 +223,7 @@ def main (args : List String) : IO UInt32 := do
     IO.println "  make golden-values"
     return 1
 
-  let modelPath := "../../data/gguf/ggml-model-i2_s.gguf"
+  let modelPath := "data/gguf/ggml-model-i2_s.gguf"
   let tests ← runValidation dataDir modelPath
 
   LSpec.lspecIO (.ofList [("BitNet Validation", [tests])]) ([] : List String)
