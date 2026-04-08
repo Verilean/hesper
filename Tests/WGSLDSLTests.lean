@@ -80,8 +80,8 @@ def testLiterals : TestSeq :=
   let boolLitTrue := litBool true
   let boolLitFalse := litBool false
 
-  test "f32 literal" (f32Lit.toWGSL == "3.140000") ++
-  test "f16 literal" (f16Lit.toWGSL == "2.500000h") ++
+  test "f32 literal" (f32Lit.toWGSL == "3.14e0") ++
+  test "f16 literal" (f16Lit.toWGSL == "2.5e0h") ++
   test "i32 literal" (i32Lit.toWGSL == "-42i") ++
   test "u32 literal" (u32Lit.toWGSL == "123u") ++
   test "bool literal (true)" (boolLitTrue.toWGSL == "true") ++
@@ -196,13 +196,13 @@ def testMathFunctions : TestSeq :=
   test "abs(x)" (absExpr.toWGSL == "abs(x)") ++
   test "min(x, y)" (minExpr.toWGSL == "min(x, y)") ++
   test "max(x, y)" (maxExpr.toWGSL == "max(x, y)") ++
-  test "clamp(x, 0.0, 1.0)" (clampExpr.toWGSL == "clamp(x, 0.000000, 1.000000)") ++
+  test "clamp(x, 0.0, 1.0)" (clampExpr.toWGSL == "clamp(x, 0.0, 1.0e0)") ++
   test "exp(x)" (expExpr.toWGSL == "exp(x)") ++
   test "sin(x)" (sinExpr.toWGSL == "sin(x)") ++
   test "cos(x)" (cosExpr.toWGSL == "cos(x)") ++
   test "tanh(x)" (tanhExpr.toWGSL == "tanh(x)") ++
   test "pow(x, y)" (powExpr.toWGSL == "pow(x, y)") ++
-  test "select(x > 0, x, 0)" (selectExpr.toWGSL == "select(0.000000, x, (x > 0.000000))")
+  test "select(x > 0, x, 0)" (selectExpr.toWGSL == "select(0.0, x, (x > 0.0))")
 
 -- Note: Vector builtins (dot, cross, length, normalize, etc.) are not yet exposed in the DSL
 -- Note: Matrix builtins (transpose, determinant) are not yet exposed in the DSL
@@ -281,13 +281,13 @@ def testVectorConstructors : TestSeq :=
 
   test "vec2(x, y)" (vec2FromScalars.toWGSL == "vec2<f32>(x, y)") ++
   test "vec2(x, x) splat" (vec2Splat.toWGSL == "vec2<f32>(x, x)") ++
-  test "vec2(1.0, 2.0)" (vec2Literals.toWGSL == "vec2<f32>(1.000000, 2.000000)") ++
+  test "vec2(1.0, 2.0)" (vec2Literals.toWGSL == "vec2<f32>(1.0e0, 2.0e0)") ++
   test "vec3(x, y, z)" (vec3FromScalars.toWGSL == "vec3<f32>(x, y, z)") ++
   test "vec3(x, x, x) splat" (vec3Splat.toWGSL == "vec3<f32>(x, x, x)") ++
-  test "vec3(x, 0.0, z)" (vec3Mixed.toWGSL == "vec3<f32>(x, 0.000000, z)") ++
+  test "vec3(x, 0.0, z)" (vec3Mixed.toWGSL == "vec3<f32>(x, 0.0, z)") ++
   test "vec4(x, y, z, w)" (vec4FromScalars.toWGSL == "vec4<f32>(x, y, z, w)") ++
   test "vec4(x, x, x, x) splat" (vec4Splat.toWGSL == "vec4<f32>(x, x, x, x)") ++
-  test "vec4(x, y, 0.0, 1.0)" (vec4Mixed.toWGSL == "vec4<f32>(x, y, 0.000000, 1.000000)")
+  test "vec4(x, y, 0.0, 1.0)" (vec4Mixed.toWGSL == "vec4<f32>(x, y, 0.0, 1.0e0)")
 
 -- ============================================================================
 -- Vector Accessor Tests
@@ -318,9 +318,9 @@ def testVectorAccessors : TestSeq :=
   test "v2.y" (v2y.toWGSL == "v2.y") ++
   test "v3.z" (v3z.toWGSL == "v3.z") ++
   test "v4.w" (v4w.toWGSL == "v4.w") ++
-  test "vec3(1,2,3).z" (complexZ.toWGSL == "vec3<f32>(1.000000, 2.000000, 3.000000).z") ++
-  test "vec4(1,2,3,4).w" (complexW.toWGSL == "vec4<f32>(1.000000, 2.000000, 3.000000, 4.000000).w") ++
-  test "vec2(5,6).x" (complexX.toWGSL == "vec2<f32>(5.000000, 6.000000).x") ++
+  test "vec3(1,2,3).z" (complexZ.toWGSL == "vec3<f32>(1.0e0, 2.0e0, 3.0e0).z") ++
+  test "vec4(1,2,3,4).w" (complexW.toWGSL == "vec4<f32>(1.0e0, 2.0e0, 3.0e0, 4.0e0).w") ++
+  test "vec2(5,6).x" (complexX.toWGSL == "vec2<f32>(5.0e0, 6.0e0).x") ++
   test "(v2 + v2).y" (complexY.toWGSL == "(v2 + v2).y")
 
 -- Note: Array indexing is not yet exposed in the DSL
@@ -450,7 +450,7 @@ def testComplexExpressions : TestSeq :=
 
   test "distance sqrt(x*x + y*y)" (distance.toWGSL == "sqrt(((x * x) + (y * y)))") ++
   test "normalized x / sqrt(x*x + y*y)" (normalized.toWGSL == "(x / sqrt(((x * x) + (y * y))))") ++
-  test "complex boolean condition" (complexCond.toWGSL == "(((x > 0.000000) && (y < 10.000000)) && ((x + y) > 1.000000))") ++
+  test "complex boolean condition" (complexCond.toWGSL == "(((x > 0.0) && (y < 1.0e1)) && ((x + y) > 1.0e0))") ++
   test "polynomial a*x^2 + b*x + c" (polynomial.toWGSL == "(((a * (x * x)) + (b * x)) + c)")
 
 -- ============================================================================
