@@ -5,12 +5,19 @@ import Hesper.WebGPU.Buffer
 import Hesper.WebGPU.BufferOps
 
 /-!
-# Gemma 4 — Run forwardBlock for ALL layers, dumping each layer output
+# Gemma 4 — pos=1 layer dump
 
-For each layer N from 0 to numHiddenLayers-1, dump the output to
-/tmp/hesper_dump/forward_layer{N}_out.bin
+Reproduces the bug where `pos > 0` breaks generation. The plan:
 
-Then compare against /tmp/llama_dump/l_out-{N}.bin to find where divergence occurs.
+1. Run a full `forwardSingleToken` at pos=0 with token 9259 ("Hello"). This
+   populates every layer's KV cache with the pos=0 entries.
+2. Run the transformer blocks manually at pos=1 with token 1902 (" world"),
+   dumping each layer's output to `/tmp/hesper_dump/forward_pos1_layerN_out.bin`.
+
+Then `scripts/compare_pos1.py` compares each dump against the second half of
+the corresponding llama.cpp `/tmp/llama_dump/l_out-N.bin` (which is shaped
+`[hiddenSize, 2]` because llama was invoked with prompt "Hello world" — the
+first half is pos=0, the second half is pos=1).
 -/
 
 open Hesper.WebGPU
@@ -35,12 +42,18 @@ def main : IO Unit := do
   IO.println s!"[Load] Loading model..."
   let model ← Gemma4Model.fromGGUF device modelPath
   let cfg := model.config
-  let tokenId := 9259  -- "Hello"
-  let pos := 0
-
   let state ← createInferenceState device cfg
 
-  -- Embedding lookup
+  -- Step 1: run pos=0 with token 9259 ("Hello") to populate the KV caches
+  IO.println "[pos=0] Running forwardSingleToken(token=9259, pos=0)"
+  forwardSingleToken device model 9259 0 state
+
+  -- Step 2: run pos=1 with token 1902 (" world"), dumping each layer output
+  IO.println "[pos=1] Running per-layer forward manually (token=1902, pos=1)"
+  let tokenId := 1902
+  let pos := 1
+
+  -- Embedding lookup: tokenBuf ← 1902, then buf1 ← embed[tokenBuf]
   let tokenBytes := Hesper.WebGPU.BufferOps.uint32ToBytes tokenId.toUInt32
   writeBuffer device state.tokenBuf 0 tokenBytes
   match model.embdFormat with
@@ -53,13 +66,14 @@ def main : IO Unit := do
   | _ =>
     Hesper.Layers.Embedding.forward device model.embedding state.tokenBuf state.buf1 1 1
 
-  -- Embedding scale: buf1 → buf2
+  -- Embedding scale buf1 → buf2
   let scaleBufs : List (String × Buffer) := [("input", state.buf1), ("output", state.buf2)]
   Hesper.WGSL.Execute.executeShaderNamed device
     (Hesper.Models.Gemma4.embeddingScaleKernel cfg.hiddenSize cfg.hiddenSize)
     scaleBufs (Hesper.WGSL.Execute.ExecutionConfig.dispatch1D cfg.hiddenSize)
+  dumpBuf device "/tmp/hesper_dump/forward_pos1_inp_scaled.bin" state.buf2 cfg.hiddenSize
 
-  -- Per-layer input precompute
+  -- Per-layer input precompute (same as forwardSingleToken / AllLayersDump)
   match model.perLayerEmbdTableCPU, model.perLayerModelProj, model.perLayerProjNorm with
   | some embdTableCPU, some modelProj, some projNorm =>
     let embdPL := cfg.embdPerLayer
@@ -93,7 +107,7 @@ def main : IO Unit := do
       addBufs (Hesper.WGSL.Execute.ExecutionConfig.dispatch1D totalPL)
   | _, _, _ => pure ()
 
-  -- Run all layers, dumping after each
+  -- Run all layers at pos=1, dumping each layer output
   let mut currentBuf := state.buf2
   let mut nextBuf := state.buf1
   let plInputBuf := if cfg.hasPerLayerEmbeddings then some state.plInputAll else none
@@ -103,35 +117,9 @@ def main : IO Unit := do
       let block := model.blocks[i]
       let plEmbd := if hp : i < model.perLayerBlocks.size then model.perLayerBlocks[i] else none
       forwardBlock device block cfg currentBuf nextBuf state pos plEmbd plInputBuf
-      -- Dump nextBuf (which now contains layer i's output)
-      dumpBuf device s!"/tmp/hesper_dump/forward_layer{i}_out.bin" nextBuf cfg.hiddenSize
+      dumpBuf device s!"/tmp/hesper_dump/forward_pos1_layer{i}_out.bin" nextBuf cfg.hiddenSize
       let tmp := currentBuf
       currentBuf := nextBuf
       nextBuf := tmp
-      if i % 5 == 0 || i == cfg.numHiddenLayers - 1 then
-        IO.println s!"  Dumped layer {i}"
 
-  -- Final norm + LM head so we can compare against llama's result_norm / result_output
-  Hesper.Layers.RMSNorm.forward device model.finalNorm currentBuf nextBuf
-  dumpBuf device "/tmp/hesper_dump/result_norm.bin" nextBuf cfg.hiddenSize
-
-  match model.embdFormat with
-  | .Q6_K =>
-    let lmBufs : List (String × Buffer) :=
-      [("weights", model.outputWeight), ("input", nextBuf), ("output", state.logitsBuf)]
-    let gridX : Nat := 4096
-    let gridY : Nat := (cfg.vocabSize + gridX - 1) / gridX
-    Hesper.WGSL.Execute.executeShaderNamed device
-      (Hesper.Quantization.Q6_K.fusedQ6KLinearKernel cfg.hiddenSize cfg.vocabSize 256 gridX)
-      lmBufs
-      { numWorkgroups := (gridX, gridY, 1)
-        workgroupSize := { x := 256, y := 1, z := 1 }
-        : Hesper.WGSL.Execute.ExecutionConfig }
-  | _ =>
-    let lmHeadConfig : Hesper.WGSL.MatMul.Config := {
-      M := 1, N := cfg.vocabSize, K := cfg.hiddenSize
-    }
-    Hesper.WGSL.MatMul.executeMatMulTranspose device nextBuf model.outputWeight state.logitsBuf lmHeadConfig
-  dumpBuf device "/tmp/hesper_dump/result_output.bin" state.logitsBuf cfg.vocabSize
-
-  IO.println "Done! Compare with: python3 scripts/compare_all_layers.py"
+  IO.println "Done! Compare with: python3 scripts/compare_pos1.py"

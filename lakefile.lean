@@ -818,6 +818,21 @@ lean_exe «gemma4-all-layers-dump» where
   supportInterpreter := false
   moreLinkArgs := stdLinkArgs
 
+lean_exe «gemma4-layer5-dump» where
+  root := `Examples.Gemma4Layer5Dump
+  supportInterpreter := false
+  moreLinkArgs := stdLinkArgs
+
+lean_exe «gemma4-pos1-dump» where
+  root := `Examples.Gemma4Pos1Dump
+  supportInterpreter := false
+  moreLinkArgs := stdLinkArgs
+
+lean_exe «flash-attn-shader-dump» where
+  root := `Examples.FlashAttnShaderDump
+  supportInterpreter := false
+  moreLinkArgs := stdLinkArgs
+
 -- ----------------------------------------------------------------------------
 -- Training (LoRA Finetuning)
 -- ----------------------------------------------------------------------------
