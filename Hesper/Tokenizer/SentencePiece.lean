@@ -275,11 +275,15 @@ def createVocabFromGGUF (gguf : GGUFFile) : IO Vocab := do
 
 /-- Normalize text: add space marker, handle special cases -/
 def normalizeText (vocab : Vocab) (text : String) : String :=
-  -- Add space marker at beginning if not present
-  let text := if text.startsWith " " then text else " " ++ text
-  -- BPE uses Ġ (U+0120), SentencePiece uses ▁ (U+2581)
-  let spaceMarker := if vocab.usesBPE then "Ġ" else "▁"
-  text.replace " " spaceMarker
+  if vocab.usesBPE then
+    -- BPE tokenizers (e.g. Gemma 4) do NOT prepend a leading space:
+    -- llama.cpp tokenize "Hello" → [9259] where 9259 = "Hello" (no Ġ).
+    -- Only interior spaces become Ġ.
+    text.replace " " "Ġ"
+  else
+    -- SentencePiece prepends a leading ▁ even if the text doesn't start with a space.
+    let text := if text.startsWith " " then text else " " ++ text
+    text.replace " " "▁"
 
 /-- Find longest matching token piece starting at position -/
 partial def findLongestMatch (vocab : Vocab) (text : String) (startPos : Nat) : Option (Nat × Nat) :=
@@ -376,16 +380,30 @@ def decode (tokenizer : Tokenizer) (tokens : Array Nat) : String :=
 
 /-! ## Tokenizer Creation -/
 
-/-- Create tokenizer from GGUF file -/
-def fromGGUF (gguf : GGUFFile) (addBos : Bool := true) (addEos : Bool := false)
+/-- Create tokenizer from GGUF file.
+    `addBos` / `addEos` defaults mirror what the GGUF metadata requests
+    (`tokenizer.ggml.add_bos_token`, `tokenizer.ggml.add_eos_token`), falling
+    back to `true` / `false` if the keys are absent. This matches how
+    llama.cpp behaves. -/
+def fromGGUF (gguf : GGUFFile) (addBos : Option Bool := none) (addEos : Option Bool := none)
     : IO Tokenizer := do
   let vocab ← createVocabFromGGUF gguf
 
-  IO.println "[Tokenizer] Tokenizer created successfully"
+  -- Read `tokenizer.ggml.add_bos_token` / `add_eos_token` (stored as u8/bool).
+  -- metadata values are little-endian bytes; bool is 1 byte.
+  let readBool (key : String) : Option Bool :=
+    match gguf.metadata.find? (·.1 == key) with
+    | some (_, mv) =>
+      if mv.data.size >= 1 then some (mv.data[0]! != 0) else none
+    | none => none
+  let addBosFinal := addBos.getD ((readBool "tokenizer.ggml.add_bos_token").getD true)
+  let addEosFinal := addEos.getD ((readBool "tokenizer.ggml.add_eos_token").getD false)
+
+  IO.println s!"[Tokenizer] addBos={addBosFinal}, addEos={addEosFinal}"
   return {
     vocab := vocab
-    addBos := addBos
-    addEos := addEos
+    addBos := addBosFinal
+    addEos := addEosFinal
   }
 
 /-! ## Utilities -/

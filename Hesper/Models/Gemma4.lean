@@ -1673,7 +1673,8 @@ def forwardSingleToken (device : Device) (model : Gemma4Model)
 -/
 def generate (device : Device) (model : Gemma4Model)
     (promptTokens : Array Nat) (maxTokens : Nat)
-    (eosToken : Option Nat := none) : IO (Array Nat) := do
+    (eosToken : Option Nat := none)
+    (extraEosTokens : Array Nat := #[]) : IO (Array Nat) := do
   IO.println s!"[Gemma4] Generating: {promptTokens.size} prompt tokens, max {maxTokens} new tokens"
 
   -- Create inference state
@@ -1705,10 +1706,13 @@ def generate (device : Device) (model : Gemma4Model)
     tokens := tokens.push nextToken
     genCount := genCount + 1
 
-    -- Check EOS
+    -- Check EOS (primary + extras, e.g. Gemma 4's <end_of_turn> = 106)
+    let mut stop := false
     match eosToken with
-    | some eos => if nextToken == eos then break
+    | some eos => if nextToken == eos then stop := true
     | none => pure ()
+    if extraEosTokens.any (· == nextToken) then stop := true
+    if stop then break
 
     -- Forward pass for next token
     let newPos := tokens.size - 1
