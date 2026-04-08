@@ -1,5 +1,7 @@
 import Hesper
 import Hesper.Models.Gemma4
+import Hesper.Tokenizer.SentencePiece
+import Hesper.GGUF.Parser
 import Hesper.WebGPU.Device
 import Hesper.WebGPU.Types
 
@@ -18,6 +20,16 @@ def main (args : List String) : IO Unit := do
   let ggufPath := args.getD 0 "data/gemma-4-e4b-it-Q4_K_M.gguf"
   let prompt := args.getD 1 "Hello"
   let maxTokens := (args.getD 2 "10").toNat!
+  -- If args[3] starts with "ids:" it's a comma-separated list of token IDs
+  -- (e.g. "ids:2,105,2364,107,9259,106,107,105,4368,107"). Skips tokenization.
+  let rawTokens : Option (Array Nat) :=
+    match args[3]? with
+    | some s =>
+      if s.startsWith "ids:" then
+        let rest := (s.toList.drop 4).asString
+        some ((rest.splitOn ",").toArray.map (fun x => x.toNat!))
+      else none
+    | none => none
 
   IO.println "═══════════════════════════════════════════"
   IO.println "  Gemma 4 E2E Inference Test"
@@ -43,14 +55,33 @@ def main (args : List String) : IO Unit := do
   IO.println s!"[Config] experts={model.config.numExperts}, embdPerLayer={model.config.embdPerLayer}"
   IO.println s!"[Config] slidingWindow={model.config.slidingWindowSize}, kvShared={model.config.numKVSharedLayers}"
 
-  -- Step 3: Simple token test (use BOS token as prompt for now)
-  -- Gemma 4 tokenizer: BOS=2, EOS=1
-  let promptTokens := #[2]  -- BOS token
-  IO.println s!"[Tokens] Prompt tokens: {promptTokens}"
+  -- Step 3: Load tokenizer from the same GGUF and encode the prompt
+  IO.println "[Tokenize] Loading tokenizer from GGUF..."
+  let ggufData ← IO.FS.readBinFile ggufPath
+  let gguf ← match Hesper.GGUF.Parser.parseGGUF ggufData with
+    | .ok g => pure g
+    | .error e => throw <| IO.userError s!"Failed to parse GGUF: {e}"
+  let tokenizer ← Hesper.Tokenizer.SentencePiece.fromGGUF gguf
+  let promptTokens ← match rawTokens with
+    | some ids => do
+      IO.println s!"[Tokens] Using raw token IDs: {ids}"
+      pure ids
+    | none => do
+      let ts := Hesper.Tokenizer.SentencePiece.encode tokenizer prompt
+      IO.println s!"[Tokens] Prompt '{prompt}' → {ts}"
+      pure ts
 
   -- Step 4: Generate
-  let tokens ← Hesper.Models.Gemma4.generate device model promptTokens maxTokens (eosToken := some 1)
+  -- Gemma 4 uses <end_of_turn> (id 106) in chat format, plus <eos> (id 1).
+  -- Stop on whichever comes first.
+  let eosId := tokenizer.vocab.eosToken.getD 1
+  let tokens ← Hesper.Models.Gemma4.generate device model promptTokens maxTokens
+    (eosToken := some eosId) (extraEosTokens := #[106])
 
   IO.println ""
   IO.println s!"[Result] Generated tokens: {tokens}"
+  -- Decode just the generated portion (skip the prompt tokens)
+  let generated := tokens.extract promptTokens.size tokens.size
+  let decoded := Hesper.Tokenizer.SentencePiece.decode tokenizer generated
+  IO.println s!"[Result] Decoded: {decoded}"
   IO.println "Done!"
