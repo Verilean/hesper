@@ -118,6 +118,17 @@ def Config.isFullAttention (c : Config) (layerIdx : Nat) : Bool :=
 def Config.hasKV (c : Config) (layerIdx : Nat) : Bool :=
   layerIdx < c.numHiddenLayers - c.numKVSharedLayers
 
+/-- For KV-shared layers, return the index of the earlier layer whose KV cache is reused.
+    Mirrors llama.cpp's Gemma 4 layer_reuse_cb (see llama-model.cpp:8355):
+      reuse(il) = n_layer_kv_from_start - (is_swa(il) ? 2 : 1)    if il >= n_layer_kv_from_start
+                = il                                              otherwise
+    The reused layer is always in [0, n_layer_kv_from_start), i.e. it has its own KV cache. -/
+def Config.kvCacheLayer (c : Config) (layerIdx : Nat) : Nat :=
+  if c.hasKV layerIdx then layerIdx
+  else
+    let firstShared := c.numHiddenLayers - c.numKVSharedLayers
+    if c.isFullAttention layerIdx then firstShared - 1 else firstShared - 2
+
 /-- Check if per-layer embeddings are enabled -/
 def Config.hasPerLayerEmbeddings (c : Config) : Bool :=
   c.embdPerLayer > 0
@@ -1107,6 +1118,7 @@ structure InferenceState where
   vBuf2 : Buffer            -- [maxKVDim] alternate V buffer
   normedBuf2 : Buffer       -- [hiddenSize] alternate normed buffer
   logitsBuf : Buffer     -- [vocabSize]
+  logitsBuf2 : Buffer    -- [vocabSize] scratch for logit softcap (no aliasing)
   tokenBuf : Buffer      -- [1] u32 for single token
   paramsBuf : Buffer     -- [2] u32: (pos, cacheLen) for RoPE
   -- MoE buffers
@@ -1168,6 +1180,7 @@ def createInferenceState (device : Device) (cfg : Config) : IO InferenceState :=
     vBuf2 := ← mkBuf maxKVDim
     normedBuf2 := ← mkBuf cfg.hiddenSize
     logitsBuf := ← mkBuf cfg.vocabSize
+    logitsBuf2 := ← mkBuf cfg.vocabSize
     tokenBuf := ← createBuffer device { size := 4, usage := [.storage, .copySrc, .copyDst], mappedAtCreation := false }
     paramsBuf := ← createBuffer device { size := 8, usage := [.storage, .copySrc, .copyDst], mappedAtCreation := false }
     moeRouterOutBuf := ← mkBuf cfg.hiddenSize
@@ -1263,15 +1276,26 @@ def forwardBlock (device : Device) (block : Gemma4Block) (cfg : Config)
 
   if cfg.hasKV li then
     -- RoPE on K: kBuf2 → kBuf
-    let ropeConfig : RoPE.Config := { dim := numKVHeads * headDim, maxSeqLen := cfg.maxSeqLen, base := cfg.ropeTheta }
-    Hesper.WGSL.Execute.executeShaderNamed device
-      (RoPE.ropeKernelDynamic ropeConfig 1 1 numKVHeads headDim)
-      [("input", state.kBuf2), ("output", state.kBuf), ("params", state.paramsBuf)]
-      (.dispatch1D (numKVHeads * headDim / 2))
+    -- Must mirror Q's RoPE branch: full attention layers use freq_factors,
+    -- otherwise Q and K end up rotated with different frequencies (mismatch).
+    match block.ropeFreqFactors with
+    | some freqFactors =>
+      Hesper.WGSL.Execute.executeShaderNamed device
+        (ropeWithFreqFactorsKernel headDim numKVHeads cfg.ropeTheta)
+        [("input", state.kBuf2), ("output", state.kBuf), ("params", state.paramsBuf), ("freq_factors", freqFactors)]
+        (.dispatch1D (numKVHeads * headDim / 2))
+    | none =>
+      let ropeConfig : RoPE.Config := { dim := numKVHeads * headDim, maxSeqLen := cfg.maxSeqLen, base := cfg.ropeTheta }
+      Hesper.WGSL.Execute.executeShaderNamed device
+        (RoPE.ropeKernelDynamic ropeConfig 1 1 numKVHeads headDim)
+        [("input", state.kBuf2), ("output", state.kBuf), ("params", state.paramsBuf)]
+        (.dispatch1D (numKVHeads * headDim / 2))
 
   -- Step 5: Write K/V to cache and compute flash attention
-  if h : li < state.kvCaches.size then
-    let kvCache := state.kvCaches[li]
+  -- KV-shared layers reuse an earlier layer's cache (see Config.kvCacheLayer).
+  let kvLi := cfg.kvCacheLayer li
+  if h : kvLi < state.kvCaches.size then
+    let kvCache := state.kvCaches[kvLi]
     let kvDim := numKVHeads * headDim
     let cacheLen := pos + 1  -- number of cached positions including current
 
@@ -1286,7 +1310,11 @@ def forwardBlock (device : Device) (block : Gemma4Block) (cfg : Config)
         (.dispatch1D kvDim)
 
     -- Flash attention: Q @ K_cache^T → softmax → @ V_cache → output
-    let scale := 1.0 / Float.sqrt headDim.toFloat
+    -- Gemma 4 uses hparams.f_attention_scale = 1.0 (NOT the usual 1/sqrt(headDim)),
+    -- because the Q-norm RMSNorm already normalizes each head, so the dot product
+    -- magnitudes are bounded without the 1/sqrt(headDim) temperature.
+    -- See llama.cpp llama-model.cpp:1272 and gemma4-iswa.cpp:94.
+    let scale : Float := 1.0
     match block.layerType with
     | .swa =>
       -- Sliding window attention: only attend within windowSize
@@ -1597,29 +1625,39 @@ def forwardSingleToken (device : Device) (model : Gemma4Model)
   RMSNorm.forward device model.finalNorm currentBuf nextBuf
 
   -- Step 4: LM head matmul (1 × hiddenSize @ hiddenSize × vocabSize)
-  -- For Q6_K embedding (weight-tied LM head), use fused Q6_K matmul
+  -- For Q6_K embedding (weight-tied LM head), use fused Q6_K matmul.
+  -- IMPORTANT: the fused kernel is "one workgroup per output row" with 256
+  -- cooperating threads, so we need numWorkgroups = vocabSize (not dispatch1D,
+  -- which would give ceil(vocabSize/256) and leave most logits unwritten).
   match model.embdFormat with
   | .Q6_K =>
+    -- 2D dispatch because vocabSize (262144) exceeds the 65535 per-dimension limit.
+    let gridX : Nat := 4096
+    let gridY : Nat := (model.config.vocabSize + gridX - 1) / gridX
     Hesper.WGSL.Execute.executeShaderNamed device
-      (Hesper.Quantization.Q6_K.fusedQ6KLinearKernel model.config.hiddenSize model.config.vocabSize)
+      (Hesper.Quantization.Q6_K.fusedQ6KLinearKernel model.config.hiddenSize model.config.vocabSize 256 gridX)
       [("weights", model.outputWeight), ("input", nextBuf), ("output", state.logitsBuf)]
-      (.dispatch1D model.config.vocabSize)
+      { numWorkgroups := (gridX, gridY, 1)
+        workgroupSize := { x := 256, y := 1, z := 1 }
+        : Hesper.WGSL.Execute.ExecutionConfig }
   | _ =>
     let lmHeadConfig : Hesper.WGSL.MatMul.Config := {
       M := 1, N := model.config.vocabSize, K := model.config.hiddenSize
     }
     Hesper.WGSL.MatMul.executeMatMulTranspose device nextBuf model.outputWeight state.logitsBuf lmHeadConfig
 
-  -- Step 5: Logit softcapping
-  -- Need a separate output buffer to avoid aliasing.
-  -- Reuse buf1 (size hiddenSize=2560 < vocabSize=262144) — won't fit.
-  -- Skip softcap for now and apply on CPU after download instead.
-  -- if model.config.logitSoftcapScale > 0.0 then
-  --   Hesper.WGSL.Execute.executeShaderNamed device
-  --     (logitSoftcapKernel model.config.vocabSize model.config.logitSoftcapScale)
-  --     [("input", state.logitsBuf), ("output", state.logitsBuf)]
-  --     (.dispatch1D model.config.vocabSize)
-  pure ()
+  -- Step 5: Logit softcapping (y = scale * tanh(x / scale))
+  -- Uses logitsBuf2 as scratch (WebGPU forbids input/output aliasing), then
+  -- copies the result back into logitsBuf so callers see the softcapped logits.
+  if model.config.logitSoftcapScale > 0.0 then
+    Hesper.WGSL.Execute.executeShaderNamed device
+      (logitSoftcapKernel model.config.vocabSize model.config.logitSoftcapScale)
+      [("input", state.logitsBuf), ("output", state.logitsBuf2)]
+      (.dispatch1D model.config.vocabSize)
+    Hesper.WGSL.Execute.executeShaderNamed device
+      (PerLayerEmbedding.scaleKernel model.config.vocabSize 1.0)
+      [("input", state.logitsBuf2), ("output", state.logitsBuf)]
+      (.dispatch1D model.config.vocabSize)
 
   Hesper.WGSL.Execute.endBatch device
 

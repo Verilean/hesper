@@ -143,44 +143,38 @@ def flashAttentionDynamicKernel (numHeads numKVHeads maxSeqLen headDim cacheLen 
   let _vCache ← ShaderM.declareInputBuffer "v_cache" (.array (.scalar .f32) (numKVHeads * maxSeqLen * headDim))
   let _output ← ShaderM.declareOutputBuffer "output" (.array (.scalar .f32) (numHeads * headDim))
 
-  -- Shared memory for partial score reduction and Q cache
+  -- Shared memory for partial score reduction, Q cache, and per-dim output accumulator
+  -- shared_out lets us support headDim > workgroupSize: each thread handles
+  -- multiple output dims via a strided loop (d = tid, tid+wgSize, tid+2*wgSize, ...).
   ShaderM.sharedNamed "shared_q" (.array (.scalar .f32) headDim)
   ShaderM.sharedNamed "shared_reduce" (.array (.scalar .f32) workgroupSize)
+  ShaderM.sharedNamed "shared_out" (.array (.scalar .f32) headDim)
 
   -- No bounds check needed: numWorkgroups == numHeads, all workgroups are valid
   -- (Removing if_ avoids WGSL "barrier in non-uniform control flow" error)
   do
-    -- Step 1: Load Q for this head into shared memory
+    -- Step 1: Load Q for this head into shared memory and zero out the output accumulator
     let qBase := Exp.mul head (Exp.litU32 headDim)
     ShaderM.loop tid (Exp.litU32 headDim) (Exp.litU32 workgroupSize) fun d => do
       let qVal ← ShaderM.readBuffer (ty := .scalar .f32) (n := numHeads * headDim) "q" (Exp.add qBase d)
       ShaderM.writeWorkgroup (ty := .scalar .f32) "shared_q" d qVal
+      ShaderM.writeWorkgroup (ty := .scalar .f32) "shared_out" d (Exp.litF32 0.0)
     ShaderM.barrier
 
-    -- Step 2: Online softmax over cached positions
-    -- Each thread maintains partial accumulator for a subset of headDim
-    -- Thread tid accumulates output[tid], output[tid+workgroupSize], etc.
-
-    -- Online softmax state (per-thread, but shared via reduction for score computation)
+    -- Online softmax state (per-thread, but identical across threads after the
+    -- score reduction since every thread reads the same scoreFromShared).
     ShaderM.varNamed "max_score" (.scalar .f32) (Exp.litF32 (-1.0e30))
     ShaderM.varNamed "sum_exp" (.scalar .f32) (Exp.litF32 0.0)
     let maxScore := Exp.var "max_score"
     let sumExp := Exp.var "sum_exp"
 
-    -- Output accumulator (per-thread dimension elements)
-    -- Each thread handles dimensions tid, tid+workgroupSize, ...
-    -- For simplicity with headDim <= workgroupSize, each thread handles 1 dim
-    ShaderM.varNamed "out_acc" (.scalar .f32) (Exp.litF32 0.0)
-    let outAcc := Exp.var "out_acc"
-
     -- Iterate over ALL positions up to maxSeqLen (uniform loop bound)
-    -- Use if-guard to skip positions beyond actual cacheLen
-    -- This ensures workgroupBarrier is in uniform control flow
     -- cacheLen is compile-time constant (shader recompiled per position, cached by pipeline cache)
     ShaderM.loop (Exp.litU32 0) (Exp.litU32 cacheLen) (Exp.litU32 1) fun s => do
       let kBase := Exp.add (Exp.mul (Exp.mul kvHead (Exp.litU32 maxSeqLen)) (Exp.litU32 headDim))
                             (Exp.mul s (Exp.litU32 headDim))
 
+      -- Score = Q · K (dot product across full headDim)
       let partialVar ← ShaderM.var (.scalar .f32) (Exp.litF32 0.0)
       ShaderM.loop tid (Exp.litU32 headDim) (Exp.litU32 workgroupSize) fun d => do
         let qVal ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := headDim) "shared_q" d
@@ -213,23 +207,27 @@ def flashAttentionDynamicKernel (numHeads numKVHeads maxSeqLen headDim cacheLen 
       let expNew := Exp.exp (Exp.sub scaledScore newMax)
       let newSum := Exp.add (Exp.mul oldSum expOld) expNew
 
-      ShaderM.if_ (Exp.lt tid (Exp.litU32 headDim)) (do
-        let vIdx := Exp.add kBase tid
-        let vVal ← ShaderM.readBuffer (ty := .scalar .f32) (n := numKVHeads * maxSeqLen * headDim) "v_cache" vIdx
-        let rescaled := Exp.mul outAcc (Exp.div (Exp.mul oldSum expOld) newSum)
-        let newContrib := Exp.mul vVal (Exp.div expNew newSum)
-        ShaderM.assign "out_acc" (Exp.add rescaled newContrib)
-      ) (pure ())
+      let rescaleFactor := Exp.div (Exp.mul oldSum expOld) newSum
+      let contribFactor := Exp.div expNew newSum
+
+      -- Update output accumulator across ALL dims via strided loop.
+      -- All threads agree on rescaleFactor / contribFactor since the reduction
+      -- broadcasts the same scoreFromShared to every thread.
+      ShaderM.loop tid (Exp.litU32 headDim) (Exp.litU32 workgroupSize) fun d => do
+        let vVal ← ShaderM.readBuffer (ty := .scalar .f32) (n := numKVHeads * maxSeqLen * headDim) "v_cache" (Exp.add kBase d)
+        let prev ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := headDim) "shared_out" d
+        let updated := Exp.add (Exp.mul prev rescaleFactor) (Exp.mul vVal contribFactor)
+        ShaderM.writeWorkgroup (ty := .scalar .f32) "shared_out" d updated
 
       ShaderM.assign "max_score" newMax
       ShaderM.assign "sum_exp" newSum
       ShaderM.barrier
 
-    -- Step 3: Write output
-    ShaderM.if_ (Exp.lt tid (Exp.litU32 headDim)) (do
-      let outIdx := Exp.add (Exp.mul head (Exp.litU32 headDim)) tid
-      ShaderM.writeBuffer (ty := .scalar .f32) "output" outIdx outAcc
-    ) (pure ())
+    -- Step 3: Write output (strided loop covers all headDim elements)
+    ShaderM.loop tid (Exp.litU32 headDim) (Exp.litU32 workgroupSize) fun d => do
+      let v ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := headDim) "shared_out" d
+      let outIdx := Exp.add (Exp.mul head (Exp.litU32 headDim)) d
+      ShaderM.writeBuffer (ty := .scalar .f32) "output" outIdx v
 
 /-! ## Dynamic Flash Attention with params buffer (production) -/
 
@@ -726,13 +724,15 @@ def flashAttentionSWAKernel (numHeads numKVHeads maxSeqLen headDim cacheLen wind
 
   ShaderM.sharedNamed "shared_q" (.array (.scalar .f32) headDim)
   ShaderM.sharedNamed "shared_reduce" (.array (.scalar .f32) workgroupSize)
+  ShaderM.sharedNamed "shared_out" (.array (.scalar .f32) headDim)
 
   do
-    -- Load Q into shared memory
+    -- Load Q into shared memory and zero shared_out
     let qBase := Exp.mul head (Exp.litU32 headDim)
     ShaderM.loop tid (Exp.litU32 headDim) (Exp.litU32 workgroupSize) fun d => do
       let qVal ← ShaderM.readBuffer (ty := .scalar .f32) (n := numHeads * headDim) "q" (Exp.add qBase d)
       ShaderM.writeWorkgroup (ty := .scalar .f32) "shared_q" d qVal
+      ShaderM.writeWorkgroup (ty := .scalar .f32) "shared_out" d (Exp.litF32 0.0)
     ShaderM.barrier
 
     -- Online softmax state
@@ -740,8 +740,6 @@ def flashAttentionSWAKernel (numHeads numKVHeads maxSeqLen headDim cacheLen wind
     ShaderM.varNamed "sum_exp" (.scalar .f32) (Exp.litF32 0.0)
     let maxScore := Exp.var "max_score"
     let sumExp := Exp.var "sum_exp"
-    ShaderM.varNamed "out_acc" (.scalar .f32) (Exp.litF32 0.0)
-    let outAcc := Exp.var "out_acc"
 
     -- Sliding window: only attend to [windowStart, cacheLen)
     let windowStart := if currentPos + 1 > windowSize then currentPos + 1 - windowSize else 0
@@ -784,22 +782,23 @@ def flashAttentionSWAKernel (numHeads numKVHeads maxSeqLen headDim cacheLen wind
       let expNew := Exp.exp (Exp.sub scaledScore newMax)
       let newSum := Exp.add (Exp.mul oldSum expOld) expNew
 
-      ShaderM.if_ (Exp.lt tid (Exp.litU32 headDim)) (do
-        let vIdx := Exp.add kBase tid
-        let vVal ← ShaderM.readBuffer (ty := .scalar .f32) (n := numKVHeads * maxSeqLen * headDim) "v_cache" vIdx
-        let rescaled := Exp.mul outAcc (Exp.div (Exp.mul oldSum expOld) newSum)
-        let newContrib := Exp.mul vVal (Exp.div expNew newSum)
-        ShaderM.assign "out_acc" (Exp.add rescaled newContrib)
-      ) (pure ())
+      let rescaleFactor := Exp.div (Exp.mul oldSum expOld) newSum
+      let contribFactor := Exp.div expNew newSum
+
+      ShaderM.loop tid (Exp.litU32 headDim) (Exp.litU32 workgroupSize) fun d => do
+        let vVal ← ShaderM.readBuffer (ty := .scalar .f32) (n := numKVHeads * maxSeqLen * headDim) "v_cache" (Exp.add kBase d)
+        let prev ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := headDim) "shared_out" d
+        let updated := Exp.add (Exp.mul prev rescaleFactor) (Exp.mul vVal contribFactor)
+        ShaderM.writeWorkgroup (ty := .scalar .f32) "shared_out" d updated
 
       ShaderM.assign "max_score" newMax
       ShaderM.assign "sum_exp" newSum
       ShaderM.barrier
 
-    -- Write output
-    ShaderM.if_ (Exp.lt tid (Exp.litU32 headDim)) (do
-      let outIdx := Exp.add (Exp.mul head (Exp.litU32 headDim)) tid
-      ShaderM.writeBuffer (ty := .scalar .f32) "output" outIdx outAcc
-    ) (pure ())
+    -- Write output (strided loop covers all headDim elements)
+    ShaderM.loop tid (Exp.litU32 headDim) (Exp.litU32 workgroupSize) fun d => do
+      let v ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := headDim) "shared_out" d
+      let outIdx := Exp.add (Exp.mul head (Exp.litU32 headDim)) d
+      ShaderM.writeBuffer (ty := .scalar .f32) "output" outIdx v
 
 end Hesper.WGSL.FlashAttention

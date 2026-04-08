@@ -23,8 +23,7 @@ echo "[3/4] Running llama-eval-callback on prompt 'Hello'..."
   -p "Hello" \
   -n 1 \
   --seed 42 \
-  --temp 0 \
-  --no-warmup 2>&1 | grep -E '\[DUMP\]|number of input tokens' | head -100
+  --temp 0 2>&1 | grep -E '\[DUMP\]|number of input tokens' | head -200
 
 echo "[4/4] Listing dumped files..."
 ls -la "$DUMP_DIR/" | head -50
