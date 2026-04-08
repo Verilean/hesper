@@ -65,11 +65,18 @@ def blockSizeBytes : Nat := 210  -- 128 + 64 + 16 + 2
     @param inDim Input dimension
     @param outDim Output dimension
     @param workgroupSize Threads per workgroup
+
+    Supports 2D workgroup grids (wid.x + wid.y * gridX) so that outDim can
+    exceed WebGPU's per-dimension limit of 65535 (e.g. vocabSize=262144 for
+    the Gemma 4 LM head). Pass `gridX=0` to use a 1D grid (outIdx = wid.x).
 -/
-def fusedQ6KLinearKernel (inDim outDim : Nat) (workgroupSize : Nat := 256) : ShaderM Unit := do
+def fusedQ6KLinearKernel (inDim outDim : Nat) (workgroupSize : Nat := 256)
+    (gridX : Nat := 0) : ShaderM Unit := do
   let wid ← ShaderM.workgroupId
   let lid ← ShaderM.localId
-  let outIdx := Exp.vec3X wid
+  let outIdx :=
+    if gridX == 0 then Exp.vec3X wid
+    else Exp.add (Exp.vec3X wid) (Exp.mul (Exp.vec3Y wid) (Exp.litU32 gridX))
   let tid := Exp.vec3X lid
 
   let blocksPerRow := inDim / blockSize
