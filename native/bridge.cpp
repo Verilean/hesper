@@ -600,12 +600,22 @@ static FeatureLevel getFeatureLevel() {
 
 // Shared device creation: max limits, feature level from env or autodetect
 static wgpu::Device createDeviceWithMaxLimits(wgpu::Adapter& adapter) {
-    // Toggles: enable experimental APIs for subgroup matrix
+    // Toggles:
+    //   allow_unsafe_apis         — lets us request experimental features
+    //                               like ChromiumExperimentalSubgroupMatrix
+    //   use_vulkan_memory_model   — required for subgroup matrix on Vulkan
+    //                               (NVIDIA/AMD). Dawn hard-errors with
+    //                               "SubgroupMatrix requires VulkanMemoryModel
+    //                               toggle on Vulkan" without it. Ignored on
+    //                               non-Vulkan backends.
     static WGPUDawnTogglesDescriptor toggles = {};
     toggles.chain.sType = WGPUSType_DawnTogglesDescriptor;
-    static const char* enableList[] = {"allow_unsafe_apis"};
+    static const char* enableList[] = {
+        "allow_unsafe_apis",
+        "use_vulkan_memory_model",
+    };
     toggles.enabledToggles = enableList;
-    toggles.enabledToggleCount = 1;
+    toggles.enabledToggleCount = sizeof(enableList) / sizeof(enableList[0]);
 
     // Limits: max settings for large model buffers (1 GB storage, 2 GB buffer)
     WGPULimits limits = getMaxLimits();
@@ -644,16 +654,37 @@ static wgpu::Device createDeviceWithMaxLimits(wgpu::Adapter& adapter) {
         }
     }
 
-    // --- Tier 2: ShaderF16 + Subgroups (no subgroup matrix) ---
+    // Probe adapter-advertised optional features once so we only ever
+    // request what the adapter claims to support. Previously we blindly
+    // asked for ShaderF16 even on adapters that don't expose it, which
+    // caused the whole tier to fail with "Requested feature
+    // FeatureName::ShaderF16 is not supported." and dropped us all the
+    // way to the minimal path.
+    bool hasShaderF16 = adapter.HasFeature(wgpu::FeatureName::ShaderF16);
+    bool hasSubgroupMatrix = adapter.HasFeature(
+        wgpu::FeatureName::ChromiumExperimentalSubgroupMatrix);
+    if (g_verbose) {
+        std::cout << "[Hesper] adapter features: shaderF16=" << hasShaderF16
+                  << " subgroups=" << hasSubgroups
+                  << " subgroupMatrix=" << hasSubgroupMatrix << std::endl;
+    }
+
+    auto pushIf = [](std::vector<WGPUFeatureName>& v, bool cond, WGPUFeatureName f) {
+        if (cond) v.push_back(f);
+    };
+
+    // --- Tier 2: Subgroups (+ ShaderF16 if available, no subgroup matrix) ---
     if (level == FeatureLevel::Auto || level == FeatureLevel::Subgroup) {
         if (hasSubgroups) {
-            static std::array<WGPUFeatureName, 2> subgroupFeatures = {
-                WGPUFeatureName_ShaderF16,
-                WGPUFeatureName_Subgroups
-            };
-            wgpu::Device device = tryCreateDevice(adapter, subgroupFeatures.data(), subgroupFeatures.size(), limits, nullptr);
+            std::vector<WGPUFeatureName> subgroupFeatures;
+            pushIf(subgroupFeatures, hasShaderF16, WGPUFeatureName_ShaderF16);
+            subgroupFeatures.push_back(WGPUFeatureName_Subgroups);
+            wgpu::Device device = tryCreateDevice(adapter,
+                subgroupFeatures.data(), subgroupFeatures.size(), limits, &toggles);
             if (device) {
-                std::cout << "[Hesper] Device: subgroups (no subgroup_matrix)" << std::endl;
+                std::cout << "[Hesper] Device: subgroups"
+                          << (hasShaderF16 ? " + shaderF16" : "")
+                          << " (no subgroup_matrix)" << std::endl;
                 return device;
             }
             if (level == FeatureLevel::Subgroup) {
@@ -668,18 +699,20 @@ static wgpu::Device createDeviceWithMaxLimits(wgpu::Adapter& adapter) {
     }
 
     // --- Tier 3: ShaderF16 only (no subgroups) ---
-    static std::array<WGPUFeatureName, 1> basicFeatures = {
-        WGPUFeatureName_ShaderF16
-    };
-    wgpu::Device device = tryCreateDevice(adapter, basicFeatures.data(), basicFeatures.size(), limits, nullptr);
-    if (device) {
-        std::cout << "[Hesper] Device: basic (no subgroups)" << std::endl;
-        return device;
+    if (hasShaderF16) {
+        static std::array<WGPUFeatureName, 1> basicFeatures = {
+            WGPUFeatureName_ShaderF16
+        };
+        wgpu::Device device = tryCreateDevice(adapter, basicFeatures.data(), basicFeatures.size(), limits, &toggles);
+        if (device) {
+            std::cout << "[Hesper] Device: basic (shaderF16, no subgroups)" << std::endl;
+            return device;
+        }
+        if (g_verbose) std::cout << "[Hesper] shaderF16-only failed, trying minimal..." << std::endl;
     }
 
     // --- Tier 4: No optional features (maximum compatibility) ---
-    if (g_verbose) std::cout << "[Hesper] ShaderF16 not supported, trying without any optional features..." << std::endl;
-    device = tryCreateDevice(adapter, nullptr, 0, limits, nullptr);
+    wgpu::Device device = tryCreateDevice(adapter, nullptr, 0, limits, &toggles);
     if (device) {
         std::cout << "[Hesper] Device: minimal (no ShaderF16, no subgroups)" << std::endl;
     }
