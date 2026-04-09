@@ -102,6 +102,32 @@ def hasSubgroupSupport (device : Device) : IO Bool := do
     subgroupSupportRef.set (some v)
     pure v
 
+/-- Cached SubgroupMatrix support flag -/
+initialize subgroupMatrixSupportRef : IO.Ref (Option Bool) ← IO.mkRef none
+
+/-- Check if the device supports Chromium experimental subgroup matrix
+    operations (subgroup_matrix_{left,right,result}, subgroupMatrixLoad,
+    subgroupMatrixMultiplyAccumulate, subgroupMatrixStore). Cached. -/
+def hasSubgroupMatrixSupport (device : Device) : IO Bool := do
+  match ← subgroupMatrixSupportRef.get with
+  | some v => pure v
+  | none =>
+    let v ← Hesper.WebGPU.deviceHasSubgroupMatrix device
+    subgroupMatrixSupportRef.set (some v)
+    pure v
+
+/-- Cached ShaderF16 support flag -/
+initialize shaderF16SupportRef : IO.Ref (Option Bool) ← IO.mkRef none
+
+/-- Check if the device supports ShaderF16 (`f16` values, f16 arithmetic). -/
+def hasShaderF16Support (device : Device) : IO Bool := do
+  match ← shaderF16SupportRef.get with
+  | some v => pure v
+  | none =>
+    let v ← Hesper.WebGPU.deviceHasShaderF16 device
+    shaderF16SupportRef.set (some v)
+    pure v
+
 /-! ## Pipeline Cache
 
 Caches compiled GPU pipelines keyed by WGSL source hash.

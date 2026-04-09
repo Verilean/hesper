@@ -364,6 +364,33 @@ def matrixMultiplyAccumulate
   let mulAccExpr := Exp.subgroupMatrixMultiplyAccumulate leftMat rightMat accMat
   emitStmt (Stmt.assignIndex resultArrayName (Exp.litU32 resultIndex) resultMatTy mulAccExpr)
 
+/-- Mixed-precision variant of `matrixMultiplyAccumulate`: A and B use
+    `inSt`, C / D use `outSt`. This matches NVIDIA cooperative matrix's
+    native `(f16, f16) → f32` config. -/
+def matrixMultiplyAccumulateMixed
+    {inSt outSt : ScalarType} {m k n : Nat}
+    (resultArrayName : String)
+    (resultIndex : Nat)
+    (leftArrayName : String)
+    (leftIndex : Nat)
+    (rightArrayName : String)
+    (rightIndex : Nat)
+    : ShaderM Unit := do
+  let leftMatTy := WGSLType.subgroupMatrixLeft inSt m k
+  let rightMatTy := WGSLType.subgroupMatrixRight inSt k n
+  let resultMatTy := WGSLType.subgroupMatrixResult outSt m n
+
+  let leftArr : Exp (.array leftMatTy leftIndex) := Exp.var leftArrayName
+  let rightArr : Exp (.array rightMatTy rightIndex) := Exp.var rightArrayName
+  let resultArr : Exp (.array resultMatTy resultIndex) := Exp.var resultArrayName
+
+  let leftMat := Exp.index leftArr (Exp.litU32 leftIndex)
+  let rightMat := Exp.index rightArr (Exp.litU32 rightIndex)
+  let accMat := Exp.index resultArr (Exp.litU32 resultIndex)
+
+  let mulAccExpr := Exp.subgroupMatrixMultiplyAccumulateMixed leftMat rightMat accMat
+  emitStmt (Stmt.assignIndex resultArrayName (Exp.litU32 resultIndex) resultMatTy mulAccExpr)
+
 /-- Store subgroup_matrix_result to buffer
 
     Example: subgroupMatrixStore(&C, offset, accxx[idx], false, stride)
