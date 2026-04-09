@@ -1603,8 +1603,11 @@ def forwardSingleToken (device : Device) (model : Gemma4Model)
       (.dispatch1D totalPL)
   | _, _, _ => pure ()
 
-  -- Step 2: Process all transformer blocks (starting from buf2 as current)
-  Hesper.WGSL.Execute.beginBatch device
+  -- Step 2: Process all transformer blocks (starting from buf2 as current).
+  -- If the caller has already started a batch (e.g. a batched prefill
+  -- wrapper), we nest inside it instead of starting a new one.
+  let ownBatch ← not <$> Hesper.WGSL.Execute.isBatching
+  if ownBatch then Hesper.WGSL.Execute.beginBatch device
 
   let mut currentBuf := state.buf2
   let mut nextBuf := state.buf1
@@ -1659,7 +1662,7 @@ def forwardSingleToken (device : Device) (model : Gemma4Model)
       [("input", state.logitsBuf2), ("output", state.logitsBuf)]
       (.dispatch1D model.config.vocabSize)
 
-  Hesper.WGSL.Execute.endBatch device
+  if ownBatch then Hesper.WGSL.Execute.endBatch device
 
 /-! ## Text Generation -/
 
