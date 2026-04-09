@@ -1238,11 +1238,11 @@ def LinearLayer.forward (device : Device) (layer : LinearLayer)
   -- scratch is noticeably expensive.
   let cacheKey : UInt64 := match layer.quantFormat with
     | .Q4_K => hash ("q4k-lin-blockcoop-swpipe", layer.config.inDim, layer.config.outDim, useSubgroups)
-    | .Q6_K => hash ("q6k-lin", layer.config.inDim, layer.config.outDim, useSubgroups)
+    | .Q6_K => hash ("q6k-lin-blockcoop-swpipe", layer.config.inDim, layer.config.outDim, useSubgroups)
   let shader := match layer.quantFormat, useSubgroups with
     | .Q4_K, true  => fusedQ4KMLinearBlockCoopKernel layer.config
     | .Q4_K, false => fusedQ4KMLinearKernel layer.config
-    | .Q6_K, true  => Hesper.Quantization.Q6_K.fusedQ6KLinearSubgroupKernel layer.config.inDim layer.config.outDim
+    | .Q6_K, true  => Hesper.Quantization.Q6_K.fusedQ6KLinearBlockCoopKernel layer.config.inDim layer.config.outDim
     | .Q6_K, false => Hesper.Quantization.Q6_K.fusedQ6KLinearKernel layer.config.inDim layer.config.outDim
   Execute.executeShaderNamed device shader namedBuffers execConfig
     (cacheKey := some cacheKey) (preparedRef := some layer.prepared)
