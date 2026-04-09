@@ -1629,20 +1629,35 @@ def forwardSingleToken (device : Device) (model : Gemma4Model)
 
   -- Step 4: LM head matmul (1 × hiddenSize @ hiddenSize × vocabSize)
   -- For Q6_K embedding (weight-tied LM head), use fused Q6_K matmul.
-  -- IMPORTANT: the fused kernel is "one workgroup per output row" with 256
-  -- cooperating threads, so we need numWorkgroups = vocabSize (not dispatch1D,
-  -- which would give ceil(vocabSize/256) and leave most logits unwritten).
+  -- IMPORTANT: the fused kernel is "one workgroup per output row" (either
+  -- 256 threads with tree reduction, or 32 threads with subgroupAdd), so
+  -- numWorkgroups = vocabSize / (gridX * gridY division), NOT
+  -- ceil(vocabSize / workgroupSize).
   match model.embdFormat with
   | .Q6_K =>
     -- 2D dispatch because vocabSize (262144) exceeds the 65535 per-dimension limit.
     let gridX : Nat := 4096
     let gridY : Nat := (model.config.vocabSize + gridX - 1) / gridX
-    Hesper.WGSL.Execute.executeShaderNamed device
-      (Hesper.Quantization.Q6_K.fusedQ6KLinearKernel model.config.hiddenSize model.config.vocabSize 256 gridX)
+    -- Prefer the subgroup variant when available — 32-thread workgroups
+    -- with hardware `subgroupAdd` instead of 256-thread tree reduction.
+    let useSubgroups ← Hesper.WGSL.Execute.hasSubgroupSupport device
+    let shader := if useSubgroups then
+        Hesper.Quantization.Q6_K.fusedQ6KLinearSubgroupKernel
+          model.config.hiddenSize model.config.vocabSize gridX
+      else
+        Hesper.Quantization.Q6_K.fusedQ6KLinearKernel
+          model.config.hiddenSize model.config.vocabSize 256 gridX
+    let wgSize := if useSubgroups then 32 else 256
+    let lmBufs : List (String × Buffer) :=
       [("weights", model.outputWeight), ("input", nextBuf), ("output", state.logitsBuf)]
+    Hesper.WGSL.Execute.executeShaderNamed device
+      shader
+      lmBufs
       { numWorkgroups := (gridX, gridY, 1)
-        workgroupSize := { x := 256, y := 1, z := 1 }
+        workgroupSize := { x := wgSize, y := 1, z := 1 }
+        extensions := if useSubgroups then ["subgroups"] else []
         : Hesper.WGSL.Execute.ExecutionConfig }
+      (cacheKey := some (hash ("gemma4-lm-head", model.config.hiddenSize, model.config.vocabSize, useSubgroups)))
   | _ =>
     let lmHeadConfig : Hesper.WGSL.MatMul.Config := {
       M := 1, N := model.config.vocabSize, K := model.config.hiddenSize
