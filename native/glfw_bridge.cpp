@@ -514,8 +514,10 @@ lean_obj_res lean_glfw_create_shader_module(b_lean_obj_arg device_obj, b_lean_ob
     wgpu::Device* device = static_cast<wgpu::Device*>(lean_get_external_data(device_obj));
     const char* code = lean_string_cstr(code_obj);
 
-    wgpu::ShaderModuleWGSLDescriptor wgslDesc{};
-    wgslDesc.code = code;
+    // Upstream Dawn: ShaderModuleWGSLDescriptor → ShaderSourceWGSL,
+    // .code is wgpu::StringView (not const char*).
+    wgpu::ShaderSourceWGSL wgslDesc{};
+    wgslDesc.code = wgpu::StringView(code);
 
     wgpu::ShaderModuleDescriptor shaderDesc{};
     shaderDesc.nextInChain = &wgslDesc;
