@@ -577,6 +577,140 @@ def fusedQ4KMLinearBlockCoopKernel (config : Config) : ShaderM Unit := do
     ShaderM.writeBuffer (ty := .scalar .f32) "output" outIdx totalSum
   ) (pure ())
 
+/-! ## Q4_K_M MatVec, Block-Coop, 2 Rows per Workgroup -/
+
+/-- Two-rows-per-workgroup extension of `fusedQ4KMLinearBlockCoopKernel`.
+
+    Motivation: the single-row block-coop kernel already has every lane
+    active during a block, but each WG only has 32 threads. On RTX 4070
+    Ti (40 SMs × ~1536 resident threads), the `outDim`-many 32-thread
+    WGs leave SMs underpopulated. Profiling showed the kernel runs at
+    ~7% of memory bandwidth, suggesting occupancy-limited behaviour
+    rather than bandwidth-limited.
+
+    This variant doubles the WG size to 64 (two hardware subgroups on
+    NVIDIA) and packs two output rows into each WG:
+
+      subgroupId = tid / 32    -- 0 or 1, selects which row
+      laneId     = tid % 32    -- 0..31, the block-coop lane
+
+      outIdx     = pairIdx * 2 + subgroupId
+
+    Because NVIDIA's subgroup size is 32, `subgroupAdd` reduces the two
+    subgroups **independently and in parallel** — subgroup 0 sums row
+    0's partial and subgroup 1 sums row 1's, with no cross-subgroup
+    barrier needed. Each subgroup reads its own block headers and qs
+    u32s; there is no register sharing between rows (so no pressure
+    blowup like the earlier failed 2-row attempt).
+
+    Dispatch: `outDim/2` workgroups × 64 threads. Requires
+    `outDim % 2 == 0` and subgroup support. Caller must check both. -/
+def fusedQ4KMLinearBlockCoop2RowKernel (config : Config) : ShaderM Unit := do
+  let wid ← ShaderM.workgroupId
+  let lid ← ShaderM.localId
+  let pairIdx := Exp.vec3X wid
+  let tid := Exp.vec3X lid
+
+  -- Intra-WG decomposition: 64 threads = 2 subgroups of 32.
+  let subgroupId := Exp.shiftRight tid (Exp.litU32 5)      -- tid / 32
+  let laneId := Exp.bitAnd tid (Exp.litU32 31)             -- tid % 32
+  let outIdx := Exp.add (Exp.mul pairIdx (Exp.litU32 2)) subgroupId
+
+  let blocksPerRow := config.inDim / 256
+  let totalWeightU32 := config.outDim * blocksPerRow * 36
+
+  let _weights ← ShaderM.declareInputBuffer "weights" (.array (.scalar .u32) totalWeightU32)
+  let _input ← ShaderM.declareInputBuffer "input" (.array (.scalar .f32) config.inDim)
+  let _output ← ShaderM.declareOutputBuffer "output" (.array (.scalar .f32) config.outDim)
+
+  let inBounds := Exp.lt outIdx (Exp.litU32 config.outDim)
+
+  ShaderM.varNamed "acc" (.scalar .f32) (Exp.litF32 0.0)
+  let acc : Exp (.scalar .f32) := Exp.var "acc"
+
+  -- Row base in u32 units. Runtime value — `outIdx` depends on
+  -- subgroupId at runtime, so unlike the 1-row kernel we can't bake
+  -- `rowBaseU32` into a per-block constant offset.
+  let rowBaseU32 := Exp.mul outIdx (Exp.litU32 (blocksPerRow * 36))
+
+  -- Per-lane partition within a block — same as 1-row kernel, but using
+  -- `laneId` instead of `tid`.
+  let cLane := Exp.div laneId (Exp.litU32 8)
+  let l32Lane := Exp.sub laneId (Exp.mul cLane (Exp.litU32 8))
+
+  for block in [0:blocksPerRow] do
+    let blockU32Base := Exp.add rowBaseU32 (Exp.litU32 (block * 36))
+    let elemBase := block * 256
+
+    let dmU32 ← ShaderM.readBuffer (ty := .scalar .u32) (n := totalWeightU32) "weights" blockU32Base
+    let d := fp16ToF32 (Exp.bitAnd dmU32 (Exp.litU32 0xFFFF))
+    let dmin := fp16ToF32 (Exp.shiftRight dmU32 (Exp.litU32 16))
+    let sc0 ← ShaderM.readBuffer (ty := .scalar .u32) (n := totalWeightU32) "weights" (Exp.add blockU32Base (Exp.litU32 1))
+    let sc1 ← ShaderM.readBuffer (ty := .scalar .u32) (n := totalWeightU32) "weights" (Exp.add blockU32Base (Exp.litU32 2))
+    let sc2 ← ShaderM.readBuffer (ty := .scalar .u32) (n := totalWeightU32) "weights" (Exp.add blockU32Base (Exp.litU32 3))
+
+    let is0 := Exp.mul cLane (Exp.litU32 2)
+    let is1 := Exp.add is0 (Exp.litU32 1)
+
+    let extractScaleMin (is : Exp (.scalar .u32)) : Exp (.scalar .f32) × Exp (.scalar .f32) :=
+      let isLow := Exp.lt is (Exp.litU32 4)
+      let shift4 := Exp.mul is (Exp.litU32 8)
+      let scaleLow := Exp.bitAnd (Exp.shiftRight sc0 shift4) (Exp.litU32 0x3F)
+      let minLow   := Exp.bitAnd (Exp.shiftRight sc1 shift4) (Exp.litU32 0x3F)
+      let isHi := Exp.sub is (Exp.litU32 4)
+      let shiftHi := Exp.mul isHi (Exp.litU32 8)
+      let scaleHiLo := Exp.bitAnd (Exp.shiftRight sc2 shiftHi) (Exp.litU32 0x0F)
+      let scaleHiHi := Exp.shiftLeft
+        (Exp.bitAnd (Exp.shiftRight sc0 (Exp.add shiftHi (Exp.litU32 6))) (Exp.litU32 0x03))
+        (Exp.litU32 4)
+      let scaleHigh := Exp.bitOr scaleHiLo scaleHiHi
+      let minHiLo := Exp.bitAnd (Exp.shiftRight sc2 (Exp.add shiftHi (Exp.litU32 4))) (Exp.litU32 0x0F)
+      let minHiHi := Exp.shiftLeft
+        (Exp.bitAnd (Exp.shiftRight sc1 (Exp.add shiftHi (Exp.litU32 6))) (Exp.litU32 0x03))
+        (Exp.litU32 4)
+      let minHigh := Exp.bitOr minHiLo minHiHi
+      let scaleU := Exp.select isLow scaleLow scaleHigh
+      let minU   := Exp.select isLow minLow   minHigh
+      (Exp.toF32 scaleU, Exp.toF32 minU)
+
+    let (scaleA, minA) := extractScaleMin is0
+    let (scaleB, minB) := extractScaleMin is1
+    let d1 := Exp.mul d scaleA
+    let m1 := Exp.mul dmin minA
+    let d2 := Exp.mul d scaleB
+    let m2 := Exp.mul dmin minB
+
+    let qsLaneIdx := Exp.add blockU32Base
+                     (Exp.add (Exp.litU32 4)
+                       (Exp.add (Exp.mul cLane (Exp.litU32 8)) l32Lane))
+    let qsU32 ← ShaderM.readBuffer (ty := .scalar .u32) (n := totalWeightU32) "weights" qsLaneIdx
+
+    let elemOffset := Exp.add (Exp.mul cLane (Exp.litU32 64))
+                      (Exp.mul l32Lane (Exp.litU32 4))
+    let elemBaseAbs := Exp.add (Exp.litU32 elemBase) elemOffset
+
+    for b in [0:4] do
+      let byte := Exp.bitAnd (Exp.shiftRight qsU32 (Exp.litU32 (b * 8))) (Exp.litU32 0xFF)
+      let qLow := Exp.bitAnd byte (Exp.litU32 0xF)
+      let qHigh := Exp.shiftRight byte (Exp.litU32 4)
+      let elemIdxLow := Exp.add elemBaseAbs (Exp.litU32 b)
+      let elemIdxHigh := Exp.add elemBaseAbs (Exp.litU32 (32 + b))
+      let inLow ← ShaderM.readBuffer (ty := .scalar .f32) (n := config.inDim) "input" elemIdxLow
+      let inHigh ← ShaderM.readBuffer (ty := .scalar .f32) (n := config.inDim) "input" elemIdxHigh
+      let wLow := Exp.sub (Exp.mul d1 (Exp.toF32 qLow)) m1
+      let wHigh := Exp.sub (Exp.mul d2 (Exp.toF32 qHigh)) m2
+      ShaderM.assign "acc" (Exp.add acc (Exp.add (Exp.mul wLow inLow) (Exp.mul wHigh inHigh)))
+
+  -- `subgroupAdd` reduces *within each subgroup*, so the two rows are
+  -- summed independently without a workgroupBarrier.
+  ShaderM.varNamed "totalSum" (.scalar .f32) (Exp.subgroupAdd acc)
+  let totalSum : Exp (.scalar .f32) := Exp.var "totalSum"
+
+  -- Lane 0 of each subgroup writes its row.
+  ShaderM.if_ (Exp.and (Exp.eq laneId (Exp.litU32 0)) inBounds) (do
+    ShaderM.writeBuffer (ty := .scalar .f32) "output" outIdx totalSum
+  ) (pure ())
+
 /-! ## Q4_K_M Fused Gate+Up (Gemma 4 / LLaMA GeGLU FFN) -/
 
 /-- Fused gate+up Q4_K_M kernel:
