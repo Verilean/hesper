@@ -187,6 +187,17 @@ inductive Exp : WGSLType → Type where
       Exp (.subgroupMatrixResult st m n) →
       Exp (.subgroupMatrixResult st m n)
 
+  /-- Mixed-precision multiply-accumulate: A and B are `inSt`, C/D are `outSt`.
+      Real NVIDIA cooperativeMatrix configs typically use `(f16, f16) → f32`
+      rather than the single-type variant above. WGSL + Dawn accept this
+      form too, so we expose a separate constructor. -/
+  | subgroupMatrixMultiplyAccumulateMixed
+      {inSt outSt : ScalarType} {m k n : Nat} :
+      Exp (.subgroupMatrixLeft inSt m k) →
+      Exp (.subgroupMatrixRight inSt k n) →
+      Exp (.subgroupMatrixResult outSt m n) →
+      Exp (.subgroupMatrixResult outSt m n)
+
   | subgroupMatrixStore {st : ScalarType} {m n : Nat} :
       String →  -- pointer reference (e.g., "&C")
       Exp (.scalar .u32) →  -- offset
@@ -657,6 +668,8 @@ partial def Exp.toWGSL {t : WGSLType} : Exp t → String
   | subgroupMatrixLoadRight (st:=_st) (k:=k) (n:=_n) ptr offset transposeFlag stride =>
     s!"subgroupMatrixLoad<subgroup_matrix_right<{_st.toWGSL},{k},{_n}>>(&{ptr}, {toWGSL offset}, {toWGSL transposeFlag}, {toWGSL stride})"
   | subgroupMatrixMultiplyAccumulate a b acc =>
+    s!"subgroupMatrixMultiplyAccumulate({toWGSL a}, {toWGSL b}, {toWGSL acc})"
+  | subgroupMatrixMultiplyAccumulateMixed a b acc =>
     s!"subgroupMatrixMultiplyAccumulate({toWGSL a}, {toWGSL b}, {toWGSL acc})"
   | subgroupMatrixStore (st:=_st) (m:=_m) (n:=_n) ptr offset mat transposeFlag stride =>
     s!"subgroupMatrixStore(&{ptr}, {toWGSL offset}, {toWGSL mat}, {toWGSL transposeFlag}, {toWGSL stride})"
