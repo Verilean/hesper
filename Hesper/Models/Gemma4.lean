@@ -1605,8 +1605,13 @@ def forwardSingleToken (device : Device) (model : Gemma4Model)
 
   -- Step 2: Process all transformer blocks (starting from buf2 as current).
   -- If the caller has already started a batch (e.g. a batched prefill
-  -- wrapper), we nest inside it instead of starting a new one.
-  let ownBatch ← not <$> Hesper.WGSL.Execute.isBatching
+  -- wrapper), we nest inside it instead of starting a new one. Callers that
+  -- want per-dispatch GPU timing (e.g. `gemma4-profile`) can flip
+  -- `Hesper.Layers.Linear.profilingRef` to `true`, in which case we also
+  -- skip our own begin/endBatch so each dispatch auto-syncs.
+  let profiling ← Hesper.Layers.Linear.profilingRef.get
+  let alreadyBatching ← Hesper.WGSL.Execute.isBatching
+  let ownBatch := !profiling && !alreadyBatching
   if ownBatch then Hesper.WGSL.Execute.beginBatch device
 
   let mut currentBuf := state.buf2

@@ -863,6 +863,11 @@ lean_exe «gemma4-pos1-dump» where
   supportInterpreter := false
   moreLinkArgs := stdLinkArgs
 
+lean_exe «gemma4-profile» where
+  root := `Examples.Gemma4Profile
+  supportInterpreter := false
+  moreLinkArgs := stdLinkArgs
+
 lean_exe «flash-attn-shader-dump» where
   root := `Examples.FlashAttnShaderDump
   supportInterpreter := false

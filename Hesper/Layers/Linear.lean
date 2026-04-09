@@ -45,6 +45,35 @@ open Hesper.WebGPU
 open Hesper.Quantization.Q4_K_M (fp16ToF32 getScaleMin)
 open Hesper.Logging (logVerbose)
 
+/-! ## Profiling counters
+
+Gated counters that a caller can enable via `profilingRef.set true` to
+measure how much total wall-clock time `LinearLayer.forward` consumes.
+Only meaningful when dispatches run in non-batch mode (each call
+deviceWaits), so the caller should profile without `beginBatch`. Reset
+`totalNanosRef` between measurements. -/
+initialize profilingRef  : IO.Ref Bool  ← IO.mkRef false
+initialize totalNanosRef : IO.Ref UInt64 ← IO.mkRef 0
+initialize callCountRef  : IO.Ref Nat    ← IO.mkRef 0
+/-- Per-shape cumulative time, keyed by (inDim, outDim). Array of
+    (inDim, outDim, cumNanos, callCount). Small N so linear scan is fine. -/
+initialize perShapeRef : IO.Ref (Array (Nat × Nat × UInt64 × Nat)) ← IO.mkRef #[]
+
+private def perShapeAdd (inDim outDim : Nat) (deltaNs : UInt64) : IO Unit := do
+  let arr ← perShapeRef.get
+  let mut found := false
+  let mut out : Array (Nat × Nat × UInt64 × Nat) := Array.empty
+  for entry in arr do
+    let (i, o, ns, cnt) := entry
+    if i == inDim && o == outDim then
+      out := out.push (i, o, ns + deltaNs, cnt + 1)
+      found := true
+    else
+      out := out.push entry
+  if !found then
+    out := out.push (inDim, outDim, deltaNs, 1)
+  perShapeRef.set out
+
 /-! ## Layer Configuration -/
 
 structure Config where
@@ -282,6 +311,8 @@ structure LinearLayer where
 -/
 def LinearLayer.forward (device : Device) (layer : LinearLayer)
     (inputBuf outputBuf : Buffer) : IO Unit := do
+  let profiling ← profilingRef.get
+  let startNs ← if profiling then IO.monoNanosNow else pure 0
   -- Fast path: instant replay if we already have a prepared dispatch and
   -- the input/output buffers match the prepared binding. The prepared
   -- dispatch binds specific buffer handles, so if the caller ever passes
@@ -292,6 +323,12 @@ def LinearLayer.forward (device : Device) (layer : LinearLayer)
   if let some p ← layer.prepared.get then
     -- Use the same workgroup count that was used at prepare time.
     Execute.replayPreparedDispatch device p layer.config.outDim 1 1
+    if profiling then
+      let endNs ← IO.monoNanosNow
+      let delta := (endNs - startNs).toUInt64
+      totalNanosRef.modify (· + delta)
+      callCountRef.modify (· + 1)
+      perShapeAdd layer.config.inDim layer.config.outDim delta
     return
 
   let namedBuffers := [
@@ -323,5 +360,11 @@ def LinearLayer.forward (device : Device) (layer : LinearLayer)
     | .Q6_K, false => Hesper.Quantization.Q6_K.fusedQ6KLinearKernel layer.config.inDim layer.config.outDim
   Execute.executeShaderNamed device shader namedBuffers execConfig
     (cacheKey := some cacheKey) (preparedRef := some layer.prepared)
+  if profiling then
+    let endNs ← IO.monoNanosNow
+    let delta := (endNs - startNs).toUInt64
+    totalNanosRef.modify (· + delta)
+    callCountRef.modify (· + 1)
+    perShapeAdd layer.config.inDim layer.config.outDim delta
 
 end Hesper.Layers.Linear
