@@ -783,6 +783,11 @@ lean_exe «integration-tests» where
 -- BitNet Validation Tests
 -- ----------------------------------------------------------------------------
 
+lean_exe «bitlinear-equiv» where
+  root := `Tests.BitLinearEquivalence
+  supportInterpreter := false
+  moreLinkArgs := stdLinkArgs
+
 lean_exe «bitnet-validation» where
   root := `Tests.BitNetValidation
   supportInterpreter := false
