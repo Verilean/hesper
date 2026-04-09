@@ -1566,70 +1566,73 @@ def forwardSingleToken (device : Device) (model : Gemma4Model)
   -- Step 1: Embedding lookup (format-dependent)
   let tokenBytes := Hesper.WebGPU.BufferOps.uint32ToBytes tokenId.toUInt32
   writeBuffer device state.tokenBuf 0 tokenBytes
-  match model.embdFormat with
-  | .Q6_K =>
-    -- Q6_K on-the-fly dequant lookup
-    Hesper.WGSL.Execute.executeShaderNamed device
-      (Hesper.Quantization.Q6_K.q6kEmbeddingLookupKernel model.config.vocabSize model.config.hiddenSize)
-      [("token_ids", state.tokenBuf), ("embedding_table", model.embedding.embeddingTable), ("output", state.buf1)]
-      (.dispatch1D model.config.hiddenSize)
-  | _ =>
-    -- F32 / F16 / Q4_K: use existing Embedding.forward (assumes F32 interpretation)
-    Embedding.forward device model.embedding state.tokenBuf state.buf1 1 1
+  Hesper.WGSL.Execute.withSection "embedLookup" do
+    match model.embdFormat with
+    | .Q6_K =>
+      -- Q6_K on-the-fly dequant lookup
+      Hesper.WGSL.Execute.executeShaderNamed device
+        (Hesper.Quantization.Q6_K.q6kEmbeddingLookupKernel model.config.vocabSize model.config.hiddenSize)
+        [("token_ids", state.tokenBuf), ("embedding_table", model.embedding.embeddingTable), ("output", state.buf1)]
+        (.dispatch1D model.config.hiddenSize)
+    | _ =>
+      -- F32 / F16 / Q4_K: use existing Embedding.forward (assumes F32 interpretation)
+      Embedding.forward device model.embedding state.tokenBuf state.buf1 1 1
 
   -- Scale embeddings by sqrt(hiddenSize)
   -- Cannot alias input/output in WebGPU, so output to buf2
-  Hesper.WGSL.Execute.executeShaderNamed device
-    (embeddingScaleKernel model.config.hiddenSize model.config.hiddenSize)
-    [("input", state.buf1), ("output", state.buf2)]
-    (.dispatch1D model.config.hiddenSize)
+  Hesper.WGSL.Execute.withSection "embedScale" do
+    Hesper.WGSL.Execute.executeShaderNamed device
+      (embeddingScaleKernel model.config.hiddenSize model.config.hiddenSize)
+      [("input", state.buf1), ("output", state.buf2)]
+      (.dispatch1D model.config.hiddenSize)
 
   -- Step 1b: Per-layer input precomputation (gemma4-iswa.cpp:258-311)
   -- The per_layer_token_embd table is too large (>2 GB) for a single GPU buffer
   -- with the current Dawn limits, so we dequant just the input token's row on
   -- CPU and upload (~43 KB).
-  match model.perLayerEmbdTableCPU, model.perLayerModelProj, model.perLayerProjNorm with
-  | some embdTableCPU, some modelProj, some projNorm =>
-    let embdPL := model.config.embdPerLayer
-    let nLayers := model.config.numHiddenLayers
-    let totalPL := embdPL * nLayers
+  Hesper.WGSL.Execute.withSection "perLayerInputPre" do
+    match model.perLayerEmbdTableCPU, model.perLayerModelProj, model.perLayerProjNorm with
+    | some embdTableCPU, some modelProj, some projNorm =>
+      let embdPL := model.config.embdPerLayer
+      let nLayers := model.config.numHiddenLayers
+      let totalPL := embdPL * nLayers
 
-    -- 1) CPU dequant of per_layer_token_embd[tokenId] → row of `totalPL` floats
-    --    Scale by sqrt(embdPerLayer) on CPU as well
-    let rowOffset := tokenId * model.perLayerEmbdRowBytes
-    let rowFloats := dequantQ6KRowCPU embdTableCPU rowOffset totalPL
-    let scaleFactor : Float := Float.sqrt embdPL.toFloat
-    let scaledRow := rowFloats.map (· * scaleFactor)
-    let rowBytes ← floatArrayToBytes scaledRow
-    -- Upload to plModelProj (will hold the scaled token embedding)
-    writeBuffer device state.plModelProj 0 rowBytes
+      -- 1) CPU dequant of per_layer_token_embd[tokenId] → row of `totalPL` floats
+      --    Scale by sqrt(embdPerLayer) on CPU as well
+      let rowOffset := tokenId * model.perLayerEmbdRowBytes
+      let rowFloats := dequantQ6KRowCPU embdTableCPU rowOffset totalPL
+      let scaleFactor : Float := Float.sqrt embdPL.toFloat
+      let scaledRow := rowFloats.map (· * scaleFactor)
+      let rowBytes ← floatArrayToBytes scaledRow
+      -- Upload to plModelProj (will hold the scaled token embedding)
+      writeBuffer device state.plModelProj 0 rowBytes
 
-    -- 2) per_layer_model_proj @ buf2 → plTokenSelected
-    --    modelProj is F16 [hiddenSize, totalPL] → use F16 matmul
-    let projConfig : Hesper.WGSL.MatMul.Config := {
-      M := 1, N := totalPL, K := model.config.hiddenSize
-    }
-    Hesper.WGSL.MatMul.executeMatMulTransposeF16 device state.buf2 modelProj state.plTokenSelected projConfig
+      -- 2) per_layer_model_proj @ buf2 → plTokenSelected
+      --    modelProj is F16 [hiddenSize, totalPL] → use F16 matmul
+      let projConfig : Hesper.WGSL.MatMul.Config := {
+        M := 1, N := totalPL, K := model.config.hiddenSize
+      }
+      Hesper.WGSL.MatMul.executeMatMulTransposeF16 device state.buf2 modelProj state.plTokenSelected projConfig
 
-    -- 3) Scale plTokenSelected by 1/sqrt(hiddenSize) → plInputAll
-    Hesper.WGSL.Execute.executeShaderNamed device
-      (PerLayerEmbedding.scaleKernel totalPL (1.0 / Float.sqrt model.config.hiddenSize.toFloat))
-      [("input", state.plTokenSelected), ("output", state.plInputAll)]
-      (.dispatch1D totalPL)
+      -- 3) Scale plTokenSelected by 1/sqrt(hiddenSize) → plInputAll
+      Hesper.WGSL.Execute.executeShaderNamed device
+        (PerLayerEmbedding.scaleKernel totalPL (1.0 / Float.sqrt model.config.hiddenSize.toFloat))
+        [("input", state.plTokenSelected), ("output", state.plInputAll)]
+        (.dispatch1D totalPL)
 
-    -- 4) chunkedRMSNorm: per_layer_proj_norm over each embdPerLayer chunk
-    Hesper.WGSL.Execute.executeShaderNamed device
-      (chunkedRMSNormKernel embdPL nLayers model.config.rmsNormEps)
-      [("input", state.plInputAll), ("weight", projNorm.scale), ("output", state.plTokenSelected)]
-      { numWorkgroups := (nLayers, 1, 1), workgroupSize := { x := min embdPL 256, y := 1, z := 1 } : Execute.ExecutionConfig }
-    -- plTokenSelected now has projected+normed values
+      -- 4) chunkedRMSNorm: per_layer_proj_norm over each embdPerLayer chunk
+      Hesper.WGSL.Execute.executeShaderNamed device
+        (chunkedRMSNormKernel embdPL nLayers model.config.rmsNormEps)
+        [("input", state.plInputAll), ("weight", projNorm.scale), ("output", state.plTokenSelected)]
+        { numWorkgroups := (nLayers, 1, 1), workgroupSize := { x := min embdPL 256, y := 1, z := 1 } : Execute.ExecutionConfig }
+      -- plTokenSelected now has projected+normed values
 
-    -- 5) (proj+norm) + scaled_token_embd, then * 1/sqrt(2) → plInputAll
-    Hesper.WGSL.Execute.executeShaderNamed device
-      (scaledAddKernel totalPL (1.0 / Float.sqrt 2.0))
-      [("a", state.plTokenSelected), ("b", state.plModelProj), ("output", state.plInputAll)]
-      (.dispatch1D totalPL)
-  | _, _, _ => pure ()
+      -- 5) (proj+norm) + scaled_token_embd, then * 1/sqrt(2) → plInputAll
+      Hesper.WGSL.Execute.executeShaderNamed device
+        (scaledAddKernel totalPL (1.0 / Float.sqrt 2.0))
+        [("a", state.plTokenSelected), ("b", state.plModelProj), ("output", state.plInputAll)]
+        (.dispatch1D totalPL)
+    | _, _, _ => pure ()
 
   -- Step 2: Process all transformer blocks (starting from buf2 as current).
   -- If the caller has already started a batch (e.g. a batched prefill
@@ -1658,57 +1661,53 @@ def forwardSingleToken (device : Device) (model : Gemma4Model)
     blockIdx := blockIdx + 1
 
   -- Step 3: Final norm
-  RMSNorm.forward device model.finalNorm currentBuf nextBuf
+  Hesper.WGSL.Execute.withSection "finalNorm" do
+    RMSNorm.forward device model.finalNorm currentBuf nextBuf
 
   -- Step 4: LM head matmul (1 × hiddenSize @ hiddenSize × vocabSize)
-  -- For Q6_K embedding (weight-tied LM head), use fused Q6_K matmul.
-  -- IMPORTANT: the fused kernel is "one workgroup per output row" (either
-  -- 256 threads with tree reduction, or 32 threads with subgroupAdd), so
-  -- numWorkgroups = vocabSize / (gridX * gridY division), NOT
-  -- ceil(vocabSize / workgroupSize).
-  match model.embdFormat with
-  | .Q6_K =>
-    -- 2D dispatch because vocabSize (262144) exceeds the 65535 per-dimension limit.
-    let gridX : Nat := 4096
-    let gridY : Nat := (model.config.vocabSize + gridX - 1) / gridX
-    -- Prefer the subgroup variant when available — 32-thread workgroups
-    -- with hardware `subgroupAdd` instead of 256-thread tree reduction.
-    let useSubgroups ← Hesper.WGSL.Execute.hasSubgroupSupport device
-    let shader := if useSubgroups then
-        Hesper.Quantization.Q6_K.fusedQ6KLinearSubgroupKernel
-          model.config.hiddenSize model.config.vocabSize gridX
-      else
-        Hesper.Quantization.Q6_K.fusedQ6KLinearKernel
-          model.config.hiddenSize model.config.vocabSize 256 gridX
-    let wgSize := if useSubgroups then 32 else 256
-    let lmBufs : List (String × Buffer) :=
-      [("weights", model.outputWeight), ("input", nextBuf), ("output", state.logitsBuf)]
-    Hesper.WGSL.Execute.executeShaderNamed device
-      shader
-      lmBufs
-      { numWorkgroups := (gridX, gridY, 1)
-        workgroupSize := { x := wgSize, y := 1, z := 1 }
-        extensions := if useSubgroups then ["subgroups"] else []
-        : Hesper.WGSL.Execute.ExecutionConfig }
-      (cacheKey := some (hash ("gemma4-lm-head", model.config.hiddenSize, model.config.vocabSize, useSubgroups)))
-  | _ =>
-    let lmHeadConfig : Hesper.WGSL.MatMul.Config := {
-      M := 1, N := model.config.vocabSize, K := model.config.hiddenSize
-    }
-    Hesper.WGSL.MatMul.executeMatMulTranspose device nextBuf model.outputWeight state.logitsBuf lmHeadConfig
+  Hesper.WGSL.Execute.withSection "lmHead" do
+    match model.embdFormat with
+    | .Q6_K =>
+      -- 2D dispatch because vocabSize (262144) exceeds the 65535 per-dimension limit.
+      let gridX : Nat := 4096
+      let gridY : Nat := (model.config.vocabSize + gridX - 1) / gridX
+      -- Prefer the subgroup variant when available — 32-thread workgroups
+      -- with hardware `subgroupAdd` instead of 256-thread tree reduction.
+      let useSubgroups ← Hesper.WGSL.Execute.hasSubgroupSupport device
+      let shader := if useSubgroups then
+          Hesper.Quantization.Q6_K.fusedQ6KLinearSubgroupKernel
+            model.config.hiddenSize model.config.vocabSize gridX
+        else
+          Hesper.Quantization.Q6_K.fusedQ6KLinearKernel
+            model.config.hiddenSize model.config.vocabSize 256 gridX
+      let wgSize := if useSubgroups then 32 else 256
+      let lmBufs : List (String × Buffer) :=
+        [("weights", model.outputWeight), ("input", nextBuf), ("output", state.logitsBuf)]
+      Hesper.WGSL.Execute.executeShaderNamed device
+        shader
+        lmBufs
+        { numWorkgroups := (gridX, gridY, 1)
+          workgroupSize := { x := wgSize, y := 1, z := 1 }
+          extensions := if useSubgroups then ["subgroups"] else []
+          : Hesper.WGSL.Execute.ExecutionConfig }
+        (cacheKey := some (hash ("gemma4-lm-head", model.config.hiddenSize, model.config.vocabSize, useSubgroups)))
+    | _ =>
+      let lmHeadConfig : Hesper.WGSL.MatMul.Config := {
+        M := 1, N := model.config.vocabSize, K := model.config.hiddenSize
+      }
+      Hesper.WGSL.MatMul.executeMatMulTranspose device nextBuf model.outputWeight state.logitsBuf lmHeadConfig
 
   -- Step 5: Logit softcapping (y = scale * tanh(x / scale))
-  -- Uses logitsBuf2 as scratch (WebGPU forbids input/output aliasing), then
-  -- copies the result back into logitsBuf so callers see the softcapped logits.
-  if model.config.logitSoftcapScale > 0.0 then
-    Hesper.WGSL.Execute.executeShaderNamed device
-      (logitSoftcapKernel model.config.vocabSize model.config.logitSoftcapScale)
-      [("input", state.logitsBuf), ("output", state.logitsBuf2)]
-      (.dispatch1D model.config.vocabSize)
-    Hesper.WGSL.Execute.executeShaderNamed device
-      (PerLayerEmbedding.scaleKernel model.config.vocabSize 1.0)
-      [("input", state.logitsBuf2), ("output", state.logitsBuf)]
-      (.dispatch1D model.config.vocabSize)
+  Hesper.WGSL.Execute.withSection "logitSoftcap" do
+    if model.config.logitSoftcapScale > 0.0 then
+      Hesper.WGSL.Execute.executeShaderNamed device
+        (logitSoftcapKernel model.config.vocabSize model.config.logitSoftcapScale)
+        [("input", state.logitsBuf), ("output", state.logitsBuf2)]
+        (.dispatch1D model.config.vocabSize)
+      Hesper.WGSL.Execute.executeShaderNamed device
+        (PerLayerEmbedding.scaleKernel model.config.vocabSize 1.0)
+        [("input", state.logitsBuf2), ("output", state.logitsBuf)]
+        (.dispatch1D model.config.vocabSize)
 
   if ownBatch then Hesper.WGSL.Execute.endBatch device
 
