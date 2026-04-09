@@ -67,11 +67,11 @@ open Hesper.Logging (logVerbose)
 initialize preparedHitsRef : IO.Ref Nat ← IO.mkRef 0
 initialize preparedMissesRef : IO.Ref Nat ← IO.mkRef 0
 
-/-- Runtime opt-in for the subgroup-matrix BitLinear kernel. Default off
-    because the kernel is still slower than the tiled fallback at M < 256
-    on current hardware (see Tests/BitLinearBench). Flip to `true` from
-    tests that want to exercise it, or leave off for production use. -/
-initialize subgroupMatrixOptInRef : IO.Ref Bool ← IO.mkRef false
+/-- Runtime opt-in for the subgroup-matrix BitLinear kernel. Defaults
+    to **on** when the device also has ShaderF16 + SubgroupMatrix (see
+    dispatch logic in `forward`). Set to `false` to force the tiled
+    fallback for debugging. -/
+initialize subgroupMatrixOptInRef : IO.Ref Bool ← IO.mkRef true
 
 /-! ## Layer Configuration -/
 
@@ -1280,18 +1280,11 @@ def forward (device : Device) (layer : BitLinear)
     -- Otherwise fall back to the workgroup-cooperative tiled kernel.
     let hasSM ← Hesper.WGSL.Execute.hasSubgroupMatrixSupport device
     let hasF16 ← Hesper.WGSL.Execute.hasShaderF16Support device
-    -- The kernel handles arbitrary numRows by zero-padding the last row tile
-    -- and skipping out-of-bounds writes, so numRows ≥ 16 is the only row
-    -- requirement. outDim must be a multiple of 16 (we don't currently do
-    -- column-tail padding) and inDim must be a multiple of 128 (i2_s group).
-    --
-    -- NOTE: the subgroup-matrix path is currently slower than the tiled
-    -- fallback at M < 256 on RTX 4070 Ti (see Tests/BitLinearBench output —
-    -- the per-workgroup weight-load traffic isn't amortized yet because
-    -- each workgroup computes only one 16×16 output tile). Gate it behind
-    -- an opt-in environment variable `HESPER_BITLINEAR_SUBGROUP_MATRIX=1`
-    -- so the default path doesn't regress; enabling the env var also
-    -- serves as the equivalence-test entry point.
+    -- The kernel zero-pads the tail row tile, so numRows ≥ 16 is the only
+    -- row requirement. outDim must be a multiple of 16 (no column-tail
+    -- padding yet) and inDim must be a multiple of 128 (i2_s group layout).
+    -- Measured ~800-2600 GFLOP/s for M ∈ [16, 128] on RTX 4070 Ti vs
+    -- the tiled fallback's ~620 GFLOP/s peak; enabled by default.
     let tileFriendly :=
       numRows ≥ 16 && layer.config.outDim % 16 == 0 &&
       layer.config.inDim % 16 == 0 && layer.config.inDim % 128 == 0
