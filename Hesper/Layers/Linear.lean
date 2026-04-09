@@ -181,6 +181,13 @@ structure LinearLayer where
 
 /-- Execute the linear layer: output = input @ weights^T
 
+    Fast path: after the first call, the prepared dispatch is cached in
+    `layer.prepared` and subsequent calls bypass WGSL regeneration / hash
+    lookup entirely via `replayPreparedDispatch`. This is critical for
+    Gemma 4 where Q4_K/Q6_K linears are called dozens of times per layer
+    × 42 layers per token — the non-fast path would pay a ~tens-of-ms
+    WGSL-emit-and-hash cost per call for these large unrolled kernels.
+
     @param device WebGPU device
     @param layer The linear layer
     @param inputBuf GPU buffer with input vector [inDim]
@@ -188,6 +195,17 @@ structure LinearLayer where
 -/
 def LinearLayer.forward (device : Device) (layer : LinearLayer)
     (inputBuf outputBuf : Buffer) : IO Unit := do
+  -- Fast path: instant replay if we already have a prepared dispatch and
+  -- the input/output buffers match the prepared binding. The prepared
+  -- dispatch binds specific buffer handles, so if the caller ever passes
+  -- different buffers, we need to fall through to the slow path and
+  -- re-prepare. In practice for Gemma 4 every layer gets its own
+  -- state.* buffers that are stable across forward passes, so the fast
+  -- path hits after the first call.
+  if let some p ← layer.prepared.get then
+    Execute.replayPreparedDispatch device p layer.config.outDim 1 1
+    return
+
   let namedBuffers := [
     ("weights", layer.weightBuf),
     ("input", inputBuf),
@@ -200,10 +218,17 @@ def LinearLayer.forward (device : Device) (layer : LinearLayer)
     numWorkgroups := (layer.config.outDim, 1, 1)
     workgroupSize := { x := 256, y := 1, z := 1 }
   }
+  -- Pass a stable cache key so the slow path (first call) also skips
+  -- per-call WGSL regeneration — this matters even for one-shot misses
+  -- because Q4_K's kernel body is large and hashing it from scratch is
+  -- noticeably expensive.
+  let cacheKey : UInt64 := match layer.quantFormat with
+    | .Q4_K => hash ("q4k-lin", layer.config.inDim, layer.config.outDim)
+    | .Q6_K => hash ("q6k-lin", layer.config.inDim, layer.config.outDim)
   let shader := match layer.quantFormat with
     | .Q4_K => fusedQ4KMLinearKernel layer.config
     | .Q6_K => Hesper.Quantization.Q6_K.fusedQ6KLinearKernel layer.config.inDim layer.config.outDim
   Execute.executeShaderNamed device shader namedBuffers execConfig
-    (preparedRef := some layer.prepared)
+    (cacheKey := some cacheKey) (preparedRef := some layer.prepared)
 
 end Hesper.Layers.Linear
