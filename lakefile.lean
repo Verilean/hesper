@@ -788,6 +788,11 @@ lean_exe «bitlinear-equiv» where
   supportInterpreter := false
   moreLinkArgs := stdLinkArgs
 
+lean_exe «bitlinear-bench» where
+  root := `Tests.BitLinearBench
+  supportInterpreter := false
+  moreLinkArgs := stdLinkArgs
+
 lean_exe «subgroup-matrix-f16-probe» where
   root := `Examples.Compute.SubgroupMatrixF16Probe
   supportInterpreter := false
