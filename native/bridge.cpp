@@ -526,40 +526,57 @@ lean_obj_res lean_hesper_init(lean_obj_res /* unit */) {
 // Reference: https://github.com/AnswerDotAI/gpu.cpp/blob/dev/experimental/kernels/ops.hpp#L14
 // Reference: https://github.com/google/dawn/blob/a8fbe981a86cb59536e2de423d2013a82d9b54a0/src/dawn/native/Limits.cpp
 
-static WGPULimits getMaxLimits() {
+// Clamp each requested limit against the adapter-advertised maximum, so we
+// don't hard-error on "Required limit X > supported Y" when Dawn's adapter
+// caps a field lower than our preferred value. Preferred values aim high;
+// adapter may reduce them.
+static WGPULimits getMaxLimits(wgpu::Adapter& adapter) {
+    wgpu::Limits adapterLimits{};
+    adapter.GetLimits(&adapterLimits);
+
+    auto atMost = [](uint64_t preferred, uint64_t cap) -> uint64_t {
+        return preferred > cap ? cap : preferred;
+    };
+
     WGPULimits limits = WGPU_LIMITS_INIT;
     limits.nextInChain = nullptr;
-    limits.maxTextureDimension1D = 8192;
-    limits.maxTextureDimension2D = 8192;
-    limits.maxTextureDimension3D = 2048;
-    limits.maxTextureArrayLayers = 256;
-    limits.maxBindGroups = 4;
-    limits.maxBindGroupsPlusVertexBuffers = 24;
-    limits.maxBindingsPerBindGroup = 1000;
-    limits.maxDynamicUniformBuffersPerPipelineLayout = 8;
-    limits.maxDynamicStorageBuffersPerPipelineLayout = 4;
-    limits.maxSampledTexturesPerShaderStage = 16;
-    limits.maxSamplersPerShaderStage = 16;
-    limits.maxStorageBuffersPerShaderStage = 8;
-    limits.maxStorageTexturesPerShaderStage = 4;
-    limits.maxUniformBuffersPerShaderStage = 12;
-    limits.maxUniformBufferBindingSize = 65536;
-    limits.maxStorageBufferBindingSize = 0xFFFFFFFCULL;  // 4 GB - 4 (Dawn's max tier)
+    limits.maxTextureDimension1D = atMost(8192, adapterLimits.maxTextureDimension1D);
+    limits.maxTextureDimension2D = atMost(8192, adapterLimits.maxTextureDimension2D);
+    limits.maxTextureDimension3D = atMost(2048, adapterLimits.maxTextureDimension3D);
+    limits.maxTextureArrayLayers = atMost(256, adapterLimits.maxTextureArrayLayers);
+    limits.maxBindGroups = atMost(4, adapterLimits.maxBindGroups);
+    limits.maxBindGroupsPlusVertexBuffers = atMost(24, adapterLimits.maxBindGroupsPlusVertexBuffers);
+    limits.maxBindingsPerBindGroup = atMost(1000, adapterLimits.maxBindingsPerBindGroup);
+    limits.maxDynamicUniformBuffersPerPipelineLayout =
+        atMost(8, adapterLimits.maxDynamicUniformBuffersPerPipelineLayout);
+    limits.maxDynamicStorageBuffersPerPipelineLayout =
+        atMost(4, adapterLimits.maxDynamicStorageBuffersPerPipelineLayout);
+    limits.maxSampledTexturesPerShaderStage = atMost(16, adapterLimits.maxSampledTexturesPerShaderStage);
+    limits.maxSamplersPerShaderStage = atMost(16, adapterLimits.maxSamplersPerShaderStage);
+    limits.maxStorageBuffersPerShaderStage = atMost(8, adapterLimits.maxStorageBuffersPerShaderStage);
+    limits.maxStorageTexturesPerShaderStage = atMost(4, adapterLimits.maxStorageTexturesPerShaderStage);
+    limits.maxUniformBuffersPerShaderStage = atMost(12, adapterLimits.maxUniformBuffersPerShaderStage);
+    limits.maxUniformBufferBindingSize = atMost(65536, adapterLimits.maxUniformBufferBindingSize);
+    // Ask for 4 GB (Dawn's historical max tier); adapter will clamp to its actual cap
+    // (typically 2 GB - 4 on NVIDIA/Vulkan).
+    limits.maxStorageBufferBindingSize =
+        atMost(0xFFFFFFFCULL, adapterLimits.maxStorageBufferBindingSize);
     limits.minUniformBufferOffsetAlignment = 256;
     limits.minStorageBufferOffsetAlignment = 256;
-    limits.maxVertexBuffers = 8;
-    limits.maxBufferSize = 0x100000000ULL;               // 4 GB (Dawn's max tier)
-    limits.maxVertexAttributes = 16;
-    limits.maxVertexBufferArrayStride = 2048;
-    limits.maxInterStageShaderVariables = 16;
-    limits.maxColorAttachments = 8;
-    limits.maxColorAttachmentBytesPerSample = 32;
-    limits.maxComputeWorkgroupStorageSize = 16384;
-    limits.maxComputeInvocationsPerWorkgroup = 256;
-    limits.maxComputeWorkgroupSizeX = 256;
-    limits.maxComputeWorkgroupSizeY = 256;
-    limits.maxComputeWorkgroupSizeZ = 64;
-    limits.maxComputeWorkgroupsPerDimension = 65535;
+    limits.maxVertexBuffers = atMost(8, adapterLimits.maxVertexBuffers);
+    limits.maxBufferSize = atMost(0x100000000ULL, adapterLimits.maxBufferSize);
+    limits.maxVertexAttributes = atMost(16, adapterLimits.maxVertexAttributes);
+    limits.maxVertexBufferArrayStride = atMost(2048, adapterLimits.maxVertexBufferArrayStride);
+    limits.maxInterStageShaderVariables = atMost(16, adapterLimits.maxInterStageShaderVariables);
+    limits.maxColorAttachments = atMost(8, adapterLimits.maxColorAttachments);
+    limits.maxColorAttachmentBytesPerSample = atMost(32, adapterLimits.maxColorAttachmentBytesPerSample);
+    limits.maxComputeWorkgroupStorageSize = atMost(16384, adapterLimits.maxComputeWorkgroupStorageSize);
+    limits.maxComputeInvocationsPerWorkgroup = atMost(256, adapterLimits.maxComputeInvocationsPerWorkgroup);
+    limits.maxComputeWorkgroupSizeX = atMost(256, adapterLimits.maxComputeWorkgroupSizeX);
+    limits.maxComputeWorkgroupSizeY = atMost(256, adapterLimits.maxComputeWorkgroupSizeY);
+    limits.maxComputeWorkgroupSizeZ = atMost(64, adapterLimits.maxComputeWorkgroupSizeZ);
+    limits.maxComputeWorkgroupsPerDimension =
+        atMost(65535, adapterLimits.maxComputeWorkgroupsPerDimension);
     return limits;
 }
 
@@ -601,24 +618,39 @@ static FeatureLevel getFeatureLevel() {
 // Shared device creation: max limits, feature level from env or autodetect
 static wgpu::Device createDeviceWithMaxLimits(wgpu::Adapter& adapter) {
     // Toggles:
-    //   allow_unsafe_apis         — lets us request experimental features
-    //                               like ChromiumExperimentalSubgroupMatrix
-    //   use_vulkan_memory_model   — required for subgroup matrix on Vulkan
-    //                               (NVIDIA/AMD). Dawn hard-errors with
-    //                               "SubgroupMatrix requires VulkanMemoryModel
-    //                               toggle on Vulkan" without it. Ignored on
-    //                               non-Vulkan backends.
+    //   allow_unsafe_apis            — lets us request experimental features
+    //                                  like ChromiumExperimentalSubgroupMatrix.
+    //   use_vulkan_memory_model      — required for SubgroupMatrix on Vulkan.
+    //                                  Dawn hard-errors "SubgroupMatrix requires
+    //                                  VulkanMemoryModel toggle on Vulkan"
+    //                                  without it.
+    //   vulkan_enable_f16_on_nvidia  — upstream Dawn blocks ShaderF16 on NVIDIA
+    //                                  by default (crbug/42251215 — some f16
+    //                                  CTS tests fail). This opt-in toggle lifts
+    //                                  the block. Our shaders are a small fixed
+    //                                  set that we validate ourselves, and f16
+    //                                  is on the critical path for subgroup
+    //                                  matrix configs (all NV cooperative matrix
+    //                                  types use f16 element type).
+    //   decompose_uniform_buffers    — required for ShaderF16 runtime validation
+    //                                  when uniformAndStorageBuffer16BitAccess
+    //                                  is not advertised by the Vulkan driver.
+    //
+    // All toggles are ignored on backends that don't understand them (Metal /
+    // D3D12), so this is safe to enable unconditionally.
     static WGPUDawnTogglesDescriptor toggles = {};
     toggles.chain.sType = WGPUSType_DawnTogglesDescriptor;
     static const char* enableList[] = {
         "allow_unsafe_apis",
         "use_vulkan_memory_model",
+        "vulkan_enable_f16_on_nvidia",
+        "decompose_uniform_buffers",
     };
     toggles.enabledToggles = enableList;
     toggles.enabledToggleCount = sizeof(enableList) / sizeof(enableList[0]);
 
     // Limits: max settings for large model buffers (1 GB storage, 2 GB buffer)
-    WGPULimits limits = getMaxLimits();
+    WGPULimits limits = getMaxLimits(adapter);
 
     FeatureLevel level = getFeatureLevel();
     bool hasSubgroups = adapter.HasFeature(wgpu::FeatureName::Subgroups);
@@ -1278,8 +1310,10 @@ lean_obj_res lean_hesper_create_shader_module(b_lean_obj_arg device_obj, b_lean_
         fflush(stderr);
     }
 
-    wgpu::ShaderModuleWGSLDescriptor wgslDesc{};
-    wgslDesc.code = shader_code;
+    // Upstream Dawn renamed ShaderModuleWGSLDescriptor → ShaderSourceWGSL
+    // and changed .code from const char* to wgpu::StringView.
+    wgpu::ShaderSourceWGSL wgslDesc{};
+    wgslDesc.code = wgpu::StringView(shader_code);
 
     wgpu::ShaderModuleDescriptor shaderDesc{};
     shaderDesc.nextInChain = &wgslDesc;
