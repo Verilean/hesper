@@ -78,12 +78,21 @@ private def buildDawnIfNeeded (cwd : FilePath) : IO UInt32 := do
   let dawnSrc := cwd / ".lake/build/dawn-src"
   let dawnBuild := cwd / ".lake/build/dawn-build"
   let dawnInstall := cwd / ".lake/build/dawn-install"
-  let dawnVersion := "3f79f3aefe0b0a498002564fcfb13eb21ab6c047"
+  let dawnVersion := "07e53299e6f6eb75a61d26e17c1ece0655e6e97e"
 
-  -- Download Dawn tarball if not already present
+  -- Download Dawn tarball if not already present.
+  -- If a local checkout exists at `dawn/` (e.g. a manually cloned upstream
+  -- repo), seed dawn-src from it instead of downloading, so developers can
+  -- test patches against the latest upstream without re-downloading.
   if !(← dawnSrc.pathExists) then
-    let ret ← downloadDawn cwd dawnSrc dawnVersion
-    if ret != 0 then return ret
+    let localDawn := cwd / "dawn"
+    if (← localDawn.pathExists) then
+      IO.println "[Hesper] Seeding dawn-src from local ./dawn checkout..."
+      let ret ← runCmd "cp" #["-r", localDawn.toString, dawnSrc.toString]
+      if ret != 0 then return ret
+    else
+      let ret ← downloadDawn cwd dawnSrc dawnVersion
+      if ret != 0 then return ret
 
   -- Check if rebuild is needed via hash
   let platform := if System.Platform.isOSX then "osx" else "linux"
@@ -351,7 +360,8 @@ def stdLinkArgs : Array String :=
   let commonArgs := #[
     "-L./.lake/build/dawn-build/src/dawn", "-ldawn_proc",
     "-L./.lake/build/dawn-install/" ++ dawnLibDir, "-lwebgpu_dawn",
-    "-L./.lake/build/dawn-build/third_party/glfw/src", "-lglfw3",
+    -- Upstream Dawn moved glfw from third_party/glfw/src to third_party/glfw3/src/src
+    "-L./.lake/build/dawn-build/third_party/glfw3/src/src", "-lglfw3",
     "./.lake/build/simd/libhesper_simd.a",
     "./.lake/build/simd/_deps/highway-build/libhwy.a"
   ]
