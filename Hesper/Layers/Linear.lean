@@ -472,31 +472,76 @@ def fusedQ4KMLinearBlockCoopKernel (config : Config) : ShaderM Unit := do
   -- Per-lane partition of a single Q4_K block:
   --   c   = tid / 8  ∈ [0,4)  — sub-block pair
   --   l32 = tid % 8  ∈ [0,8)  — u32 within the pair
-  -- qs base for this lane's u32 inside a block (in u32 units, relative
-  -- to the block start): `4 + c*8 + l32`. And the lane owns exactly
-  -- this one u32, which decodes to 4 low-nibble + 4 high-nibble
-  -- elements at `elemBase + c*64 + l32*4 + {0..3}` (low) and
-  -- `elemBase + c*64 + 32 + l32*4 + {0..3}` (high).
   let cLane := Exp.div tid (Exp.litU32 8)
   let l32Lane := Exp.sub tid (Exp.mul cLane (Exp.litU32 8))
+  let qsOffsetInBlock := Exp.add (Exp.litU32 4)
+                         (Exp.add (Exp.mul cLane (Exp.litU32 8)) l32Lane)
 
-  -- Sequential block loop — Lean-level `for` so it's fully unrolled in
-  -- WGSL for small `blocksPerRow`. For large `inDim` (e.g. 10240 →
-  -- 40 blocks) the unroll is still tolerable; if not, switch to a
-  -- runtime ShaderM.loop of stride 1.
+  -- ## Software-pipelined block loop
+  --
+  -- The naive version does `load → dequant → FMA` per block, which
+  -- serialises memory latency with the FMA chain and leaves memory
+  -- bandwidth at ~7 % of peak (see Bench/GpuFixedCost.lean). To overlap
+  -- the next block's load with the current block's FMAs, we keep the
+  -- five per-block u32 values (dm, sc0, sc1, sc2, qs) in mutable `var`s
+  -- that are **prefetched one iteration ahead**:
+  --
+  --   pre-loop:          next* = weights[block 0 ...]
+  --   inside loop:       curr* = next*                    (snapshot)
+  --                      next* = weights[block+1 ...]     (issue only)
+  --                      dequant/FMA using curr*          (overlaps with next*)
+  --
+  -- `ShaderM.varNamed` emits a WGSL `var`, `ShaderM.assign` rewrites
+  -- it, so the SPIR-V backend sees the next-block loads as independent
+  -- from the current-block math and can schedule them.
+  -- Pre-loop prefetch of block 0 headers + qs.
+  let nbBase0 := rowBaseU32
+  let init0Dm  ← ShaderM.readBuffer (ty := .scalar .u32) (n := totalWeightU32) "weights" nbBase0
+  let init0Sc0 ← ShaderM.readBuffer (ty := .scalar .u32) (n := totalWeightU32) "weights" (Exp.add nbBase0 (Exp.litU32 1))
+  let init0Sc1 ← ShaderM.readBuffer (ty := .scalar .u32) (n := totalWeightU32) "weights" (Exp.add nbBase0 (Exp.litU32 2))
+  let init0Sc2 ← ShaderM.readBuffer (ty := .scalar .u32) (n := totalWeightU32) "weights" (Exp.add nbBase0 (Exp.litU32 3))
+  let init0Qs  ← ShaderM.readBuffer (ty := .scalar .u32) (n := totalWeightU32) "weights" (Exp.add nbBase0 qsOffsetInBlock)
+  ShaderM.varNamed "nextDm"  (.scalar .u32) init0Dm
+  ShaderM.varNamed "nextSc0" (.scalar .u32) init0Sc0
+  ShaderM.varNamed "nextSc1" (.scalar .u32) init0Sc1
+  ShaderM.varNamed "nextSc2" (.scalar .u32) init0Sc2
+  ShaderM.varNamed "nextQs"  (.scalar .u32) init0Qs
+
   for block in [0:blocksPerRow] do
-    let blockU32Base := Exp.add rowBaseU32 (Exp.litU32 (block * 36))
     let elemBase := block * 256
 
-    -- Header: d, dmin (from first u32), then sc0/sc1/sc2 (next three).
-    -- All 32 lanes read the same 4 addresses → hardware-broadcast, not
-    -- 32 independent loads.
-    let dmU32 ← ShaderM.readBuffer (ty := .scalar .u32) (n := totalWeightU32) "weights" blockU32Base
+    -- Snapshot the prefetched "next" values into per-iteration `curr`
+    -- WGSL vars BEFORE issuing the block+1 loads. Unique names per
+    -- block so the Lean-level unroll doesn't emit duplicate decls.
+    let cDm  := s!"currDm_{block}"
+    let cSc0 := s!"currSc0_{block}"
+    let cSc1 := s!"currSc1_{block}"
+    let cSc2 := s!"currSc2_{block}"
+    let cQs  := s!"currQs_{block}"
+    ShaderM.varNamed cDm  (.scalar .u32) (Exp.var "nextDm")
+    ShaderM.varNamed cSc0 (.scalar .u32) (Exp.var "nextSc0")
+    ShaderM.varNamed cSc1 (.scalar .u32) (Exp.var "nextSc1")
+    ShaderM.varNamed cSc2 (.scalar .u32) (Exp.var "nextSc2")
+    ShaderM.varNamed cQs  (.scalar .u32) (Exp.var "nextQs")
+    let dmU32 : Exp (.scalar .u32) := Exp.var cDm
+    let sc0   : Exp (.scalar .u32) := Exp.var cSc0
+    let sc1   : Exp (.scalar .u32) := Exp.var cSc1
+    let sc2   : Exp (.scalar .u32) := Exp.var cSc2
+    let qsU32 : Exp (.scalar .u32) := Exp.var cQs
     let d := fp16ToF32 (Exp.bitAnd dmU32 (Exp.litU32 0xFFFF))
     let dmin := fp16ToF32 (Exp.shiftRight dmU32 (Exp.litU32 16))
-    let sc0 ← ShaderM.readBuffer (ty := .scalar .u32) (n := totalWeightU32) "weights" (Exp.add blockU32Base (Exp.litU32 1))
-    let sc1 ← ShaderM.readBuffer (ty := .scalar .u32) (n := totalWeightU32) "weights" (Exp.add blockU32Base (Exp.litU32 2))
-    let sc2 ← ShaderM.readBuffer (ty := .scalar .u32) (n := totalWeightU32) "weights" (Exp.add blockU32Base (Exp.litU32 3))
+
+    -- Issue block+1 loads. These happen AFTER the curr snapshot but
+    -- BEFORE the dequant+FMA chain below, so the backend sees them as
+    -- independent writes that can be issued in parallel with the
+    -- subsequent math on curr*.
+    if block + 1 < blocksPerRow then
+      let nbBaseNext := Exp.add rowBaseU32 (Exp.litU32 ((block + 1) * 36))
+      ShaderM.assign "nextDm"  (← ShaderM.readBuffer (ty := .scalar .u32) (n := totalWeightU32) "weights" nbBaseNext)
+      ShaderM.assign "nextSc0" (← ShaderM.readBuffer (ty := .scalar .u32) (n := totalWeightU32) "weights" (Exp.add nbBaseNext (Exp.litU32 1)))
+      ShaderM.assign "nextSc1" (← ShaderM.readBuffer (ty := .scalar .u32) (n := totalWeightU32) "weights" (Exp.add nbBaseNext (Exp.litU32 2)))
+      ShaderM.assign "nextSc2" (← ShaderM.readBuffer (ty := .scalar .u32) (n := totalWeightU32) "weights" (Exp.add nbBaseNext (Exp.litU32 3)))
+      ShaderM.assign "nextQs"  (← ShaderM.readBuffer (ty := .scalar .u32) (n := totalWeightU32) "weights" (Exp.add nbBaseNext qsOffsetInBlock))
 
     -- Per-lane scale/min for this block. `cLane` is a runtime value so
     -- we cannot use the tuple-returning `getScaleMin` (it pattern-matches
@@ -541,11 +586,7 @@ def fusedQ4KMLinearBlockCoopKernel (config : Config) : ShaderM Unit := do
     let d2 := Exp.mul d scaleB
     let m2 := Exp.mul dmin minB
 
-    -- Per-lane qs u32: `blockU32Base + 4 + cLane*8 + l32Lane`.
-    let qsLaneIdx := Exp.add blockU32Base
-                     (Exp.add (Exp.litU32 4)
-                       (Exp.add (Exp.mul cLane (Exp.litU32 8)) l32Lane))
-    let qsU32 ← ShaderM.readBuffer (ty := .scalar .u32) (n := totalWeightU32) "weights" qsLaneIdx
+    -- qsU32 comes from the software-pipelined `curr` snapshot above.
 
     -- 4 bytes → 4 low nibbles + 4 high nibbles = 8 weights.
     -- Low nibble weights go to elements `elemBase + c*64 + l32*4 + b`,
@@ -910,7 +951,7 @@ def LinearLayer.forward (device : Device) (layer : LinearLayer)
   -- regeneration — Q4_K's kernel body is large and hashing it from
   -- scratch is noticeably expensive.
   let cacheKey : UInt64 := match layer.quantFormat with
-    | .Q4_K => hash ("q4k-lin-blockcoop", layer.config.inDim, layer.config.outDim, useSubgroups)
+    | .Q4_K => hash ("q4k-lin-blockcoop-swpipe", layer.config.inDim, layer.config.outDim, useSubgroups)
     | .Q6_K => hash ("q6k-lin", layer.config.inDim, layer.config.outDim, useSubgroups)
   let shader := match layer.quantFormat, useSubgroups with
     | .Q4_K, true  => fusedQ4KMLinearBlockCoopKernel layer.config
