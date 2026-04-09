@@ -1675,7 +1675,7 @@ def forwardSingleToken (device : Device) (model : Gemma4Model)
       -- with hardware `subgroupAdd` instead of 256-thread tree reduction.
       let useSubgroups ← Hesper.WGSL.Execute.hasSubgroupSupport device
       let shader := if useSubgroups then
-          Hesper.Quantization.Q6_K.fusedQ6KLinearSubgroupKernel
+          Hesper.Quantization.Q6_K.fusedQ6KLinearBlockCoopKernel
             model.config.hiddenSize model.config.vocabSize gridX
         else
           Hesper.Quantization.Q6_K.fusedQ6KLinearKernel
@@ -1690,7 +1690,7 @@ def forwardSingleToken (device : Device) (model : Gemma4Model)
           workgroupSize := { x := wgSize, y := 1, z := 1 }
           extensions := if useSubgroups then ["subgroups"] else []
           : Hesper.WGSL.Execute.ExecutionConfig }
-        (cacheKey := some (hash ("gemma4-lm-head", model.config.hiddenSize, model.config.vocabSize, useSubgroups)))
+        (cacheKey := some (hash ("gemma4-lm-head-blockcoop", model.config.hiddenSize, model.config.vocabSize, useSubgroups)))
     | _ =>
       let lmHeadConfig : Hesper.WGSL.MatMul.Config := {
         M := 1, N := model.config.vocabSize, K := model.config.hiddenSize
