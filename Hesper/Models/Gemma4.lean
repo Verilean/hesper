@@ -1153,6 +1153,14 @@ structure InferenceState where
   plTokenSelected : Buffer    -- [embdPerLayer * numLayers] tok_embd_per_layer[token] dequantized
   plModelProj : Buffer        -- [embdPerLayer * numLayers] per_layer_model_proj @ scaled_embed
   plInputAll : Buffer         -- [embdPerLayer * numLayers] final per-layer input (sum, normed, scaled)
+  -- Small GPU-side scratch for the raw Q6_K bytes of one per-layer
+  -- embedding row (~33 KB for Gemma 4 e4b). The full per-layer
+  -- embedding table lives on CPU (> WebGPU single-buffer limit); at
+  -- decode time we slice the needed row out of the CPU ByteArray,
+  -- upload it here, and dequant on-GPU via `q6kSingleRowDequantScaleKernel`.
+  -- Sized to the maximum row bytes seen at load time; left as a small
+  -- placeholder when per-layer embeddings are absent.
+  plRawRowBuf : Buffer
 
 /-- Create inference state with pre-allocated buffers -/
 def createInferenceState (device : Device) (cfg : Config) : IO InferenceState := do
@@ -1212,6 +1220,18 @@ def createInferenceState (device : Device) (cfg : Config) : IO InferenceState :=
     plTokenSelected := ← mkBuf (max (cfg.embdPerLayer * cfg.numHiddenLayers) 1)
     plModelProj := ← mkBuf (max (cfg.embdPerLayer * cfg.numHiddenLayers) 1)
     plInputAll := ← mkBuf (max (cfg.embdPerLayer * cfg.numHiddenLayers) 1)
+    plRawRowBuf := ← do
+      -- Raw Q6_K bytes for one per-layer-embd row:
+      --   blocksPerRow = ceil((embdPerLayer * numLayers) / 256)
+      --   rowBytes     = blocksPerRow * 210
+      let totalPL := cfg.embdPerLayer * cfg.numHiddenLayers
+      let blocksPerRow := (totalPL + 255) / 256
+      let rowBytes := blocksPerRow * 210
+      createBuffer device {
+        size := (max rowBytes 4).toUSize
+        usage := [.storage, .copySrc, .copyDst]
+        mappedAtCreation := false
+      }
   }
 
 /-! ## Single-Token Forward Pass -/
@@ -1597,41 +1617,52 @@ def forwardSingleToken (device : Device) (model : Gemma4Model)
       let nLayers := model.config.numHiddenLayers
       let totalPL := embdPL * nLayers
 
-      -- 1) CPU dequant of per_layer_token_embd[tokenId] → row of `totalPL` floats
-      --    Scale by sqrt(embdPerLayer) on CPU as well
-      let rowOffset := tokenId * model.perLayerEmbdRowBytes
-      let rowFloats := dequantQ6KRowCPU embdTableCPU rowOffset totalPL
-      let scaleFactor : Float := Float.sqrt embdPL.toFloat
-      let scaledRow := rowFloats.map (· * scaleFactor)
-      let rowBytes ← floatArrayToBytes scaledRow
-      -- Upload to plModelProj (will hold the scaled token embedding)
-      writeBuffer device state.plModelProj 0 rowBytes
+      -- 1) Dequant the `tokenId` row of the Q6_K per-layer embedding
+      --    table on the GPU. The table is too big to keep on the GPU
+      --    (> single-buffer limit), so we slice the 33 KB of raw Q6_K
+      --    bytes for this row out of the CPU ByteArray, upload it to a
+      --    small scratch buffer, and run `q6kSingleRowDequantScaleKernel`
+      --    to dequant + scale(sqrt(embdPL)) into plModelProj in one
+      --    pass. This replaces a 10 ms/token CPU dequant+upload loop.
+      Hesper.WGSL.Execute.withSection "plPre.rowUpload" do
+        let rowOffset := tokenId * model.perLayerEmbdRowBytes
+        let rowBytes := embdTableCPU.extract rowOffset (rowOffset + model.perLayerEmbdRowBytes)
+        writeBuffer device state.plRawRowBuf 0 rowBytes
+      Hesper.WGSL.Execute.withSection "plPre.gpuDequant" do
+        let scaleFactor : Float := Float.sqrt embdPL.toFloat
+        Hesper.WGSL.Execute.executeShaderNamed device
+          (Hesper.Quantization.Q6_K.q6kSingleRowDequantScaleKernel totalPL scaleFactor)
+          [("row", state.plRawRowBuf), ("output", state.plModelProj)]
+          (.dispatch1D totalPL)
+          (cacheKey := some (hash ("q6k-single-row-dequant-scale", totalPL)))
 
       -- 2) per_layer_model_proj @ buf2 → plTokenSelected
-      --    modelProj is F16 [hiddenSize, totalPL] → use F16 matmul
       let projConfig : Hesper.WGSL.MatMul.Config := {
         M := 1, N := totalPL, K := model.config.hiddenSize
       }
-      Hesper.WGSL.MatMul.executeMatMulTransposeF16 device state.buf2 modelProj state.plTokenSelected projConfig
+      Hesper.WGSL.Execute.withSection "plPre.f16Matmul" do
+        if projConfig.K % 64 == 0 then
+          Hesper.WGSL.MatMul.executeMatMulTransposeF16BlockCoop device state.buf2 modelProj state.plTokenSelected projConfig
+        else
+          Hesper.WGSL.MatMul.executeMatMulTransposeF16 device state.buf2 modelProj state.plTokenSelected projConfig
 
-      -- 3) Scale plTokenSelected by 1/sqrt(hiddenSize) → plInputAll
-      Hesper.WGSL.Execute.executeShaderNamed device
-        (PerLayerEmbedding.scaleKernel totalPL (1.0 / Float.sqrt model.config.hiddenSize.toFloat))
-        [("input", state.plTokenSelected), ("output", state.plInputAll)]
-        (.dispatch1D totalPL)
+      Hesper.WGSL.Execute.withSection "plPre.scale" do
+        Hesper.WGSL.Execute.executeShaderNamed device
+          (PerLayerEmbedding.scaleKernel totalPL (1.0 / Float.sqrt model.config.hiddenSize.toFloat))
+          [("input", state.plTokenSelected), ("output", state.plInputAll)]
+          (.dispatch1D totalPL)
 
-      -- 4) chunkedRMSNorm: per_layer_proj_norm over each embdPerLayer chunk
-      Hesper.WGSL.Execute.executeShaderNamed device
-        (chunkedRMSNormKernel embdPL nLayers model.config.rmsNormEps)
-        [("input", state.plInputAll), ("weight", projNorm.scale), ("output", state.plTokenSelected)]
-        { numWorkgroups := (nLayers, 1, 1), workgroupSize := { x := min embdPL 256, y := 1, z := 1 } : Execute.ExecutionConfig }
-      -- plTokenSelected now has projected+normed values
+      Hesper.WGSL.Execute.withSection "plPre.chunkedNorm" do
+        Hesper.WGSL.Execute.executeShaderNamed device
+          (chunkedRMSNormKernel embdPL nLayers model.config.rmsNormEps)
+          [("input", state.plInputAll), ("weight", projNorm.scale), ("output", state.plTokenSelected)]
+          { numWorkgroups := (nLayers, 1, 1), workgroupSize := { x := min embdPL 256, y := 1, z := 1 } : Execute.ExecutionConfig }
 
-      -- 5) (proj+norm) + scaled_token_embd, then * 1/sqrt(2) → plInputAll
-      Hesper.WGSL.Execute.executeShaderNamed device
-        (scaledAddKernel totalPL (1.0 / Float.sqrt 2.0))
-        [("a", state.plTokenSelected), ("b", state.plModelProj), ("output", state.plInputAll)]
-        (.dispatch1D totalPL)
+      Hesper.WGSL.Execute.withSection "plPre.scaledAdd" do
+        Hesper.WGSL.Execute.executeShaderNamed device
+          (scaledAddKernel totalPL (1.0 / Float.sqrt 2.0))
+          [("a", state.plTokenSelected), ("b", state.plModelProj), ("output", state.plInputAll)]
+          (.dispatch1D totalPL)
     | _, _, _ => pure ()
 
   -- Step 2: Process all transformer blocks (starting from buf2 as current).

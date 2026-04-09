@@ -746,4 +746,30 @@ def q6kEmbeddingLookupKernel (vocabSize dim : Nat) : ShaderM Unit := do
     ShaderM.writeBuffer (ty := .scalar .f32) "output" idx val
   ) (pure ())
 
+/-- Single-row Q6_K dequant with a compile-time scale. Used to replace
+    the slow `dequantQ6KRowCPU` + map + upload pipeline in
+    `forwardSingleToken`'s per-layer-embedding precompute: upload the
+    ~33 KB of raw Q6_K bytes for the needed row once, then run this
+    kernel to dequant + scale into the target f32 buffer in one pass.
+    The row table is just one row (rowIdx = 0 is always used).
+
+    @param dim  Total elements in the row (must be multiple of 256)
+    @param scale  Multiplicative scale applied after dequant
+-/
+def q6kSingleRowDequantScaleKernel (dim : Nat) (scale : Float) : ShaderM Unit := do
+  let gid ← ShaderM.globalId
+  let idx := Exp.vec3X gid
+
+  let blocksPerRow := dim / 256
+  -- One row only; totalU32 covers just `blocksPerRow` blocks.
+  let totalU32 := (blocksPerRow * blockSizeBytes + 3) / 4
+
+  let _row ← ShaderM.declareInputBuffer "row" (.array (.scalar .u32) totalU32)
+  let _output ← ShaderM.declareOutputBuffer "output" (.array (.scalar .f32) dim)
+
+  ShaderM.if_ (Exp.lt idx (Exp.litU32 dim)) (do
+    let val ← dequantQ6KElement dim "row" totalU32 (Exp.litU32 0) idx
+    ShaderM.writeBuffer (ty := .scalar .f32) "output" idx (Exp.mul val (Exp.litF32 scale))
+  ) (pure ())
+
 end Hesper.Quantization.Q6_K
