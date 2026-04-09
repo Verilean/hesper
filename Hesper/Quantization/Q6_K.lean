@@ -229,6 +229,146 @@ def fusedQ6KLinearKernel (inDim outDim : Nat) (workgroupSize : Nat := 256)
     ) (pure ())
   ) (pure ())
 
+/-! ## Q6_K MatVec with Subgroup Reduction -/
+
+/-- Subgroup-reduction variant of `fusedQ6KLinearKernel` for decode (M=1).
+
+    Same math as the tree-reduction kernel, but uses 32 threads per
+    workgroup and a single `subgroupAdd` instead of a 256-thread
+    shared-memory tree reduction. Matches the pattern used by
+    `BitLinear.fusedBitLinearM1Kernel` and
+    `Linear.fusedQ4KMLinearSubgroupKernel`.
+
+    1D workgroup grid only (no gridX = 2D split). For the huge LM-head
+    dispatch (vocabSize=262144) keep using the tree-reduction kernel
+    via the 2D grid path; this kernel is intended for the "normal"
+    linears inside each transformer layer where outDim ≤ 65535.
+
+    @param inDim  Input dimension (must be multiple of blockSize=256)
+    @param outDim Output dimension (must be ≤ 65535 for 1D dispatch)
+-/
+def fusedQ6KLinearSubgroupKernel (inDim outDim : Nat) : ShaderM Unit := do
+  let wid ← ShaderM.workgroupId
+  let lid ← ShaderM.localId
+  let outIdx := Exp.vec3X wid
+  let tid := Exp.vec3X lid
+
+  let blocksPerRow := inDim / blockSize
+  let totalWeightBytes := outDim * blocksPerRow * blockSizeBytes
+  let totalWeightU32 := (totalWeightBytes + 3) / 4
+
+  let _weights ← ShaderM.declareInputBuffer "weights" (.array (.scalar .u32) totalWeightU32)
+  let _input ← ShaderM.declareInputBuffer "input" (.array (.scalar .f32) inDim)
+  let _output ← ShaderM.declareOutputBuffer "output" (.array (.scalar .f32) outDim)
+
+  -- NOTE: no barriers, no shared memory. outIdx bounds check is fine as a
+  -- uniform branch since all 32 lanes share the same workgroup_id.
+  let inBounds := Exp.lt outIdx (Exp.litU32 outDim)
+
+  let rowByteBase := Exp.mul outIdx (Exp.litU32 (blocksPerRow * blockSizeBytes))
+  ShaderM.varNamed "acc" (.scalar .f32) (Exp.litF32 0.0)
+  let acc : Exp (.scalar .f32) := Exp.var "acc"
+
+  let readByte (blockBase : Exp (.scalar .u32)) (offset : Nat) : ShaderM (Exp (.scalar .u32)) := do
+    let byteIdx := Exp.add blockBase (Exp.litU32 offset)
+    let u32Idx := Exp.div byteIdx (Exp.litU32 4)
+    let byteShift := Exp.mul (Exp.mod byteIdx (Exp.litU32 4)) (Exp.litU32 8)
+    let u32 ← ShaderM.readBuffer (ty := .scalar .u32) (n := totalWeightU32) "weights" u32Idx
+    pure (Exp.bitAnd (Exp.shiftRight u32 byteShift) (Exp.litU32 0xFF))
+
+  ShaderM.loop tid (Exp.litU32 blocksPerRow) (Exp.litU32 32) fun blockLocalIdx => do
+    let blockByteBase := Exp.add rowByteBase (Exp.mul blockLocalIdx (Exp.litU32 blockSizeBytes))
+    let elemBase := Exp.mul blockLocalIdx (Exp.litU32 blockSize)
+
+    -- d (FP16) at byte offset 208
+    let dLoByte ← readByte blockByteBase 208
+    let dHiByte ← readByte blockByteBase 209
+    let dBits := Exp.bitOr dLoByte (Exp.shiftLeft dHiByte (Exp.litU32 8))
+    let sign := Exp.shiftRight dBits (Exp.litU32 15)
+    let exp5 := Exp.bitAnd (Exp.shiftRight dBits (Exp.litU32 10)) (Exp.litU32 0x1F)
+    let mant := Exp.bitAnd dBits (Exp.litU32 0x3FF)
+    let signF := Exp.select (Exp.eq sign (Exp.litU32 1)) (Exp.litF32 (-1.0)) (Exp.litF32 1.0)
+    let isSubnormal := Exp.eq exp5 (Exp.litU32 0)
+    let mantFNormal := Exp.add (Exp.litF32 1.0) (Exp.div (Exp.toF32 mant) (Exp.litF32 1024.0))
+    let mantFSubnormal := Exp.div (Exp.toF32 mant) (Exp.litF32 1024.0)
+    let mantF := Exp.select isSubnormal mantFSubnormal mantFNormal
+    let expFNormal := Exp.exp2 (Exp.sub (Exp.toF32 exp5) (Exp.litF32 15.0))
+    let expFSubnormal := Exp.litF32 6.103515625e-5
+    let expF := Exp.select isSubnormal expFSubnormal expFNormal
+    let d := Exp.mul signF (Exp.mul mantF expF)
+
+    let readScaleI8 (offset : Nat) : ShaderM (Exp (.scalar .f32)) := do
+      let scByte ← readByte blockByteBase offset
+      let scSigned := Exp.select (Exp.ge scByte (Exp.litU32 128))
+        (Exp.sub (Exp.toF32 scByte) (Exp.litF32 256.0))
+        (Exp.toF32 scByte)
+      pure scSigned
+
+    for chunk in [0:2] do
+      let qlBaseOff := chunk * 64
+      let qhBaseOff := 128 + chunk * 32
+      let scBaseOff := 192 + chunk * 8
+      let chunkOutBase := chunk * 128
+      for l in [0:32] do
+        let isIdx := l / 16
+        let sc0F ← readScaleI8 (scBaseOff + isIdx)
+        let sc2F ← readScaleI8 (scBaseOff + isIdx + 2)
+        let sc4F ← readScaleI8 (scBaseOff + isIdx + 4)
+        let sc6F ← readScaleI8 (scBaseOff + isIdx + 6)
+        let dsc0 := Exp.mul d sc0F
+        let dsc2 := Exp.mul d sc2F
+        let dsc4 := Exp.mul d sc4F
+        let dsc6 := Exp.mul d sc6F
+
+        let qlByte0 ← readByte blockByteBase (qlBaseOff + l)
+        let qlByte32 ← readByte blockByteBase (qlBaseOff + l + 32)
+        let qhByte ← readByte blockByteBase (qhBaseOff + l)
+
+        let qlLow0 := Exp.bitAnd qlByte0 (Exp.litU32 0xF)
+        let qlLow32 := Exp.bitAnd qlByte32 (Exp.litU32 0xF)
+        let qlHigh0 := Exp.shiftRight qlByte0 (Exp.litU32 4)
+        let qlHigh32 := Exp.shiftRight qlByte32 (Exp.litU32 4)
+
+        let qhBits0 := Exp.bitAnd (Exp.shiftRight qhByte (Exp.litU32 0)) (Exp.litU32 3)
+        let qhBits2 := Exp.bitAnd (Exp.shiftRight qhByte (Exp.litU32 2)) (Exp.litU32 3)
+        let qhBits4 := Exp.bitAnd (Exp.shiftRight qhByte (Exp.litU32 4)) (Exp.litU32 3)
+        let qhBits6 := Exp.bitAnd (Exp.shiftRight qhByte (Exp.litU32 6)) (Exp.litU32 3)
+
+        let q1Raw := Exp.bitOr qlLow0  (Exp.shiftLeft qhBits0 (Exp.litU32 4))
+        let q2Raw := Exp.bitOr qlLow32 (Exp.shiftLeft qhBits2 (Exp.litU32 4))
+        let q3Raw := Exp.bitOr qlHigh0  (Exp.shiftLeft qhBits4 (Exp.litU32 4))
+        let q4Raw := Exp.bitOr qlHigh32 (Exp.shiftLeft qhBits6 (Exp.litU32 4))
+        let q1 := Exp.sub (Exp.toF32 q1Raw) (Exp.litF32 32.0)
+        let q2 := Exp.sub (Exp.toF32 q2Raw) (Exp.litF32 32.0)
+        let q3 := Exp.sub (Exp.toF32 q3Raw) (Exp.litF32 32.0)
+        let q4 := Exp.sub (Exp.toF32 q4Raw) (Exp.litF32 32.0)
+
+        let w1 := Exp.mul dsc0 q1
+        let w2 := Exp.mul dsc2 q2
+        let w3 := Exp.mul dsc4 q3
+        let w4 := Exp.mul dsc6 q4
+
+        let inIdx1 := Exp.add elemBase (Exp.litU32 (chunkOutBase + l))
+        let inIdx2 := Exp.add elemBase (Exp.litU32 (chunkOutBase + l + 32))
+        let inIdx3 := Exp.add elemBase (Exp.litU32 (chunkOutBase + l + 64))
+        let inIdx4 := Exp.add elemBase (Exp.litU32 (chunkOutBase + l + 96))
+
+        let in1 ← ShaderM.readBuffer (ty := .scalar .f32) (n := inDim) "input" inIdx1
+        let in2 ← ShaderM.readBuffer (ty := .scalar .f32) (n := inDim) "input" inIdx2
+        let in3 ← ShaderM.readBuffer (ty := .scalar .f32) (n := inDim) "input" inIdx3
+        let in4 ← ShaderM.readBuffer (ty := .scalar .f32) (n := inDim) "input" inIdx4
+
+        ShaderM.assign "acc" (Exp.add acc (Exp.add (Exp.add (Exp.mul w1 in1) (Exp.mul w2 in2))
+                                                    (Exp.add (Exp.mul w3 in3) (Exp.mul w4 in4))))
+
+  -- Subgroup reduction: hardware-accelerated sum across 32 lanes.
+  ShaderM.varNamed "totalSum" (.scalar .f32) (Exp.subgroupAdd acc)
+  let totalSum : Exp (.scalar .f32) := Exp.var "totalSum"
+
+  ShaderM.if_ (Exp.and (Exp.eq tid (Exp.litU32 0)) inBounds) (do
+    ShaderM.writeBuffer (ty := .scalar .f32) "output" outIdx totalSum
+  ) (pure ())
+
 /-! ## Q6_K Embedding Lookup Kernel -/
 
 /-- Dequant a single Q6_K element at (rowIdx, col) in a [numRows, dim] table.

@@ -164,6 +164,93 @@ def fusedQ4KMLinearKernel (config : Config) (workgroupSize : Nat := 256) : Shade
     ShaderM.writeBuffer (ty := .scalar .f32) "output" outIdx totalSum
   ) (pure ())
 
+/-! ## Q4_K_M MatVec with Subgroup Reduction -/
+
+/-- Subgroup-reduction variant of `fusedQ4KMLinearKernel`.
+
+    Same math as the tree-reduction version, but uses 32 threads per
+    workgroup and a single `subgroupAdd` at the end instead of a
+    256-thread shared-memory tree. On adapters with subgroup support
+    this eliminates all `workgroupBarrier` calls in the reduction phase
+    and runs with an 8× smaller workgroup → more workgroups in flight
+    → higher occupancy.
+
+    Mirrors the pattern in `BitLinear.fusedBitLinearM1Kernel` — one
+    subgroup per output element, strided block processing, hardware
+    subgroupAdd across 32 lanes.
+
+    @param config Layer dimensions
+-/
+def fusedQ4KMLinearSubgroupKernel (config : Config) : ShaderM Unit := do
+  let wid ← ShaderM.workgroupId
+  let lid ← ShaderM.localId
+  let outIdx := Exp.vec3X wid
+  let tid := Exp.vec3X lid
+
+  let blocksPerRow := config.inDim / 256
+  let totalWeightU32 := config.outDim * blocksPerRow * 36
+
+  let _weights ← ShaderM.declareInputBuffer "weights" (.array (.scalar .u32) totalWeightU32)
+  let _input ← ShaderM.declareInputBuffer "input" (.array (.scalar .f32) config.inDim)
+  let _output ← ShaderM.declareOutputBuffer "output" (.array (.scalar .f32) config.outDim)
+
+  let inBounds := Exp.lt outIdx (Exp.litU32 config.outDim)
+
+  ShaderM.varNamed "acc" (.scalar .f32) (Exp.litF32 0.0)
+  let acc : Exp (.scalar .f32) := Exp.var "acc"
+
+  let rowBaseU32 := Exp.mul outIdx (Exp.litU32 (blocksPerRow * 36))
+
+  -- Strided loop: 32 threads, stride = 32. Thread k handles blocks
+  -- k, k+32, k+64, ... (consecutive threads hit consecutive blocks for
+  -- coalesced weight reads).
+  ShaderM.loop tid (Exp.litU32 blocksPerRow) (Exp.litU32 32) fun blockLocalIdx => do
+    let blockU32Base := Exp.add rowBaseU32 (Exp.mul blockLocalIdx (Exp.litU32 36))
+    let elemBase := Exp.mul blockLocalIdx (Exp.litU32 256)
+
+    -- Read block header: d and dmin (first u32)
+    let dmU32 ← ShaderM.readBuffer (ty := .scalar .u32) (n := totalWeightU32) "weights" blockU32Base
+    let d := fp16ToF32 (Exp.bitAnd dmU32 (Exp.litU32 0xFFFF))
+    let dmin := fp16ToF32 (Exp.shiftRight dmU32 (Exp.litU32 16))
+
+    let sc0 ← ShaderM.readBuffer (ty := .scalar .u32) (n := totalWeightU32) "weights" (Exp.add blockU32Base (Exp.litU32 1))
+    let sc1 ← ShaderM.readBuffer (ty := .scalar .u32) (n := totalWeightU32) "weights" (Exp.add blockU32Base (Exp.litU32 2))
+    let sc2 ← ShaderM.readBuffer (ty := .scalar .u32) (n := totalWeightU32) "weights" (Exp.add blockU32Base (Exp.litU32 3))
+
+    for c in [0:4] do
+      let is0 := c * 2
+      let is1 := c * 2 + 1
+      let (scaleA, minA) := getScaleMin is0 sc0 sc1 sc2
+      let (scaleB, minB) := getScaleMin is1 sc0 sc1 sc2
+      let d1 := Exp.mul d scaleA
+      let m1 := Exp.mul dmin minA
+      let d2 := Exp.mul d scaleB
+      let m2 := Exp.mul dmin minB
+
+      let qsU32Base := Exp.add blockU32Base (Exp.litU32 (4 + c * 8))
+
+      for l32 in [0:8] do
+        let qsU32 ← ShaderM.readBuffer (ty := .scalar .u32) (n := totalWeightU32) "weights" (Exp.add qsU32Base (Exp.litU32 l32))
+        for b in [0:4] do
+          let byte := Exp.bitAnd (Exp.shiftRight qsU32 (Exp.litU32 (b * 8))) (Exp.litU32 0xFF)
+          let qLow := Exp.bitAnd byte (Exp.litU32 0xF)
+          let qHigh := Exp.shiftRight byte (Exp.litU32 4)
+          let elemIdxLow := Exp.add elemBase (Exp.litU32 (c * 64 + l32 * 4 + b))
+          let elemIdxHigh := Exp.add elemBase (Exp.litU32 (c * 64 + 32 + l32 * 4 + b))
+          let inLow ← ShaderM.readBuffer (ty := .scalar .f32) (n := config.inDim) "input" elemIdxLow
+          let inHigh ← ShaderM.readBuffer (ty := .scalar .f32) (n := config.inDim) "input" elemIdxHigh
+          let wLow := Exp.sub (Exp.mul d1 (Exp.toF32 qLow)) m1
+          let wHigh := Exp.sub (Exp.mul d2 (Exp.toF32 qHigh)) m2
+          ShaderM.assign "acc" (Exp.add acc (Exp.add (Exp.mul wLow inLow) (Exp.mul wHigh inHigh)))
+
+  -- Subgroup reduction: one hardware-accelerated sum across 32 lanes.
+  ShaderM.varNamed "totalSum" (.scalar .f32) (Exp.subgroupAdd acc)
+  let totalSum : Exp (.scalar .f32) := Exp.var "totalSum"
+
+  ShaderM.if_ (Exp.and (Exp.eq tid (Exp.litU32 0)) inBounds) (do
+    ShaderM.writeBuffer (ty := .scalar .f32) "output" outIdx totalSum
+  ) (pure ())
+
 /-! ## Layer Structure -/
 
 /-- Quantization format for the weight tensor -/
@@ -203,6 +290,7 @@ def LinearLayer.forward (device : Device) (layer : LinearLayer)
   -- state.* buffers that are stable across forward passes, so the fast
   -- path hits after the first call.
   if let some p ← layer.prepared.get then
+    -- Use the same workgroup count that was used at prepare time.
     Execute.replayPreparedDispatch device p layer.config.outDim 1 1
     return
 
@@ -211,23 +299,28 @@ def LinearLayer.forward (device : Device) (layer : LinearLayer)
     ("input", inputBuf),
     ("output", outputBuf)
   ]
-  -- The fused kernels use one workgroup per output element with workgroup_size=256
-  -- threads cooperating on a tree reduction. So dispatch outDim workgroups, not
-  -- ceil(outDim / 256).
+  -- Pick subgroup-reduction (32 threads per workgroup, hardware
+  -- `subgroupAdd`) if the device supports subgroups, else the
+  -- original shared-memory tree-reduction kernel (256 threads).
+  -- Both variants dispatch `outDim` workgroups, one per output row.
+  let useSubgroups ← Execute.hasSubgroupSupport device
+  let wgSize := if useSubgroups then 32 else 256
   let execConfig : Execute.ExecutionConfig := {
     numWorkgroups := (layer.config.outDim, 1, 1)
-    workgroupSize := { x := 256, y := 1, z := 1 }
+    workgroupSize := { x := wgSize, y := 1, z := 1 }
+    extensions := if useSubgroups then ["subgroups"] else []
   }
-  -- Pass a stable cache key so the slow path (first call) also skips
-  -- per-call WGSL regeneration — this matters even for one-shot misses
-  -- because Q4_K's kernel body is large and hashing it from scratch is
-  -- noticeably expensive.
+  -- Stable cache key so the slow path (first call) skips per-call WGSL
+  -- regeneration — Q4_K's kernel body is large and hashing it from
+  -- scratch is noticeably expensive.
   let cacheKey : UInt64 := match layer.quantFormat with
-    | .Q4_K => hash ("q4k-lin", layer.config.inDim, layer.config.outDim)
-    | .Q6_K => hash ("q6k-lin", layer.config.inDim, layer.config.outDim)
-  let shader := match layer.quantFormat with
-    | .Q4_K => fusedQ4KMLinearKernel layer.config
-    | .Q6_K => Hesper.Quantization.Q6_K.fusedQ6KLinearKernel layer.config.inDim layer.config.outDim
+    | .Q4_K => hash ("q4k-lin", layer.config.inDim, layer.config.outDim, useSubgroups)
+    | .Q6_K => hash ("q6k-lin", layer.config.inDim, layer.config.outDim, useSubgroups)
+  let shader := match layer.quantFormat, useSubgroups with
+    | .Q4_K, true  => fusedQ4KMLinearSubgroupKernel layer.config
+    | .Q4_K, false => fusedQ4KMLinearKernel layer.config
+    | .Q6_K, true  => Hesper.Quantization.Q6_K.fusedQ6KLinearSubgroupKernel layer.config.inDim layer.config.outDim
+    | .Q6_K, false => Hesper.Quantization.Q6_K.fusedQ6KLinearKernel layer.config.inDim layer.config.outDim
   Execute.executeShaderNamed device shader namedBuffers execConfig
     (cacheKey := some cacheKey) (preparedRef := some layer.prepared)
 
