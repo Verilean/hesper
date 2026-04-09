@@ -281,6 +281,44 @@ def endBatch (device : Device) : IO Unit := do
 def isBatching : IO Bool := do
   return (← batchEncoderRef.get).isSome
 
+/-! ## Section profiling
+
+Lightweight per-section wall-clock timing for the "everything else" bucket
+breakdown. When `sectionProfilingRef` is true, `withSection name act` wraps
+`act` with monoNanos timestamps and accumulates total ns + call count into
+`sectionTotalsRef` keyed by name. Nested sections are allowed (the outer
+section's total includes nested ones). Only meaningful in unbatched mode
+where each dispatch auto-syncs.
+-/
+
+initialize sectionProfilingRef : IO.Ref Bool ← IO.mkRef false
+-- (name, totalNanos, callCount)
+initialize sectionTotalsRef : IO.Ref (Array (String × UInt64 × Nat)) ← IO.mkRef #[]
+
+private def addSectionSample (name : String) (ns : UInt64) : IO Unit := do
+  let arr ← sectionTotalsRef.get
+  match arr.findIdx? (fun e => e.1 == name) with
+  | some i =>
+    let (n, t, c) := arr[i]!
+    sectionTotalsRef.set (arr.set! i (n, t + ns, c + 1))
+  | none =>
+    sectionTotalsRef.set (arr.push (name, ns, 1))
+
+def resetSectionTotals : IO Unit := sectionTotalsRef.set #[]
+
+def getSectionTotals : IO (Array (String × UInt64 × Nat)) := sectionTotalsRef.get
+
+/-- Time an IO action under a section name; no-op when profiling disabled. -/
+@[inline] def withSection (name : String) (act : IO α) : IO α := do
+  if ← sectionProfilingRef.get then
+    let t0 ← IO.monoNanosNow
+    let r ← act
+    let t1 ← IO.monoNanosNow
+    addSectionSample name (t1 - t0).toUInt64
+    pure r
+  else
+    act
+
 /-- Replay a prepared dispatch directly. Skips ALL Lean-side processing.
     Works in both batch mode (record into shared encoder) and standalone mode. -/
 def replayPreparedDispatch (device : Device) (prepared : PreparedDispatch)
