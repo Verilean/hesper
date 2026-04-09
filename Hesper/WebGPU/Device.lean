@@ -43,6 +43,18 @@ opaque getDeviceByIndex (inst : @& Instance) (gpuIdx : @& UInt32) : IO Device
 @[extern "lean_hesper_device_has_subgroups"]
 opaque deviceHasSubgroups (device : @& Device) : IO Bool
 
+/-- Check if the device was created with the Chromium experimental
+    subgroup matrix feature. `subgroup_matrix_left/right/result` types
+    and `subgroupMatrixLoad/Store/MultiplyAccumulate` are available iff
+    this returns `true`. -/
+@[extern "lean_hesper_device_has_subgroup_matrix"]
+opaque deviceHasSubgroupMatrix (device : @& Device) : IO Bool
+
+/-- Check if the device was created with ShaderF16 support. `f16` values
+    and related arithmetic are available iff this returns `true`. -/
+@[extern "lean_hesper_device_has_shader_f16"]
+opaque deviceHasShaderF16 (device : @& Device) : IO Bool
+
 /-- Tick the device (process callbacks and events).
     Should be called regularly when doing async operations. -/
 @[extern "lean_hesper_device_tick"]

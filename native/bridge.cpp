@@ -17,6 +17,31 @@
 // g_dawn_instance is kept global for deviceWait to use (since deviceWait only gets device, not instance)
 static dawn::native::Instance* g_dawn_instance = nullptr;
 
+// Build a shared RequestAdapterOptions with our DawnTogglesDescriptor chained in.
+// Using this at adapter-enumeration time makes the toggles visible on the Adapter
+// object itself (mTogglesState on the native side), which is what controls whether
+// optional features like ShaderF16 and SubgroupMatrix get advertised on the adapter.
+//
+// Without this, Instance::EnumerateAdapters() uses an empty TogglesState and the
+// NVIDIA path filters out every f16 cooperative-matrix config (because
+// `vulkan_enable_f16_on_nvidia` is not enabled), leaving only i8/u8 configs usable.
+static const wgpu::RequestAdapterOptions* togglesAdapterOptions() {
+    static WGPUDawnTogglesDescriptor toggles = {};
+    toggles.chain.sType = WGPUSType_DawnTogglesDescriptor;
+    static const char* enableList[] = {
+        "allow_unsafe_apis",
+        "use_vulkan_memory_model",
+        "vulkan_enable_f16_on_nvidia",
+        "decompose_uniform_buffers",
+    };
+    toggles.enabledToggles = enableList;
+    toggles.enabledToggleCount = sizeof(enableList) / sizeof(enableList[0]);
+
+    static wgpu::RequestAdapterOptions options{};
+    options.nextInChain = reinterpret_cast<const wgpu::ChainedStruct*>(&toggles.chain);
+    return &options;
+}
+
 // Global verbose flag for controlling debug output
 static bool g_verbose = true;
 #define DBG_PRINT(...) do { if (g_verbose) { __VA_ARGS__; } } while(0)
@@ -469,7 +494,7 @@ lean_obj_res lean_hesper_init(lean_obj_res /* unit */) {
     g_dawn_instance = instance;
 
     // 3. Enumerate Adapters (replaces DiscoverDefaultAdapters + GetAdapters)
-    auto adapters = instance->EnumerateAdapters();
+    auto adapters = instance->EnumerateAdapters(togglesAdapterOptions());
 
     if (g_verbose) std::cout << "[Hesper] Initialized. Found " << adapters.size() << " adapters:" << std::endl;
 
@@ -673,6 +698,34 @@ static wgpu::Device createDeviceWithMaxLimits(wgpu::Adapter& adapter) {
             wgpu::Device device = tryCreateDevice(adapter, allFeatures.data(), allFeatures.size(), limits, &toggles);
             if (device) {
                 std::cout << "[Hesper] Device: subgroups + subgroup_matrix" << std::endl;
+                // Dump supported subgroup matrix configs so users/kernel authors
+                // know which (M, N, K, inType, outType) tuples to target.
+                wgpu::AdapterInfo info{};
+                wgpu::AdapterPropertiesSubgroupMatrixConfigs smConfigs{};
+                info.nextInChain = &smConfigs;
+                if (adapter.GetInfo(&info) == wgpu::Status::Success) {
+                    std::cout << "[Hesper] SubgroupMatrix configs (count="
+                              << smConfigs.configCount << "):" << std::endl;
+                    auto typeName = [](wgpu::SubgroupMatrixComponentType t) -> const char* {
+                        switch (t) {
+                            case wgpu::SubgroupMatrixComponentType::F16: return "f16";
+                            case wgpu::SubgroupMatrixComponentType::F32: return "f32";
+                            case wgpu::SubgroupMatrixComponentType::I8:  return "i8";
+                            case wgpu::SubgroupMatrixComponentType::U8:  return "u8";
+                            case wgpu::SubgroupMatrixComponentType::I32: return "i32";
+                            case wgpu::SubgroupMatrixComponentType::U32: return "u32";
+                            default: return "?";
+                        }
+                    };
+                    for (size_t i = 0; i < smConfigs.configCount; ++i) {
+                        const auto& c = smConfigs.configs[i];
+                        std::cout << "  [" << i << "] M=" << c.M << " N=" << c.N
+                                  << " K=" << c.K
+                                  << " in=" << typeName(c.componentType)
+                                  << " out=" << typeName(c.resultComponentType)
+                                  << std::endl;
+                    }
+                }
                 return device;
             }
             if (level == FeatureLevel::SubgroupMatrix) {
@@ -756,7 +809,7 @@ static wgpu::Device createDeviceWithMaxLimits(wgpu::Adapter& adapter) {
 lean_obj_res lean_hesper_get_device_with_features(b_lean_obj_arg instance_obj, lean_obj_res /* unit */) {
     dawn::native::Instance* instance = static_cast<dawn::native::Instance*>(lean_get_external_data(instance_obj));
 
-    auto adapters = instance->EnumerateAdapters();
+    auto adapters = instance->EnumerateAdapters(togglesAdapterOptions());
     if (adapters.empty()) {
         return make_webgpu_io_error(WebGPUError::Device(DeviceError::NoAdaptersFound()));
     }
@@ -785,7 +838,7 @@ lean_obj_res lean_hesper_get_device_with_features(b_lean_obj_arg instance_obj, l
 lean_obj_res lean_hesper_get_device(b_lean_obj_arg instance_obj, lean_obj_res /* unit */) {
     dawn::native::Instance* instance = static_cast<dawn::native::Instance*>(lean_get_external_data(instance_obj));
 
-    auto adapters = instance->EnumerateAdapters();
+    auto adapters = instance->EnumerateAdapters(togglesAdapterOptions());
     if (adapters.empty()) {
         return make_webgpu_io_error(WebGPUError::Device(DeviceError::NoAdaptersFound()));
     }
@@ -818,7 +871,7 @@ lean_obj_res lean_hesper_get_device(b_lean_obj_arg instance_obj, lean_obj_res /*
 lean_obj_res lean_hesper_get_adapter_count(b_lean_obj_arg instance_obj, lean_obj_res /* unit */) {
     dawn::native::Instance* instance = static_cast<dawn::native::Instance*>(lean_get_external_data(instance_obj));
 
-    auto adapters = instance->EnumerateAdapters();
+    auto adapters = instance->EnumerateAdapters(togglesAdapterOptions());
     return lean_io_result_mk_ok(lean_box(adapters.size()));
 }
 
@@ -833,7 +886,7 @@ lean_obj_res lean_hesper_get_time_ns(lean_obj_res /* unit */) {
 lean_obj_res lean_hesper_get_adapter_info(b_lean_obj_arg instance_obj, uint32_t gpuIdx, lean_obj_res /* unit */) {
     dawn::native::Instance* instance = static_cast<dawn::native::Instance*>(lean_get_external_data(instance_obj));
 
-    auto adapters = instance->EnumerateAdapters();
+    auto adapters = instance->EnumerateAdapters(togglesAdapterOptions());
 
     if (gpuIdx >= adapters.size()) {
         return make_webgpu_io_error(WebGPUError::Device(DeviceError::InvalidAdapterIndex(gpuIdx, adapters.size())));
@@ -860,7 +913,7 @@ lean_obj_res lean_hesper_get_adapter_info(b_lean_obj_arg instance_obj, uint32_t 
 lean_obj_res lean_hesper_get_device_by_index(b_lean_obj_arg instance_obj, uint32_t gpuIdx, lean_obj_res /* unit */) {
     dawn::native::Instance* instance = static_cast<dawn::native::Instance*>(lean_get_external_data(instance_obj));
 
-    auto adapters = instance->EnumerateAdapters();
+    auto adapters = instance->EnumerateAdapters(togglesAdapterOptions());
 
     if (adapters.empty()) {
         return make_webgpu_io_error(WebGPUError::Device(DeviceError::NoAdaptersFound()));
@@ -901,6 +954,20 @@ lean_obj_res lean_hesper_get_device_by_index(b_lean_obj_arg instance_obj, uint32
 lean_obj_res lean_hesper_device_has_subgroups(b_lean_obj_arg device_obj, lean_obj_res /* unit */) {
     wgpu::Device* device = EXTRACT_DEVICE_PTR(device_obj);
     bool has = device->HasFeature(wgpu::FeatureName::Subgroups);
+    return lean_io_result_mk_ok(lean_box(has ? 1 : 0));
+}
+
+// Query whether the device was created with SubgroupMatrix support
+lean_obj_res lean_hesper_device_has_subgroup_matrix(b_lean_obj_arg device_obj, lean_obj_res /* unit */) {
+    wgpu::Device* device = EXTRACT_DEVICE_PTR(device_obj);
+    bool has = device->HasFeature(wgpu::FeatureName::ChromiumExperimentalSubgroupMatrix);
+    return lean_io_result_mk_ok(lean_box(has ? 1 : 0));
+}
+
+// Query whether the device was created with ShaderF16 support
+lean_obj_res lean_hesper_device_has_shader_f16(b_lean_obj_arg device_obj, lean_obj_res /* unit */) {
+    wgpu::Device* device = EXTRACT_DEVICE_PTR(device_obj);
+    bool has = device->HasFeature(wgpu::FeatureName::ShaderF16);
     return lean_io_result_mk_ok(lean_box(has ? 1 : 0));
 }
 
