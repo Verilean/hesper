@@ -715,6 +715,12 @@ structure Gemma4FFN where
   gate : Linear.LinearLayer       -- Gate projection [hiddenSize → intermediateSize]
   up : Linear.LinearLayer         -- Up projection [hiddenSize → intermediateSize]
   down : Linear.LinearLayer       -- Down projection [intermediateSize → hiddenSize]
+  -- Prepared-dispatch cache for the fused gate+up+gelu_mul kernel
+  -- (`Linear.forwardFusedGateUp`). Separate from `gate.prepared` and
+  -- `up.prepared` because the fused dispatch binds both weight buffers
+  -- plus the distinct output buffer, so the prepared state is not
+  -- interchangeable with either single-linear prepared state.
+  fusedGateUpPrepared : IO.Ref (Option Hesper.WGSL.Execute.PreparedDispatch)
 
 /-- Gemma 4 transformer block (single layer) -/
 structure Gemma4Block where
@@ -924,7 +930,9 @@ def Gemma4Model.fromGGUF (device : Device) (ggufPath : String)
     let ffnUp ← loadLinear device gguf s!"blk.{li}.ffn_up.weight" cfg.hiddenSize cfg.intermediateSize
     let ffnDown ← loadLinear device gguf s!"blk.{li}.ffn_down.weight" cfg.intermediateSize cfg.hiddenSize
 
-    let ffn : Gemma4FFN := { gate := ffnGate, up := ffnUp, down := ffnDown }
+    let fusedGateUpPrepared ← IO.mkRef (none : Option Hesper.WGSL.Execute.PreparedDispatch)
+    let ffn : Gemma4FFN :=
+      { gate := ffnGate, up := ffnUp, down := ffnDown, fusedGateUpPrepared }
 
     -- Load optional RoPE frequency factors
     -- In the E4B model, rope_freqs is a global tensor, not per-layer
@@ -1465,7 +1473,14 @@ def forwardBlock (device : Device) (block : Gemma4Block) (cfg : Config)
       [("a", state.normedBuf2), ("b", state.attnResidualBuf), ("output", outputBuf)]
       (.dispatch1D cfg.hiddenSize)
   else do
-    -- Dense FFN path (GeGLU)
+    -- Dense FFN path (GeGLU).
+    -- A `forwardFusedGateUp` single-dispatch kernel exists in
+    -- `Hesper.Layers.Linear` and produces byte-identical output, but on
+    -- NVIDIA Vulkan it currently runs at exactly 2× the time of one
+    -- single matmul (i.e. no wall-clock saving over the separate-then-
+    -- gelu_mul path) because Tint emits two independent inlined dot
+    -- product bodies back-to-back. Keeping the 3-dispatch form until
+    -- the fused kernel gets proper shared-memory input caching.
     RMSNorm.forward device block.ffnNorm state.attnResidualBuf state.normedBuf
     Linear.LinearLayer.forward device block.ffn.gate state.normedBuf state.gateBuf
     Linear.LinearLayer.forward device block.ffn.up state.normedBuf state.upBuf

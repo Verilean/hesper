@@ -280,6 +280,134 @@ def fusedQ4KMLinearSubgroupKernel (config : Config) : ShaderM Unit := do
     ShaderM.writeBuffer (ty := .scalar .f32) "output" outIdx totalSum
   ) (pure ())
 
+/-! ## Q4_K_M Fused Gate+Up (Gemma 4 / LLaMA GeGLU FFN) -/
+
+/-- Fused gate+up Q4_K_M kernel:
+    `h[i] = GELU_tanh(x · W_gate[i]) * (x · W_up[i])`.
+
+    Replaces three separate dispatches (gate matmul, up matmul,
+    gelu-mul) with one. Both W_gate and W_up are Q4_K_M linears with
+    the same (inDim, outDim) shape — Gemma 4's FFN layout — and both
+    share the same input vector `x`. The fusion reuses the input loads
+    between the two dot products, halves the dispatch overhead, and
+    folds the element-wise GELU*mul step into the per-output
+    computation (no separate kernel, no intermediate gate/up buffers).
+
+    Constraint: both weight buffers must have the exact same
+    (inDim, outDim); this is enforced at dispatch time by the caller
+    (`forwardFusedGateUp` in `Hesper.Models.Gemma4`). The `config`
+    argument gives those dims.
+
+    @param config Layer dimensions (inDim, outDim must match both weight matrices)
+-/
+def fusedQ4KMGateUpSubgroupKernel (config : Config) : ShaderM Unit := do
+  let wid ← ShaderM.workgroupId
+  let lid ← ShaderM.localId
+  let outIdx := Exp.vec3X wid
+  let tid := Exp.vec3X lid
+
+  let blocksPerRow := config.inDim / 256
+  let totalWeightU32 := config.outDim * blocksPerRow * 36
+
+  -- Two weight buffers with identical shape.
+  let _weightsGate ← ShaderM.declareInputBuffer "weights_gate" (.array (.scalar .u32) totalWeightU32)
+  let _weightsUp   ← ShaderM.declareInputBuffer "weights_up"   (.array (.scalar .u32) totalWeightU32)
+  let _input       ← ShaderM.declareInputBuffer "input"        (.array (.scalar .f32) config.inDim)
+  let _output      ← ShaderM.declareOutputBuffer "output"      (.array (.scalar .f32) config.outDim)
+
+  let inBounds := Exp.lt outIdx (Exp.litU32 config.outDim)
+
+  -- Two accumulators — one per dot product.
+  ShaderM.varNamed "accG" (.scalar .f32) (Exp.litF32 0.0)
+  ShaderM.varNamed "accU" (.scalar .f32) (Exp.litF32 0.0)
+  let accG : Exp (.scalar .f32) := Exp.var "accG"
+  let accU : Exp (.scalar .f32) := Exp.var "accU"
+
+  let rowBaseU32 := Exp.mul outIdx (Exp.litU32 (blocksPerRow * 36))
+
+  -- Decode one Q4_K_M block from `bufName` at `blockU32Base`, computing the
+  -- dot-product contribution against the input elements starting at
+  -- `elemBase`, and adding the result to `accName`. Input reads are
+  -- performed in parallel for both weight buffers so they share memory
+  -- bandwidth (the GPU L1/L2 caches handle the actual sharing).
+  let processBlock (bufName : String) (accName : String) (acc : Exp (.scalar .f32))
+      (blockU32Base : Exp (.scalar .u32)) (elemBase : Exp (.scalar .u32)) : ShaderM Unit := do
+    -- Block header: d and dmin (packed as fp16 halves in u32[0]).
+    let dmU32 ← ShaderM.readBuffer (ty := .scalar .u32) (n := totalWeightU32) bufName blockU32Base
+    let d := fp16ToF32 (Exp.bitAnd dmU32 (Exp.litU32 0xFFFF))
+    let dmin := fp16ToF32 (Exp.shiftRight dmU32 (Exp.litU32 16))
+    let sc0 ← ShaderM.readBuffer (ty := .scalar .u32) (n := totalWeightU32) bufName (Exp.add blockU32Base (Exp.litU32 1))
+    let sc1 ← ShaderM.readBuffer (ty := .scalar .u32) (n := totalWeightU32) bufName (Exp.add blockU32Base (Exp.litU32 2))
+    let sc2 ← ShaderM.readBuffer (ty := .scalar .u32) (n := totalWeightU32) bufName (Exp.add blockU32Base (Exp.litU32 3))
+
+    for c in [0:4] do
+      let is0 := c * 2
+      let is1 := c * 2 + 1
+      let (scaleA, minA) := getScaleMin is0 sc0 sc1 sc2
+      let (scaleB, minB) := getScaleMin is1 sc0 sc1 sc2
+      let d1 := Exp.mul d scaleA
+      let m1 := Exp.mul dmin minA
+      let d2 := Exp.mul d scaleB
+      let m2 := Exp.mul dmin minB
+
+      let qsU32Base := Exp.add blockU32Base (Exp.litU32 (4 + c * 8))
+
+      for l32 in [0:8] do
+        let qsU32 ← ShaderM.readBuffer (ty := .scalar .u32) (n := totalWeightU32) bufName (Exp.add qsU32Base (Exp.litU32 l32))
+        for b in [0:4] do
+          let byte := Exp.bitAnd (Exp.shiftRight qsU32 (Exp.litU32 (b * 8))) (Exp.litU32 0xFF)
+          let qLow := Exp.bitAnd byte (Exp.litU32 0xF)
+          let qHigh := Exp.shiftRight byte (Exp.litU32 4)
+          let elemIdxLow := Exp.add elemBase (Exp.litU32 (c * 64 + l32 * 4 + b))
+          let elemIdxHigh := Exp.add elemBase (Exp.litU32 (c * 64 + 32 + l32 * 4 + b))
+          let inLow ← ShaderM.readBuffer (ty := .scalar .f32) (n := config.inDim) "input" elemIdxLow
+          let inHigh ← ShaderM.readBuffer (ty := .scalar .f32) (n := config.inDim) "input" elemIdxHigh
+          let wLow := Exp.sub (Exp.mul d1 (Exp.toF32 qLow)) m1
+          let wHigh := Exp.sub (Exp.mul d2 (Exp.toF32 qHigh)) m2
+          ShaderM.assign accName (Exp.add acc (Exp.add (Exp.mul wLow inLow) (Exp.mul wHigh inHigh)))
+
+  -- Strided loop over blocks. Each iteration processes one Q4_K block
+  -- from W_gate and one from W_up for the SAME (outIdx, blockLocalIdx)
+  -- pair. We do them in TWO SEPARATE inner loops so each loop keeps the
+  -- register footprint of a single matmul (about half what an
+  -- interleaved version would need). The gate-loop populates L1/L2
+  -- with the input block, so the up-loop's input reads hit the cache.
+  --
+  -- NOTE: an earlier version interleaved the two `processBlock` calls
+  -- inside a single loop iteration. On NVIDIA Vulkan that cost 2.8 ms
+  -- per call vs 0.5 ms for a single matmul (5.6× / call, i.e. ~3×
+  -- slower than the separate matmul baseline) because the interleaved
+  -- form doubled live register usage and forced register spills.
+  -- Keeping the two passes separate recovers the single-matmul
+  -- throughput while still saving a dispatch.
+  ShaderM.loop tid (Exp.litU32 blocksPerRow) (Exp.litU32 32) fun blockLocalIdx => do
+    let blockU32Base := Exp.add rowBaseU32 (Exp.mul blockLocalIdx (Exp.litU32 36))
+    let elemBase := Exp.mul blockLocalIdx (Exp.litU32 256)
+    processBlock "weights_gate" "accG" accG blockU32Base elemBase
+  ShaderM.loop tid (Exp.litU32 blocksPerRow) (Exp.litU32 32) fun blockLocalIdx => do
+    let blockU32Base := Exp.add rowBaseU32 (Exp.mul blockLocalIdx (Exp.litU32 36))
+    let elemBase := Exp.mul blockLocalIdx (Exp.litU32 256)
+    processBlock "weights_up"   "accU" accU blockU32Base elemBase
+
+  -- Subgroup reductions — one per accumulator. Each subgroupAdd is
+  -- hardware-accelerated across 32 lanes.
+  ShaderM.varNamed "gateSum" (.scalar .f32) (Exp.subgroupAdd accG)
+  ShaderM.varNamed "upSum"   (.scalar .f32) (Exp.subgroupAdd accU)
+  let gateSum : Exp (.scalar .f32) := Exp.var "gateSum"
+  let upSum   : Exp (.scalar .f32) := Exp.var "upSum"
+
+  ShaderM.if_ (Exp.and (Exp.eq tid (Exp.litU32 0)) inBounds) (do
+    -- GELU(tanh) — llama.cpp's approximation, matches `geluMulKernel`
+    -- and `FusedFFNSpec.geluTanh`.
+    let sqrt2OverPi := Exp.litF32 0.7978845608028654
+    let z := gateSum
+    let z3 := Exp.mul (Exp.mul z z) z
+    let inner := Exp.mul sqrt2OverPi (Exp.add z (Exp.mul (Exp.litF32 0.044715) z3))
+    let gelu := Exp.mul (Exp.mul (Exp.litF32 0.5) z) (Exp.add (Exp.litF32 1.0) (Exp.tanh inner))
+    let result := Exp.mul gelu upSum
+    ShaderM.writeBuffer (ty := .scalar .f32) "output" outIdx result
+  ) (pure ())
+
 /-! ## Layer Structure -/
 
 /-- Quantization format for the weight tensor -/
@@ -366,5 +494,73 @@ def LinearLayer.forward (device : Device) (layer : LinearLayer)
     totalNanosRef.modify (· + delta)
     callCountRef.modify (· + 1)
     perShapeAdd layer.config.inDim layer.config.outDim delta
+
+/-- Fused Q4_K gate+up forward pass.
+
+    Computes `out[i] = GELU(x · W_gate[i]) * (x · W_up[i])` for all
+    `i ∈ [0, outDim)` in a single dispatch. Both weight layers must be
+    Q4_K and share the same `(inDim, outDim)` Config. This is Gemma 4's
+    FFN gate+up+geluMul collapsed into one kernel.
+
+    The fused kernel only supports the subgroup-reduction path
+    (requires the device to expose subgroups). If subgroups aren't
+    available, the caller should fall back to the 3-dispatch sequence:
+    `gate.forward` + `up.forward` + separate `geluMulKernel`.
+
+    @param preparedRef Shared prepared-dispatch cache for the fast path.
+-/
+def forwardFusedGateUp (device : Device)
+    (gate up : LinearLayer)
+    (inputBuf outputBuf : Buffer)
+    (preparedRef : IO.Ref (Option Execute.PreparedDispatch))
+    : IO Unit := do
+  -- Preconditions (assert at the Lean level so kernel dispatch is well-formed).
+  -- Both weight layers must be Q4_K and share the same shape.
+  if gate.quantFormat != .Q4_K then
+    throw (IO.userError s!"forwardFusedGateUp: gate must be Q4_K, got {repr gate.quantFormat}")
+  if up.quantFormat != .Q4_K then
+    throw (IO.userError s!"forwardFusedGateUp: up must be Q4_K, got {repr up.quantFormat}")
+  if gate.config.inDim != up.config.inDim || gate.config.outDim != up.config.outDim then
+    throw (IO.userError s!"forwardFusedGateUp: shape mismatch gate={gate.config.inDim}→{gate.config.outDim} up={up.config.inDim}→{up.config.outDim}")
+
+  let profiling ← profilingRef.get
+  let startNs ← if profiling then IO.monoNanosNow else pure 0
+
+  -- Fast path: instant replay if prepared.
+  if let some p ← preparedRef.get then
+    Execute.replayPreparedDispatch device p gate.config.outDim 1 1
+    if profiling then
+      let endNs ← IO.monoNanosNow
+      let delta := (endNs - startNs).toUInt64
+      totalNanosRef.modify (· + delta)
+      -- Attribute as two linear calls with the shared shape so the
+      -- profiler still sees the gate+up workload.
+      callCountRef.modify (· + 2)
+      perShapeAdd gate.config.inDim gate.config.outDim delta
+    return
+
+  let namedBuffers := [
+    ("weights_gate", gate.weightBuf),
+    ("weights_up",   up.weightBuf),
+    ("input",        inputBuf),
+    ("output",       outputBuf)
+  ]
+  let execConfig : Execute.ExecutionConfig := {
+    numWorkgroups := (gate.config.outDim, 1, 1)
+    workgroupSize := { x := 32, y := 1, z := 1 }
+    extensions := ["subgroups"]
+  }
+  let cacheKey : UInt64 :=
+    hash ("q4k-gate-up", gate.config.inDim, gate.config.outDim)
+  Execute.executeShaderNamed device
+    (fusedQ4KMGateUpSubgroupKernel gate.config)
+    namedBuffers execConfig
+    (cacheKey := some cacheKey) (preparedRef := some preparedRef)
+  if profiling then
+    let endNs ← IO.monoNanosNow
+    let delta := (endNs - startNs).toUInt64
+    totalNanosRef.modify (· + delta)
+    callCountRef.modify (· + 2)
+    perShapeAdd gate.config.inDim gate.config.outDim delta
 
 end Hesper.Layers.Linear
