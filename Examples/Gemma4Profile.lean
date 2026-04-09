@@ -60,6 +60,8 @@ def main : IO Unit := do
   Hesper.Layers.Linear.totalNanosRef.set 0
   Hesper.Layers.Linear.callCountRef.set 0
   Hesper.Layers.Linear.perShapeRef.set #[]
+  Hesper.WGSL.Execute.sectionProfilingRef.set true
+  Hesper.WGSL.Execute.resetSectionTotals
 
   let n := 10
   let start ← IO.monoNanosNow
@@ -68,6 +70,7 @@ def main : IO Unit := do
   let stop ← IO.monoNanosNow
 
   Hesper.Layers.Linear.profilingRef.set false
+  Hesper.WGSL.Execute.sectionProfilingRef.set false
 
   let totalNs := stop - start
   let linearNs := (← Hesper.Layers.Linear.totalNanosRef.get).toNat
@@ -111,3 +114,22 @@ def main : IO Unit := do
   for row in rows do
     let (i, o, cnt, total, avg, perTok) := row
     IO.println s!"  {i}×{o}  calls={cnt}  total={total} ms  avg={avg} ms  ms/tok={perTok}"
+
+  -- Section breakdown (non-linear "everything else" bucket)
+  let sections ← Hesper.WGSL.Execute.getSectionTotals
+  let secRows := sections.toList.map (fun (name, ns, cnt) =>
+    let total := ns.toNat.toFloat / 1_000_000.0
+    let perTok := total / nf
+    let callsPerTok := cnt / n
+    (name, callsPerTok, total, perTok))
+  let secRows := secRows.toArray.qsort (fun a b =>
+    let (_, _, _, pt1) := a
+    let (_, _, _, pt2) := b
+    pt1 > pt2)
+  IO.println ""
+  IO.println "  Section breakdown (sorted by ms/tok)"
+  IO.println "  ─────────────────────────────────────────────"
+  IO.println "    section          calls/tok   total_ms   ms/tok"
+  for row in secRows do
+    let (name, cpt, total, perTok) := row
+    IO.println s!"  {name}  calls/tok={cpt}  total={total} ms  ms/tok={perTok}"

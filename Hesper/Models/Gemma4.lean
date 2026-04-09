@@ -1224,13 +1224,15 @@ def forwardBlock (device : Device) (block : Gemma4Block) (cfg : Config)
   let headDim := cfg.headDim li
 
   -- Step 1: Attention pre-norm
-  RMSNorm.forward device block.attnNorm inputBuf state.normedBuf
+  Hesper.WGSL.Execute.withSection "attnNorm" do
+    RMSNorm.forward device block.attnNorm inputBuf state.normedBuf
 
   -- Step 2: Q/K/V projections
-  Linear.LinearLayer.forward device block.attention.wQ state.normedBuf state.qBuf
-  if cfg.hasKV li then
-    Linear.LinearLayer.forward device block.attention.wK state.normedBuf state.kBuf
-    Linear.LinearLayer.forward device block.attention.wV state.normedBuf state.vBuf
+  Hesper.WGSL.Execute.withSection "qkvProj" do
+    Linear.LinearLayer.forward device block.attention.wQ state.normedBuf state.qBuf
+    if cfg.hasKV li then
+      Linear.LinearLayer.forward device block.attention.wK state.normedBuf state.kBuf
+      Linear.LinearLayer.forward device block.attention.wV state.normedBuf state.vBuf
 
   -- Step 3: Q-norm, K-norm (per-head RMSNorm)
   let numHeads := cfg.numAttentionHeads
@@ -1241,63 +1243,65 @@ def forwardBlock (device : Device) (block : Gemma4Block) (cfg : Config)
     workgroupSize := { x := wgSize, y := 1, z := 1 }
     : Execute.ExecutionConfig
   }
-  -- Q-norm: qBuf → qBuf2
-  Hesper.WGSL.Execute.executeShaderNamed device
-    (perHeadRMSNormKernel numHeads headDim cfg.rmsNormEps)
-    [("input", state.qBuf), ("weight", block.attention.qNormWeight), ("output", state.qBuf2)]
-    (mkNormConfig numHeads)
-
-  if cfg.hasKV li then
-    -- K-norm: kBuf → kBuf2
+  Hesper.WGSL.Execute.withSection "qkvNorm" do
+    -- Q-norm: qBuf → qBuf2
     Hesper.WGSL.Execute.executeShaderNamed device
-      (perHeadRMSNormKernel numKVHeads headDim cfg.rmsNormEps)
-      [("input", state.kBuf), ("weight", block.attention.kNormWeight), ("output", state.kBuf2)]
-      (mkNormConfig numKVHeads)
+      (perHeadRMSNormKernel numHeads headDim cfg.rmsNormEps)
+      [("input", state.qBuf), ("weight", block.attention.qNormWeight), ("output", state.qBuf2)]
+      (mkNormConfig numHeads)
 
-    -- V-norm: bare per-head RMSNorm on V (no learned weights)
-    -- Each KV head normalized independently. vBuf → vBuf2
-    Hesper.WGSL.Execute.executeShaderNamed device
-      (perHeadBareRMSNormKernel numKVHeads headDim cfg.rmsNormEps)
-      [("input", state.vBuf), ("output", state.vBuf2)]
-      { numWorkgroups := (numKVHeads, 1, 1), workgroupSize := { x := min headDim 256, y := 1, z := 1 } : Execute.ExecutionConfig }
+    if cfg.hasKV li then
+      -- K-norm: kBuf → kBuf2
+      Hesper.WGSL.Execute.executeShaderNamed device
+        (perHeadRMSNormKernel numKVHeads headDim cfg.rmsNormEps)
+        [("input", state.kBuf), ("weight", block.attention.kNormWeight), ("output", state.kBuf2)]
+        (mkNormConfig numKVHeads)
+
+      -- V-norm: bare per-head RMSNorm on V (no learned weights)
+      -- Each KV head normalized independently. vBuf → vBuf2
+      Hesper.WGSL.Execute.executeShaderNamed device
+        (perHeadBareRMSNormKernel numKVHeads headDim cfg.rmsNormEps)
+        [("input", state.vBuf), ("output", state.vBuf2)]
+        { numWorkgroups := (numKVHeads, 1, 1), workgroupSize := { x := min headDim 256, y := 1, z := 1 } : Execute.ExecutionConfig }
 
   -- Step 4: RoPE on Q and K
   -- Upload position to params buffer
   let posBytes := Hesper.WebGPU.BufferOps.uint32ToBytes pos.toUInt32
   writeBuffer device state.paramsBuf 0 posBytes
 
-  -- RoPE on Q: qBuf2 → qBuf
-  match block.ropeFreqFactors with
-  | some freqFactors =>
-    -- Full attention: RoPE with frequency factors
-    Hesper.WGSL.Execute.executeShaderNamed device
-      (ropeWithFreqFactorsKernel headDim numHeads cfg.ropeTheta)
-      [("input", state.qBuf2), ("output", state.qBuf), ("params", state.paramsBuf), ("freq_factors", freqFactors)]
-      (.dispatch1D (numHeads * headDim / 2))
-  | none =>
-    -- SWA: standard RoPE (use existing dynamic kernel)
-    let ropeConfig : RoPE.Config := { dim := numHeads * headDim, maxSeqLen := cfg.maxSeqLen, base := cfg.ropeTheta }
-    Hesper.WGSL.Execute.executeShaderNamed device
-      (RoPE.ropeKernelDynamic ropeConfig 1 1 numHeads headDim)
-      [("input", state.qBuf2), ("output", state.qBuf), ("params", state.paramsBuf)]
-      (.dispatch1D (numHeads * headDim / 2))
-
-  if cfg.hasKV li then
-    -- RoPE on K: kBuf2 → kBuf
-    -- Must mirror Q's RoPE branch: full attention layers use freq_factors,
-    -- otherwise Q and K end up rotated with different frequencies (mismatch).
+  Hesper.WGSL.Execute.withSection "rope" do
+    -- RoPE on Q: qBuf2 → qBuf
     match block.ropeFreqFactors with
     | some freqFactors =>
+      -- Full attention: RoPE with frequency factors
       Hesper.WGSL.Execute.executeShaderNamed device
-        (ropeWithFreqFactorsKernel headDim numKVHeads cfg.ropeTheta)
-        [("input", state.kBuf2), ("output", state.kBuf), ("params", state.paramsBuf), ("freq_factors", freqFactors)]
-        (.dispatch1D (numKVHeads * headDim / 2))
+        (ropeWithFreqFactorsKernel headDim numHeads cfg.ropeTheta)
+        [("input", state.qBuf2), ("output", state.qBuf), ("params", state.paramsBuf), ("freq_factors", freqFactors)]
+        (.dispatch1D (numHeads * headDim / 2))
     | none =>
-      let ropeConfig : RoPE.Config := { dim := numKVHeads * headDim, maxSeqLen := cfg.maxSeqLen, base := cfg.ropeTheta }
+      -- SWA: standard RoPE (use existing dynamic kernel)
+      let ropeConfig : RoPE.Config := { dim := numHeads * headDim, maxSeqLen := cfg.maxSeqLen, base := cfg.ropeTheta }
       Hesper.WGSL.Execute.executeShaderNamed device
-        (RoPE.ropeKernelDynamic ropeConfig 1 1 numKVHeads headDim)
-        [("input", state.kBuf2), ("output", state.kBuf), ("params", state.paramsBuf)]
-        (.dispatch1D (numKVHeads * headDim / 2))
+        (RoPE.ropeKernelDynamic ropeConfig 1 1 numHeads headDim)
+        [("input", state.qBuf2), ("output", state.qBuf), ("params", state.paramsBuf)]
+        (.dispatch1D (numHeads * headDim / 2))
+
+    if cfg.hasKV li then
+      -- RoPE on K: kBuf2 → kBuf
+      -- Must mirror Q's RoPE branch: full attention layers use freq_factors,
+      -- otherwise Q and K end up rotated with different frequencies (mismatch).
+      match block.ropeFreqFactors with
+      | some freqFactors =>
+        Hesper.WGSL.Execute.executeShaderNamed device
+          (ropeWithFreqFactorsKernel headDim numKVHeads cfg.ropeTheta)
+          [("input", state.kBuf2), ("output", state.kBuf), ("params", state.paramsBuf), ("freq_factors", freqFactors)]
+          (.dispatch1D (numKVHeads * headDim / 2))
+      | none =>
+        let ropeConfig : RoPE.Config := { dim := numKVHeads * headDim, maxSeqLen := cfg.maxSeqLen, base := cfg.ropeTheta }
+        Hesper.WGSL.Execute.executeShaderNamed device
+          (RoPE.ropeKernelDynamic ropeConfig 1 1 numKVHeads headDim)
+          [("input", state.kBuf2), ("output", state.kBuf), ("params", state.paramsBuf)]
+          (.dispatch1D (numKVHeads * headDim / 2))
 
   -- Step 5: Write K/V to cache and compute flash attention
   -- KV-shared layers reuse an earlier layer's cache (see Config.kvCacheLayer).
@@ -1310,12 +1314,13 @@ def forwardBlock (device : Device) (block : Gemma4Block) (cfg : Config)
     -- Write K and V to cache at current position (fused kernel)
     -- K is now in kBuf (after RoPE), V is in vBuf2 (after V-norm)
     if cfg.hasKV li then
-      Hesper.WGSL.Execute.executeShaderNamed device
-        (Attention.fusedCacheWriteKVKernel numKVHeads cfg.maxSeqLen headDim kvDim)
-        [("new_k", state.kBuf), ("new_v", state.vBuf2),
-         ("k_cache", kvCache.kBuf), ("v_cache", kvCache.vBuf),
-         ("params", state.paramsBuf)]
-        (.dispatch1D kvDim)
+      Hesper.WGSL.Execute.withSection "kvWrite" do
+        Hesper.WGSL.Execute.executeShaderNamed device
+          (Attention.fusedCacheWriteKVKernel numKVHeads cfg.maxSeqLen headDim kvDim)
+          [("new_k", state.kBuf), ("new_v", state.vBuf2),
+           ("k_cache", kvCache.kBuf), ("v_cache", kvCache.vBuf),
+           ("params", state.paramsBuf)]
+          (.dispatch1D kvDim)
 
     -- Flash attention: Q @ K_cache^T → softmax → @ V_cache → output
     -- Gemma 4 uses hparams.f_attention_scale = 1.0 (NOT the usual 1/sqrt(headDim)),
@@ -1323,33 +1328,36 @@ def forwardBlock (device : Device) (block : Gemma4Block) (cfg : Config)
     -- magnitudes are bounded without the 1/sqrt(headDim) temperature.
     -- See llama.cpp llama-model.cpp:1272 and gemma4-iswa.cpp:94.
     let scale : Float := 1.0
-    match block.layerType with
-    | .swa =>
-      -- Sliding window attention: only attend within windowSize
-      Hesper.WGSL.Execute.executeShaderNamed device
-        (FlashAttention.flashAttentionSWAKernel numHeads numKVHeads cfg.maxSeqLen headDim cacheLen cfg.slidingWindowSize pos scale)
-        [("q", state.qBuf), ("k_cache", kvCache.kBuf), ("v_cache", kvCache.vBuf), ("output", state.attnOutBuf)]
-        (Execute.ExecutionConfig.default (numHeads, 1, 1))
-    | .full =>
-      -- Full attention: attend to all cached positions
-      Hesper.WGSL.Execute.executeShaderNamed device
-        (FlashAttention.flashAttentionDynamicKernel numHeads numKVHeads cfg.maxSeqLen headDim cacheLen scale)
-        [("q", state.qBuf), ("k_cache", kvCache.kBuf), ("v_cache", kvCache.vBuf), ("output", state.attnOutBuf)]
-        (Execute.ExecutionConfig.default (numHeads, 1, 1))
+    Hesper.WGSL.Execute.withSection "flashAttn" do
+      match block.layerType with
+      | .swa =>
+        -- Sliding window attention: only attend within windowSize
+        Hesper.WGSL.Execute.executeShaderNamed device
+          (FlashAttention.flashAttentionSWAKernel numHeads numKVHeads cfg.maxSeqLen headDim cacheLen cfg.slidingWindowSize pos scale)
+          [("q", state.qBuf), ("k_cache", kvCache.kBuf), ("v_cache", kvCache.vBuf), ("output", state.attnOutBuf)]
+          (Execute.ExecutionConfig.default (numHeads, 1, 1))
+      | .full =>
+        -- Full attention: attend to all cached positions
+        Hesper.WGSL.Execute.executeShaderNamed device
+          (FlashAttention.flashAttentionDynamicKernel numHeads numKVHeads cfg.maxSeqLen headDim cacheLen scale)
+          [("q", state.qBuf), ("k_cache", kvCache.kBuf), ("v_cache", kvCache.vBuf), ("output", state.attnOutBuf)]
+          (Execute.ExecutionConfig.default (numHeads, 1, 1))
 
     -- Output projection: attnOut [numHeads * headDim] → normedBuf [hiddenSize]
-    Linear.LinearLayer.forward device block.attention.wO state.attnOutBuf state.normedBuf
+    Hesper.WGSL.Execute.withSection "oProj" do
+      Linear.LinearLayer.forward device block.attention.wO state.attnOutBuf state.normedBuf
   else
     -- Fallback: skip attention (shouldn't happen)
     Linear.LinearLayer.forward device block.attention.wO state.qBuf state.normedBuf
 
   -- Step 6: Post-attention norm + residual
   -- normedBuf → normedBuf2 (avoid aliasing)
-  RMSNorm.forward device block.postAttnNorm state.normedBuf state.normedBuf2
-  Hesper.WGSL.Execute.executeShaderNamed device
-    (residualAddKernel cfg.hiddenSize)
-    [("a", state.normedBuf2), ("b", inputBuf), ("output", state.attnResidualBuf)]
-    (.dispatch1D cfg.hiddenSize)
+  Hesper.WGSL.Execute.withSection "postAttnNorm" do
+    RMSNorm.forward device block.postAttnNorm state.normedBuf state.normedBuf2
+    Hesper.WGSL.Execute.executeShaderNamed device
+      (residualAddKernel cfg.hiddenSize)
+      [("a", state.normedBuf2), ("b", inputBuf), ("output", state.attnResidualBuf)]
+      (.dispatch1D cfg.hiddenSize)
 
   -- Step 7: FFN (dense or MoE)
   if block.isMoE then do
@@ -1474,28 +1482,26 @@ def forwardBlock (device : Device) (block : Gemma4Block) (cfg : Config)
       (.dispatch1D cfg.hiddenSize)
   else do
     -- Dense FFN path (GeGLU).
-    -- A `forwardFusedGateUp` single-dispatch kernel exists in
-    -- `Hesper.Layers.Linear` and produces byte-identical output, but on
-    -- NVIDIA Vulkan it currently runs at exactly 2× the time of one
-    -- single matmul (i.e. no wall-clock saving over the separate-then-
-    -- gelu_mul path) because Tint emits two independent inlined dot
-    -- product bodies back-to-back. Keeping the 3-dispatch form until
-    -- the fused kernel gets proper shared-memory input caching.
-    RMSNorm.forward device block.ffnNorm state.attnResidualBuf state.normedBuf
-    Linear.LinearLayer.forward device block.ffn.gate state.normedBuf state.gateBuf
-    Linear.LinearLayer.forward device block.ffn.up state.normedBuf state.upBuf
-    Hesper.WGSL.Execute.executeShaderNamed device
-      (geluMulKernel cfg.intermediateSize)
-      [("gate", state.gateBuf), ("up", state.upBuf), ("output", state.geluBuf)]
-      (.dispatch1D cfg.intermediateSize)
-    Linear.LinearLayer.forward device block.ffn.down state.geluBuf state.ffnOutBuf
+    Hesper.WGSL.Execute.withSection "ffnNorm" do
+      RMSNorm.forward device block.ffnNorm state.attnResidualBuf state.normedBuf
+    Hesper.WGSL.Execute.withSection "ffnGateUp" do
+      Linear.LinearLayer.forward device block.ffn.gate state.normedBuf state.gateBuf
+      Linear.LinearLayer.forward device block.ffn.up state.normedBuf state.upBuf
+    Hesper.WGSL.Execute.withSection "ffnGeluMul" do
+      Hesper.WGSL.Execute.executeShaderNamed device
+        (geluMulKernel cfg.intermediateSize)
+        [("gate", state.gateBuf), ("up", state.upBuf), ("output", state.geluBuf)]
+        (.dispatch1D cfg.intermediateSize)
+    Hesper.WGSL.Execute.withSection "ffnDown" do
+      Linear.LinearLayer.forward device block.ffn.down state.geluBuf state.ffnOutBuf
 
     -- Post-FFN norm + residual (avoid aliasing: ffnOutBuf → normedBuf2 → outputBuf)
-    RMSNorm.forward device block.postFFNNorm state.ffnOutBuf state.normedBuf2
-    Hesper.WGSL.Execute.executeShaderNamed device
-      (residualAddKernel cfg.hiddenSize)
-      [("a", state.normedBuf2), ("b", state.attnResidualBuf), ("output", outputBuf)]
-      (.dispatch1D cfg.hiddenSize)
+    Hesper.WGSL.Execute.withSection "postFFNNorm" do
+      RMSNorm.forward device block.postFFNNorm state.ffnOutBuf state.normedBuf2
+      Hesper.WGSL.Execute.executeShaderNamed device
+        (residualAddKernel cfg.hiddenSize)
+        [("a", state.normedBuf2), ("b", state.attnResidualBuf), ("output", outputBuf)]
+        (.dispatch1D cfg.hiddenSize)
 
   -- Step 8: Per-layer embedding (optional, from gemma4-iswa.cpp:192-213)
   -- pe_in = cur (= outputBuf at this point)
@@ -1504,32 +1510,33 @@ def forwardBlock (device : Device) (block : Gemma4Block) (cfg : Config)
   -- cur = per_layer_proj @ cur
   -- cur = per_layer_post_norm(cur)
   -- output = pe_in + cur
-  match perLayerEmbd, perLayerInput with
-  | some plEmbd, some plInputAll =>
-    -- per_layer_inp_gate @ outputBuf → plGateBuf [embdPerLayer]
-    Linear.LinearLayer.forward device plEmbd.inpGate outputBuf state.plGateBuf
-    -- GELU(gate) * per_layer_input[layerIdx] → moeRouterOutBuf (slice via offset kernel)
-    let plOffset := li * cfg.embdPerLayer
-    let plTotalSize := cfg.embdPerLayer * cfg.numHiddenLayers
-    Hesper.WGSL.Execute.executeShaderNamed device
-      (PerLayerEmbedding.geluGateMulSliceKernel cfg.embdPerLayer plTotalSize plOffset)
-      [("gate", state.plGateBuf), ("per_layer_input", plInputAll), ("output", state.moeRouterOutBuf)]
-      (.dispatch1D cfg.embdPerLayer)
-    -- per_layer_proj @ moeRouterOutBuf → plProjBuf [hiddenSize]
-    Linear.LinearLayer.forward device plEmbd.proj state.moeRouterOutBuf state.plProjBuf
-    -- per_layer_post_norm: plProjBuf → normedBuf2 (avoid aliasing)
-    RMSNorm.forward device plEmbd.postNorm state.plProjBuf state.normedBuf2
-    -- residual: outputBuf = pe_in + normedBuf2
-    -- pe_in is current outputBuf value. Use attnResidualBuf as temp to read old outputBuf
-    Hesper.WGSL.Execute.executeShaderNamed device
-      (PerLayerEmbedding.scaleKernel cfg.hiddenSize 1.0)
-      [("input", outputBuf), ("output", state.attnResidualBuf)]
-      (.dispatch1D cfg.hiddenSize)
-    Hesper.WGSL.Execute.executeShaderNamed device
-      (residualAddKernel cfg.hiddenSize)
-      [("a", state.attnResidualBuf), ("b", state.normedBuf2), ("output", outputBuf)]
-      (.dispatch1D cfg.hiddenSize)
-  | _, _ => pure ()
+  Hesper.WGSL.Execute.withSection "perLayerEmbd" do
+    match perLayerEmbd, perLayerInput with
+    | some plEmbd, some plInputAll =>
+      -- per_layer_inp_gate @ outputBuf → plGateBuf [embdPerLayer]
+      Linear.LinearLayer.forward device plEmbd.inpGate outputBuf state.plGateBuf
+      -- GELU(gate) * per_layer_input[layerIdx] → moeRouterOutBuf (slice via offset kernel)
+      let plOffset := li * cfg.embdPerLayer
+      let plTotalSize := cfg.embdPerLayer * cfg.numHiddenLayers
+      Hesper.WGSL.Execute.executeShaderNamed device
+        (PerLayerEmbedding.geluGateMulSliceKernel cfg.embdPerLayer plTotalSize plOffset)
+        [("gate", state.plGateBuf), ("per_layer_input", plInputAll), ("output", state.moeRouterOutBuf)]
+        (.dispatch1D cfg.embdPerLayer)
+      -- per_layer_proj @ moeRouterOutBuf → plProjBuf [hiddenSize]
+      Linear.LinearLayer.forward device plEmbd.proj state.moeRouterOutBuf state.plProjBuf
+      -- per_layer_post_norm: plProjBuf → normedBuf2 (avoid aliasing)
+      RMSNorm.forward device plEmbd.postNorm state.plProjBuf state.normedBuf2
+      -- residual: outputBuf = pe_in + normedBuf2
+      -- pe_in is current outputBuf value. Use attnResidualBuf as temp to read old outputBuf
+      Hesper.WGSL.Execute.executeShaderNamed device
+        (PerLayerEmbedding.scaleKernel cfg.hiddenSize 1.0)
+        [("input", outputBuf), ("output", state.attnResidualBuf)]
+        (.dispatch1D cfg.hiddenSize)
+      Hesper.WGSL.Execute.executeShaderNamed device
+        (residualAddKernel cfg.hiddenSize)
+        [("a", state.attnResidualBuf), ("b", state.normedBuf2), ("output", outputBuf)]
+        (.dispatch1D cfg.hiddenSize)
+    | _, _ => pure ()
 
   -- Step 9: Layer output scale (optional)
   -- Use normedBuf2 as temp to avoid input/output aliasing
