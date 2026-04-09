@@ -219,6 +219,113 @@ def matMulTransposeF16Kernel (config : Config) : ShaderM Unit := do
   let result := Exp.select inBounds acc (Exp.litF32 0.0)
   ShaderM.writeBuffer (ty := .scalar .f32) "c" idx result
 
+/-! ## Block-Cooperative + SW-Pipelined F16 Transposed MatMul (M=1 decode) -/
+
+/-- Block-cooperative F16 matrix-vector multiply with B transposed and
+    stored as packed F16: `C = A @ B^T`, specialised to **M = 1**
+    (single-row A). Mirrors the Q4_K / Q6_K block-coop pattern:
+
+      * 1 workgroup per output element (N workgroups), 32 threads each
+      * The K dim is tiled into `kTilesPerRow = K / 64` tiles of 64
+        F16s = 32 u32s. Each lane `tid ∈ [0, 32)` reads one u32 per
+        tile (contiguous across lanes → one coalesced 128-byte load),
+        unpacks it into two F16→F32 values, pairs them with the
+        matching two A f32s, and accumulates two FMAs.
+      * Depth-1 software pipelining: each iteration, the u32 for tile
+        N+1 is prefetched into a mutable `nextU32` var BEFORE the
+        dequant+FMA chain that consumes the current snapshot, so
+        memory load latency overlaps with FMA latency (same trick
+        that cut Q4_K ffnGate/Up to 0.059 ms at 335 GB/s).
+
+    Constraints: `M = 1` (the inner loop keeps the single A row in
+    registers), `K % 64 == 0` (per-lane tile of 64 F16 values needs 32
+    u32s cleanly), subgroup support required.
+
+    Weight layout: row-major `[N, K/2]` packed F16 (same as
+    `matMulTransposeF16Kernel`). Row `n` starts at u32 index
+    `n * (K/2)`.
+-/
+def matMulTransposeF16BlockCoopKernel (config : Config) : ShaderM Unit := do
+  let wid ← ShaderM.workgroupId
+  let lid ← ShaderM.localId
+  let outIdx := Exp.vec3X wid
+  let tid := Exp.vec3X lid
+
+  let packedK := config.K / 2        -- u32s per row of B
+  let kTilesPerRow := config.K / 64  -- tiles of 64 F16s (= 32 u32s) per row
+
+  let _a ← ShaderM.declareInputBuffer "a" (.array (.scalar .f32) config.K)
+  let _b ← ShaderM.declareInputBuffer "b" (.array (.scalar .u32) (config.N * packedK))
+  let _c ← ShaderM.declareOutputBuffer "c" (.array (.scalar .f32) config.N)
+
+  let inBounds := Exp.lt outIdx (Exp.litU32 config.N)
+
+  ShaderM.varNamed "acc" (.scalar .f32) (Exp.litF32 0.0)
+  let acc : Exp (.scalar .f32) := Exp.var "acc"
+
+  -- Row base in u32 units (runtime; depends on outIdx).
+  let rowBaseU32 := Exp.mul outIdx (Exp.litU32 packedK)
+
+  -- ## Pre-loop prefetch of tile 0's per-lane u32.
+  --   lane tid reads u32 at row_base + 0*32 + tid.
+  let init0 ← ShaderM.readBuffer (ty := .scalar .u32) (n := config.N * packedK) "b"
+                (Exp.add rowBaseU32 tid)
+  ShaderM.varNamed "nextU32" (.scalar .u32) init0
+
+  for tile in [0:kTilesPerRow] do
+    -- Snapshot into per-iteration `curr` var.
+    let cName := s!"currU32_{tile}"
+    ShaderM.varNamed cName (.scalar .u32) (Exp.var "nextU32" : Exp (.scalar .u32))
+    let currU32 : Exp (.scalar .u32) := Exp.var cName
+
+    -- Issue next tile's load BEFORE dequant+FMA. Independent of curr*.
+    if tile + 1 < kTilesPerRow then
+      let nextBase := Exp.add rowBaseU32 (Exp.litU32 ((tile + 1) * 32))
+      ShaderM.assign "nextU32"
+        (← ShaderM.readBuffer (ty := .scalar .u32) (n := config.N * packedK) "b"
+              (Exp.add nextBase tid))
+
+    -- Unpack: u32 → vec2<f32>. Each lane's u32 holds two consecutive
+    -- F16 values for K-positions (tile*64 + tid*2, tile*64 + tid*2 + 1).
+    let unpacked := Exp.unpack2x16float currU32
+    let b0 := Exp.vecX unpacked
+    let b1 := Exp.vecY unpacked
+
+    -- Corresponding A reads. M=1 so row is 0; A is flat length K.
+    let kIdx0 := Exp.add (Exp.litU32 (tile * 64)) (Exp.mul tid (Exp.litU32 2))
+    let kIdx1 := Exp.add kIdx0 (Exp.litU32 1)
+    let a0 ← ShaderM.readBuffer (ty := .scalar .f32) (n := config.K) "a" kIdx0
+    let a1 ← ShaderM.readBuffer (ty := .scalar .f32) (n := config.K) "a" kIdx1
+
+    ShaderM.assign "acc" (Exp.add acc (Exp.add (Exp.mul a0 b0) (Exp.mul a1 b1)))
+
+  ShaderM.varNamed "totalSum" (.scalar .f32) (Exp.subgroupAdd acc)
+  let totalSum : Exp (.scalar .f32) := Exp.var "totalSum"
+
+  ShaderM.if_ (Exp.and (Exp.eq tid (Exp.litU32 0)) inBounds) (do
+    ShaderM.writeBuffer (ty := .scalar .f32) "c" outIdx totalSum
+  ) (pure ())
+
+/-- Execute `matMulTransposeF16BlockCoopKernel`. See the kernel doc for
+    preconditions (`M = 1`, `K % 64 == 0`, subgroup support). -/
+def executeMatMulTransposeF16BlockCoop (device : Device)
+                                        (aBuf bF16Buf cBuf : Buffer)
+                                        (config : Config) : IO Unit := do
+  let namedBuffers := [
+    ("a", aBuf),
+    ("b", bF16Buf),
+    ("c", cBuf)
+  ]
+  let execConfig : Hesper.WGSL.Execute.ExecutionConfig := {
+    numWorkgroups := (config.N, 1, 1)
+    workgroupSize := { x := 32, y := 1, z := 1 }
+    extensions := ["subgroups"]
+  }
+  let cacheKey : UInt64 := hash ("mmf16-blockcoop", config.M, config.N, config.K)
+  Hesper.WGSL.Execute.executeShaderNamed device
+    (matMulTransposeF16BlockCoopKernel config)
+    namedBuffers execConfig (some cacheKey)
+
 /-! ## Optimized F16 Transposed MatMul with Shared Memory -/
 
 /-- Optimized matrix multiply with B transposed, B stored as packed F16: C = A @ B^T
