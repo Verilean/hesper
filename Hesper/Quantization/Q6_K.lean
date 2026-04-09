@@ -239,18 +239,24 @@ def fusedQ6KLinearKernel (inDim outDim : Nat) (workgroupSize : Nat := 256)
     `BitLinear.fusedBitLinearM1Kernel` and
     `Linear.fusedQ4KMLinearSubgroupKernel`.
 
-    1D workgroup grid only (no gridX = 2D split). For the huge LM-head
-    dispatch (vocabSize=262144) keep using the tree-reduction kernel
-    via the 2D grid path; this kernel is intended for the "normal"
-    linears inside each transformer layer where outDim ≤ 65535.
+    Supports 2D workgroup grids via the optional `gridX` parameter so
+    that `outDim` can exceed WebGPU's 65535 per-dimension workgroup
+    limit (e.g. the Gemma 4 LM head at vocabSize=262144). With
+    `gridX = 0` (the default), the kernel uses a 1D grid and computes
+    `outIdx = workgroup_id.x`; with `gridX > 0`, it computes
+    `outIdx = workgroup_id.x + workgroup_id.y * gridX`.
 
     @param inDim  Input dimension (must be multiple of blockSize=256)
-    @param outDim Output dimension (must be ≤ 65535 for 1D dispatch)
+    @param outDim Output dimension
+    @param gridX  Set > 0 to enable 2D dispatch; must divide the dispatch
+                  configuration such that wid.x + wid.y*gridX covers [0, outDim).
 -/
-def fusedQ6KLinearSubgroupKernel (inDim outDim : Nat) : ShaderM Unit := do
+def fusedQ6KLinearSubgroupKernel (inDim outDim : Nat) (gridX : Nat := 0) : ShaderM Unit := do
   let wid ← ShaderM.workgroupId
   let lid ← ShaderM.localId
-  let outIdx := Exp.vec3X wid
+  let outIdx :=
+    if gridX == 0 then Exp.vec3X wid
+    else Exp.add (Exp.vec3X wid) (Exp.mul (Exp.vec3Y wid) (Exp.litU32 gridX))
   let tid := Exp.vec3X lid
 
   let blocksPerRow := inDim / blockSize
