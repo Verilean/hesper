@@ -199,6 +199,85 @@ def embeddingScaleKernel (size : Nat) (hiddenSize : Nat) : ShaderM Unit := do
     ShaderM.writeBuffer (ty := .scalar .f32) "output" idx result
   ) (pure ())
 
+/-- Fused post-norm + residual-add kernel, in place on the residual
+    buffer. Replaces the 3-dispatch chain used by the per-layer
+    embedding:
+
+      norm[i] = plProj[i] * rsqrt(mean(plProj²) + eps) * weight[i]
+      residual[i] = residual[i] + norm[i]    -- written in place
+
+    Implementation: 1 workgroup of 256 threads (= 8 subgroups of 32
+    each on NVIDIA). Phase 1 accumulates `sum(x²)` per lane then
+    reduces via one `subgroupAdd` (intra-subgroup) + one shared-mem
+    stash + one barrier + a final cross-subgroup sum on thread 0 —
+    total 1 barrier, vs 8 barriers in a full tree reduction. Phase 2
+    every thread re-reads its slice, normalises, multiplies by weight,
+    and adds into the residual buffer (bound as read_write) in place.
+
+    Dispatch: `(1, 1, 1)` workgroups × 256 threads. -/
+def fusedPerLayerPostKernel (hiddenSize : Nat) (eps : Float) : ShaderM Unit := do
+  let wgSize := 256
+  let numSubgroups := wgSize / 32
+  let lid ← ShaderM.localId
+  let tid := Exp.vec3X lid
+
+  let _proj ← ShaderM.declareInputBuffer "proj" (.array (.scalar .f32) hiddenSize)
+  let _weight ← ShaderM.declareInputBuffer "weight" (.array (.scalar .f32) hiddenSize)
+  let _residual ← ShaderM.declareOutputBuffer "residual" (.array (.scalar .f32) hiddenSize)
+
+  -- Shared workspace: `numSubgroups` per-subgroup partials + 1 slot
+  -- for the final broadcast `invRms`.
+  ShaderM.sharedNamed "shared_sg" (.array (.scalar .f32) (numSubgroups + 1))
+
+  -- Phase 1: per-thread sum of squares over stride-wgSize slice.
+  ShaderM.varNamed "partialSq" (.scalar .f32) (Exp.litF32 0.0)
+  let partialSq : Exp (.scalar .f32) := Exp.var "partialSq"
+  ShaderM.loop tid (Exp.litU32 hiddenSize) (Exp.litU32 wgSize) fun d => do
+    let v ← ShaderM.readBuffer (ty := .scalar .f32) (n := hiddenSize) "proj" d
+    ShaderM.assign "partialSq" (Exp.add partialSq (Exp.mul v v))
+
+  -- Intra-subgroup reduction: every lane of each subgroup now holds
+  -- the same 32-way sum.
+  ShaderM.varNamed "sgSum" (.scalar .f32) (Exp.subgroupAdd partialSq)
+  let sgSum : Exp (.scalar .f32) := Exp.var "sgSum"
+
+  -- Lane 0 of each subgroup writes its partial into shared memory.
+  let subgroupId := Exp.div tid (Exp.litU32 32)
+  let laneId := Exp.sub tid (Exp.mul subgroupId (Exp.litU32 32))
+  ShaderM.if_ (Exp.eq laneId (Exp.litU32 0)) (do
+    ShaderM.writeWorkgroup (ty := .scalar .f32) "shared_sg" subgroupId sgSum
+  ) (pure ())
+  ShaderM.barrier
+
+  -- Thread 0 sums the per-subgroup partials, computes invRms, and
+  -- stashes it in shared_sg[numSubgroups] for broadcast.
+  ShaderM.if_ (Exp.eq tid (Exp.litU32 0)) (do
+    ShaderM.varNamed "totalSq" (.scalar .f32) (Exp.litF32 0.0)
+    let totalSq : Exp (.scalar .f32) := Exp.var "totalSq"
+    for sg in [0:numSubgroups] do
+      let part ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := numSubgroups + 1) "shared_sg" (Exp.litU32 sg)
+      ShaderM.assign "totalSq" (Exp.add totalSq part)
+    let invRms := Exp.div (Exp.litF32 1.0)
+      (Exp.sqrt (Exp.add (Exp.div totalSq (Exp.litF32 hiddenSize.toFloat))
+                         (Exp.litF32 eps)))
+    ShaderM.writeWorkgroup (ty := .scalar .f32) "shared_sg" (Exp.litU32 numSubgroups) invRms
+  ) (pure ())
+  ShaderM.barrier
+
+  -- Every thread grabs invRms from the shared slot.
+  ShaderM.varNamed "invRms" (.scalar .f32)
+    (← ShaderM.readWorkgroup (ty := .scalar .f32) (n := numSubgroups + 1)
+          "shared_sg" (Exp.litU32 numSubgroups))
+  let invRms : Exp (.scalar .f32) := Exp.var "invRms"
+
+  -- Phase 2: normalise, apply weight, add into residual in place.
+  ShaderM.loop tid (Exp.litU32 hiddenSize) (Exp.litU32 wgSize) fun d => do
+    let pVal ← ShaderM.readBuffer (ty := .scalar .f32) (n := hiddenSize) "proj" d
+    let wVal ← ShaderM.readBuffer (ty := .scalar .f32) (n := hiddenSize) "weight" d
+    let rVal ← ShaderM.readBuffer (ty := .scalar .f32) (n := hiddenSize) "residual" d
+    let normed := Exp.mul (Exp.mul pVal invRms) wVal
+    ShaderM.writeBuffer (ty := .scalar .f32) "residual" d (Exp.add rVal normed)
+
 /-- Residual add kernel: y = a + b -/
 def residualAddKernel (size : Nat) : ShaderM Unit := do
   let gid ← ShaderM.globalId
@@ -1540,28 +1619,30 @@ def forwardBlock (device : Device) (block : Gemma4Block) (cfg : Config)
     match perLayerEmbd, perLayerInput with
     | some plEmbd, some plInputAll =>
       -- per_layer_inp_gate @ outputBuf → plGateBuf [embdPerLayer]
-      Linear.LinearLayer.forward device plEmbd.inpGate outputBuf state.plGateBuf
+      Hesper.WGSL.Execute.withSection "ple.inpGate" do
+        Linear.LinearLayer.forward device plEmbd.inpGate outputBuf state.plGateBuf
       -- GELU(gate) * per_layer_input[layerIdx] → moeRouterOutBuf (slice via offset kernel)
       let plOffset := li * cfg.embdPerLayer
       let plTotalSize := cfg.embdPerLayer * cfg.numHiddenLayers
-      Hesper.WGSL.Execute.executeShaderNamed device
-        (PerLayerEmbedding.geluGateMulSliceKernel cfg.embdPerLayer plTotalSize plOffset)
-        [("gate", state.plGateBuf), ("per_layer_input", plInputAll), ("output", state.moeRouterOutBuf)]
-        (.dispatch1D cfg.embdPerLayer)
+      Hesper.WGSL.Execute.withSection "ple.geluGateMul" do
+        Hesper.WGSL.Execute.executeShaderNamed device
+          (PerLayerEmbedding.geluGateMulSliceKernel cfg.embdPerLayer plTotalSize plOffset)
+          [("gate", state.plGateBuf), ("per_layer_input", plInputAll), ("output", state.moeRouterOutBuf)]
+          (.dispatch1D cfg.embdPerLayer)
       -- per_layer_proj @ moeRouterOutBuf → plProjBuf [hiddenSize]
-      Linear.LinearLayer.forward device plEmbd.proj state.moeRouterOutBuf state.plProjBuf
-      -- per_layer_post_norm: plProjBuf → normedBuf2 (avoid aliasing)
-      RMSNorm.forward device plEmbd.postNorm state.plProjBuf state.normedBuf2
-      -- residual: outputBuf = pe_in + normedBuf2
-      -- pe_in is current outputBuf value. Use attnResidualBuf as temp to read old outputBuf
-      Hesper.WGSL.Execute.executeShaderNamed device
-        (PerLayerEmbedding.scaleKernel cfg.hiddenSize 1.0)
-        [("input", outputBuf), ("output", state.attnResidualBuf)]
-        (.dispatch1D cfg.hiddenSize)
-      Hesper.WGSL.Execute.executeShaderNamed device
-        (residualAddKernel cfg.hiddenSize)
-        [("a", state.attnResidualBuf), ("b", state.normedBuf2), ("output", outputBuf)]
-        (.dispatch1D cfg.hiddenSize)
+      Hesper.WGSL.Execute.withSection "ple.proj" do
+        Linear.LinearLayer.forward device plEmbd.proj state.moeRouterOutBuf state.plProjBuf
+      -- Fused post-norm + residual-add, in place on outputBuf.
+      -- Replaces three dispatches (postNorm, copyBack, residAdd) with
+      -- one: `outputBuf[i] += rmsNorm(plProjBuf)[i] * postNorm.scale[i]`.
+      Hesper.WGSL.Execute.withSection "ple.postNormAdd" do
+        Hesper.WGSL.Execute.executeShaderNamed device
+          (fusedPerLayerPostKernel cfg.hiddenSize cfg.rmsNormEps)
+          [("proj", state.plProjBuf), ("weight", plEmbd.postNorm.scale), ("residual", outputBuf)]
+          { numWorkgroups := (1, 1, 1)
+            workgroupSize := { x := 256, y := 1, z := 1 }
+            extensions := ["subgroups"]
+            : Execute.ExecutionConfig }
     | _, _ => pure ()
 
   -- Step 9: Layer output scale (optional)
