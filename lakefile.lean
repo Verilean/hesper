@@ -664,6 +664,10 @@ lean_exe «micro-bench» where
   root := `Bench.MicroBenchmark
   moreLinkArgs := stdLinkArgs
 
+lean_exe «gpu-fixed-cost-bench» where
+  root := `Bench.GpuFixedCost
+  moreLinkArgs := stdLinkArgs
+
 -- ============================================================================
 -- SIMD CPU BACKEND (Google Highway)
 -- ============================================================================
