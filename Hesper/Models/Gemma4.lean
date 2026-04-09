@@ -812,11 +812,17 @@ private def loadLinear (device : Device) (gguf : Hesper.GGUF.GGUFFile)
     | .error e => throw $ IO.userError e
   let weightBuf ← uploadBuffer device data
   let prepared ← IO.mkRef none
+  let splitKBuf ← IO.mkRef none
+  let splitKPartialPrepared ← IO.mkRef none
+  let splitKReducePrepared ← IO.mkRef none
   return {
     config := { inDim, outDim }
     weightBuf
     quantFormat
     prepared
+    splitKBuf
+    splitKPartialPrepared
+    splitKReducePrepared
   }
 
 /-- Load Gemma 4 model from GGUF file -/

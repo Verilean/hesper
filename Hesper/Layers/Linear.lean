@@ -752,6 +752,202 @@ def fusedQ4KMLinearBlockCoop2RowKernel (config : Config) : ShaderM Unit := do
     ShaderM.writeBuffer (ty := .scalar .f32) "output" outIdx totalSum
   ) (pure ())
 
+/-! ## Split-K Q4_K_M MatVec (for ffnDown-shape low-wave-count linears) -/
+
+/-- Split-K Q4_K_M mat-vec kernel. Each workgroup computes a partial
+    dot-product over a **contiguous slice** of the input-dim blocks for
+    one output row, and writes the partial sum into a scratch buffer at
+    `partial[outIdx * splits + splitIdx]`. A second small kernel
+    (`splitKReduceKernel`) sums the `splits` partials into the final
+    `output[outIdx]`.
+
+    Motivation: for `ffnDown` (outDim=2560, inDim=10240), the 1-WG-per-row
+    scheme only launches `2560 × 32 = 81920` threads, filling ~0.9 waves
+    on an RTX 4070 Ti (60 SM × 1536 resident threads = 92160 capacity).
+    With less than one wave of latent Warps on each SM, the hardware
+    scheduler has no second Warp to swap in when the current one stalls
+    on a DRAM load, and memory latency directly serialises the kernel.
+    Splitting the K dim (inDim) by a factor of `splits` multiplies the
+    WG count by `splits`, raising wave occupancy to `splits × 0.9`
+    and restoring inter-Warp latency hiding.
+
+    The per-block loop is the same software-pipelined block-coop body
+    as `fusedQ4KMLinearBlockCoopKernel`, just constrained to
+    `[splitStart, splitEnd)` of the row's blocks. `blocksPerSplit` must
+    divide `blocksPerRow` evenly.
+
+    Dispatch grid: `(outDim * splits, 1, 1)` workgroups × 32 threads.
+    Requires subgroup support and `blocksPerRow % splits == 0`. -/
+def fusedQ4KMLinearSplitKKernel (config : Config) (splits : Nat) : ShaderM Unit := do
+  let wid ← ShaderM.workgroupId
+  let lid ← ShaderM.localId
+  let gwid := Exp.vec3X wid
+  let tid := Exp.vec3X lid
+
+  let blocksPerRow := config.inDim / 256
+  let blocksPerSplit := blocksPerRow / splits
+  let totalWeightU32 := config.outDim * blocksPerRow * 36
+
+  let _weights ← ShaderM.declareInputBuffer "weights" (.array (.scalar .u32) totalWeightU32)
+  let _input ← ShaderM.declareInputBuffer "input" (.array (.scalar .f32) config.inDim)
+  -- Partial-sums scratch: outDim * splits f32s, row-major
+  -- [outIdx * splits + splitIdx].
+  let _partial ← ShaderM.declareOutputBuffer "partial"
+    (.array (.scalar .f32) (config.outDim * splits))
+
+  -- Decompose flat WG id: outIdx = gwid / splits, splitIdx = gwid % splits.
+  let outIdx := Exp.div gwid (Exp.litU32 splits)
+  let splitIdx := Exp.sub gwid (Exp.mul outIdx (Exp.litU32 splits))
+  let inBounds := Exp.lt outIdx (Exp.litU32 config.outDim)
+
+  ShaderM.varNamed "acc" (.scalar .f32) (Exp.litF32 0.0)
+  let acc : Exp (.scalar .f32) := Exp.var "acc"
+
+  -- Row base + split starting block offset (runtime).
+  let rowBaseU32 := Exp.mul outIdx (Exp.litU32 (blocksPerRow * 36))
+  let splitStartBlock := Exp.mul splitIdx (Exp.litU32 blocksPerSplit)
+  let splitBlockBaseU32 := Exp.add rowBaseU32 (Exp.mul splitStartBlock (Exp.litU32 36))
+  -- Starting element (relative to row) for the split's first block.
+  let splitElemBase := Exp.mul splitStartBlock (Exp.litU32 256)
+
+  let cLane := Exp.div tid (Exp.litU32 8)
+  let l32Lane := Exp.sub tid (Exp.mul cLane (Exp.litU32 8))
+  let qsOffsetInBlock := Exp.add (Exp.litU32 4)
+                         (Exp.add (Exp.mul cLane (Exp.litU32 8)) l32Lane)
+
+  -- Pre-loop depth-1 prefetch of the split's first block.
+  let init0Dm  ← ShaderM.readBuffer (ty := .scalar .u32) (n := totalWeightU32) "weights" splitBlockBaseU32
+  let init0Sc0 ← ShaderM.readBuffer (ty := .scalar .u32) (n := totalWeightU32) "weights" (Exp.add splitBlockBaseU32 (Exp.litU32 1))
+  let init0Sc1 ← ShaderM.readBuffer (ty := .scalar .u32) (n := totalWeightU32) "weights" (Exp.add splitBlockBaseU32 (Exp.litU32 2))
+  let init0Sc2 ← ShaderM.readBuffer (ty := .scalar .u32) (n := totalWeightU32) "weights" (Exp.add splitBlockBaseU32 (Exp.litU32 3))
+  let init0Qs  ← ShaderM.readBuffer (ty := .scalar .u32) (n := totalWeightU32) "weights" (Exp.add splitBlockBaseU32 qsOffsetInBlock)
+  ShaderM.varNamed "nextDm"  (.scalar .u32) init0Dm
+  ShaderM.varNamed "nextSc0" (.scalar .u32) init0Sc0
+  ShaderM.varNamed "nextSc1" (.scalar .u32) init0Sc1
+  ShaderM.varNamed "nextSc2" (.scalar .u32) init0Sc2
+  ShaderM.varNamed "nextQs"  (.scalar .u32) init0Qs
+
+  for localBlock in [0:blocksPerSplit] do
+    -- elemBase: element offset relative to row start = splitElemBase + localBlock*256.
+    let elemBase := Exp.add splitElemBase (Exp.litU32 (localBlock * 256))
+
+    let cDm  := s!"currDm_{localBlock}"
+    let cSc0 := s!"currSc0_{localBlock}"
+    let cSc1 := s!"currSc1_{localBlock}"
+    let cSc2 := s!"currSc2_{localBlock}"
+    let cQs  := s!"currQs_{localBlock}"
+    ShaderM.varNamed cDm  (.scalar .u32) (Exp.var "nextDm")
+    ShaderM.varNamed cSc0 (.scalar .u32) (Exp.var "nextSc0")
+    ShaderM.varNamed cSc1 (.scalar .u32) (Exp.var "nextSc1")
+    ShaderM.varNamed cSc2 (.scalar .u32) (Exp.var "nextSc2")
+    ShaderM.varNamed cQs  (.scalar .u32) (Exp.var "nextQs")
+    let dmU32 : Exp (.scalar .u32) := Exp.var cDm
+    let sc0   : Exp (.scalar .u32) := Exp.var cSc0
+    let sc1   : Exp (.scalar .u32) := Exp.var cSc1
+    let sc2   : Exp (.scalar .u32) := Exp.var cSc2
+    let qsU32 : Exp (.scalar .u32) := Exp.var cQs
+    let d := fp16ToF32 (Exp.bitAnd dmU32 (Exp.litU32 0xFFFF))
+    let dmin := fp16ToF32 (Exp.shiftRight dmU32 (Exp.litU32 16))
+
+    if localBlock + 1 < blocksPerSplit then
+      let nbBaseNext := Exp.add splitBlockBaseU32 (Exp.litU32 ((localBlock + 1) * 36))
+      ShaderM.assign "nextDm"  (← ShaderM.readBuffer (ty := .scalar .u32) (n := totalWeightU32) "weights" nbBaseNext)
+      ShaderM.assign "nextSc0" (← ShaderM.readBuffer (ty := .scalar .u32) (n := totalWeightU32) "weights" (Exp.add nbBaseNext (Exp.litU32 1)))
+      ShaderM.assign "nextSc1" (← ShaderM.readBuffer (ty := .scalar .u32) (n := totalWeightU32) "weights" (Exp.add nbBaseNext (Exp.litU32 2)))
+      ShaderM.assign "nextSc2" (← ShaderM.readBuffer (ty := .scalar .u32) (n := totalWeightU32) "weights" (Exp.add nbBaseNext (Exp.litU32 3)))
+      ShaderM.assign "nextQs"  (← ShaderM.readBuffer (ty := .scalar .u32) (n := totalWeightU32) "weights" (Exp.add nbBaseNext qsOffsetInBlock))
+
+    let is0 := Exp.mul cLane (Exp.litU32 2)
+    let is1 := Exp.add is0 (Exp.litU32 1)
+
+    let extractScaleMin (is : Exp (.scalar .u32)) : Exp (.scalar .f32) × Exp (.scalar .f32) :=
+      let isLow := Exp.lt is (Exp.litU32 4)
+      let shift4 := Exp.mul is (Exp.litU32 8)
+      let scaleLow := Exp.bitAnd (Exp.shiftRight sc0 shift4) (Exp.litU32 0x3F)
+      let minLow   := Exp.bitAnd (Exp.shiftRight sc1 shift4) (Exp.litU32 0x3F)
+      let isHi := Exp.sub is (Exp.litU32 4)
+      let shiftHi := Exp.mul isHi (Exp.litU32 8)
+      let scaleHiLo := Exp.bitAnd (Exp.shiftRight sc2 shiftHi) (Exp.litU32 0x0F)
+      let scaleHiHi := Exp.shiftLeft
+        (Exp.bitAnd (Exp.shiftRight sc0 (Exp.add shiftHi (Exp.litU32 6))) (Exp.litU32 0x03))
+        (Exp.litU32 4)
+      let scaleHigh := Exp.bitOr scaleHiLo scaleHiHi
+      let minHiLo := Exp.bitAnd (Exp.shiftRight sc2 (Exp.add shiftHi (Exp.litU32 4))) (Exp.litU32 0x0F)
+      let minHiHi := Exp.shiftLeft
+        (Exp.bitAnd (Exp.shiftRight sc1 (Exp.add shiftHi (Exp.litU32 6))) (Exp.litU32 0x03))
+        (Exp.litU32 4)
+      let minHigh := Exp.bitOr minHiLo minHiHi
+      let scaleU := Exp.select isLow scaleLow scaleHigh
+      let minU   := Exp.select isLow minLow   minHigh
+      (Exp.toF32 scaleU, Exp.toF32 minU)
+
+    let (scaleA, minA) := extractScaleMin is0
+    let (scaleB, minB) := extractScaleMin is1
+    let d1 := Exp.mul d scaleA
+    let m1 := Exp.mul dmin minA
+    let d2 := Exp.mul d scaleB
+    let m2 := Exp.mul dmin minB
+
+    let elemOffset := Exp.add (Exp.mul cLane (Exp.litU32 64))
+                      (Exp.mul l32Lane (Exp.litU32 4))
+    let elemBaseAbs := Exp.add elemBase elemOffset
+
+    for b in [0:4] do
+      let byte := Exp.bitAnd (Exp.shiftRight qsU32 (Exp.litU32 (b * 8))) (Exp.litU32 0xFF)
+      let qLow := Exp.bitAnd byte (Exp.litU32 0xF)
+      let qHigh := Exp.shiftRight byte (Exp.litU32 4)
+      let elemIdxLow := Exp.add elemBaseAbs (Exp.litU32 b)
+      let elemIdxHigh := Exp.add elemBaseAbs (Exp.litU32 (32 + b))
+      let inLow ← ShaderM.readBuffer (ty := .scalar .f32) (n := config.inDim) "input" elemIdxLow
+      let inHigh ← ShaderM.readBuffer (ty := .scalar .f32) (n := config.inDim) "input" elemIdxHigh
+      let wLow := Exp.sub (Exp.mul d1 (Exp.toF32 qLow)) m1
+      let wHigh := Exp.sub (Exp.mul d2 (Exp.toF32 qHigh)) m2
+      ShaderM.assign "acc" (Exp.add acc (Exp.add (Exp.mul wLow inLow) (Exp.mul wHigh inHigh)))
+
+  ShaderM.varNamed "totalSum" (.scalar .f32) (Exp.subgroupAdd acc)
+  let totalSum : Exp (.scalar .f32) := Exp.var "totalSum"
+
+  -- Lane 0 writes the partial sum to partial[outIdx * splits + splitIdx].
+  ShaderM.if_ (Exp.and (Exp.eq tid (Exp.litU32 0)) inBounds) (do
+    let writeIdx := Exp.add (Exp.mul outIdx (Exp.litU32 splits)) splitIdx
+    ShaderM.writeBuffer (ty := .scalar .f32) "partial" writeIdx totalSum
+  ) (pure ())
+
+/-- Reduce kernel for split-K: sum the `splits` partials for each
+    output row into `output[outIdx]`. Dispatched as a flat 1D grid of
+    `outDim` threads (one thread per output element); the caller picks
+    `numWorkgroups = outDim / 256`, `workgroupSize = 256`. -/
+def splitKReduceKernel (outDim splits : Nat) : ShaderM Unit := do
+  let gid ← ShaderM.globalId
+  let outIdx := Exp.vec3X gid
+
+  let _partial ← ShaderM.declareInputBuffer "partial" (.array (.scalar .f32) (outDim * splits))
+  let _output ← ShaderM.declareOutputBuffer "output" (.array (.scalar .f32) outDim)
+
+  let inBounds := Exp.lt outIdx (Exp.litU32 outDim)
+
+  ShaderM.if_ inBounds (do
+    ShaderM.varNamed "sum" (.scalar .f32) (Exp.litF32 0.0)
+    let sum : Exp (.scalar .f32) := Exp.var "sum"
+    let base := Exp.mul outIdx (Exp.litU32 splits)
+    for s in [0:splits] do
+      let v ← ShaderM.readBuffer (ty := .scalar .f32) (n := outDim * splits) "partial"
+                (Exp.add base (Exp.litU32 s))
+      ShaderM.assign "sum" (Exp.add sum v)
+    ShaderM.writeBuffer (ty := .scalar .f32) "output" outIdx sum
+  ) (pure ())
+
+/-- Decide split-K factor based on shape. Currently returns 1
+    unconditionally — the infrastructure is in place and correct, but
+    on RTX 4070 Ti / Tint it yields essentially no speedup on ffnDown
+    (splits=2,4,8 all tested, all within 1% of the depth-1 pipelined
+    baseline). The wave-count hypothesis does not hold here; see the
+    commit message for `b1288bf`-followup analysis.
+
+    Kept as a toggle so future investigation on other hardware or with
+    a different reduce strategy can re-enable it by returning >1. -/
+def splitKFactorFor (_cfg : Config) : Nat := 1
+
 /-! ## Q4_K_M Fused Gate+Up (Gemma 4 / LLaMA GeGLU FFN) -/
 
 /-- Fused gate+up Q4_K_M kernel:
@@ -894,6 +1090,13 @@ structure LinearLayer where
   weightBuf : Buffer    -- Raw packed weights on GPU
   quantFormat : QuantFormat  -- Which dequant kernel to use
   prepared : IO.Ref (Option Execute.PreparedDispatch)
+  -- Split-K partial-sums workspace buffer (`outDim * splits` f32), lazily
+  -- allocated on the first call when split-K is eligible (see
+  -- `splitKFactorFor` below). Nil until then.
+  splitKBuf : IO.Ref (Option Buffer)
+  -- Prepared dispatch for the split-K partial kernel and the reduce kernel.
+  splitKPartialPrepared : IO.Ref (Option Execute.PreparedDispatch)
+  splitKReducePrepared : IO.Ref (Option Execute.PreparedDispatch)
 
 /-- Execute the linear layer: output = input @ weights^T
 
@@ -913,6 +1116,90 @@ def LinearLayer.forward (device : Device) (layer : LinearLayer)
     (inputBuf outputBuf : Buffer) : IO Unit := do
   let profiling ← profilingRef.get
   let startNs ← if profiling then IO.monoNanosNow else pure 0
+
+  let useSubgroups ← Execute.hasSubgroupSupport device
+  let splits := if layer.quantFormat == .Q4_K && useSubgroups
+                then splitKFactorFor layer.config else 1
+
+  if splits > 1 then
+    -- ## Split-K fast path
+    -- Two dispatches: partial compute → reduce. Both have their own
+    -- PreparedDispatch caches on the layer.
+    if let (some pPart, some pRed) ← do
+        let a ← layer.splitKPartialPrepared.get
+        let b ← layer.splitKReducePrepared.get
+        pure (a, b) then
+      Execute.replayPreparedDispatch device pPart (layer.config.outDim * splits) 1 1
+      let reduceWGs := (layer.config.outDim + 255) / 256
+      Execute.replayPreparedDispatch device pRed reduceWGs 1 1
+      if profiling then
+        let endNs ← IO.monoNanosNow
+        let delta := (endNs - startNs).toUInt64
+        totalNanosRef.modify (· + delta)
+        callCountRef.modify (· + 1)
+        perShapeAdd layer.config.inDim layer.config.outDim delta
+      return
+
+    -- Slow path: lazily alloc the partial-sums buffer, then run both
+    -- dispatches in the non-fast form so they get cached in the
+    -- respective prepared refs.
+    let partialBuf ← (do
+      match ← layer.splitKBuf.get with
+      | some b => pure b
+      | none =>
+        let sizeBytes : USize := (layer.config.outDim * splits * 4).toUSize
+        let b ← createBuffer device {
+          size := sizeBytes
+          usage := [.storage, .copySrc, .copyDst]
+          mappedAtCreation := false
+        }
+        layer.splitKBuf.set (some b)
+        pure b)
+
+    let partialBuffers := [
+      ("weights", layer.weightBuf),
+      ("input", inputBuf),
+      ("partial", partialBuf)
+    ]
+    let partialCfg : Execute.ExecutionConfig := {
+      numWorkgroups := (layer.config.outDim * splits, 1, 1)
+      workgroupSize := { x := 32, y := 1, z := 1 }
+      extensions := ["subgroups"]
+    }
+    let partialCacheKey : UInt64 :=
+      hash ("q4k-lin-splitk-partial", layer.config.inDim, layer.config.outDim, splits)
+    Execute.executeShaderNamed device
+      (fusedQ4KMLinearSplitKKernel layer.config splits)
+      partialBuffers partialCfg
+      (cacheKey := some partialCacheKey)
+      (preparedRef := some layer.splitKPartialPrepared)
+
+    let reduceBuffers := [
+      ("partial", partialBuf),
+      ("output", outputBuf)
+    ]
+    let reduceWGs := (layer.config.outDim + 255) / 256
+    let reduceCfg : Execute.ExecutionConfig := {
+      numWorkgroups := (reduceWGs, 1, 1)
+      workgroupSize := { x := 256, y := 1, z := 1 }
+      extensions := []
+    }
+    let reduceCacheKey : UInt64 :=
+      hash ("q4k-lin-splitk-reduce", layer.config.outDim, splits)
+    Execute.executeShaderNamed device
+      (splitKReduceKernel layer.config.outDim splits)
+      reduceBuffers reduceCfg
+      (cacheKey := some reduceCacheKey)
+      (preparedRef := some layer.splitKReducePrepared)
+
+    if profiling then
+      let endNs ← IO.monoNanosNow
+      let delta := (endNs - startNs).toUInt64
+      totalNanosRef.modify (· + delta)
+      callCountRef.modify (· + 1)
+      perShapeAdd layer.config.inDim layer.config.outDim delta
+    return
+
   -- Fast path: instant replay if we already have a prepared dispatch and
   -- the input/output buffers match the prepared binding. The prepared
   -- dispatch binds specific buffer handles, so if the caller ever passes
@@ -940,7 +1227,6 @@ def LinearLayer.forward (device : Device) (layer : LinearLayer)
   -- `subgroupAdd`) if the device supports subgroups, else the
   -- original shared-memory tree-reduction kernel (256 threads).
   -- Both variants dispatch `outDim` workgroups, one per output row.
-  let useSubgroups ← Execute.hasSubgroupSupport device
   let wgSize := if useSubgroups then 32 else 256
   let execConfig : Execute.ExecutionConfig := {
     numWorkgroups := (layer.config.outDim, 1, 1)
