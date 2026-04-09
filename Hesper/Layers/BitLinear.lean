@@ -67,6 +67,12 @@ open Hesper.Logging (logVerbose)
 initialize preparedHitsRef : IO.Ref Nat ← IO.mkRef 0
 initialize preparedMissesRef : IO.Ref Nat ← IO.mkRef 0
 
+/-- Runtime opt-in for the subgroup-matrix BitLinear kernel. Default off
+    because the kernel is still slower than the tiled fallback at M < 256
+    on current hardware (see Tests/BitLinearBench). Flip to `true` from
+    tests that want to exercise it, or leave off for production use. -/
+initialize subgroupMatrixOptInRef : IO.Ref Bool ← IO.mkRef false
+
 /-! ## Layer Configuration -/
 
 /-- BitLinear layer configuration -/
@@ -956,6 +962,168 @@ def fusedBitLinearResidualKernel (config : Config) (numRows : Nat) (workgroupSiz
     ShaderM.writeBuffer (ty := .scalar .f32) "output" outputIdx result
   ) (pure ())
 
+/-! ## Subgroup-Matrix Multi-row BitLinear Kernel (cooperative matmul) -/
+
+/-- Multi-row BitLinear kernel using cooperative matrix operations.
+
+    Targets the NVIDIA Ada / Ampere WMMA config (f16, f16) → f32 at 16×16×16.
+    One workgroup (= one subgroup of 32 threads) computes a single 16×16
+    output tile `Y[rowBase .. rowBase+16, outBase .. outBase+16]`.
+
+    The math is `Y = X @ W^T` where X is the row-major `[numRows, inDim]`
+    input and W is the ternary weight matrix (`[outDim, inDim]`). So the
+    subgroup matrix layout is:
+
+      A (left,  M×K = 16×16) = X[rowBase .. +16, kBase .. +16]
+      B (right, K×N = 16×16) = W^T[kBase .. +16, outBase .. +16]
+                             = W[outBase .. +16, kBase .. +16]^T
+      C (result, M×N = 16×16)
+
+    A is f16 (cast from f32 input), B is f16 (dequantized from i2_s
+    ternary), C accumulates as f32 for precision. Preconditions:
+    `numRows % 16 == 0`, `outDim % 16 == 0`, `inDim % 16 == 0`
+    (and `inDim % 128 == 0` for i2_s). The caller (`forward`) must check
+    these and fall back to the existing tiled kernel otherwise.
+
+    Layout of shared memory:
+      shared_A : array<f16, 256>   row-major 16 × 16 (M × K)
+      shared_B : array<f16, 256>   row-major 16 × 16 (K × N)
+
+    The subgroup matrix load reads f16 tiles from these with stride=16,
+    does one 16×16×16 cooperative MAC per K-block, then at the end of
+    the K loop stores the f32 result into another shared buffer
+    `shared_C` of 256 f32 values, after which all 32 threads scale and
+    write 8 elements each to the output buffer. -/
+def fusedBitLinearSubgroupMatrixKernel (config : Config) (numRows : Nat) : ShaderM Unit := do
+  let wid ← ShaderM.workgroupId
+  let lid ← ShaderM.localId
+  let wgX := Exp.vec3X wid   -- tile column (outDim direction)
+  let wgY := Exp.vec3Y wid   -- tile row    (row direction)
+  let tid := Exp.vec3X lid   -- lane within the subgroup (0..31)
+
+  let outTiles := config.outDim / 16
+  let _ := outTiles  -- silence unused when not used directly
+  let numKTiles := config.inDim / 16
+
+  let totalWeightElements := config.outDim * config.inDim
+  let numPackedBytes := totalWeightElements / 4
+  let numPackedU32 := (numPackedBytes + 3) / 4
+  let totalInputElements := numRows * config.inDim
+  let totalOutputElements := numRows * config.outDim
+
+  -- Buffers
+  let _packed ← ShaderM.declareInputBuffer "weights_packed" (.array (.scalar .u32) numPackedU32)
+  let _scale ← ShaderM.declareInputBuffer "scale" (.array (.scalar .f32) 1)
+  let _input ← ShaderM.declareInputBuffer "input" (.array (.scalar .f32) totalInputElements)
+  let _output ← ShaderM.declareOutputBuffer "output" (.array (.scalar .f32) totalOutputElements)
+
+  -- Workgroup-private matrix tiles (16×16 each).
+  ShaderM.sharedNamed "shared_A" (.array (.scalar .f16) 256)
+  ShaderM.sharedNamed "shared_B" (.array (.scalar .f16) 256)
+  ShaderM.sharedNamed "shared_C" (.array (.scalar .f32) 256)
+
+  -- Declare the one-element subgroup matrix arrays.
+  ShaderM.declareMatrixLeftArray  "Ax" .f16 16 16 1 Exp.subgroupMatrixZeroLeft
+  ShaderM.declareMatrixRightArray "Bx" .f16 16 16 1 Exp.subgroupMatrixZeroRight
+  ShaderM.declareMatrixResultArray "Cx" .f32 16 16 1 Exp.subgroupMatrixZeroResult
+
+  let rowBase := Exp.mul wgY (Exp.litU32 16)
+  let outBase := Exp.mul wgX (Exp.litU32 16)
+
+  -- Each row of W covers inDim / 4 bytes in the packed buffer.
+  let bytesPerRow := config.inDim / 4
+
+  -- Thread layout: 32 threads, 256 elements per tile → 8 elements/thread.
+  -- Use flat index e = tid + s*32 for s in 0..8.
+  -- Rows past `numRows` are zero-padded so the workgroup grid can cover any
+  -- numRows (not just multiples of 16). Out-of-bounds output rows are
+  -- skipped in the store phase below. outDim still needs to be a multiple of
+  -- 16 (enforced by the dispatch threshold in `forward`).
+  let numRowsU32 := Exp.litU32 numRows
+  let loadTileA (kBase : Exp (.scalar .u32)) : ShaderM Unit := do
+    for s in [0:8] do
+      let e := Exp.add tid (Exp.litU32 (s * 32))
+      let mi := Exp.div e (Exp.litU32 16)
+      let ki := Exp.mod e (Exp.litU32 16)
+      let row := Exp.add rowBase mi
+      let col := Exp.add kBase ki
+      let inRange := Exp.lt row numRowsU32
+      ShaderM.if_ inRange (do
+        let inIdx := Exp.add (Exp.mul row (Exp.litU32 config.inDim)) col
+        let xf32 ← ShaderM.readBuffer (ty := .scalar .f32) (n := totalInputElements) "input" inIdx
+        let xf16 := Exp.toF16 xf32
+        ShaderM.writeWorkgroup (ty := .scalar .f16) "shared_A" e xf16
+      ) (do
+        ShaderM.writeWorkgroup (ty := .scalar .f16) "shared_A" e (Exp.toF16 (Exp.litF32 0.0)))
+
+  -- Decode a single i2_s ternary value at (outRow, col) into a plain f32 in {-1, 0, 1}.
+  -- This mirrors BitLinearSpec.decodeI2S exactly.
+  let decodeTernary (outRow col : Exp (.scalar .u32)) : ShaderM (Exp (.scalar .f32)) := do
+    let rowStart := Exp.mul outRow (Exp.litU32 bytesPerRow)
+    let group128 := Exp.div col (Exp.litU32 128)
+    let colInGroup := Exp.mod col (Exp.litU32 128)
+    let bytePos := Exp.mod colInGroup (Exp.litU32 32)
+    let shiftIdx := Exp.div colInGroup (Exp.litU32 32)
+    -- shift = 6 - shiftIdx*2
+    let shift := Exp.sub (Exp.litU32 6) (Exp.mul shiftIdx (Exp.litU32 2))
+    let byteOffset := Exp.add rowStart (Exp.add (Exp.mul group128 (Exp.litU32 32)) bytePos)
+    -- Weights are packed as u32. Read the u32 that contains this byte.
+    let u32Idx := Exp.div byteOffset (Exp.litU32 4)
+    let byteInU32 := Exp.mod byteOffset (Exp.litU32 4)
+    let packedU32 ← ShaderM.readBuffer (ty := .scalar .u32) (n := numPackedU32) "weights_packed" u32Idx
+    -- Extract the right byte: (packedU32 >> (byteInU32 * 8)) & 0xFF
+    let byteShift := Exp.mul byteInU32 (Exp.litU32 8)
+    let theByte := Exp.bitAnd (Exp.shiftRight packedU32 byteShift) (Exp.litU32 0xFF)
+    -- Extract 2-bit code at (shift .. shift+2)
+    let code := Exp.bitAnd (Exp.shiftRight theByte shift) (Exp.litU32 0x3)
+    pure (Exp.sub (Exp.toF32 code) (Exp.litF32 1.0))
+
+  let loadTileB (kBase : Exp (.scalar .u32)) : ShaderM Unit := do
+    for s in [0:8] do
+      let e := Exp.add tid (Exp.litU32 (s * 32))
+      -- B is stored row-major as [K=16, N=16]; B[ki, ni] = W^T[kBase+ki, outBase+ni]
+      -- = W[outBase+ni, kBase+ki]. So we decode at (row = outBase+ni, col = kBase+ki).
+      let ki := Exp.div e (Exp.litU32 16)
+      let ni := Exp.mod e (Exp.litU32 16)
+      let col := Exp.add kBase ki
+      let row := Exp.add outBase ni
+      let w ← decodeTernary row col
+      let wf16 := Exp.toF16 w
+      ShaderM.writeWorkgroup (ty := .scalar .f16) "shared_B" e wf16
+
+  -- Main K loop — march over inDim in steps of 16.
+  for kTile in [0:numKTiles] do
+    let kBase := Exp.litU32 (kTile * 16)
+    loadTileA kBase
+    loadTileB kBase
+    ShaderM.barrier
+    ShaderM.loadMatrixLeft  (st := .f16) (m := 16) (k := 16) "Ax" 0 "shared_A" (Exp.litU32 0) (Exp.litU32 16)
+    ShaderM.loadMatrixRight (st := .f16) (k := 16) (n := 16) "Bx" 0 "shared_B" (Exp.litU32 0) (Exp.litU32 16)
+    ShaderM.matrixMultiplyAccumulateMixed
+      (inSt := .f16) (outSt := .f32) (m := 16) (k := 16) (n := 16)
+      "Cx" 0 "Ax" 0 "Bx" 0
+    ShaderM.barrier
+
+  -- Store the f32 accumulator tile into workgroup memory, then scale + write out.
+  ShaderM.storeMatrixResult (st := .f32) (m := 16) (n := 16)
+    "Cx" 0 "shared_C" (Exp.litU32 0) (Exp.litU32 16)
+  ShaderM.barrier
+
+  -- 32 threads, 256 tile elements → 8 per thread. Skip writes for rows past
+  -- `numRows` (workgroup grid may cover padding rows when numRows % 16 ≠ 0).
+  let scaleVal ← ShaderM.readBuffer (ty := .scalar .f32) (n := 1) "scale" (Exp.litU32 0)
+  for s in [0:8] do
+    let e := Exp.add tid (Exp.litU32 (s * 32))
+    let mi := Exp.div e (Exp.litU32 16)
+    let ni := Exp.mod e (Exp.litU32 16)
+    let row := Exp.add rowBase mi
+    let col := Exp.add outBase ni
+    ShaderM.if_ (Exp.lt row numRowsU32) (do
+      let v ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := 256) "shared_C" e
+      let outIdx := Exp.add (Exp.mul row (Exp.litU32 config.outDim)) col
+      ShaderM.writeBuffer (ty := .scalar .f32) "output" outIdx (Exp.mul scaleVal v)
+    ) (pure ())
+
 /-! ## High-Level API -/
 
 /-- BitLinear layer structure -/
@@ -1105,22 +1273,65 @@ def forward (device : Device) (layer : BitLinear)
     layer.prepared.set (some (layer.kernel.prepare bg))
     Hesper.WGSL.Execute.dispatchKernel device layer.kernel bg (layer.config.outDim, 1, 1)
   else
-    -- M>1 path: workgroup-cooperative tiled kernel
-    let wgSize := 256
-    let shader := fusedBitLinearKernel layer.config numRows wgSize
-    let namedBuffers := [
-      ("weights_packed", layer.weightsPacked),
-      ("scale", layer.scaleBuf),
-      ("input", inputBuf),
-      ("output", outputBuf)
-    ]
-    let totalOutputs := numRows * layer.config.outDim
-    let execConfig : Hesper.WGSL.Execute.ExecutionConfig := {
-      workgroupSize := { x := wgSize, y := 1, z := 1 }
-      numWorkgroups := (totalOutputs, 1, 1)
-    }
-    let cacheKey : UInt64 := hash ("bl", layer.config.inDim, layer.config.outDim, numRows)
-    Hesper.WGSL.Execute.executeShaderNamed device shader namedBuffers execConfig (some cacheKey)
+    -- M>1 path. Prefer the subgroup-matrix cooperative matmul kernel when:
+    --   (a) the device exposes SubgroupMatrix + ShaderF16,
+    --   (b) the shape is tile-friendly (numRows, inDim, outDim all % 16 == 0),
+    --   (c) inDim is also % 128 == 0 (i2_s group layout).
+    -- Otherwise fall back to the workgroup-cooperative tiled kernel.
+    let hasSM ← Hesper.WGSL.Execute.hasSubgroupMatrixSupport device
+    let hasF16 ← Hesper.WGSL.Execute.hasShaderF16Support device
+    -- The kernel handles arbitrary numRows by zero-padding the last row tile
+    -- and skipping out-of-bounds writes, so numRows ≥ 16 is the only row
+    -- requirement. outDim must be a multiple of 16 (we don't currently do
+    -- column-tail padding) and inDim must be a multiple of 128 (i2_s group).
+    --
+    -- NOTE: the subgroup-matrix path is currently slower than the tiled
+    -- fallback at M < 256 on RTX 4070 Ti (see Tests/BitLinearBench output —
+    -- the per-workgroup weight-load traffic isn't amortized yet because
+    -- each workgroup computes only one 16×16 output tile). Gate it behind
+    -- an opt-in environment variable `HESPER_BITLINEAR_SUBGROUP_MATRIX=1`
+    -- so the default path doesn't regress; enabling the env var also
+    -- serves as the equivalence-test entry point.
+    let tileFriendly :=
+      numRows ≥ 16 && layer.config.outDim % 16 == 0 &&
+      layer.config.inDim % 16 == 0 && layer.config.inDim % 128 == 0
+    let optIn ← subgroupMatrixOptInRef.get
+    if hasSM && hasF16 && tileFriendly && optIn then
+      let shader := fusedBitLinearSubgroupMatrixKernel layer.config numRows
+      let namedBuffers := [
+        ("weights_packed", layer.weightsPacked),
+        ("scale", layer.scaleBuf),
+        ("input", inputBuf),
+        ("output", outputBuf)
+      ]
+      let numRowTiles := (numRows + 15) / 16
+      let execConfig : Hesper.WGSL.Execute.ExecutionConfig := {
+        workgroupSize := { x := 32, y := 1, z := 1 }
+        numWorkgroups := (layer.config.outDim / 16, numRowTiles, 1)
+        extensions :=
+          ["f16", "chromium_experimental_subgroup_matrix"]
+        diagnostics := [("off", "chromium.subgroup_matrix_uniformity")]
+      }
+      let cacheKey : UInt64 :=
+        hash ("bl-sm", layer.config.inDim, layer.config.outDim, numRows)
+      Hesper.WGSL.Execute.executeShaderNamed device shader namedBuffers execConfig (some cacheKey)
+    else
+      -- Workgroup-cooperative tiled kernel (existing fallback)
+      let wgSize := 256
+      let shader := fusedBitLinearKernel layer.config numRows wgSize
+      let namedBuffers := [
+        ("weights_packed", layer.weightsPacked),
+        ("scale", layer.scaleBuf),
+        ("input", inputBuf),
+        ("output", outputBuf)
+      ]
+      let totalOutputs := numRows * layer.config.outDim
+      let execConfig : Hesper.WGSL.Execute.ExecutionConfig := {
+        workgroupSize := { x := wgSize, y := 1, z := 1 }
+        numWorkgroups := (totalOutputs, 1, 1)
+      }
+      let cacheKey : UInt64 := hash ("bl", layer.config.inDim, layer.config.outDim, numRows)
+      Hesper.WGSL.Execute.executeShaderNamed device shader namedBuffers execConfig (some cacheKey)
 
   logVerbose "[BitLinear] Forward pass complete"
 
