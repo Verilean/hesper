@@ -793,6 +793,16 @@ lean_exe «bitlinear-bench» where
   supportInterpreter := false
   moreLinkArgs := stdLinkArgs
 
+lean_exe «wmma-matmul-equiv» where
+  root := `Tests.WMMAMatMulEquiv
+  supportInterpreter := false
+  moreLinkArgs := stdLinkArgs
+
+lean_exe «wmma-matmul-bench» where
+  root := `Tests.WMMAMatMulBench
+  supportInterpreter := false
+  moreLinkArgs := stdLinkArgs
+
 lean_exe «subgroup-matrix-f16-probe» where
   root := `Examples.Compute.SubgroupMatrixF16Probe
   supportInterpreter := false
