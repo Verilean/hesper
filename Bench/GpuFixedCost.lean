@@ -77,6 +77,44 @@ def memBwKernel (stride : Nat) : Hesper.WGSL.Monad.ShaderM Unit := do
     ShaderM.writeBuffer (ty := .scalar .f32) "out" (Exp.litU32 0) total
   ) (pure ())
 
+/-- Dequant-burdened memory kernel: same stride + same total load
+    volume as `memBwKernel`, but after each load the value is fed
+    through a Q4_K-style dequant chain (shift / and / int→f32 / mul /
+    sub) before being FMA'd into the accumulator. This is the same
+    number of memory transactions and the same memory access pattern,
+    so any slowdown vs plain `memBwKernel` isolates the cost of the
+    dequant dependency chain serialising loads. -/
+def dequantBwKernel (stride : Nat) : Hesper.WGSL.Monad.ShaderM Unit := do
+  let _ ← ShaderM.declareInputBuffer "input" (.array (.scalar .u32) stride)
+  let _ ← ShaderM.declareOutputBuffer "out" (.array (.scalar .f32) 1)
+  let lid ← ShaderM.localId
+  let wid ← ShaderM.workgroupId
+  let tid := Exp.vec3X lid
+  let w := Exp.vec3X wid
+  ShaderM.varNamed "acc" (.scalar .f32) (Exp.litF32 0.0)
+  let acc : Exp (.scalar .f32) := Exp.var "acc"
+  -- Pretend "d" and "dmin" per-thread so dequant has something to mul/sub by.
+  let d := Exp.mul (Exp.toF32 tid) (Exp.litF32 0.001)
+  let dmin := Exp.mul (Exp.toF32 tid) (Exp.litF32 0.0001)
+  let iters := stride / 32
+  for i in [0:iters] do
+    let idx := Exp.add tid (Exp.litU32 (i * 32))
+    let qsU32 ← ShaderM.readBuffer (ty := .scalar .u32) (n := stride) "input" idx
+    -- Mirror Q4_K's inner chain: 4 bytes × (shift, and, low nibble,
+    -- high nibble, int→f32, mul, sub, FMA into acc).
+    for b in [0:4] do
+      let byte := Exp.bitAnd (Exp.shiftRight qsU32 (Exp.litU32 (b * 8))) (Exp.litU32 0xFF)
+      let qLow := Exp.bitAnd byte (Exp.litU32 0xF)
+      let qHigh := Exp.shiftRight byte (Exp.litU32 4)
+      let wLow := Exp.sub (Exp.mul d (Exp.toF32 qLow)) dmin
+      let wHigh := Exp.sub (Exp.mul d (Exp.toF32 qHigh)) dmin
+      ShaderM.assign "acc" (Exp.add acc (Exp.add wLow wHigh))
+  ShaderM.varNamed "total" (.scalar .f32) (Exp.subgroupAdd acc)
+  let total : Exp (.scalar .f32) := Exp.var "total"
+  ShaderM.if_ (Exp.and (Exp.eq tid (Exp.litU32 0)) (Exp.eq w (Exp.litU32 0))) (do
+    ShaderM.writeBuffer (ty := .scalar .f32) "out" (Exp.litU32 0) total
+  ) (pure ())
+
 /-- Compute-bound kernel: K inlined FMA ops on register-only data, no
     memory reads (beyond one initial constant), then a write. -/
 def computeKernel (k : Nat) : Hesper.WGSL.Monad.ShaderM Unit := do
@@ -193,6 +231,16 @@ def main : IO Unit := do
     (memBwKernel 10240) memBufs wg1 32 subExt rep
   runExperiment device "10240 WG × 32 th, read 2560 f32 each"
     (memBwKernel 2560) memBufs wg2 32 subExt rep
+
+  IO.println ""
+  IO.println "─── 3b. Dequant-burdened memory (Q4_K-style chain) ───"
+  -- Same load volume as §3 line 2 (2560 WG × 10240 u32 each = 100 MB),
+  -- but every load feeds a 4-byte dequant chain before FMA.
+  runExperiment device "2560 WG × 32 th, dequant-read 10240 u32 each"
+    (dequantBwKernel 10240) memBufs wg1 32 subExt rep
+  -- Same load volume as §3 line 1 (2560 WG × 2560 u32 each = 25 MB).
+  runExperiment device "2560 WG × 32 th, dequant-read 2560 u32 each"
+    (dequantBwKernel 2560) memBufs wg1 32 subExt rep
 
   IO.println ""
   IO.println "─── 4. Compute bound (inline FMAs) ───"
