@@ -38,8 +38,8 @@ def buildNeedlePrompt (haystackSize : Nat) (vocabSize : Nat)
   for i in [0:5] do
     prompt := prompt.push (10 + i)
 
-  -- Inject the needle 3 times (repetition helps TTT learn)
-  for _ in [0:3] do
+  -- Inject the needle 5 times (more repetition = stronger memory)
+  for _ in [0:5] do
     prompt := prompt.push sep
     prompt := prompt.push needleKey
     prompt := prompt.push needleValue
@@ -73,9 +73,10 @@ def runBaseTest (device : Device) (model : BitNetModel)
 /-- Run one needle test — Hidden-Space TTT model -/
 def runTTTTest (device : Device) (model : BitNetModel) (tttConfig : HiddenTTTConfig)
     (haystackSize : Nat) (needleKey needleValue : Nat)
+    (verbose : Bool := false)
     : IO (Bool × Nat) := do
   let (prompt, expected) := buildNeedlePrompt haystackSize model.config.vocabSize needleKey needleValue
-  let tokens ← generateWithHiddenTTT device model prompt 1 tttConfig .Greedy (verbose := false)
+  let tokens ← generateWithHiddenTTT device model prompt 1 tttConfig .Greedy (verbose := verbose)
   let generated := tokens.getD prompt.size 0
   return (generated == expected, generated)
 
@@ -106,8 +107,8 @@ def main (args : List String) : IO Unit := do
   let hiddenTTTConfig : HiddenTTTConfig := {
     dim := model.config.dim
     vocabSize := model.config.vocabSize
-    innerLR := 0.5    -- aggressive lr (MSE gradients are small)
-    tau := 0.001      -- very low threshold (MSE values are tiny)
+    innerLR := 2.0    -- very aggressive lr (only 3 gate opens per needle)
+    tau := 0.005      -- tuned: needle MSE ~0.01, haystack ~0.001-0.003
   }
   IO.println s!"[TTT] Hidden-Space MSE: W_ttt=[{model.config.dim}×{model.config.dim}] = {model.config.dim * model.config.dim * 4 / 1024} KB"
   IO.println s!"[TTT] Loss: MSE(W@h_t, h_t1 - h_t), lr={hiddenTTTConfig.innerLR}, tau={hiddenTTTConfig.tau}"
