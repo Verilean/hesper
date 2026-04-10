@@ -176,4 +176,83 @@ def executeCopy (device : Device) (srcBuf dstBuf : Buffer) (n : Nat) : IO Unit :
     [("src", srcBuf), ("dst", dstBuf)]
     cfg
 
+/-! ## 6. MSE Residual Loss + Gradient (Hidden-Space TTT) -/
+
+/-- Fused MSE loss + gradient for hidden-space TTT.
+
+    Given:
+      ttt_output[i] = W_ttt @ hidden_t  (the TTT prediction)
+      hidden_t[i]   = current hidden state
+      hidden_t1[i]  = next token's hidden state
+      target_residual[i] = hidden_t1[i] - hidden_t[i]
+
+    Computes:
+      loss = (1/dim) * Σ_i (ttt_output[i] - target_residual[i])²
+      d_ttt_output[i] = (2/dim) * (ttt_output[i] - target_residual[i])
+
+    Uses a single workgroup with shared-memory reduction for the scalar
+    loss, then every thread writes its gradient element.
+    Requires dim ≤ workgroupSize (true for typical hidden dims ≤ 4096
+    with wgSize=256 when using strided loops). -/
+def mseResidualLossAndGradKernel (dim : Nat) (workgroupSize : Nat := 256) : ShaderM Unit := do
+  let lid ← ShaderM.localId
+  let tid := Exp.vec3X lid
+
+  let _tttOut  ← ShaderM.declareInputBuffer "ttt_output" (.array (.scalar .f32) dim)
+  let _hiddenT ← ShaderM.declareInputBuffer "hidden_t" (.array (.scalar .f32) dim)
+  let _hiddenT1 ← ShaderM.declareInputBuffer "hidden_t1" (.array (.scalar .f32) dim)
+  let _grad ← ShaderM.declareOutputBuffer "grad" (.array (.scalar .f32) dim)
+  let _loss ← ShaderM.declareOutputBuffer "loss" (.array (.scalar .f32) 1)
+
+  ShaderM.sharedNamed "shared_sum" (.array (.scalar .f32) workgroupSize)
+
+  -- Phase 1: each thread computes partial sum of squared errors
+  ShaderM.varNamed "partialSq" (.scalar .f32) (Exp.litF32 0.0)
+  let partialSq : Exp (.scalar .f32) := Exp.var "partialSq"
+
+  ShaderM.loop tid (Exp.litU32 dim) (Exp.litU32 workgroupSize) fun i => do
+    let pred ← ShaderM.readBuffer (ty := .scalar .f32) (n := dim) "ttt_output" i
+    let ht  ← ShaderM.readBuffer (ty := .scalar .f32) (n := dim) "hidden_t" i
+    let ht1 ← ShaderM.readBuffer (ty := .scalar .f32) (n := dim) "hidden_t1" i
+    -- target_residual = hidden_t1 - hidden_t
+    let target := Exp.sub ht1 ht
+    let diff := Exp.sub pred target
+    -- Accumulate squared error
+    ShaderM.assign "partialSq" (Exp.add partialSq (Exp.mul diff diff))
+    -- Write gradient: d_ttt_output[i] = 2 * diff / dim
+    let gradVal := Exp.div (Exp.mul (Exp.litF32 2.0) diff) (Exp.litF32 dim.toFloat)
+    ShaderM.writeBuffer (ty := .scalar .f32) "grad" i gradVal
+
+  -- Phase 2: reduce partial sums for scalar loss
+  ShaderM.writeWorkgroup (ty := .scalar .f32) "shared_sum" tid partialSq
+  ShaderM.barrier
+
+  let mut stride := workgroupSize / 2
+  while stride > 0 do
+    ShaderM.if_ (Exp.lt tid (Exp.litU32 stride)) (do
+      let a ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := workgroupSize) "shared_sum" tid
+      let b ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := workgroupSize) "shared_sum"
+                (Exp.add tid (Exp.litU32 stride))
+      ShaderM.writeWorkgroup (ty := .scalar .f32) "shared_sum" tid (Exp.add a b)
+    ) (pure ())
+    ShaderM.barrier
+    stride := stride / 2
+
+  -- Thread 0 writes loss = total_sq / dim
+  ShaderM.if_ (Exp.eq tid (Exp.litU32 0)) (do
+    let totalSq ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := workgroupSize) "shared_sum" (Exp.litU32 0)
+    ShaderM.writeBuffer (ty := .scalar .f32) "loss" (Exp.litU32 0)
+      (Exp.div totalSq (Exp.litF32 dim.toFloat))
+  ) (pure ())
+
+def executeMSEResidualLossAndGrad (device : Device)
+    (tttOutBuf hiddenTBuf hiddenT1Buf gradBuf lossBuf : Buffer) (dim : Nat) : IO Unit := do
+  let workgroupSize := min 256 (max dim 32)
+  Execute.executeShaderNamed device
+    (mseResidualLossAndGradKernel dim workgroupSize)
+    [("ttt_output", tttOutBuf), ("hidden_t", hiddenTBuf),
+     ("hidden_t1", hiddenT1Buf), ("grad", gradBuf), ("loss", lossBuf)]
+    { numWorkgroups := (1, 1, 1),
+      workgroupSize := { x := workgroupSize, y := 1, z := 1 } }
+
 end Hesper.TTT.Kernels
