@@ -680,6 +680,10 @@ lean_exe «bitnet-ttt-needle» where
   root := `Examples.BitNetTTT_Needle
   moreLinkArgs := stdLinkArgs
 
+lean_exe «smart-kv-needle» where
+  root := `Examples.SmartKV_Needle
+  moreLinkArgs := stdLinkArgs
+
 -- ============================================================================
 -- SIMD CPU BACKEND (Google Highway)
 -- ============================================================================
