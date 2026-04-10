@@ -2,6 +2,7 @@ import Hesper.Models.BitNet
 import Hesper.TTT.Types
 import Hesper.TTT.Kernels
 import Hesper.Training.SafeBuffer
+import Hesper.Optimizer.AdamGPU
 import Hesper.WebGPU.BufferOps
 import Hesper.Inference.Sampling
 import Hesper.WGSL.MatMul
@@ -44,6 +45,7 @@ open Hesper.Models.BitNet
 open Hesper.TTT.Kernels
 open Hesper.Inference
 open Hesper.Training
+open Hesper.Optimizer
 
 /-- Hidden-space MSE TTT config. -/
 structure HiddenTTTConfig where
@@ -51,6 +53,10 @@ structure HiddenTTTConfig where
   vocabSize : Nat     -- needed for decode-phase LM head
   innerLR : Float
   tau : Float          -- MSE threshold for gate (much smaller than CE: ~0.001-0.01)
+  useAdam : Bool := true  -- Adam optimizer (momentum for noise resistance)
+  adamBeta1 : Float := 0.9
+  adamBeta2 : Float := 0.999
+  adamEps : Float := 1e-7
   deriving Inhabited, Repr
 
 /-- GPU buffers for hidden-space MSE TTT. -/
@@ -62,6 +68,9 @@ structure HiddenTTTBuffers where
   gradBuf : Buffer            -- [dim] f32, d_ttt_output
   dWeightBuf : Buffer         -- [dim × dim] f32, outer product
   lossBuf : Buffer            -- [1] f32, scalar MSE loss
+  -- Adam state (m and v for W_ttt)
+  adamMBuf : Buffer           -- [dim × dim] f32, first moment
+  adamVBuf : Buffer           -- [dim × dim] f32, second moment
 
 def createHiddenTTTBuffers (device : Device) (config : HiddenTTTConfig) : IO HiddenTTTBuffers := do
   let mkF32Buf := fun (n : Nat) => createBuffer device {
@@ -84,6 +93,9 @@ def createHiddenTTTBuffers (device : Device) (config : HiddenTTTConfig) : IO Hid
     gradBuf := ← mkF32Buf config.dim
     dWeightBuf := ← mkF32Buf dimSq
     lossBuf := ← mkF32Buf 1
+    -- Adam momentum buffers (zero-initialized by GPU default)
+    adamMBuf := ← mkF32Buf dimSq
+    adamVBuf := ← mkF32Buf dimSq
   }
 
 /-- Which buffer holds post-norm hidden after forwardSingleToken -/
@@ -98,20 +110,19 @@ def postNormBuf (cacheState : KVCacheState) (numLayers : Nat) : Buffer :=
     Computes:
       ttt_output = W_ttt @ hidden_t
       loss = MSE(ttt_output, hidden_{t+1} - hidden_t)
-      if loss > tau: W_ttt -= lr * outer(grad, hidden_t)
+      if loss > tau: update W_ttt (SGD or Adam)
 
-    Returns (mseLoss, gateOpen). -/
+    Returns (mseLoss, gateOpen, updatedAdamStep). -/
 def hiddenTTTStep (device : Device) (config : HiddenTTTConfig) (bufs : HiddenTTTBuffers)
-    (curHiddenBuf : Buffer)
-    : IO (Float × Bool) := do
+    (curHiddenBuf : Buffer) (adamStep : Nat)
+    : IO (Float × Bool × Nat) := do
   let d := config.dim
+  let n := d * d
 
   -- TTT forward: ttt_output = W_ttt @ hidden_t (prevHiddenBuf)
   executeMatVec device bufs.tttWeightBuf bufs.prevHiddenBuf bufs.tttOutputBuf d d
 
-  -- Fused MSE loss + gradient:
-  --   loss = MSE(ttt_output, hidden_{t+1} - hidden_t)
-  --   grad[i] = (2/dim) * (ttt_output[i] - (hidden_{t+1}[i] - hidden_t[i]))
+  -- Fused MSE loss + gradient
   executeMSEResidualLossAndGrad device
     bufs.tttOutputBuf bufs.prevHiddenBuf curHiddenBuf
     bufs.gradBuf bufs.lossBuf d
@@ -124,10 +135,25 @@ def hiddenTTTStep (device : Device) (config : HiddenTTTConfig) (bufs : HiddenTTT
   if gateOpen then
     -- Weight gradient: dW = outer(grad, hidden_t)
     executeOuterProduct device bufs.gradBuf bufs.prevHiddenBuf bufs.dWeightBuf d d
-    -- SGD update: W_ttt -= lr * dW
-    executeSGDUpdate device bufs.tttWeightBuf bufs.dWeightBuf (d * d) config.innerLR
 
-  return (mseLoss, gateOpen)
+    if config.useAdam then
+      -- Adam update with momentum (noise-resistant)
+      let adamConfig : AdamGPU.Config := {
+        lr := config.innerLR
+        beta1 := config.adamBeta1
+        beta2 := config.adamBeta2
+        eps := config.adamEps
+        weightDecay := 0.0  -- no weight decay for TTT
+      }
+      AdamGPU.executeAdamUpdate device bufs.tttWeightBuf bufs.dWeightBuf
+        bufs.adamMBuf bufs.adamVBuf n adamConfig (adamStep + 1)
+      return (mseLoss, true, adamStep + 1)
+    else
+      -- SGD fallback
+      executeSGDUpdate device bufs.tttWeightBuf bufs.dWeightBuf n config.innerLR
+      return (mseLoss, true, adamStep)
+
+  return (mseLoss, false, adamStep)
 
 /-- Compute LM head using model's embedding weights -/
 def computeLMHead (device : Device) (model : BitNetModel)
@@ -179,11 +205,13 @@ def generateWithHiddenTTT (device : Device) (model : BitNetModel)
   let mut tokens := promptTokens
   let mut gateOpenCount : Nat := 0
   let mut hasPrevHidden := false
+  let mut adamStep : Nat := 0
 
   -- ═══════════════════════════════════════════
   -- Prefill with MSE TTT learning
   -- ═══════════════════════════════════════════
-  IO.println s!"[Prefill+TTT] Processing {promptTokens.size} prompt tokens..."
+  let optStr := if tttConfig.useAdam then "Adam" else "SGD"
+  IO.println s!"[Prefill+TTT] Processing {promptTokens.size} prompt tokens (optimizer: {optStr})..."
   let prefillStart ← IO.monoNanosNow
 
   for i in [0:promptTokens.size] do
@@ -194,8 +222,8 @@ def generateWithHiddenTTT (device : Device) (model : BitNetModel)
 
     -- TTT update: compare prev_hidden vs current_hidden
     if hasPrevHidden then
-      -- prevHiddenBuf has hidden_t, hBuf has hidden_{t+1}
-      let (mseLoss, gateOpen) ← hiddenTTTStep device tttConfig bufs hBuf
+      let (mseLoss, gateOpen, newAdamStep) ← hiddenTTTStep device tttConfig bufs hBuf adamStep
+      adamStep := newAdamStep
 
       if gateOpen then gateOpenCount := gateOpenCount + 1
       if verbose then

@@ -38,8 +38,8 @@ def buildNeedlePrompt (haystackSize : Nat) (vocabSize : Nat)
   for i in [0:5] do
     prompt := prompt.push (10 + i)
 
-  -- Inject the needle 5 times (more repetition = stronger memory)
-  for _ in [0:5] do
+  -- Inject the needle 10 times (more repetition = stronger memory with Adam)
+  for _ in [0:10] do
     prompt := prompt.push sep
     prompt := prompt.push needleKey
     prompt := prompt.push needleValue
@@ -107,8 +107,9 @@ def main (args : List String) : IO Unit := do
   let hiddenTTTConfig : HiddenTTTConfig := {
     dim := model.config.dim
     vocabSize := model.config.vocabSize
-    innerLR := 2.0    -- very aggressive lr (only 3 gate opens per needle)
+    innerLR := 2.0    -- tuned for SGD (aggressive, few gate opens)
     tau := 0.005      -- tuned: needle MSE ~0.01, haystack ~0.001-0.003
+    useAdam := false   -- SGD outperforms Adam on this task
   }
   IO.println s!"[TTT] Hidden-Space MSE: W_ttt=[{model.config.dim}×{model.config.dim}] = {model.config.dim * model.config.dim * 4 / 1024} KB"
   IO.println s!"[TTT] Loss: MSE(W@h_t, h_t1 - h_t), lr={hiddenTTTConfig.innerLR}, tau={hiddenTTTConfig.tau}"
@@ -121,7 +122,7 @@ def main (args : List String) : IO Unit := do
   IO.println ""
 
   -- Test at increasing haystack sizes (keep small to avoid OOM/dispatch issues)
-  let haystackSizes : Array Nat := #[10, 30, 50, 100, 200]
+  let haystackSizes : Array Nat := #[10, 50, 100, 200, 500]
 
   IO.println "┌───────────┬────────────────┬────────────────┬────────────────┬────────────────┐"
   IO.println "│ Haystack  │ Prompt Length   │ Base Model     │ TTT Model      │ Winner         │"
