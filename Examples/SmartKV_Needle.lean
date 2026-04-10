@@ -81,9 +81,9 @@ def main (args : List String) : IO Unit := do
   let needleValue := min 42424 (model.config.vocabSize - 1)
 
   let smartConfig : SmartKVConfig := {
-    maxSinks := 32
+    maxSinks := 64
     windowSize := 256
-    tau := 0.005
+    tau := 0.003     -- lower threshold to catch needle tokens
   }
 
   IO.println s!"Needle: Key {needleKey} → Value {needleValue}"
