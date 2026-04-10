@@ -863,19 +863,10 @@ def executeFlashAttentionTiled (device : Device)
         mappedAtCreation := false
       }
 
-  if numTiles == 1 then
-    -- Single tile: use in-place v1 kernel (Q and output share same buffer)
-    -- Q is loaded to shared memory first, then output overwrites the buffer.
-    -- Uses declareOutputBuffer for q_output (read-write) to avoid aliasing.
-    let shader := flashAttentionInPlaceKernel numHeads numKVHeads maxSeqLen headDim cacheLen scale workgroupSize
-    let namedBuffers := [("q_output", outputBuf), ("k_cache", kCacheBuf), ("v_cache", vCacheBuf)]
-    let cacheKey : UInt64 := hash ("flashIP", numHeads, numKVHeads, maxSeqLen, headDim, cacheLen)
-    let execConfig : Hesper.WGSL.Execute.ExecutionConfig := {
-      workgroupSize := {x := workgroupSize, y := 1, z := 1}
-      numWorkgroups := (numHeads, 1, 1)
-    }
-    Hesper.WGSL.Execute.executeShaderNamed device shader namedBuffers execConfig (some cacheKey)
-  else
+  -- Always use Phase 1 + Phase 2. The old `numTiles == 1` in-place
+  -- shortcut assumed Q and output shared the same buffer, which is NOT
+  -- the case in Gemma 4 (Q is in qBuf, output is in attnOutBuf).
+  do
     -- Multi-tile: Phase 1 (parallel tiles) + Phase 2 (merge)
     let shader1 := flashAttentionTiledPhase1 numHeads numKVHeads maxSeqLen headDim cacheLen tileSize scale workgroupSize
     let namedBuffers1 := [("q", qBuf), ("k_cache", kCacheBuf), ("v_cache", vCacheBuf), ("partial", partialBuf)]
