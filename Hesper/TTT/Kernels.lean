@@ -255,4 +255,154 @@ def executeMSEResidualLossAndGrad (device : Device)
     { numWorkgroups := (1, 1, 1),
       workgroupSize := { x := workgroupSize, y := 1, z := 1 } }
 
+/-! ## 7. Cosine Surprise Sensor (scale-invariant) -/
+
+/-- Cosine distance sensor: measures how "surprising" the transition
+    from hidden_t to hidden_t1 is. Scale-invariant — works regardless
+    of embedding scale (no inf/NaN on Gemma 4's sqrt(d) scaling).
+
+    surprise = 1 - cosine_sim(hidden_t, hidden_t1)
+    where cosine_sim = dot(h_t, h_t1) / (||h_t|| * ||h_t1||)
+
+    Output: lossBuf[0] = surprise ∈ [0, 2] (0 = identical, 2 = opposite)
+    Uses shared memory tree reduction for dot product and norms. -/
+def cosineSurpriseSensorKernel (dim : Nat) (workgroupSize : Nat := 256) : ShaderM Unit := do
+  let lid ← ShaderM.localId
+  let tid := Exp.vec3X lid
+
+  let _hiddenT  ← ShaderM.declareInputBuffer "hidden_t" (.array (.scalar .f32) dim)
+  let _hiddenT1 ← ShaderM.declareInputBuffer "hidden_t1" (.array (.scalar .f32) dim)
+  let _loss ← ShaderM.declareOutputBuffer "loss" (.array (.scalar .f32) 1)
+
+  -- Three shared arrays for parallel reduction: dot, normT², normT1²
+  ShaderM.sharedNamed "shared_dot" (.array (.scalar .f32) workgroupSize)
+  ShaderM.sharedNamed "shared_normT" (.array (.scalar .f32) workgroupSize)
+  ShaderM.sharedNamed "shared_normT1" (.array (.scalar .f32) workgroupSize)
+
+  -- Phase 1: per-thread partial sums.
+  -- To avoid f32 overflow with Gemma 4's huge hidden values (~1e15+),
+  -- we first find the max absolute value, then scale all elements by
+  -- 1/maxAbs before computing dot products and norms.
+
+  -- Phase 1a: find max absolute value across both vectors
+  ShaderM.varNamed "partialMax" (.scalar .f32) (Exp.litF32 0.0)
+  let pMax : Exp (.scalar .f32) := Exp.var "partialMax"
+  ShaderM.loop tid (Exp.litU32 dim) (Exp.litU32 workgroupSize) fun i => do
+    let ht ← ShaderM.readBuffer (ty := .scalar .f32) (n := dim) "hidden_t" i
+    let ht1 ← ShaderM.readBuffer (ty := .scalar .f32) (n := dim) "hidden_t1" i
+    ShaderM.assign "partialMax" (Exp.max pMax (Exp.max (Exp.abs ht) (Exp.abs ht1)))
+
+  ShaderM.writeWorkgroup (ty := .scalar .f32) "shared_dot" tid pMax
+  ShaderM.barrier
+  let mut maxStride := workgroupSize / 2
+  while maxStride > 0 do
+    ShaderM.if_ (Exp.lt tid (Exp.litU32 maxStride)) (do
+      let a ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := workgroupSize) "shared_dot" tid
+      let b ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := workgroupSize) "shared_dot" (Exp.add tid (Exp.litU32 maxStride))
+      ShaderM.writeWorkgroup (ty := .scalar .f32) "shared_dot" tid (Exp.max a b)
+    ) (pure ())
+    ShaderM.barrier
+    maxStride := maxStride / 2
+  -- Broadcast max to all threads via shared[0]
+  ShaderM.varNamed "globalMax" (.scalar .f32)
+    (← ShaderM.readWorkgroup (ty := .scalar .f32) (n := workgroupSize) "shared_dot" (Exp.litU32 0))
+  let globalMax : Exp (.scalar .f32) := Exp.var "globalMax"
+  let invMax := Exp.div (Exp.litF32 1.0) (Exp.max globalMax (Exp.litF32 1.0e-30))
+  ShaderM.barrier
+
+  -- Phase 1b: compute scaled dot product and norms
+  ShaderM.varNamed "partialDot" (.scalar .f32) (Exp.litF32 0.0)
+  ShaderM.varNamed "partialNormT" (.scalar .f32) (Exp.litF32 0.0)
+  ShaderM.varNamed "partialNormT1" (.scalar .f32) (Exp.litF32 0.0)
+  let pDot : Exp (.scalar .f32) := Exp.var "partialDot"
+  let pNormT : Exp (.scalar .f32) := Exp.var "partialNormT"
+  let pNormT1 : Exp (.scalar .f32) := Exp.var "partialNormT1"
+
+  ShaderM.loop tid (Exp.litU32 dim) (Exp.litU32 workgroupSize) fun i => do
+    let ht_raw ← ShaderM.readBuffer (ty := .scalar .f32) (n := dim) "hidden_t" i
+    let ht1_raw ← ShaderM.readBuffer (ty := .scalar .f32) (n := dim) "hidden_t1" i
+    -- Scale by 1/maxAbs to prevent overflow
+    let ht := Exp.mul ht_raw invMax
+    let ht1 := Exp.mul ht1_raw invMax
+    ShaderM.assign "partialDot" (Exp.add pDot (Exp.mul ht ht1))
+    ShaderM.assign "partialNormT" (Exp.add pNormT (Exp.mul ht ht))
+    ShaderM.assign "partialNormT1" (Exp.add pNormT1 (Exp.mul ht1 ht1))
+
+  -- Phase 2: tree reduction for all three
+  ShaderM.writeWorkgroup (ty := .scalar .f32) "shared_dot" tid pDot
+  ShaderM.writeWorkgroup (ty := .scalar .f32) "shared_normT" tid pNormT
+  ShaderM.writeWorkgroup (ty := .scalar .f32) "shared_normT1" tid pNormT1
+  ShaderM.barrier
+
+  let mut stride := workgroupSize / 2
+  while stride > 0 do
+    ShaderM.if_ (Exp.lt tid (Exp.litU32 stride)) (do
+      let d1 ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := workgroupSize) "shared_dot" tid
+      let d2 ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := workgroupSize) "shared_dot" (Exp.add tid (Exp.litU32 stride))
+      ShaderM.writeWorkgroup (ty := .scalar .f32) "shared_dot" tid (Exp.add d1 d2)
+      let n1 ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := workgroupSize) "shared_normT" tid
+      let n2 ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := workgroupSize) "shared_normT" (Exp.add tid (Exp.litU32 stride))
+      ShaderM.writeWorkgroup (ty := .scalar .f32) "shared_normT" tid (Exp.add n1 n2)
+      let m1 ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := workgroupSize) "shared_normT1" tid
+      let m2 ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := workgroupSize) "shared_normT1" (Exp.add tid (Exp.litU32 stride))
+      ShaderM.writeWorkgroup (ty := .scalar .f32) "shared_normT1" tid (Exp.add m1 m2)
+    ) (pure ())
+    ShaderM.barrier
+    stride := stride / 2
+
+  -- Thread 0: compute cosine similarity and write surprise
+  ShaderM.if_ (Exp.eq tid (Exp.litU32 0)) (do
+    let dotVal ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := workgroupSize) "shared_dot" (Exp.litU32 0)
+    let normTSq ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := workgroupSize) "shared_normT" (Exp.litU32 0)
+    let normT1Sq ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := workgroupSize) "shared_normT1" (Exp.litU32 0)
+    let normProduct := Exp.mul (Exp.sqrt normTSq) (Exp.sqrt normT1Sq)
+    -- Guard against division by zero
+    let safeNorm := Exp.max normProduct (Exp.litF32 1.0e-8)
+    let cosineSim := Exp.div dotVal safeNorm
+    -- Clamp to [-1, 1] for numerical safety
+    let clampedSim := Exp.max (Exp.litF32 (-1.0)) (Exp.min (Exp.litF32 1.0) cosineSim)
+    let surprise := Exp.sub (Exp.litF32 1.0) clampedSim
+    ShaderM.writeBuffer (ty := .scalar .f32) "loss" (Exp.litU32 0) surprise
+  ) (pure ())
+
+def executeCosineSurpriseSensor (device : Device)
+    (hiddenTBuf hiddenT1Buf lossBuf : Buffer) (dim : Nat) : IO Unit := do
+  let workgroupSize := min 256 (max dim 32)
+  Execute.executeShaderNamed device
+    (cosineSurpriseSensorKernel dim workgroupSize)
+    [("hidden_t", hiddenTBuf), ("hidden_t1", hiddenT1Buf), ("loss", lossBuf)]
+    { numWorkgroups := (1, 1, 1),
+      workgroupSize := { x := workgroupSize, y := 1, z := 1 } }
+
+/-! ## 8. KV Cache Zero-Out (Eviction) -/
+
+/-- Zero out a single KV cache row at position `pos` across one layer.
+    Sets K[head, pos, :] = 0 and V[head, pos, :] = 0 for all KV heads.
+    Zeroed K forces dot(Q, K) = 0, minimizing attention weight. -/
+def zeroKVRowKernel (numKVHeads maxSeqLen headDim : Nat) (pos : Nat) : ShaderM Unit := do
+  let gid ← ShaderM.globalId
+  let idx := Exp.vec3X gid
+  let kvDim := numKVHeads * headDim
+
+  let _kCache ← ShaderM.declareOutputBuffer "k_cache" (.array (.scalar .f32) (numKVHeads * maxSeqLen * headDim))
+  let _vCache ← ShaderM.declareOutputBuffer "v_cache" (.array (.scalar .f32) (numKVHeads * maxSeqLen * headDim))
+
+  ShaderM.if_ (Exp.lt idx (Exp.litU32 kvDim)) (do
+    let kvHead := Exp.div idx (Exp.litU32 headDim)
+    let d := Exp.sub idx (Exp.mul kvHead (Exp.litU32 headDim))
+    let cacheIdx := Exp.add
+      (Exp.mul kvHead (Exp.litU32 (maxSeqLen * headDim)))
+      (Exp.add (Exp.litU32 (pos * headDim)) d)
+    ShaderM.writeBuffer (ty := .scalar .f32) "k_cache" cacheIdx (Exp.litF32 0.0)
+    ShaderM.writeBuffer (ty := .scalar .f32) "v_cache" cacheIdx (Exp.litF32 0.0)
+  ) (pure ())
+
+def executeZeroKVRow (device : Device) (kCacheBuf vCacheBuf : Buffer)
+    (numKVHeads maxSeqLen headDim pos : Nat) : IO Unit := do
+  let kvDim := numKVHeads * headDim
+  Execute.executeShaderNamed device
+    (zeroKVRowKernel numKVHeads maxSeqLen headDim pos)
+    [("k_cache", kCacheBuf), ("v_cache", vCacheBuf)]
+    (Execute.ExecutionConfig.dispatch1D kvDim 256)
+
 end Hesper.TTT.Kernels
