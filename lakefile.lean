@@ -676,6 +676,10 @@ lean_exe «bitnet-ttt-mqar» where
   root := `Examples.BitNetTTT_MQAR
   moreLinkArgs := stdLinkArgs
 
+lean_exe «bitnet-ttt-needle» where
+  root := `Examples.BitNetTTT_Needle
+  moreLinkArgs := stdLinkArgs
+
 -- ============================================================================
 -- SIMD CPU BACKEND (Google Highway)
 -- ============================================================================
