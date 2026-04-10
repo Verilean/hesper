@@ -672,6 +672,10 @@ lean_exe «ttt-golden-gpu» where
   root := `Tests.TTT.TTTGoldenGPUMain
   moreLinkArgs := stdLinkArgs
 
+lean_exe «bitnet-ttt-mqar» where
+  root := `Examples.BitNetTTT_MQAR
+  moreLinkArgs := stdLinkArgs
+
 -- ============================================================================
 -- SIMD CPU BACKEND (Google Highway)
 -- ============================================================================
