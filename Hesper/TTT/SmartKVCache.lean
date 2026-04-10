@@ -95,11 +95,10 @@ def generateWithSmartKV (device : Device) (model : BitNetModel)
   IO.println s!"  Prompt: {promptTokens.size} tokens, generate up to {maxTokens}"
   IO.println ""
 
-  -- Create KV cache with limited maxSeqLen = sinks + window
-  -- Override model config temporarily for buffer allocation
-  let limitedConfig : Config := { model.config with maxSeqLen := totalSlots }
-  let limitedModel : BitNetModel := { model with config := limitedConfig }
-  let cacheState ← createKVCacheState device limitedModel
+  -- Use the ORIGINAL model for KV cache — full maxSeqLen allocation.
+  -- The 288-slot limit is enforced purely by Lean-side routing logic.
+  -- This avoids kernel/buffer-size mismatches.
+  let cacheState ← createKVCacheState device model
 
   -- TTT buffers for MSE sensor (W_ttt stays zero — we only read loss)
   let tttConfig : HiddenTTTConfig := {
@@ -124,6 +123,8 @@ def generateWithSmartKV (device : Device) (model : BitNetModel)
   }
   let mut hasPrevHidden := false
   let mut sinkTokens : Array (Nat × Nat) := #[]  -- (tokenIdx, physicalPos) for logging
+  let mut isSurprise := false  -- carries over from previous iteration
+  let mut mseLoss : Float := 0.0
 
   -- ═══════════════════════════════════════════
   -- Prefill: classify tokens and route to KV cache
@@ -132,60 +133,37 @@ def generateWithSmartKV (device : Device) (model : BitNetModel)
   let prefillStart ← IO.monoNanosNow
 
   for i in [0:promptTokens.size] do
-    -- Compute MSE sensor (compare prev vs current hidden state)
-    let mut mseLoss : Float := 0.0
-    let mut isSurprise := false
 
-    -- Step 1: Forward pass at sequential position i (capped to total slots)
-    -- For the PoC, use sequential positions during prefill. Surprise tokens
-    -- are duplicated to sink slots afterwards.
-    let seqPos := i % totalSlots
-    forwardSingleToken device limitedModel promptTokens[i]! seqPos cacheState
+    -- Step 1: Forward pass at position within the smart window.
+    -- Sinks occupy [0, maxSinks), ring occupies [maxSinks, totalSlots).
+    -- Compute the physical position FIRST from current routing state,
+    -- then run forward at that position.
+    let (physPos, wasSink, newState) := getPhysicalPos isSurprise kvState
+    kvState := newState
+    forwardSingleToken device model promptTokens[i]! physPos cacheState
 
     -- Step 2: MSE sensor between consecutive hidden states
     if hasPrevHidden then
-      -- Debug: check hidden + logit buffer values
-      if i <= 2 then
-        let hVals ← BufferOps.downloadFloatArray device hBuf 4
-        let pVals ← BufferOps.downloadFloatArray device tttBufs.prevHiddenBuf 4
-        let lVals ← BufferOps.downloadFloatArray device cacheState.logitsBuf 4
-        let b1Vals ← BufferOps.downloadFloatArray device cacheState.buf1 4
-        let b2Vals ← BufferOps.downloadFloatArray device cacheState.buf2 4
-        IO.println s!"  [DEBUG] hBuf(=buf2)[0..3]={hVals.extract 0 4}"
-        IO.println s!"  [DEBUG] buf1[0..3]={b1Vals.extract 0 4}"
-        IO.println s!"  [DEBUG] buf2[0..3]={b2Vals.extract 0 4}"
-        IO.println s!"  [DEBUG] logits[0..3]={lVals.extract 0 4}"
-        IO.println s!"  [DEBUG] prevHid[0..3]={pVals.extract 0 4}"
-
       executeMSEResidualLossAndGrad device
         tttBufs.tttOutputBuf  -- zeros (W=0)
         tttBufs.prevHiddenBuf -- hidden_t (from previous step)
         hBuf                  -- hidden_{t+1} (current step)
         tttBufs.gradBuf tttBufs.lossBuf model.config.dim
       mseLoss ← SafeBuffer.safeReadF32 device tttBufs.lossBuf
+      -- This surprise flag will be used for the NEXT token's routing
       isSurprise := mseLoss > config.tau
-
-    -- Step 3: Route to sink or ring
-    let (physicalPos, isSink, newKVState) := getPhysicalPos isSurprise kvState
-    kvState := newKVState
-
-    -- Step 4: If surprise, duplicate the KV data to a permanent sink slot
-    -- by re-running forward at the sink position (less efficient but correct).
-    if isSink then
-      forwardSingleToken device limitedModel promptTokens[i]! physicalPos cacheState
 
     -- Save current hidden for next MSE comparison
     executeCopy device hBuf tttBufs.prevHiddenBuf model.config.dim
     hasPrevHidden := true
 
-    if isSink then
-      sinkTokens := sinkTokens.push (i, physicalPos)
+    if wasSink then
+      sinkTokens := sinkTokens.push (i, physPos)
 
     if verbose then
-      let typeStr := if isSink then s!"SINK[{physicalPos}] ⚓"
-        else if isSurprise then s!"SURPRISE (sinks full)"
-        else s!"ring[{physicalPos}]"
-      if i < 10 || isSurprise || i >= promptTokens.size - 3 then
+      let typeStr := if wasSink then s!"SINK[{physPos}] ⚓"
+        else s!"ring[{physPos}]"
+      if i < 10 || wasSink || i >= promptTokens.size - 3 then
         IO.println s!"  Token {i} (id={promptTokens[i]!}): mse={mseLoss}, {typeStr}"
 
   let prefillEnd ← IO.monoNanosNow
@@ -224,7 +202,7 @@ def generateWithSmartKV (device : Device) (model : BitNetModel)
     -- Forward pass for new token in the ring buffer
     let (physPos, _, newState) := getPhysicalPos false kvState
     kvState := newState
-    forwardSingleToken device limitedModel nextToken physPos cacheState
+    forwardSingleToken device model nextToken physPos cacheState
 
   let genEnd ← IO.monoNanosNow
   let genMs := (genEnd - genStart).toFloat / 1_000_000.0
@@ -232,22 +210,20 @@ def generateWithSmartKV (device : Device) (model : BitNetModel)
 
   pure tokens
 
-/-- Baseline: dumb sliding window (no smart routing). -/
+/-- Baseline: dumb sliding window (no smart routing).
+    Uses original model's full KV cache but writes at pos % windowSize. -/
 def generateWithDumbWindow (device : Device) (model : BitNetModel)
     (promptTokens : Array Nat) (maxTokens : Nat)
     (windowSize : Nat)
     (strategy : Sampling.Strategy := .Greedy)
     : IO (Array Nat) := do
   resetPreparedDispatches model
-
-  let limitedConfig : Config := { model.config with maxSeqLen := windowSize }
-  let limitedModel : BitNetModel := { model with config := limitedConfig }
-  let cacheState ← createKVCacheState device limitedModel
+  let cacheState ← createKVCacheState device model
 
   -- Simple sliding window: pos = t % windowSize
   for i in [0:promptTokens.size] do
     let physPos := i % windowSize
-    forwardSingleToken device limitedModel promptTokens[i]! physPos cacheState
+    forwardSingleToken device model promptTokens[i]! physPos cacheState
 
   let mut tokens := promptTokens
   for step in [0:maxTokens] do
@@ -256,7 +232,7 @@ def generateWithDumbWindow (device : Device) (model : BitNetModel)
       (Sampling.RNG.create (some (42 + step)))
     tokens := tokens.push nextToken
     let physPos := tokens.size % windowSize
-    forwardSingleToken device limitedModel nextToken physPos cacheState
+    forwardSingleToken device model nextToken physPos cacheState
 
   pure tokens
 
