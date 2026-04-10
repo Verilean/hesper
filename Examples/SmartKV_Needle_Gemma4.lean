@@ -4,9 +4,12 @@ import Hesper.TTT.SmartKVCacheGemma4
 import Hesper.WebGPU.Device
 
 /-!
-# Smart KV-Cache Needle Test for Gemma 4
+# Gemma 4 Smart KV-Cache Needle Test
 
-Same needle-in-haystack test as BitNet, but on Gemma 4 e4b (Q4_K_M).
+Cosine surprise sensor + KV eviction approach:
+- Both models use full sequential positions (Gemma4 untouched)
+- Dumb window: zeros out ALL KV rows older than windowSize
+- Smart KV: zeros out old rows EXCEPT surprise-protected sinks
 -/
 
 open Hesper.WebGPU
@@ -19,8 +22,7 @@ def buildPrompt (haystackSize : Nat) (vocabSize : Nat)
   let sep := min 2 (vocabSize - 1)
   let queryMark := min 3 (vocabSize - 1)
   let mut prompt : Array Nat := #[]
-  for i in [0:5] do
-    prompt := prompt.push (10 + i)
+  for i in [0:5] do prompt := prompt.push (10 + i)
   for _ in [0:10] do
     prompt := prompt.push sep
     prompt := prompt.push needleKey
@@ -37,7 +39,7 @@ def buildPrompt (haystackSize : Nat) (vocabSize : Nat)
 
 def main (args : List String) : IO Unit := do
   IO.println "╔══════════════════════════════════════════════════════════╗"
-  IO.println "║  Gemma 4 + Smart KV-Cache: Needle Test                 ║"
+  IO.println "║  Gemma 4 + Cosine Surprise Smart KV-Cache              ║"
   IO.println "╚══════════════════════════════════════════════════════════╝"
   IO.println ""
 
@@ -52,7 +54,7 @@ def main (args : List String) : IO Unit := do
   let device ← getDevice inst
   IO.println "[GPU] Device initialized"
 
-  IO.println s!"[Model] Loading from {ggufPath}..."
+  IO.println s!"[Model] Loading {ggufPath}..."
   let model ← Gemma4Model.fromGGUF device ggufPath
   IO.println s!"[Model] Gemma 4: {model.config.hiddenSize}d, {model.config.numHiddenLayers}L, vocab={model.config.vocabSize}"
   IO.println ""
@@ -61,13 +63,12 @@ def main (args : List String) : IO Unit := do
   let needleValue := min 42424 (model.config.vocabSize - 1)
 
   let smartConfig : SmartKVConfig := {
-    maxSinks := 64
     windowSize := 256
-    tau := 0.003
+    tau := 0.05   -- cosine distance threshold
   }
 
   IO.println s!"Needle: Key {needleKey} → Value {needleValue}"
-  IO.println s!"KV Cache: {smartConfig.maxSinks} sinks + {smartConfig.windowSize} window = {smartConfig.maxSinks + smartConfig.windowSize} total"
+  IO.println s!"Window: {smartConfig.windowSize}, Surprise tau: {smartConfig.tau}"
   IO.println ""
 
   let haystackSizes : Array Nat := #[100, 300, 500, 1000]
@@ -78,15 +79,18 @@ def main (args : List String) : IO Unit := do
 
   let mut dumbTotal : Nat := 0
   let mut smartTotal : Nat := 0
-  let totalWindow := smartConfig.maxSinks + smartConfig.windowSize
 
   for hsSize in haystackSizes do
     let prompt := buildPrompt hsSize model.config.vocabSize needleKey needleValue
 
-    let dumbTokens ← generateWithDumbWindow device model prompt 1 totalWindow .Greedy
+    IO.println s!"[Running haystack={hsSize}, prompt={prompt.size} tokens]"
+
+    -- Dumb window: evicts everything older than windowSize
+    let dumbTokens ← generateWithDumbWindow device model prompt 1 smartConfig.windowSize .Greedy
     let dumbGen := dumbTokens.getD prompt.size 0
     let dumbOk := dumbGen == needleValue
 
+    -- Smart KV: protects surprise tokens from eviction
     let smartTokens ← generateWithSmartKV device model prompt 1 smartConfig .Greedy
       (verbose := hsSize == haystackSizes[0]!)
     let smartGen := smartTokens.getD prompt.size 0
@@ -115,6 +119,6 @@ def main (args : List String) : IO Unit := do
     IO.println "║  🎯 Smart KV-Cache outperformed dumb window on Gemma4! ║"
     IO.println "╚══════════════════════════════════════════════════════════╝"
   else if smartTotal == dumbTotal then
-    IO.println "Both performed equally."
+    IO.println "Both performed equally. Try tuning tau."
   else
     IO.println "Dumb window outperformed Smart KV (unexpected)."

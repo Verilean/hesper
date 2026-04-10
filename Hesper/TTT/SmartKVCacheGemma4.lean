@@ -1,6 +1,5 @@
 import Hesper.Models.Gemma4
 import Hesper.TTT.Kernels
-import Hesper.TTT.HiddenSpaceTTT
 import Hesper.Training.SafeBuffer
 import Hesper.WebGPU.BufferOps
 import Hesper.Inference.Sampling
@@ -8,12 +7,23 @@ import Hesper.Inference.Sampling
 /-!
 # Surprise-Gated Smart KV-Cache for Gemma 4
 
-Port of SmartKVCache.lean (BitNet version) to the Gemma 4 pipeline.
-Uses the MSE sensor to detect surprising tokens and route their KV
-vectors to permanent "sink" slots, while boring tokens use a sliding
-window ring buffer.
+Uses cosine distance between consecutive hidden states as a
+scale-invariant surprise sensor. Important tokens are protected
+from eviction; boring tokens outside the window are zeroed out.
 
-Does NOT modify Hesper.Models.Gemma4.
+Strategy (NO modification to Gemma4.lean):
+1. Call forwardSingleToken(pos=i) normally — KV written at row i,
+   cacheLen = i+1 (Gemma's internal logic, untouched)
+2. After forward, measure cosine surprise between h_t and h_{t+1}
+3. If surprise > tau: mark position i as a "sink" (protected)
+4. When i > windowSize: zero out K/V at position (i - windowSize)
+   UNLESS that position is a protected sink
+5. Zeroed K → dot(Q,K)=0 → minimal attention weight → effectively evicted
+
+This approach works because:
+- Gemma 4 always loops 0..cacheLen in attention
+- Zeroed K rows produce near-zero attention scores
+- Protected sink rows retain their full K/V content permanently
 -/
 
 namespace Hesper.TTT.SmartKVGemma4
@@ -21,40 +31,36 @@ namespace Hesper.TTT.SmartKVGemma4
 open Hesper.WebGPU
 open Hesper.Models.Gemma4
 open Hesper.TTT.Kernels
-open Hesper.TTT.HiddenSpace
 open Hesper.Inference
 open Hesper.Training
 
-/-- Smart KV-Cache position tracker (same as BitNet version). -/
-structure SmartKVState where
-  maxSinks : Nat
-  windowSize : Nat
-  sinkCount : Nat := 0
-  ringCount : Nat := 0
-  deriving Inhabited, Repr
-
-def getPhysicalPos (isSurprise : Bool) (state : SmartKVState)
-    : Nat × Bool × SmartKVState :=
-  if isSurprise && state.sinkCount < state.maxSinks then
-    (state.sinkCount, true, { state with sinkCount := state.sinkCount + 1 })
-  else
-    let ringPos := state.maxSinks + (state.ringCount % state.windowSize)
-    (ringPos, false, { state with ringCount := state.ringCount + 1 })
-
-def cacheLen (state : SmartKVState) : Nat :=
-  state.sinkCount + min state.ringCount state.windowSize
-
 structure SmartKVConfig where
-  maxSinks : Nat := 64
   windowSize : Nat := 256
-  tau : Float := 0.003
+  tau : Float := 0.05      -- cosine surprise threshold (0=identical, 1=orthogonal)
   deriving Inhabited, Repr
 
-/-- Post-norm hidden buffer: buf2 for even layers, buf1 for odd. -/
+/-- Post-norm hidden buffer for Gemma 4.
+    Gemma 4's forwardSingleToken starts with currentBuf=buf2, nextBuf=buf1
+    (opposite of BitNet). After N layers of ping-pong + final norm
+    (currentBuf → nextBuf), the post-norm hidden ends up in:
+      even layers: buf1  (start=buf2, 42 swaps → buf2 again, norm writes → buf1)
+      odd layers:  buf2 -/
 def postNormBuf (state : InferenceState) (numLayers : Nat) : Buffer :=
-  if numLayers % 2 == 0 then state.buf2 else state.buf1
+  if numLayers % 2 == 0 then state.buf1 else state.buf2
 
-/-- Generate with Smart KV-Cache on Gemma 4. -/
+/-- Zero out KV cache at position `pos` across ALL layers.
+    Each layer's KV cache is in its own Gemma4KVCache struct. -/
+def evictPosition (device : Device) (state : InferenceState)
+    (cfg : Config) (pos : Nat) : IO Unit := do
+  for kvCache in state.kvCaches do
+    -- Gemma 4 has varying numKVHeads per layer (full vs SWA).
+    -- Use max heads to be safe; extra zeros beyond actual heads are harmless.
+    let maxKVHeads := max cfg.numKeyValueHeadsFull cfg.numKeyValueHeadsSWA
+    let maxHeadDim := max cfg.headDimFull cfg.headDimSWA
+    executeZeroKVRow device kvCache.kBuf kvCache.vBuf maxKVHeads cfg.maxSeqLen maxHeadDim pos
+
+/-- Generate with Smart KV-Cache on Gemma 4.
+    Uses cosine surprise sensor + KV eviction. -/
 def generateWithSmartKV (device : Device) (model : Gemma4Model)
     (promptTokens : Array Nat) (maxTokens : Nat)
     (config : SmartKVConfig)
@@ -62,80 +68,83 @@ def generateWithSmartKV (device : Device) (model : Gemma4Model)
     (eosToken : Option Nat := none)
     (verbose : Bool := true)
     : IO (Array Nat) := do
-  let totalSlots := config.maxSinks + config.windowSize
   let dim := model.config.hiddenSize
 
   IO.println "╔══════════════════════════════════════════════════════════╗"
-  IO.println "║  Gemma 4 + Surprise-Gated Smart KV-Cache               ║"
+  IO.println "║  Gemma 4 + Cosine Surprise Smart KV-Cache              ║"
   IO.println "╚══════════════════════════════════════════════════════════╝"
   IO.println s!"  Model: {dim}d, {model.config.numHiddenLayers}L, vocab={model.config.vocabSize}"
-  IO.println s!"  Sinks: {config.maxSinks}, Window: {config.windowSize}, Total: {totalSlots}"
-  IO.println s!"  Surprise tau: {config.tau}"
+  IO.println s!"  Window: {config.windowSize}, Surprise tau: {config.tau} (cosine distance)"
   IO.println s!"  Prompt: {promptTokens.size} tokens, generate up to {maxTokens}"
   IO.println ""
 
-  -- Original model for KV cache (full maxSeqLen allocation)
+  -- Full KV cache (original maxSeqLen) — Gemma4's attention is untouched
   let state ← createInferenceState device model.config
-
-  -- MSE sensor buffers (W_ttt stays zero — sensor only)
-  let tttConfig : HiddenTTTConfig := {
-    dim := dim
-    vocabSize := model.config.vocabSize
-    innerLR := 0.0
-    tau := config.tau
-    useAdam := false
-  }
-  let tttBufs ← createHiddenTTTBuffers device tttConfig
-  let mut zeroBytes := ByteArray.empty
-  for _ in [0:dim * 4] do
-    zeroBytes := zeroBytes.push 0
-  writeBuffer device tttBufs.tttOutputBuf 0 zeroBytes
-
   let hBuf := postNormBuf state model.config.numHiddenLayers
 
-  let mut tokens := promptTokens
-  let mut kvState : SmartKVState := {
-    maxSinks := config.maxSinks, windowSize := config.windowSize
+  -- Sensor buffers: only need prevHidden + lossBuf
+  let prevHiddenBuf ← createBuffer device {
+    size := (dim * 4).toUSize, usage := [.storage, .copySrc, .copyDst], mappedAtCreation := false
   }
+  let lossBuf ← createBuffer device {
+    size := 4, usage := [.storage, .copySrc, .copyDst, .mapRead], mappedAtCreation := false
+  }
+
+  let mut tokens := promptTokens
   let mut hasPrevHidden := false
-  let mut isSurprise := false
-  let mut mseLoss : Float := 0.0
-  let mut sinkTokens : Array (Nat × Nat) := #[]
+  let mut sinkPositions : Array Nat := #[]  -- protected absolute positions
 
   -- ═══════════════════════════════════════════
-  -- Prefill with surprise-gated routing
+  -- Prefill: forward + sensor + eviction
   -- ═══════════════════════════════════════════
   IO.println s!"[Prefill] Processing {promptTokens.size} prompt tokens..."
   let prefillStart ← IO.monoNanosNow
 
   for i in [0:promptTokens.size] do
-    let (physPos, wasSink, newState) := getPhysicalPos isSurprise kvState
-    kvState := newState
-    forwardSingleToken device model promptTokens[i]! physPos state
+    if i >= model.config.maxSeqLen then break
 
+    -- Standard forward at absolute position i
+    forwardSingleToken device model promptTokens[i]! i state
+
+    -- Cosine surprise sensor
+    let mut surprise : Float := 0.0
+    let mut isSurprise := false
     if hasPrevHidden then
-      executeMSEResidualLossAndGrad device
-        tttBufs.tttOutputBuf tttBufs.prevHiddenBuf hBuf
-        tttBufs.gradBuf tttBufs.lossBuf dim
-      mseLoss ← SafeBuffer.safeReadF32 device tttBufs.lossBuf
-      isSurprise := mseLoss > config.tau
+      if i <= 2 then
+        let pv ← BufferOps.downloadFloatArray device prevHiddenBuf 4
+        let hv ← BufferOps.downloadFloatArray device hBuf 4
+        IO.println s!"  [DBG] prevH={pv.extract 0 4} curH={hv.extract 0 4}"
+      executeCosineSurpriseSensor device prevHiddenBuf hBuf lossBuf dim
+      surprise ← SafeBuffer.safeReadF32 device lossBuf
+      isSurprise := surprise > config.tau
 
-    executeCopy device hBuf tttBufs.prevHiddenBuf dim
+    -- Save current hidden for next comparison
+    executeCopy device hBuf prevHiddenBuf dim
     hasPrevHidden := true
 
-    if wasSink then sinkTokens := sinkTokens.push (i, physPos)
+    -- If surprise, protect this position
+    if isSurprise then
+      sinkPositions := sinkPositions.push i
+
+    -- Eviction: zero out old positions outside the window
+    if i >= config.windowSize then
+      let evictPos := i - config.windowSize
+      -- Only evict if NOT a protected sink
+      if !sinkPositions.contains evictPos then
+        evictPosition device state model.config evictPos
+
     if verbose then
-      let typeStr := if wasSink then s!"SINK[{physPos}] ⚓" else s!"ring[{physPos}]"
-      if i < 10 || wasSink || i >= promptTokens.size - 3 then
-        IO.println s!"  Token {i} (id={promptTokens[i]!}): mse={mseLoss}, {typeStr}"
+      let typeStr := if isSurprise then s!"SURPRISE ⚓ (sink #{sinkPositions.size})"
+        else s!"normal"
+      if i < 10 || isSurprise || i >= promptTokens.size - 3 then
+        IO.println s!"  Token {i} (id={promptTokens[i]!}): cosine_dist={surprise}, {typeStr}"
 
   let prefillEnd ← IO.monoNanosNow
   let prefillMs := (prefillEnd - prefillStart).toFloat / 1_000_000.0
   IO.println s!"[Prefill] Done in {prefillMs} ms"
-  IO.println s!"  Sinks used: {kvState.sinkCount}/{config.maxSinks}"
-  IO.println s!"  Ring count: {kvState.ringCount} (window={config.windowSize})"
-  if sinkTokens.size > 0 && sinkTokens.size <= 40 then
-    IO.println s!"  Sink tokens: {sinkTokens.map (·.1)}"
+  IO.println s!"  Sink positions: {sinkPositions.size} protected tokens"
+  if sinkPositions.size > 0 && sinkPositions.size <= 40 then
+    IO.println s!"  Protected: {sinkPositions}"
   IO.println ""
 
   -- ═══════════════════════════════════════════
@@ -146,6 +155,8 @@ def generateWithSmartKV (device : Device) (model : Gemma4Model)
   let mut genTokenCount : Nat := 0
 
   for step in [0:maxTokens] do
+    if tokens.size >= model.config.maxSeqLen then break
+
     let logits ← BufferOps.downloadFloatArray device state.logitsBuf model.config.vocabSize
     let (nextToken, _) := Sampling.sampleWithRNG logits strategy
       (Sampling.RNG.create (some (42 + step)))
@@ -158,16 +169,17 @@ def generateWithSmartKV (device : Device) (model : Gemma4Model)
     | some eos => if nextToken == eos then IO.println "  EOS"; break
     | none => pure ()
 
-    let (physPos, _, newState) := getPhysicalPos false kvState
-    kvState := newState
-    forwardSingleToken device model nextToken physPos state
+    let newPos := tokens.size - 1
+    if newPos < model.config.maxSeqLen then
+      forwardSingleToken device model nextToken newPos state
 
   let genEnd ← IO.monoNanosNow
   let genMs := (genEnd - genStart).toFloat / 1_000_000.0
   IO.println s!"\nGenerated {genTokenCount} tokens in {genMs} ms"
   pure tokens
 
-/-- Baseline: dumb sliding window for Gemma 4 -/
+/-- Baseline: dumb sliding window with KV eviction (no surprise gate).
+    Zeros out ALL positions older than windowSize — no protection. -/
 def generateWithDumbWindow (device : Device) (model : Gemma4Model)
     (promptTokens : Array Nat) (maxTokens : Nat)
     (windowSize : Nat)
@@ -176,15 +188,24 @@ def generateWithDumbWindow (device : Device) (model : Gemma4Model)
   let state ← createInferenceState device model.config
 
   for i in [0:promptTokens.size] do
-    forwardSingleToken device model promptTokens[i]! (i % windowSize) state
+    if i >= model.config.maxSeqLen then break
+    forwardSingleToken device model promptTokens[i]! i state
+    -- Evict ALL old positions (no protection)
+    if i >= windowSize then
+      evictPosition device state model.config (i - windowSize)
 
   let mut tokens := promptTokens
   for step in [0:maxTokens] do
+    if tokens.size >= model.config.maxSeqLen then break
     let logits ← BufferOps.downloadFloatArray device state.logitsBuf model.config.vocabSize
     let (nextToken, _) := Sampling.sampleWithRNG logits strategy
       (Sampling.RNG.create (some (42 + step)))
     tokens := tokens.push nextToken
-    forwardSingleToken device model nextToken (tokens.size % windowSize) state
+    let newPos := tokens.size - 1
+    if newPos < model.config.maxSeqLen then
+      forwardSingleToken device model nextToken newPos state
+      if newPos >= windowSize then
+        evictPosition device state model.config (newPos - windowSize)
 
   pure tokens
 
