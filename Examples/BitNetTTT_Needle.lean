@@ -1,6 +1,7 @@
 import Hesper
 import Hesper.Models.BitNet
 import Hesper.TTT.BitNetTTT
+import Hesper.TTT.HiddenSpaceTTT
 import Hesper.TTT.Types
 import Hesper.WebGPU.Device
 
@@ -21,6 +22,7 @@ open Hesper.WebGPU
 open Hesper.Models.BitNet
 open Hesper.TTT
 open Hesper.TTT.BitNetTTT
+open Hesper.TTT.HiddenSpace
 
 /-- Build a needle-in-haystack prompt:
     [background(5)] [sep key value sep] [haystack(n)] [sep queryMark key]
@@ -66,12 +68,12 @@ def runBaseTest (device : Device) (model : BitNetModel)
   let generated := tokens.getD prompt.size 0
   return (generated == expected, generated)
 
-/-- Run one needle test — TTT model only -/
-def runTTTTest (device : Device) (model : BitNetModel) (tttConfig : TTTConfig)
+/-- Run one needle test — Hidden-Space TTT model -/
+def runTTTTest (device : Device) (model : BitNetModel) (tttConfig : HiddenTTTConfig)
     (haystackSize : Nat) (needleKey needleValue : Nat)
     : IO (Bool × Nat) := do
   let (prompt, expected) := buildNeedlePrompt haystackSize model.config.vocabSize needleKey needleValue
-  let tokens ← generateWithTTT device model prompt 1 tttConfig .Greedy (verbose := false)
+  let tokens ← generateWithHiddenTTT device model prompt 1 tttConfig .Greedy (verbose := false)
   let generated := tokens.getD prompt.size 0
   return (generated == expected, generated)
 
@@ -97,12 +99,14 @@ def main (args : List String) : IO Unit := do
   IO.println s!"[Model] {model.config.dim}d, {model.config.numLayers}L, vocab={model.config.vocabSize}"
   IO.println ""
 
-  let tttConfig : TTTConfig := {
-    hiddenDim := model.config.dim
+  -- Hidden-Space TTT: W_ttt is [dim × dim] = 26 MB (vs 1.3 GB for logit-space)
+  let hiddenTTTConfig : HiddenTTTConfig := {
+    dim := model.config.dim
     vocabSize := model.config.vocabSize
-    innerLR := 0.1    -- aggressive lr for 128K vocab
-    tau := 1.0        -- low threshold: learn from most tokens
+    innerLR := 0.01
+    tau := 2.0
   }
+  IO.println s!"[TTT] Hidden-Space: W_ttt=[{model.config.dim}×{model.config.dim}] = {model.config.dim * model.config.dim * 4 / 1024} KB"
 
   -- Use rare tokens as the needle
   let needleKey := min 77777 (model.config.vocabSize - 1)
@@ -130,7 +134,7 @@ def main (args : List String) : IO Unit := do
     let promptLen := prompt.size
 
     let (baseOk, baseTok) ← runBaseTest device model hsSize needleKey needleValue
-    let (tttOk, tttTok) ← runTTTTest device model tttConfig hsSize needleKey needleValue
+    let (tttOk, tttTok) ← runTTTTest device model hiddenTTTConfig hsSize needleKey needleValue
 
     if baseOk then baseTotalCorrect := baseTotalCorrect + 1
     if tttOk then tttTotalCorrect := tttTotalCorrect + 1
