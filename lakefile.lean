@@ -668,6 +668,10 @@ lean_exe «gpu-fixed-cost-bench» where
   root := `Bench.GpuFixedCost
   moreLinkArgs := stdLinkArgs
 
+lean_exe «ttt-golden-gpu» where
+  root := `Tests.TTT.TTTGoldenGPUMain
+  moreLinkArgs := stdLinkArgs
+
 -- ============================================================================
 -- SIMD CPU BACKEND (Google Highway)
 -- ============================================================================
