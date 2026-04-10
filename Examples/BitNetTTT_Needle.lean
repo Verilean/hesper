@@ -107,6 +107,7 @@ def main (args : List String) : IO Unit := do
     vocabSize := model.config.vocabSize
     innerLR := 0.1   -- higher lr for hidden-space (2560-dim needs stronger updates)
     tau := 2.0
+    dynamicGate := false   -- static gate: proven to work at haystack=30
   }
   IO.println s!"[TTT] Hidden-Space: W_ttt=[{model.config.dim}×{model.config.dim}] = {model.config.dim * model.config.dim * 4 / 1024} KB"
 
@@ -118,7 +119,7 @@ def main (args : List String) : IO Unit := do
   IO.println ""
 
   -- Test at increasing haystack sizes (keep small to avoid OOM/dispatch issues)
-  let haystackSizes : Array Nat := #[10, 30, 50]
+  let haystackSizes : Array Nat := #[10, 30, 50, 100]
 
   IO.println "┌───────────┬────────────────┬────────────────┬────────────────┬────────────────┐"
   IO.println "│ Haystack  │ Prompt Length   │ Base Model     │ TTT Model      │ Winner         │"

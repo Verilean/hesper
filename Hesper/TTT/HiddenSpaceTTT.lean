@@ -45,7 +45,22 @@ structure HiddenTTTConfig where
   dim : Nat
   vocabSize : Nat     -- needed for CE loss/backward
   innerLR : Float
-  tau : Float
+  tau : Float          -- static fallback threshold (used if dynamicGate=false)
+  -- Dynamic EMA gate: gate opens when loss > emaLoss * gateMultiplier.
+  -- Intended to filter haystack noise, but requires tuning per model.
+  -- Default off: static tau works better on BitNet 2B where random
+  -- token loss is already high (~10), making EMA-relative thresholding
+  -- ineffective at distinguishing needles from noise.
+  dynamicGate : Bool := false
+  gateMultiplier : Float := 2.0   -- open when loss > k × EMA
+  emaAlpha : Float := 0.1         -- smoothing factor for running average
+  warmupSteps : Nat := 5          -- always OPEN for first N steps (EMA not stable yet)
+  deriving Inhabited, Repr
+
+/-- Mutable gate state for dynamic EMA thresholding. -/
+structure GateState where
+  emaLoss : Float := 0.0
+  stepCount : Nat := 0
   deriving Inhabited, Repr
 
 /-- GPU buffers for hidden-space TTT. W_ttt is [dim × dim]. -/
@@ -129,17 +144,37 @@ def computeLMHeadBackward (device : Device) (model : BitNetModel)
   let matConfig : Hesper.WGSL.MatMul.Config := { M := 1, N := cfg.dim, K := cfg.vocabSize }
   Hesper.WGSL.MatMul.executeMatMul device dLogitsBuf model.embedding.embeddingTable dHiddenBuf matConfig
 
-/-- One hidden-space TTT step. Returns (baseLoss, gateOpen). -/
+/-- One hidden-space TTT step with dynamic EMA gate.
+    Returns (baseLoss, gateOpen, updatedGateState). -/
 def hiddenTTTStep (device : Device) (config : HiddenTTTConfig) (bufs : HiddenTTTBuffers)
     (model : BitNetModel) (baseLogitsBuf postNormHiddenBuf : Buffer)
-    : IO (Float × Bool) := do
+    (gateState : GateState)
+    : IO (Float × Bool × GateState) := do
   let d := config.dim
   let v := config.vocabSize
 
   -- Step 1: Compute base loss from the ORIGINAL base logits
   Loss.executeCrossEntropyForward device baseLogitsBuf bufs.targetBuf bufs.lossBuf v
   let baseLoss ← SafeBuffer.safeReadF32 device bufs.lossBuf
-  let gateOpen := baseLoss > config.tau
+
+  -- Step 2: Dynamic gate decision
+  let gateOpen :=
+    if config.dynamicGate then
+      if gateState.stepCount < config.warmupSteps then
+        true  -- warmup: always open (EMA not stable yet)
+      else
+        baseLoss > gateState.emaLoss * config.gateMultiplier
+    else
+      baseLoss > config.tau
+
+  -- Update EMA (always, regardless of gate decision)
+  let newEma :=
+    if gateState.stepCount == 0 then baseLoss  -- init to first loss
+    else config.emaAlpha * baseLoss + (1.0 - config.emaAlpha) * gateState.emaLoss
+  let newGateState : GateState := {
+    emaLoss := newEma
+    stepCount := gateState.stepCount + 1
+  }
 
   if gateOpen then
     -- Copy hidden state
@@ -166,7 +201,7 @@ def hiddenTTTStep (device : Device) (config : HiddenTTTConfig) (bufs : HiddenTTT
     -- SGD update: W_ttt -= lr * dW
     executeSGDUpdate device bufs.tttWeightBuf bufs.dWeightBuf (d * d) config.innerLR
 
-  return (baseLoss, gateOpen)
+  return (baseLoss, gateOpen, newGateState)
 
 /-- Add TTT correction to hidden, then compute LM head (decode phase, frozen). -/
 def addTTTAndComputeLogits (device : Device) (config : HiddenTTTConfig) (bufs : HiddenTTTBuffers)
@@ -204,9 +239,11 @@ def generateWithHiddenTTT (device : Device) (model : BitNetModel)
   let hBuf := postNormBuf cacheState model.config.numLayers
   let mut tokens := promptTokens
   let mut gateOpenCount : Nat := 0
+  let mut gateState : GateState := {}
 
   -- Prefill with TTT learning
-  IO.println s!"[Prefill+TTT] Processing {promptTokens.size} prompt tokens..."
+  let gateMode := if tttConfig.dynamicGate then s!"dynamic (EMA×{tttConfig.gateMultiplier})" else s!"static (tau={tttConfig.tau})"
+  IO.println s!"[Prefill+TTT] Processing {promptTokens.size} prompt tokens (gate: {gateMode})..."
   let prefillStart ← IO.monoNanosNow
 
   for i in [0:promptTokens.size] do
@@ -218,12 +255,14 @@ def generateWithHiddenTTT (device : Device) (model : BitNetModel)
       let targetBytes := BufferOps.uint32ToBytes target.toUInt32
       writeBuffer device bufs.targetBuf 0 targetBytes
 
-      let (baseLoss, gateOpen) ← hiddenTTTStep device tttConfig bufs model cacheState.logitsBuf hBuf
+      let (baseLoss, gateOpen, newGS) ← hiddenTTTStep device tttConfig bufs model cacheState.logitsBuf hBuf gateState
+      gateState := newGS
 
       if gateOpen then gateOpenCount := gateOpenCount + 1
       if verbose then
         let gateStr := if gateOpen then "OPEN ⚡" else "closed"
-        IO.println s!"  Token {i}: loss={baseLoss}, gate={gateStr}"
+        let emaStr := if tttConfig.dynamicGate then s!" ema={gateState.emaLoss}" else ""
+        IO.println s!"  Token {i}: loss={baseLoss}, gate={gateStr}{emaStr}"
 
   let prefillEnd ← IO.monoNanosNow
   let prefillMs := (prefillEnd - prefillStart).toFloat / 1_000_000.0
