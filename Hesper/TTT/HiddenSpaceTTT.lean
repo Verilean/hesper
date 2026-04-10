@@ -109,43 +109,25 @@ def computeLMHead (device : Device) (model : BitNetModel)
   | none =>
     Hesper.WGSL.MatMul.executeMatMulTranspose device hiddenBuf model.embedding.embeddingTable logitsBuf lmConfig
 
-/-- Compute LM head transpose: dHidden = embedding^T @ dLogits.
-    This is the backward through the LM head. Shape: [dim] = [dim, vocabSize] @ [vocabSize].
-    Equivalent to: for each d in dim, dHidden[d] = Σ_v embedding[v,d] * dLogits[v].
-    We reuse matVec with the embedding treated as [dim, vocabSize]. -/
+/-- Compute LM head backward: dHidden = embedding^T @ dLogits.
+
+    Math: `dHidden[d] = Σ_v embedding[v,d] * dLogits[v]`
+
+    Since embedding is stored as [vocabSize, dim] (row-major), this is
+    a **non-transposed** matmul: `C = A @ B` where
+      A = dLogits [1, vocabSize]
+      B = embedding [vocabSize, dim]
+      C = dHidden [1, dim]
+
+    Always uses the F32 embeddingTable (guaranteed to exist) via
+    `executeMatMul` (not transpose). Previous version incorrectly
+    used `executeMatMulTransposeF16` which swapped the matrix layout. -/
 def computeLMHeadBackward (device : Device) (model : BitNetModel)
     (dLogitsBuf dHiddenBuf : Buffer) : IO Unit := do
-  -- The embedding is stored as [vocabSize, dim]. We need [dim, vocabSize]^T @ dLogits.
-  -- This is equivalent to: dHidden[d] = Σ_v embedding[v * dim + d] * dLogits[v].
-  -- = embedding^T @ dLogits where embedding^T is [dim, vocabSize].
-  -- Using executeMatMulTranspose: C = A @ B^T where A=[1,vocabSize], B=[dim,vocabSize]
-  -- → C = [1, dim]. But we'd need the f32 embedding table.
-  -- Simplest: use a direct matmul kernel.
   let cfg := model.config
-  -- matMulTranspose: C[1,dim] = dLogits[1,vocab] @ embedding[dim,vocab]^T
-  -- = dLogits[1,vocab] @ embedding^T... no, embedding is [vocab,dim],
-  -- so embedding^T = [dim,vocab]. C = A @ B where A=[1,vocab], B=[vocab,dim] → [1,dim].
-  -- That's a non-transposed matmul: C = dLogits @ embedding.
+  -- C[1, dim] = dLogits[1, vocabSize] @ embedding[vocabSize, dim]
   let matConfig : Hesper.WGSL.MatMul.Config := { M := 1, N := cfg.dim, K := cfg.vocabSize }
-  match model.embedding.f16Table with
-  | some f16Buf =>
-    -- f16 table is [vocabSize, dim] packed as [vocabSize, dim/2] u32s
-    -- For backward: need dLogits @ f16Table → [1, dim]
-    -- This is NOT the transpose — it's the forward direction of the LM head.
-    -- executeMatMulTransposeF16 computes C = A @ B^T where B is [N, K] in F16.
-    -- Here we want C[1,dim] = dLogits[1,vocab] @ emb[vocab,dim].
-    -- emb is [vocab, dim] F16. C = A @ B^T would be A[1,K] @ B[N,K]^T → [1,N].
-    -- So: A = dLogits, K = vocab, B = emb viewed as [dim, vocab], N = dim... no.
-    -- Actually: emb[vocab,dim]^T = emb^T[dim,vocab]. C = dLogits @ emb = C[1,dim].
-    -- Using transposed: C = dLogits @ (emb^T)^T = dLogits @ emb. So we don't transpose.
-    -- Use the non-transposed matmul: C = A @ B where A=[1,vocab], B=[vocab,dim].
-    -- That's a standard matmul. We can use MatMul.executeMatMul... but it might not exist for F16.
-    -- Simplest working approach: download dLogits, do CPU matmul, upload dHidden.
-    -- For correctness-first, let's use the F32 embedding table if available.
-    -- F32 table may not exist (it's unpacked from F16). Use the direct kernel.
-    Hesper.WGSL.MatMul.executeMatMulTransposeF16 device dLogitsBuf f16Buf dHiddenBuf matConfig
-  | none =>
-    Hesper.WGSL.MatMul.executeMatMulTranspose device dLogitsBuf model.embedding.embeddingTable dHiddenBuf matConfig
+  Hesper.WGSL.MatMul.executeMatMul device dLogitsBuf model.embedding.embeddingTable dHiddenBuf matConfig
 
 /-- One hidden-space TTT step. Returns (baseLoss, gateOpen). -/
 def hiddenTTTStep (device : Device) (config : HiddenTTTConfig) (bufs : HiddenTTTBuffers)
