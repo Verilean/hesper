@@ -1,5 +1,6 @@
 import Hesper.Models.Gemma4
 import Hesper.TTT.Kernels
+import Hesper.Training.Loss
 import Hesper.Training.SafeBuffer
 import Hesper.WebGPU.BufferOps
 import Hesper.Inference.Sampling
@@ -36,7 +37,7 @@ open Hesper.Training
 
 structure SmartKVConfig where
   windowSize : Nat := 256
-  tau : Float := 0.05      -- cosine surprise threshold (0=identical, 1=orthogonal)
+  tau : Float := 5.0       -- CE loss threshold (high = very surprising)
   deriving Inhabited, Repr
 
 /-- Post-norm hidden buffer for Gemma 4.
@@ -80,14 +81,16 @@ def generateWithSmartKV (device : Device) (model : Gemma4Model)
 
   -- Full KV cache (original maxSeqLen) — Gemma4's attention is untouched
   let state ← createInferenceState device model.config
-  let hBuf := postNormBuf state model.config.numHiddenLayers
 
-  -- Sensor buffers: only need prevHidden + lossBuf
-  let prevHiddenBuf ← createBuffer device {
-    size := (dim * 4).toUSize, usage := [.storage, .copySrc, .copyDst], mappedAtCreation := false
-  }
+  -- Sensor: CE loss between base logits and next token (same as BitNet TTT).
+  -- This is the most reliable surprise metric — directly measures
+  -- "how wrong was the model about the next token?"
+  let vocabSize := model.config.vocabSize
   let lossBuf ← createBuffer device {
     size := 4, usage := [.storage, .copySrc, .copyDst, .mapRead], mappedAtCreation := false
+  }
+  let targetBuf ← createBuffer device {
+    size := 4, usage := [.storage, .copySrc, .copyDst], mappedAtCreation := false
   }
 
   let mut tokens := promptTokens
@@ -106,21 +109,19 @@ def generateWithSmartKV (device : Device) (model : Gemma4Model)
     -- Standard forward at absolute position i
     forwardSingleToken device model promptTokens[i]! i state
 
-    -- Cosine surprise sensor
+    -- CE surprise sensor: how wrong was the model about the next token?
+    -- CE loss > tau means the model was "surprised" by this token.
     let mut surprise : Float := 0.0
     let mut isSurprise := false
-    if hasPrevHidden then
-      if i <= 2 then
-        let pv ← BufferOps.downloadFloatArray device prevHiddenBuf 4
-        let hv ← BufferOps.downloadFloatArray device hBuf 4
-        IO.println s!"  [DBG] prevH={pv.extract 0 4} curH={hv.extract 0 4}"
-      executeCosineSurpriseSensor device prevHiddenBuf hBuf lossBuf dim
+    if i + 1 < promptTokens.size then
+      -- Target = next token in the prompt
+      let target := promptTokens[i + 1]!
+      let tBytes := BufferOps.uint32ToBytes target.toUInt32
+      writeBuffer device targetBuf 0 tBytes
+      -- CE loss of current logits vs next token
+      Loss.executeCrossEntropyForward device state.logitsBuf targetBuf lossBuf vocabSize
       surprise ← SafeBuffer.safeReadF32 device lossBuf
       isSurprise := surprise > config.tau
-
-    -- Save current hidden for next comparison
-    executeCopy device hBuf prevHiddenBuf dim
-    hasPrevHidden := true
 
     -- If surprise, protect this position
     if isSurprise then
@@ -137,7 +138,7 @@ def generateWithSmartKV (device : Device) (model : Gemma4Model)
       let typeStr := if isSurprise then s!"SURPRISE ⚓ (sink #{sinkPositions.size})"
         else s!"normal"
       if i < 10 || isSurprise || i >= promptTokens.size - 3 then
-        IO.println s!"  Token {i} (id={promptTokens[i]!}): cosine_dist={surprise}, {typeStr}"
+        IO.println s!"  Token {i} (id={promptTokens[i]!}): ce_loss={surprise}, {typeStr}"
 
   let prefillEnd ← IO.monoNanosNow
   let prefillMs := (prefillEnd - prefillStart).toFloat / 1_000_000.0

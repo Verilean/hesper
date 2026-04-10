@@ -49,7 +49,7 @@ def main (args : List String) : IO Unit := do
   IO.println s!"[Model] Gemma 4: {model.config.hiddenSize}d, {model.config.numHiddenLayers}L"
   IO.println ""
 
-  let smartConfig : SmartKVConfig := { windowSize := 256, tau := 0.05 }
+  let smartConfig : SmartKVConfig := { windowSize := 256, tau := 5.0 }
 
   -- Natural language needle: a secret password buried in text
   let needle := "The secret password is: RAINBOW42."
