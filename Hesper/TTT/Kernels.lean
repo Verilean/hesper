@@ -25,13 +25,28 @@ open Hesper.WGSL
 open Hesper.WGSL.Monad
 open Hesper.WebGPU
 
+/-- Smart dispatch: 1D if fits, 2D otherwise.
+    Returns `(config, gridDimX)` where gridDimX=0 for 1D, >0 for 2D. -/
+private def smartDispatch (totalThreads : Nat) (wgSize : Nat := 256)
+    : Execute.ExecutionConfig × Nat :=
+  let wgCount := (totalThreads + wgSize - 1) / wgSize
+  if wgCount <= 65535 then
+    (Execute.ExecutionConfig.dispatch1D totalThreads wgSize, 0)
+  else
+    let gridX : Nat := 4096
+    let gridY := (wgCount + gridX - 1) / gridX
+    ({ numWorkgroups := (gridX, gridY, 1),
+       workgroupSize := { x := wgSize, y := 1, z := 1 } }, gridX * wgSize)
+
 /-! ## 1. Matrix-Vector Multiply -/
 
 /-- `output[i] = Σ_j weight[i * inDim + j] * input[j]`
-    One thread per output row. -/
-def matVecKernel (outDim inDim : Nat) : ShaderM Unit := do
+    One thread per output row. Supports 2D dispatch for large outDim
+    via `i = globalId.x + globalId.y * numWorkgroups.x * workgroupSize.x`. -/
+def matVecKernel (outDim inDim : Nat) (gridDimX : Nat := 0) : ShaderM Unit := do
   let gid ← ShaderM.globalId
-  let i := Exp.vec3X gid
+  let i := if gridDimX == 0 then Exp.vec3X gid
+    else Exp.add (Exp.vec3X gid) (Exp.mul (Exp.vec3Y gid) (Exp.litU32 gridDimX))
 
   let _weight ← ShaderM.declareInputBuffer "weight" (.array (.scalar .f32) (outDim * inDim))
   let _input ← ShaderM.declareInputBuffer "input" (.array (.scalar .f32) inDim)
@@ -48,18 +63,20 @@ def matVecKernel (outDim inDim : Nat) : ShaderM Unit := do
   ) (pure ())
 
 def executeMatVec (device : Device) (weightBuf inputBuf outputBuf : Buffer)
-    (outDim inDim : Nat) : IO Unit :=
+    (outDim inDim : Nat) : IO Unit := do
+  let (cfg, gdx) := smartDispatch outDim
   Execute.executeShaderNamed device
-    (matVecKernel outDim inDim)
+    (matVecKernel outDim inDim gdx)
     [("weight", weightBuf), ("input", inputBuf), ("output", outputBuf)]
-    (Execute.ExecutionConfig.dispatch1D outDim 256)
+    cfg
 
 /-! ## 2. Vector Addition -/
 
-/-- `output[i] = a[i] + b[i]` -/
-def vecAddKernel (n : Nat) : ShaderM Unit := do
+/-- `output[i] = a[i] + b[i]`. Supports 2D dispatch via gridDimX. -/
+def vecAddKernel (n : Nat) (gridDimX : Nat := 0) : ShaderM Unit := do
   let gid ← ShaderM.globalId
-  let i := Exp.vec3X gid
+  let i := if gridDimX == 0 then Exp.vec3X gid
+    else Exp.add (Exp.vec3X gid) (Exp.mul (Exp.vec3Y gid) (Exp.litU32 gridDimX))
 
   let _a ← ShaderM.declareInputBuffer "a" (.array (.scalar .f32) n)
   let _b ← ShaderM.declareInputBuffer "b" (.array (.scalar .f32) n)
@@ -72,19 +89,21 @@ def vecAddKernel (n : Nat) : ShaderM Unit := do
   ) (pure ())
 
 def executeVecAdd (device : Device) (aBuf bBuf outputBuf : Buffer)
-    (n : Nat) : IO Unit :=
+    (n : Nat) : IO Unit := do
+  let (cfg, gdx) := smartDispatch n
   Execute.executeShaderNamed device
-    (vecAddKernel n)
+    (vecAddKernel n gdx)
     [("a", aBuf), ("b", bBuf), ("output", outputBuf)]
-    (Execute.ExecutionConfig.dispatch1D n 256)
+    cfg
 
 /-! ## 3. Outer Product -/
 
 /-- `result[i * inDim + j] = vec_a[i] * vec_b[j]`
-    Writes fresh (does NOT accumulate). -/
-def outerProductKernel (outDim inDim : Nat) : ShaderM Unit := do
+    Writes fresh (does NOT accumulate). Supports 2D dispatch. -/
+def outerProductKernel (outDim inDim : Nat) (gridDimX : Nat := 0) : ShaderM Unit := do
   let gid ← ShaderM.globalId
-  let idx := Exp.vec3X gid
+  let idx := if gridDimX == 0 then Exp.vec3X gid
+    else Exp.add (Exp.vec3X gid) (Exp.mul (Exp.vec3Y gid) (Exp.litU32 gridDimX))
 
   let total := outDim * inDim
   let _vecA ← ShaderM.declareInputBuffer "vec_a" (.array (.scalar .f32) outDim)
@@ -100,19 +119,21 @@ def outerProductKernel (outDim inDim : Nat) : ShaderM Unit := do
   ) (pure ())
 
 def executeOuterProduct (device : Device) (vecABuf vecBBuf resultBuf : Buffer)
-    (outDim inDim : Nat) : IO Unit :=
+    (outDim inDim : Nat) : IO Unit := do
+  let (cfg, gdx) := smartDispatch (outDim * inDim)
   Execute.executeShaderNamed device
-    (outerProductKernel outDim inDim)
+    (outerProductKernel outDim inDim gdx)
     [("vec_a", vecABuf), ("vec_b", vecBBuf), ("result", resultBuf)]
-    (Execute.ExecutionConfig.dispatch1D (outDim * inDim) 256)
+    cfg
 
 /-! ## 4. SGD Update (in-place) -/
 
 /-- `param[i] = param[i] - lr * grad[i]`
-    `param` is read-write (declared as output). -/
-def sgdUpdateKernel (n : Nat) (lr : Float) : ShaderM Unit := do
+    `param` is read-write. Supports 2D dispatch. -/
+def sgdUpdateKernel (n : Nat) (lr : Float) (gridDimX : Nat := 0) : ShaderM Unit := do
   let gid ← ShaderM.globalId
-  let i := Exp.vec3X gid
+  let i := if gridDimX == 0 then Exp.vec3X gid
+    else Exp.add (Exp.vec3X gid) (Exp.mul (Exp.vec3Y gid) (Exp.litU32 gridDimX))
 
   let _grad ← ShaderM.declareInputBuffer "grad" (.array (.scalar .f32) n)
   let _param ← ShaderM.declareOutputBuffer "param" (.array (.scalar .f32) n)
@@ -125,18 +146,20 @@ def sgdUpdateKernel (n : Nat) (lr : Float) : ShaderM Unit := do
   ) (pure ())
 
 def executeSGDUpdate (device : Device) (paramBuf gradBuf : Buffer)
-    (n : Nat) (lr : Float) : IO Unit :=
+    (n : Nat) (lr : Float) : IO Unit := do
+  let (cfg, gdx) := smartDispatch n
   Execute.executeShaderNamed device
-    (sgdUpdateKernel n lr)
+    (sgdUpdateKernel n lr gdx)
     [("grad", gradBuf), ("param", paramBuf)]
-    (Execute.ExecutionConfig.dispatch1D n 256)
+    cfg
 
 /-! ## 5. Buffer Copy -/
 
-/-- `dst[i] = src[i]` -/
-def copyBufferKernel (n : Nat) : ShaderM Unit := do
+/-- `dst[i] = src[i]`. Supports 2D dispatch. -/
+def copyBufferKernel (n : Nat) (gridDimX : Nat := 0) : ShaderM Unit := do
   let gid ← ShaderM.globalId
-  let i := Exp.vec3X gid
+  let i := if gridDimX == 0 then Exp.vec3X gid
+    else Exp.add (Exp.vec3X gid) (Exp.mul (Exp.vec3Y gid) (Exp.litU32 gridDimX))
 
   let _src ← ShaderM.declareInputBuffer "src" (.array (.scalar .f32) n)
   let _dst ← ShaderM.declareOutputBuffer "dst" (.array (.scalar .f32) n)
@@ -146,10 +169,11 @@ def copyBufferKernel (n : Nat) : ShaderM Unit := do
     ShaderM.writeBuffer (ty := .scalar .f32) "dst" i v
   ) (pure ())
 
-def executeCopy (device : Device) (srcBuf dstBuf : Buffer) (n : Nat) : IO Unit :=
+def executeCopy (device : Device) (srcBuf dstBuf : Buffer) (n : Nat) : IO Unit := do
+  let (cfg, gdx) := smartDispatch n
   Execute.executeShaderNamed device
-    (copyBufferKernel n)
+    (copyBufferKernel n gdx)
     [("src", srcBuf), ("dst", dstBuf)]
-    (Execute.ExecutionConfig.dispatch1D n 256)
+    cfg
 
 end Hesper.TTT.Kernels
