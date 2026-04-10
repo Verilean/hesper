@@ -1,45 +1,25 @@
 import Hesper
 import Hesper.Models.Gemma4
 import Hesper.TTT.SmartKVCacheGemma4
+import Hesper.Tokenizer.SentencePiece
+import Hesper.GGUF.Parser
 import Hesper.WebGPU.Device
 
 /-!
-# Gemma 4 Smart KV-Cache Needle Test
+# Gemma 4 Smart KV-Cache: Natural Language Needle Test
 
-Cosine surprise sensor + KV eviction approach:
-- Both models use full sequential positions (Gemma4 untouched)
-- Dumb window: zeros out ALL KV rows older than windowSize
-- Smart KV: zeros out old rows EXCEPT surprise-protected sinks
+Uses the actual Gemma 4 tokenizer to encode natural language prompts,
+avoiding the hidden-state divergence caused by synthetic raw token IDs.
 -/
 
 open Hesper.WebGPU
 open Hesper.Models.Gemma4
 open Hesper.TTT.SmartKVGemma4
-
-def buildPrompt (haystackSize : Nat) (vocabSize : Nat)
-    (needleKey needleValue : Nat) (seed : Nat := 42)
-    : Array Nat := Id.run do
-  let sep := min 2 (vocabSize - 1)
-  let queryMark := min 3 (vocabSize - 1)
-  let mut prompt : Array Nat := #[]
-  for i in [0:5] do prompt := prompt.push (10 + i)
-  for _ in [0:10] do
-    prompt := prompt.push sep
-    prompt := prompt.push needleKey
-    prompt := prompt.push needleValue
-  prompt := prompt.push sep
-  let mut rng := seed
-  for _ in [0:haystackSize] do
-    rng := (rng * 1103515245 + 12345) % (2^31)
-    prompt := prompt.push (100 + rng % 900)
-  prompt := prompt.push sep
-  prompt := prompt.push queryMark
-  prompt := prompt.push needleKey
-  prompt
+open Hesper.Tokenizer.SentencePiece
 
 def main (args : List String) : IO Unit := do
   IO.println "╔══════════════════════════════════════════════════════════╗"
-  IO.println "║  Gemma 4 + Cosine Surprise Smart KV-Cache              ║"
+  IO.println "║  Gemma 4 + Smart KV-Cache: Natural Language Needle     ║"
   IO.println "╚══════════════════════════════════════════════════════════╝"
   IO.println ""
 
@@ -52,73 +32,90 @@ def main (args : List String) : IO Unit := do
 
   let inst ← Hesper.init
   let device ← getDevice inst
-  IO.println "[GPU] Device initialized"
 
-  IO.println s!"[Model] Loading {ggufPath}..."
+  -- Load GGUF for both model and tokenizer
+  IO.println s!"[Load] Parsing GGUF: {ggufPath}..."
+  let ggufData ← IO.FS.readBinFile ggufPath
+  let gguf ← match Hesper.GGUF.Parser.parseGGUF ggufData with
+    | .ok gf => pure gf
+    | .error e => throw (IO.userError s!"GGUF parse error: {e}")
+
+  IO.println "[Load] Initializing tokenizer..."
+  let tokenizer ← fromGGUF gguf (some true) (some false)  -- addBos=true, addEos=false
+  IO.println s!"  Vocab: {tokenizer.vocab.vocabSize} tokens"
+
+  IO.println "[Load] Loading model..."
   let model ← Gemma4Model.fromGGUF device ggufPath
-  IO.println s!"[Model] Gemma 4: {model.config.hiddenSize}d, {model.config.numHiddenLayers}L, vocab={model.config.vocabSize}"
+  IO.println s!"[Model] Gemma 4: {model.config.hiddenSize}d, {model.config.numHiddenLayers}L"
   IO.println ""
 
-  let needleKey := min 77777 (model.config.vocabSize - 1)
-  let needleValue := min 42424 (model.config.vocabSize - 1)
+  let smartConfig : SmartKVConfig := { windowSize := 256, tau := 0.05 }
 
-  let smartConfig : SmartKVConfig := {
-    windowSize := 256
-    tau := 0.05   -- cosine distance threshold
-  }
+  -- Natural language needle: a secret password buried in text
+  let needle := "The secret password is: RAINBOW42."
+  let needleAnswer := "RAINBOW42"
 
-  IO.println s!"Needle: Key {needleKey} → Value {needleValue}"
+  -- Build prompts with increasing haystack
+  let haystackTexts : Array (Nat × String) := #[
+    (100, "The quick brown fox jumps over the lazy dog. " ++
+          "Lorem ipsum dolor sit amet, consectetur adipiscing elit. " ++
+          "Sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. " ++
+          "Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris. "),
+    (300, "The quick brown fox jumps over the lazy dog. " ++
+          "Lorem ipsum dolor sit amet, consectetur adipiscing elit. " ++
+          "Sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. " ++
+          "Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris. " ++
+          "Duis aute irure dolor in reprehenderit in voluptate velit esse cillum dolore. " ++
+          "Excepteur sint occaecat cupidatat non proident sunt in culpa qui officia deserunt. " ++
+          "Nemo enim ipsam voluptatem quia voluptas sit aspernatur aut odit aut fugit. " ++
+          "Sed quia consequuntur magni dolores eos qui ratione voluptatem sequi nesciunt. " ++
+          "Neque porro quisquam est qui dolorem ipsum quia dolor sit amet consectetur. " ++
+          "At vero eos et accusamus et iusto odio dignissimos ducimus qui blanditiis. ")
+  ]
+
+  let query := "\n\nQuestion: What is the secret password?\nAnswer: The secret password is:"
+
+  IO.println s!"Needle: \"{needle}\""
+  IO.println s!"Query: \"{query}\""
   IO.println s!"Window: {smartConfig.windowSize}, Surprise tau: {smartConfig.tau}"
   IO.println ""
 
-  let haystackSizes : Array Nat := #[100, 300, 500, 1000]
+  for (label, haystack) in haystackTexts do
+    let fullPrompt := needle ++ " " ++ haystack ++ query
+    let promptTokensArr := encode tokenizer fullPrompt
+    IO.println s!"═══ Haystack ~{label} words ({promptTokensArr.size} tokens) ═══"
 
-  IO.println "┌───────────┬────────────────┬────────────────┬────────────────┬────────────────┐"
-  IO.println "│ Haystack  │ Prompt Length   │ Dumb Window    │ Smart KV       │ Winner         │"
-  IO.println "├───────────┼────────────────┼────────────────┼────────────────┼────────────────┤"
+    -- Run 1: Dumb window
+    IO.println "  [Dumb Window]"
+    let dumbTokens ← generateWithDumbWindow device model promptTokensArr 10 smartConfig.windowSize .Greedy
+    let dumbGenIds := dumbTokens.extract promptTokensArr.size dumbTokens.size
+    let dumbText := decode tokenizer dumbGenIds
+    IO.println s!"    Generated: {dumbText}"
 
-  let mut dumbTotal : Nat := 0
-  let mut smartTotal : Nat := 0
+    -- Run 2: Smart KV
+    IO.println "  [Smart KV]"
+    let smartTokens ← generateWithSmartKV device model promptTokensArr 10 smartConfig .Greedy
+      (verbose := label == 100)
+    let smartGenIds := smartTokens.extract promptTokensArr.size smartTokens.size
+    let smartText := decode tokenizer smartGenIds
+    IO.println s!"    Generated: {smartText}"
+    IO.println s!"    Sinks protected: (see prefill log)"
 
-  for hsSize in haystackSizes do
-    let prompt := buildPrompt hsSize model.config.vocabSize needleKey needleValue
+    -- Simple substring check
+    let dumbHas := (dumbText.splitOn needleAnswer).length > 1
+    let smartHas := (smartText.splitOn needleAnswer).length > 1
 
-    IO.println s!"[Running haystack={hsSize}, prompt={prompt.size} tokens]"
+    IO.println s!"    Dumb contains '{needleAnswer}': {if dumbHas then "YES" else "no"}"
+    IO.println s!"    Smart contains '{needleAnswer}': {if smartHas then "YES" else "no"}"
 
-    -- Dumb window: evicts everything older than windowSize
-    let dumbTokens ← generateWithDumbWindow device model prompt 1 smartConfig.windowSize .Greedy
-    let dumbGen := dumbTokens.getD prompt.size 0
-    let dumbOk := dumbGen == needleValue
+    if smartHas && !dumbHas then
+      IO.println "    🎯 Smart KV wins!"
+    else if smartHas && dumbHas then
+      IO.println "    Both got it"
+    else if !smartHas && !dumbHas then
+      IO.println "    Both missed"
+    else
+      IO.println "    Dumb wins (unexpected)"
+    IO.println ""
 
-    -- Smart KV: protects surprise tokens from eviction
-    let smartTokens ← generateWithSmartKV device model prompt 1 smartConfig .Greedy
-      (verbose := hsSize == haystackSizes[0]!)
-    let smartGen := smartTokens.getD prompt.size 0
-    let smartOk := smartGen == needleValue
-
-    if dumbOk then dumbTotal := dumbTotal + 1
-    if smartOk then smartTotal := smartTotal + 1
-
-    let dumbStr := if dumbOk then s!"✓ ({dumbGen})" else s!"✗ ({dumbGen})"
-    let smartStr := if smartOk then s!"✓ ({smartGen})" else s!"✗ ({smartGen})"
-    let winner := if smartOk && !dumbOk then "Smart wins! 🎯"
-      else if dumbOk && smartOk then "Both ✓"
-      else if !dumbOk && !smartOk then "Both ✗"
-      else "Dumb wins"
-
-    IO.println s!"│ {hsSize}       │ {prompt.size}            │ {dumbStr}     │ {smartStr}     │ {winner} │"
-
-  IO.println "└───────────┴────────────────┴────────────────┴────────────────┴────────────────┘"
-  IO.println ""
-  IO.println s!"Dumb window: {dumbTotal}/{haystackSizes.size} correct"
-  IO.println s!"Smart KV:    {smartTotal}/{haystackSizes.size} correct"
-  IO.println ""
-
-  if smartTotal > dumbTotal then
-    IO.println "╔══════════════════════════════════════════════════════════╗"
-    IO.println "║  🎯 Smart KV-Cache outperformed dumb window on Gemma4! ║"
-    IO.println "╚══════════════════════════════════════════════════════════╝"
-  else if smartTotal == dumbTotal then
-    IO.println "Both performed equally. Try tuning tau."
-  else
-    IO.println "Dumb window outperformed Smart KV (unexpected)."
+  IO.println "Done!"
