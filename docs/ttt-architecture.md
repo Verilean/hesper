@@ -125,6 +125,60 @@ transpose-matVec (`LM_head^T @ dLogits`).
 Compared to Logit-Space TTT which would add 1.3 GB → only 5.7 GB
 headroom, Hidden-Space TTT is essentially free.
 
+## Current Status & Remaining Challenges
+
+### What Works
+- **Golden test**: 1024/1024 steps pass (logit-space TTT, vocabSize=16)
+- **BitNet integration**: Zero changes to BitNet.lean
+- **Hidden-Space MSE TTT**: Needle recall up to **200 tokens** (4/5 wins)
+- **Gate tuning**: tau=0.005 perfectly separates needle (MSE ~0.01) from
+  haystack (MSE ~0.001-0.003)
+
+### Needle-in-Haystack Results (Best: SGD lr=2.0, tau=0.005, 10 reps)
+
+| Haystack | Prompt | Base | TTT | Winner |
+|----------|--------|------|-----|--------|
+| 10 | 49 | ✓ | ✓ | Both ✓ |
+| 50 | 89 | ✗ | ✓ | TTT 🎯 |
+| 100 | 139 | ✓ | ✓ | Both ✓ |
+| 200 | 239 | ✗ | ✓ | TTT 🎯 |
+| 500 | 539 | ✗ | ✗ | Both ✗ |
+
+### Key Findings
+
+1. **MSE > CE for TTT gradients**: Hidden-space MSE reconstruction
+   bypasses the 128K-dim softmax bottleneck. Recall range improved
+   from 30 tokens (CE) to 200 tokens (MSE).
+
+2. **SGD > Adam for few-shot TTT**: Adam's momentum/adaptive scaling
+   destabilizes with only ~10 gradient steps. SGD with aggressive
+   lr=2.0 is more effective for this regime.
+
+3. **Stability Gap at 500+ tokens**: Even with perfect gate filtering
+   (tau=0.005), the 26 MB W_ttt matrix (2560×2560) cannot reliably
+   hold memories across 500+ tokens of haystack noise. The weight
+   space has limited capacity and gradients from later tokens
+   interfere with earlier memories.
+
+4. **Vocab-scale limits**: Full vocab TTT (128K×2560 = 1.3 GB) causes
+   OOM. Hidden-space (2560×2560 = 26 MB) solved this.
+
+### Next Direction: Surprise-Gated Smart KV-Cache
+
+The key insight from TTT experiments is that the **Surprise Gate is an
+excellent sensor** for detecting important tokens. Rather than updating
+TTT weights (which suffer from stability gap), we can use the gate
+signal to route important tokens to **permanent KV cache slots** while
+discarding boring tokens via a sliding window.
+
+This combines:
+- TTT's Surprise Gate (MSE loss spike detection)
+- Attention Sink (permanent slots for important tokens)
+- Sliding Window Attention (recent context in ring buffer)
+
+Expected benefit: O(1) memory with selective permanent memory, no
+gradient updates needed, works with any context length.
+
 ## File Structure
 
 ```
