@@ -1232,6 +1232,9 @@ structure InferenceState where
   plTokenSelected : Buffer    -- [embdPerLayer * numLayers] tok_embd_per_layer[token] dequantized
   plModelProj : Buffer        -- [embdPerLayer * numLayers] per_layer_model_proj @ scaled_embed
   plInputAll : Buffer         -- [embdPerLayer * numLayers] final per-layer input (sum, normed, scaled)
+  -- Partial buffer for tiled (split-K) flash attention. Pre-allocated
+  -- at createInferenceState with size for the maximum tile count.
+  flashPartialBuf : Buffer
   -- Small GPU-side scratch for the raw Q6_K bytes of one per-layer
   -- embedding row (~33 KB for Gemma 4 e4b). The full per-layer
   -- embedding table lives on CPU (> WebGPU single-buffer limit); at
@@ -1299,6 +1302,8 @@ def createInferenceState (device : Device) (cfg : Config) : IO InferenceState :=
     plTokenSelected := ← mkBuf (max (cfg.embdPerLayer * cfg.numHiddenLayers) 1)
     plModelProj := ← mkBuf (max (cfg.embdPerLayer * cfg.numHiddenLayers) 1)
     plInputAll := ← mkBuf (max (cfg.embdPerLayer * cfg.numHiddenLayers) 1)
+    flashPartialBuf := ← FlashAttention.createFlashPartialBuffer device
+                          cfg.numAttentionHeads cfg.maxSeqLen (max cfg.headDimFull cfg.headDimSWA)
     plRawRowBuf := ← do
       -- Raw Q6_K bytes for one per-layer-embd row:
       --   blocksPerRow = ceil((embdPerLayer * numLayers) / 256)
@@ -1436,17 +1441,28 @@ def forwardBlock (device : Device) (block : Gemma4Block) (cfg : Config)
     Hesper.WGSL.Execute.withSection "flashAttn" do
       match block.layerType with
       | .swa =>
-        -- Sliding window attention: only attend within windowSize
+        -- Sliding window attention: only attend within windowSize.
+        -- SWA layers have short effective cacheLen (≤ windowSize), so
+        -- the 1-WG-per-head dispatch is fine — no split-K needed.
         Hesper.WGSL.Execute.executeShaderNamed device
           (FlashAttention.flashAttentionSWAKernel numHeads numKVHeads cfg.maxSeqLen headDim cacheLen cfg.slidingWindowSize pos scale)
           [("q", state.qBuf), ("k_cache", kvCache.kBuf), ("v_cache", kvCache.vBuf), ("output", state.attnOutBuf)]
           (Execute.ExecutionConfig.default (numHeads, 1, 1))
       | .full =>
-        -- Full attention: attend to all cached positions
-        Hesper.WGSL.Execute.executeShaderNamed device
-          (FlashAttention.flashAttentionDynamicKernel numHeads numKVHeads cfg.maxSeqLen headDim cacheLen scale)
-          [("q", state.qBuf), ("k_cache", kvCache.kBuf), ("v_cache", kvCache.vBuf), ("output", state.attnOutBuf)]
-          (Execute.ExecutionConfig.default (numHeads, 1, 1))
+        -- Full attention: use tiled (split-K) flash attention when
+        -- cacheLen is large enough to benefit from multiple tiles.
+        -- For small cacheLen (≤ tileSize=32), the single-WG-per-head
+        -- kernel is faster (1 dispatch vs 2 + intermediate buffer).
+        if cacheLen > 32 then
+          FlashAttention.executeFlashAttentionTiled device
+            state.qBuf kvCache.kBuf kvCache.vBuf state.attnOutBuf
+            numHeads numKVHeads cfg.maxSeqLen headDim cacheLen scale
+            (partialBuf := some state.flashPartialBuf)
+        else
+          Hesper.WGSL.Execute.executeShaderNamed device
+            (FlashAttention.flashAttentionDynamicKernel numHeads numKVHeads cfg.maxSeqLen headDim cacheLen scale)
+            [("q", state.qBuf), ("k_cache", kvCache.kBuf), ("v_cache", kvCache.vBuf), ("output", state.attnOutBuf)]
+            (Execute.ExecutionConfig.default (numHeads, 1, 1))
 
     -- Output projection: attnOut [numHeads * headDim] → normedBuf [hiddenSize]
     Hesper.WGSL.Execute.withSection "oProj" do
