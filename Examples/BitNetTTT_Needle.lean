@@ -101,15 +101,16 @@ def main (args : List String) : IO Unit := do
   IO.println s!"[Model] {model.config.dim}d, {model.config.numLayers}L, vocab={model.config.vocabSize}"
   IO.println ""
 
-  -- Hidden-Space TTT: W_ttt is [dim × dim] = 26 MB (vs 1.3 GB for logit-space)
+  -- Hidden-Space MSE TTT: loss = MSE(W@h_t, h_{t+1} - h_t)
+  -- tau is much smaller than CE-based (MSE values are ~0.001-0.1)
   let hiddenTTTConfig : HiddenTTTConfig := {
     dim := model.config.dim
     vocabSize := model.config.vocabSize
-    innerLR := 0.1   -- higher lr for hidden-space (2560-dim needs stronger updates)
-    tau := 2.0
-    dynamicGate := false   -- static gate: proven to work at haystack=30
+    innerLR := 0.5    -- aggressive lr (MSE gradients are small)
+    tau := 0.001      -- very low threshold (MSE values are tiny)
   }
-  IO.println s!"[TTT] Hidden-Space: W_ttt=[{model.config.dim}×{model.config.dim}] = {model.config.dim * model.config.dim * 4 / 1024} KB"
+  IO.println s!"[TTT] Hidden-Space MSE: W_ttt=[{model.config.dim}×{model.config.dim}] = {model.config.dim * model.config.dim * 4 / 1024} KB"
+  IO.println s!"[TTT] Loss: MSE(W@h_t, h_t1 - h_t), lr={hiddenTTTConfig.innerLR}, tau={hiddenTTTConfig.tau}"
 
   -- Use rare tokens as the needle
   let needleKey := min 77777 (model.config.vocabSize - 1)
@@ -119,7 +120,7 @@ def main (args : List String) : IO Unit := do
   IO.println ""
 
   -- Test at increasing haystack sizes (keep small to avoid OOM/dispatch issues)
-  let haystackSizes : Array Nat := #[10, 30, 50, 100]
+  let haystackSizes : Array Nat := #[10, 30, 50, 100, 200]
 
   IO.println "┌───────────┬────────────────┬────────────────┬────────────────┬────────────────┐"
   IO.println "│ Haystack  │ Prompt Length   │ Base Model     │ TTT Model      │ Winner         │"
