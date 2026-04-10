@@ -38,10 +38,12 @@ def buildNeedlePrompt (haystackSize : Nat) (vocabSize : Nat)
   for i in [0:5] do
     prompt := prompt.push (10 + i)
 
-  -- Inject the needle: sep key value sep
-  prompt := prompt.push sep
-  prompt := prompt.push needleKey
-  prompt := prompt.push needleValue
+  -- Inject the needle 3 times (repetition helps TTT learn)
+  for _ in [0:3] do
+    prompt := prompt.push sep
+    prompt := prompt.push needleKey
+    prompt := prompt.push needleValue
+
   prompt := prompt.push sep
 
   -- Haystack: pseudo-random tokens in range [100, 1000)
@@ -103,7 +105,7 @@ def main (args : List String) : IO Unit := do
   let hiddenTTTConfig : HiddenTTTConfig := {
     dim := model.config.dim
     vocabSize := model.config.vocabSize
-    innerLR := 0.01
+    innerLR := 0.1   -- higher lr for hidden-space (2560-dim needs stronger updates)
     tau := 2.0
   }
   IO.println s!"[TTT] Hidden-Space: W_ttt=[{model.config.dim}×{model.config.dim}] = {model.config.dim * model.config.dim * 4 / 1024} KB"
