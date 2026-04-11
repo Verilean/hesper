@@ -526,9 +526,76 @@ def main : IO Unit := do
   freeCUDABuffer bABuf; freeCUDABuffer bBBuf
   freeCUDABuffer bCBuf1; freeCUDABuffer bCBuf2
 
+  -- ═══ Test 9: mseResidualLossAndGradKernel ═══
   IO.println ""
-  if ok1 && ok2 && ok3 && ok4 && ok5 && ok6 && ok7 && ok8 then
-    IO.println "✓ ALL 8 CUDA KERNEL TESTS PASSED"
+  IO.println "Test 9: mseResidualLossAndGrad (shared mem reduction)"
+  IO.println "──────────────────────────────────────────────────────"
+  let mseDim := 32; let mseWG := 32
+  let ptx9 := generatePTX "mseLoss" {x := mseWG} (mseResidualLossAndGradKernel mseDim mseWG)
+  IO.println s!"  PTX: {ptx9.length} chars"
+  let mod9 ← cuModuleLoadData ptx9
+  let func9 ← cuModuleGetFunction mod9 "mseLoss"
+  IO.println "  JIT: OK"
+
+  let tttOutBuf ← createCUDABuffer (mseDim * 4).toUSize
+  let hiddenTBuf ← createCUDABuffer (mseDim * 4).toUSize
+  let hiddenT1Buf ← createCUDABuffer (mseDim * 4).toUSize
+  let mseGradBuf ← createCUDABuffer (mseDim * 4).toUSize
+  let mseLossBuf ← createCUDABuffer 4
+
+  -- ttt_output = [0..31]/10, hidden_t = [0..31]*0, hidden_t1 = [0..31]/10
+  -- target_residual = hidden_t1 - hidden_t = [0..31]/10
+  -- diff = ttt_output - target_residual = 0 for all
+  -- → MSE loss = 0
+  let tttOut := Array.range mseDim |>.map (fun i => i.toFloat / 10.0)
+  let hiddenT := Array.replicate mseDim 0.0
+  let hiddenT1 := Array.range mseDim |>.map (fun i => i.toFloat / 10.0)
+  writeCUDABuffer tttOutBuf (packFloats tttOut)
+  writeCUDABuffer hiddenTBuf (packFloats hiddenT)
+  writeCUDABuffer hiddenT1Buf (packFloats hiddenT1)
+
+  cuLaunchKernel func9 1 1 1 mseWG.toUInt32 1 1 0
+    #[tttOutBuf.ptr, hiddenTBuf.ptr, hiddenT1Buf.ptr, mseGradBuf.ptr, mseLossBuf.ptr]
+  let lossBytes ← readCUDABufferFull mseLossBuf
+  let loss := unpackFloat lossBytes 0
+  IO.println s!"  Loss (expect 0.0): {loss}"
+  let mut ok9 : Bool := loss.abs < 0.001
+
+  -- Now with non-zero error: ttt_output = 1.0 for all, target = 0
+  -- diff = 1.0, sq = 1.0, sum = 32, MSE = 32/32 = 1.0
+  let tttOut2 := Array.replicate mseDim 1.0
+  let hiddenT2 := Array.replicate mseDim 0.0
+  let hiddenT12 := Array.replicate mseDim 0.0
+  writeCUDABuffer tttOutBuf (packFloats tttOut2)
+  writeCUDABuffer hiddenTBuf (packFloats hiddenT2)
+  writeCUDABuffer hiddenT1Buf (packFloats hiddenT12)
+
+  cuLaunchKernel func9 1 1 1 mseWG.toUInt32 1 1 0
+    #[tttOutBuf.ptr, hiddenTBuf.ptr, hiddenT1Buf.ptr, mseGradBuf.ptr, mseLossBuf.ptr]
+  let lossBytes2 ← readCUDABufferFull mseLossBuf
+  let loss2 := unpackFloat lossBytes2 0
+  IO.println s!"  Loss (expect 1.0): {loss2}"
+  if (loss2 - 1.0).abs > 0.01 then ok9 := false
+
+  -- Check gradients: grad[i] = 2 * 1.0 / 32 = 0.0625
+  let gradBytes ← readCUDABufferFull mseGradBuf
+  let grad0 := unpackFloat gradBytes 0
+  let grad15 := unpackFloat gradBytes 15
+  IO.println s!"  grad[0] (expect 0.0625): {grad0}"
+  IO.println s!"  grad[15] (expect 0.0625): {grad15}"
+  if (grad0 - 0.0625).abs > 0.001 then ok9 := false
+  if (grad15 - 0.0625).abs > 0.001 then ok9 := false
+
+  freeCUDABuffer tttOutBuf; freeCUDABuffer hiddenTBuf
+  freeCUDABuffer hiddenT1Buf; freeCUDABuffer mseGradBuf; freeCUDABuffer mseLossBuf
+  let ok9f : Bool := ok9
+  IO.println s!"  → {if ok9f then "PASSED" else "FAILED"}"
+
+  IO.println ""
+  let ok5f : Bool := ok5; let ok6f : Bool := ok6; let ok7f : Bool := ok7
+  let allOk := ok1 && ok2 && ok3 && ok4 && ok5f && ok6f && ok7f && ok8 && ok9f
+  if allOk then
+    IO.println "✓ ALL 9 CUDA KERNEL TESTS PASSED"
   else
     IO.println "✗ SOME TESTS FAILED"
     IO.Process.exit 1
