@@ -1,9 +1,6 @@
 import Hesper.WGSL.Monad
-import Hesper.WGSL.Execute
 import Hesper.WGSL.Exp
-import Hesper.WebGPU.Types
-import Hesper.WebGPU.Device
-import Hesper.WebGPU.Buffer
+import Hesper.Backend
 import Hesper.Logging
 
 /-!
@@ -75,7 +72,7 @@ namespace Hesper.Layers.Softmax
 
 open Hesper.WGSL
 open Hesper.WGSL.Monad
-open Hesper.WebGPU
+open Hesper
 open Hesper.Logging (logVerbose)
 
 /-! ## Configuration -/
@@ -255,26 +252,18 @@ def create (config : Config) : IO Softmax := do
     @param inputBuf GPU buffer [num_rows, row_size]
     @param outputBuf GPU buffer for output (same shape)
 -/
-def forward (device : Device) (layer : Softmax)
-            (inputBuf outputBuf : Buffer) : IO Unit := do
+@[inline]
+def forward [GPUBackend β] (ctx : β) (layer : Softmax)
+            (inputBuf outputBuf : GPUBackend.Buf β) : IO Unit := do
   logVerbose "[Softmax] Applying softmax..."
-
   let shader := if layer.config.useMask then
     softmaxMaskedKernel layer.config
   else
     softmaxKernel layer.config
-
-  let namedBuffers := [
-    ("input", inputBuf),
-    ("output", outputBuf)
-  ]
-
   let totalElements := layer.config.numRows * layer.config.rowSize
-  let execConfig := Hesper.WGSL.Execute.ExecutionConfig.dispatch1D
-    totalElements
-    256  -- Workgroup size
-
-  Hesper.WGSL.Execute.executeShaderNamed device shader namedBuffers execConfig
+  GPUBackend.execute ctx shader
+    [("input", inputBuf), ("output", outputBuf)]
+    (ExecConfig.dispatch1D totalElements)
   logVerbose "[Softmax] ✓ Forward pass complete"
 
 /-! ## Optimized: Flash Softmax (Future) -/
