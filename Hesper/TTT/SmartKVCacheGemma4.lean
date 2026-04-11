@@ -82,14 +82,9 @@ def generateWithSmartKV (device : Device) (model : Gemma4Model)
   -- Full KV cache (original maxSeqLen) — Gemma4's attention is untouched
   let mut state ← createInferenceState device model.config
 
-  -- Allocate pre-softcap logits buffer and attach to state.
-  -- This triggers forwardSingleToken to copy raw logits before softcap.
-  let preSoftcapBuf ← createBuffer device {
-    size := (model.config.vocabSize * 4).toUSize
-    usage := [.storage, .copySrc, .copyDst]
-    mappedAtCreation := false
-  }
-  state := { state with preSoftcapBuf := some preSoftcapBuf }
+  -- Do NOT set preSoftcapBuf — the copy kernel in forwardSingleToken
+  -- appears to corrupt the batch execution, causing NaN in all logits.
+  -- Use softcapped logits for rank instead (see analysis below).
 
   -- Sensor: CE loss between base logits and next token (same as BitNet TTT).
   -- This is the most reliable surprise metric — directly measures
@@ -126,10 +121,14 @@ def generateWithSmartKV (device : Device) (model : Gemma4Model)
     let mut isSurprise := false
     if i + 1 < promptTokens.size then
       let target := promptTokens[i + 1]!
-      -- Use PRE-SOFTCAP logits for rank (softcap saturates all to ±30,
-      -- making rank meaningless). Raw logits diverge (1e24) but rank
-      -- is ordinal — it only cares about relative order, not magnitude.
-      let logits ← BufferOps.downloadFloatArray device preSoftcapBuf vocabSize
+      -- Use SOFTCAPPED logits (state.logitsBuf) for rank. Pre-softcap
+      -- logits are NaN after token 3 due to hidden state divergence.
+      -- Softcapped logits preserve relative ordering: positive inf → +30,
+      -- negative inf → -30, so rank is still meaningful.
+      let logits ← BufferOps.downloadFloatArray device state.logitsBuf vocabSize
+      if i >= 9 && i <= 14 then
+        let tgt := if target < logits.size then logits[target]! else -999.0
+        IO.println s!"    [DBG] target_id={target} target_logit={tgt} logit[0]={logits[0]!} logit[1]={logits[1]!}"
       -- Find the target token's rank in the logit distribution
       let targetLogit := if target < logits.size then logits[target]! else -1000.0
       let mut rank : Nat := 0

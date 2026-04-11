@@ -54,8 +54,10 @@ def main (args : List String) : IO Unit := do
   -- Natural language needle: a secret password buried in text
   -- Use a truly unpredictable needle: random hex string that no LLM
   -- could have seen in training data or predict from context.
-  let needle := "The encryption key is: x7f2a9b4e1d6c8350."
-  let needleAnswer := "x7f2a9b4e1d6c8350"
+  -- Random unrelated words: impossible for any LLM to predict
+  -- "banana" → "dinosaur" has near-zero probability in any training data
+  let needle := "The secret password is: banana dinosaur galaxy umbrella philosophy."
+  let needleAnswer := "banana dinosaur galaxy umbrella philosophy"
 
   -- Build prompts with increasing haystack
   -- Single test with verbose rank output for analysis
