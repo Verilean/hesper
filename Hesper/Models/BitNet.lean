@@ -1,6 +1,5 @@
-import Hesper.WebGPU.Types
-import Hesper.WebGPU.Device
-import Hesper.WebGPU.Buffer
+import Hesper.Backend
+import Hesper.Backend.WebGPU
 import Hesper.WebGPU.BufferOps
 import Hesper.Layers.Embedding
 import Hesper.Layers.TransformerBlock
@@ -154,7 +153,9 @@ next_token = sample(nucleus)
 
 namespace Hesper.Models.BitNet
 
+open Hesper
 open Hesper.WebGPU
+open Hesper.WGSL.Execute (PreparedDispatch CompiledKernel)
 open Hesper.Layers
 open Hesper.GGUF
 open Hesper.WGSL
@@ -217,9 +218,9 @@ def Config.bitnet1_3B : Config := {
 structure BitNetModel where
   config : Config
   -- Layers
-  embedding : Embedding.Embedding
-  layers : Array TransformerBlock.TransformerBlock
-  finalNorm : RMSNorm.RMSNorm
+  embedding : Embedding.Embedding Buffer
+  layers : Array (TransformerBlock.TransformerBlock Buffer PreparedDispatch CompiledKernel)
+  finalNorm : RMSNorm.RMSNorm Buffer PreparedDispatch
   -- LM head uses weight tying: reuses embedding table as [vocabSize, dim] matrix
   -- output = input @ embedding^T
 
@@ -299,14 +300,14 @@ def forward (device : Device) (model : BitNetModel)
     maxSeqLen := model.config.maxSeqLen
     useCausalMask := true
   }
-  let layerBufs ← TransformerBlock.createLayerBuffers device
+  let layerBufs ← TransformerBlock.createLayerBuffers (β := Device) device
     model.config.dim model.config.ffnDim attnConfig batchSize seqLen
 
   let verbose ← isVerbose
 
   -- Step 1: Embedding lookup (outside batch - needs sync for debug)
   logVerbose "[1/4] Embedding lookup..."
-  Embedding.forward device model.embedding tokenIdsBuf buf1 batchSize seqLen
+  Embedding.forward (β := Device) device model.embedding tokenIdsBuf buf1 batchSize seqLen
 
   -- Debug: Check embedding output (needs GPU readback, so before batch)
   if verbose then
@@ -332,7 +333,7 @@ def forward (device : Device) (model : BitNetModel)
 
   -- Step 3: Final normalization
   logVerbose "[3/4] Final RMSNorm..."
-  RMSNorm.forward device model.finalNorm currentBuf nextBuf (batchSize * seqLen) 256 (some layerBufs.rmsTempBuf)
+  RMSNorm.forward (β := Device) device model.finalNorm currentBuf nextBuf (batchSize * seqLen) 256 (some layerBufs.rmsTempBuf)
 
   -- Step 4: LM head projection to vocabulary (weight tying with embedding)
   logVerbose "[4/4] LM head projection (weight-tied)..."
@@ -362,9 +363,9 @@ def forward (device : Device) (model : BitNetModel)
 
 /-- Full KV cache state for incremental inference -/
 structure KVCacheState where
-  kvCaches : Array Attention.KVCache   -- Per-layer KV caches
-  fusedRefs : Array TransformerBlock.FusedLayerRefs  -- Per-layer fused PreparedDispatch refs
-  layerBufs : TransformerBlock.CachedLayerBuffers  -- Shared temp buffers (single-token)
+  kvCaches : Array (Attention.KVCache Buffer PreparedDispatch)   -- Per-layer KV caches
+  fusedRefs : Array (TransformerBlock.FusedLayerRefs PreparedDispatch)  -- Per-layer fused PreparedDispatch refs
+  layerBufs : TransformerBlock.CachedLayerBuffers Buffer PreparedDispatch  -- Shared temp buffers (single-token)
   buf1 : Buffer        -- [dim] ping-pong buffer
   buf2 : Buffer        -- [dim] ping-pong buffer
   logitsBuf : Buffer   -- [vocabSize]
@@ -384,10 +385,10 @@ def createKVCacheState (device : Device) (model : BitNetModel) : IO KVCacheState
   let mut kvCaches := Array.mkEmpty cfg.numLayers
   let mut fusedRefs := Array.mkEmpty cfg.numLayers
   for _ in [0:cfg.numLayers] do
-    kvCaches := kvCaches.push (← Attention.createKVCache device attnConfig)
-    fusedRefs := fusedRefs.push (← TransformerBlock.createFusedLayerRefs)
+    kvCaches := kvCaches.push (← Attention.createKVCache (β := Device) device attnConfig)
+    fusedRefs := fusedRefs.push (← TransformerBlock.createFusedLayerRefs (β := Device))
   -- Create shared layer buffers
-  let layerBufs ← TransformerBlock.createCachedLayerBuffers device cfg.dim cfg.ffnDim attnConfig
+  let layerBufs ← TransformerBlock.createCachedLayerBuffers (β := Device) device cfg.dim cfg.ffnDim attnConfig
   let mkBuf := fun size => createBuffer device { size := size, usage := [.storage], mappedAtCreation := false }
   let mkBufRW := fun size => createBuffer device { size := size, usage := [.storage, .copySrc, .copyDst], mappedAtCreation := false }
   pure {
@@ -413,7 +414,7 @@ def forwardSingleToken (device : Device) (model : BitNetModel)
   -- Step 1: Embedding lookup (single token) - reuse pre-allocated tokenBuf
   let tokenBytes := Hesper.WebGPU.BufferOps.uint32ToBytes tokenId.toUInt32
   writeBuffer device cacheState.tokenBuf 0 tokenBytes
-  Embedding.forward device model.embedding cacheState.tokenBuf cacheState.buf1 1 1
+  Embedding.forward (β := Device) device model.embedding cacheState.tokenBuf cacheState.buf1 1 1
 
   -- === BEGIN BATCHED EXECUTION ===
   Hesper.WGSL.Execute.beginBatch device
@@ -434,7 +435,7 @@ def forwardSingleToken (device : Device) (model : BitNetModel)
     layerIdx := layerIdx + 1
 
   -- Step 3: Final normalization (single token)
-  RMSNorm.forward device model.finalNorm currentBuf nextBuf 1 256
+  RMSNorm.forward (β := Device) device model.finalNorm currentBuf nextBuf 1 256
 
   -- Step 4: LM head (1×dim @ dim×vocab)
   let lmHeadConfig : Hesper.WGSL.MatMul.Config := {
@@ -831,12 +832,12 @@ def fromGGUFObject (device : Device) (gguf : Hesper.GGUF.GGUFFile) (config : Opt
       -- BitNet models use F16 for embeddings
       IO.println "  Using F16 embeddings"
       let embData ← Hesper.GGUF.Loader.extractF16Tensor gguf "token_embd.weight"
-      Embedding.createFromF16 device embConfig embData
+      Embedding.createFromF16 (β := Device) device embConfig embData
     | .IQ2_XXS =>
       -- TQ2_0 ternary embeddings
       IO.println "  Using TQ2_0 ternary embeddings"
       let (embPackedData, embScalesData) ← Hesper.GGUF.Loader.extractTQ2_0Tensor gguf "token_embd.weight"
-      Embedding.create device embConfig embPackedData embScalesData
+      Embedding.create (β := Device) device embConfig embPackedData embScalesData
     | _ =>
       throw $ IO.userError s!"Unsupported embedding tensor type: {toString embTensorInfo.ggmlType}"
 
@@ -857,25 +858,25 @@ def fromGGUFObject (device : Device) (gguf : Hesper.GGUF.GGUFFile) (config : Opt
     let qConfig : BitLinear.Config := { inDim := cfg.dim, outDim := cfg.dim, batchSize := 1 }
     let wQ ← match Hesper.GGUF.Loader.getI2_S_Tensor gguf s!"blk.{layerIdx}.attn_q.weight" with
       | .ok (packedData, scale, _numElements) =>
-        BitLinear.create device qConfig packedData scale
+        BitLinear.create (β := Device) device qConfig packedData scale
       | .error e => throw $ IO.userError e
 
     let kConfig : BitLinear.Config := { inDim := cfg.dim, outDim := cfg.kvDim, batchSize := 1 }
     let wK ← match Hesper.GGUF.Loader.getI2_S_Tensor gguf s!"blk.{layerIdx}.attn_k.weight" with
       | .ok (packedData, scale, _numElements) =>
-        BitLinear.create device kConfig packedData scale
+        BitLinear.create (β := Device) device kConfig packedData scale
       | .error e => throw $ IO.userError e
 
     let vConfig : BitLinear.Config := { inDim := cfg.dim, outDim := cfg.kvDim, batchSize := 1 }
     let wV ← match Hesper.GGUF.Loader.getI2_S_Tensor gguf s!"blk.{layerIdx}.attn_v.weight" with
       | .ok (packedData, scale, _numElements) =>
-        BitLinear.create device vConfig packedData scale
+        BitLinear.create (β := Device) device vConfig packedData scale
       | .error e => throw $ IO.userError e
 
     let oConfig : BitLinear.Config := { inDim := cfg.dim, outDim := cfg.dim, batchSize := 1 }
     let wO ← match Hesper.GGUF.Loader.getI2_S_Tensor gguf s!"blk.{layerIdx}.attn_output.weight" with
       | .ok (packedData, scale, _numElements) =>
-        BitLinear.create device oConfig packedData scale
+        BitLinear.create (β := Device) device oConfig packedData scale
       | .error e => throw $ IO.userError e
 
     -- Create RoPE layer
@@ -904,7 +905,7 @@ def fromGGUFObject (device : Device) (gguf : Hesper.GGUF.GGUFFile) (config : Opt
       maxSeqLen := cfg.maxSeqLen,
       useCausalMask := true
     }
-    let attention : Attention.Attention := {
+    let attention : Attention.Attention Buffer PreparedDispatch CompiledKernel := {
       config := attnConfig,
       wQ := wQ,
       wK := wK,
@@ -918,19 +919,19 @@ def fromGGUFObject (device : Device) (gguf : Hesper.GGUF.GGUFFile) (config : Opt
     let gateConfig : BitLinear.Config := { inDim := cfg.dim, outDim := cfg.ffnDim, batchSize := 1 }
     let ffnGate ← match Hesper.GGUF.Loader.getI2_S_Tensor gguf s!"blk.{layerIdx}.ffn_gate.weight" with
       | .ok (packedData, scale, _numElements) =>
-        BitLinear.create device gateConfig packedData scale
+        BitLinear.create (β := Device) device gateConfig packedData scale
       | .error e => throw $ IO.userError e
 
     let upConfig : BitLinear.Config := { inDim := cfg.dim, outDim := cfg.ffnDim, batchSize := 1 }
     let ffnUp ← match Hesper.GGUF.Loader.getI2_S_Tensor gguf s!"blk.{layerIdx}.ffn_up.weight" with
       | .ok (packedData, scale, _numElements) =>
-        BitLinear.create device upConfig packedData scale
+        BitLinear.create (β := Device) device upConfig packedData scale
       | .error e => throw $ IO.userError e
 
     let downConfig : BitLinear.Config := { inDim := cfg.ffnDim, outDim := cfg.dim, batchSize := 1 }
     let ffnDown ← match Hesper.GGUF.Loader.getI2_S_Tensor gguf s!"blk.{layerIdx}.ffn_down.weight" with
       | .ok (packedData, scale, _numElements) =>
-        BitLinear.create device downConfig packedData scale
+        BitLinear.create (β := Device) device downConfig packedData scale
       | .error e => throw $ IO.userError e
 
     -- Create transformer block
@@ -942,7 +943,7 @@ def fromGGUFObject (device : Device) (gguf : Hesper.GGUF.GGUFFile) (config : Opt
       maxSeqLen := cfg.maxSeqLen
     }
 
-    let block ← TransformerBlock.createWithLayers device blockConfig
+    let block ← TransformerBlock.createWithLayers (β := Device) device blockConfig
       attnNormData attnSubNormData ffnNormData ffnSubNormData
       attention
       ffnGate ffnUp ffnDown
@@ -953,7 +954,7 @@ def fromGGUFObject (device : Device) (gguf : Hesper.GGUF.GGUFFile) (config : Opt
   IO.println "[5/5] Loading final normalization and LM head..."
   let finalNormData ← Hesper.GGUF.Loader.extractFloat32Tensor gguf "output_norm.weight"
   let finalNormConfig : RMSNorm.Config := { dim := cfg.dim }
-  let finalNorm ← RMSNorm.create device finalNormConfig finalNormData
+  let finalNorm ← RMSNorm.create (β := Device) device finalNormConfig finalNormData
 
   -- LM head: Uses weight tying with embedding table (no separate weights needed)
   IO.println "[LM Head] Using weight tying with embedding layer (no extra weights)"
