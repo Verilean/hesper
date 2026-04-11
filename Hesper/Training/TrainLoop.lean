@@ -7,6 +7,7 @@ import Hesper.Optimizer.GradientClip
 import Hesper.Training.Loss
 import Hesper.Training.AlpacaDataset
 import Hesper.Optimizer.AdamGPU
+import Hesper.Backend.WebGPU
 import Hesper.WebGPU.Types
 import Hesper.WebGPU.Device
 import Hesper.WebGPU.Buffer
@@ -204,7 +205,7 @@ def zeroBuffer (device : Device) (buf : Buffer) (numElements : Nat) : IO Unit :=
 
 /-- Read loss value from GPU buffer (safe, returns 0.0 on failure) -/
 def readLoss (device : Device) (lossBuf : Buffer) : IO Float := do
-  Hesper.Training.SafeBuffer.safeReadF32 device lossBuf
+  Hesper.Training.SafeBuffer.safeReadF32 (β := Device) device lossBuf
 
 /-- Print training progress -/
 def printProgress (epoch step : Nat) (loss : Float) (numTokens : Nat) : IO Unit := do

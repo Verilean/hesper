@@ -62,7 +62,7 @@ def buildNeedlePrompt (haystackSize : Nat) (vocabSize : Nat)
   (prompt, needleValue)
 
 /-- Run one needle test — base model only -/
-def runBaseTest (device : Device) (model : BitNetModel)
+def runBaseTest (device : Device) (model : BitNetModel Buffer PreparedDispatch CompiledKernel)
     (haystackSize : Nat) (needleKey needleValue : Nat)
     : IO (Bool × Nat) := do
   let (prompt, expected) := buildNeedlePrompt haystackSize model.config.vocabSize needleKey needleValue
@@ -71,7 +71,7 @@ def runBaseTest (device : Device) (model : BitNetModel)
   return (generated == expected, generated)
 
 /-- Run one needle test — Hidden-Space TTT model -/
-def runTTTTest (device : Device) (model : BitNetModel) (tttConfig : HiddenTTTConfig)
+def runTTTTest (device : Device) (model : BitNetModel Buffer PreparedDispatch CompiledKernel) (tttConfig : HiddenTTTConfig)
     (haystackSize : Nat) (needleKey needleValue : Nat)
     (verbose : Bool := false)
     : IO (Bool × Nat) := do

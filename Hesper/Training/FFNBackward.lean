@@ -1,6 +1,7 @@
 import Hesper.WGSL.Monad
 import Hesper.WGSL.Execute
 import Hesper.WGSL.Exp
+import Hesper.Backend.WebGPU
 import Hesper.WebGPU.Types
 import Hesper.WebGPU.Device
 import Hesper.WebGPU.Buffer
@@ -40,6 +41,7 @@ namespace Hesper.Training.FFNBackward
 
 open Hesper.WGSL
 open Hesper.WGSL.Monad
+open Hesper.WGSL.Execute (PreparedDispatch CompiledKernel)
 open Hesper.WebGPU
 
 /-- ReLU²×Mul backward kernel.
@@ -104,7 +106,7 @@ def executeReluSqrMulBackward (device : Device) (gateBuf upBuf dHiddenBuf dGateB
     @param dUp Scratch [ffnDim]
     @param dNormed2 Scratch [dim] -/
 def executeFFNBackward (device : Device)
-    (wDown wGate wUp : Hesper.Layers.BitLinear.BitLinear)
+    (wDown wGate wUp : Hesper.Layers.BitLinear.BitLinear Buffer PreparedDispatch CompiledKernel)
     (ffnSubNormScale ffnNormScale : Buffer)
     (dOutputBuf : Buffer)
     (savedHidden savedResidual1 savedGate savedUp : Buffer)

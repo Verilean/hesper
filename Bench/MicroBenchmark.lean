@@ -124,7 +124,7 @@ def main : IO Unit := do
   -- === 5. Elementwise Add (residual) ===
   let addBuf ← createOutputBuffer device numElements
   let elemConfig : Elementwise.Config := { numElements }
-  let addMs ← timeMsAvg iterations (Elementwise.executeAdd device inputBuf outputBuf addBuf elemConfig)
+  let addMs ← timeMsAvg iterations (Elementwise.executeAdd (β := Device) device inputBuf outputBuf addBuf elemConfig)
   IO.println s!"Elementwise Add ({numElements} elems):   {addMs} ms"
 
   -- === 6. ReLU²*Mul (gated activation) ===
@@ -193,14 +193,14 @@ def main : IO Unit := do
   -- Unbatched: each dispatch creates encoder + submits + waits
   let unbatchedMs ← timeMsAvg batchIter (do
     for _ in [0:batchN] do
-      Elementwise.executeAdd device inputBuf outputBuf addBuf elemConfig)
+      Elementwise.executeAdd (β := Device) device inputBuf outputBuf addBuf elemConfig)
   IO.println s!"  {batchN} dispatches (unbatched): {unbatchedMs} ms ({unbatchedMs / batchN.toFloat} ms/dispatch)"
 
   -- Batched: record all dispatches into one encoder, submit once
   let batchedMs ← timeMsAvg batchIter (do
     Hesper.WGSL.Execute.beginBatch device
     for _ in [0:batchN] do
-      Elementwise.executeAdd device inputBuf outputBuf addBuf elemConfig
+      Elementwise.executeAdd (β := Device) device inputBuf outputBuf addBuf elemConfig
     Hesper.WGSL.Execute.endBatch device)
   IO.println s!"  {batchN} dispatches (batched):   {batchedMs} ms ({batchedMs / batchN.toFloat} ms/dispatch)"
   if unbatchedMs > 0 then

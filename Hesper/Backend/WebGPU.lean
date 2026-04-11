@@ -13,7 +13,7 @@ open Hesper.WebGPU
 open Hesper.WGSL.Execute
 open Hesper.WGSL (WorkgroupSize)
 
-instance : GPUBackend Device where
+@[reducible] instance : GPUBackend Device where
   Buf := Buffer
   CachedDispatch := PreparedDispatch
   CompiledKernel := Hesper.WGSL.Execute.CompiledKernel
