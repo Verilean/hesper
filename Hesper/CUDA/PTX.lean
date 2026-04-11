@@ -25,11 +25,13 @@ structure RegF32  where id : Nat deriving BEq, Repr, Inhabited
 structure RegU32  where id : Nat deriving BEq, Repr, Inhabited
 structure RegU64  where id : Nat deriving BEq, Repr, Inhabited
 structure RegPred where id : Nat deriving BEq, Repr, Inhabited
+structure RegB16  where id : Nat deriving BEq, Repr, Inhabited  -- 16-bit (f16/b16)
 
 instance : ToString RegF32  where toString r := s!"%f{r.id}"
 instance : ToString RegU32  where toString r := s!"%r{r.id}"
 instance : ToString RegU64  where toString r := s!"%rd{r.id}"
 instance : ToString RegPred where toString r := s!"%p{r.id}"
+instance : ToString RegB16  where toString r := s!"%h{r.id}"
 
 /-- Untyped register for varMap (bridges Exp's erased types to typed PTX). -/
 inductive AnyReg where
@@ -187,6 +189,11 @@ inductive Inst where
   -- ── type conversions ──
   | cvt_f32_u32 (dst : RegF32) (src : RegU32)
   | cvt_u32_f32 (dst : RegU32) (src : RegF32)
+  | cvt_f32_f16 (dst : RegF32) (src : RegB16)   -- f16 → f32
+  | cvt_f16_f32 (dst : RegB16) (src : RegF32)   -- f32 → f16
+
+  -- ── f16 unpack (u32 → two b16) ──
+  | mov_b32_unpack (lo hi : RegB16) (src : RegU32)  -- mov.b32 {%h_lo, %h_hi}, %r
 
   -- ── comparison → predicate ── (operands must match comparison type)
   | setp_f32    (op : CmpOp) (dst : RegPred) (src1 src2 : RegF32)
@@ -268,6 +275,9 @@ def Inst.toString : Inst → String
   | .mul_wide_u32 d s n  => s!"  mul.wide.u32 {d}, {s}, {n};"
   | .cvt_f32_u32 d s     => s!"  cvt.rn.f32.u32 {d}, {s};"
   | .cvt_u32_f32 d s     => s!"  cvt.rzi.u32.f32 {d}, {s};"
+  | .cvt_f32_f16 d s     => s!"  cvt.f32.f16 {d}, {s};"
+  | .cvt_f16_f32 d s     => s!"  cvt.rn.f16.f32 {d}, {s};"
+  | .mov_b32_unpack l h src => s!"  mov.b32 " ++ "{" ++ s!"{l}, {h}" ++ "}" ++ s!", {src};"
   | .setp_f32 op d a b   => s!"  setp.{op}.f32 {d}, {a}, {b};"
   | .setp_u32 op d a b   => s!"  setp.{op}.u32 {d}, {a}, {b};"
   | .and_pred d a b      => s!"  and.pred {d}, {a}, {b};"
@@ -309,6 +319,7 @@ structure Module where
   rRegCount : Nat
   rdRegCount : Nat
   pRegCount : Nat
+  hRegCount : Nat := 0
 
 def Module.render (m : Module) : String := Id.run do
   let mut s := s!".version {m.version}\n.target {m.target}\n.address_size 64\n\n"
@@ -324,6 +335,7 @@ def Module.render (m : Module) : String := Id.run do
   if m.rRegCount > 0  then s := s ++ s!"  .reg .u32 %r<{m.rRegCount}>;\n"
   if m.rdRegCount > 0 then s := s ++ s!"  .reg .u64 %rd<{m.rdRegCount}>;\n"
   if m.pRegCount > 0  then s := s ++ s!"  .reg .pred %p<{m.pRegCount}>;\n"
+  if m.hRegCount > 0  then s := s ++ s!"  .reg .b16 %h<{m.hRegCount}>;\n"
   s := s ++ "\n"
   for inst in m.body do s := s ++ inst.toString ++ "\n"
   s := s ++ "}\n"
@@ -338,6 +350,7 @@ structure GenState where
   rRegs : Nat := 0
   rdRegs : Nat := 0
   pRegs : Nat := 0
+  hRegs : Nat := 0   -- b16 (f16) registers
   labels : Nat := 0
   insts : Array Inst := #[]
   varMap : List (String × AnyReg) := []
@@ -359,6 +372,9 @@ def freshU64 (s : GenState) : RegU64 × GenState :=
 
 def freshPred (s : GenState) : RegPred × GenState :=
   (⟨s.pRegs⟩, { s with pRegs := s.pRegs + 1 })
+
+def freshB16 (s : GenState) : RegB16 × GenState :=
+  (⟨s.hRegs⟩, { s with hRegs := s.hRegs + 1 })
 
 def freshLabel (s : GenState) : Label × GenState :=
   (⟨s.labels⟩, { s with labels := s.labels + 1 })
