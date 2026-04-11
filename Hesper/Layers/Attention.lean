@@ -399,12 +399,12 @@ def create [GPUBackend β] (ctx : β) (config : Config)
     @param batchSize Batch size
     @param seqLen Sequence length
 -/
-def forward (device : Device) (layer : Attention Buffer PreparedDispatch CompiledKernel)
-            (inputBuf outputBuf : Buffer)
+def forward [GPUBackend β] (ctx : β) (layer : Attention (GPUBackend.Buf β) (GPUBackend.CachedDispatch β) (GPUBackend.CompiledKernel β))
+            (inputBuf outputBuf : GPUBackend.Buf β)
             (batchSize seqLen : Nat)
-            (subNorm : Option (RMSNorm.RMSNorm Buffer PreparedDispatch) := none)
-            (preAllocBufs : Option (AttentionBuffers Buffer) := none)
-            (residualBuf : Option Buffer := none) : IO Unit := do
+            (subNorm : Option (RMSNorm.RMSNorm (GPUBackend.Buf β) (GPUBackend.CachedDispatch β)) := none)
+            (preAllocBufs : Option (AttentionBuffers (GPUBackend.Buf β)) := none)
+            (residualBuf : Option (GPUBackend.Buf β) := none) : IO Unit := do
   let headDim := layer.config.effectiveHeadDim
   let numKVHeads := layer.config.effectiveKVHeads
   let kvDim := layer.config.kvDim
@@ -413,19 +413,19 @@ def forward (device : Device) (layer : Attention Buffer PreparedDispatch Compile
   -- Use pre-allocated or allocate temporary buffers
   let bufs ← match preAllocBufs with
     | some b => pure b
-    | none => createAttentionBuffers (β := Device) device layer.config batchSize seqLen
+    | none => createAttentionBuffers ctx layer.config batchSize seqLen
 
   -- Step 1: Project to Q, K, V using BitLinear
   let numRows := batchSize * seqLen
   logVerbose s!"  [1/7] Projecting to Q, K, V ({numRows} rows)..."
-  BitLinear.forward (β := Device) device layer.wQ inputBuf bufs.qBuf numRows
-  BitLinear.forward (β := Device) device layer.wK inputBuf bufs.kBuf numRows
-  BitLinear.forward (β := Device) device layer.wV inputBuf bufs.vBuf numRows
+  BitLinear.forward ctx layer.wQ inputBuf bufs.qBuf numRows
+  BitLinear.forward ctx layer.wK inputBuf bufs.kBuf numRows
+  BitLinear.forward ctx layer.wV inputBuf bufs.vBuf numRows
 
   -- Step 2: Apply RoPE to Q and K (need temp buffer since WebGPU disallows aliased writable bindings)
   logVerbose "  [2/7] Applying RoPE to Q and K..."
-  RoPE.forward (β := Device) device layer.rope bufs.qBuf bufs.qRotBuf batchSize seqLen layer.config.numHeads headDim
-  RoPE.forward (β := Device) device layer.rope bufs.kBuf bufs.kRotBuf batchSize seqLen numKVHeads headDim
+  RoPE.forward ctx layer.rope bufs.qBuf bufs.qRotBuf batchSize seqLen layer.config.numHeads headDim
+  RoPE.forward ctx layer.rope bufs.kBuf bufs.kRotBuf batchSize seqLen numKVHeads headDim
 
   -- Step 2.5: Reshape for multi-head attention
   -- Q: [batch, seq, numHeads*headDim] → [batch, numHeads, seq, headDim]
@@ -434,10 +434,10 @@ def forward (device : Device) (layer : Attention Buffer PreparedDispatch Compile
   logVerbose "  [2.5/7] Reshaping for multi-head attention..."
 
   -- Q: simple transpose (inputHeads = outputHeads = numHeads)
-  executeReshapeToHeads (β := Device) device bufs.qRotBuf bufs.qHeadBuf batchSize seqLen layer.config.numHeads layer.config.numHeads headDim
+  executeReshapeToHeads ctx bufs.qRotBuf bufs.qHeadBuf batchSize seqLen layer.config.numHeads layer.config.numHeads headDim
   -- K/V: transpose + GQA expansion (inputHeads = numKVHeads, outputHeads = numHeads)
-  executeReshapeToHeads (β := Device) device bufs.kRotBuf bufs.kHeadBuf batchSize seqLen numKVHeads layer.config.numHeads headDim
-  executeReshapeToHeads (β := Device) device bufs.vBuf bufs.vHeadBuf batchSize seqLen numKVHeads layer.config.numHeads headDim
+  executeReshapeToHeads ctx bufs.kRotBuf bufs.kHeadBuf batchSize seqLen numKVHeads layer.config.numHeads headDim
+  executeReshapeToHeads ctx bufs.vBuf bufs.vHeadBuf batchSize seqLen numKVHeads layer.config.numHeads headDim
 
   -- Step 3: Compute attention scores: Q @ K^T / sqrt(head_dim)
   logVerbose "  [3/7] Computing attention scores..."
@@ -450,7 +450,7 @@ def forward (device : Device) (layer : Attention Buffer PreparedDispatch Compile
   }
   let batchedSize := batchSize * layer.config.numHeads
 
-  MatMul.executeBatchedScaledMatMulTranspose (β := Device) device bufs.qHeadBuf bufs.kHeadBuf bufs.scoresBuf attnScoreConfig batchedSize scale
+  MatMul.executeBatchedScaledMatMulTranspose ctx bufs.qHeadBuf bufs.kHeadBuf bufs.scoresBuf attnScoreConfig batchedSize scale
 
   -- Step 4: Apply softmax with optional causal mask
   logVerbose "  [4/7] Applying softmax..."
@@ -460,7 +460,7 @@ def forward (device : Device) (layer : Attention Buffer PreparedDispatch Compile
     useMask := layer.config.useCausalMask
   }
   let softmaxLayer ← Softmax.create softmaxConfig
-  Softmax.forward (β := Device) device softmaxLayer bufs.scoresBuf bufs.attnBuf
+  Softmax.forward ctx softmaxLayer bufs.scoresBuf bufs.attnBuf
 
   -- Step 5: Apply attention to values: attn @ V
   -- attn: [batch*heads, seq, seq], V: [batch*heads, seq, headDim] → [batch*heads, seq, headDim]
@@ -471,18 +471,18 @@ def forward (device : Device) (layer : Attention Buffer PreparedDispatch Compile
     K := seqLen
   }
   -- Reuse qHeadBuf for output (same size: [batch, numHeads, seq, headDim])
-  MatMul.executeBatchedMatMul (β := Device) device bufs.attnBuf bufs.vHeadBuf bufs.qHeadBuf attnVConfig batchedSize
+  MatMul.executeBatchedMatMul ctx bufs.attnBuf bufs.vHeadBuf bufs.qHeadBuf attnVConfig batchedSize
 
   -- Step 5.5: Reshape back: [batch, numHeads, seq, headDim] → [batch, seq, numHeads*headDim]
   logVerbose "  [5.5/7] Reshaping attention output..."
-  executeReshapeFromHeads (β := Device) device bufs.qHeadBuf bufs.reshapedOutBuf batchSize seqLen layer.config.numHeads headDim
+  executeReshapeFromHeads ctx bufs.qHeadBuf bufs.reshapedOutBuf batchSize seqLen layer.config.numHeads headDim
 
   -- Step 5.7: Apply attention sub-norm (if provided) - BitNet specific
   -- This normalizes the attention output before the O projection
   let attnOutForO ← match subNorm with
     | some norm => do
       logVerbose "  [5.7/7] Applying attention sub-norm..."
-      RMSNorm.forward (β := Device) device norm bufs.reshapedOutBuf bufs.subNormBuf numRows 256 (some bufs.rmsTempBuf)
+      RMSNorm.forward ctx norm bufs.reshapedOutBuf bufs.subNormBuf numRows 256 (some bufs.rmsTempBuf)
       pure bufs.subNormBuf
     | none => pure bufs.reshapedOutBuf
 
@@ -490,9 +490,9 @@ def forward (device : Device) (layer : Attention Buffer PreparedDispatch Compile
   logVerbose s!"  [6/7] Output projection ({numRows} rows)..."
   match residualBuf with
   | some resBuf =>
-    BitLinear.forwardWithResidual (β := Device) device layer.wO attnOutForO resBuf outputBuf numRows
+    BitLinear.forwardWithResidual ctx layer.wO attnOutForO resBuf outputBuf numRows
   | none =>
-    BitLinear.forward (β := Device) device layer.wO attnOutForO outputBuf numRows
+    BitLinear.forward ctx layer.wO attnOutForO outputBuf numRows
 
   logVerbose "[Attention] ✓ Forward pass complete"
 
@@ -803,13 +803,12 @@ def cachedApplyKernel (numHeads numKVHeads maxSeqLen headDim : Nat) : ShaderM Un
 
     @param pos Position of the new token (0-indexed)
 -/
-def forwardWithCache (device : Device) (layer : Attention Buffer PreparedDispatch CompiledKernel)
-                     (inputBuf outputBuf : Buffer)
-                     (kvCache : KVCache Buffer PreparedDispatch) (pos : Nat)
-                     (subNorm : Option (RMSNorm.RMSNorm Buffer PreparedDispatch) := none)
-                     (preAllocBufs : Option (CachedAttentionBuffers Buffer PreparedDispatch) := none)
-                     (residualBuf : Option Buffer := none)
-                     (loraOpt : Option (Hesper.LoRA.LayerAdapter × Float × Buffer × Buffer × Buffer) := none) : IO Unit := do
+def forwardWithCache [GPUBackend β] (ctx : β) (layer : Attention (GPUBackend.Buf β) (GPUBackend.CachedDispatch β) (GPUBackend.CompiledKernel β))
+                     (inputBuf outputBuf : GPUBackend.Buf β)
+                     (kvCache : KVCache (GPUBackend.Buf β) (GPUBackend.CachedDispatch β)) (pos : Nat)
+                     (subNorm : Option (RMSNorm.RMSNorm (GPUBackend.Buf β) (GPUBackend.CachedDispatch β)) := none)
+                     (preAllocBufs : Option (CachedAttentionBuffers (GPUBackend.Buf β) (GPUBackend.CachedDispatch β)) := none)
+                     (residualBuf : Option (GPUBackend.Buf β) := none) : IO Unit := do
   let headDim := layer.config.effectiveHeadDim
   let numKVHeads := layer.config.effectiveKVHeads
   let kvDim := layer.config.kvDim
@@ -821,20 +820,12 @@ def forwardWithCache (device : Device) (layer : Attention Buffer PreparedDispatc
 
   let bufs ← match preAllocBufs with
     | some b => pure b
-    | none => createCachedAttentionBuffers (β := Device) device layer.config
+    | none => createCachedAttentionBuffers ctx layer.config
 
   -- Step 1: Project Q, K_new, V_new (single row)
-  BitLinear.forward (β := Device) device layer.wQ inputBuf bufs.qBuf 1
-  BitLinear.forward (β := Device) device layer.wK inputBuf bufs.kNewBuf 1
-  BitLinear.forward (β := Device) device layer.wV inputBuf bufs.vNewBuf 1
-
-  -- Step 1.5: LoRA corrections on Q and V (BEFORE RoPE)
-  match loraOpt with
-  | some (loraAdapter, loraScale, loraHBuf, _loraYBufQ, _loraYBufV) =>
-    -- Fused LoRA: projectA + fusedBAdd (2 dispatches per projection instead of 3)
-    Hesper.LoRA.Forward.executeLoRAForwardFused device loraAdapter.loraQ loraScale inputBuf bufs.qBuf loraHBuf
-    Hesper.LoRA.Forward.executeLoRAForwardFused device loraAdapter.loraV loraScale inputBuf bufs.vNewBuf loraHBuf
-  | none => pure ()
+  BitLinear.forward ctx layer.wQ inputBuf bufs.qBuf 1
+  BitLinear.forward ctx layer.wK inputBuf bufs.kNewBuf 1
+  BitLinear.forward ctx layer.wV inputBuf bufs.vNewBuf 1
 
   -- Write params buffer: [pos: u32, cacheLen: u32]
   -- Done BEFORE RoPE so the dynamic kernel can read posOffset from params[0]
@@ -847,20 +838,20 @@ def forwardWithCache (device : Device) (layer : Attention Buffer PreparedDispatc
     |>.push ((cacheLen.toUInt32 >>> 8) &&& 0xFF).toUInt8
     |>.push ((cacheLen.toUInt32 >>> 16) &&& 0xFF).toUInt8
     |>.push ((cacheLen.toUInt32 >>> 24) &&& 0xFF).toUInt8
-  GPUBackend.writeBuffer (β := Device) device bufs.paramsBuf paramsBytes
+  GPUBackend.writeBuffer ctx bufs.paramsBuf paramsBytes
 
   -- Step 2: Apply RoPE at position `pos` (reads posOffset from params[0])
-  RoPE.forwardDynamic (β := Device) device layer.rope bufs.qBuf bufs.qRotBuf bufs.paramsBuf 1 1 numHeads headDim (some bufs.preparedRopeQ)
-  RoPE.forwardDynamic (β := Device) device layer.rope bufs.kNewBuf bufs.kRotBuf bufs.paramsBuf 1 1 numKVHeads headDim (some bufs.preparedRopeK)
+  RoPE.forwardDynamic ctx layer.rope bufs.qBuf bufs.qRotBuf bufs.paramsBuf 1 1 numHeads headDim (some bufs.preparedRopeQ)
+  RoPE.forwardDynamic ctx layer.rope bufs.kNewBuf bufs.kRotBuf bufs.paramsBuf 1 1 numKVHeads headDim (some bufs.preparedRopeK)
 
   -- Step 3: Append K (after RoPE) and V to cache at position `pos` (fused single dispatch)
   let cwWx := (kvDim + 255) / 256
   if let some p ← kvCache.preparedCacheWriteKV.get then
-    GPUBackend.replayCached (β := Device) device p (cwWx, 1, 1)
+    GPUBackend.replayCached ctx p (cwWx, 1, 1)
   else
     let writeShader := fusedCacheWriteKVKernel numKVHeads maxSeqLen headDim kvDim
     let writeCacheKey : UInt64 := hash ("cwkv", numKVHeads, maxSeqLen, headDim, kvDim)
-    GPUBackend.executeWithConfigCached (β := Device) device writeShader
+    GPUBackend.executeWithConfigCached ctx writeShader
       [("new_k", bufs.kRotBuf), ("new_v", bufs.vNewBuf),
        ("k_cache", kvCache.kBuf), ("v_cache", kvCache.vBuf),
        ("params", bufs.paramsBuf)]
@@ -871,23 +862,23 @@ def forwardWithCache (device : Device) (layer : Attention Buffer PreparedDispatc
   -- Uses diagnostic(off, derivative_uniformity) to allow barrier in dynamic loop.
   -- Single dispatch per head, no intermediate score/attn buffers.
   let attnScale := 1.0 / headDim.toFloat.sqrt
-  Hesper.WGSL.FlashAttention.executeFlashAttentionWithParams (β := Device) device
+  Hesper.WGSL.FlashAttention.executeFlashAttentionWithParams ctx
     bufs.qRotBuf kvCache.kBuf kvCache.vBuf bufs.paramsBuf bufs.qRotBuf
     numHeads numKVHeads maxSeqLen headDim attnScale
 
   -- Step 7: Sub-norm (if provided)
   let attnOutForO ← match subNorm with
     | some norm => do
-      RMSNorm.forward (β := Device) device norm bufs.qRotBuf bufs.subNormBuf 1 256 (some bufs.rmsTempBuf)
+      RMSNorm.forward ctx norm bufs.qRotBuf bufs.subNormBuf 1 256 (some bufs.rmsTempBuf)
       pure bufs.subNormBuf
     | none => pure bufs.qRotBuf
 
   -- Step 8: O projection (with optional fused residual add)
   match residualBuf with
   | some resBuf =>
-    BitLinear.forwardWithResidual (β := Device) device layer.wO attnOutForO resBuf outputBuf 1
+    BitLinear.forwardWithResidual ctx layer.wO attnOutForO resBuf outputBuf 1
   | none =>
-    BitLinear.forward (β := Device) device layer.wO attnOutForO outputBuf 1
+    BitLinear.forward ctx layer.wO attnOutForO outputBuf 1
 
   logVerbose "[Attention] ✓ Cached forward complete"
 
