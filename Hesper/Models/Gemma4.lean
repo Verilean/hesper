@@ -1243,6 +1243,11 @@ structure InferenceState where
   -- Sized to the maximum row bytes seen at load time; left as a small
   -- placeholder when per-layer embeddings are absent.
   plRawRowBuf : Buffer
+  -- Optional: pre-softcap logits buffer for TTT surprise sensor.
+  -- When `some`, forwardSingleToken copies logitsBuf here BEFORE
+  -- applying logit softcap. When `none` (default), no copy is done
+  -- and there is zero performance impact.
+  preSoftcapBuf : Option Buffer := none
 
 /-- Create inference state with pre-allocated buffers -/
 def createInferenceState (device : Device) (cfg : Config) : IO InferenceState := do
@@ -1824,6 +1829,16 @@ def forwardSingleToken (device : Device) (model : Gemma4Model)
         M := 1, N := model.config.vocabSize, K := model.config.hiddenSize
       }
       Hesper.WGSL.MatMul.executeMatMulTranspose device nextBuf model.outputWeight state.logitsBuf lmHeadConfig
+
+  -- Optional: save pre-softcap logits for TTT surprise sensor.
+  -- Only runs when preSoftcapBuf is set (zero cost otherwise).
+  match state.preSoftcapBuf with
+  | some psBuf =>
+    Hesper.WGSL.Execute.executeShaderNamed device
+      (PerLayerEmbedding.scaleKernel model.config.vocabSize 1.0)
+      [("input", state.logitsBuf), ("output", psBuf)]
+      (.dispatch1D model.config.vocabSize)
+  | none => pure ()
 
   -- Step 5: Logit softcapping (y = scale * tanh(x / scale))
   Hesper.WGSL.Execute.withSection "logitSoftcap" do
