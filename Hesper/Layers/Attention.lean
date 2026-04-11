@@ -450,7 +450,7 @@ def forward (device : Device) (layer : Attention Buffer PreparedDispatch Compile
   }
   let batchedSize := batchSize * layer.config.numHeads
 
-  MatMul.executeBatchedScaledMatMulTranspose device bufs.qHeadBuf bufs.kHeadBuf bufs.scoresBuf attnScoreConfig batchedSize scale
+  MatMul.executeBatchedScaledMatMulTranspose (β := Device) device bufs.qHeadBuf bufs.kHeadBuf bufs.scoresBuf attnScoreConfig batchedSize scale
 
   -- Step 4: Apply softmax with optional causal mask
   logVerbose "  [4/7] Applying softmax..."
@@ -471,7 +471,7 @@ def forward (device : Device) (layer : Attention Buffer PreparedDispatch Compile
     K := seqLen
   }
   -- Reuse qHeadBuf for output (same size: [batch, numHeads, seq, headDim])
-  MatMul.executeBatchedMatMul device bufs.attnBuf bufs.vHeadBuf bufs.qHeadBuf attnVConfig batchedSize
+  MatMul.executeBatchedMatMul (β := Device) device bufs.attnBuf bufs.vHeadBuf bufs.qHeadBuf attnVConfig batchedSize
 
   -- Step 5.5: Reshape back: [batch, numHeads, seq, headDim] → [batch, seq, numHeads*headDim]
   logVerbose "  [5.5/7] Reshaping attention output..."
@@ -871,7 +871,7 @@ def forwardWithCache (device : Device) (layer : Attention Buffer PreparedDispatc
   -- Uses diagnostic(off, derivative_uniformity) to allow barrier in dynamic loop.
   -- Single dispatch per head, no intermediate score/attn buffers.
   let attnScale := 1.0 / headDim.toFloat.sqrt
-  Hesper.WGSL.FlashAttention.executeFlashAttentionWithParams device
+  Hesper.WGSL.FlashAttention.executeFlashAttentionWithParams (β := Device) device
     bufs.qRotBuf kvCache.kBuf kvCache.vBuf bufs.paramsBuf bufs.qRotBuf
     numHeads numKVHeads maxSeqLen headDim attnScale
 
