@@ -4,6 +4,7 @@ import Hesper.TTT.Kernels
 import Hesper.Training.SafeBuffer
 import Hesper.Optimizer.AdamGPU
 import Hesper.WebGPU.BufferOps
+import Hesper.Backend.WebGPU
 import Hesper.Inference.Sampling
 import Hesper.WGSL.MatMul
 

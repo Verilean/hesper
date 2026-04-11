@@ -1,3 +1,4 @@
+import Hesper.Backend.WebGPU
 import Hesper.Models.Gemma4
 import Hesper.TTT.Kernels
 import Hesper.Training.Loss
