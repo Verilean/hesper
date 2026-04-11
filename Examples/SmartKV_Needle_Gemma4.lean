@@ -90,21 +90,21 @@ def main (args : List String) : IO Unit := do
     let promptTokensArr := encode tokenizer fullPrompt
     IO.println s!"═══ Haystack ~{label} words ({promptTokensArr.size} tokens) ═══"
 
-    -- Run 1: Dumb window
-    IO.println "  [Dumb Window]"
-    let dumbTokens ← generateWithDumbWindow device model promptTokensArr 10 smartConfig.windowSize .Greedy
-    let dumbGenIds := dumbTokens.extract promptTokensArr.size dumbTokens.size
-    let dumbText := decode tokenizer dumbGenIds
-    IO.println s!"    Generated: {dumbText}"
-
-    -- Run 2: Smart KV
+    -- Smart KV FIRST (before Dumb window, to avoid stale PreparedDispatch
+    -- caches from Dumb window's InferenceState buffer handles)
     IO.println "  [Smart KV]"
     let smartTokens ← generateWithSmartKV device model promptTokensArr 10 smartConfig .Greedy
       (verbose := label == 100)
     let smartGenIds := smartTokens.extract promptTokensArr.size smartTokens.size
     let smartText := decode tokenizer smartGenIds
     IO.println s!"    Generated: {smartText}"
-    IO.println s!"    Sinks protected: (see prefill log)"
+
+    -- Dumb window SECOND
+    IO.println "  [Dumb Window]"
+    let dumbTokens ← generateWithDumbWindow device model promptTokensArr 10 smartConfig.windowSize .Greedy
+    let dumbGenIds := dumbTokens.extract promptTokensArr.size dumbTokens.size
+    let dumbText := decode tokenizer dumbGenIds
+    IO.println s!"    Generated: {dumbText}"
 
     -- Simple substring check
     let dumbHas := (dumbText.splitOn needleAnswer).length > 1
