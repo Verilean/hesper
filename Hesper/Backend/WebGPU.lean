@@ -53,5 +53,7 @@ instance : GPUBackend Device where
   hasSubgroupSupport device := Hesper.WGSL.Execute.hasSubgroupSupport device
   hasShaderF16Support device := Hesper.WGSL.Execute.hasShaderF16Support device
   newCacheRef := IO.mkRef none
+  beginBatch device := Hesper.WGSL.Execute.beginBatch device
+  endBatch device := Hesper.WGSL.Execute.endBatch device
 
 end Hesper
