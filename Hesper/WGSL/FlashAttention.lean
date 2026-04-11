@@ -1,9 +1,7 @@
 import Hesper.WGSL.Monad
 import Hesper.WGSL.Execute
 import Hesper.WGSL.Exp
-import Hesper.WebGPU.Types
-import Hesper.WebGPU.Device
-import Hesper.WebGPU.Buffer
+import Hesper.Backend
 import Hesper.Training.VerifiedBackward
 
 /-!
@@ -48,7 +46,7 @@ namespace Hesper.WGSL.FlashAttention
 
 open Hesper.WGSL
 open Hesper.WGSL.Monad
-open Hesper.WebGPU
+open Hesper
 
 /-! ## CPU Spec (for equivalence proof) -/
 
@@ -557,20 +555,20 @@ def flashAttentionParamsKernel (numHeads numKVHeads maxSeqLen headDim : Nat)
 
 /-- Execute flash attention with params buffer (dynamic cacheLen, 1 dispatch).
     Same WGSL source for all cacheLen → 100% pipeline cache hit rate. -/
-def executeFlashAttentionWithParams (device : Device)
-    (qBuf kCacheBuf vCacheBuf paramsBuf outputBuf : Buffer)
+def executeFlashAttentionWithParams [GPUBackend β] (ctx : β)
+    (qBuf kCacheBuf vCacheBuf paramsBuf outputBuf : GPUBackend.Buf β)
     (numHeads numKVHeads maxSeqLen headDim : Nat) (scale : Float) : IO Unit := do
   let workgroupSize := min 256 (max headDim 32)
   let shader := flashAttentionParamsKernel numHeads numKVHeads maxSeqLen headDim scale workgroupSize
   let namedBuffers := [("q_output", outputBuf), ("k_cache", kCacheBuf), ("v_cache", vCacheBuf), ("params", paramsBuf)]
   -- Static cache key: same WGSL for all cacheLen (cacheLen is read from params buffer)
   let cacheKey : UInt64 := hash ("flashP", numHeads, numKVHeads, maxSeqLen, headDim)
-  let execConfig : Hesper.WGSL.Execute.ExecutionConfig := {
+  let execConfig : Hesper.ExecConfig := {
     workgroupSize := {x := workgroupSize, y := 1, z := 1}
     numWorkgroups := (numHeads, 1, 1)
     -- No diagnostic needed: params is var<storage, read> which is uniform
   }
-  Hesper.WGSL.Execute.executeShaderNamed device shader namedBuffers execConfig (some cacheKey)
+  GPUBackend.executeWithConfigCached ctx shader namedBuffers execConfig cacheKey (← IO.mkRef none)
 
 /-! ## In-Place Flash Attention (single tile, no merge) -/
 
@@ -831,22 +829,18 @@ def flashAttentionTiledPhase2 (numHeads headDim numTiles : Nat) : ShaderM Unit :
 
 /-- Pre-allocate partial buffer for tiled flash attention.
     Call once during initialization, reuse across all tokens. -/
-def createFlashPartialBuffer (device : Device) (numHeads maxSeqLen headDim : Nat)
-    (tileSize : Nat := 32) : IO Buffer := do
+def createFlashPartialBuffer [GPUBackend β] (ctx : β) (numHeads maxSeqLen headDim : Nat)
+    (tileSize : Nat := 32) : IO (GPUBackend.Buf β) := do
   let maxTiles := (maxSeqLen + tileSize - 1) / tileSize
   let stride := headDim + 2
   let partialSize := numHeads * maxTiles * stride
-  createBuffer device {
-    size := (partialSize * 4).toUSize
-    usage := [.storage, .copySrc, .copyDst]
-    mappedAtCreation := false
-  }
+  GPUBackend.allocBuffer ctx (partialSize * 4).toUSize
 
 /-- Execute tiled flash attention (2 phases) -/
-def executeFlashAttentionTiled (device : Device)
-    (qBuf kCacheBuf vCacheBuf outputBuf : Buffer)
+def executeFlashAttentionTiled [GPUBackend β] (ctx : β)
+    (qBuf kCacheBuf vCacheBuf outputBuf : GPUBackend.Buf β)
     (numHeads numKVHeads maxSeqLen headDim cacheLen : Nat) (scale : Float)
-    (partialBuf : Option Buffer := none) : IO Unit := do
+    (partialBuf : Option (GPUBackend.Buf β) := none) : IO Unit := do
   let tileSize := 32
   let numTiles := (cacheLen + tileSize - 1) / tileSize
   let workgroupSize := min 256 (max headDim 32)
@@ -857,11 +851,7 @@ def executeFlashAttentionTiled (device : Device)
     | none => do
       let stride := headDim + 2
       let partialSize := numHeads * numTiles * stride
-      createBuffer device {
-        size := (partialSize * 4).toUSize
-        usage := [.storage, .copySrc, .copyDst]
-        mappedAtCreation := false
-      }
+      GPUBackend.allocBuffer ctx (partialSize * 4).toUSize
 
   -- Always use Phase 1 + Phase 2. The old `numTiles == 1` in-place
   -- shortcut assumed Q and output shared the same buffer, which is NOT
@@ -870,21 +860,21 @@ def executeFlashAttentionTiled (device : Device)
     -- Multi-tile: Phase 1 (parallel tiles) + Phase 2 (merge)
     let shader1 := flashAttentionTiledPhase1 numHeads numKVHeads maxSeqLen headDim cacheLen tileSize scale workgroupSize
     let namedBuffers1 := [("q", qBuf), ("k_cache", kCacheBuf), ("v_cache", vCacheBuf), ("partial", partialBuf)]
-    let execConfig1 : Hesper.WGSL.Execute.ExecutionConfig := {
+    let execConfig1 : Hesper.ExecConfig := {
       workgroupSize := {x := workgroupSize, y := 1, z := 1}
       numWorkgroups := (numHeads, numTiles, 1)
     }
     let cacheKey1 : UInt64 := hash ("flashT1", numHeads, numKVHeads, maxSeqLen, headDim, cacheLen, tileSize)
-    Hesper.WGSL.Execute.executeShaderNamed device shader1 namedBuffers1 execConfig1 (some cacheKey1)
+    GPUBackend.executeWithConfigCached ctx shader1 namedBuffers1 execConfig1 cacheKey1 (← IO.mkRef none)
 
     let shader2 := flashAttentionTiledPhase2 numHeads headDim numTiles
     let namedBuffers2 := [("partial", partialBuf), ("output", outputBuf)]
-    let execConfig2 := Hesper.WGSL.Execute.ExecutionConfig.dispatch1D (numHeads * headDim) 256
+    let execConfig2 := Hesper.ExecConfig.dispatch1D (numHeads * headDim) 256
     let cacheKey2 : UInt64 := hash ("flashT2", numHeads, headDim, numTiles)
-    Hesper.WGSL.Execute.executeShaderNamed device shader2 namedBuffers2 execConfig2 (some cacheKey2)
+    GPUBackend.executeWithConfigCached ctx shader2 namedBuffers2 execConfig2 cacheKey2 (← IO.mkRef none)
 
-def executeFlashAttentionDynamic (device : Device)
-    (qBuf kCacheBuf vCacheBuf outputBuf : Buffer)
+def executeFlashAttentionDynamic [GPUBackend β] (ctx : β)
+    (qBuf kCacheBuf vCacheBuf outputBuf : GPUBackend.Buf β)
     (numHeads numKVHeads maxSeqLen headDim cacheLen : Nat) (scale : Float) : IO Unit := do
   let workgroupSize := min 256 (max headDim 32)
   let shader := flashAttentionDynamicKernel numHeads numKVHeads maxSeqLen headDim cacheLen scale workgroupSize
@@ -892,22 +882,22 @@ def executeFlashAttentionDynamic (device : Device)
   -- Pipeline cache key includes cacheLen (shader recompiled per position)
   -- The WGSL source hash + buffer layout is cached, so same cacheLen reuses pipeline
   let cacheKey : UInt64 := hash ("flash", numHeads, numKVHeads, maxSeqLen, headDim, cacheLen)
-  let execConfig : Hesper.WGSL.Execute.ExecutionConfig := {
+  let execConfig : Hesper.ExecConfig := {
     workgroupSize := {x := workgroupSize, y := 1, z := 1}
     numWorkgroups := (numHeads, 1, 1)
   }
   -- Note: shader compilation is cached by pipeline cache (Execute.lean).
   -- First call with a new cacheLen compiles, subsequent calls with same cacheLen reuse.
   -- Over a training run, common cacheLens are cached and recompilation is rare.
-  Hesper.WGSL.Execute.executeShaderNamed device shader namedBuffers execConfig (some cacheKey)
+  GPUBackend.executeWithConfigCached ctx shader namedBuffers execConfig cacheKey (← IO.mkRef none)
 
 /-- Execute flash attention with static cacheLen (for testing).
     Uses dynamic kernel with a params buffer containing cacheLen. -/
-def executeFlashAttention (device : Device)
-    (qBuf kCacheBuf vCacheBuf outputBuf : Buffer)
+def executeFlashAttention [GPUBackend β] (ctx : β)
+    (qBuf kCacheBuf vCacheBuf outputBuf : GPUBackend.Buf β)
     (numHeads numKVHeads cacheLen headDim : Nat) (scale : Float) : IO Unit := do
   -- For testing: maxSeqLen = cacheLen (buffer sizes match exactly)
-  executeFlashAttentionDynamic device qBuf kCacheBuf vCacheBuf outputBuf
+  executeFlashAttentionDynamic ctx qBuf kCacheBuf vCacheBuf outputBuf
     numHeads numKVHeads cacheLen headDim cacheLen scale
 
 /-! ## Sliding Window Flash Attention -/
