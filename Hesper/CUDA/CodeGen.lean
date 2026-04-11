@@ -250,16 +250,25 @@ partial def expToPTX (e : Exp t) (s : GenState) : ExpResult :=
   -- Memory access
   | .index arr idx =>
     let (rArr, s) := expToPTX arr s; let (rIdx, s) := expToPTX idx s
-    let (r, s) := s.freshF32
     let arrName := match arr with | .var n => some n | _ => none
     let isShared := match arrName with | some n => s.isSharedVar n | none => false
+    let isU32 := match arrName with | some n => s.isU32Buffer n | none => false
     if isShared then
       let name := arrName.getD "unknown"
+      let (r, s) := s.freshF32
       let (off, s) := s.freshU32; let s := s.emit (.shl_u32 off rIdx.toU32! 2)
       let (symR, s) := s.freshU32; let s := s.emit (.mov_shared_addr symR name)
       let (addr, s) := s.freshU32; let s := s.emit (.add_u32 addr symR off)
       (.f32 r, s.emit (.ld_shared_sym r symR off addr))
+    else if isU32 then
+      -- u32 buffer → ld.global.u32
+      let (r, s) := s.freshU32
+      let (off, s) := s.freshU64; let s := s.emit (.mul_wide_u32 off rIdx.toU32! 4)
+      let (addr, s) := s.freshU64; let s := s.emit (.add_u64 addr rArr.toU64! off)
+      (.u32 r, s.emit (.ld_u32 .global r addr))
     else
+      -- f32 buffer → ld.global.f32
+      let (r, s) := s.freshF32
       let (off, s) := s.freshU64; let s := s.emit (.mul_wide_u32 off rIdx.toU32! 4)
       let (addr, s) := s.freshU64; let s := s.emit (.add_u64 addr rArr.toU64! off)
       (.f32 r, s.emit (.ld_f32 .global r addr))
@@ -316,6 +325,12 @@ partial def stmtToPTX (stmt : Stmt) (s : GenState) : GenState :=
       let (symR, s) := s.freshU32; let s := s.emit (.mov_shared_addr symR arrName)
       let (addr, s) := s.freshU32; let s := s.emit (.add_u32 addr symR off)
       s.emit (.st_shared_sym rVal.toF32! symR off addr)
+    else if s.isU32Buffer arrName then match s.lookupVar arrName with
+    | some (.u64 base) =>
+      let (off, s) := s.freshU64; let s := s.emit (.mul_wide_u32 off rIdx.toU32! 4)
+      let (addr, s) := s.freshU64; let s := s.emit (.add_u64 addr base off)
+      s.emit (.st_u32 .global addr rVal.toU32!)
+    | _ => s
     else match s.lookupVar arrName with
     | some (.u64 base) =>
       let (off, s) := s.freshU64; let s := s.emit (.mul_wide_u32 off rIdx.toU32! 4)
@@ -370,9 +385,15 @@ def generatePTX
     | _ => acc) #[]
   let paramNames := state.declaredBuffers.map (·.1) |>.toArray
   let sharedNames := state.sharedVars.map (·.1)
+  -- Identify u32-element buffers for correct ld.global.u32 generation
+  let u32BufferNames := state.declaredBuffers.foldl (fun (acc : List String) (name, ty, _) =>
+    match ty with
+    | .array (.scalar .u32) _ => name :: acc
+    | .array (.scalar .atomicU32) _ => name :: acc
+    | _ => acc) []
   let initState := state.declaredBuffers.foldl (fun (s : GenState) (name, _, _) =>
     let (r, s) := s.freshU64; let s := s.emit (.ld_param_u64 r name); s.bindVar name (.u64 r))
-    ({ sharedNames := sharedNames } : GenState)
+    ({ sharedNames, u32BufferNames } : GenState)
   let finalState := (state.stmts.foldl (fun s st => stmtToPTX st s) initState).emit .ret
   (Module.mk ptxVersion targetArch funcName paramNames sharedDecls
     finalState.insts finalState.fRegs finalState.rRegs finalState.rdRegs finalState.pRegs).render
