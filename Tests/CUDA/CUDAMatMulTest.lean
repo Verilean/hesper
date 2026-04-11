@@ -362,9 +362,105 @@ def main : IO Unit := do
   freeCUDABuffer taBuf; freeCUDABuffer tbBuf; freeCUDABuffer tcBuf
   IO.println s!"  → {if ok4 then "PASSED" else "FAILED"}"
 
+  -- ═══ Test 5: outerProductKernel ═══
   IO.println ""
-  if ok1 && ok2 && ok3 && ok4 then
-    IO.println "✓ ALL CUDA KERNEL TESTS PASSED"
+  IO.println "Test 5: outerProductKernel (R[i,j] = a[i] * b[j])"
+  IO.println "───────────────────────────────────────────────────"
+  let opM := 4; let opN := 4
+  let ptx5 := generatePTX "outerProd" {x := 256} (outerProductKernel opM opN)
+  IO.println s!"  PTX: {ptx5.length} chars"
+  let mod5 ← cuModuleLoadData ptx5
+  let func5 ← cuModuleGetFunction mod5 "outerProd"
+  IO.println "  JIT: OK"
+
+  let opABuf ← createCUDABuffer (opM * 4).toUSize
+  let opBBuf ← createCUDABuffer (opN * 4).toUSize
+  let opRBuf ← createCUDABuffer (opM * opN * 4).toUSize
+  -- a = [1,2,3,4], b = [10,20,30,40]
+  writeCUDABuffer opABuf (packFloats #[1,2,3,4])
+  writeCUDABuffer opBBuf (packFloats #[10,20,30,40])
+
+  cuLaunchKernel func5 1 1 1 (opM * opN).toUInt32 1 1 0 #[opABuf.ptr, opBBuf.ptr, opRBuf.ptr]
+  let res5 ← readCUDABufferFull opRBuf
+
+  let mut ok5 := true
+  for i in List.range opM do
+    let mut line := s!"    row {i}: "
+    for j in List.range opN do
+      let got := unpackFloat res5 (i * opN + j)
+      let exp := (i + 1).toFloat * ((j + 1) * 10).toFloat
+      line := line ++ s!"{got} "
+      if (got - exp).abs > 0.01 then ok5 := false
+    IO.println line
+  freeCUDABuffer opABuf; freeCUDABuffer opBBuf; freeCUDABuffer opRBuf
+  IO.println s!"  → {if ok5 then "PASSED" else "FAILED"}"
+
+  -- ═══ Test 6: sgdUpdateKernel ═══
+  IO.println ""
+  IO.println "Test 6: sgdUpdateKernel (param -= lr * grad)"
+  IO.println "─────────────────────────────────────────────"
+  let sgdN := 8; let lr := 0.1
+  let ptx6 := generatePTX "sgdUpdate" {x := 256} (sgdUpdateKernel sgdN lr)
+  IO.println s!"  PTX: {ptx6.length} chars"
+  let mod6 ← cuModuleLoadData ptx6
+  let func6 ← cuModuleGetFunction mod6 "sgdUpdate"
+  IO.println "  JIT: OK"
+
+  let gradBuf ← createCUDABuffer (sgdN * 4).toUSize
+  let paramBuf ← createCUDABuffer (sgdN * 4).toUSize
+  -- param = [10..17], grad = [1..8]
+  let paramArr := Array.range sgdN |>.map (fun i => (i + 10).toFloat)
+  let gradArr := Array.range sgdN |>.map (fun i => (i + 1).toFloat)
+  writeCUDABuffer gradBuf (packFloats gradArr)
+  writeCUDABuffer paramBuf (packFloats paramArr)
+
+  cuLaunchKernel func6 1 1 1 sgdN.toUInt32 1 1 0 #[gradBuf.ptr, paramBuf.ptr]
+  let res6 ← readCUDABufferFull paramBuf
+
+  let mut ok6 := true
+  let mut line6 := "    param: "
+  for i in List.range sgdN do
+    let got := unpackFloat res6 i
+    -- param[i] = (i+10) - 0.1 * (i+1)
+    let exp := (i + 10).toFloat - lr * (i + 1).toFloat
+    line6 := line6 ++ s!"{got} "
+    if (got - exp).abs > 0.01 then ok6 := false
+  IO.println line6
+  freeCUDABuffer gradBuf; freeCUDABuffer paramBuf
+  IO.println s!"  → {if ok6 then "PASSED" else "FAILED"}"
+
+  -- ═══ Test 7: copyBufferKernel ═══
+  IO.println ""
+  IO.println "Test 7: copyBufferKernel (dst = src)"
+  IO.println "─────────────────────────────────────"
+  let cpN := 16
+  let ptx7 := generatePTX "copyBuf" {x := 256} (copyBufferKernel cpN)
+  IO.println s!"  PTX: {ptx7.length} chars"
+  let mod7 ← cuModuleLoadData ptx7
+  let func7 ← cuModuleGetFunction mod7 "copyBuf"
+  IO.println "  JIT: OK"
+
+  let srcBuf ← createCUDABuffer (cpN * 4).toUSize
+  let dstBuf ← createCUDABuffer (cpN * 4).toUSize
+  let srcArr := Array.range cpN |>.map (fun i => (i * 7 + 3).toFloat)
+  writeCUDABuffer srcBuf (packFloats srcArr)
+
+  cuLaunchKernel func7 1 1 1 cpN.toUInt32 1 1 0 #[srcBuf.ptr, dstBuf.ptr]
+  let res7 ← readCUDABufferFull dstBuf
+
+  let mut ok7 := true
+  for i in [0, 1, 7, 15] do
+    let got := unpackFloat res7 i
+    let exp := srcArr.getD i 0.0
+    let pass := (got - exp).abs < 0.01
+    IO.println s!"    dst[{i}] = {got} (expect {exp}) {if pass then "✓" else "✗"}"
+    if !pass then ok7 := false
+  freeCUDABuffer srcBuf; freeCUDABuffer dstBuf
+  IO.println s!"  → {if ok7 then "PASSED" else "FAILED"}"
+
+  IO.println ""
+  if ok1 && ok2 && ok3 && ok4 && ok5 && ok6 && ok7 then
+    IO.println "✓ ALL 7 CUDA KERNEL TESTS PASSED"
   else
     IO.println "✗ SOME TESTS FAILED"
     IO.Process.exit 1
