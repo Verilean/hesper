@@ -1,9 +1,6 @@
 import Hesper.WGSL.Monad
-import Hesper.WGSL.Execute
 import Hesper.WGSL.Exp
-import Hesper.WebGPU.Types
-import Hesper.WebGPU.Device
-import Hesper.WebGPU.Buffer
+import Hesper.Backend
 
 /-!
 # Cross-Entropy Loss for Language Model Training
@@ -27,7 +24,6 @@ namespace Hesper.Training.Loss
 
 open Hesper.WGSL
 open Hesper.WGSL.Monad
-open Hesper.WebGPU
 
 /-! ## Forward: Cross-Entropy Loss -/
 
@@ -109,16 +105,15 @@ def crossEntropyForwardKernel (vocabSize : Nat) (workgroupSize : Nat := 256) : S
 
 /-- Execute cross-entropy loss forward.
     Returns loss value by reading back from GPU. -/
-def executeCrossEntropyForward (device : Device) (logitsBuf targetBuf lossBuf : Buffer)
+@[inline]
+def executeCrossEntropyForward [Hesper.GPUBackend β] (ctx : β)
+    (logitsBuf targetBuf lossBuf : Hesper.GPUBackend.Buf β)
     (vocabSize : Nat) : IO Unit := do
   let workgroupSize := 256
-  let shader := crossEntropyForwardKernel vocabSize workgroupSize
-  let namedBuffers := [("logits", logitsBuf), ("target_id", targetBuf), ("loss", lossBuf)]
-  let execConfig : Hesper.WGSL.Execute.ExecutionConfig := {
-    workgroupSize := {x := workgroupSize, y := 1, z := 1}
-    numWorkgroups := (1, 1, 1)
-  }
-  Hesper.WGSL.Execute.executeShaderNamed device shader namedBuffers execConfig
+  Hesper.GPUBackend.execute ctx
+    (crossEntropyForwardKernel vocabSize workgroupSize)
+    [("logits", logitsBuf), ("target_id", targetBuf), ("loss", lossBuf)]
+    { workgroupSize := {x := workgroupSize}, numWorkgroups := (1, 1, 1) }
 
 /-- Cross-entropy forward with GPU-side loss accumulation.
     Adds the per-token loss to an accumulator buffer instead of overwriting.
@@ -185,16 +180,15 @@ def crossEntropyForwardAccumKernel (vocabSize : Nat) (workgroupSize : Nat := 256
 
 /-- Execute cross-entropy forward with GPU-side loss accumulation.
     Call this per-token; loss accumulates on GPU. Read once at end of example. -/
-def executeCrossEntropyForwardAccum (device : Device) (logitsBuf targetBuf lossAccumBuf : Buffer)
+@[inline]
+def executeCrossEntropyForwardAccum [Hesper.GPUBackend β] (ctx : β)
+    (logitsBuf targetBuf lossAccumBuf : Hesper.GPUBackend.Buf β)
     (vocabSize : Nat) : IO Unit := do
   let workgroupSize := 256
-  let shader := crossEntropyForwardAccumKernel vocabSize workgroupSize
-  let namedBuffers := [("logits", logitsBuf), ("target_id", targetBuf), ("loss_accum", lossAccumBuf)]
-  let execConfig : Hesper.WGSL.Execute.ExecutionConfig := {
-    workgroupSize := {x := workgroupSize, y := 1, z := 1}
-    numWorkgroups := (1, 1, 1)
-  }
-  Hesper.WGSL.Execute.executeShaderNamed device shader namedBuffers execConfig
+  Hesper.GPUBackend.execute ctx
+    (crossEntropyForwardAccumKernel vocabSize workgroupSize)
+    [("logits", logitsBuf), ("target_id", targetBuf), ("loss_accum", lossAccumBuf)]
+    { workgroupSize := {x := workgroupSize}, numWorkgroups := (1, 1, 1) }
 
 /-! ## Backward: dLogits = softmax(logits) - one_hot(target) -/
 
@@ -273,15 +267,14 @@ def crossEntropyBackwardKernel (vocabSize : Nat) (workgroupSize : Nat := 256) : 
     ShaderM.writeBuffer (ty := .scalar .f32) "dLogits" i grad
 
 /-- Execute cross-entropy backward: dLogits = softmax(logits) - one_hot(target) -/
-def executeCrossEntropyBackward (device : Device) (logitsBuf targetBuf dLogitsBuf : Buffer)
+@[inline]
+def executeCrossEntropyBackward [Hesper.GPUBackend β] (ctx : β)
+    (logitsBuf targetBuf dLogitsBuf : Hesper.GPUBackend.Buf β)
     (vocabSize : Nat) : IO Unit := do
   let workgroupSize := 256
-  let shader := crossEntropyBackwardKernel vocabSize workgroupSize
-  let namedBuffers := [("logits", logitsBuf), ("target_id", targetBuf), ("dLogits", dLogitsBuf)]
-  let execConfig : Hesper.WGSL.Execute.ExecutionConfig := {
-    workgroupSize := {x := workgroupSize, y := 1, z := 1}
-    numWorkgroups := (1, 1, 1)
-  }
-  Hesper.WGSL.Execute.executeShaderNamed device shader namedBuffers execConfig
+  Hesper.GPUBackend.execute ctx
+    (crossEntropyBackwardKernel vocabSize workgroupSize)
+    [("logits", logitsBuf), ("target_id", targetBuf), ("dLogits", dLogitsBuf)]
+    { workgroupSize := {x := workgroupSize}, numWorkgroups := (1, 1, 1) }
 
 end Hesper.Training.Loss
