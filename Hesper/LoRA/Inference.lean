@@ -34,6 +34,7 @@ which inject LoRA at the correct point in the forward pass.
 namespace Hesper.LoRA.Inference
 
 open Hesper.WebGPU
+open Hesper.WGSL.Execute (PreparedDispatch CompiledKernel)
 open Hesper.Models.BitNet
 open Hesper.LoRA
 open Hesper.Logging
@@ -137,8 +138,8 @@ def createLoRATrainingState (device : Device) (adapter : Adapter)
 /-- Single-token forward pass with LoRA.
     Uses `TransformerBlock.forwardWithCacheLoRA` which injects LoRA
     inside the attention layer (between BitLinear Q/V and RoPE). -/
-def forwardSingleTokenWithLoRA (device : Device) (model : BitNetModel)
-    (tokenId : Nat) (pos : Nat) (cacheState : KVCacheState)
+def forwardSingleTokenWithLoRA (device : Device) (model : BitNetModel Buffer PreparedDispatch CompiledKernel)
+    (tokenId : Nat) (pos : Nat) (cacheState : KVCacheState Buffer PreparedDispatch)
     (adapter : Adapter) (loraState : LoRAInferenceState) : IO Unit := do
   logVerbose s!"[SingleToken+LoRA] pos={pos}, tokenId={tokenId}"
 
@@ -164,16 +165,18 @@ def forwardSingleTokenWithLoRA (device : Device) (model : BitNetModel)
         some cacheState.fusedRefs[layerIdx]
       else none
 
-      let loraOpt := if h3 : layerIdx < adapter.layers.size then
-        some (adapter.layers[layerIdx], scale, loraState.hBuf, loraState.yBufQ, loraState.yBufV)
-      else none
-      Hesper.Layers.TransformerBlock.forwardWithCache device layer currentBuf nextBuf pos kvCache (some cacheState.layerBufs) fusedRef loraOpt
+      if h3 : layerIdx < adapter.layers.size then
+        Hesper.Layers.TransformerBlock.forwardWithCacheLoRA device layer currentBuf nextBuf pos kvCache
+          adapter.layers[layerIdx] scale loraState.hBuf loraState.yBufQ loraState.yBufV
+          (some cacheState.layerBufs) fusedRef
+      else
+        Hesper.Layers.TransformerBlock.forwardWithCache (β := Device) device layer currentBuf nextBuf pos kvCache (some cacheState.layerBufs) fusedRef
 
       let temp := currentBuf; currentBuf := nextBuf; nextBuf := temp
     layerIdx := layerIdx + 1
 
   -- Step 3: Final normalization
-  Hesper.Layers.RMSNorm.forward device model.finalNorm currentBuf nextBuf 1 256
+  Hesper.Layers.RMSNorm.forward (β := Device) device model.finalNorm currentBuf nextBuf 1 256
 
   -- Step 4: LM head
   let lmHeadConfig : Hesper.WGSL.MatMul.Config := {
@@ -205,8 +208,8 @@ def forwardSingleTokenWithLoRA (device : Device) (model : BitNetModel)
     @param grads Gradient accumulators for LoRA weights
     @param startLayer First layer to compute LoRA backward for
     @param trainState Training state with temp buffers -/
-def forwardAndBackwardBatched (device : Device) (model : BitNetModel)
-    (tokenId : Nat) (pos : Nat) (cacheState : KVCacheState)
+def forwardAndBackwardBatched (device : Device) (model : BitNetModel Buffer PreparedDispatch CompiledKernel)
+    (tokenId : Nat) (pos : Nat) (cacheState : KVCacheState Buffer PreparedDispatch)
     (adapter : Adapter) (loraState : LoRAInferenceState)
     (isOutputToken : Bool)
     (targetBuf lossAccumBuf dLogitsBuf dHiddenBuf : Buffer)
@@ -239,10 +242,12 @@ def forwardAndBackwardBatched (device : Device) (model : BitNetModel)
           some cacheState.fusedRefs[layerIdx]
         else none
       -- LoRA forward always active (weights affect output for all tokens)
-      let loraOpt := if h3 : layerIdx < adapter.layers.size then
-        some (adapter.layers[layerIdx], scale, loraState.hBuf, loraState.yBufQ, loraState.yBufV)
-      else none
-      Hesper.Layers.TransformerBlock.forwardWithCache device layer currentBuf nextBuf pos kvCache (some cacheState.layerBufs) fusedRef loraOpt
+      if h3 : layerIdx < adapter.layers.size then
+        Hesper.Layers.TransformerBlock.forwardWithCacheLoRA device layer currentBuf nextBuf pos kvCache
+          adapter.layers[layerIdx] scale loraState.hBuf loraState.yBufQ loraState.yBufV
+          (some cacheState.layerBufs) fusedRef
+      else
+        Hesper.Layers.TransformerBlock.forwardWithCache (β := Device) device layer currentBuf nextBuf pos kvCache (some cacheState.layerBufs) fusedRef
 
       -- Save activations for multi-layer backward (gradient checkpointing)
       if isOutputToken then
@@ -424,7 +429,7 @@ def forwardAndBackwardBatched (device : Device) (model : BitNetModel)
 
 /-- Generate text with LoRA adapter applied.
     Same interface as BitNetModel.generate but with LoRA corrections. -/
-def generateWithLoRA (device : Device) (model : BitNetModel)
+def generateWithLoRA (device : Device) (model : BitNetModel Buffer PreparedDispatch CompiledKernel)
     (adapter : Adapter) (loraState : LoRAInferenceState)
     (promptTokens : Array Nat) (maxTokens : Nat)
     (strategy : Hesper.Inference.Sampling.Strategy := .Greedy)

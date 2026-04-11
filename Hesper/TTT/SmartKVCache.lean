@@ -76,7 +76,7 @@ structure SmartKVConfig where
     permanent KV cache slots; boring tokens use a sliding window.
     This allows perfect recall of important facts even after thousands
     of intervening tokens. -/
-def generateWithSmartKV (device : Device) (model : BitNetModel)
+def generateWithSmartKV (device : Device) (model : BitNetModel Buffer PreparedDispatch CompiledKernel)
     (promptTokens : Array Nat) (maxTokens : Nat)
     (config : SmartKVConfig)
     (strategy : Sampling.Strategy := .Greedy)
@@ -99,7 +99,7 @@ def generateWithSmartKV (device : Device) (model : BitNetModel)
   -- Use the ORIGINAL model for KV cache — full maxSeqLen allocation.
   -- The 288-slot limit is enforced purely by Lean-side routing logic.
   -- This avoids kernel/buffer-size mismatches.
-  let cacheState ← createKVCacheState device model
+  let cacheState ← createKVCacheState (β := Device) device model
 
   -- TTT buffers for MSE sensor (W_ttt stays zero — we only read loss)
   let tttConfig : HiddenTTTConfig := {
@@ -141,7 +141,7 @@ def generateWithSmartKV (device : Device) (model : BitNetModel)
     -- then run forward at that position.
     let (physPos, wasSink, newState) := getPhysicalPos isSurprise kvState
     kvState := newState
-    forwardSingleToken device model promptTokens[i]! physPos cacheState
+    forwardSingleToken (β := Device) device model promptTokens[i]! physPos cacheState
 
     -- Step 2: MSE sensor between consecutive hidden states
     if hasPrevHidden then
@@ -203,7 +203,7 @@ def generateWithSmartKV (device : Device) (model : BitNetModel)
     -- Forward pass for new token in the ring buffer
     let (physPos, _, newState) := getPhysicalPos false kvState
     kvState := newState
-    forwardSingleToken device model nextToken physPos cacheState
+    forwardSingleToken (β := Device) device model nextToken physPos cacheState
 
   let genEnd ← IO.monoNanosNow
   let genMs := (genEnd - genStart).toFloat / 1_000_000.0
@@ -213,18 +213,18 @@ def generateWithSmartKV (device : Device) (model : BitNetModel)
 
 /-- Baseline: dumb sliding window (no smart routing).
     Uses original model's full KV cache but writes at pos % windowSize. -/
-def generateWithDumbWindow (device : Device) (model : BitNetModel)
+def generateWithDumbWindow (device : Device) (model : BitNetModel Buffer PreparedDispatch CompiledKernel)
     (promptTokens : Array Nat) (maxTokens : Nat)
     (windowSize : Nat)
     (strategy : Sampling.Strategy := .Greedy)
     : IO (Array Nat) := do
   resetPreparedDispatches model
-  let cacheState ← createKVCacheState device model
+  let cacheState ← createKVCacheState (β := Device) device model
 
   -- Simple sliding window: pos = t % windowSize
   for i in [0:promptTokens.size] do
     let physPos := i % windowSize
-    forwardSingleToken device model promptTokens[i]! physPos cacheState
+    forwardSingleToken (β := Device) device model promptTokens[i]! physPos cacheState
 
   let mut tokens := promptTokens
   for step in [0:maxTokens] do
@@ -233,7 +233,7 @@ def generateWithDumbWindow (device : Device) (model : BitNetModel)
       (Sampling.RNG.create (some (42 + step)))
     tokens := tokens.push nextToken
     let physPos := tokens.size % windowSize
-    forwardSingleToken device model nextToken physPos cacheState
+    forwardSingleToken (β := Device) device model nextToken physPos cacheState
 
   pure tokens
 

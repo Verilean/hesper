@@ -215,18 +215,18 @@ def Config.bitnet1_3B : Config := {
 /-! ## Model Structure -/
 
 /-- Complete BitNet model -/
-structure BitNetModel where
+structure BitNetModel (BufT : Type) (CacheT : Type := Unit) (KernelT : Type := Unit) where
   config : Config
   -- Layers
-  embedding : Embedding.Embedding Buffer
-  layers : Array (TransformerBlock.TransformerBlock Buffer PreparedDispatch CompiledKernel)
-  finalNorm : RMSNorm.RMSNorm Buffer PreparedDispatch
+  embedding : Embedding.Embedding BufT
+  layers : Array (TransformerBlock.TransformerBlock BufT CacheT KernelT)
+  finalNorm : RMSNorm.RMSNorm BufT CacheT
   -- LM head uses weight tying: reuses embedding table as [vocabSize, dim] matrix
   -- output = input @ embedding^T
 
 /-- Reset all PreparedDispatch caches in the model.
     Must be called when buffer bindings change (e.g., new generate call). -/
-def resetPreparedDispatches (model : BitNetModel) : IO Unit := do
+def resetPreparedDispatches (model : BitNetModel Buffer PreparedDispatch CompiledKernel) : IO Unit := do
   -- Reset RMSNorm PreparedDispatches
   model.finalNorm.prepared.set none
   for layer in model.layers do
@@ -251,7 +251,7 @@ def resetPreparedDispatches (model : BitNetModel) : IO Unit := do
     @param device WebGPU device
     @param config Model configuration
 -/
-def create (device : Device) (config : Config) : IO BitNetModel := do
+def create (device : Device) (config : Config) : IO (BitNetModel Buffer PreparedDispatch CompiledKernel) := do
   IO.println "═══════════════════════════════════════════════"
   IO.println "   BitNet Model Initialization"
   IO.println "═══════════════════════════════════════════════"
@@ -277,8 +277,8 @@ def create (device : Device) (config : Config) : IO BitNetModel := do
     @param batchSize Batch size
     @param seqLen Sequence length
 -/
-def forward (device : Device) (model : BitNetModel)
-            (tokenIdsBuf outputBuf : Buffer)
+def forward [GPUBackend β] (ctx : β) (model : BitNetModel (GPUBackend.Buf β) (GPUBackend.CachedDispatch β) (GPUBackend.CompiledKernel β))
+            (tokenIdsBuf outputBuf : GPUBackend.Buf β)
             (batchSize seqLen : Nat) : IO Unit := do
   logVerbose "═══════════════════════════════════════════════"
   logVerbose s!"  Forward Pass: batch={batchSize}, seq_len={seqLen}"
@@ -288,8 +288,8 @@ def forward (device : Device) (model : BitNetModel)
   let tempSize := (numElements * 4).toUSize
 
   -- Allocate ping-pong buffers for layer outputs
-  let buf1 ← createBuffer device { size := tempSize, usage := [.storage], mappedAtCreation := false }
-  let buf2 ← createBuffer device { size := tempSize, usage := [.storage], mappedAtCreation := false }
+  let buf1 ← GPUBackend.allocBuffer ctx tempSize
+  let buf2 ← GPUBackend.allocBuffer ctx tempSize
 
   -- Pre-allocate layer buffers ONCE (reused across all 30 layers)
   let attnConfig : Attention.Config := {
@@ -300,23 +300,16 @@ def forward (device : Device) (model : BitNetModel)
     maxSeqLen := model.config.maxSeqLen
     useCausalMask := true
   }
-  let layerBufs ← TransformerBlock.createLayerBuffers (β := Device) device
+  let layerBufs ← TransformerBlock.createLayerBuffers ctx
     model.config.dim model.config.ffnDim attnConfig batchSize seqLen
 
-  let verbose ← isVerbose
-
-  -- Step 1: Embedding lookup (outside batch - needs sync for debug)
+  -- Step 1: Embedding lookup
   logVerbose "[1/4] Embedding lookup..."
-  Embedding.forward (β := Device) device model.embedding tokenIdsBuf buf1 batchSize seqLen
-
-  -- Debug: Check embedding output (needs GPU readback, so before batch)
-  if verbose then
-    let embDbg ← BufferOps.downloadFloatArray device buf1 (min 10 numElements)
-    logVerbose s!"  [DEBUG] Embedding output (first 10): {embDbg.toList.take 10}"
+  Embedding.forward ctx model.embedding tokenIdsBuf buf1 batchSize seqLen
 
   -- === BEGIN BATCHED EXECUTION ===
   -- All transformer layers + final norm + LM head recorded into single command buffer
-  Hesper.WGSL.Execute.beginBatch device
+  GPUBackend.beginBatch ctx
 
   -- Step 2: Pass through all transformer layers
   logVerbose s!"[2/4] Transformer layers (×{model.config.numLayers})..."
@@ -324,7 +317,7 @@ def forward (device : Device) (model : BitNetModel)
   let mut nextBuf := buf2
 
   for layer in model.layers do
-    TransformerBlock.forward device layer currentBuf nextBuf batchSize seqLen (some layerBufs)
+    TransformerBlock.forward ctx layer currentBuf nextBuf batchSize seqLen (some layerBufs)
 
     -- Ping-pong buffers
     let temp := currentBuf
@@ -333,7 +326,7 @@ def forward (device : Device) (model : BitNetModel)
 
   -- Step 3: Final normalization
   logVerbose "[3/4] Final RMSNorm..."
-  RMSNorm.forward (β := Device) device model.finalNorm currentBuf nextBuf (batchSize * seqLen) 256 (some layerBufs.rmsTempBuf)
+  RMSNorm.forward ctx model.finalNorm currentBuf nextBuf (batchSize * seqLen) 256 (some layerBufs.rmsTempBuf)
 
   -- Step 4: LM head projection to vocabulary (weight tying with embedding)
   logVerbose "[4/4] LM head projection (weight-tied)..."
@@ -345,15 +338,15 @@ def forward (device : Device) (model : BitNetModel)
   match model.embedding.f16Table with
   | some f16Buf =>
     if model.config.dim % 8 == 0 then
-      Hesper.WGSL.MatMul.executeMatMulTransposeF16Shared device nextBuf f16Buf outputBuf lmHeadConfig
+      Hesper.WGSL.MatMul.executeMatMulTransposeF16Shared ctx nextBuf f16Buf outputBuf lmHeadConfig
     else
-      Hesper.WGSL.MatMul.executeMatMulTransposeF16 device nextBuf f16Buf outputBuf lmHeadConfig
+      Hesper.WGSL.MatMul.executeMatMulTransposeF16 ctx nextBuf f16Buf outputBuf lmHeadConfig
   | none =>
-    Hesper.WGSL.MatMul.executeMatMulTranspose device nextBuf model.embedding.embeddingTable outputBuf lmHeadConfig
+    Hesper.WGSL.MatMul.executeMatMulTranspose ctx nextBuf model.embedding.embeddingTable outputBuf lmHeadConfig
 
   -- === END BATCHED EXECUTION ===
   -- Submit all recorded dispatches and wait once
-  Hesper.WGSL.Execute.endBatch device
+  GPUBackend.endBatch ctx
 
   logVerbose "═══════════════════════════════════════════════"
   logVerbose "  ✓ Forward pass complete"
@@ -362,20 +355,20 @@ def forward (device : Device) (model : BitNetModel)
 /-! ## KV Cache State -/
 
 /-- Full KV cache state for incremental inference -/
-structure KVCacheState where
-  kvCaches : Array (Attention.KVCache Buffer PreparedDispatch)   -- Per-layer KV caches
-  fusedRefs : Array (TransformerBlock.FusedLayerRefs PreparedDispatch)  -- Per-layer fused PreparedDispatch refs
-  layerBufs : TransformerBlock.CachedLayerBuffers Buffer PreparedDispatch  -- Shared temp buffers (single-token)
-  buf1 : Buffer        -- [dim] ping-pong buffer
-  buf2 : Buffer        -- [dim] ping-pong buffer
-  logitsBuf : Buffer   -- [vocabSize]
-  argmaxBuf : Buffer   -- [1] u32 for GPU-side argmax result
-  tokenBuf : Buffer    -- [1] u32 for single-token upload (reusable)
-  penaltyTokensBuf : Buffer  -- [maxSeqLen] u32 for repetition penalty token IDs
-  penaltyParamsBuf : Buffer  -- [2] u32: (numTokens, penalty_as_u32)
+structure KVCacheState (BufT : Type) (CacheT : Type := Unit) where
+  kvCaches : Array (Attention.KVCache BufT CacheT)   -- Per-layer KV caches
+  fusedRefs : Array (TransformerBlock.FusedLayerRefs CacheT)  -- Per-layer fused PreparedDispatch refs
+  layerBufs : TransformerBlock.CachedLayerBuffers BufT CacheT  -- Shared temp buffers (single-token)
+  buf1 : BufT        -- [dim] ping-pong buffer
+  buf2 : BufT        -- [dim] ping-pong buffer
+  logitsBuf : BufT   -- [vocabSize]
+  argmaxBuf : BufT   -- [1] u32 for GPU-side argmax result
+  tokenBuf : BufT    -- [1] u32 for single-token upload (reusable)
+  penaltyTokensBuf : BufT  -- [maxSeqLen] u32 for repetition penalty token IDs
+  penaltyParamsBuf : BufT  -- [2] u32: (numTokens, penalty_as_u32)
 
 /-- Create KV cache state for the model -/
-def createKVCacheState (device : Device) (model : BitNetModel) : IO KVCacheState := do
+def createKVCacheState [GPUBackend β] (ctx : β) (model : BitNetModel (GPUBackend.Buf β) (GPUBackend.CachedDispatch β) (GPUBackend.CompiledKernel β)) : IO (KVCacheState (GPUBackend.Buf β) (GPUBackend.CachedDispatch β)) := do
   let cfg := model.config
   let attnConfig : Attention.Config := {
     dim := cfg.dim, numHeads := cfg.numHeads, numKVHeads := cfg.numKVHeads,
@@ -385,12 +378,12 @@ def createKVCacheState (device : Device) (model : BitNetModel) : IO KVCacheState
   let mut kvCaches := Array.mkEmpty cfg.numLayers
   let mut fusedRefs := Array.mkEmpty cfg.numLayers
   for _ in [0:cfg.numLayers] do
-    kvCaches := kvCaches.push (← Attention.createKVCache (β := Device) device attnConfig)
-    fusedRefs := fusedRefs.push (← TransformerBlock.createFusedLayerRefs (β := Device))
+    kvCaches := kvCaches.push (← Attention.createKVCache ctx attnConfig)
+    fusedRefs := fusedRefs.push (← TransformerBlock.createFusedLayerRefs (β := β))
   -- Create shared layer buffers
-  let layerBufs ← TransformerBlock.createCachedLayerBuffers (β := Device) device cfg.dim cfg.ffnDim attnConfig
-  let mkBuf := fun size => createBuffer device { size := size, usage := [.storage], mappedAtCreation := false }
-  let mkBufRW := fun size => createBuffer device { size := size, usage := [.storage, .copySrc, .copyDst], mappedAtCreation := false }
+  let layerBufs ← TransformerBlock.createCachedLayerBuffers ctx cfg.dim cfg.ffnDim attnConfig
+  let mkBuf := fun size => GPUBackend.allocBuffer ctx size
+  let mkBufRW := fun size => GPUBackend.allocBufferUsage ctx size ["storage", "copySrc", "copyDst"]
   pure {
     kvCaches := kvCaches
     fusedRefs := fusedRefs
@@ -407,17 +400,17 @@ def createKVCacheState (device : Device) (model : BitNetModel) : IO KVCacheState
 /-- Run single-token forward pass with KV cache.
     Processes one token at position `pos`, using cached K/V from past tokens.
     Returns logits in `cacheState.logitsBuf`. -/
-def forwardSingleToken (device : Device) (model : BitNetModel)
-                       (tokenId : Nat) (pos : Nat) (cacheState : KVCacheState) : IO Unit := do
+def forwardSingleToken [GPUBackend β] (ctx : β) (model : BitNetModel (GPUBackend.Buf β) (GPUBackend.CachedDispatch β) (GPUBackend.CompiledKernel β))
+                       (tokenId : Nat) (pos : Nat) (cacheState : KVCacheState (GPUBackend.Buf β) (GPUBackend.CachedDispatch β)) : IO Unit := do
   logVerbose s!"[SingleToken] pos={pos}, tokenId={tokenId}"
 
   -- Step 1: Embedding lookup (single token) - reuse pre-allocated tokenBuf
   let tokenBytes := Hesper.WebGPU.BufferOps.uint32ToBytes tokenId.toUInt32
-  writeBuffer device cacheState.tokenBuf 0 tokenBytes
-  Embedding.forward (β := Device) device model.embedding cacheState.tokenBuf cacheState.buf1 1 1
+  GPUBackend.writeBufferOffset ctx cacheState.tokenBuf 0 tokenBytes
+  Embedding.forward ctx model.embedding cacheState.tokenBuf cacheState.buf1 1 1
 
   -- === BEGIN BATCHED EXECUTION ===
-  Hesper.WGSL.Execute.beginBatch device
+  GPUBackend.beginBatch ctx
 
   -- Step 2: Pass through all transformer layers with KV cache
   let mut currentBuf := cacheState.buf1
@@ -430,12 +423,12 @@ def forwardSingleToken (device : Device) (model : BitNetModel)
       let fusedRef := if h2 : layerIdx < cacheState.fusedRefs.size then
         some cacheState.fusedRefs[layerIdx]
       else none
-      TransformerBlock.forwardWithCache device layer currentBuf nextBuf pos kvCache (some cacheState.layerBufs) fusedRef
+      TransformerBlock.forwardWithCache ctx layer currentBuf nextBuf pos kvCache (some cacheState.layerBufs) fusedRef
       let temp := currentBuf; currentBuf := nextBuf; nextBuf := temp
     layerIdx := layerIdx + 1
 
   -- Step 3: Final normalization (single token)
-  RMSNorm.forward (β := Device) device model.finalNorm currentBuf nextBuf 1 256
+  RMSNorm.forward ctx model.finalNorm currentBuf nextBuf 1 256
 
   -- Step 4: LM head (1×dim @ dim×vocab)
   let lmHeadConfig : Hesper.WGSL.MatMul.Config := {
@@ -445,14 +438,14 @@ def forwardSingleToken (device : Device) (model : BitNetModel)
   | some f16Buf =>
     -- Use shared memory kernel when K is divisible by 8 (true for BitNet: K=2560)
     if model.config.dim % 8 == 0 then
-      Hesper.WGSL.MatMul.executeMatMulTransposeF16Shared device nextBuf f16Buf cacheState.logitsBuf lmHeadConfig
+      Hesper.WGSL.MatMul.executeMatMulTransposeF16Shared ctx nextBuf f16Buf cacheState.logitsBuf lmHeadConfig
     else
-      Hesper.WGSL.MatMul.executeMatMulTransposeF16 device nextBuf f16Buf cacheState.logitsBuf lmHeadConfig
+      Hesper.WGSL.MatMul.executeMatMulTransposeF16 ctx nextBuf f16Buf cacheState.logitsBuf lmHeadConfig
   | none =>
-    Hesper.WGSL.MatMul.executeMatMulTranspose device nextBuf model.embedding.embeddingTable cacheState.logitsBuf lmHeadConfig
+    Hesper.WGSL.MatMul.executeMatMulTranspose ctx nextBuf model.embedding.embeddingTable cacheState.logitsBuf lmHeadConfig
 
   -- === END BATCHED EXECUTION ===
-  Hesper.WGSL.Execute.endBatch device
+  GPUBackend.endBatch ctx
 
 /-! ## GPU Argmax -/
 
@@ -552,7 +545,7 @@ def repetitionPenaltyKernel (maxTokens vocabSize : Nat) (penalty : Float) : Shad
   ) (pure ())
 
 /-- Append a single token ID to the penalty tokens buffer at the given offset. -/
-def appendPenaltyToken (device : Device) (cacheState : KVCacheState)
+def appendPenaltyToken (device : Device) (cacheState : KVCacheState Buffer PreparedDispatch)
     (tokenId : Nat) (offset : Nat) : IO Unit := do
   let tokenBytes := Hesper.WebGPU.BufferOps.uint32ToBytes tokenId.toUInt32
   writeBuffer device cacheState.penaltyTokensBuf (offset * 4).toUSize tokenBytes
@@ -560,7 +553,7 @@ def appendPenaltyToken (device : Device) (cacheState : KVCacheState)
 /-- Apply repetition penalty on GPU, then run GPU argmax.
     Assumes token IDs are already uploaded incrementally. Just updates numTokens param,
     runs penalty + argmax batched in a single GPU submit, downloads 4 bytes. -/
-def gpuArgmaxWithPenalty (device : Device) (cacheState : KVCacheState)
+def gpuArgmaxWithPenalty (device : Device) (cacheState : KVCacheState Buffer PreparedDispatch)
     (vocabSize maxSeqLen : Nat) (numTokens : Nat) (penalty : Float) : IO Nat := do
   -- Upload params: numTokens
   let paramBytes := Hesper.WebGPU.BufferOps.uint32ToBytes numTokens.toUInt32
@@ -599,7 +592,7 @@ def gpuArgmaxWithPenalty (device : Device) (cacheState : KVCacheState)
     @param maxTokens Maximum tokens to generate
     @return Generated token sequence
 -/
-def generate (device : Device) (model : BitNetModel)
+def generate (device : Device) (model : BitNetModel Buffer PreparedDispatch CompiledKernel)
              (promptTokens : Array Nat) (maxTokens : Nat)
              (strategy : Hesper.Inference.Sampling.Strategy := .Greedy)
              (eosToken : Option Nat := none)
@@ -618,7 +611,7 @@ def generate (device : Device) (model : BitNetModel)
   logVerbose ""
 
   -- Create KV cache state (pre-allocated buffers for all layers)
-  let cacheState ← createKVCacheState device model
+  let cacheState ← createKVCacheState (β := Device) device model
 
   let mut tokens := promptTokens
   let mut rng := Hesper.Inference.Sampling.RNG.create (some 42)
@@ -633,7 +626,7 @@ def generate (device : Device) (model : BitNetModel)
   let prefillStart ← IO.monoNanosNow
   for i in [0:promptTokens.size] do
     if i >= model.config.maxSeqLen then break
-    forwardSingleToken device model promptTokens[i]! i cacheState
+    forwardSingleToken (β := Device) device model promptTokens[i]! i cacheState
   let prefillEnd ← IO.monoNanosNow
   let prefillMs := (prefillEnd - prefillStart).toFloat / 1_000_000.0
   IO.println s!"[Prefill] Done in {prefillMs} ms ({prefillMs / promptTokens.size.toFloat} ms/token)"
@@ -687,7 +680,7 @@ def generate (device : Device) (model : BitNetModel)
     -- Run forward pass for the new token
     let newPos := tokens.size - 1
     if newPos < model.config.maxSeqLen then
-      forwardSingleToken device model nextToken newPos cacheState
+      forwardSingleToken (β := Device) device model nextToken newPos cacheState
 
   let genEnd ← IO.monoNanosNow
   let genMs := (genEnd - genStart).toFloat / 1_000_000.0
@@ -713,7 +706,7 @@ def generate (device : Device) (model : BitNetModel)
 
 /-- Generate text WITHOUT KV cache (naive quadratic approach).
     Kept for validation/comparison with cached generate. -/
-def generateNaive (device : Device) (model : BitNetModel)
+def generateNaive (device : Device) (model : BitNetModel Buffer PreparedDispatch CompiledKernel)
              (promptTokens : Array Nat) (maxTokens : Nat)
              (strategy : Hesper.Inference.Sampling.Strategy := .Greedy)
              (eosToken : Option Nat := none)
@@ -726,7 +719,7 @@ def generateNaive (device : Device) (model : BitNetModel)
     let seqLen := tokens.size
     let tokenIdsBuf ← Hesper.WebGPU.BufferOps.uploadTokens device tokens
     let logitsBuf ← Hesper.WebGPU.BufferOps.createLogitsBuffer device 1 seqLen model.config.vocabSize
-    forward device model tokenIdsBuf logitsBuf 1 seqLen
+    forward (β := Device) device model tokenIdsBuf logitsBuf 1 seqLen
     let lastLogits ← Hesper.WebGPU.BufferOps.downloadLastLogits device logitsBuf 1 seqLen model.config.vocabSize
     let (nextToken, newRng) := Hesper.Inference.Sampling.sampleWithRNG lastLogits strategy rng
     rng := newRng
@@ -799,7 +792,7 @@ def extractConfig (gguf : Hesper.GGUF.GGUFFile) : IO Config := do
 
     NOTE: This function prevents premature GC of the GGUF object during loading
 -/
-def fromGGUFObject (device : Device) (gguf : Hesper.GGUF.GGUFFile) (config : Option Config := none) : IO BitNetModel := do
+def fromGGUFObject (device : Device) (gguf : Hesper.GGUF.GGUFFile) (config : Option Config := none) : IO (BitNetModel Buffer PreparedDispatch CompiledKernel) := do
   IO.println "═══════════════════════════════════════════════"
   IO.println s!"  Loading BitNet Model from GGUF Object"
   IO.println "═══════════════════════════════════════════════"
@@ -982,7 +975,7 @@ def fromGGUFObject (device : Device) (gguf : Hesper.GGUF.GGUFFile) (config : Opt
 
     NOTE: This loads the GGUF file and calls fromGGUFObject
 -/
-def fromGGUF (device : Device) (ggufPath : String) (config : Option Config := none) : IO BitNetModel := do
+def fromGGUF (device : Device) (ggufPath : String) (config : Option Config := none) : IO (BitNetModel Buffer PreparedDispatch CompiledKernel) := do
   -- Load GGUF file
   let gguf ← loadGGUF ggufPath
   -- Call the object-based loader
@@ -992,7 +985,7 @@ def fromGGUF (device : Device) (ggufPath : String) (config : Option Config := no
 
     @param model BitNet model
 -/
-def printStats (model : BitNetModel) : IO Unit := do
+def printStats (model : BitNetModel Buffer PreparedDispatch CompiledKernel) : IO Unit := do
   IO.println "═══════════════════════════════════════════════"
   IO.println "  Model Statistics"
   IO.println "═══════════════════════════════════════════════"

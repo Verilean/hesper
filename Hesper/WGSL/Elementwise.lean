@@ -1,6 +1,7 @@
 import Hesper.WGSL.Monad
 import Hesper.WGSL.Execute
 import Hesper.WGSL.Exp
+import Hesper.Backend
 import Hesper.WebGPU.Types
 import Hesper.WebGPU.Device
 import Hesper.WebGPU.Buffer
@@ -72,6 +73,7 @@ namespace Hesper.WGSL.Elementwise
 open Hesper.WGSL
 open Hesper.WGSL.Monad
 open Hesper.WebGPU
+open Hesper (GPUBackend)
 
 /-! ## Configuration -/
 
@@ -114,11 +116,11 @@ def addKernel (config : Config) : ShaderM Unit := do
     @param cBuf Output buffer C
     @param config Configuration
 -/
-def executeAdd (device : Device) (aBuf bBuf cBuf : Buffer) (config : Config) : IO Unit := do
+def executeAdd [GPUBackend β] (ctx : β) (aBuf bBuf cBuf : GPUBackend.Buf β) (config : Config) : IO Unit := do
   let shader := addKernel config
   let namedBuffers := [("a", aBuf), ("b", bBuf), ("c", cBuf)]
-  let execConfig := Hesper.WGSL.Execute.ExecutionConfig.dispatch1D config.numElements 256
-  Hesper.WGSL.Execute.executeShaderNamed device shader namedBuffers execConfig
+  let execConfig := Hesper.ExecConfig.dispatch1D config.numElements 256
+  GPUBackend.execute ctx shader namedBuffers execConfig
 
 /-! ## Multiplication (Gating) -/
 
@@ -154,11 +156,11 @@ def mulKernel (config : Config) : ShaderM Unit := do
     @param cBuf Output buffer C
     @param config Configuration
 -/
-def executeMul (device : Device) (aBuf bBuf cBuf : Buffer) (config : Config) : IO Unit := do
+def executeMul [GPUBackend β] (ctx : β) (aBuf bBuf cBuf : GPUBackend.Buf β) (config : Config) : IO Unit := do
   let shader := mulKernel config
   let namedBuffers := [("a", aBuf), ("b", bBuf), ("c", cBuf)]
-  let execConfig := Hesper.WGSL.Execute.ExecutionConfig.dispatch1D config.numElements 256
-  Hesper.WGSL.Execute.executeShaderNamed device shader namedBuffers execConfig
+  let execConfig := Hesper.ExecConfig.dispatch1D config.numElements 256
+  GPUBackend.execute ctx shader namedBuffers execConfig
 
 /-! ## ReLU² Activation -/
 
@@ -193,11 +195,11 @@ def reluSqrKernel (config : Config) : ShaderM Unit := do
     @param outputBuf Output buffer
     @param config Configuration
 -/
-def executeReluSqr (device : Device) (inputBuf outputBuf : Buffer) (config : Config) : IO Unit := do
+def executeReluSqr [GPUBackend β] (ctx : β) (inputBuf outputBuf : GPUBackend.Buf β) (config : Config) : IO Unit := do
   let shader := reluSqrKernel config
   let namedBuffers := [("input", inputBuf), ("output", outputBuf)]
-  let execConfig := Hesper.WGSL.Execute.ExecutionConfig.dispatch1D config.numElements 256
-  Hesper.WGSL.Execute.executeShaderNamed device shader namedBuffers execConfig
+  let execConfig := Hesper.ExecConfig.dispatch1D config.numElements 256
+  GPUBackend.execute ctx shader namedBuffers execConfig
 
 /-! ## GELU Activation -/
 
@@ -252,11 +254,11 @@ def geluKernel (config : Config) : ShaderM Unit := do
     @param outputBuf Output buffer
     @param config Configuration
 -/
-def executeGELU (device : Device) (inputBuf outputBuf : Buffer) (config : Config) : IO Unit := do
+def executeGELU [GPUBackend β] (ctx : β) (inputBuf outputBuf : GPUBackend.Buf β) (config : Config) : IO Unit := do
   let shader := geluKernel config
   let namedBuffers := [("input", inputBuf), ("output", outputBuf)]
-  let execConfig := Hesper.WGSL.Execute.ExecutionConfig.dispatch1D config.numElements 256
-  Hesper.WGSL.Execute.executeShaderNamed device shader namedBuffers execConfig
+  let execConfig := Hesper.ExecConfig.dispatch1D config.numElements 256
+  GPUBackend.execute ctx shader namedBuffers execConfig
 
 /-! ## Scalar Operations -/
 
@@ -291,12 +293,12 @@ def scaleKernel (config : Config) (scalar : Float) : ShaderM Unit := do
     @param config Configuration
     @param scalar Scalar multiplier
 -/
-def executeScale (device : Device) (inputBuf outputBuf : Buffer)
+def executeScale [GPUBackend β] (ctx : β) (inputBuf outputBuf : GPUBackend.Buf β)
                  (config : Config) (scalar : Float) : IO Unit := do
   let shader := scaleKernel config scalar
   let namedBuffers := [("input", inputBuf), ("output", outputBuf)]
-  let execConfig := Hesper.WGSL.Execute.ExecutionConfig.dispatch1D config.numElements 256
-  Hesper.WGSL.Execute.executeShaderNamed device shader namedBuffers execConfig
+  let execConfig := Hesper.ExecConfig.dispatch1D config.numElements 256
+  GPUBackend.execute ctx shader namedBuffers execConfig
 
 /-! ## Fused Operations (Optimization) -/
 
@@ -346,19 +348,21 @@ def reluSqrMulKernel (config : Config) : ShaderM Unit := do
     @param cBuf Output buffer C
     @param config Configuration
 -/
-def executeReluSqrMul (device : Device) (aBuf bBuf cBuf : Buffer) (config : Config)
-    (preparedRef : Option (IO.Ref (Option Hesper.WGSL.Execute.PreparedDispatch)) := none) : IO Unit := do
+def executeReluSqrMul [GPUBackend β] (ctx : β) (aBuf bBuf cBuf : GPUBackend.Buf β) (config : Config)
+    (preparedRef : Option (IO.Ref (Option (GPUBackend.CachedDispatch β))) := none) : IO Unit := do
   -- Fast path: replay prepared dispatch
   if let some ref := preparedRef then
     if let some p ← ref.get then
       let wx := (config.numElements + 255) / 256
-      Hesper.WGSL.Execute.replayPreparedDispatch device p wx 1 1
+      GPUBackend.replayCached ctx p (wx, 1, 1)
       return
   let shader := reluSqrMulKernel config
   let namedBuffers := [("a", aBuf), ("b", bBuf), ("c", cBuf)]
-  let execConfig := Hesper.WGSL.Execute.ExecutionConfig.dispatch1D config.numElements 256
+  let execConfig := Hesper.ExecConfig.dispatch1D config.numElements 256
   let cacheKey : UInt64 := hash ("relu2mul", config.numElements)
-  Hesper.WGSL.Execute.executeShaderNamed device shader namedBuffers execConfig (some cacheKey) preparedRef
+  match preparedRef with
+  | some ref => GPUBackend.executeWithConfigCached ctx shader namedBuffers execConfig cacheKey ref
+  | none => GPUBackend.execute ctx shader namedBuffers execConfig
 
 /-! ## Clamp (Gradient Clipping) -/
 
@@ -375,11 +379,11 @@ def clampInPlaceKernel (numElements : Nat) (minVal maxVal : Float) : ShaderM Uni
   ShaderM.writeBuffer (ty := .scalar .f32) "data" idx result
 
 /-- Execute in-place clamp: buf[i] = clamp(buf[i], minVal, maxVal) -/
-def executeClamp (device : Device) (inputBuf _outputBuf : Buffer)
+def executeClamp [GPUBackend β] (ctx : β) (inputBuf _outputBuf : GPUBackend.Buf β)
     (numElements : Nat) (minVal maxVal : Float) : IO Unit := do
   let shader := clampInPlaceKernel numElements minVal maxVal
   let namedBuffers := [("data", inputBuf)]
-  let execConfig := Hesper.WGSL.Execute.ExecutionConfig.dispatch1D numElements 256
-  Hesper.WGSL.Execute.executeShaderNamed device shader namedBuffers execConfig
+  let execConfig := Hesper.ExecConfig.dispatch1D numElements 256
+  GPUBackend.execute ctx shader namedBuffers execConfig
 
 end Hesper.WGSL.Elementwise
