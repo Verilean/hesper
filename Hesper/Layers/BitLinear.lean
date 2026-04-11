@@ -1,9 +1,6 @@
+import Hesper.Backend
 import Hesper.WGSL.Monad
-import Hesper.WGSL.Execute
 import Hesper.WGSL.Exp
-import Hesper.WebGPU.Types
-import Hesper.WebGPU.Device
-import Hesper.WebGPU.Buffer
 import Hesper.Quantization.TQ2_0
 import Hesper.Basic
 import Hesper.Logging
@@ -60,7 +57,7 @@ namespace Hesper.Layers.BitLinear
 
 open Hesper.WGSL
 open Hesper.WGSL.Monad
-open Hesper.WebGPU
+open Hesper
 open Hesper.Logging (logVerbose)
 
 /-- Counters for PreparedDispatch fast-path vs slow-path -/
@@ -1127,12 +1124,12 @@ def fusedBitLinearSubgroupMatrixKernel (config : Config) (numRows : Nat) : Shade
 /-! ## High-Level API -/
 
 /-- BitLinear layer structure -/
-structure BitLinear where
+structure BitLinear (BufT : Type) (CacheT : Type := Unit) (KernelT : Type := Unit) where
   config : Config
-  weightsPacked : Buffer   -- i2_s packed weights (raw bytes as u32 array)
-  scaleBuf : Buffer        -- Single f32 scale value
-  prepared : IO.Ref (Option Hesper.WGSL.Execute.PreparedDispatch)  -- Graph capture cache
-  kernel : Hesper.WGSL.Execute.CompiledKernel  -- Pre-compiled M=1 kernel
+  weightsPacked : BufT   -- i2_s packed weights (raw bytes as u32 array)
+  scaleBuf : BufT        -- Single f32 scale value
+  prepared : IO.Ref (Option CacheT)  -- Graph capture cache
+  kernel : KernelT  -- Pre-compiled M=1 kernel
 
 /-- Create BitLinear layer from i2_s packed data
 
@@ -1141,8 +1138,8 @@ structure BitLinear where
     @param packedWeights Raw i2_s packed byte data from GGUF
     @param scale Float32 scale factor for the ternary weights
 -/
-def create (device : Device) (config : Config)
-           (packedWeights : ByteArray) (scale : Float) : IO BitLinear := do
+def create [GPUBackend β] (ctx : β) (config : Config)
+           (packedWeights : ByteArray) (scale : Float) : IO (BitLinear (GPUBackend.Buf β) (GPUBackend.CachedDispatch β) (GPUBackend.CompiledKernel β)) := do
   logVerbose s!"[BitLinear] Creating layer: {config.inDim} -> {config.outDim}, scale={scale}"
 
   -- Pad packed weights to u32 alignment if needed
@@ -1155,40 +1152,22 @@ def create (device : Device) (config : Config)
         w := w.push 0
       pure w
 
-  -- Create GPU buffer for packed weights
   let bufSize := if paddedWeights.size == 0 then 4 else paddedWeights.size
-  let weightsBuf ← createBuffer device {
-    size := bufSize.toUSize
-    usage := [.storage, .copyDst]
-    mappedAtCreation := false
-  }
+  let weightsBuf ← GPUBackend.allocBuffer ctx bufSize.toUSize
   if paddedWeights.size > 0 then
-    writeBuffer device weightsBuf 0 paddedWeights
-
-  -- Create GPU buffer for scale (single f32 = 4 bytes)
-  let scaleBuf ← createBuffer device {
-    size := 4
-    usage := [.storage, .copyDst]
-    mappedAtCreation := false
-  }
-  -- Encode scale as f32 bytes (little-endian) via FFI (proper f64→f32 conversion)
+    GPUBackend.writeBuffer ctx weightsBuf paddedWeights
+  let scaleBuf ← GPUBackend.allocBuffer ctx 4
   let scaleBytes ← Hesper.Basic.floatToBytes scale
-  writeBuffer device scaleBuf 0 scaleBytes
-
-  let prepared ← IO.mkRef none
-  -- Build M=1 kernel at init time (select subgroup or shared-mem fallback)
-  let useSubgroups ← Hesper.WGSL.Execute.hasSubgroupSupport device
+  GPUBackend.writeBuffer ctx scaleBuf scaleBytes
+  let prepared ← GPUBackend.newCacheRef (β := β)
+  let useSubgroups ← GPUBackend.hasSubgroupSupport ctx
   let shaderM := if useSubgroups
     then fusedBitLinearM1Kernel config
     else fusedBitLinearM1KernelSharedMem config
-  let kernel ← Hesper.WGSL.Execute.buildKernel device shaderM {
-    workgroupSize := { x := 32, y := 1, z := 1 }
-    numWorkgroups := (config.outDim, 1, 1)
-    extensions := if useSubgroups then ["subgroups"] else []
-    diagnostics := if useSubgroups then [("off", "chromium.subgroup_matrix_uniformity")] else []
-  }
+  let kernel ← GPUBackend.buildKernel ctx shaderM "main"
+    { x := 32 } (config.outDim, 1, 1)
   logVerbose s!"[BitLinear] Layer created: packed={paddedWeights.size} bytes (subgroups={useSubgroups})"
-  pure { config, weightsPacked := weightsBuf, scaleBuf := scaleBuf, prepared, kernel }
+  pure { config, weightsPacked := weightsBuf, scaleBuf, prepared, kernel }
 
 /-- Create BitLinear layer from packed data + scale ByteArrays
 
@@ -1200,8 +1179,8 @@ def create (device : Device) (config : Config)
     @param packedWeights Raw i2_s packed byte data
     @param scaleBytes 4-byte little-endian F32 scale
 -/
-def createFromBytes (device : Device) (config : Config)
-                    (packedWeights : ByteArray) (scaleBytes : ByteArray) : IO BitLinear := do
+def createFromBytes [GPUBackend β] (ctx : β) (config : Config)
+                    (packedWeights : ByteArray) (scaleBytes : ByteArray) : IO (BitLinear (GPUBackend.Buf β) (GPUBackend.CachedDispatch β) (GPUBackend.CompiledKernel β)) := do
   logVerbose s!"[BitLinear] Creating layer from bytes: {config.inDim} -> {config.outDim}"
 
   -- Pad packed weights to u32 alignment if needed
@@ -1214,38 +1193,21 @@ def createFromBytes (device : Device) (config : Config)
         w := w.push 0
       pure w
 
-  -- Create GPU buffer for packed weights
   let bufSize := if paddedWeights.size == 0 then 4 else paddedWeights.size
-  let weightsBuf ← createBuffer device {
-    size := bufSize.toUSize
-    usage := [.storage, .copyDst]
-    mappedAtCreation := false
-  }
+  let weightsBuf ← GPUBackend.allocBuffer ctx bufSize.toUSize
   if paddedWeights.size > 0 then
-    writeBuffer device weightsBuf 0 paddedWeights
-
-  -- Create GPU buffer for scale (single f32 = 4 bytes)
-  let scaleBuf ← createBuffer device {
-    size := (scaleBytes.size.max 4).toUSize
-    usage := [.storage, .copyDst]
-    mappedAtCreation := false
-  }
-  writeBuffer device scaleBuf 0 scaleBytes
-
-  let prepared ← IO.mkRef none
-  -- Build M=1 kernel at init time (select subgroup or shared-mem fallback)
-  let useSubgroups ← Hesper.WGSL.Execute.hasSubgroupSupport device
+    GPUBackend.writeBuffer ctx weightsBuf paddedWeights
+  let scaleBuf ← GPUBackend.allocBuffer ctx (scaleBytes.size.max 4).toUSize
+  GPUBackend.writeBuffer ctx scaleBuf scaleBytes
+  let prepared ← GPUBackend.newCacheRef (β := β)
+  let useSubgroups ← GPUBackend.hasSubgroupSupport ctx
   let shaderM := if useSubgroups
     then fusedBitLinearM1Kernel config
     else fusedBitLinearM1KernelSharedMem config
-  let kernel ← Hesper.WGSL.Execute.buildKernel device shaderM {
-    workgroupSize := { x := 32, y := 1, z := 1 }
-    numWorkgroups := (config.outDim, 1, 1)
-    extensions := if useSubgroups then ["subgroups"] else []
-    diagnostics := if useSubgroups then [("off", "chromium.subgroup_matrix_uniformity")] else []
-  }
+  let kernel ← GPUBackend.buildKernel ctx shaderM "main"
+    { x := 32 } (config.outDim, 1, 1)
   logVerbose s!"[BitLinear] Layer created: packed={paddedWeights.size} bytes (subgroups={useSubgroups})"
-  pure { config, weightsPacked := weightsBuf, scaleBuf := scaleBuf, prepared, kernel }
+  pure { config, weightsPacked := weightsBuf, scaleBuf, prepared, kernel }
 
 /-- Execute forward pass
 
@@ -1254,13 +1216,13 @@ def createFromBytes (device : Device) (config : Config)
     @param inputBuf GPU buffer containing input (Float32)
     @param outputBuf GPU buffer for output (Float32)
 -/
-def forward (device : Device) (layer : BitLinear)
-            (inputBuf outputBuf : Buffer) (numRows : Nat := 1) : IO Unit := do
+def forward [GPUBackend β] (ctx : β) (layer : BitLinear (GPUBackend.Buf β) (GPUBackend.CachedDispatch β) (GPUBackend.CompiledKernel β))
+            (inputBuf outputBuf : GPUBackend.Buf β) (numRows : Nat := 1) : IO Unit := do
   -- Fast path: replay prepared dispatch (skips ALL Lean processing)
   if numRows == 1 then
     if let some p ← layer.prepared.get then
       preparedHitsRef.modify (· + 1)
-      Hesper.WGSL.Execute.replayPreparedDispatch device p layer.config.outDim 1 1
+      GPUBackend.replayCached ctx p (layer.config.outDim, 1, 1)
       return
 
   preparedMissesRef.modify (· + 1)
@@ -1268,18 +1230,17 @@ def forward (device : Device) (layer : BitLinear)
 
   if numRows == 1 then
     -- M=1 path: use pre-compiled kernel, direct buffer binding (no string matching)
-    let bg ← Hesper.WGSL.Execute.bindKernelDirect device layer.kernel
+    GPUBackend.dispatchCompiledKernel ctx layer.kernel
       #[layer.weightsPacked, layer.scaleBuf, inputBuf, outputBuf]
-    layer.prepared.set (some (layer.kernel.prepare bg))
-    Hesper.WGSL.Execute.dispatchKernel device layer.kernel bg (layer.config.outDim, 1, 1)
+      (layer.config.outDim, 1, 1) (some layer.prepared)
   else
     -- M>1 path. Prefer the subgroup-matrix cooperative matmul kernel when:
     --   (a) the device exposes SubgroupMatrix + ShaderF16,
     --   (b) the shape is tile-friendly (numRows, inDim, outDim all % 16 == 0),
     --   (c) inDim is also % 128 == 0 (i2_s group layout).
     -- Otherwise fall back to the workgroup-cooperative tiled kernel.
-    let hasSM ← Hesper.WGSL.Execute.hasSubgroupMatrixSupport device
-    let hasF16 ← Hesper.WGSL.Execute.hasShaderF16Support device
+    let hasSM ← GPUBackend.hasSubgroupSupport ctx
+    let hasF16 ← GPUBackend.hasShaderF16Support ctx
     -- The kernel zero-pads the tail row tile, so numRows ≥ 16 is the only
     -- row requirement. outDim must be a multiple of 16 (no column-tail
     -- padding yet) and inDim must be a multiple of 128 (i2_s group layout).
@@ -1298,16 +1259,13 @@ def forward (device : Device) (layer : BitLinear)
         ("output", outputBuf)
       ]
       let numRowTiles := (numRows + 15) / 16
-      let execConfig : Hesper.WGSL.Execute.ExecutionConfig := {
+      let execConfig : Hesper.ExecConfig := {
         workgroupSize := { x := 32, y := 1, z := 1 }
         numWorkgroups := (layer.config.outDim / 16, numRowTiles, 1)
-        extensions :=
-          ["f16", "chromium_experimental_subgroup_matrix"]
-        diagnostics := [("off", "chromium.subgroup_matrix_uniformity")]
       }
       let cacheKey : UInt64 :=
         hash ("bl-sm", layer.config.inDim, layer.config.outDim, numRows)
-      Hesper.WGSL.Execute.executeShaderNamed device shader namedBuffers execConfig (some cacheKey)
+      GPUBackend.execute ctx shader namedBuffers execConfig
     else
       -- Workgroup-cooperative tiled kernel (existing fallback)
       let wgSize := 256
@@ -1319,12 +1277,12 @@ def forward (device : Device) (layer : BitLinear)
         ("output", outputBuf)
       ]
       let totalOutputs := numRows * layer.config.outDim
-      let execConfig : Hesper.WGSL.Execute.ExecutionConfig := {
+      let execConfig : Hesper.ExecConfig := {
         workgroupSize := { x := wgSize, y := 1, z := 1 }
         numWorkgroups := (totalOutputs, 1, 1)
       }
       let cacheKey : UInt64 := hash ("bl", layer.config.inDim, layer.config.outDim, numRows)
-      Hesper.WGSL.Execute.executeShaderNamed device shader namedBuffers execConfig (some cacheKey)
+      GPUBackend.execute ctx shader namedBuffers execConfig
 
   logVerbose "[BitLinear] Forward pass complete"
 
@@ -1339,13 +1297,13 @@ def forward (device : Device) (layer : BitLinear)
     @param outputBuf GPU buffer for output (Float32)
     @param numRows Number of input rows
 -/
-def forwardWithResidual (device : Device) (layer : BitLinear)
-            (inputBuf residualBuf outputBuf : Buffer) (numRows : Nat := 1) : IO Unit := do
+def forwardWithResidual [GPUBackend β] (ctx : β) (layer : BitLinear (GPUBackend.Buf β) (GPUBackend.CachedDispatch β) (GPUBackend.CompiledKernel β))
+            (inputBuf residualBuf outputBuf : GPUBackend.Buf β) (numRows : Nat := 1) : IO Unit := do
   -- Fast path: replay prepared dispatch (skips ALL Lean processing)
   if numRows == 1 then
     if let some p ← layer.prepared.get then
       preparedHitsRef.modify (· + 1)
-      Hesper.WGSL.Execute.replayPreparedDispatch device p layer.config.outDim 1 1
+      GPUBackend.replayCached ctx p (layer.config.outDim, 1, 1)
       return
 
   preparedMissesRef.modify (· + 1)
@@ -1361,29 +1319,27 @@ def forwardWithResidual (device : Device) (layer : BitLinear)
 
   if numRows == 1 then
     -- M=1 path: 32 threads per output, fused residual add
-    let useSubgroups ← Hesper.WGSL.Execute.hasSubgroupSupport device
+    let useSubgroups ← GPUBackend.hasSubgroupSupport ctx
     let shader := if useSubgroups
       then fusedBitLinearResidualM1Kernel layer.config
       else fusedBitLinearResidualM1KernelSharedMem layer.config
-    let execConfig : Hesper.WGSL.Execute.ExecutionConfig := {
+    let execConfig : Hesper.ExecConfig := {
       workgroupSize := { x := 32, y := 1, z := 1 }
       numWorkgroups := (layer.config.outDim, 1, 1)
-      extensions := if useSubgroups then ["subgroups"] else []
-      diagnostics := if useSubgroups then [("off", "chromium.subgroup_matrix_uniformity")] else []
     }
     let cacheKey : UInt64 := hash ("blrm1", layer.config.inDim, layer.config.outDim, useSubgroups)
-    Hesper.WGSL.Execute.executeShaderNamed device shader namedBuffers execConfig (some cacheKey) (some layer.prepared)
+    GPUBackend.executeWithConfigCached ctx shader namedBuffers execConfig cacheKey layer.prepared
   else
     -- M>1 path: workgroup-cooperative tiled kernel with residual
     let wgSize := 256
     let shader := fusedBitLinearResidualKernel layer.config numRows wgSize
     let totalOutputs := numRows * layer.config.outDim
-    let execConfig : Hesper.WGSL.Execute.ExecutionConfig := {
+    let execConfig : Hesper.ExecConfig := {
       workgroupSize := { x := wgSize, y := 1, z := 1 }
       numWorkgroups := (totalOutputs, 1, 1)
     }
     let cacheKey : UInt64 := hash ("blr", layer.config.inDim, layer.config.outDim, numRows)
-    Hesper.WGSL.Execute.executeShaderNamed device shader namedBuffers execConfig (some cacheKey)
+    GPUBackend.execute ctx shader namedBuffers execConfig
 
   logVerbose "[BitLinear] Fused forward+residual complete"
 
@@ -1402,22 +1358,22 @@ def forwardWithResidual (device : Device) (layer : BitLinear)
     @param outputBuf Output buffer [outDim]
     @param preparedRef Optional PreparedDispatch ref for fast-path replay
 -/
-def forwardFusedRMSNormResidual (device : Device) (layer : BitLinear)
-    (rmsNorm : Hesper.Layers.RMSNorm.RMSNorm)
-    (inputBuf residualBuf outputBuf : Buffer)
-    (preparedRef : Option (IO.Ref (Option Hesper.WGSL.Execute.PreparedDispatch)) := none)
+def forwardFusedRMSNormResidual [GPUBackend β] (ctx : β) (layer : BitLinear (GPUBackend.Buf β) (GPUBackend.CachedDispatch β) (GPUBackend.CompiledKernel β))
+    (rmsNorm : Hesper.Layers.RMSNorm.RMSNorm (GPUBackend.Buf β) (GPUBackend.CachedDispatch β))
+    (inputBuf residualBuf outputBuf : GPUBackend.Buf β)
+    (preparedRef : Option (IO.Ref (Option (GPUBackend.CachedDispatch β))) := none)
     : IO Unit := do
   -- Fast path: replay prepared dispatch
   if let some ref := preparedRef then
     if let some p ← ref.get then
       preparedHitsRef.modify (· + 1)
-      Hesper.WGSL.Execute.replayPreparedDispatch device p layer.config.outDim 1 1
+      GPUBackend.replayCached ctx p (layer.config.outDim, 1, 1)
       return
 
   preparedMissesRef.modify (· + 1)
   logVerbose s!"[BitLinear] Executing fused RMSNorm+BitLinear+Residual ({layer.config.inDim}→{layer.config.outDim})..."
 
-  let useSubgroups ← Hesper.WGSL.Execute.hasSubgroupSupport device
+  let useSubgroups ← GPUBackend.hasSubgroupSupport ctx
   let shader := if useSubgroups
     then fusedRMSNormBitLinearResidualM1Kernel layer.config rmsNorm.config.eps
     else fusedRMSNormBitLinearResidualM1KernelSharedMem layer.config rmsNorm.config.eps
@@ -1429,14 +1385,14 @@ def forwardFusedRMSNormResidual (device : Device) (layer : BitLinear)
     ("residual", residualBuf),
     ("output", outputBuf)
   ]
-  let execConfig : Hesper.WGSL.Execute.ExecutionConfig := {
+  let execConfig : Hesper.ExecConfig := {
     workgroupSize := { x := 32, y := 1, z := 1 }
     numWorkgroups := (layer.config.outDim, 1, 1)
-    extensions := if useSubgroups then ["subgroups"] else []
-    diagnostics := if useSubgroups then [("off", "chromium.subgroup_matrix_uniformity")] else []
   }
   let cacheKey : UInt64 := hash ("frnblrm1", layer.config.inDim, layer.config.outDim, useSubgroups)
-  Hesper.WGSL.Execute.executeShaderNamed device shader namedBuffers execConfig (some cacheKey) preparedRef
+  match preparedRef with
+  | some ref => GPUBackend.executeWithConfigCached ctx shader namedBuffers execConfig cacheKey ref
+  | none => GPUBackend.execute ctx shader namedBuffers execConfig
 
 /-- Execute fused Gate+Up+ReLU²×Mul forward pass (M=1 only).
 
@@ -1450,21 +1406,21 @@ def forwardFusedRMSNormResidual (device : Device) (layer : BitLinear)
     @param outputBuf Output buffer [outDim]
     @param preparedRef Optional PreparedDispatch ref for fast-path replay
 -/
-def forwardFusedGateUpReluSqrMul (device : Device) (gateLayer upLayer : BitLinear)
-    (inputBuf outputBuf : Buffer)
-    (preparedRef : Option (IO.Ref (Option Hesper.WGSL.Execute.PreparedDispatch)) := none)
+def forwardFusedGateUpReluSqrMul [GPUBackend β] (ctx : β) (gateLayer upLayer : BitLinear (GPUBackend.Buf β) (GPUBackend.CachedDispatch β) (GPUBackend.CompiledKernel β))
+    (inputBuf outputBuf : GPUBackend.Buf β)
+    (preparedRef : Option (IO.Ref (Option (GPUBackend.CachedDispatch β))) := none)
     : IO Unit := do
   -- Fast path: replay prepared dispatch
   if let some ref := preparedRef then
     if let some p ← ref.get then
       preparedHitsRef.modify (· + 1)
-      Hesper.WGSL.Execute.replayPreparedDispatch device p gateLayer.config.outDim 1 1
+      GPUBackend.replayCached ctx p (gateLayer.config.outDim, 1, 1)
       return
 
   preparedMissesRef.modify (· + 1)
   logVerbose s!"[BitLinear] Executing fused Gate+Up+ReLU²×Mul ({gateLayer.config.inDim}→{gateLayer.config.outDim})..."
 
-  let useSubgroups ← Hesper.WGSL.Execute.hasSubgroupSupport device
+  let useSubgroups ← GPUBackend.hasSubgroupSupport ctx
   let shader := if useSubgroups
     then fusedGateUpReluSqrMulM1Kernel gateLayer.config
     else fusedGateUpReluSqrMulM1KernelSharedMem gateLayer.config
@@ -1476,13 +1432,13 @@ def forwardFusedGateUpReluSqrMul (device : Device) (gateLayer upLayer : BitLinea
     ("up_scale", upLayer.scaleBuf),
     ("output", outputBuf)
   ]
-  let execConfig : Hesper.WGSL.Execute.ExecutionConfig := {
+  let execConfig : Hesper.ExecConfig := {
     workgroupSize := { x := 32, y := 1, z := 1 }
     numWorkgroups := (gateLayer.config.outDim, 1, 1)
-    extensions := if useSubgroups then ["subgroups"] else []
-    diagnostics := if useSubgroups then [("off", "chromium.subgroup_matrix_uniformity")] else []
   }
   let cacheKey : UInt64 := hash ("fgurelum1", gateLayer.config.inDim, gateLayer.config.outDim, useSubgroups)
-  Hesper.WGSL.Execute.executeShaderNamed device shader namedBuffers execConfig (some cacheKey) preparedRef
+  match preparedRef with
+  | some ref => GPUBackend.executeWithConfigCached ctx shader namedBuffers execConfig cacheKey ref
+  | none => GPUBackend.execute ctx shader namedBuffers execConfig
 
 end Hesper.Layers.BitLinear
