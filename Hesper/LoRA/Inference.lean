@@ -437,7 +437,7 @@ def generateWithLoRA (device : Device) (model : BitNetModel Buffer PreparedDispa
     (repetitionPenalty : Float := 1.1)
     : IO (Array Nat) := do
   -- Reset caches
-  resetPreparedDispatches model
+  resetPreparedDispatches (β := Device) model
 
   IO.println "═══════════════════════════════════════════════"
   IO.println "  Text Generation with LoRA"
@@ -446,14 +446,14 @@ def generateWithLoRA (device : Device) (model : BitNetModel Buffer PreparedDispa
   IO.println s!"Prompt: {promptTokens.size} tokens, generating up to {maxTokens}"
   IO.println ""
 
-  let cacheState ← createKVCacheState device model
+  let cacheState ← createKVCacheState (β := Device) device model
   let mut tokens := promptTokens
   let mut rng := Hesper.Inference.Sampling.RNG.create (some 42)
 
   -- Pre-upload prompt tokens to penalty buffer
   if repetitionPenalty != 1.0 then
     for i in [0:promptTokens.size] do
-      appendPenaltyToken device cacheState promptTokens[i]! i
+      appendPenaltyToken (β := Device) device cacheState promptTokens[i]! i
 
   -- Phase 1: Prefill with LoRA
   IO.println s!"[Prefill+LoRA] Processing {promptTokens.size} prompt tokens..."
@@ -479,9 +479,9 @@ def generateWithLoRA (device : Device) (model : BitNetModel Buffer PreparedDispa
     let mut nextToken := 0
     if isGreedy then
       if repetitionPenalty == 1.0 then
-        nextToken ← gpuArgmax device cacheState.logitsBuf cacheState.argmaxBuf model.config.vocabSize
+        nextToken ← gpuArgmax (β := Device) device cacheState.logitsBuf cacheState.argmaxBuf model.config.vocabSize
       else
-        nextToken ← gpuArgmaxWithPenalty device cacheState model.config.vocabSize
+        nextToken ← gpuArgmaxWithPenalty (β := Device) device cacheState model.config.vocabSize
           model.config.maxSeqLen tokens.size repetitionPenalty
     else
       let logits ← Hesper.WebGPU.BufferOps.downloadFloatArray device cacheState.logitsBuf model.config.vocabSize
@@ -494,7 +494,7 @@ def generateWithLoRA (device : Device) (model : BitNetModel Buffer PreparedDispa
     genTokenCount := genTokenCount + 1
 
     if repetitionPenalty != 1.0 then
-      appendPenaltyToken device cacheState nextToken (tokens.size - 1)
+      appendPenaltyToken (β := Device) device cacheState nextToken (tokens.size - 1)
 
     match eosToken with
     | some eos =>
