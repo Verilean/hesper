@@ -41,7 +41,7 @@ open Hesper.Inference
     writes currentBuf → nextBuf:
       even N: currentBuf=buf1, nextBuf=buf2 → hidden in buf2
       odd N:  currentBuf=buf2, nextBuf=buf1 → hidden in buf1 -/
-def hiddenBuf (cacheState : KVCacheState) (numLayers : Nat) : Buffer :=
+def hiddenBuf (cacheState : KVCacheState Buffer PreparedDispatch) (numLayers : Nat) : Buffer :=
   if numLayers % 2 == 0 then cacheState.buf2 else cacheState.buf1
 
 /-- Upload a hidden state from a GPU buffer into the TTT hidden buffer.
@@ -117,7 +117,7 @@ def addTTTLogits (device : Device) (config : TTTConfig) (tttBufs : TTTBuffers)
     the learned TTT weights are frozen and simply added to base logits.
 
     Does NOT modify the BitNet model or its weights in any way. -/
-def generateWithTTT (device : Device) (model : BitNetModel)
+def generateWithTTT (device : Device) (model : BitNetModel Buffer PreparedDispatch CompiledKernel)
     (promptTokens : Array Nat) (maxTokens : Nat)
     (tttConfig : TTTConfig)
     (strategy : Sampling.Strategy := .Greedy)
@@ -135,7 +135,7 @@ def generateWithTTT (device : Device) (model : BitNetModel)
   IO.println ""
 
   -- Create standard BitNet KV cache state
-  let cacheState ← createKVCacheState device model
+  let cacheState ← createKVCacheState (β := Device) device model
 
   -- Create TTT buffers (tttWeightBuf zero-initialized)
   -- TTT operates at vocabSize × dim (same as LM head)
@@ -155,7 +155,7 @@ def generateWithTTT (device : Device) (model : BitNetModel)
     if i >= model.config.maxSeqLen then break
 
     -- Run standard BitNet forward pass (fills KV cache + produces logits)
-    forwardSingleToken device model promptTokens[i]! i cacheState
+    forwardSingleToken (β := Device) device model promptTokens[i]! i cacheState
 
     -- TTT learning: use next token as target (teacher forcing)
     if i + 1 < promptTokens.size then
@@ -219,7 +219,7 @@ def generateWithTTT (device : Device) (model : BitNetModel)
     -- Forward pass for the new token (extends KV cache)
     let newPos := tokens.size - 1
     if newPos < model.config.maxSeqLen then
-      forwardSingleToken device model nextToken newPos cacheState
+      forwardSingleToken (β := Device) device model nextToken newPos cacheState
 
   let genEnd ← IO.monoNanosNow
   let genMs := (genEnd - genStart).toFloat / 1_000_000.0

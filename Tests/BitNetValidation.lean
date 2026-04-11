@@ -105,7 +105,7 @@ def runValidation (dataDir : String) (modelPath : String) : IO TestSeq := do
     mappedAtCreation := false
   }
 
-  Hesper.Models.BitNet.forward device model tokensBuf outputBuf batchSize seqLen
+  Hesper.Models.BitNet.forward (β := Device) device model tokensBuf outputBuf batchSize seqLen
   IO.println "  Forward pass complete"
 
   -- Download Hesper logits

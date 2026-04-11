@@ -100,7 +100,7 @@ def createHiddenTTTBuffers (device : Device) (config : HiddenTTTConfig) : IO Hid
   }
 
 /-- Which buffer holds post-norm hidden after forwardSingleToken -/
-def postNormBuf (cacheState : KVCacheState) (numLayers : Nat) : Buffer :=
+def postNormBuf (cacheState : KVCacheState Buffer PreparedDispatch) (numLayers : Nat) : Buffer :=
   if numLayers % 2 == 0 then cacheState.buf2 else cacheState.buf1
 
 /-- One MSE-based hidden-space TTT step.
@@ -157,7 +157,7 @@ def hiddenTTTStep (device : Device) (config : HiddenTTTConfig) (bufs : HiddenTTT
   return (mseLoss, false, adamStep)
 
 /-- Compute LM head using model's embedding weights -/
-def computeLMHead (device : Device) (model : BitNetModel)
+def computeLMHead (device : Device) (model : BitNetModel Buffer PreparedDispatch CompiledKernel)
     (hiddenBuf logitsBuf : Buffer) : IO Unit := do
   let cfg := model.config
   let lmConfig : Hesper.WGSL.MatMul.Config := { M := 1, N := cfg.vocabSize, K := cfg.dim }
@@ -172,7 +172,7 @@ def computeLMHead (device : Device) (model : BitNetModel)
 
 /-- Add TTT correction to hidden, then compute LM head (decode phase, frozen). -/
 def addTTTAndComputeLogits (device : Device) (config : HiddenTTTConfig) (bufs : HiddenTTTBuffers)
-    (model : BitNetModel) (postNormHiddenBuf logitsBuf : Buffer) : IO Unit := do
+    (model : BitNetModel Buffer PreparedDispatch CompiledKernel) (postNormHiddenBuf logitsBuf : Buffer) : IO Unit := do
   let d := config.dim
   -- tttOut = W_ttt @ hidden
   executeMatVec device bufs.tttWeightBuf postNormHiddenBuf bufs.tttOutputBuf d d
@@ -182,7 +182,7 @@ def addTTTAndComputeLogits (device : Device) (config : HiddenTTTConfig) (bufs : 
   computeLMHead device model bufs.correctedHiddenBuf logitsBuf
 
 /-- Generate text with Hidden-Space MSE TTT. -/
-def generateWithHiddenTTT (device : Device) (model : BitNetModel)
+def generateWithHiddenTTT (device : Device) (model : BitNetModel Buffer PreparedDispatch CompiledKernel)
     (promptTokens : Array Nat) (maxTokens : Nat)
     (tttConfig : HiddenTTTConfig)
     (strategy : Sampling.Strategy := .Greedy)
@@ -200,7 +200,7 @@ def generateWithHiddenTTT (device : Device) (model : BitNetModel)
   IO.println s!"  Prompt: {promptTokens.size} tokens, generate up to {maxTokens}"
   IO.println ""
 
-  let cacheState ← createKVCacheState device model
+  let cacheState ← createKVCacheState (β := Device) device model
   let bufs ← createHiddenTTTBuffers device tttConfig
   let hBuf := postNormBuf cacheState model.config.numLayers
   let mut tokens := promptTokens
@@ -219,7 +219,7 @@ def generateWithHiddenTTT (device : Device) (model : BitNetModel)
     if i >= model.config.maxSeqLen then break
 
     -- Forward pass: fills KV cache + produces hidden state in hBuf
-    forwardSingleToken device model promptTokens[i]! i cacheState
+    forwardSingleToken (β := Device) device model promptTokens[i]! i cacheState
 
     -- TTT update: compare prev_hidden vs current_hidden
     if hasPrevHidden then
@@ -278,7 +278,7 @@ def generateWithHiddenTTT (device : Device) (model : BitNetModel)
 
     let newPos := tokens.size - 1
     if newPos < model.config.maxSeqLen then
-      forwardSingleToken device model nextToken newPos cacheState
+      forwardSingleToken (β := Device) device model nextToken newPos cacheState
 
   let genEnd ← IO.monoNanosNow
   let genMs := (genEnd - genStart).toFloat / 1_000_000.0

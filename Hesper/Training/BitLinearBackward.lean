@@ -1,6 +1,7 @@
 import Hesper.WGSL.Monad
 import Hesper.WGSL.Execute
 import Hesper.WGSL.Exp
+import Hesper.Backend.WebGPU
 import Hesper.WebGPU.Types
 import Hesper.WebGPU.Device
 import Hesper.WebGPU.Buffer
@@ -43,6 +44,7 @@ namespace Hesper.Training.BitLinearBackward
 
 open Hesper.WGSL
 open Hesper.WGSL.Monad
+open Hesper.WGSL.Execute (PreparedDispatch CompiledKernel)
 open Hesper.WebGPU
 
 /-- Transpose matmul kernel: dInput[j] = scale * Σ_i W[i,j] * dOutput[i]
@@ -117,7 +119,7 @@ def bitLinearTransposeKernel (inDim outDim : Nat) (workgroupSize : Nat := 256) :
   ) (pure ())
 
 /-- Execute BitLinear transpose: dInput = scale * W^T @ dOutput -/
-def executeBitLinearTranspose (device : Device) (layer : Hesper.Layers.BitLinear.BitLinear)
+def executeBitLinearTranspose (device : Device) (layer : Hesper.Layers.BitLinear.BitLinear Buffer PreparedDispatch CompiledKernel)
     (dOutputBuf dInputBuf : Buffer) : IO Unit := do
   let inDim := layer.config.inDim
   let outDim := layer.config.outDim
