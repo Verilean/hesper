@@ -65,9 +65,15 @@ private def cudaLaunchWithBuffers (func : CUfunction) (namedBuffers : List (Stri
     workgroupSize.x.toUInt32 workgroupSize.y.toUInt32 workgroupSize.z.toUInt32
     0 args
 
+/-- CUDA compiled kernel — just the JIT'd function. -/
+structure CUDACompiledKernel where
+  func : CUfunction
+  declaredNames : Array String
+
 instance : GPUBackend CUDAContext where
   Buf := CUDABuffer
   CachedDispatch := CUDACachedDispatch
+  CompiledKernel := CUDACompiledKernel
   executeKernel _ctx computation namedBuffers funcName workgroupSize numWorkgroups := do
     let func ← cudaExecuteImpl computation namedBuffers funcName workgroupSize numWorkgroups
     cudaLaunchWithBuffers func namedBuffers computation workgroupSize numWorkgroups
@@ -89,6 +95,24 @@ instance : GPUBackend CUDAContext where
   freeBuffer _ctx buf := freeCUDABuffer buf
   writeBuffer _ctx buf data := writeCUDABuffer buf data
   readBuffer _ctx buf size := readCUDABuffer buf size
+  buildKernel _ctx computation funcName workgroupSize _numWorkgroups := do
+    let ptx := generatePTX funcName workgroupSize computation
+    let sourceHash := hash ptx
+    let cache ← cudaModuleCache.get
+    let func ← match cache.find? (fun e => e.1 == sourceHash) with
+    | some (_, f) => pure f
+    | none => do
+      let cudaMod ← cuModuleLoadData ptx
+      let f ← cuModuleGetFunction cudaMod funcName
+      cudaModuleCache.modify (·.push (sourceHash, f))
+      pure f
+    let state := Hesper.WGSL.Monad.ShaderM.exec computation
+    pure { func, declaredNames := state.declaredBuffers.map (·.1) |>.toArray }
+  dispatchCompiledKernel _ctx kernel buffers numWorkgroups _cacheRef := do
+    let args := buffers.map (·.ptr)
+    let (gx, gy, gz) := numWorkgroups
+    cuLaunchKernel kernel.func
+      gx.toUInt32 gy.toUInt32 gz.toUInt32 1 1 1 0 args
   newCacheRef := IO.mkRef none
 
 end Hesper

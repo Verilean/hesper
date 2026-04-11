@@ -35,6 +35,8 @@ class GPUBackend (β : Type) where
   Buf : Type
   /-- Cached dispatch state for fast-path replay (WebGPU: PreparedDispatch, CUDA: hash key) -/
   CachedDispatch : Type := Unit
+  /-- Pre-compiled kernel (WebGPU: CompiledKernel, CUDA: CUfunction + metadata) -/
+  CompiledKernel : Type := Unit
 
   -- ── Kernel execution ──
 
@@ -69,6 +71,17 @@ class GPUBackend (β : Type) where
   writeBufferOffset : β → Buf → USize → ByteArray → IO Unit := fun ctx buf _ data => writeBuffer ctx buf data
   /-- Download `size` bytes from GPU buffer to host -/
   readBuffer : β → Buf → USize → IO ByteArray
+
+  -- ── Kernel compilation ──
+
+  /-- Pre-compile a kernel (WebGPU: build pipeline, CUDA: JIT PTX) -/
+  buildKernel : β → ShaderM Unit →
+    (funcName : String) → (workgroupSize : WorkgroupSize) →
+    (numWorkgroups : Nat × Nat × Nat) → IO CompiledKernel
+  /-- Dispatch a pre-compiled kernel with positional buffers + optional cache -/
+  dispatchCompiledKernel : β → CompiledKernel → Array Buf →
+    (numWorkgroups : Nat × Nat × Nat) →
+    (cacheRef : Option (IO.Ref (Option CachedDispatch))) → IO Unit
 
   -- ── Dispatch cache management ──
 
