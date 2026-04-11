@@ -1164,8 +1164,11 @@ def create [GPUBackend β] (ctx : β) (config : Config)
   let shaderM := if useSubgroups
     then fusedBitLinearM1Kernel config
     else fusedBitLinearM1KernelSharedMem config
-  let kernel ← GPUBackend.buildKernel ctx shaderM "main"
-    { x := 32 } (config.outDim, 1, 1)
+  let kernel ← GPUBackend.buildKernel ctx shaderM {
+    workgroupSize := { x := 32 }, numWorkgroups := (config.outDim, 1, 1),
+    extensions := if useSubgroups then ["subgroups"] else [],
+    diagnostics := if useSubgroups then [("off", "chromium.subgroup_matrix_uniformity")] else []
+  }
   logVerbose s!"[BitLinear] Layer created: packed={paddedWeights.size} bytes (subgroups={useSubgroups})"
   pure { config, weightsPacked := weightsBuf, scaleBuf, prepared, kernel }
 
@@ -1204,8 +1207,11 @@ def createFromBytes [GPUBackend β] (ctx : β) (config : Config)
   let shaderM := if useSubgroups
     then fusedBitLinearM1Kernel config
     else fusedBitLinearM1KernelSharedMem config
-  let kernel ← GPUBackend.buildKernel ctx shaderM "main"
-    { x := 32 } (config.outDim, 1, 1)
+  let kernel ← GPUBackend.buildKernel ctx shaderM {
+    workgroupSize := { x := 32 }, numWorkgroups := (config.outDim, 1, 1),
+    extensions := if useSubgroups then ["subgroups"] else [],
+    diagnostics := if useSubgroups then [("off", "chromium.subgroup_matrix_uniformity")] else []
+  }
   logVerbose s!"[BitLinear] Layer created: packed={paddedWeights.size} bytes (subgroups={useSubgroups})"
   pure { config, weightsPacked := weightsBuf, scaleBuf, prepared, kernel }
 

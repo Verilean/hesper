@@ -62,7 +62,7 @@ class GPUBackend (β : Type) where
   writeBuffer : β → Buf → ByteArray → IO Unit
   writeBufferOffset : β → Buf → USize → ByteArray → IO Unit := fun ctx buf _ data => writeBuffer ctx buf data
   readBuffer : β → Buf → USize → IO ByteArray
-  buildKernel : β → ShaderM Unit → String → WorkgroupSize → Nat × Nat × Nat → IO CompiledKernel
+  buildKernel : β → ShaderM Unit → ExecConfig → IO CompiledKernel
   dispatchCompiledKernel : β → CompiledKernel → Array Buf →
     Nat × Nat × Nat → Option (IO.Ref (Option CachedDispatch)) → IO Unit
   hasSubgroupSupport : β → IO Bool := fun _ => pure false
