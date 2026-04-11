@@ -69,6 +69,12 @@ class GPUBackend (β : Type) where
   hasShaderF16Support : β → IO Bool := fun _ => pure false
   newCacheRef : IO (IO.Ref (Option CachedDispatch)) := IO.mkRef none
 
+  -- ── Batching (optional) ──
+  /-- Begin recording dispatches for batch submission. CUDA: no-op. -/
+  beginBatch : β → IO Unit := fun _ => pure ()
+  /-- Submit all recorded dispatches and wait. CUDA: no-op (sync is per-launch). -/
+  endBatch : β → IO Unit := fun _ => pure ()
+
 /-- Convenience: execute with ExecConfig -/
 @[inline]
 def GPUBackend.execute [GPUBackend β] (ctx : β) (computation : ShaderM Unit)
