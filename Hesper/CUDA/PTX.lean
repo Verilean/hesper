@@ -201,8 +201,10 @@ inductive Inst where
   -- ── memory ──
   | ld_f32        (space : AddrSpace) (dst : RegF32) (addr : RegU64)
   | st_f32        (space : AddrSpace) (addr : RegU64) (val : RegF32)
-  | ld_f32_offset (space : AddrSpace) (dst : RegF32) (base : String) (offset : RegU32)
-  | st_f32_offset (space : AddrSpace) (val : RegF32) (base : String) (offset : RegU32)
+  -- shared memory via symbol: mov.u32 %r, sym; add.u32 %r, %r, off; ld/st
+  | ld_shared_sym (dst : RegF32) (symAddr : RegU32) (offset : RegU32) (addr : RegU32)
+  | st_shared_sym (val : RegF32) (symAddr : RegU32) (offset : RegU32) (addr : RegU32)
+  | mov_shared_addr (dst : RegU32) (symName : String)  -- mov.u32 %r, symbol
   | ld_param_u64  (dst : RegU64) (paramName : String)
 
   -- ── warp shuffle ──
@@ -270,8 +272,9 @@ def Inst.toString : Inst → String
   | .mov_sreg d sr       => s!"  mov.u32 {d}, {sr};"
   | .ld_f32 sp d a       => s!"  ld.{spStr sp}.f32 {d}, [{a}];"
   | .st_f32 sp a v       => s!"  st.{spStr sp}.f32 [{a}], {v};"
-  | .ld_f32_offset sp d base off => s!"  ld.{spStr sp}.f32 {d}, [{base} + {off}];"
-  | .st_f32_offset sp v base off => s!"  st.{spStr sp}.f32 [{base} + {off}], {v};"
+  | .ld_shared_sym d _sa _off addr => s!"  ld.shared.f32 {d}, [{addr}];"
+  | .st_shared_sym v _sa _off addr => s!"  st.shared.f32 [{addr}], {v};"
+  | .mov_shared_addr d sym         => s!"  mov.u32 {d}, {sym};"
   | .ld_param_u64 d name => s!"  ld.param.u64 {d}, [param_{name}];"
   | .shfl_bfly_f32 d s off => s!"  shfl.sync.bfly.b32 {d}, {s}, {off}, 31, 0xFFFFFFFF;"
   | .bar_sync id         => s!"  bar.sync {id};"
