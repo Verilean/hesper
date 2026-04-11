@@ -374,9 +374,9 @@ def forwardDynamic [GPUBackend β] (ctx : β) (layer : RoPE)
   let cacheKey : UInt64 := hash ("rope_dyn", batchSize, seqLen, numHeads, effectiveHeadDim, layer.config.base.toBits)
   match preparedRef with
   | some ref =>
-    GPUBackend.executeKernelCached ctx (ropeKernelDynamic layer.config batchSize seqLen numHeads effectiveHeadDim)
+    GPUBackend.executeWithConfigCached ctx (ropeKernelDynamic layer.config batchSize seqLen numHeads effectiveHeadDim)
       [("input", inputBuf), ("output", outputBuf), ("params", paramsBuf)]
-      "main" {x := 256} ((totalElements + 255) / 256, 1, 1) cacheKey ref
+      (ExecConfig.dispatch1D totalElements) cacheKey ref
   | none =>
     GPUBackend.execute ctx (ropeKernelDynamic layer.config batchSize seqLen numHeads effectiveHeadDim)
       [("input", inputBuf), ("output", outputBuf), ("params", paramsBuf)]

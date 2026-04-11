@@ -17,12 +17,16 @@ instance : GPUBackend Device where
   Buf := Buffer
   CachedDispatch := PreparedDispatch
   CompiledKernel := Hesper.WGSL.Execute.CompiledKernel
-  executeKernel device computation namedBuffers funcName workgroupSize numWorkgroups :=
+  executeWithConfig device computation namedBuffers (config : Hesper.ExecConfig) :=
     executeShaderNamed device computation namedBuffers
-      { funcName, workgroupSize, numWorkgroups }
-  executeKernelCached device computation namedBuffers funcName workgroupSize numWorkgroups cacheKey cacheRef :=
+      { funcName := config.funcName, workgroupSize := config.workgroupSize,
+        numWorkgroups := config.numWorkgroups,
+        extensions := config.extensions, diagnostics := config.diagnostics }
+  executeWithConfigCached device computation namedBuffers (config : Hesper.ExecConfig) cacheKey cacheRef :=
     executeShaderNamed device computation namedBuffers
-      { funcName, workgroupSize, numWorkgroups }
+      { funcName := config.funcName, workgroupSize := config.workgroupSize,
+        numWorkgroups := config.numWorkgroups,
+        extensions := config.extensions, diagnostics := config.diagnostics }
       (some cacheKey) (some cacheRef)
   replayCached device cached dims :=
     replayPreparedDispatch device cached dims.1 dims.2.1 dims.2.2
@@ -46,6 +50,8 @@ instance : GPUBackend Device where
     | some ref => ref.set (some (kernel.prepare bg))
     | none => pure ()
     Hesper.WGSL.Execute.dispatchKernel device kernel bg numWorkgroups
+  hasSubgroupSupport device := Hesper.WGSL.Execute.hasSubgroupSupport device
+  hasShaderF16Support device := Hesper.WGSL.Execute.hasShaderF16Support device
   newCacheRef := IO.mkRef none
 
 end Hesper

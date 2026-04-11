@@ -74,18 +74,19 @@ instance : GPUBackend CUDAContext where
   Buf := CUDABuffer
   CachedDispatch := CUDACachedDispatch
   CompiledKernel := CUDACompiledKernel
-  executeKernel _ctx computation namedBuffers funcName workgroupSize numWorkgroups := do
-    let func ← cudaExecuteImpl computation namedBuffers funcName workgroupSize numWorkgroups
-    cudaLaunchWithBuffers func namedBuffers computation workgroupSize numWorkgroups
-  executeKernelCached _ctx computation namedBuffers funcName workgroupSize numWorkgroups _cacheKey cacheRef := do
+  executeWithConfig _ctx computation namedBuffers config := do
+    -- CUDA ignores extensions/diagnostics
+    let func ← cudaExecuteImpl computation namedBuffers config.funcName config.workgroupSize config.numWorkgroups
+    cudaLaunchWithBuffers func namedBuffers computation config.workgroupSize config.numWorkgroups
+  executeWithConfigCached _ctx computation namedBuffers config _cacheKey cacheRef := do
     let cached ← cacheRef.get
     let func ← match cached with
     | some c => pure c.func
     | none => do
-      let f ← cudaExecuteImpl computation namedBuffers funcName workgroupSize numWorkgroups
-      cacheRef.set (some { func := f, sourceHash := hash (generatePTX funcName workgroupSize computation) })
+      let f ← cudaExecuteImpl computation namedBuffers config.funcName config.workgroupSize config.numWorkgroups
+      cacheRef.set (some { func := f, sourceHash := hash (generatePTX config.funcName config.workgroupSize computation) })
       pure f
-    cudaLaunchWithBuffers func namedBuffers computation workgroupSize numWorkgroups
+    cudaLaunchWithBuffers func namedBuffers computation config.workgroupSize config.numWorkgroups
   replayCached _ctx cached dims := do
     -- CUDA doesn't have "replay" — just re-launch with cached function
     -- We need the buffer args, but they're not in the cached dispatch.
@@ -113,6 +114,8 @@ instance : GPUBackend CUDAContext where
     let (gx, gy, gz) := numWorkgroups
     cuLaunchKernel kernel.func
       gx.toUInt32 gy.toUInt32 gz.toUInt32 1 1 1 0 args
+  hasSubgroupSupport _ctx := pure true   -- CUDA always has warp shuffle
+  hasShaderF16Support _ctx := pure true  -- sm_89 has native f16
   newCacheRef := IO.mkRef none
 
 end Hesper
