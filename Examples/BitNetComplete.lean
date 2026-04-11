@@ -41,7 +41,7 @@ def initializeDevice : IO Device := do
   Hesper.WebGPU.getDevice inst
 
 /-- Load model and tokenizer from GGUF -/
-def loadModel (ggufPath : String) : IO (BitNetModel × Tokenizer × Device × Option Nat) := do
+def loadModel (ggufPath : String) : IO (BitNetModel Buffer Hesper.WGSL.Execute.PreparedDispatch Hesper.WGSL.Execute.CompiledKernel × Tokenizer × Device × Option Nat) := do
   IO.println "[1/4] Loading GGUF model..."
   let gguf ← loadGGUF ggufPath
   IO.println s!"  Loaded {gguf.tensors.size} tensors"
@@ -55,7 +55,7 @@ def loadModel (ggufPath : String) : IO (BitNetModel × Tokenizer × Device × Op
   IO.println "  Device ready"
 
   IO.println "[4/4] Loading model to GPU..."
-  let model ← fromGGUFObject device gguf none
+  let model ← fromGGUFObject (β := Device) device gguf none
   IO.println s!"  {model.config.numLayers} layers, {model.config.dim} dim"
 
   return (model, tokenizer, device, tokenizer.vocab.eosToken)
@@ -111,7 +111,7 @@ def runGeneration (args : List String) : IO Unit := do
     let loraState ← Hesper.LoRA.Inference.createLoRAInferenceState device adapter model.config.dim model.config.kvDim
     Hesper.LoRA.Inference.generateWithLoRA device model adapter loraState promptTokens maxTokens .Greedy eosToken
   | none =>
-    generate device model promptTokens maxTokens .Greedy eosToken showStats
+    generate (β := Device) device model promptTokens maxTokens .Greedy eosToken showStats
 
   let outputText := decode tokenizer outputTokens
   IO.println ""
@@ -203,7 +203,7 @@ def runInteractive (ggufPath : String) (loraPath : Option String := none) : IO U
     | some (adapter, loraState) =>
       Hesper.LoRA.Inference.generateWithLoRA device model adapter loraState promptTokens maxTokens .Greedy eosToken
     | none =>
-      generate device model promptTokens maxTokens .Greedy eosToken
+      generate (β := Device) device model promptTokens maxTokens .Greedy eosToken
 
     let newTokenCount := outputTokens.size - promptTokens.size
     let outputText := decode tokenizer outputTokens
