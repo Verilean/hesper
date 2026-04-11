@@ -163,6 +163,15 @@ partial def expToPTX (e : Exp t) (s : GenState) : ExpResult :=
   | .toU32 e =>
     let (re, s) := expToPTX e s
     let (r, s) := s.freshU32; (.u32 r, s.emit (.cvt_u32_f32 r re.toF32!))
+  | .toF16 e =>
+    -- f32 → f16 (stored as AnyReg.u32 holding the b16 value for shared mem writes)
+    let (re, s) := expToPTX e s
+    let (h, s) := s.freshB16; let s := s.emit (.cvt_f16_f32 h re.toF32!)
+    -- Return as u32 for writeWorkgroup compatibility (b16 in low bits)
+    let (r, s) := s.freshU32
+    -- TODO: proper b16 → u32 zero-extend. For now, shared mem f16 writes
+    -- need special handling. Return the f32 version instead.
+    let (rf, s) := s.freshF32; (.f32 rf, s.emit (.cvt_f32_f16 rf h))
 
   -- Math functions
   | .sqrt e => let (re, s) := expToPTX e s; let (r, s) := s.freshF32; (.f32 r, s.emit (.sqrt_f32 r re.toF32!))
@@ -218,6 +227,27 @@ partial def expToPTX (e : Exp t) (s : GenState) : ExpResult :=
   | .select cond t f =>
     let (pc, s) := expToPTX cond s; let (rt, s) := expToPTX t s; let (rf, s) := expToPTX f s
     let (r, s) := s.freshF32; (.f32 r, s.emit (.selp_f32 r rt.toF32! rf.toF32! pc.toPred!))
+
+  -- Vec2 component extraction (f16 unpack pattern)
+  | .vecX (.unpack2x16float packed) =>
+    -- unpack2x16float → extract lower f16 from u32, convert to f32
+    -- PTX: mov.b32 {%h_lo, %h_hi}, %r; cvt.f32.f16 %f, %h_lo;
+    let (rp, s) := expToPTX packed s
+    let (hLo, s) := s.freshB16; let (hHi, s) := s.freshB16
+    let s := s.emit (.mov_b32_unpack hLo hHi rp.toU32!)
+    let (r, s) := s.freshF32; (.f32 r, s.emit (.cvt_f32_f16 r hLo))
+
+  | .vecY (.unpack2x16float packed) =>
+    -- extract upper f16
+    let (rp, s) := expToPTX packed s
+    let (hLo, s) := s.freshB16; let (hHi, s) := s.freshB16
+    let s := s.emit (.mov_b32_unpack hLo hHi rp.toU32!)
+    let (r, s) := s.freshF32; (.f32 r, s.emit (.cvt_f32_f16 r hHi))
+
+  | .vecX v =>
+    let (rv, s) := expToPTX v s; (rv, s)
+  | .vecY v =>
+    let (rv, s) := expToPTX v s; (rv, s)
 
   -- Thread IDs
   | .vec3X v =>
@@ -396,6 +426,6 @@ def generatePTX
     ({ sharedNames, u32BufferNames } : GenState)
   let finalState := (state.stmts.foldl (fun s st => stmtToPTX st s) initState).emit .ret
   (Module.mk ptxVersion targetArch funcName paramNames sharedDecls
-    finalState.insts finalState.fRegs finalState.rRegs finalState.rdRegs finalState.pRegs).render
+    finalState.insts finalState.fRegs finalState.rRegs finalState.rdRegs finalState.pRegs finalState.hRegs).render
 
 end Hesper.CUDA.CodeGen
