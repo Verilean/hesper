@@ -1,9 +1,6 @@
 import Hesper.WGSL.Monad
-import Hesper.WGSL.Execute
 import Hesper.WGSL.Exp
-import Hesper.WebGPU.Types
-import Hesper.WebGPU.Device
-import Hesper.WebGPU.Buffer
+import Hesper.Backend
 import Hesper.Quantization.TQ2_0
 import Hesper.Logging
 
@@ -88,7 +85,7 @@ namespace Hesper.Layers.Embedding
 
 open Hesper.WGSL
 open Hesper.WGSL.Monad
-open Hesper.WebGPU
+open Hesper
 open Hesper.Quantization.TQ2_0
 open Hesper.Logging (logVerbose)
 
@@ -153,10 +150,10 @@ def embeddingLookupKernel (config : Config) (batchSize seqLen : Nat) : ShaderM U
 /-! ## Layer Structure -/
 
 /-- Embedding layer -/
-structure Embedding where
+structure Embedding (BufT : Type) where
   config : Config
-  embeddingTable : Buffer  -- Precomputed Float32 embeddings
-  f16Table : Option Buffer := none  -- Original F16 data (for F16 matmul LM head)
+  embeddingTable : BufT
+  f16Table : Option BufT := none
 
 /-! ## Layer Creation -/
 
@@ -169,20 +166,16 @@ structure Embedding where
     @param packedData TQ2_0 packed embedding data
     @param scalesData FP16 scales for each block
 -/
-def create (device : Device) (config : Config)
-           (packedData : ByteArray) (scalesData : ByteArray) : IO Embedding := do
+def create [GPUBackend β] (ctx : β) (config : Config)
+           (packedData : ByteArray) (scalesData : ByteArray)
+           : IO (Embedding (GPUBackend.Buf β)) := do
   logVerbose s!"[Embedding] Creating layer: vocab={config.vocabSize}, dim={config.dim}"
 
   -- Calculate sizes
   let totalElements := config.vocabSize * config.dim
   let tableSize := (totalElements * 4).toUSize  -- Float32
 
-  -- Create buffer for embedding table
-  let embeddingTable ← createBuffer device {
-    size := tableSize
-    usage := [.storage, .copyDst]
-    mappedAtCreation := false
-  }
+  let embeddingTable ← GPUBackend.allocBuffer ctx tableSize
 
   -- TODO: Unpack TQ2_0 to Float32
   -- For now, we'll need to:
@@ -202,20 +195,14 @@ def create (device : Device) (config : Config)
     @param config Embedding configuration
     @param float32Data Raw Float32 embedding data
 -/
-def createFromFloat32 (device : Device) (config : Config)
-                      (float32Data : ByteArray) : IO Embedding := do
+def createFromFloat32 [GPUBackend β] (ctx : β) (config : Config)
+                      (float32Data : ByteArray) : IO (Embedding (GPUBackend.Buf β)) := do
   logVerbose s!"[Embedding] Creating layer from Float32: vocab={config.vocabSize}, dim={config.dim}"
 
   let tableSize := float32Data.size.toUSize
 
-  let embeddingTable ← createBuffer device {
-    size := tableSize
-    usage := [.storage, .copyDst]
-    mappedAtCreation := false
-  }
-
-  -- Upload Float32 data directly
-  writeBuffer device embeddingTable 0 float32Data
+  let embeddingTable ← GPUBackend.allocBuffer ctx tableSize
+  GPUBackend.writeBuffer ctx embeddingTable float32Data
 
   logVerbose "[Embedding] ✓ Layer created"
   pure { config, embeddingTable }
@@ -269,8 +256,8 @@ def unpackF16ToF32Kernel (numElements : Nat) (packedPerThread : Nat) : ShaderM U
     @param config Embedding configuration
     @param f16Data Raw F16 (Float16) embedding data (packed as bytes)
 -/
-def createFromF16 (device : Device) (config : Config)
-                  (f16Data : ByteArray) : IO Embedding := do
+def createFromF16 [GPUBackend β] (ctx : β) (config : Config)
+                  (f16Data : ByteArray) : IO (Embedding (GPUBackend.Buf β)) := do
   logVerbose s!"[Embedding] Creating layer from F16 (GPU-optimized): vocab={config.vocabSize}, dim={config.dim}"
 
   let numElements := config.vocabSize * config.dim
@@ -279,20 +266,9 @@ def createFromF16 (device : Device) (config : Config)
 
   IO.println s!"  Upload: {f16Size / (1024*1024)} MB F16 (vs {f32Size / (1024*1024)} MB F32 saved)"
 
-  -- Step 1: Upload raw F16 data (256 MB instead of 512 MB!)
-  let f16Buffer ← createBuffer device {
-    size := f16Size
-    usage := [.storage, .copySrc]
-    mappedAtCreation := false
-  }
-  writeBuffer device f16Buffer 0 f16Data
-
-  -- Step 2: Create F32 output buffer
-  let f32Buffer ← createBuffer device {
-    size := f32Size
-    usage := [.storage, .copyDst]
-    mappedAtCreation := false
-  }
+  let f16Buffer ← GPUBackend.allocBuffer ctx f16Size
+  GPUBackend.writeBuffer ctx f16Buffer f16Data
+  let f32Buffer ← GPUBackend.allocBuffer ctx f32Size
 
   -- Step 3: Dispatch GPU unpacking kernel
   IO.println "  Unpacking F16 → F32 on GPU..."
@@ -311,9 +287,7 @@ def createFromF16 (device : Device) (config : Config)
     ("f32_data", f32Buffer)
   ]
 
-  let execConfig := Hesper.WGSL.Execute.ExecutionConfig.dispatch1D totalThreads workgroupSize
-
-  Hesper.WGSL.Execute.executeShaderNamed device shader namedBuffers execConfig
+  GPUBackend.execute ctx shader namedBuffers (ExecConfig.dispatch1D totalThreads workgroupSize)
 
   logVerbose s!"[Embedding] ✓ Layer created (GPU unpacked {numElements} F16 → F32 elements)"
   pure { config, embeddingTable := f32Buffer, f16Table := some f16Buffer }
@@ -329,24 +303,16 @@ def createFromF16 (device : Device) (config : Config)
     @param batchSize Batch size
     @param seqLen Sequence length
 -/
-def forward (device : Device) (layer : Embedding)
-            (tokenIdsBuf outputBuf : Buffer)
+@[inline]
+def forward [GPUBackend β] (ctx : β)
+            (layer : Embedding (GPUBackend.Buf β))
+            (tokenIdsBuf outputBuf : GPUBackend.Buf β)
             (batchSize seqLen : Nat) : IO Unit := do
   logVerbose s!"[Embedding] Lookup: batch={batchSize}, seq_len={seqLen}"
-
-  let shader := embeddingLookupKernel layer.config batchSize seqLen
-  let namedBuffers := [
-    ("token_ids", tokenIdsBuf),
-    ("embedding_table", layer.embeddingTable),
-    ("output", outputBuf)
-  ]
-
   let totalTokens := batchSize * seqLen
-  let execConfig := Hesper.WGSL.Execute.ExecutionConfig.dispatch1D
-    totalTokens
-    256  -- One thread per token
-
-  Hesper.WGSL.Execute.executeShaderNamed device shader namedBuffers execConfig
+  GPUBackend.execute ctx (embeddingLookupKernel layer.config batchSize seqLen)
+    [("token_ids", tokenIdsBuf), ("embedding_table", layer.embeddingTable), ("output", outputBuf)]
+    (ExecConfig.dispatch1D totalTokens)
   logVerbose "[Embedding] ✓ Lookup complete"
 
 /-! ## Integration with GGUF -/
@@ -359,7 +325,7 @@ def forward (device : Device) (layer : Embedding)
     @param gguf Loaded GGUF file
     @param config Embedding configuration
 -/
-def fromGGUF (device : Device) (gguf : α) (config : Config) : IO Embedding := do
+def fromGGUF [GPUBackend β] (ctx : β) (gguf : α) (config : Config) : IO (Embedding (GPUBackend.Buf β)) := do
   -- Placeholder - actual implementation would:
   -- 1. Find tensor: gguf.findTensor "token_embd.weight"
   -- 2. Extract TQ2_0 packed data + scales
