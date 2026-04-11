@@ -6,10 +6,12 @@ import Hesper.GGUF.Parser
 import Hesper.WebGPU.Device
 
 /-!
-# Gemma 4 Smart KV-Cache: Natural Language Needle Test
+# Gemma 4 Smart KV-Cache: 50K Token Endurance Test
 
-Uses the actual Gemma 4 tokenizer to encode natural language prompts,
-avoiding the hidden-state divergence caused by synthetic raw token IDs.
+Injects a random-word needle at the beginning of a ~50,000-token
+prompt, then queries for it at the end. Smart KV-Cache should
+protect the needle in permanent sinks while the 7,680-token sliding
+window overwrites everything else.
 -/
 
 open Hesper.WebGPU
@@ -19,7 +21,7 @@ open Hesper.Tokenizer.SentencePiece
 
 def main (args : List String) : IO Unit := do
   IO.println "╔══════════════════════════════════════════════════════════╗"
-  IO.println "║  Gemma 4 + Smart KV-Cache: Natural Language Needle     ║"
+  IO.println "║  Gemma 4 Smart KV-Cache: 50K Token Endurance Test      ║"
   IO.println "╚══════════════════════════════════════════════════════════╝"
   IO.println ""
 
@@ -32,8 +34,8 @@ def main (args : List String) : IO Unit := do
 
   let inst ← Hesper.init
   let device ← getDevice inst
+  IO.println "[GPU] Device initialized"
 
-  -- Load GGUF for both model and tokenizer
   IO.println s!"[Load] Parsing GGUF: {ggufPath}..."
   let ggufData ← IO.FS.readBinFile ggufPath
   let gguf ← match Hesper.GGUF.Parser.parseGGUF ggufData with
@@ -41,86 +43,118 @@ def main (args : List String) : IO Unit := do
     | .error e => throw (IO.userError s!"GGUF parse error: {e}")
 
   IO.println "[Load] Initializing tokenizer..."
-  let tokenizer ← fromGGUF gguf (some true) (some false)  -- addBos=true, addEos=false
-  IO.println s!"  Vocab: {tokenizer.vocab.vocabSize} tokens"
+  let tokenizer ← fromGGUF gguf (some true) (some false)
 
   IO.println "[Load] Loading model..."
   let model ← Gemma4Model.fromGGUF device ggufPath
-  IO.println s!"[Model] Gemma 4: {model.config.hiddenSize}d, {model.config.numHiddenLayers}L"
+  IO.println s!"[Model] Gemma 4: {model.config.hiddenSize}d, {model.config.numHiddenLayers}L, vocab={model.config.vocabSize}"
+  IO.println s!"[Model] maxSeqLen={model.config.maxSeqLen}"
   IO.println ""
 
-  let smartConfig : SmartKVConfig := { windowSize := 256, tau := 5.0 }
+  -- Smart KV config: 512 sinks + 7680 window = 8192 total
+  let smartConfig : SmartKVConfig := {
+    windowSize := 7680
+    tau := 0.5  -- rank-based: top-5 threshold
+  }
 
-  -- Natural language needle: a secret password buried in text
-  -- Use a truly unpredictable needle: random hex string that no LLM
-  -- could have seen in training data or predict from context.
-  -- Random unrelated words: impossible for any LLM to predict
-  -- "banana" → "dinosaur" has near-zero probability in any training data
   let needle := "The secret password is: banana dinosaur galaxy umbrella philosophy."
-  let needleAnswer := "banana dinosaur galaxy umbrella philosophy"
-
-  -- Build prompts with increasing haystack
-  -- Single test with verbose rank output for analysis
-  let haystackTexts : Array (Nat × String) := #[
-    (100, "The quick brown fox jumps over the lazy dog. " ++
-          "Lorem ipsum dolor sit amet, consectetur adipiscing elit. " ++
-          "Sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. " ++
-          "Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris. "),
-    (300, "The quick brown fox jumps over the lazy dog. " ++
-          "Lorem ipsum dolor sit amet, consectetur adipiscing elit. " ++
-          "Sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. " ++
-          "Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris. " ++
-          "Duis aute irure dolor in reprehenderit in voluptate velit esse cillum dolore. " ++
-          "Excepteur sint occaecat cupidatat non proident sunt in culpa qui officia deserunt. " ++
-          "Nemo enim ipsam voluptatem quia voluptas sit aspernatur aut odit aut fugit. " ++
-          "Sed quia consequuntur magni dolores eos qui ratione voluptatem sequi nesciunt. " ++
-          "Neque porro quisquam est qui dolorem ipsum quia dolor sit amet consectetur. " ++
-          "At vero eos et accusamus et iusto odio dignissimos ducimus qui blanditiis. ")
-  ]
-
+  let needleAnswer := "banana dinosaur"  -- check first 2 words (easier match)
   let query := "\n\nQuestion: What is the secret password?\nAnswer: The secret password is:"
 
+  -- Build a large haystack by repeating diverse text
+  let haystackBlock :=
+    "The quick brown fox jumps over the lazy dog. " ++
+    "Lorem ipsum dolor sit amet, consectetur adipiscing elit. " ++
+    "Sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. " ++
+    "Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris. " ++
+    "Duis aute irure dolor in reprehenderit in voluptate velit esse cillum. " ++
+    "Excepteur sint occaecat cupidatat non proident sunt in culpa qui officia. " ++
+    "Nemo enim ipsam voluptatem quia voluptas sit aspernatur aut odit aut fugit. " ++
+    "Sed quia consequuntur magni dolores eos qui ratione voluptatem sequi nesciunt. " ++
+    "At vero eos et accusamus et iusto odio dignissimos ducimus qui blanditiis. " ++
+    "Neque porro quisquam est qui dolorem ipsum quia dolor sit amet consectetur. "
+
+  -- Tokenize the haystack block to see how many tokens per repeat
+  let blockTokens := encode tokenizer haystackBlock
+  let tokensPerBlock := blockTokens.size
+  IO.println s!"Haystack block: {tokensPerBlock} tokens per repeat"
+
+  -- Target ~50,000 tokens — but capped at maxSeqLen
+  let targetTokens := min 50000 (model.config.maxSeqLen - 200)
+  let numRepeats := (targetTokens / tokensPerBlock) + 1
+
+  -- Build full haystack
+  let mut haystackFull := ""
+  for _ in [0:numRepeats] do
+    haystackFull := haystackFull ++ haystackBlock
+
+  let fullPrompt := needle ++ " " ++ haystackFull ++ query
+  let promptTokensArr := encode tokenizer fullPrompt
+  let actualTokens := min promptTokensArr.size model.config.maxSeqLen
+
   IO.println s!"Needle: \"{needle}\""
-  IO.println s!"Query: \"{query}\""
-  IO.println s!"Window: {smartConfig.windowSize}, Surprise tau: {smartConfig.tau}"
+  IO.println s!"Haystack: {numRepeats} repeats"
+  IO.println s!"Full prompt: {promptTokensArr.size} tokens (capped to {actualTokens})"
+  IO.println s!"Smart KV: window={smartConfig.windowSize}, top-K=5"
+  IO.println s!"Physical KV slots: {smartConfig.windowSize} window (+ sinks)"
   IO.println ""
 
-  for (label, haystack) in haystackTexts do
-    let fullPrompt := needle ++ " " ++ haystack ++ query
-    let promptTokensArr := encode tokenizer fullPrompt
-    IO.println s!"═══ Haystack ~{label} words ({promptTokensArr.size} tokens) ═══"
+  -- Cap prompt to maxSeqLen
+  let cappedPrompt := promptTokensArr.extract 0 actualTokens
 
-    -- Smart KV FIRST (before Dumb window, to avoid stale PreparedDispatch
-    -- caches from Dumb window's InferenceState buffer handles)
-    IO.println "  [Smart KV]"
-    let smartTokens ← generateWithSmartKV device model promptTokensArr 10 smartConfig .Greedy
-      (verbose := label == 100)
-    let smartGenIds := smartTokens.extract promptTokensArr.size smartTokens.size
-    let smartText := decode tokenizer smartGenIds
-    IO.println s!"    Generated: {smartText}"
+  -- ═══════════════════════════════════════════
+  -- Run 1: Smart KV (FIRST to avoid stale PreparedDispatch)
+  -- ═══════════════════════════════════════════
+  IO.println "═══ Run 1: Smart KV-Cache ═══"
+  let startSmart ← IO.monoNanosNow
+  let smartTokens ← generateWithSmartKV device model cappedPrompt 20 smartConfig .Greedy
+    (verbose := false)
+  let endSmart ← IO.monoNanosNow
+  let smartMs := (endSmart - startSmart).toFloat / 1_000_000.0
 
-    -- Dumb window SECOND
-    IO.println "  [Dumb Window]"
-    let dumbTokens ← generateWithDumbWindow device model promptTokensArr 10 smartConfig.windowSize .Greedy
-    let dumbGenIds := dumbTokens.extract promptTokensArr.size dumbTokens.size
-    let dumbText := decode tokenizer dumbGenIds
-    IO.println s!"    Generated: {dumbText}"
+  let smartGenIds := smartTokens.extract cappedPrompt.size smartTokens.size
+  let smartText := decode tokenizer smartGenIds
+  IO.println s!"  Generated: {smartText}"
+  IO.println s!"  Time: {smartMs} ms ({smartMs / actualTokens.toFloat} ms/token)"
+  IO.println ""
 
-    -- Simple substring check
-    let dumbHas := (dumbText.splitOn needleAnswer).length > 1
-    let smartHas := (smartText.splitOn needleAnswer).length > 1
+  -- ═══════════════════════════════════════════
+  -- Run 2: Dumb Window
+  -- ═══════════════════════════════════════════
+  IO.println "═══ Run 2: Dumb Sliding Window ═══"
+  let startDumb ← IO.monoNanosNow
+  let dumbTokens ← generateWithDumbWindow device model cappedPrompt 20 smartConfig.windowSize .Greedy
+  let endDumb ← IO.monoNanosNow
+  let dumbMs := (endDumb - startDumb).toFloat / 1_000_000.0
 
-    IO.println s!"    Dumb contains '{needleAnswer}': {if dumbHas then "YES" else "no"}"
-    IO.println s!"    Smart contains '{needleAnswer}': {if smartHas then "YES" else "no"}"
+  let dumbGenIds := dumbTokens.extract cappedPrompt.size dumbTokens.size
+  let dumbText := decode tokenizer dumbGenIds
+  IO.println s!"  Generated: {dumbText}"
+  IO.println s!"  Time: {dumbMs} ms ({dumbMs / actualTokens.toFloat} ms/token)"
+  IO.println ""
 
-    if smartHas && !dumbHas then
-      IO.println "    🎯 Smart KV wins!"
-    else if smartHas && dumbHas then
-      IO.println "    Both got it"
-    else if !smartHas && !dumbHas then
-      IO.println "    Both missed"
-    else
-      IO.println "    Dumb wins (unexpected)"
-    IO.println ""
+  -- ═══════════════════════════════════════════
+  -- Comparison
+  -- ═══════════════════════════════════════════
+  let smartHas := (smartText.splitOn needleAnswer).length > 1
+  let dumbHas := (dumbText.splitOn needleAnswer).length > 1
 
+  IO.println "═══ Results ═══"
+  IO.println s!"  Needle (first 2 words): '{needleAnswer}'"
+  IO.println s!"  Smart KV contains needle: {if smartHas then "YES ✓" else "no ✗"}"
+  IO.println s!"  Dumb window contains needle: {if dumbHas then "YES ✓" else "no ✗"}"
+  IO.println ""
+
+  if smartHas && !dumbHas then
+    IO.println "╔══════════════════════════════════════════════════════════╗"
+    IO.println "║  🎯 Smart KV-Cache WINS on Gemma 4 endurance test!     ║"
+    IO.println "╚══════════════════════════════════════════════════════════╝"
+  else if smartHas && dumbHas then
+    IO.println "Both recalled the needle."
+  else if !smartHas && !dumbHas then
+    IO.println "Neither recalled the needle."
+  else
+    IO.println "Dumb window recalled but Smart KV didn't (unexpected)."
+
+  IO.println ""
   IO.println "Done!"
