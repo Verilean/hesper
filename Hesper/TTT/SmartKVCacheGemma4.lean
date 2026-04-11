@@ -110,8 +110,18 @@ def generateWithSmartKV (device : Device) (model : Gemma4Model)
   for i in [0:promptTokens.size] do
     if i >= model.config.maxSeqLen then break
 
+    -- Debug: batch state before forward
+    if i <= 5 then
+      let batchBefore ← Hesper.WGSL.Execute.isBatching
+      IO.println s!"  [BATCH] t{i}: before_forward isBatching={if batchBefore then "YES ⚠️" else "no"}"
+
     -- Standard forward at absolute position i
     forwardSingleToken device model promptTokens[i]! i state
+
+    -- Debug: batch state after forward
+    if i <= 5 then
+      let batchAfter ← Hesper.WGSL.Execute.isBatching
+      IO.println s!"  [BATCH] t{i}: after_forward isBatching={if batchAfter then "YES ⚠️" else "no"}"
 
     -- Top-K surprise sensor: is the next token in the model's top-K predictions?
     -- If NOT in top-K → the model was very wrong → surprise → sink.
