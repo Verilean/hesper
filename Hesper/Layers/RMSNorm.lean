@@ -1,9 +1,6 @@
 import Hesper.WGSL.Monad
-import Hesper.WGSL.Execute
 import Hesper.WGSL.Exp
-import Hesper.WebGPU.Types
-import Hesper.WebGPU.Device
-import Hesper.WebGPU.Buffer
+import Hesper.Backend
 import Hesper.Logging
 
 /-!
@@ -53,7 +50,7 @@ namespace Hesper.Layers.RMSNorm
 
 open Hesper.WGSL
 open Hesper.WGSL.Monad
-open Hesper.WebGPU
+open Hesper
 open Hesper.Logging (logVerbose)
 
 /-- Counters for PreparedDispatch fast-path vs slow-path -/
@@ -304,10 +301,10 @@ def rmsApplyKernel (config : Config) (numRows : Nat) : ShaderM Unit := do
 /-! ## High-Level API -/
 
 /-- RMSNorm layer structure -/
-structure RMSNorm where
+structure RMSNorm (BufT : Type) (CacheT : Type := Unit) where
   config : Config
-  scale : Buffer  -- Learned scale parameters (γ)
-  prepared : IO.Ref (Option Hesper.WGSL.Execute.PreparedDispatch)  -- Graph capture cache
+  scale : BufT
+  prepared : IO.Ref (Option CacheT)
 
 /-- Create RMSNorm layer from GGUF tensors
 
@@ -315,20 +312,12 @@ structure RMSNorm where
     @param config Layer configuration
     @param scaleData Raw scale data from GGUF (Float32 or FP16)
 -/
-def create (device : Device) (config : Config) (scaleData : ByteArray) : IO RMSNorm := do
+def create [GPUBackend β] (ctx : β) (config : Config) (scaleData : ByteArray)
+    : IO (RMSNorm (GPUBackend.Buf β) (GPUBackend.CachedDispatch β)) := do
   logVerbose s!"[RMSNorm] Creating layer: dim={config.dim}, eps={config.eps}"
-
-  -- Create GPU buffer for scale parameters
-  let scaleBuf ← createBuffer device {
-    size := scaleData.size.toUSize
-    usage := [.storage, .copyDst]
-    mappedAtCreation := false
-  }
-
-  -- Upload scale data
-  writeBuffer device scaleBuf 0 scaleData
-
-  let prepared ← IO.mkRef none
+  let scaleBuf ← GPUBackend.allocBuffer ctx scaleData.size.toUSize
+  GPUBackend.writeBuffer ctx scaleBuf scaleData
+  let prepared ← GPUBackend.newCacheRef (β := β)
   logVerbose "[RMSNorm] ✓ Layer created on GPU"
   pure { config, scale := scaleBuf, prepared }
 
@@ -339,34 +328,25 @@ def create (device : Device) (config : Config) (scaleData : ByteArray) : IO RMSN
     @param inputBuf GPU buffer containing input (Float32)
     @param outputBuf GPU buffer for output (Float32)
 -/
-def forward (device : Device) (layer : RMSNorm)
-            (inputBuf outputBuf : Buffer) (numRows : Nat := 1) (workgroupSize : Nat := 256)
-            (preAllocRmsBuf : Option Buffer := none) : IO Unit := do
-  -- Fast path: replay prepared dispatch (skips ALL Lean processing)
+@[inline]
+def forward [GPUBackend β] (ctx : β)
+            (layer : RMSNorm (GPUBackend.Buf β) (GPUBackend.CachedDispatch β))
+            (inputBuf outputBuf : GPUBackend.Buf β) (numRows : Nat := 1) (workgroupSize : Nat := 256)
+            (preAllocRmsBuf : Option (GPUBackend.Buf β) := none) : IO Unit := do
+  -- Fast path: replay cached dispatch
   if numRows == 1 then
     if let some p ← layer.prepared.get then
       preparedHitsRef.modify (· + 1)
-      Hesper.WGSL.Execute.replayPreparedDispatch device p numRows 1 1
+      GPUBackend.replayCached ctx p (numRows, 1, 1)
       return
 
   preparedMissesRef.modify (· + 1)
   logVerbose s!"[RMSNorm] Executing forward pass ({numRows} rows × {layer.config.dim} dim)..."
-
-  -- Fused single-pass: compute RMS + apply normalization in one dispatch
-  -- 1 workgroup per row, each workgroup uses shared memory reduction
   let shader := rmsNormFusedKernel layer.config numRows workgroupSize
-  let namedBuffers := [
-    ("input", inputBuf),
-    ("scale", layer.scale),
-    ("output", outputBuf)
-  ]
-  let execConfig : Hesper.WGSL.Execute.ExecutionConfig := {
-    workgroupSize := { x := workgroupSize, y := 1, z := 1 }
-    numWorkgroups := (numRows, 1, 1)
-  }
   let cacheKey : UInt64 := hash ("rms", layer.config.dim, numRows, workgroupSize)
-  Hesper.WGSL.Execute.executeShaderNamed device shader namedBuffers execConfig (some cacheKey) (some layer.prepared)
-
+  GPUBackend.executeKernelCached ctx shader
+    [("input", inputBuf), ("scale", layer.scale), ("output", outputBuf)]
+    "main" { x := workgroupSize } (numRows, 1, 1) cacheKey layer.prepared
   logVerbose "[RMSNorm] ✓ Forward pass complete"
 
 /-- Execute forward pass (two-pass optimized version)
@@ -380,37 +360,18 @@ def forward (device : Device) (layer : RMSNorm)
     @param outputBuf GPU buffer for output (Float32)
     @param rmsTempBuf Temporary 1-element buffer for RMS value
 -/
-def forwardTwoPass (device : Device) (layer : RMSNorm)
-                   (inputBuf outputBuf rmsTempBuf : Buffer) (numRows : Nat := 1) (workgroupSize : Nat := 256) : IO Unit := do
+@[inline]
+def forwardTwoPass [GPUBackend β] (ctx : β)
+                   (layer : RMSNorm (GPUBackend.Buf β) (GPUBackend.CachedDispatch β))
+                   (inputBuf outputBuf rmsTempBuf : GPUBackend.Buf β) (numRows : Nat := 1) (workgroupSize : Nat := 256) : IO Unit := do
   logVerbose "[RMSNorm] Executing two-pass forward pass..."
-
-  -- Pass 1: Compute RMS (one workgroup per row)
-  let shader1 := rmsComputeKernel layer.config numRows workgroupSize
-  let namedBuffers1 := [
-    ("input", inputBuf),
-    ("rms_output", rmsTempBuf)
-  ]
-  let execConfig1 : Hesper.WGSL.Execute.ExecutionConfig := {
-    workgroupSize := { x := workgroupSize, y := 1, z := 1 }
-    numWorkgroups := (numRows, 1, 1)
-  }
-
-  Hesper.WGSL.Execute.executeShaderNamed device shader1 namedBuffers1 execConfig1
-
-  -- Pass 2: Apply normalization (one thread per element across all rows)
-  let shader2 := rmsApplyKernel layer.config numRows
-  let namedBuffers2 := [
-    ("input", inputBuf),
-    ("rms_input", rmsTempBuf),
-    ("scale", layer.scale),
-    ("output", outputBuf)
-  ]
+  GPUBackend.execute ctx (rmsComputeKernel layer.config numRows workgroupSize)
+    [("input", inputBuf), ("rms_output", rmsTempBuf)]
+    { workgroupSize := { x := workgroupSize }, numWorkgroups := (numRows, 1, 1) }
   let totalElements := numRows * layer.config.dim
-  let execConfig2 := Hesper.WGSL.Execute.ExecutionConfig.dispatch1D
-    totalElements
-    workgroupSize
-
-  Hesper.WGSL.Execute.executeShaderNamed device shader2 namedBuffers2 execConfig2
+  GPUBackend.execute ctx (rmsApplyKernel layer.config numRows)
+    [("input", inputBuf), ("rms_input", rmsTempBuf), ("scale", layer.scale), ("output", outputBuf)]
+    (ExecConfig.dispatch1D totalElements workgroupSize)
   logVerbose "[RMSNorm] ✓ Two-pass forward complete"
 
 /-! ## Integration with GGUF Reader -/
@@ -429,7 +390,8 @@ def forwardTwoPass (device : Device) (layer : RMSNorm)
     @param tensorName Name of the scale tensor in GGUF
     @param config Layer configuration
 -/
-def fromGGUF (device : Device) (gguf : α) (tensorName : String) (config : Config) : IO RMSNorm := do
+def fromGGUF [GPUBackend β] (ctx : β) (gguf : α) (tensorName : String) (config : Config)
+    : IO (RMSNorm (GPUBackend.Buf β) (GPUBackend.CachedDispatch β)) := do
   -- This is a placeholder - actual implementation would:
   -- 1. Find tensor by name: gguf.findTensor tensorName
   -- 2. Extract raw data: gguf.getTensorRaw tensorInfo

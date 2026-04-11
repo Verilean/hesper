@@ -33,27 +33,47 @@ open Hesper.WGSL.Monad (ShaderM)
 class GPUBackend (β : Type) where
   /-- Buffer type for this backend -/
   Buf : Type
+  /-- Cached dispatch state for fast-path replay (WebGPU: PreparedDispatch, CUDA: hash key) -/
+  CachedDispatch : Type := Unit
 
   -- ── Kernel execution ──
 
-  /-- Execute a ShaderM kernel with named buffers.
-      `funcName`: PTX/WGSL entry point name.
-      `workgroupSize`: threads per workgroup (= CUDA block).
-      `numWorkgroups`: workgroup grid dimensions (= CUDA grid). -/
+  /-- Execute a ShaderM kernel with named buffers. -/
   executeKernel : β → ShaderM Unit → List (String × Buf) →
     (funcName : String) → (workgroupSize : WorkgroupSize) →
     (numWorkgroups : Nat × Nat × Nat) → IO Unit
+
+  /-- Execute with optional dispatch cache (PreparedDispatch equivalent).
+      If cacheRef contains a cached dispatch, replay it (fast path).
+      Otherwise, execute normally and store the result. -/
+  executeKernelCached : β → ShaderM Unit → List (String × Buf) →
+    (funcName : String) → (workgroupSize : WorkgroupSize) →
+    (numWorkgroups : Nat × Nat × Nat) →
+    (cacheKey : UInt64) →
+    (cacheRef : IO.Ref (Option CachedDispatch)) → IO Unit
+
+  /-- Replay a cached dispatch with different grid dimensions. -/
+  replayCached : β → CachedDispatch → Nat × Nat × Nat → IO Unit
 
   -- ── Buffer management ──
 
   /-- Allocate a GPU buffer of given size (bytes), zero-filled -/
   allocBuffer : β → USize → IO Buf
+  /-- Allocate a buffer with specific usage flags (backend-specific) -/
+  allocBufferUsage : β → USize → List String → IO Buf := fun ctx size _ => allocBuffer ctx size
   /-- Free a GPU buffer -/
   freeBuffer : β → Buf → IO Unit
   /-- Upload host ByteArray to GPU buffer (offset 0) -/
   writeBuffer : β → Buf → ByteArray → IO Unit
+  /-- Upload host ByteArray to GPU buffer at byte offset -/
+  writeBufferOffset : β → Buf → USize → ByteArray → IO Unit := fun ctx buf _ data => writeBuffer ctx buf data
   /-- Download `size` bytes from GPU buffer to host -/
   readBuffer : β → Buf → USize → IO ByteArray
+
+  -- ── Dispatch cache management ──
+
+  /-- Create a new empty dispatch cache ref -/
+  newCacheRef : IO (IO.Ref (Option CachedDispatch)) := IO.mkRef none
 
 /-- Execution config — mirrors the existing `Execute.ExecutionConfig`
     so that `smartDispatch` etc. work unchanged. -/
