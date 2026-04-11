@@ -2,8 +2,7 @@ import Hesper.TTT.Types
 import Hesper.TTT.Kernels
 import Hesper.Training.Loss
 import Hesper.Training.SafeBuffer
-import Hesper.WebGPU.Device
-import Hesper.WebGPU.Buffer
+import Hesper.Backend.WebGPU
 
 /-!
 # TTT Inner Loop (GPU)

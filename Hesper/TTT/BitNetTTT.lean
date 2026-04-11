@@ -1,3 +1,4 @@
+import Hesper.Backend.WebGPU
 import Hesper.Models.BitNet
 import Hesper.TTT.Types
 import Hesper.TTT.Kernels

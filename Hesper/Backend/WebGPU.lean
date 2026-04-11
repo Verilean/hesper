@@ -5,8 +5,6 @@ import Hesper.WGSL.Execute
 
 /-!
 # WebGPU Backend Instance
-
-Implements `GPUBackend` for the Dawn/WebGPU backend.
 -/
 
 namespace Hesper
@@ -16,21 +14,18 @@ open Hesper.WGSL.Execute (ExecutionConfig executeShaderNamed)
 
 instance : GPUBackend Device where
   Buf := Buffer
-  execute device computation namedBuffers config := do
-    let wgpuConfig : ExecutionConfig := {
-      funcName := config.funcName
-      workgroupSize := config.workgroupSize
-      numWorkgroups := config.numWorkgroups
+  executeKernel device computation namedBuffers funcName workgroupSize numWorkgroups := do
+    let config : ExecutionConfig := {
+      funcName, workgroupSize, numWorkgroups
     }
-    executeShaderNamed device computation namedBuffers wgpuConfig
+    executeShaderNamed device computation namedBuffers config
   allocBuffer device size := do
-    let desc : BufferDescriptor := {
+    createBuffer device {
       size := size
       usage := [.storage, .copyDst, .copySrc]
       mappedAtCreation := false
     }
-    createBuffer device desc
-  freeBuffer _device _buf := pure ()  -- WebGPU GC handles this
+  freeBuffer _device _buf := pure ()
   writeBuffer device buf data :=
     Hesper.WebGPU.writeBuffer device buf 0 data
   readBuffer device buf size :=
