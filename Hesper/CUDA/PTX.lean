@@ -201,6 +201,8 @@ inductive Inst where
   -- ── memory ──
   | ld_f32        (space : AddrSpace) (dst : RegF32) (addr : RegU64)
   | st_f32        (space : AddrSpace) (addr : RegU64) (val : RegF32)
+  | ld_u32        (space : AddrSpace) (dst : RegU32) (addr : RegU64)
+  | st_u32        (space : AddrSpace) (addr : RegU64) (val : RegU32)
   -- shared memory via symbol: mov.u32 %r, sym; add.u32 %r, %r, off; ld/st
   | ld_shared_sym (dst : RegF32) (symAddr : RegU32) (offset : RegU32) (addr : RegU32)
   | st_shared_sym (val : RegF32) (symAddr : RegU32) (offset : RegU32) (addr : RegU32)
@@ -272,6 +274,8 @@ def Inst.toString : Inst → String
   | .mov_sreg d sr       => s!"  mov.u32 {d}, {sr};"
   | .ld_f32 sp d a       => s!"  ld.{spStr sp}.f32 {d}, [{a}];"
   | .st_f32 sp a v       => s!"  st.{spStr sp}.f32 [{a}], {v};"
+  | .ld_u32 sp d a       => s!"  ld.{spStr sp}.u32 {d}, [{a}];"
+  | .st_u32 sp a v       => s!"  st.{spStr sp}.u32 [{a}], {v};"
   | .ld_shared_sym d _sa _off addr => s!"  ld.shared.f32 {d}, [{addr}];"
   | .st_shared_sym v _sa _off addr => s!"  st.shared.f32 [{addr}], {v};"
   | .mov_shared_addr d sym         => s!"  mov.u32 {d}, {sym};"
@@ -337,7 +341,9 @@ structure GenState where
   labels : Nat := 0
   insts : Array Inst := #[]
   varMap : List (String × AnyReg) := []
-  sharedNames : List String := []    -- names of shared memory declarations
+  sharedNames : List String := []
+  /-- Buffer names declared with u32 element type (for ld.global.u32) -/
+  u32BufferNames : List String := []
   deriving Inhabited
 
 namespace GenState
@@ -368,6 +374,9 @@ def lookupVar (s : GenState) (name : String) : Option AnyReg :=
 
 def isSharedVar (s : GenState) (name : String) : Bool :=
   s.sharedNames.any (· == name)
+
+def isU32Buffer (s : GenState) (name : String) : Bool :=
+  s.u32BufferNames.any (· == name)
 
 end GenState
 

@@ -73,10 +73,11 @@ def main : IO Unit := do
   let vocabSize := 8; let hiddenDim := 4
 
   -- Create embedding table: [vocabSize × hiddenDim]
-  -- Token 0 → [1, 2, 3, 4] (use token 0 to avoid u32/f32 load mismatch)
-  let mut embData : Array Float := #[1, 2, 3, 4]
-  for _ in [1:vocabSize] do
-    embData := embData ++ #[0.0, 0.0, 0.0, 0.0]
+  -- Token 0 → [0.1, 0.2, 0.3, 0.4], Token 1 → [1.1, ...], Token 2 → [2.1, 2.2, 2.3, 2.4], ...
+  let mut embData : Array Float := #[]
+  for i in List.range vocabSize do
+    for j in List.range hiddenDim do
+      embData := embData.push (i.toFloat + (j + 1).toFloat / 10.0)
 
   let embLayer ← Hesper.Layers.Embedding.createFromFloat32 ctx
     { vocabSize, dim := hiddenDim } (packFloats embData)
@@ -96,31 +97,26 @@ def main : IO Unit := do
   let weightBuf ← GPUBackend.allocBuffer ctx (vocabSize * hiddenDim * 4).toUSize
   GPUBackend.writeBuffer ctx weightBuf (packFloats wData)
 
-  -- Token input: token ID = 0 (u32 zero = f32 zero, avoids ld.global.f32 mismatch)
+  -- Token input: token ID = 2
   let tokenBuf ← GPUBackend.allocBuffer ctx 4
-  GPUBackend.writeBuffer ctx tokenBuf (ByteArray.mk #[0, 0, 0, 0])
+  GPUBackend.writeBuffer ctx tokenBuf (ByteArray.mk #[2, 0, 0, 0])
 
   let outputBuf ← GPUBackend.allocBuffer ctx (vocabSize * 4).toUSize
 
-  -- Skip embedding (u32 ld.global.f32 issue) — test RMSNorm → matVec directly
-  IO.println "  Running: [1,2,3,4] → RMSNorm → W @ hidden → logits"
-  let hiddenBuf ← GPUBackend.allocBuffer ctx (hiddenDim * 4).toUSize
-  GPUBackend.writeBuffer ctx hiddenBuf (packFloats #[1, 2, 3, 4])
-  let normBuf ← GPUBackend.allocBuffer ctx (hiddenDim * 4).toUSize
-  Hesper.Layers.RMSNorm.forward ctx normLayer hiddenBuf normBuf
-  executeMatVec ctx weightBuf normBuf outputBuf vocabSize hiddenDim
-  GPUBackend.freeBuffer ctx hiddenBuf
-  GPUBackend.freeBuffer ctx normBuf
+  -- Full pipeline: embed(2) → RMSNorm → W @ hidden → logits
+  IO.println "  Running: embed(2) → RMSNorm → W @ hidden → logits"
+  miniForward ctx embLayer normLayer weightBuf tokenBuf outputBuf vocabSize hiddenDim
 
   let result ← GPUBackend.readBuffer ctx outputBuf (vocabSize * 4).toUSize
   IO.println "  Logits:"
   let mut ok := true
   for i in List.range vocabSize do
     let v := unpackFloat result i
-    -- Token 0 → embed = [1,2,3,4] → RMSNorm(scale=1) → [1,2,3,4]/sqrt(7.5) → W@normed
-    -- W = identity(4)×8 → logit[i] = normed[i] for i<4, 0 for i>=4
-    let rms := Float.sqrt 7.5
-    let expected := if i < hiddenDim then (i + 1).toFloat / rms else 0.0
+    -- Token 2 → embed = [2.1, 2.2, 2.3, 2.4]
+    -- RMSNorm: rms = sqrt((2.1²+2.2²+2.3²+2.4²)/4) = sqrt(5.075) ≈ 2.2528
+    -- normed[j] = embed[j] / rms, W = identity(4)×8 → logit[i] = normed[i] for i<4
+    let rms := Float.sqrt 5.075
+    let expected := if i < hiddenDim then (2.0 + (i + 1).toFloat / 10.0) / rms else 0.0
     IO.println s!"    logit[{i}] = {v} (expect {expected})"
     if (v - expected).abs > 0.1 then ok := false
 
