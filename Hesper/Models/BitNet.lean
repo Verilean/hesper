@@ -226,7 +226,7 @@ structure BitNetModel (BufT : Type) (CacheT : Type := Unit) (KernelT : Type := U
 
 /-- Reset all PreparedDispatch caches in the model.
     Must be called when buffer bindings change (e.g., new generate call). -/
-def resetPreparedDispatches (model : BitNetModel Buffer PreparedDispatch CompiledKernel) : IO Unit := do
+def resetPreparedDispatches [GPUBackend β] (model : BitNetModel (GPUBackend.Buf β) (GPUBackend.CachedDispatch β) (GPUBackend.CompiledKernel β)) : IO Unit := do
   -- Reset RMSNorm PreparedDispatches
   model.finalNorm.prepared.set none
   for layer in model.layers do
@@ -251,7 +251,7 @@ def resetPreparedDispatches (model : BitNetModel Buffer PreparedDispatch Compile
     @param device WebGPU device
     @param config Model configuration
 -/
-def create (device : Device) (config : Config) : IO (BitNetModel Buffer PreparedDispatch CompiledKernel) := do
+def create [GPUBackend β] (_ctx : β) (config : Config) : IO (BitNetModel (GPUBackend.Buf β) (GPUBackend.CachedDispatch β) (GPUBackend.CompiledKernel β)) := do
   IO.println "═══════════════════════════════════════════════"
   IO.println "   BitNet Model Initialization"
   IO.println "═══════════════════════════════════════════════"
@@ -507,17 +507,17 @@ def argmaxKernel (vocabSize : Nat) (workgroupSize : Nat := 256) : ShaderM Unit :
 /-- Execute GPU argmax on logits buffer.
     Returns the token index with maximum logit value.
     Downloads only 4 bytes instead of vocabSize × 4 bytes. -/
-def gpuArgmax (device : Device) (logitsBuf argmaxBuf : Buffer) (vocabSize : Nat) : IO Nat := do
+def gpuArgmax [GPUBackend β] (ctx : β) (logitsBuf argmaxBuf : GPUBackend.Buf β) (vocabSize : Nat) : IO Nat := do
   let shader := argmaxKernel vocabSize
   let namedBuffers := [("logits", logitsBuf), ("result", argmaxBuf)]
-  let execConfig : Hesper.WGSL.Execute.ExecutionConfig := {
+  let execConfig : Hesper.ExecConfig := {
     workgroupSize := { x := 256, y := 1, z := 1 }
     numWorkgroups := (1, 1, 1)
   }
-  Hesper.WGSL.Execute.executeShaderNamed device shader namedBuffers execConfig
+  GPUBackend.execute ctx shader namedBuffers execConfig
   -- Download single u32
-  let bytes ← mapBufferRead device argmaxBuf 0 4
-  let tokenId := Hesper.WebGPU.BufferOps.bytesToUInt32 bytes 0
+  let bytes ← GPUBackend.readBuffer ctx argmaxBuf 4
+  let tokenId := Hesper.Basic.bytesToUInt32 bytes 0
   pure tokenId.toNat
 
 /-- GPU kernel: apply repetition penalty to logits in-place.
@@ -545,41 +545,40 @@ def repetitionPenaltyKernel (maxTokens vocabSize : Nat) (penalty : Float) : Shad
   ) (pure ())
 
 /-- Append a single token ID to the penalty tokens buffer at the given offset. -/
-def appendPenaltyToken (device : Device) (cacheState : KVCacheState Buffer PreparedDispatch)
+def appendPenaltyToken [GPUBackend β] (ctx : β) (cacheState : KVCacheState (GPUBackend.Buf β) (GPUBackend.CachedDispatch β))
     (tokenId : Nat) (offset : Nat) : IO Unit := do
-  let tokenBytes := Hesper.WebGPU.BufferOps.uint32ToBytes tokenId.toUInt32
-  writeBuffer device cacheState.penaltyTokensBuf (offset * 4).toUSize tokenBytes
+  let tokenBytes := Hesper.Basic.uint32ToBytes tokenId.toUInt32
+  GPUBackend.writeBufferOffset ctx cacheState.penaltyTokensBuf (offset * 4).toUSize tokenBytes
 
 /-- Apply repetition penalty on GPU, then run GPU argmax.
     Assumes token IDs are already uploaded incrementally. Just updates numTokens param,
     runs penalty + argmax batched in a single GPU submit, downloads 4 bytes. -/
-def gpuArgmaxWithPenalty (device : Device) (cacheState : KVCacheState Buffer PreparedDispatch)
+def gpuArgmaxWithPenalty [GPUBackend β] (ctx : β) (cacheState : KVCacheState (GPUBackend.Buf β) (GPUBackend.CachedDispatch β))
     (vocabSize maxSeqLen : Nat) (numTokens : Nat) (penalty : Float) : IO Nat := do
   -- Upload params: numTokens
-  let paramBytes := Hesper.WebGPU.BufferOps.uint32ToBytes numTokens.toUInt32
-  writeBuffer device cacheState.penaltyParamsBuf 0 paramBytes
+  let paramBytes := Hesper.Basic.uint32ToBytes numTokens.toUInt32
+  GPUBackend.writeBufferOffset ctx cacheState.penaltyParamsBuf 0 paramBytes
   -- Batch penalty + argmax into single GPU submit
-  Hesper.WGSL.Execute.beginBatch device
+  GPUBackend.beginBatch ctx
   let penaltyShader := repetitionPenaltyKernel maxSeqLen vocabSize penalty
-  let penaltyConfig : Hesper.WGSL.Execute.ExecutionConfig :=
-    Hesper.WGSL.Execute.ExecutionConfig.dispatch1D numTokens 256
-  let penaltyCacheKey : UInt64 := hash ("rp", maxSeqLen, vocabSize)
-  Hesper.WGSL.Execute.executeShaderNamed device penaltyShader
+  let penaltyConfig : Hesper.ExecConfig :=
+    Hesper.ExecConfig.dispatch1D numTokens 256
+  GPUBackend.execute ctx penaltyShader
     [("token_ids", cacheState.penaltyTokensBuf), ("params", cacheState.penaltyParamsBuf),
      ("logits", cacheState.logitsBuf)]
-    penaltyConfig (some penaltyCacheKey)
+    penaltyConfig
   let argmaxShader := argmaxKernel vocabSize
-  let argmaxConfig : Hesper.WGSL.Execute.ExecutionConfig := {
+  let argmaxConfig : Hesper.ExecConfig := {
     workgroupSize := { x := 256, y := 1, z := 1 }
     numWorkgroups := (1, 1, 1)
   }
-  Hesper.WGSL.Execute.executeShaderNamed device argmaxShader
+  GPUBackend.execute ctx argmaxShader
     [("logits", cacheState.logitsBuf), ("result", cacheState.argmaxBuf)]
     argmaxConfig
-  Hesper.WGSL.Execute.endBatch device
+  GPUBackend.endBatch ctx
   -- Download single u32
-  let bytes ← mapBufferRead device cacheState.argmaxBuf 0 4
-  let tokenId := Hesper.WebGPU.BufferOps.bytesToUInt32 bytes 0
+  let bytes ← GPUBackend.readBuffer ctx cacheState.argmaxBuf 4
+  let tokenId := Hesper.Basic.bytesToUInt32 bytes 0
   pure tokenId.toNat
 
 /-! ## Text Generation -/
@@ -592,16 +591,13 @@ def gpuArgmaxWithPenalty (device : Device) (cacheState : KVCacheState Buffer Pre
     @param maxTokens Maximum tokens to generate
     @return Generated token sequence
 -/
-def generate (device : Device) (model : BitNetModel Buffer PreparedDispatch CompiledKernel)
+def generate [GPUBackend β] (ctx : β) (model : BitNetModel (GPUBackend.Buf β) (GPUBackend.CachedDispatch β) (GPUBackend.CompiledKernel β))
              (promptTokens : Array Nat) (maxTokens : Nat)
              (strategy : Hesper.Inference.Sampling.Strategy := .Greedy)
              (eosToken : Option Nat := none)
              (showStats : Bool := false)
              (repetitionPenalty : Float := 1.1)
     : IO (Array Nat) := do
-  -- Reset model-level PreparedDispatch caches (buffers change per generate call)
-  resetPreparedDispatches model
-
   logVerbose "═══════════════════════════════════════════════"
   logVerbose "  Text Generation (KV Cache)"
   logVerbose "═══════════════════════════════════════════════"
@@ -611,7 +607,7 @@ def generate (device : Device) (model : BitNetModel Buffer PreparedDispatch Comp
   logVerbose ""
 
   -- Create KV cache state (pre-allocated buffers for all layers)
-  let cacheState ← createKVCacheState (β := Device) device model
+  let cacheState ← createKVCacheState ctx model
 
   let mut tokens := promptTokens
   let mut rng := Hesper.Inference.Sampling.RNG.create (some 42)
@@ -619,14 +615,14 @@ def generate (device : Device) (model : BitNetModel Buffer PreparedDispatch Comp
   -- Pre-upload prompt tokens to penalty buffer (incremental updates later)
   if repetitionPenalty != 1.0 then
     for i in [0:promptTokens.size] do
-      appendPenaltyToken device cacheState promptTokens[i]! i
+      appendPenaltyToken ctx cacheState promptTokens[i]! i
 
   -- Phase 1: Process prompt tokens one at a time (populating KV cache)
   IO.println s!"[Prefill] Processing {promptTokens.size} prompt tokens..."
   let prefillStart ← IO.monoNanosNow
   for i in [0:promptTokens.size] do
     if i >= model.config.maxSeqLen then break
-    forwardSingleToken (β := Device) device model promptTokens[i]! i cacheState
+    forwardSingleToken ctx model promptTokens[i]! i cacheState
   let prefillEnd ← IO.monoNanosNow
   let prefillMs := (prefillEnd - prefillStart).toFloat / 1_000_000.0
   IO.println s!"[Prefill] Done in {prefillMs} ms ({prefillMs / promptTokens.size.toFloat} ms/token)"
@@ -647,14 +643,15 @@ def generate (device : Device) (model : BitNetModel Buffer PreparedDispatch Comp
     if isGreedy then
       if repetitionPenalty == 1.0 then
         -- GPU-side argmax only: download 4 bytes
-        nextToken ← gpuArgmax device cacheState.logitsBuf cacheState.argmaxBuf model.config.vocabSize
+        nextToken ← gpuArgmax ctx cacheState.logitsBuf cacheState.argmaxBuf model.config.vocabSize
       else
         -- GPU-side penalty + argmax (batched): upload numTokens param, download 4 bytes
-        nextToken ← gpuArgmaxWithPenalty device cacheState model.config.vocabSize
+        nextToken ← gpuArgmaxWithPenalty ctx cacheState model.config.vocabSize
           model.config.maxSeqLen tokens.size repetitionPenalty
     else
       -- Non-greedy: download full logits for CPU sampling
-      let logits ← Hesper.WebGPU.BufferOps.downloadFloatArray device cacheState.logitsBuf model.config.vocabSize
+      let bytes ← GPUBackend.readBuffer ctx cacheState.logitsBuf (model.config.vocabSize * 4).toUSize
+      let logits ← Hesper.Basic.bytesToFloatArray bytes
       let logits := Hesper.Inference.Sampling.applyRepetitionPenalty logits tokens repetitionPenalty
       let (tok, newRng) := Hesper.Inference.Sampling.sampleWithRNG logits strategy rng
       rng := newRng
@@ -667,7 +664,7 @@ def generate (device : Device) (model : BitNetModel Buffer PreparedDispatch Comp
 
     -- Append new token to penalty buffer incrementally (4 bytes)
     if repetitionPenalty != 1.0 then
-      appendPenaltyToken device cacheState nextToken (tokens.size - 1)
+      appendPenaltyToken ctx cacheState nextToken (tokens.size - 1)
 
     -- Early stopping on EOS
     match eosToken with
@@ -680,7 +677,7 @@ def generate (device : Device) (model : BitNetModel Buffer PreparedDispatch Comp
     -- Run forward pass for the new token
     let newPos := tokens.size - 1
     if newPos < model.config.maxSeqLen then
-      forwardSingleToken (β := Device) device model nextToken newPos cacheState
+      forwardSingleToken ctx model nextToken newPos cacheState
 
   let genEnd ← IO.monoNanosNow
   let genMs := (genEnd - genStart).toFloat / 1_000_000.0
@@ -697,10 +694,6 @@ def generate (device : Device) (model : BitNetModel Buffer PreparedDispatch Comp
     let rmsMisses ← Hesper.Layers.RMSNorm.preparedMissesRef.get
     IO.println s!"  BitLinear PreparedDispatch: {blHits} hits, {blMisses} misses"
     IO.println s!"  RMSNorm PreparedDispatch: {rmsHits} hits, {rmsMisses} misses"
-    let (plHits, plMisses) ← Hesper.WGSL.Execute.getPipelineCacheStats
-    let (bgHits, bgMisses) ← Hesper.WGSL.Execute.getBindGroupCacheStats
-    IO.println s!"  Pipeline cache: {plHits} hits, {plMisses} misses"
-    IO.println s!"  BindGroup cache: {bgHits} hits, {bgMisses} misses"
 
   pure tokens
 
@@ -792,7 +785,7 @@ def extractConfig (gguf : Hesper.GGUF.GGUFFile) : IO Config := do
 
     NOTE: This function prevents premature GC of the GGUF object during loading
 -/
-def fromGGUFObject (device : Device) (gguf : Hesper.GGUF.GGUFFile) (config : Option Config := none) : IO (BitNetModel Buffer PreparedDispatch CompiledKernel) := do
+def fromGGUFObject [GPUBackend β] (ctx : β) (gguf : Hesper.GGUF.GGUFFile) (config : Option Config := none) : IO (BitNetModel (GPUBackend.Buf β) (GPUBackend.CachedDispatch β) (GPUBackend.CompiledKernel β)) := do
   IO.println "═══════════════════════════════════════════════"
   IO.println s!"  Loading BitNet Model from GGUF Object"
   IO.println "═══════════════════════════════════════════════"
@@ -825,12 +818,12 @@ def fromGGUFObject (device : Device) (gguf : Hesper.GGUF.GGUFFile) (config : Opt
       -- BitNet models use F16 for embeddings
       IO.println "  Using F16 embeddings"
       let embData ← Hesper.GGUF.Loader.extractF16Tensor gguf "token_embd.weight"
-      Embedding.createFromF16 (β := Device) device embConfig embData
+      Embedding.createFromF16 ctx embConfig embData
     | .IQ2_XXS =>
       -- TQ2_0 ternary embeddings
       IO.println "  Using TQ2_0 ternary embeddings"
       let (embPackedData, embScalesData) ← Hesper.GGUF.Loader.extractTQ2_0Tensor gguf "token_embd.weight"
-      Embedding.create (β := Device) device embConfig embPackedData embScalesData
+      Embedding.create ctx embConfig embPackedData embScalesData
     | _ =>
       throw $ IO.userError s!"Unsupported embedding tensor type: {toString embTensorInfo.ggmlType}"
 
@@ -851,25 +844,25 @@ def fromGGUFObject (device : Device) (gguf : Hesper.GGUF.GGUFFile) (config : Opt
     let qConfig : BitLinear.Config := { inDim := cfg.dim, outDim := cfg.dim, batchSize := 1 }
     let wQ ← match Hesper.GGUF.Loader.getI2_S_Tensor gguf s!"blk.{layerIdx}.attn_q.weight" with
       | .ok (packedData, scale, _numElements) =>
-        BitLinear.create (β := Device) device qConfig packedData scale
+        BitLinear.create ctx qConfig packedData scale
       | .error e => throw $ IO.userError e
 
     let kConfig : BitLinear.Config := { inDim := cfg.dim, outDim := cfg.kvDim, batchSize := 1 }
     let wK ← match Hesper.GGUF.Loader.getI2_S_Tensor gguf s!"blk.{layerIdx}.attn_k.weight" with
       | .ok (packedData, scale, _numElements) =>
-        BitLinear.create (β := Device) device kConfig packedData scale
+        BitLinear.create ctx kConfig packedData scale
       | .error e => throw $ IO.userError e
 
     let vConfig : BitLinear.Config := { inDim := cfg.dim, outDim := cfg.kvDim, batchSize := 1 }
     let wV ← match Hesper.GGUF.Loader.getI2_S_Tensor gguf s!"blk.{layerIdx}.attn_v.weight" with
       | .ok (packedData, scale, _numElements) =>
-        BitLinear.create (β := Device) device vConfig packedData scale
+        BitLinear.create ctx vConfig packedData scale
       | .error e => throw $ IO.userError e
 
     let oConfig : BitLinear.Config := { inDim := cfg.dim, outDim := cfg.dim, batchSize := 1 }
     let wO ← match Hesper.GGUF.Loader.getI2_S_Tensor gguf s!"blk.{layerIdx}.attn_output.weight" with
       | .ok (packedData, scale, _numElements) =>
-        BitLinear.create (β := Device) device oConfig packedData scale
+        BitLinear.create ctx oConfig packedData scale
       | .error e => throw $ IO.userError e
 
     -- Create RoPE layer
@@ -898,7 +891,7 @@ def fromGGUFObject (device : Device) (gguf : Hesper.GGUF.GGUFFile) (config : Opt
       maxSeqLen := cfg.maxSeqLen,
       useCausalMask := true
     }
-    let attention : Attention.Attention Buffer PreparedDispatch CompiledKernel := {
+    let attention : Attention.Attention (GPUBackend.Buf β) (GPUBackend.CachedDispatch β) (GPUBackend.CompiledKernel β) := {
       config := attnConfig,
       wQ := wQ,
       wK := wK,
@@ -912,19 +905,19 @@ def fromGGUFObject (device : Device) (gguf : Hesper.GGUF.GGUFFile) (config : Opt
     let gateConfig : BitLinear.Config := { inDim := cfg.dim, outDim := cfg.ffnDim, batchSize := 1 }
     let ffnGate ← match Hesper.GGUF.Loader.getI2_S_Tensor gguf s!"blk.{layerIdx}.ffn_gate.weight" with
       | .ok (packedData, scale, _numElements) =>
-        BitLinear.create (β := Device) device gateConfig packedData scale
+        BitLinear.create ctx gateConfig packedData scale
       | .error e => throw $ IO.userError e
 
     let upConfig : BitLinear.Config := { inDim := cfg.dim, outDim := cfg.ffnDim, batchSize := 1 }
     let ffnUp ← match Hesper.GGUF.Loader.getI2_S_Tensor gguf s!"blk.{layerIdx}.ffn_up.weight" with
       | .ok (packedData, scale, _numElements) =>
-        BitLinear.create (β := Device) device upConfig packedData scale
+        BitLinear.create ctx upConfig packedData scale
       | .error e => throw $ IO.userError e
 
     let downConfig : BitLinear.Config := { inDim := cfg.ffnDim, outDim := cfg.dim, batchSize := 1 }
     let ffnDown ← match Hesper.GGUF.Loader.getI2_S_Tensor gguf s!"blk.{layerIdx}.ffn_down.weight" with
       | .ok (packedData, scale, _numElements) =>
-        BitLinear.create (β := Device) device downConfig packedData scale
+        BitLinear.create ctx downConfig packedData scale
       | .error e => throw $ IO.userError e
 
     -- Create transformer block
@@ -936,7 +929,7 @@ def fromGGUFObject (device : Device) (gguf : Hesper.GGUF.GGUFFile) (config : Opt
       maxSeqLen := cfg.maxSeqLen
     }
 
-    let block ← TransformerBlock.createWithLayers (β := Device) device blockConfig
+    let block ← TransformerBlock.createWithLayers ctx blockConfig
       attnNormData attnSubNormData ffnNormData ffnSubNormData
       attention
       ffnGate ffnUp ffnDown
@@ -947,7 +940,7 @@ def fromGGUFObject (device : Device) (gguf : Hesper.GGUF.GGUFFile) (config : Opt
   IO.println "[5/5] Loading final normalization and LM head..."
   let finalNormData ← Hesper.GGUF.Loader.extractFloat32Tensor gguf "output_norm.weight"
   let finalNormConfig : RMSNorm.Config := { dim := cfg.dim }
-  let finalNorm ← RMSNorm.create (β := Device) device finalNormConfig finalNormData
+  let finalNorm ← RMSNorm.create ctx finalNormConfig finalNormData
 
   -- LM head: Uses weight tying with embedding table (no separate weights needed)
   IO.println "[LM Head] Using weight tying with embedding layer (no extra weights)"
@@ -975,17 +968,17 @@ def fromGGUFObject (device : Device) (gguf : Hesper.GGUF.GGUFFile) (config : Opt
 
     NOTE: This loads the GGUF file and calls fromGGUFObject
 -/
-def fromGGUF (device : Device) (ggufPath : String) (config : Option Config := none) : IO (BitNetModel Buffer PreparedDispatch CompiledKernel) := do
+def fromGGUF [GPUBackend β] (ctx : β) (ggufPath : String) (config : Option Config := none) : IO (BitNetModel (GPUBackend.Buf β) (GPUBackend.CachedDispatch β) (GPUBackend.CompiledKernel β)) := do
   -- Load GGUF file
   let gguf ← loadGGUF ggufPath
   -- Call the object-based loader
-  fromGGUFObject device gguf config
+  fromGGUFObject ctx gguf config
 
 /-- Print model statistics
 
     @param model BitNet model
 -/
-def printStats (model : BitNetModel Buffer PreparedDispatch CompiledKernel) : IO Unit := do
+def printStats (model : BitNetModel BufT CacheT KernelT) : IO Unit := do
   IO.println "═══════════════════════════════════════════════"
   IO.println "  Model Statistics"
   IO.println "═══════════════════════════════════════════════"

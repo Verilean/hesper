@@ -147,7 +147,7 @@ def main : IO Unit := do
   -- === 8. GPU Argmax ===
   let argmaxOutBuf ← createBuffer device { size := 4, usage := [.storage, .copySrc], mappedAtCreation := false }
   let argmaxMs ← timeMsAvg iterations (do
-    let _ ← Hesper.Models.BitNet.gpuArgmax device logitsBuf argmaxOutBuf vocabSize
+    let _ ← Hesper.Models.BitNet.gpuArgmax (β := Device) device logitsBuf argmaxOutBuf vocabSize
     pure ())
   IO.println s!"GPU Argmax ({vocabSize} logits):       {argmaxMs} ms"
 
