@@ -37,7 +37,7 @@ open Hesper.Training
 
 structure SmartKVConfig where
   windowSize : Nat := 256
-  tau : Float := 5.0       -- CE loss threshold (high = very surprising)
+  tau : Float := 0.5       -- Argmax sensor: 1.0 = wrong, 0.0 = correct. tau < 1 → sink all wrong predictions
   deriving Inhabited, Repr
 
 /-- Post-norm hidden buffer for Gemma 4.
@@ -80,7 +80,16 @@ def generateWithSmartKV (device : Device) (model : Gemma4Model)
   IO.println ""
 
   -- Full KV cache (original maxSeqLen) — Gemma4's attention is untouched
-  let state ← createInferenceState device model.config
+  let mut state ← createInferenceState device model.config
+
+  -- Allocate pre-softcap logits buffer and attach to state.
+  -- This triggers forwardSingleToken to copy raw logits before softcap.
+  let preSoftcapBuf ← createBuffer device {
+    size := (model.config.vocabSize * 4).toUSize
+    usage := [.storage, .copySrc, .copyDst]
+    mappedAtCreation := false
+  }
+  state := { state with preSoftcapBuf := some preSoftcapBuf }
 
   -- Sensor: CE loss between base logits and next token (same as BitNet TTT).
   -- This is the most reliable surprise metric — directly measures
@@ -109,19 +118,25 @@ def generateWithSmartKV (device : Device) (model : Gemma4Model)
     -- Standard forward at absolute position i
     forwardSingleToken device model promptTokens[i]! i state
 
-    -- CE surprise sensor: how wrong was the model about the next token?
-    -- CE loss > tau means the model was "surprised" by this token.
+    -- Top-K surprise sensor: is the next token in the model's top-K predictions?
+    -- If NOT in top-K → the model was very wrong → surprise → sink.
+    -- This filters out tokens the model "sort of" knows (in top-K even if
+    -- not argmax) and only sinks tokens the model truly didn't expect.
     let mut surprise : Float := 0.0
     let mut isSurprise := false
     if i + 1 < promptTokens.size then
-      -- Target = next token in the prompt
       let target := promptTokens[i + 1]!
-      let tBytes := BufferOps.uint32ToBytes target.toUInt32
-      writeBuffer device targetBuf 0 tBytes
-      -- CE loss of current logits vs next token
-      Loss.executeCrossEntropyForward device state.logitsBuf targetBuf lossBuf vocabSize
-      surprise ← SafeBuffer.safeReadF32 device lossBuf
-      isSurprise := surprise > config.tau
+      let logits ← BufferOps.downloadFloatArray device state.logitsBuf vocabSize
+      -- Find the target token's rank in the logit distribution
+      let targetLogit := if target < logits.size then logits[target]! else -1000.0
+      let mut rank : Nat := 0
+      for j in [0:vocabSize] do
+        if j < logits.size && logits[j]! > targetLogit then
+          rank := rank + 1
+      -- Surprise if target is NOT in top-K (rank >= K means very unexpected)
+      let topK : Nat := 50  -- top-50: generous threshold
+      isSurprise := rank >= topK
+      surprise := rank.toFloat
 
     -- If surprise, protect this position
     if isSurprise then
