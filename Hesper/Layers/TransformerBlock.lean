@@ -349,7 +349,7 @@ def forward (device : Device) (block : TransformerBlock Buffer PreparedDispatch 
   -- Step 2: Multi-head self-attention (with attn sub-norm before O projection)
   -- The O projection fuses the residual add: output = input + attn_O(attn_out)
   logVerbose "  [2/9] Multi-head attention (with fused O-proj residual)..."
-  Attention.forward device block.attention bufs.normedBuf bufs.residual1Buf batchSize seqLen (some block.attnSubNorm) (some bufs.attnBufs) (some inputBuf)
+  Attention.forward (β := Device) device block.attention bufs.normedBuf bufs.residual1Buf batchSize seqLen (some block.attnSubNorm) (some bufs.attnBufs) (some inputBuf)
 
   -- Debug: check attention output (layer 0 only)
   if block.config.layerIdx == 0 && (← isVerbose) then
@@ -486,8 +486,14 @@ def forwardWithCache (device : Device) (block : TransformerBlock Buffer Prepared
   RMSNorm.forward (β := Device) device block.attnNorm inputBuf bufs.normedBuf 1 256 (some bufs.rmsTempBuf)
 
   -- Step 2: Attention with KV cache (O projection fuses residual add)
-  Attention.forwardWithCache device block.attention bufs.normedBuf bufs.residual1Buf
-    kvCache pos (some block.attnSubNorm) (some bufs.attnBufs) (some inputBuf) loraOpt
+  match loraOpt with
+  | some (loraAdapter, loraScale, loraHBuf, loraYBufQ, loraYBufV) =>
+    Attention.forwardWithCacheLoRA device block.attention bufs.normedBuf bufs.residual1Buf
+      kvCache pos loraAdapter loraScale loraHBuf loraYBufQ loraYBufV
+      (some block.attnSubNorm) (some bufs.attnBufs) (some inputBuf)
+  | none =>
+    Attention.forwardWithCache (β := Device) device block.attention bufs.normedBuf bufs.residual1Buf
+      kvCache pos (some block.attnSubNorm) (some bufs.attnBufs) (some inputBuf)
 
   -- === FFN SUB-LAYER ===
 
