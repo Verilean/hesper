@@ -11,10 +11,12 @@ namespace Hesper
 
 open Hesper.WebGPU
 open Hesper.WGSL.Execute
+open Hesper.WGSL (WorkgroupSize)
 
 instance : GPUBackend Device where
   Buf := Buffer
   CachedDispatch := PreparedDispatch
+  CompiledKernel := Hesper.WGSL.Execute.CompiledKernel
   executeKernel device computation namedBuffers funcName workgroupSize numWorkgroups :=
     executeShaderNamed device computation namedBuffers
       { funcName, workgroupSize, numWorkgroups }
@@ -35,6 +37,15 @@ instance : GPUBackend Device where
     Hesper.WebGPU.writeBuffer device buf offset data
   readBuffer device buf size :=
     mapBufferRead device buf 0 size
+  buildKernel device computation funcName workgroupSize numWorkgroups :=
+    Hesper.WGSL.Execute.buildKernel device computation
+      { funcName, workgroupSize, numWorkgroups }
+  dispatchCompiledKernel device kernel buffers numWorkgroups cacheRef := do
+    let bg ← Hesper.WGSL.Execute.bindKernelDirect device kernel buffers
+    match cacheRef with
+    | some ref => ref.set (some (kernel.prepare bg))
+    | none => pure ()
+    Hesper.WGSL.Execute.dispatchKernel device kernel bg numWorkgroups
   newCacheRef := IO.mkRef none
 
 end Hesper
