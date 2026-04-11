@@ -344,9 +344,10 @@ def forward [GPUBackend β] (ctx : β)
   logVerbose s!"[RMSNorm] Executing forward pass ({numRows} rows × {layer.config.dim} dim)..."
   let shader := rmsNormFusedKernel layer.config numRows workgroupSize
   let cacheKey : UInt64 := hash ("rms", layer.config.dim, numRows, workgroupSize)
-  GPUBackend.executeKernelCached ctx shader
+  GPUBackend.executeWithConfigCached ctx shader
     [("input", inputBuf), ("scale", layer.scale), ("output", outputBuf)]
-    "main" { x := workgroupSize } (numRows, 1, 1) cacheKey layer.prepared
+    { workgroupSize := { x := workgroupSize }, numWorkgroups := (numRows, 1, 1) }
+    cacheKey layer.prepared
   logVerbose "[RMSNorm] ✓ Forward pass complete"
 
 /-- Execute forward pass (two-pass optimized version)

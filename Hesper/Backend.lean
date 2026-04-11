@@ -26,74 +26,14 @@ namespace Hesper
 open Hesper.WGSL (WorkgroupSize)
 open Hesper.WGSL.Monad (ShaderM)
 
-/-- Typeclass for GPU compute backends.
-
-    `β` is the backend context type.
-    All GPU operations go through this interface. -/
-class GPUBackend (β : Type) where
-  /-- Buffer type for this backend -/
-  Buf : Type
-  /-- Cached dispatch state for fast-path replay (WebGPU: PreparedDispatch, CUDA: hash key) -/
-  CachedDispatch : Type := Unit
-  /-- Pre-compiled kernel (WebGPU: CompiledKernel, CUDA: CUfunction + metadata) -/
-  CompiledKernel : Type := Unit
-
-  -- ── Kernel execution ──
-
-  /-- Execute a ShaderM kernel with named buffers. -/
-  executeKernel : β → ShaderM Unit → List (String × Buf) →
-    (funcName : String) → (workgroupSize : WorkgroupSize) →
-    (numWorkgroups : Nat × Nat × Nat) → IO Unit
-
-  /-- Execute with optional dispatch cache (PreparedDispatch equivalent).
-      If cacheRef contains a cached dispatch, replay it (fast path).
-      Otherwise, execute normally and store the result. -/
-  executeKernelCached : β → ShaderM Unit → List (String × Buf) →
-    (funcName : String) → (workgroupSize : WorkgroupSize) →
-    (numWorkgroups : Nat × Nat × Nat) →
-    (cacheKey : UInt64) →
-    (cacheRef : IO.Ref (Option CachedDispatch)) → IO Unit
-
-  /-- Replay a cached dispatch with different grid dimensions. -/
-  replayCached : β → CachedDispatch → Nat × Nat × Nat → IO Unit
-
-  -- ── Buffer management ──
-
-  /-- Allocate a GPU buffer of given size (bytes), zero-filled -/
-  allocBuffer : β → USize → IO Buf
-  /-- Allocate a buffer with specific usage flags (backend-specific) -/
-  allocBufferUsage : β → USize → List String → IO Buf := fun ctx size _ => allocBuffer ctx size
-  /-- Free a GPU buffer -/
-  freeBuffer : β → Buf → IO Unit
-  /-- Upload host ByteArray to GPU buffer (offset 0) -/
-  writeBuffer : β → Buf → ByteArray → IO Unit
-  /-- Upload host ByteArray to GPU buffer at byte offset -/
-  writeBufferOffset : β → Buf → USize → ByteArray → IO Unit := fun ctx buf _ data => writeBuffer ctx buf data
-  /-- Download `size` bytes from GPU buffer to host -/
-  readBuffer : β → Buf → USize → IO ByteArray
-
-  -- ── Kernel compilation ──
-
-  /-- Pre-compile a kernel (WebGPU: build pipeline, CUDA: JIT PTX) -/
-  buildKernel : β → ShaderM Unit →
-    (funcName : String) → (workgroupSize : WorkgroupSize) →
-    (numWorkgroups : Nat × Nat × Nat) → IO CompiledKernel
-  /-- Dispatch a pre-compiled kernel with positional buffers + optional cache -/
-  dispatchCompiledKernel : β → CompiledKernel → Array Buf →
-    (numWorkgroups : Nat × Nat × Nat) →
-    (cacheRef : Option (IO.Ref (Option CachedDispatch))) → IO Unit
-
-  -- ── Dispatch cache management ──
-
-  /-- Create a new empty dispatch cache ref -/
-  newCacheRef : IO (IO.Ref (Option CachedDispatch)) := IO.mkRef none
-
-/-- Execution config — mirrors the existing `Execute.ExecutionConfig`
-    so that `smartDispatch` etc. work unchanged. -/
+/-- Execution config — backend-agnostic. extensions/diagnostics are used
+    by WebGPU (e.g., chromium_experimental_subgroup_matrix) and ignored by CUDA. -/
 structure ExecConfig where
   funcName : String := "main"
   workgroupSize : WorkgroupSize := {x := 256, y := 1, z := 1}
   numWorkgroups : Nat × Nat × Nat := (1, 1, 1)
+  extensions : List String := []
+  diagnostics : List (String × String) := []
 
 namespace ExecConfig
 
@@ -107,13 +47,34 @@ def dispatch2D (nx ny : Nat) (bx : Nat := 16) (by_ : Nat := 16) : ExecConfig :=
 
 end ExecConfig
 
-/-- Convenience: execute with ExecConfig (unpacks into executeKernel args) -/
+/-- Typeclass for GPU compute backends. -/
+class GPUBackend (β : Type) where
+  Buf : Type
+  CachedDispatch : Type := Unit
+  CompiledKernel : Type := Unit
+  executeWithConfig : β → ShaderM Unit → List (String × Buf) → ExecConfig → IO Unit
+  executeWithConfigCached : β → ShaderM Unit → List (String × Buf) → ExecConfig →
+    UInt64 → IO.Ref (Option CachedDispatch) → IO Unit
+  replayCached : β → CachedDispatch → Nat × Nat × Nat → IO Unit
+  allocBuffer : β → USize → IO Buf
+  allocBufferUsage : β → USize → List String → IO Buf := fun ctx size _ => allocBuffer ctx size
+  freeBuffer : β → Buf → IO Unit
+  writeBuffer : β → Buf → ByteArray → IO Unit
+  writeBufferOffset : β → Buf → USize → ByteArray → IO Unit := fun ctx buf _ data => writeBuffer ctx buf data
+  readBuffer : β → Buf → USize → IO ByteArray
+  buildKernel : β → ShaderM Unit → String → WorkgroupSize → Nat × Nat × Nat → IO CompiledKernel
+  dispatchCompiledKernel : β → CompiledKernel → Array Buf →
+    Nat × Nat × Nat → Option (IO.Ref (Option CachedDispatch)) → IO Unit
+  hasSubgroupSupport : β → IO Bool := fun _ => pure false
+  hasShaderF16Support : β → IO Bool := fun _ => pure false
+  newCacheRef : IO (IO.Ref (Option CachedDispatch)) := IO.mkRef none
+
+/-- Convenience: execute with ExecConfig -/
 @[inline]
 def GPUBackend.execute [GPUBackend β] (ctx : β) (computation : ShaderM Unit)
     (namedBuffers : List (String × GPUBackend.Buf β))
     (config : ExecConfig) : IO Unit :=
-  GPUBackend.executeKernel ctx computation namedBuffers
-    config.funcName config.workgroupSize config.numWorkgroups
+  GPUBackend.executeWithConfig ctx computation namedBuffers config
 
 /-- Smart dispatch: 1D if fits, 2D otherwise.
     Returns `(config, gridDimX)` — same signature as TTT.Kernels.smartDispatch. -/
