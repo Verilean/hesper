@@ -103,15 +103,15 @@ instance : GPUBackend CUDAContext where
   freeBuffer _ctx buf := freeCUDABuffer buf
   writeBuffer _ctx buf data := writeCUDABuffer buf data
   readBuffer _ctx buf size := readCUDABuffer buf size
-  buildKernel _ctx computation funcName workgroupSize _numWorkgroups := do
-    let ptx := generatePTX funcName workgroupSize computation
+  buildKernel _ctx computation config := do
+    let ptx := generatePTX config.funcName config.workgroupSize computation
     let sourceHash := hash ptx
     let cache ← cudaModuleCache.get
     let func ← match cache.find? (fun e => e.1 == sourceHash) with
     | some (_, f) => pure f
     | none => do
       let cudaMod ← cuModuleLoadData ptx
-      let f ← cuModuleGetFunction cudaMod funcName
+      let f ← cuModuleGetFunction cudaMod config.funcName
       cudaModuleCache.modify (·.push (sourceHash, f))
       pure f
     let state := Hesper.WGSL.Monad.ShaderM.exec computation
