@@ -688,6 +688,24 @@ lean_exe «smart-kv-needle-gemma4» where
   root := `Examples.SmartKV_Needle_Gemma4
   moreLinkArgs := stdLinkArgs
 
+lean_exe «ptx-codegen-test» where
+  root := `Tests.CUDA.PTXCodeGenTest
+
+def cudaLinkArgs : Array String :=
+  stdLinkArgs ++ #["./.lake/build/native/libhesper_cuda.a", "-ldl"]
+
+lean_exe «cuda-minimal-test» where
+  root := `Tests.CUDA.CUDAMinimalTest
+  moreLinkArgs := #["./.lake/build/native/libhesper_cuda.a", "-lcuda"]
+
+lean_exe «cuda-execute-test» where
+  root := `Tests.CUDA.CUDAExecuteTest
+  moreLinkArgs := cudaLinkArgs
+
+lean_exe «cuda-matmul-test» where
+  root := `Tests.CUDA.CUDAMatMulTest
+  moreLinkArgs := stdLinkArgs ++ #["./.lake/build/native/libhesper_cuda.a", "-lcuda"]
+
 -- ============================================================================
 -- SIMD CPU BACKEND (Google Highway)
 -- ============================================================================
