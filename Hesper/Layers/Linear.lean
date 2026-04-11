@@ -1,9 +1,6 @@
+import Hesper.Backend
 import Hesper.WGSL.Monad
-import Hesper.WGSL.Execute
 import Hesper.WGSL.Exp
-import Hesper.WebGPU.Types
-import Hesper.WebGPU.Device
-import Hesper.WebGPU.Buffer
 import Hesper.Quantization.Q4_K_M
 import Hesper.Quantization.Q6_K
 import Hesper.Logging
@@ -41,7 +38,7 @@ namespace Hesper.Layers.Linear
 
 open Hesper.WGSL
 open Hesper.WGSL.Monad
-open Hesper.WebGPU
+open Hesper
 open Hesper.Quantization.Q4_K_M (fp16ToF32 getScaleMin)
 open Hesper.Logging (logVerbose)
 
@@ -1085,18 +1082,18 @@ inductive QuantFormat where
   deriving Repr, BEq, Inhabited
 
 /-- Quantized linear layer (supports Q4_K and Q6_K) -/
-structure LinearLayer where
+structure LinearLayer (BufT : Type) (CacheT : Type := Unit) where
   config : Config
-  weightBuf : Buffer    -- Raw packed weights on GPU
+  weightBuf : BufT    -- Raw packed weights on GPU
   quantFormat : QuantFormat  -- Which dequant kernel to use
-  prepared : IO.Ref (Option Execute.PreparedDispatch)
+  prepared : IO.Ref (Option CacheT)
   -- Split-K partial-sums workspace buffer (`outDim * splits` f32), lazily
   -- allocated on the first call when split-K is eligible (see
   -- `splitKFactorFor` below). Nil until then.
-  splitKBuf : IO.Ref (Option Buffer)
+  splitKBuf : IO.Ref (Option BufT)
   -- Prepared dispatch for the split-K partial kernel and the reduce kernel.
-  splitKPartialPrepared : IO.Ref (Option Execute.PreparedDispatch)
-  splitKReducePrepared : IO.Ref (Option Execute.PreparedDispatch)
+  splitKPartialPrepared : IO.Ref (Option CacheT)
+  splitKReducePrepared : IO.Ref (Option CacheT)
 
 /-- Execute the linear layer: output = input @ weights^T
 
@@ -1112,12 +1109,12 @@ structure LinearLayer where
     @param inputBuf GPU buffer with input vector [inDim]
     @param outputBuf GPU buffer for output vector [outDim]
 -/
-def LinearLayer.forward (device : Device) (layer : LinearLayer)
-    (inputBuf outputBuf : Buffer) : IO Unit := do
+def LinearLayer.forward [GPUBackend β] (ctx : β) (layer : LinearLayer (GPUBackend.Buf β) (GPUBackend.CachedDispatch β))
+    (inputBuf outputBuf : GPUBackend.Buf β) : IO Unit := do
   let profiling ← profilingRef.get
   let startNs ← if profiling then IO.monoNanosNow else pure 0
 
-  let useSubgroups ← Execute.hasSubgroupSupport device
+  let useSubgroups ← GPUBackend.hasSubgroupSupport ctx
   let splits := if layer.quantFormat == .Q4_K && useSubgroups
                 then splitKFactorFor layer.config else 1
 
@@ -1129,9 +1126,9 @@ def LinearLayer.forward (device : Device) (layer : LinearLayer)
         let a ← layer.splitKPartialPrepared.get
         let b ← layer.splitKReducePrepared.get
         pure (a, b) then
-      Execute.replayPreparedDispatch device pPart (layer.config.outDim * splits) 1 1
+      GPUBackend.replayCached ctx pPart (layer.config.outDim * splits, 1, 1)
       let reduceWGs := (layer.config.outDim + 255) / 256
-      Execute.replayPreparedDispatch device pRed reduceWGs 1 1
+      GPUBackend.replayCached ctx pRed (reduceWGs, 1, 1)
       if profiling then
         let endNs ← IO.monoNanosNow
         let delta := (endNs - startNs).toUInt64
@@ -1148,11 +1145,7 @@ def LinearLayer.forward (device : Device) (layer : LinearLayer)
       | some b => pure b
       | none =>
         let sizeBytes : USize := (layer.config.outDim * splits * 4).toUSize
-        let b ← createBuffer device {
-          size := sizeBytes
-          usage := [.storage, .copySrc, .copyDst]
-          mappedAtCreation := false
-        }
+        let b ← GPUBackend.allocBuffer ctx sizeBytes
         layer.splitKBuf.set (some b)
         pure b)
 
@@ -1161,36 +1154,30 @@ def LinearLayer.forward (device : Device) (layer : LinearLayer)
       ("input", inputBuf),
       ("partial", partialBuf)
     ]
-    let partialCfg : Execute.ExecutionConfig := {
+    let partialCfg : Hesper.ExecConfig := {
       numWorkgroups := (layer.config.outDim * splits, 1, 1)
       workgroupSize := { x := 32, y := 1, z := 1 }
-      extensions := ["subgroups"]
     }
     let partialCacheKey : UInt64 :=
       hash ("q4k-lin-splitk-partial", layer.config.inDim, layer.config.outDim, splits)
-    Execute.executeShaderNamed device
+    GPUBackend.executeWithConfigCached ctx
       (fusedQ4KMLinearSplitKKernel layer.config splits)
-      partialBuffers partialCfg
-      (cacheKey := some partialCacheKey)
-      (preparedRef := some layer.splitKPartialPrepared)
+      partialBuffers partialCfg partialCacheKey layer.splitKPartialPrepared
 
     let reduceBuffers := [
       ("partial", partialBuf),
       ("output", outputBuf)
     ]
     let reduceWGs := (layer.config.outDim + 255) / 256
-    let reduceCfg : Execute.ExecutionConfig := {
+    let reduceCfg : Hesper.ExecConfig := {
       numWorkgroups := (reduceWGs, 1, 1)
       workgroupSize := { x := 256, y := 1, z := 1 }
-      extensions := []
     }
     let reduceCacheKey : UInt64 :=
       hash ("q4k-lin-splitk-reduce", layer.config.outDim, splits)
-    Execute.executeShaderNamed device
+    GPUBackend.executeWithConfigCached ctx
       (splitKReduceKernel layer.config.outDim splits)
-      reduceBuffers reduceCfg
-      (cacheKey := some reduceCacheKey)
-      (preparedRef := some layer.splitKReducePrepared)
+      reduceBuffers reduceCfg reduceCacheKey layer.splitKReducePrepared
 
     if profiling then
       let endNs ← IO.monoNanosNow
@@ -1209,7 +1196,7 @@ def LinearLayer.forward (device : Device) (layer : LinearLayer)
   -- path hits after the first call.
   if let some p ← layer.prepared.get then
     -- Use the same workgroup count that was used at prepare time.
-    Execute.replayPreparedDispatch device p layer.config.outDim 1 1
+    GPUBackend.replayCached ctx p (layer.config.outDim, 1, 1)
     if profiling then
       let endNs ← IO.monoNanosNow
       let delta := (endNs - startNs).toUInt64
@@ -1228,10 +1215,9 @@ def LinearLayer.forward (device : Device) (layer : LinearLayer)
   -- original shared-memory tree-reduction kernel (256 threads).
   -- Both variants dispatch `outDim` workgroups, one per output row.
   let wgSize := if useSubgroups then 32 else 256
-  let execConfig : Execute.ExecutionConfig := {
+  let execConfig : Hesper.ExecConfig := {
     numWorkgroups := (layer.config.outDim, 1, 1)
     workgroupSize := { x := wgSize, y := 1, z := 1 }
-    extensions := if useSubgroups then ["subgroups"] else []
   }
   -- Stable cache key so the slow path (first call) skips per-call WGSL
   -- regeneration — Q4_K's kernel body is large and hashing it from
@@ -1244,8 +1230,7 @@ def LinearLayer.forward (device : Device) (layer : LinearLayer)
     | .Q4_K, false => fusedQ4KMLinearKernel layer.config
     | .Q6_K, true  => Hesper.Quantization.Q6_K.fusedQ6KLinearBlockCoopKernel layer.config.inDim layer.config.outDim
     | .Q6_K, false => Hesper.Quantization.Q6_K.fusedQ6KLinearKernel layer.config.inDim layer.config.outDim
-  Execute.executeShaderNamed device shader namedBuffers execConfig
-    (cacheKey := some cacheKey) (preparedRef := some layer.prepared)
+  GPUBackend.executeWithConfigCached ctx shader namedBuffers execConfig cacheKey layer.prepared
   if profiling then
     let endNs ← IO.monoNanosNow
     let delta := (endNs - startNs).toUInt64
@@ -1267,10 +1252,10 @@ def LinearLayer.forward (device : Device) (layer : LinearLayer)
 
     @param preparedRef Shared prepared-dispatch cache for the fast path.
 -/
-def forwardFusedGateUp (device : Device)
-    (gate up : LinearLayer)
-    (inputBuf outputBuf : Buffer)
-    (preparedRef : IO.Ref (Option Execute.PreparedDispatch))
+def forwardFusedGateUp [GPUBackend β] (ctx : β)
+    (gate up : LinearLayer (GPUBackend.Buf β) (GPUBackend.CachedDispatch β))
+    (inputBuf outputBuf : GPUBackend.Buf β)
+    (preparedRef : IO.Ref (Option (GPUBackend.CachedDispatch β)))
     : IO Unit := do
   -- Preconditions (assert at the Lean level so kernel dispatch is well-formed).
   -- Both weight layers must be Q4_K and share the same shape.
@@ -1286,7 +1271,7 @@ def forwardFusedGateUp (device : Device)
 
   -- Fast path: instant replay if prepared.
   if let some p ← preparedRef.get then
-    Execute.replayPreparedDispatch device p gate.config.outDim 1 1
+    GPUBackend.replayCached ctx p (gate.config.outDim, 1, 1)
     if profiling then
       let endNs ← IO.monoNanosNow
       let delta := (endNs - startNs).toUInt64
@@ -1303,17 +1288,15 @@ def forwardFusedGateUp (device : Device)
     ("input",        inputBuf),
     ("output",       outputBuf)
   ]
-  let execConfig : Execute.ExecutionConfig := {
+  let execConfig : Hesper.ExecConfig := {
     numWorkgroups := (gate.config.outDim, 1, 1)
     workgroupSize := { x := 32, y := 1, z := 1 }
-    extensions := ["subgroups"]
   }
   let cacheKey : UInt64 :=
     hash ("q4k-gate-up", gate.config.inDim, gate.config.outDim)
-  Execute.executeShaderNamed device
+  GPUBackend.executeWithConfigCached ctx
     (fusedQ4KMGateUpSubgroupKernel gate.config)
-    namedBuffers execConfig
-    (cacheKey := some cacheKey) (preparedRef := some preparedRef)
+    namedBuffers execConfig cacheKey preparedRef
   if profiling then
     let endNs ← IO.monoNanosNow
     let delta := (endNs - startNs).toUInt64
