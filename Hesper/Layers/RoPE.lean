@@ -1,9 +1,6 @@
 import Hesper.WGSL.Monad
-import Hesper.WGSL.Execute
 import Hesper.WGSL.Exp
-import Hesper.WebGPU.Types
-import Hesper.WebGPU.Device
-import Hesper.WebGPU.Buffer
+import Hesper.Backend
 import Hesper.Logging
 
 /-!
@@ -73,7 +70,7 @@ namespace Hesper.Layers.RoPE
 
 open Hesper.WGSL
 open Hesper.WGSL.Monad
-open Hesper.WebGPU
+open Hesper
 open Hesper.Logging (logVerbose)
 
 /-! ## Layer Configuration -/
@@ -342,63 +339,48 @@ def create (config : Config) : IO RoPE := do
     @param seqLen Current sequence length
     @param numHeads Number of attention heads
 -/
-def forward (device : Device) (layer : RoPE)
-            (inputBuf outputBuf : Buffer)
+@[inline]
+def forward [GPUBackend β] (ctx : β) (layer : RoPE)
+            (inputBuf outputBuf : GPUBackend.Buf β)
             (batchSize seqLen numHeads : Nat) (headDim : Nat := 0) (posOffset : Nat := 0) : IO Unit := do
-  -- If headDim is 0, derive from config.dim / numHeads
   let effectiveHeadDim := if headDim > 0 then headDim else layer.config.dim / numHeads
   logVerbose s!"[RoPE] Applying to batch={batchSize}, seq_len={seqLen}, heads={numHeads}, headDim={effectiveHeadDim}, posOffset={posOffset}"
-
   let dimPairs := effectiveHeadDim / 2
   let totalElements := batchSize * seqLen * numHeads * dimPairs
-
-  let shader := ropeKernel layer.config batchSize seqLen numHeads effectiveHeadDim posOffset
-  let namedBuffers := [
-    ("input", inputBuf),
-    ("output", outputBuf)
-  ]
-
-  let execConfig := Hesper.WGSL.Execute.ExecutionConfig.dispatch1D
-    totalElements
-    256  -- Workgroup size
-
-  Hesper.WGSL.Execute.executeShaderNamed device shader namedBuffers execConfig
+  GPUBackend.execute ctx (ropeKernel layer.config batchSize seqLen numHeads effectiveHeadDim posOffset)
+    [("input", inputBuf), ("output", outputBuf)]
+    (ExecConfig.dispatch1D totalElements)
   logVerbose "[RoPE] ✓ Forward pass complete"
 
 /-- Apply RoPE with dynamic posOffset from a params buffer.
     The params buffer must contain [posOffset: u32, ...] (posOffset at index 0).
     Produces identical WGSL across tokens → enables pipeline + bind group caching.
 -/
-def forwardDynamic (device : Device) (layer : RoPE)
-            (inputBuf outputBuf paramsBuf : Buffer)
+@[inline]
+def forwardDynamic [GPUBackend β] (ctx : β) (layer : RoPE)
+            (inputBuf outputBuf paramsBuf : GPUBackend.Buf β)
             (batchSize seqLen numHeads : Nat) (headDim : Nat := 0)
-            (preparedRef : Option (IO.Ref (Option Hesper.WGSL.Execute.PreparedDispatch)) := none) : IO Unit := do
+            (preparedRef : Option (IO.Ref (Option (GPUBackend.CachedDispatch β))) := none) : IO Unit := do
   let effectiveHeadDim := if headDim > 0 then headDim else layer.config.dim / numHeads
   let dimPairs := effectiveHeadDim / 2
   let totalElements := batchSize * seqLen * numHeads * dimPairs
-  let wx := (totalElements + 255) / 256
-
-  -- Fast path: replay prepared dispatch
+  -- Fast path: replay cached dispatch
   if let some ref := preparedRef then
     if let some p ← ref.get then
-      Hesper.WGSL.Execute.replayPreparedDispatch device p wx 1 1
+      let wx := (totalElements + 255) / 256
+      GPUBackend.replayCached ctx p (wx, 1, 1)
       return
-
   logVerbose s!"[RoPE] Applying dynamic to batch={batchSize}, seq_len={seqLen}, heads={numHeads}, headDim={effectiveHeadDim}"
-
-  let shader := ropeKernelDynamic layer.config batchSize seqLen numHeads effectiveHeadDim
-  let namedBuffers := [
-    ("input", inputBuf),
-    ("output", outputBuf),
-    ("params", paramsBuf)
-  ]
-
-  let execConfig := Hesper.WGSL.Execute.ExecutionConfig.dispatch1D
-    totalElements
-    256
-
   let cacheKey : UInt64 := hash ("rope_dyn", batchSize, seqLen, numHeads, effectiveHeadDim, layer.config.base.toBits)
-  Hesper.WGSL.Execute.executeShaderNamed device shader namedBuffers execConfig (some cacheKey) preparedRef
+  match preparedRef with
+  | some ref =>
+    GPUBackend.executeKernelCached ctx (ropeKernelDynamic layer.config batchSize seqLen numHeads effectiveHeadDim)
+      [("input", inputBuf), ("output", outputBuf), ("params", paramsBuf)]
+      "main" {x := 256} ((totalElements + 255) / 256, 1, 1) cacheKey ref
+  | none =>
+    GPUBackend.execute ctx (ropeKernelDynamic layer.config batchSize seqLen numHeads effectiveHeadDim)
+      [("input", inputBuf), ("output", outputBuf), ("params", paramsBuf)]
+      (ExecConfig.dispatch1D totalElements)
   logVerbose "[RoPE] ✓ Dynamic forward pass complete"
 
 /-- Apply cached RoPE (requires precomputed cos/sin buffers)
@@ -413,28 +395,17 @@ def forwardDynamic (device : Device) (layer : RoPE)
     @param seqLen Current sequence length
     @param numHeads Number of attention heads
 -/
-def forwardCached (device : Device) (layer : RoPE)
-                  (inputBuf cosCacheBuf sinCacheBuf outputBuf : Buffer)
+@[inline]
+def forwardCached [GPUBackend β] (ctx : β) (layer : RoPE)
+                  (inputBuf cosCacheBuf sinCacheBuf outputBuf : GPUBackend.Buf β)
                   (batchSize seqLen numHeads : Nat) : IO Unit := do
   logVerbose s!"[RoPE] Applying cached RoPE: batch={batchSize}, seq_len={seqLen}"
-
   let headDim := layer.config.dim / numHeads
   let dimPairs := headDim / 2
   let totalElements := batchSize * seqLen * numHeads * dimPairs
-
-  let shader := ropeCachedKernel layer.config batchSize seqLen numHeads
-  let namedBuffers := [
-    ("input", inputBuf),
-    ("cos_cache", cosCacheBuf),
-    ("sin_cache", sinCacheBuf),
-    ("output", outputBuf)
-  ]
-
-  let execConfig := Hesper.WGSL.Execute.ExecutionConfig.dispatch1D
-    totalElements
-    256
-
-  Hesper.WGSL.Execute.executeShaderNamed device shader namedBuffers execConfig
+  GPUBackend.execute ctx (ropeCachedKernel layer.config batchSize seqLen numHeads)
+    [("input", inputBuf), ("cos_cache", cosCacheBuf), ("sin_cache", sinCacheBuf), ("output", outputBuf)]
+    (ExecConfig.dispatch1D totalElements)
   logVerbose "[RoPE] ✓ Cached forward pass complete"
 
 /-! ## Cache Generation Utilities -/
