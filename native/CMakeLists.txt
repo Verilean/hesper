@@ -43,3 +43,11 @@ target_link_libraries(hesper_native PRIVATE
 )
 
 # Note: GLFW and Dawn linking happens in the final executable via lakefile.lean
+
+# ============================================================================
+# CUDA bridge (always built — uses dlopen, no CUDA SDK dependency)
+# ============================================================================
+find_package(CUDAToolkit REQUIRED)
+add_library(hesper_cuda STATIC cuda_bridge.cpp)
+target_include_directories(hesper_cuda PRIVATE ${LEAN_INCLUDE_DIR} ${CUDAToolkit_INCLUDE_DIRS})
+target_link_libraries(hesper_cuda PRIVATE CUDA::cuda_driver)

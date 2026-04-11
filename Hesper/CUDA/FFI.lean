@@ -91,19 +91,4 @@ opaque cuLaunchKernel
     (args : @& Array USize)  -- device pointers
     : IO Unit
 
-/-! ## High-level helpers -/
-
-/-- Initialize CUDA and create a context on device 0. -/
-def initCUDA : IO (CUdevice × CUcontext) := do
-  cuDriverInit
-  let count ← cuDeviceCount
-  if count == 0 then throw (IO.userError "No CUDA devices found")
-  let dev ← cuDeviceGet 0
-  let name ← cuDeviceName dev
-  let cc ← cuComputeCapability dev
-  let mem ← cuTotalMem dev
-  IO.println s!"[CUDA] Device: {name}, SM {cc / 10}.{cc % 10}, {mem / (1024*1024)} MB"
-  let ctx ← cuCtxCreate dev
-  return (dev, ctx)
-
 end Hesper.CUDA
