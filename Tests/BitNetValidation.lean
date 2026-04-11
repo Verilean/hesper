@@ -91,7 +91,7 @@ def runValidation (dataDir : String) (modelPath : String) : IO TestSeq := do
 
   -- Load model
   IO.println "[3/5] Loading BitNet model..."
-  let model ← Hesper.Models.BitNet.fromGGUF device modelPath none
+  let model ← Hesper.Models.BitNet.fromGGUF (β := Device) device modelPath none
   IO.println s!"  Model loaded: dim={model.config.dim}, layers={model.config.numLayers}, vocab={model.config.vocabSize}"
 
   -- Run forward pass

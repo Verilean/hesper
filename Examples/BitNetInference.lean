@@ -46,7 +46,7 @@ def example1LoadModel (ggufPath : String) : IO Unit := do
 
   -- Load BitNet model from GGUF
   IO.println s!"Loading model from: {ggufPath}"
-  let model ← BitNet.fromGGUF device ggufPath none
+  let model ← BitNet.fromGGUF (β := Device) device ggufPath none
 
   -- Print model statistics
   BitNet.printStats model
@@ -63,7 +63,7 @@ def example2GreedyGeneration (ggufPath : String) : IO Unit := do
   IO.println ""
 
   let device ← initializeDevice
-  let model ← BitNet.fromGGUF device ggufPath none
+  let model ← BitNet.fromGGUF (β := Device) device ggufPath none
 
   -- Example prompt: "Hello world"
   -- (In real usage, these would come from a tokenizer)
@@ -74,7 +74,7 @@ def example2GreedyGeneration (ggufPath : String) : IO Unit := do
   IO.println ""
 
   -- Generate with greedy sampling
-  let outputTokens ← BitNet.generate device model promptTokens 20 .Greedy
+  let outputTokens ← BitNet.generate (β := Device) device model promptTokens 20 .Greedy
 
   IO.println s!"Generated {outputTokens.size - promptTokens.size} new tokens"
   IO.println s!"Output tokens: {outputTokens}"
@@ -91,7 +91,7 @@ def example3TopKGeneration (ggufPath : String) : IO Unit := do
   IO.println ""
 
   let device ← initializeDevice
-  let model ← BitNet.fromGGUF device ggufPath none
+  let model ← BitNet.fromGGUF (β := Device) device ggufPath none
 
   let promptTokens := #[1, 2, 3, 4, 5]
 
@@ -103,7 +103,7 @@ def example3TopKGeneration (ggufPath : String) : IO Unit := do
   IO.println "Generating with Top-k sampling (k=40, temp=0.8)..."
   IO.println ""
 
-  let outputTokens ← BitNet.generate device model promptTokens 20 strategy
+  let outputTokens ← BitNet.generate (β := Device) device model promptTokens 20 strategy
 
   IO.println s!"Generated {outputTokens.size - promptTokens.size} new tokens"
   IO.println s!"Output tokens: {outputTokens}"
@@ -121,7 +121,7 @@ def example4NucleusGeneration (ggufPath : String) : IO Unit := do
   IO.println ""
 
   let device ← initializeDevice
-  let model ← BitNet.fromGGUF device ggufPath none
+  let model ← BitNet.fromGGUF (β := Device) device ggufPath none
 
   let promptTokens := #[1, 2, 3, 4, 5]
 
@@ -134,7 +134,7 @@ def example4NucleusGeneration (ggufPath : String) : IO Unit := do
   IO.println ""
 
   -- Stop at EOS token (ID 2 in this example)
-  let outputTokens ← BitNet.generate device model promptTokens 20 strategy (some 2)
+  let outputTokens ← BitNet.generate (β := Device) device model promptTokens 20 strategy (some 2)
 
   IO.println s!"Generated {outputTokens.size - promptTokens.size} new tokens"
   IO.println s!"Output tokens: {outputTokens}"
@@ -152,7 +152,7 @@ def example5CompareSamplingStrategies (ggufPath : String) : IO Unit := do
   IO.println ""
 
   let device ← initializeDevice
-  let model ← BitNet.fromGGUF device ggufPath none
+  let model ← BitNet.fromGGUF (β := Device) device ggufPath none
 
   let promptTokens := #[1, 2, 3, 4, 5]
   let maxTokens := 10
@@ -163,28 +163,28 @@ def example5CompareSamplingStrategies (ggufPath : String) : IO Unit := do
 
   -- Strategy 1: Greedy
   IO.println "1. Greedy (deterministic):"
-  let output1 ← BitNet.generate device model promptTokens maxTokens .Greedy
+  let output1 ← BitNet.generate (β := Device) device model promptTokens maxTokens .Greedy
   IO.println s!"   Output: {output1}"
   IO.println ""
 
   -- Strategy 2: Top-k with low temperature (more conservative)
   IO.println "2. Top-k (k=10, temp=0.5):"
   let strategy2 := Strategy.TopK 10 0.5
-  let output2 ← BitNet.generate device model promptTokens maxTokens strategy2
+  let output2 ← BitNet.generate (β := Device) device model promptTokens maxTokens strategy2
   IO.println s!"   Output: {output2}"
   IO.println ""
 
   -- Strategy 3: Top-k with high temperature (more creative)
   IO.println "3. Top-k (k=40, temp=1.2):"
   let strategy3 := Strategy.TopK 40 1.2
-  let output3 ← BitNet.generate device model promptTokens maxTokens strategy3
+  let output3 ← BitNet.generate (β := Device) device model promptTokens maxTokens strategy3
   IO.println s!"   Output: {output3}"
   IO.println ""
 
   -- Strategy 4: Nucleus
   IO.println "4. Nucleus (p=0.9, temp=1.0):"
   let strategy4 := Strategy.Nucleus 0.9 1.0
-  let output4 ← BitNet.generate device model promptTokens maxTokens strategy4
+  let output4 ← BitNet.generate (β := Device) device model promptTokens maxTokens strategy4
   IO.println s!"   Output: {output4}"
   IO.println ""
 
@@ -200,7 +200,7 @@ def example6LongFormGeneration (ggufPath : String) : IO Unit := do
   IO.println ""
 
   let device ← initializeDevice
-  let model ← BitNet.fromGGUF device ggufPath none
+  let model ← BitNet.fromGGUF (β := Device) device ggufPath none
 
   -- Longer prompt
   let promptTokens := #[1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
@@ -216,7 +216,7 @@ def example6LongFormGeneration (ggufPath : String) : IO Unit := do
   IO.println ""
 
   let start ← IO.monoMsNow
-  let outputTokens ← BitNet.generate device model promptTokens maxTokens strategy (some 2)
+  let outputTokens ← BitNet.generate (β := Device) device model promptTokens maxTokens strategy (some 2)
   let duration ← IO.monoMsNow
 
   let elapsed := duration - start
