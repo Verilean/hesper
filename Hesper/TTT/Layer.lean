@@ -1,3 +1,4 @@
+import Hesper.Backend.WebGPU
 import Hesper.TTT.Types
 import Hesper.TTT.InnerLoop
 import Hesper.WebGPU.Device
