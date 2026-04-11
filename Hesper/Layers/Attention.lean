@@ -1,10 +1,8 @@
 import Hesper.WGSL.Monad
-import Hesper.WGSL.Execute
 import Hesper.WGSL.Exp
 import Hesper.WGSL.MatMul
-import Hesper.WebGPU.Types
-import Hesper.WebGPU.Device
-import Hesper.WebGPU.Buffer
+import Hesper.Backend
+import Hesper.Backend.WebGPU
 import Hesper.Layers.BitLinear
 import Hesper.Layers.RoPE
 import Hesper.Layers.Softmax
@@ -107,7 +105,9 @@ namespace Hesper.Layers.Attention
 open Hesper.WGSL
 open Hesper.WGSL.Monad
 open Hesper.WGSL.MatMul
-open Hesper.WebGPU
+open Hesper
+open Hesper.WebGPU (Device Buffer)
+open Hesper.WGSL.Execute (PreparedDispatch CompiledKernel)
 open Hesper.Layers
 open Hesper.Logging (logVerbose)
 
@@ -219,44 +219,44 @@ def reshapeFromHeadsKernel (batchSize seqLen numHeads headDim : Nat) : ShaderM U
   ShaderM.writeBuffer (ty := .scalar .f32) "out" idx result
 
 /-- Execute reshape to multi-head layout -/
-def executeReshapeToHeads (device : Device) (inBuf outBuf : Buffer)
+def executeReshapeToHeads [GPUBackend β] (ctx : β) (inBuf outBuf : GPUBackend.Buf β)
     (batchSize seqLen inputHeads outputHeads headDim : Nat) : IO Unit := do
   let shader := reshapeToHeadsKernel batchSize seqLen inputHeads outputHeads headDim
   let namedBuffers := [("inp", inBuf), ("out", outBuf)]
   let totalElements := batchSize * outputHeads * seqLen * headDim
-  let execConfig := Hesper.WGSL.Execute.ExecutionConfig.dispatch1D totalElements 256
-  Hesper.WGSL.Execute.executeShaderNamed device shader namedBuffers execConfig
+  let execConfig := Hesper.ExecConfig.dispatch1D totalElements 256
+  GPUBackend.execute ctx shader namedBuffers execConfig
 
 /-- Execute reshape from multi-head layout -/
-def executeReshapeFromHeads (device : Device) (inBuf outBuf : Buffer)
+def executeReshapeFromHeads [GPUBackend β] (ctx : β) (inBuf outBuf : GPUBackend.Buf β)
     (batchSize seqLen numHeads headDim : Nat) : IO Unit := do
   let shader := reshapeFromHeadsKernel batchSize seqLen numHeads headDim
   let namedBuffers := [("inp", inBuf), ("out", outBuf)]
   let totalElements := batchSize * seqLen * numHeads * headDim
-  let execConfig := Hesper.WGSL.Execute.ExecutionConfig.dispatch1D totalElements 256
-  Hesper.WGSL.Execute.executeShaderNamed device shader namedBuffers execConfig
+  let execConfig := Hesper.ExecConfig.dispatch1D totalElements 256
+  GPUBackend.execute ctx shader namedBuffers execConfig
 
 /-! ## Pre-allocated Buffers -/
 
 /-- Pre-allocated buffers for attention forward pass.
     Avoids ~12 GPU buffer allocations per layer per token. -/
-structure AttentionBuffers where
-  qBuf : Buffer
-  kBuf : Buffer
-  vBuf : Buffer
-  scoresBuf : Buffer
-  attnBuf : Buffer
-  qRotBuf : Buffer
-  kRotBuf : Buffer
-  qHeadBuf : Buffer
-  kHeadBuf : Buffer
-  vHeadBuf : Buffer
-  reshapedOutBuf : Buffer
-  subNormBuf : Buffer
-  rmsTempBuf : Buffer
+structure AttentionBuffers (BufT : Type) where
+  qBuf : BufT
+  kBuf : BufT
+  vBuf : BufT
+  scoresBuf : BufT
+  attnBuf : BufT
+  qRotBuf : BufT
+  kRotBuf : BufT
+  qHeadBuf : BufT
+  kHeadBuf : BufT
+  vHeadBuf : BufT
+  reshapedOutBuf : BufT
+  subNormBuf : BufT
+  rmsTempBuf : BufT
 
 /-- Create pre-allocated attention buffers for given dimensions -/
-def createAttentionBuffers (device : Device) (config : Config) (batchSize seqLen : Nat) : IO AttentionBuffers := do
+def createAttentionBuffers [GPUBackend β] (ctx : β) (config : Config) (batchSize seqLen : Nat) : IO (AttentionBuffers (GPUBackend.Buf β)) := do
   let headDim := config.effectiveHeadDim
   let kvDim := config.kvDim
   let numRows := batchSize * seqLen
@@ -264,7 +264,7 @@ def createAttentionBuffers (device : Device) (config : Config) (batchSize seqLen
   let kvSize := (batchSize * seqLen * kvDim * 4).toUSize
   let scoresSize := (batchSize * config.numHeads * seqLen * seqLen * 4).toUSize
   let headBufSize := (batchSize * config.numHeads * seqLen * headDim * 4).toUSize
-  let mkBuf := fun size => createBuffer device { size := size, usage := [.storage], mappedAtCreation := false }
+  let mkBuf := fun size => GPUBackend.allocBuffer ctx size
   pure {
     qBuf := ← mkBuf qSize
     kBuf := ← mkBuf kvSize
@@ -284,14 +284,14 @@ def createAttentionBuffers (device : Device) (config : Config) (batchSize seqLen
 /-! ## Layer Structure -/
 
 /-- Multi-head self-attention layer -/
-structure Attention where
+structure Attention (BufT : Type) (CacheT : Type := Unit) (KernelT : Type := Unit) where
   config : Config
   -- Q, K, V projection weights (TQ2_0 packed)
-  wQ : BitLinear.BitLinear
-  wK : BitLinear.BitLinear
-  wV : BitLinear.BitLinear
+  wQ : BitLinear.BitLinear BufT CacheT KernelT
+  wK : BitLinear.BitLinear BufT CacheT KernelT
+  wV : BitLinear.BitLinear BufT CacheT KernelT
   -- Output projection weight
-  wO : BitLinear.BitLinear
+  wO : BitLinear.BitLinear BufT CacheT KernelT
   -- RoPE layer (no learned parameters)
   rope : RoPE.RoPE
   -- Softmax layer (no learned parameters)
@@ -312,9 +312,9 @@ structure Attention where
     @param vScales V projection scales (FP16)
     @param oScales Output projection scales (FP16)
 -/
-def create (device : Device) (config : Config)
+def create [GPUBackend β] (ctx : β) (config : Config)
            (wqData wkData wvData woData : ByteArray)
-           (qScale kScale vScale oScale : Float) : IO Attention := do
+           (qScale kScale vScale oScale : Float) : IO (Attention (GPUBackend.Buf β) (GPUBackend.CachedDispatch β) (GPUBackend.CompiledKernel β)) := do
   -- Validate configuration
   match config.validate with
   | .error msg => throw $ IO.userError s!"Invalid attention config: {msg}"
@@ -332,10 +332,10 @@ def create (device : Device) (config : Config)
     batchSize := 1  -- Will be adjusted during forward pass
   }
 
-  let wQ ← BitLinear.create device bitlinearConfig wqData qScale
-  let wK ← BitLinear.create device bitlinearConfig wkData kScale
-  let wV ← BitLinear.create device bitlinearConfig wvData vScale
-  let wO ← BitLinear.create device bitlinearConfig woData oScale
+  let wQ ← BitLinear.create ctx bitlinearConfig wqData qScale
+  let wK ← BitLinear.create ctx bitlinearConfig wkData kScale
+  let wV ← BitLinear.create ctx bitlinearConfig wvData vScale
+  let wO ← BitLinear.create ctx bitlinearConfig woData oScale
 
   -- Create RoPE layer
   let ropeConfig : RoPE.Config := {
@@ -399,11 +399,11 @@ def create (device : Device) (config : Config)
     @param batchSize Batch size
     @param seqLen Sequence length
 -/
-def forward (device : Device) (layer : Attention)
+def forward (device : Device) (layer : Attention Buffer PreparedDispatch CompiledKernel)
             (inputBuf outputBuf : Buffer)
             (batchSize seqLen : Nat)
-            (subNorm : Option RMSNorm.RMSNorm := none)
-            (preAllocBufs : Option AttentionBuffers := none)
+            (subNorm : Option (RMSNorm.RMSNorm Buffer PreparedDispatch) := none)
+            (preAllocBufs : Option (AttentionBuffers Buffer) := none)
             (residualBuf : Option Buffer := none) : IO Unit := do
   let headDim := layer.config.effectiveHeadDim
   let numKVHeads := layer.config.effectiveKVHeads
@@ -413,19 +413,19 @@ def forward (device : Device) (layer : Attention)
   -- Use pre-allocated or allocate temporary buffers
   let bufs ← match preAllocBufs with
     | some b => pure b
-    | none => createAttentionBuffers device layer.config batchSize seqLen
+    | none => createAttentionBuffers (β := Device) device layer.config batchSize seqLen
 
   -- Step 1: Project to Q, K, V using BitLinear
   let numRows := batchSize * seqLen
   logVerbose s!"  [1/7] Projecting to Q, K, V ({numRows} rows)..."
-  BitLinear.forward device layer.wQ inputBuf bufs.qBuf numRows
-  BitLinear.forward device layer.wK inputBuf bufs.kBuf numRows
-  BitLinear.forward device layer.wV inputBuf bufs.vBuf numRows
+  BitLinear.forward (β := Device) device layer.wQ inputBuf bufs.qBuf numRows
+  BitLinear.forward (β := Device) device layer.wK inputBuf bufs.kBuf numRows
+  BitLinear.forward (β := Device) device layer.wV inputBuf bufs.vBuf numRows
 
   -- Step 2: Apply RoPE to Q and K (need temp buffer since WebGPU disallows aliased writable bindings)
   logVerbose "  [2/7] Applying RoPE to Q and K..."
-  RoPE.forward device layer.rope bufs.qBuf bufs.qRotBuf batchSize seqLen layer.config.numHeads headDim
-  RoPE.forward device layer.rope bufs.kBuf bufs.kRotBuf batchSize seqLen numKVHeads headDim
+  RoPE.forward (β := Device) device layer.rope bufs.qBuf bufs.qRotBuf batchSize seqLen layer.config.numHeads headDim
+  RoPE.forward (β := Device) device layer.rope bufs.kBuf bufs.kRotBuf batchSize seqLen numKVHeads headDim
 
   -- Step 2.5: Reshape for multi-head attention
   -- Q: [batch, seq, numHeads*headDim] → [batch, numHeads, seq, headDim]
@@ -434,10 +434,10 @@ def forward (device : Device) (layer : Attention)
   logVerbose "  [2.5/7] Reshaping for multi-head attention..."
 
   -- Q: simple transpose (inputHeads = outputHeads = numHeads)
-  executeReshapeToHeads device bufs.qRotBuf bufs.qHeadBuf batchSize seqLen layer.config.numHeads layer.config.numHeads headDim
+  executeReshapeToHeads (β := Device) device bufs.qRotBuf bufs.qHeadBuf batchSize seqLen layer.config.numHeads layer.config.numHeads headDim
   -- K/V: transpose + GQA expansion (inputHeads = numKVHeads, outputHeads = numHeads)
-  executeReshapeToHeads device bufs.kRotBuf bufs.kHeadBuf batchSize seqLen numKVHeads layer.config.numHeads headDim
-  executeReshapeToHeads device bufs.vBuf bufs.vHeadBuf batchSize seqLen numKVHeads layer.config.numHeads headDim
+  executeReshapeToHeads (β := Device) device bufs.kRotBuf bufs.kHeadBuf batchSize seqLen numKVHeads layer.config.numHeads headDim
+  executeReshapeToHeads (β := Device) device bufs.vBuf bufs.vHeadBuf batchSize seqLen numKVHeads layer.config.numHeads headDim
 
   -- Step 3: Compute attention scores: Q @ K^T / sqrt(head_dim)
   logVerbose "  [3/7] Computing attention scores..."
@@ -460,7 +460,7 @@ def forward (device : Device) (layer : Attention)
     useMask := layer.config.useCausalMask
   }
   let softmaxLayer ← Softmax.create softmaxConfig
-  Softmax.forward device softmaxLayer bufs.scoresBuf bufs.attnBuf
+  Softmax.forward (β := Device) device softmaxLayer bufs.scoresBuf bufs.attnBuf
 
   -- Step 5: Apply attention to values: attn @ V
   -- attn: [batch*heads, seq, seq], V: [batch*heads, seq, headDim] → [batch*heads, seq, headDim]
@@ -475,14 +475,14 @@ def forward (device : Device) (layer : Attention)
 
   -- Step 5.5: Reshape back: [batch, numHeads, seq, headDim] → [batch, seq, numHeads*headDim]
   logVerbose "  [5.5/7] Reshaping attention output..."
-  executeReshapeFromHeads device bufs.qHeadBuf bufs.reshapedOutBuf batchSize seqLen layer.config.numHeads headDim
+  executeReshapeFromHeads (β := Device) device bufs.qHeadBuf bufs.reshapedOutBuf batchSize seqLen layer.config.numHeads headDim
 
   -- Step 5.7: Apply attention sub-norm (if provided) - BitNet specific
   -- This normalizes the attention output before the O projection
   let attnOutForO ← match subNorm with
     | some norm => do
       logVerbose "  [5.7/7] Applying attention sub-norm..."
-      RMSNorm.forward device norm bufs.reshapedOutBuf bufs.subNormBuf numRows 256 (some bufs.rmsTempBuf)
+      RMSNorm.forward (β := Device) device norm bufs.reshapedOutBuf bufs.subNormBuf numRows 256 (some bufs.rmsTempBuf)
       pure bufs.subNormBuf
     | none => pure bufs.reshapedOutBuf
 
@@ -490,9 +490,9 @@ def forward (device : Device) (layer : Attention)
   logVerbose s!"  [6/7] Output projection ({numRows} rows)..."
   match residualBuf with
   | some resBuf =>
-    BitLinear.forwardWithResidual device layer.wO attnOutForO resBuf outputBuf numRows
+    BitLinear.forwardWithResidual (β := Device) device layer.wO attnOutForO resBuf outputBuf numRows
   | none =>
-    BitLinear.forward device layer.wO attnOutForO outputBuf numRows
+    BitLinear.forward (β := Device) device layer.wO attnOutForO outputBuf numRows
 
   logVerbose "[Attention] ✓ Forward pass complete"
 
@@ -500,54 +500,53 @@ def forward (device : Device) (layer : Attention)
 
 /-- KV cache for a single attention layer.
     Stores key and value vectors for all past positions. -/
-structure KVCache where
-  kBuf : Buffer    -- [numKVHeads, maxSeqLen, headDim]
-  vBuf : Buffer    -- [numKVHeads, maxSeqLen, headDim]
-  -- Per-layer PreparedDispatch for kernels that bind kvCache buffers
-  preparedCacheWriteK : IO.Ref (Option Hesper.WGSL.Execute.PreparedDispatch)
-  preparedCacheWriteV : IO.Ref (Option Hesper.WGSL.Execute.PreparedDispatch)
-  preparedCacheWriteKV : IO.Ref (Option Hesper.WGSL.Execute.PreparedDispatch)
-  preparedScores : IO.Ref (Option Hesper.WGSL.Execute.PreparedDispatch)
-  preparedApply : IO.Ref (Option Hesper.WGSL.Execute.PreparedDispatch)
+structure KVCache (BufT : Type) (CacheT : Type := Unit) where
+  kBuf : BufT    -- [numKVHeads, maxSeqLen, headDim]
+  vBuf : BufT    -- [numKVHeads, maxSeqLen, headDim]
+  -- Per-layer cached dispatch refs for kernels that bind kvCache buffers
+  preparedCacheWriteK : IO.Ref (Option CacheT)
+  preparedCacheWriteV : IO.Ref (Option CacheT)
+  preparedCacheWriteKV : IO.Ref (Option CacheT)
+  preparedScores : IO.Ref (Option CacheT)
+  preparedApply : IO.Ref (Option CacheT)
 
 /-- Create KV cache for one attention layer -/
-def createKVCache (device : Device) (config : Config) : IO KVCache := do
+def createKVCache [GPUBackend β] (ctx : β) (config : Config) : IO (KVCache (GPUBackend.Buf β) (GPUBackend.CachedDispatch β)) := do
   let headDim := config.effectiveHeadDim
   let numKVHeads := config.effectiveKVHeads
   let cacheSize := (numKVHeads * config.maxSeqLen * headDim * 4).toUSize
-  let mkBuf := fun () => createBuffer device { size := cacheSize, usage := [.storage], mappedAtCreation := false }
+  let mkBuf := fun () => GPUBackend.allocBuffer ctx cacheSize
   pure {
     kBuf := ← mkBuf (), vBuf := ← mkBuf ()
-    preparedCacheWriteK := ← IO.mkRef none
-    preparedCacheWriteV := ← IO.mkRef none
-    preparedCacheWriteKV := ← IO.mkRef none
-    preparedScores := ← IO.mkRef none
-    preparedApply := ← IO.mkRef none
+    preparedCacheWriteK := ← GPUBackend.newCacheRef (β := β)
+    preparedCacheWriteV := ← GPUBackend.newCacheRef (β := β)
+    preparedCacheWriteKV := ← GPUBackend.newCacheRef (β := β)
+    preparedScores := ← GPUBackend.newCacheRef (β := β)
+    preparedApply := ← GPUBackend.newCacheRef (β := β)
   }
 
 /-- Pre-allocated buffers for cached single-token attention -/
-structure CachedAttentionBuffers where
-  qBuf : Buffer        -- [dim]
-  kNewBuf : Buffer     -- [kvDim]
-  vNewBuf : Buffer     -- [kvDim]
-  qRotBuf : Buffer     -- [dim]
-  kRotBuf : Buffer     -- [kvDim]
-  scoresBuf : Buffer   -- [numHeads * maxSeqLen]
-  attnBuf : Buffer     -- [numHeads * maxSeqLen]
-  subNormBuf : Buffer  -- [dim]
-  rmsTempBuf : Buffer  -- small
-  paramsBuf : Buffer   -- [2 × u32]: pos, cacheLen
-  flashPartialBuf : Buffer  -- [numHeads * maxTiles * (headDim + 2)] for tiled flash attention
-  -- PreparedDispatch refs for instant replay (shared-buffer-safe only)
-  preparedSoftmax : IO.Ref (Option Hesper.WGSL.Execute.PreparedDispatch)
-  preparedRopeQ : IO.Ref (Option Hesper.WGSL.Execute.PreparedDispatch)
-  preparedRopeK : IO.Ref (Option Hesper.WGSL.Execute.PreparedDispatch)
+structure CachedAttentionBuffers (BufT : Type) (CacheT : Type := Unit) where
+  qBuf : BufT        -- [dim]
+  kNewBuf : BufT     -- [kvDim]
+  vNewBuf : BufT     -- [kvDim]
+  qRotBuf : BufT     -- [dim]
+  kRotBuf : BufT     -- [kvDim]
+  scoresBuf : BufT   -- [numHeads * maxSeqLen]
+  attnBuf : BufT     -- [numHeads * maxSeqLen]
+  subNormBuf : BufT  -- [dim]
+  rmsTempBuf : BufT  -- small
+  paramsBuf : BufT   -- [2 × u32]: pos, cacheLen
+  flashPartialBuf : BufT  -- [numHeads * maxTiles * (headDim + 2)] for tiled flash attention
+  -- Cached dispatch refs for instant replay (shared-buffer-safe only)
+  preparedSoftmax : IO.Ref (Option CacheT)
+  preparedRopeQ : IO.Ref (Option CacheT)
+  preparedRopeK : IO.Ref (Option CacheT)
 
 /-- Create pre-allocated buffers for cached attention -/
-def createCachedAttentionBuffers (device : Device) (config : Config) : IO CachedAttentionBuffers := do
+def createCachedAttentionBuffers [GPUBackend β] (ctx : β) (config : Config) : IO (CachedAttentionBuffers (GPUBackend.Buf β) (GPUBackend.CachedDispatch β)) := do
   let kvDim := config.kvDim
-  let mkBuf := fun size => createBuffer device { size := size, usage := [.storage], mappedAtCreation := false }
-  let mkCopyBuf := fun size => createBuffer device { size := size, usage := [.storage, .copyDst], mappedAtCreation := false }
+  let mkBuf := fun size => GPUBackend.allocBuffer ctx size
   pure {
     qBuf := ← mkBuf (config.dim * 4).toUSize
     kNewBuf := ← mkBuf (kvDim * 4).toUSize
@@ -558,7 +557,7 @@ def createCachedAttentionBuffers (device : Device) (config : Config) : IO Cached
     attnBuf := ← mkBuf (config.numHeads * config.maxSeqLen * 4).toUSize
     subNormBuf := ← mkBuf (config.dim * 4).toUSize
     rmsTempBuf := ← mkBuf 4
-    paramsBuf := ← mkCopyBuf 8  -- 2 × u32 = 8 bytes
+    paramsBuf := ← mkBuf 8  -- 2 × u32 = 8 bytes
     -- Flash attention partial buffer: numHeads * maxTiles * (headDim + 2)
     flashPartialBuf := ← do
       let tileSize := 32
@@ -566,9 +565,9 @@ def createCachedAttentionBuffers (device : Device) (config : Config) : IO Cached
       let headDim := config.effectiveHeadDim
       let partialSize := config.numHeads * maxTiles * (headDim + 2)
       mkBuf (partialSize * 4).toUSize
-    preparedSoftmax := ← IO.mkRef none
-    preparedRopeQ := ← IO.mkRef none
-    preparedRopeK := ← IO.mkRef none
+    preparedSoftmax := ← GPUBackend.newCacheRef (β := β)
+    preparedRopeQ := ← GPUBackend.newCacheRef (β := β)
+    preparedRopeK := ← GPUBackend.newCacheRef (β := β)
   }
 
 /-! ## KV Cache Kernels
@@ -804,11 +803,11 @@ def cachedApplyKernel (numHeads numKVHeads maxSeqLen headDim : Nat) : ShaderM Un
 
     @param pos Position of the new token (0-indexed)
 -/
-def forwardWithCache (device : Device) (layer : Attention)
+def forwardWithCache (device : Device) (layer : Attention Buffer PreparedDispatch CompiledKernel)
                      (inputBuf outputBuf : Buffer)
-                     (kvCache : KVCache) (pos : Nat)
-                     (subNorm : Option RMSNorm.RMSNorm := none)
-                     (preAllocBufs : Option CachedAttentionBuffers := none)
+                     (kvCache : KVCache Buffer PreparedDispatch) (pos : Nat)
+                     (subNorm : Option (RMSNorm.RMSNorm Buffer PreparedDispatch) := none)
+                     (preAllocBufs : Option (CachedAttentionBuffers Buffer PreparedDispatch) := none)
                      (residualBuf : Option Buffer := none)
                      (loraOpt : Option (Hesper.LoRA.LayerAdapter × Float × Buffer × Buffer × Buffer) := none) : IO Unit := do
   let headDim := layer.config.effectiveHeadDim
@@ -822,12 +821,12 @@ def forwardWithCache (device : Device) (layer : Attention)
 
   let bufs ← match preAllocBufs with
     | some b => pure b
-    | none => createCachedAttentionBuffers device layer.config
+    | none => createCachedAttentionBuffers (β := Device) device layer.config
 
   -- Step 1: Project Q, K_new, V_new (single row)
-  BitLinear.forward device layer.wQ inputBuf bufs.qBuf 1
-  BitLinear.forward device layer.wK inputBuf bufs.kNewBuf 1
-  BitLinear.forward device layer.wV inputBuf bufs.vNewBuf 1
+  BitLinear.forward (β := Device) device layer.wQ inputBuf bufs.qBuf 1
+  BitLinear.forward (β := Device) device layer.wK inputBuf bufs.kNewBuf 1
+  BitLinear.forward (β := Device) device layer.wV inputBuf bufs.vNewBuf 1
 
   -- Step 1.5: LoRA corrections on Q and V (BEFORE RoPE)
   match loraOpt with
@@ -848,25 +847,25 @@ def forwardWithCache (device : Device) (layer : Attention)
     |>.push ((cacheLen.toUInt32 >>> 8) &&& 0xFF).toUInt8
     |>.push ((cacheLen.toUInt32 >>> 16) &&& 0xFF).toUInt8
     |>.push ((cacheLen.toUInt32 >>> 24) &&& 0xFF).toUInt8
-  writeBuffer device bufs.paramsBuf 0 paramsBytes
+  GPUBackend.writeBuffer (β := Device) device bufs.paramsBuf paramsBytes
 
   -- Step 2: Apply RoPE at position `pos` (reads posOffset from params[0])
-  RoPE.forwardDynamic device layer.rope bufs.qBuf bufs.qRotBuf bufs.paramsBuf 1 1 numHeads headDim (some bufs.preparedRopeQ)
-  RoPE.forwardDynamic device layer.rope bufs.kNewBuf bufs.kRotBuf bufs.paramsBuf 1 1 numKVHeads headDim (some bufs.preparedRopeK)
+  RoPE.forwardDynamic (β := Device) device layer.rope bufs.qBuf bufs.qRotBuf bufs.paramsBuf 1 1 numHeads headDim (some bufs.preparedRopeQ)
+  RoPE.forwardDynamic (β := Device) device layer.rope bufs.kNewBuf bufs.kRotBuf bufs.paramsBuf 1 1 numKVHeads headDim (some bufs.preparedRopeK)
 
   -- Step 3: Append K (after RoPE) and V to cache at position `pos` (fused single dispatch)
   let cwWx := (kvDim + 255) / 256
   if let some p ← kvCache.preparedCacheWriteKV.get then
-    Hesper.WGSL.Execute.replayPreparedDispatch device p cwWx 1 1
+    GPUBackend.replayCached (β := Device) device p (cwWx, 1, 1)
   else
     let writeShader := fusedCacheWriteKVKernel numKVHeads maxSeqLen headDim kvDim
     let writeCacheKey : UInt64 := hash ("cwkv", numKVHeads, maxSeqLen, headDim, kvDim)
-    Hesper.WGSL.Execute.executeShaderNamed device writeShader
+    GPUBackend.executeWithConfigCached (β := Device) device writeShader
       [("new_k", bufs.kRotBuf), ("new_v", bufs.vNewBuf),
        ("k_cache", kvCache.kBuf), ("v_cache", kvCache.vBuf),
        ("params", bufs.paramsBuf)]
-      (Hesper.WGSL.Execute.ExecutionConfig.dispatch1D kvDim 256)
-      (some writeCacheKey) (some kvCache.preparedCacheWriteKV)
+      (Hesper.ExecConfig.dispatch1D kvDim 256)
+      writeCacheKey kvCache.preparedCacheWriteKV
 
   -- Steps 4-6: Flash Attention with dynamic cacheLen from params buffer
   -- Uses diagnostic(off, derivative_uniformity) to allow barrier in dynamic loop.
@@ -879,30 +878,30 @@ def forwardWithCache (device : Device) (layer : Attention)
   -- Step 7: Sub-norm (if provided)
   let attnOutForO ← match subNorm with
     | some norm => do
-      RMSNorm.forward device norm bufs.qRotBuf bufs.subNormBuf 1 256 (some bufs.rmsTempBuf)
+      RMSNorm.forward (β := Device) device norm bufs.qRotBuf bufs.subNormBuf 1 256 (some bufs.rmsTempBuf)
       pure bufs.subNormBuf
     | none => pure bufs.qRotBuf
 
   -- Step 8: O projection (with optional fused residual add)
   match residualBuf with
   | some resBuf =>
-    BitLinear.forwardWithResidual device layer.wO attnOutForO resBuf outputBuf 1
+    BitLinear.forwardWithResidual (β := Device) device layer.wO attnOutForO resBuf outputBuf 1
   | none =>
-    BitLinear.forward device layer.wO attnOutForO outputBuf 1
+    BitLinear.forward (β := Device) device layer.wO attnOutForO outputBuf 1
 
   logVerbose "[Attention] ✓ Cached forward complete"
 
 /-- Single-token cached attention forward WITH LoRA corrections on Q and V.
     Identical to `forwardWithCache` except it injects LoRA after Q/V BitLinear
     and before RoPE, so the LoRA contribution flows through the full attention. -/
-def forwardWithCacheLoRA (device : Device) (layer : Attention)
+def forwardWithCacheLoRA (device : Device) (layer : Attention Buffer PreparedDispatch CompiledKernel)
                      (inputBuf outputBuf : Buffer)
-                     (kvCache : KVCache) (pos : Nat)
+                     (kvCache : KVCache Buffer PreparedDispatch) (pos : Nat)
                      (loraAdapter : Hesper.LoRA.LayerAdapter)
                      (loraScale : Float)
                      (loraHBuf loraYBufQ loraYBufV : Buffer)
-                     (subNorm : Option RMSNorm.RMSNorm := none)
-                     (preAllocBufs : Option CachedAttentionBuffers := none)
+                     (subNorm : Option (RMSNorm.RMSNorm Buffer PreparedDispatch) := none)
+                     (preAllocBufs : Option (CachedAttentionBuffers Buffer PreparedDispatch) := none)
                      (residualBuf : Option Buffer := none) : IO Unit := do
   let headDim := layer.config.effectiveHeadDim
   let numKVHeads := layer.config.effectiveKVHeads
@@ -915,12 +914,12 @@ def forwardWithCacheLoRA (device : Device) (layer : Attention)
 
   let bufs ← match preAllocBufs with
     | some b => pure b
-    | none => createCachedAttentionBuffers device layer.config
+    | none => createCachedAttentionBuffers (β := Device) device layer.config
 
   -- Step 1: Project Q, K_new, V_new (single row) — base BitLinear
-  BitLinear.forward device layer.wQ inputBuf bufs.qBuf 1
-  BitLinear.forward device layer.wK inputBuf bufs.kNewBuf 1
-  BitLinear.forward device layer.wV inputBuf bufs.vNewBuf 1
+  BitLinear.forward (β := Device) device layer.wQ inputBuf bufs.qBuf 1
+  BitLinear.forward (β := Device) device layer.wK inputBuf bufs.kNewBuf 1
+  BitLinear.forward (β := Device) device layer.wV inputBuf bufs.vNewBuf 1
 
   -- Step 1.5: LoRA corrections on Q and V (BEFORE RoPE)
   -- Q: qBuf += scale * B_Q @ (A_Q @ inputBuf)
@@ -942,71 +941,71 @@ def forwardWithCacheLoRA (device : Device) (layer : Attention)
     |>.push ((cacheLen.toUInt32 >>> 8) &&& 0xFF).toUInt8
     |>.push ((cacheLen.toUInt32 >>> 16) &&& 0xFF).toUInt8
     |>.push ((cacheLen.toUInt32 >>> 24) &&& 0xFF).toUInt8
-  writeBuffer device bufs.paramsBuf 0 paramsBytes
+  GPUBackend.writeBuffer (β := Device) device bufs.paramsBuf paramsBytes
 
   -- Step 3: Apply RoPE (now Q and V have LoRA corrections baked in)
-  RoPE.forwardDynamic device layer.rope bufs.qBuf bufs.qRotBuf bufs.paramsBuf 1 1 numHeads headDim (some bufs.preparedRopeQ)
-  RoPE.forwardDynamic device layer.rope bufs.kNewBuf bufs.kRotBuf bufs.paramsBuf 1 1 numKVHeads headDim (some bufs.preparedRopeK)
+  RoPE.forwardDynamic (β := Device) device layer.rope bufs.qBuf bufs.qRotBuf bufs.paramsBuf 1 1 numHeads headDim (some bufs.preparedRopeQ)
+  RoPE.forwardDynamic (β := Device) device layer.rope bufs.kNewBuf bufs.kRotBuf bufs.paramsBuf 1 1 numKVHeads headDim (some bufs.preparedRopeK)
 
   -- Steps 4-8: Same as base forwardWithCache (KV cache write, attention, softmax, apply, O proj)
   let cwWx := (kvDim + 255) / 256
   if let some p ← kvCache.preparedCacheWriteKV.get then
-    Hesper.WGSL.Execute.replayPreparedDispatch device p cwWx 1 1
+    GPUBackend.replayCached (β := Device) device p (cwWx, 1, 1)
   else
     let writeShader := fusedCacheWriteKVKernel numKVHeads maxSeqLen headDim kvDim
     let writeCacheKey : UInt64 := hash ("cwkv", numKVHeads, maxSeqLen, headDim, kvDim)
-    Hesper.WGSL.Execute.executeShaderNamed device writeShader
+    GPUBackend.executeWithConfigCached (β := Device) device writeShader
       [("new_k", bufs.kRotBuf), ("new_v", bufs.vNewBuf),
        ("k_cache", kvCache.kBuf), ("v_cache", kvCache.vBuf),
        ("params", bufs.paramsBuf)]
-      (Hesper.WGSL.Execute.ExecutionConfig.dispatch1D kvDim 256)
-      (some writeCacheKey) (some kvCache.preparedCacheWriteKV)
+      (Hesper.ExecConfig.dispatch1D kvDim 256)
+      writeCacheKey kvCache.preparedCacheWriteKV
 
   let scoresWx := (numHeads * cacheLen + 255) / 256
   if let some p ← kvCache.preparedScores.get then
-    Hesper.WGSL.Execute.replayPreparedDispatch device p scoresWx 1 1
+    GPUBackend.replayCached (β := Device) device p (scoresWx, 1, 1)
   else
     let scale := 1.0 / headDim.toFloat.sqrt
     let scoresShader := cachedScoresKernel numHeads numKVHeads maxSeqLen headDim scale
     let scoresCacheKey : UInt64 := hash ("cs", numHeads, numKVHeads, maxSeqLen, headDim)
-    Hesper.WGSL.Execute.executeShaderNamed device scoresShader
+    GPUBackend.executeWithConfigCached (β := Device) device scoresShader
       [("q", bufs.qRotBuf), ("k_cache", kvCache.kBuf), ("scores", bufs.scoresBuf), ("params", bufs.paramsBuf)]
-      (Hesper.WGSL.Execute.ExecutionConfig.dispatch1D (numHeads * cacheLen) 256)
-      (some scoresCacheKey) (some kvCache.preparedScores)
+      (Hesper.ExecConfig.dispatch1D (numHeads * cacheLen) 256)
+      scoresCacheKey kvCache.preparedScores
 
   let softmaxWx := (numHeads * cacheLen + 255) / 256
   if let some p ← bufs.preparedSoftmax.get then
-    Hesper.WGSL.Execute.replayPreparedDispatch device p softmaxWx 1 1
+    GPUBackend.replayCached (β := Device) device p (softmaxWx, 1, 1)
   else
     let softmaxShader := cachedSoftmaxKernel numHeads maxSeqLen
     let softmaxCacheKey : UInt64 := hash ("sm", numHeads, maxSeqLen)
-    Hesper.WGSL.Execute.executeShaderNamed device softmaxShader
+    GPUBackend.executeWithConfigCached (β := Device) device softmaxShader
       [("input", bufs.scoresBuf), ("output", bufs.attnBuf), ("params", bufs.paramsBuf)]
-      (Hesper.WGSL.Execute.ExecutionConfig.dispatch1D (numHeads * cacheLen) 256)
-      (some softmaxCacheKey) (some bufs.preparedSoftmax)
+      (Hesper.ExecConfig.dispatch1D (numHeads * cacheLen) 256)
+      softmaxCacheKey bufs.preparedSoftmax
 
   let applyWx := (numHeads * headDim + 255) / 256
   if let some p ← kvCache.preparedApply.get then
-    Hesper.WGSL.Execute.replayPreparedDispatch device p applyWx 1 1
+    GPUBackend.replayCached (β := Device) device p (applyWx, 1, 1)
   else
     let applyShader := cachedApplyKernel numHeads numKVHeads maxSeqLen headDim
     let applyCacheKey : UInt64 := hash ("ca", numHeads, numKVHeads, maxSeqLen, headDim)
-    Hesper.WGSL.Execute.executeShaderNamed device applyShader
+    GPUBackend.executeWithConfigCached (β := Device) device applyShader
       [("attn", bufs.attnBuf), ("v_cache", kvCache.vBuf), ("output", bufs.qRotBuf), ("params", bufs.paramsBuf)]
-      (Hesper.WGSL.Execute.ExecutionConfig.dispatch1D (numHeads * headDim) 256)
-      (some applyCacheKey) (some kvCache.preparedApply)
+      (Hesper.ExecConfig.dispatch1D (numHeads * headDim) 256)
+      applyCacheKey kvCache.preparedApply
 
   let attnOutForO ← match subNorm with
     | some norm => do
-      RMSNorm.forward device norm bufs.qRotBuf bufs.subNormBuf 1 256 (some bufs.rmsTempBuf)
+      RMSNorm.forward (β := Device) device norm bufs.qRotBuf bufs.subNormBuf 1 256 (some bufs.rmsTempBuf)
       pure bufs.subNormBuf
     | none => pure bufs.qRotBuf
 
   match residualBuf with
   | some resBuf =>
-    BitLinear.forwardWithResidual device layer.wO attnOutForO resBuf outputBuf 1
+    BitLinear.forwardWithResidual (β := Device) device layer.wO attnOutForO resBuf outputBuf 1
   | none =>
-    BitLinear.forward device layer.wO attnOutForO outputBuf 1
+    BitLinear.forward (β := Device) device layer.wO attnOutForO outputBuf 1
 
   logVerbose "[Attention+LoRA] ✓ Cached forward complete"
 
@@ -1027,7 +1026,7 @@ def forwardWithCacheLoRA (device : Device) (layer : Attention)
     @param layerIdx Layer index (0-31 for BitNet-3B)
     @param config Attention configuration
 -/
-def fromGGUF (device : Device) (gguf : α) (layerIdx : Nat) (config : Config) : IO Attention := do
+def fromGGUF [GPUBackend β] (ctx : β) (gguf : α) (layerIdx : Nat) (config : Config) : IO (Attention (GPUBackend.Buf β) (GPUBackend.CachedDispatch β) (GPUBackend.CompiledKernel β)) := do
   -- Placeholder - actual implementation would:
   -- 1. Find tensors: gguf.findTensor s!"blk.{layerIdx}.attn_q.weight"
   -- 2. Extract TQ2_0 packed data + scales
