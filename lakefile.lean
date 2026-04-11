@@ -706,6 +706,10 @@ lean_exe «cuda-matmul-test» where
   root := `Tests.CUDA.CUDAMatMulTest
   moreLinkArgs := stdLinkArgs ++ #["./.lake/build/native/libhesper_cuda.a", "-lcuda"]
 
+lean_exe «cuda-backend-test» where
+  root := `Tests.CUDA.CUDABackendTest
+  moreLinkArgs := stdLinkArgs ++ #["./.lake/build/native/libhesper_cuda.a", "-lcuda"]
+
 -- ============================================================================
 -- SIMD CPU BACKEND (Google Highway)
 -- ============================================================================
