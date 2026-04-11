@@ -126,15 +126,18 @@ def generateWithSmartKV (device : Device) (model : Gemma4Model)
     let mut isSurprise := false
     if i + 1 < promptTokens.size then
       let target := promptTokens[i + 1]!
-      let logits ← BufferOps.downloadFloatArray device state.logitsBuf vocabSize
+      -- Use PRE-SOFTCAP logits for rank (softcap saturates all to ±30,
+      -- making rank meaningless). Raw logits diverge (1e24) but rank
+      -- is ordinal — it only cares about relative order, not magnitude.
+      let logits ← BufferOps.downloadFloatArray device preSoftcapBuf vocabSize
       -- Find the target token's rank in the logit distribution
       let targetLogit := if target < logits.size then logits[target]! else -1000.0
       let mut rank : Nat := 0
       for j in [0:vocabSize] do
         if j < logits.size && logits[j]! > targetLogit then
           rank := rank + 1
-      -- Surprise if target is NOT in top-K (rank >= K means very unexpected)
-      let topK : Nat := 50  -- top-50: generous threshold
+      -- Surprise if target is NOT in top-K
+      let topK : Nat := 5
       isSurprise := rank >= topK
       surprise := rank.toFloat
 
@@ -151,9 +154,8 @@ def generateWithSmartKV (device : Device) (model : Gemma4Model)
 
     if verbose then
       let typeStr := if isSurprise then s!"SURPRISE ⚓ (sink #{sinkPositions.size})"
-        else s!"normal"
-      if i < 10 || isSurprise || i >= promptTokens.size - 3 then
-        IO.println s!"  Token {i} (id={promptTokens[i]!}): ce_loss={surprise}, {typeStr}"
+        else s!"rank={surprise}"
+      IO.println s!"  t{i} (id={promptTokens[i]!}→{if i+1<promptTokens.size then promptTokens[i+1]! else 0}): rank={surprise} {typeStr}"
 
   let prefillEnd ← IO.monoNanosNow
   let prefillMs := (prefillEnd - prefillStart).toFloat / 1_000_000.0
