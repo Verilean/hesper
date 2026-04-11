@@ -52,10 +52,13 @@ def main (args : List String) : IO Unit := do
   let smartConfig : SmartKVConfig := { windowSize := 256, tau := 5.0 }
 
   -- Natural language needle: a secret password buried in text
-  let needle := "The secret password is: RAINBOW42."
-  let needleAnswer := "RAINBOW42"
+  -- Use a truly unpredictable needle: random hex string that no LLM
+  -- could have seen in training data or predict from context.
+  let needle := "The encryption key is: x7f2a9b4e1d6c8350."
+  let needleAnswer := "x7f2a9b4e1d6c8350"
 
   -- Build prompts with increasing haystack
+  -- Single test with verbose rank output for analysis
   let haystackTexts : Array (Nat × String) := #[
     (100, "The quick brown fox jumps over the lazy dog. " ++
           "Lorem ipsum dolor sit amet, consectetur adipiscing elit. " ++
