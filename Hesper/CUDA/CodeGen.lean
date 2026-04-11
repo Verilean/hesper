@@ -256,7 +256,9 @@ partial def expToPTX (e : Exp t) (s : GenState) : ExpResult :=
     if isShared then
       let name := arrName.getD "unknown"
       let (off, s) := s.freshU32; let s := s.emit (.shl_u32 off rIdx.toU32! 2)
-      (.f32 r, s.emit (.ld_f32_offset .shared r name off))
+      let (symR, s) := s.freshU32; let s := s.emit (.mov_shared_addr symR name)
+      let (addr, s) := s.freshU32; let s := s.emit (.add_u32 addr symR off)
+      (.f32 r, s.emit (.ld_shared_sym r symR off addr))
     else
       let (off, s) := s.freshU64; let s := s.emit (.mul_wide_u32 off rIdx.toU32! 4)
       let (addr, s) := s.freshU64; let s := s.emit (.add_u64 addr rArr.toU64! off)
@@ -311,15 +313,20 @@ partial def stmtToPTX (stmt : Stmt) (s : GenState) : GenState :=
     let (rIdx, s) := expToPTX idx s; let (rVal, s) := expToPTX value s
     if s.isSharedVar arrName then
       let (off, s) := s.freshU32; let s := s.emit (.shl_u32 off rIdx.toU32! 2)
-      s.emit (.st_f32_offset .shared rVal.toF32! arrName off)
+      let (symR, s) := s.freshU32; let s := s.emit (.mov_shared_addr symR arrName)
+      let (addr, s) := s.freshU32; let s := s.emit (.add_u32 addr symR off)
+      s.emit (.st_shared_sym rVal.toF32! symR off addr)
     else match s.lookupVar arrName with
     | some (.u64 base) =>
       let (off, s) := s.freshU64; let s := s.emit (.mul_wide_u32 off rIdx.toU32! 4)
       let (addr, s) := s.freshU64; let s := s.emit (.add_u64 addr base off)
       s.emit (.st_f32 .global addr rVal.toF32!)
     | _ =>
+      -- Assume shared memory as fallback
       let (off, s) := s.freshU32; let s := s.emit (.shl_u32 off rIdx.toU32! 2)
-      s.emit (.st_f32_offset .shared rVal.toF32! arrName off)
+      let (symR, s) := s.freshU32; let s := s.emit (.mov_shared_addr symR arrName)
+      let (addr, s) := s.freshU32; let s := s.emit (.add_u32 addr symR off)
+      s.emit (.st_shared_sym rVal.toF32! symR off addr)
 
   | .forLoop varName init cond update body =>
     let (ri, s) := expToPTX init s
