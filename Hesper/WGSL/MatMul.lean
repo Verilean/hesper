@@ -1,9 +1,7 @@
 import Hesper.WGSL.Monad
 import Hesper.WGSL.Execute
 import Hesper.WGSL.Exp
-import Hesper.WebGPU.Types
-import Hesper.WebGPU.Device
-import Hesper.WebGPU.Buffer
+import Hesper.Backend
 import Hesper.Logging
 
 /-!
@@ -58,7 +56,7 @@ namespace Hesper.WGSL.MatMul
 
 open Hesper.WGSL
 open Hesper.WGSL.Monad
-open Hesper.WebGPU
+open Hesper
 open Hesper.Logging (logVerbose)
 
 /-! ## Configuration -/
@@ -308,23 +306,23 @@ def matMulTransposeF16BlockCoopKernel (config : Config) : ShaderM Unit := do
 
 /-- Execute `matMulTransposeF16BlockCoopKernel`. See the kernel doc for
     preconditions (`M = 1`, `K % 64 == 0`, subgroup support). -/
-def executeMatMulTransposeF16BlockCoop (device : Device)
-                                        (aBuf bF16Buf cBuf : Buffer)
+def executeMatMulTransposeF16BlockCoop [GPUBackend β] (ctx : β)
+                                        (aBuf bF16Buf cBuf : GPUBackend.Buf β)
                                         (config : Config) : IO Unit := do
   let namedBuffers := [
     ("a", aBuf),
     ("b", bF16Buf),
     ("c", cBuf)
   ]
-  let execConfig : Hesper.WGSL.Execute.ExecutionConfig := {
+  let execConfig : Hesper.ExecConfig := {
     numWorkgroups := (config.N, 1, 1)
     workgroupSize := { x := 32, y := 1, z := 1 }
     extensions := ["subgroups"]
   }
   let cacheKey : UInt64 := hash ("mmf16-blockcoop", config.M, config.N, config.K)
-  Hesper.WGSL.Execute.executeShaderNamed device
+  GPUBackend.executeWithConfigCached ctx
     (matMulTransposeF16BlockCoopKernel config)
-    namedBuffers execConfig (some cacheKey)
+    namedBuffers execConfig cacheKey (← IO.mkRef none)
 
 /-! ## Optimized F16 Transposed MatMul with Shared Memory -/
 
@@ -682,8 +680,8 @@ def batchedScaledMatMulTransposeKernel (config : Config) (batchSize : Nat) (scal
     @param cBuf Output matrix C [M, N]
     @param config Matrix dimensions
 -/
-def executeMatMul (device : Device)
-                  (aBuf bBuf cBuf : Buffer)
+def executeMatMul [GPUBackend β] (ctx : β)
+                  (aBuf bBuf cBuf : GPUBackend.Buf β)
                   (config : Config) : IO Unit := do
   logVerbose s!"[MatMul] Computing {config.M}×{config.K} @ {config.K}×{config.N}..."
 
@@ -695,11 +693,11 @@ def executeMatMul (device : Device)
   ]
 
   let totalElements := config.M * config.N
-  let execConfig := Hesper.WGSL.Execute.ExecutionConfig.dispatch1D
+  let execConfig := Hesper.ExecConfig.dispatch1D
     totalElements
     256
 
-  Hesper.WGSL.Execute.executeShaderNamed device shader namedBuffers execConfig
+  GPUBackend.execute ctx shader namedBuffers execConfig
   logVerbose "[MatMul] ✓ Complete"
 
 /-- Execute transposed matrix multiply: C = A @ B^T
@@ -710,8 +708,8 @@ def executeMatMul (device : Device)
     @param cBuf Output matrix C [M, N]
     @param config Matrix dimensions
 -/
-def executeMatMulTranspose (device : Device)
-                           (aBuf bBuf cBuf : Buffer)
+def executeMatMulTranspose [GPUBackend β] (ctx : β)
+                           (aBuf bBuf cBuf : GPUBackend.Buf β)
                            (config : Config) : IO Unit := do
   logVerbose s!"[MatMul] Computing {config.M}×{config.K} @ ({config.N}×{config.K})^T..."
 
@@ -723,11 +721,11 @@ def executeMatMulTranspose (device : Device)
   ]
 
   let totalElements := config.M * config.N
-  let execConfig := Hesper.WGSL.Execute.ExecutionConfig.dispatch1D
+  let execConfig := Hesper.ExecConfig.dispatch1D
     totalElements
     256
 
-  Hesper.WGSL.Execute.executeShaderNamed device shader namedBuffers execConfig
+  GPUBackend.execute ctx shader namedBuffers execConfig
   logVerbose "[MatMul] ✓ Complete"
 
 /-- Execute transposed matrix multiply with B in packed F16: C = A @ B^T
@@ -742,8 +740,8 @@ def executeMatMulTranspose (device : Device)
     @param cBuf Output matrix C [M, N] in F32
     @param config Matrix dimensions (K must be even)
 -/
-def executeMatMulTransposeF16 (device : Device)
-                               (aBuf bF16Buf cBuf : Buffer)
+def executeMatMulTransposeF16 [GPUBackend β] (ctx : β)
+                               (aBuf bF16Buf cBuf : GPUBackend.Buf β)
                                (config : Config) : IO Unit := do
   logVerbose s!"[MatMul] Computing F16: {config.M}×{config.K} @ ({config.N}×{config.K})^T..."
 
@@ -755,12 +753,12 @@ def executeMatMulTransposeF16 (device : Device)
   ]
 
   let totalElements := config.M * config.N
-  let execConfig := Hesper.WGSL.Execute.ExecutionConfig.dispatch1D
+  let execConfig := Hesper.ExecConfig.dispatch1D
     totalElements
     256
 
   let cacheKey : UInt64 := hash ("mmf16", config.M, config.N, config.K)
-  Hesper.WGSL.Execute.executeShaderNamed device shader namedBuffers execConfig (some cacheKey)
+  GPUBackend.executeWithConfigCached ctx shader namedBuffers execConfig cacheKey (← IO.mkRef none)
   logVerbose "[MatMul] ✓ Complete (F16)"
 
 /-- Execute optimized F16 transposed matmul with shared memory: C = A @ B^T
@@ -776,8 +774,8 @@ def executeMatMulTransposeF16 (device : Device)
     @param cBuf Output matrix C [M, N] in F32
     @param config Matrix dimensions (K must be divisible by 8)
 -/
-def executeMatMulTransposeF16Shared (device : Device)
-                                     (aBuf bF16Buf cBuf : Buffer)
+def executeMatMulTransposeF16Shared [GPUBackend β] (ctx : β)
+                                     (aBuf bF16Buf cBuf : GPUBackend.Buf β)
                                      (config : Config) : IO Unit := do
   logVerbose s!"[MatMul] Computing F16-Shared: {config.M}×{config.K} @ ({config.N}×{config.K})^T..."
 
@@ -789,12 +787,12 @@ def executeMatMulTransposeF16Shared (device : Device)
   ]
 
   let totalElements := config.M * config.N
-  let execConfig := Hesper.WGSL.Execute.ExecutionConfig.dispatch1D
+  let execConfig := Hesper.ExecConfig.dispatch1D
     totalElements
     256
 
   let cacheKey : UInt64 := hash ("mmf16s", config.M, config.N, config.K)
-  Hesper.WGSL.Execute.executeShaderNamed device shader namedBuffers execConfig (some cacheKey)
+  GPUBackend.executeWithConfigCached ctx shader namedBuffers execConfig cacheKey (← IO.mkRef none)
   logVerbose "[MatMul] ✓ Complete (F16-Shared)"
 
 /-- Execute scaled transposed matrix multiply: C = (A @ B^T) / scale
@@ -808,8 +806,8 @@ def executeMatMulTransposeF16Shared (device : Device)
     @param config Matrix dimensions
     @param scale Scaling factor
 -/
-def executeScaledMatMulTranspose (device : Device)
-                                 (aBuf bBuf cBuf : Buffer)
+def executeScaledMatMulTranspose [GPUBackend β] (ctx : β)
+                                 (aBuf bBuf cBuf : GPUBackend.Buf β)
                                  (config : Config)
                                  (scale : Float) : IO Unit := do
   logVerbose s!"[MatMul] Computing ({config.M}×{config.K} @ {config.N}×{config.K}^T) / {scale}..."
@@ -822,11 +820,11 @@ def executeScaledMatMulTranspose (device : Device)
   ]
 
   let totalElements := config.M * config.N
-  let execConfig := Hesper.WGSL.Execute.ExecutionConfig.dispatch1D
+  let execConfig := Hesper.ExecConfig.dispatch1D
     totalElements
     256
 
-  Hesper.WGSL.Execute.executeShaderNamed device shader namedBuffers execConfig
+  GPUBackend.execute ctx shader namedBuffers execConfig
   logVerbose "[MatMul] ✓ Complete"
 
 /-- Execute batched matrix multiply: C[b] = A[b] @ B[b]
@@ -838,8 +836,8 @@ def executeScaledMatMulTranspose (device : Device)
     @param config Matrix dimensions (per batch)
     @param batchSize Number of batches
 -/
-def executeBatchedMatMul (device : Device)
-                         (aBuf bBuf cBuf : Buffer)
+def executeBatchedMatMul [GPUBackend β] (ctx : β)
+                         (aBuf bBuf cBuf : GPUBackend.Buf β)
                          (config : Config)
                          (batchSize : Nat) : IO Unit := do
   logVerbose s!"[MatMul] Batched multiply: {batchSize} × ({config.M}×{config.K} @ {config.K}×{config.N})..."
@@ -852,11 +850,11 @@ def executeBatchedMatMul (device : Device)
   ]
 
   let totalElements := batchSize * config.M * config.N
-  let execConfig := Hesper.WGSL.Execute.ExecutionConfig.dispatch1D
+  let execConfig := Hesper.ExecConfig.dispatch1D
     totalElements
     256
 
-  Hesper.WGSL.Execute.executeShaderNamed device shader namedBuffers execConfig
+  GPUBackend.execute ctx shader namedBuffers execConfig
   logVerbose "[MatMul] ✓ Complete"
 
 /-- Execute batched scaled transposed matmul: C[b] = (A[b] @ B[b]^T) * scale
@@ -864,8 +862,8 @@ def executeBatchedMatMul (device : Device)
     A: [batch, M, K], B: [batch, N, K] → C: [batch, M, N]
     Used for attention: scores = (Q @ K^T) / sqrt(d_k)
 -/
-def executeBatchedScaledMatMulTranspose (device : Device)
-                                        (aBuf bBuf cBuf : Buffer)
+def executeBatchedScaledMatMulTranspose [GPUBackend β] (ctx : β)
+                                        (aBuf bBuf cBuf : GPUBackend.Buf β)
                                         (config : Config)
                                         (batchSize : Nat)
                                         (scale : Float) : IO Unit := do
@@ -879,11 +877,11 @@ def executeBatchedScaledMatMulTranspose (device : Device)
   ]
 
   let totalElements := batchSize * config.M * config.N
-  let execConfig := Hesper.WGSL.Execute.ExecutionConfig.dispatch1D
+  let execConfig := Hesper.ExecConfig.dispatch1D
     totalElements
     256
 
-  Hesper.WGSL.Execute.executeShaderNamed device shader namedBuffers execConfig
+  GPUBackend.execute ctx shader namedBuffers execConfig
   logVerbose "[MatMul] ✓ Complete"
 
 end Hesper.WGSL.MatMul
