@@ -29,10 +29,11 @@ def CUDAContext.init : IO CUDAContext := do
   let ctx ← cuCtxCreate dev
   return ⟨ctx⟩
 
-/-- CUDA cached dispatch — just the compiled function + hash. -/
+/-- CUDA cached dispatch — compiled function + buffer args for replay. -/
 structure CUDACachedDispatch where
   func : CUfunction
   sourceHash : UInt64
+  args : Array USize  -- device pointers for replay
 
 initialize cudaModuleCache : IO.Ref (Array (UInt64 × CUfunction)) ← IO.mkRef #[]
 
@@ -84,14 +85,20 @@ instance : GPUBackend CUDAContext where
     | some c => pure c.func
     | none => do
       let f ← cudaExecuteImpl computation namedBuffers config.funcName config.workgroupSize config.numWorkgroups
-      cacheRef.set (some { func := f, sourceHash := hash (generatePTX config.funcName config.workgroupSize computation) })
+      -- Collect buffer args for replay
+      let state := Hesper.WGSL.Monad.ShaderM.exec computation
+      let declaredNames := state.declaredBuffers.map (·.1)
+      let args ← declaredNames.foldlM (init := #[]) fun acc name => do
+        match namedBuffers.find? (fun p => p.1 == name) with
+        | some (_, buf) => return acc.push buf.ptr
+        | none => return acc
+      cacheRef.set (some { func := f, sourceHash := hash (generatePTX config.funcName config.workgroupSize computation), args })
       pure f
     cudaLaunchWithBuffers func namedBuffers computation config.workgroupSize config.numWorkgroups
   replayCached _ctx cached dims := do
-    -- CUDA doesn't have "replay" — just re-launch with cached function
-    -- We need the buffer args, but they're not in the cached dispatch.
-    -- For now, this is a no-op; the executeKernelCached path handles it.
-    pure ()
+    let (gx, gy, gz) := dims
+    cuLaunchKernel cached.func
+      gx.toUInt32 gy.toUInt32 gz.toUInt32 1 1 1 0 cached.args
   allocBuffer _ctx size := createCUDABuffer size
   freeBuffer _ctx buf := freeCUDABuffer buf
   writeBuffer _ctx buf data := writeCUDABuffer buf data

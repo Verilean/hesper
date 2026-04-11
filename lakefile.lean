@@ -714,6 +714,10 @@ lean_exe «cuda-bitnet-test» where
   root := `Tests.CUDA.CUDABitNetTest
   moreLinkArgs := stdLinkArgs ++ #["./.lake/build/native/libhesper_cuda.a", "-lcuda"]
 
+lean_exe «cuda-benchmark» where
+  root := `Tests.CUDA.CUDABenchmark
+  moreLinkArgs := stdLinkArgs ++ #["./.lake/build/native/libhesper_cuda.a", "-lcuda"]
+
 -- ============================================================================
 -- SIMD CPU BACKEND (Google Highway)
 -- ============================================================================
