@@ -458,9 +458,77 @@ def main : IO Unit := do
   freeCUDABuffer srcBuf; freeCUDABuffer dstBuf
   IO.println s!"  → {if ok7 then "PASSED" else "FAILED"}"
 
+  -- ═══ Test 8: Large matmul benchmark (256×256) ═══
   IO.println ""
-  if ok1 && ok2 && ok3 && ok4 && ok5 && ok6 && ok7 then
-    IO.println "✓ ALL 7 CUDA KERNEL TESTS PASSED"
+  IO.println "Test 8: Large matMul (256×256, naive vs tiled)"
+  IO.println "───────────────────────────────────────────────"
+  let bM := 256; let bN := 256; let bK := 256; let bTILE := 16
+
+  -- Generate random-ish data: A[i] = sin(i), B[i] = cos(i)
+  let bAArr := Array.range (bM * bK) |>.map (fun i => Float.sin (i.toFloat * 0.01))
+  let bBArr := Array.range (bK * bN) |>.map (fun i => Float.cos (i.toFloat * 0.007))
+
+  let bABuf ← createCUDABuffer (bM * bK * 4).toUSize
+  let bBBuf ← createCUDABuffer (bK * bN * 4).toUSize
+  let bCBuf1 ← createCUDABuffer (bM * bN * 4).toUSize
+  let bCBuf2 ← createCUDABuffer (bM * bN * 4).toUSize
+  writeCUDABuffer bABuf (packFloats bAArr)
+  writeCUDABuffer bBBuf (packFloats bBArr)
+
+  -- Naive matmul
+  let ptxNaive := generatePTX "matMulNaive" {x := 16, y := 16} (matMulKernel bM bN bK)
+  let modN ← cuModuleLoadData ptxNaive
+  let funcN ← cuModuleGetFunction modN "matMulNaive"
+  let gridN := (bN + 15) / 16; let gridMN := (bM + 15) / 16
+
+  -- Warmup
+  cuLaunchKernel funcN gridN.toUInt32 gridMN.toUInt32 1 16 16 1 0 #[bABuf.ptr, bBBuf.ptr, bCBuf1.ptr]
+
+  let t0 ← IO.monoNanosNow
+  for _ in List.range 10 do
+    cuLaunchKernel funcN gridN.toUInt32 gridMN.toUInt32 1 16 16 1 0 #[bABuf.ptr, bBBuf.ptr, bCBuf1.ptr]
+  let t1 ← IO.monoNanosNow
+  let naiveUs := (t1 - t0).toFloat / 10000.0  -- avg per run in μs
+
+  -- Tiled matmul
+  let ptxTiled := generatePTX "matMulTiled" {x := bTILE, y := bTILE} (tiledMatMulKernel bM bN bK bTILE)
+  let modT ← cuModuleLoadData ptxTiled
+  let funcT ← cuModuleGetFunction modT "matMulTiled"
+  let gridTX := bN / bTILE; let gridTY := bM / bTILE
+
+  cuLaunchKernel funcT gridTX.toUInt32 gridTY.toUInt32 1 bTILE.toUInt32 bTILE.toUInt32 1 0
+    #[bABuf.ptr, bBBuf.ptr, bCBuf2.ptr]
+
+  let t2 ← IO.monoNanosNow
+  for _ in List.range 10 do
+    cuLaunchKernel funcT gridTX.toUInt32 gridTY.toUInt32 1 bTILE.toUInt32 bTILE.toUInt32 1 0
+      #[bABuf.ptr, bBBuf.ptr, bCBuf2.ptr]
+  let t3 ← IO.monoNanosNow
+  let tiledUs := (t3 - t2).toFloat / 10000.0
+
+  -- Verify both produce same results
+  let resN ← readCUDABufferFull bCBuf1
+  let resT ← readCUDABufferFull bCBuf2
+  let mut maxDiff : Float := 0.0
+  for i in List.range (bM * bN) do
+    let vn := unpackFloat resN i
+    let vt := unpackFloat resT i
+    let diff := (vn - vt).abs
+    if diff > maxDiff then maxDiff := diff
+
+  IO.println s!"  Naive:  {naiveUs} μs/run"
+  IO.println s!"  Tiled:  {tiledUs} μs/run"
+  IO.println s!"  Speedup: {naiveUs / tiledUs}×"
+  IO.println s!"  Max diff (naive vs tiled): {maxDiff}"
+  let ok8 := maxDiff < 0.1
+  IO.println s!"  → {if ok8 then "PASSED" else "FAILED"}"
+
+  freeCUDABuffer bABuf; freeCUDABuffer bBBuf
+  freeCUDABuffer bCBuf1; freeCUDABuffer bCBuf2
+
+  IO.println ""
+  if ok1 && ok2 && ok3 && ok4 && ok5 && ok6 && ok7 && ok8 then
+    IO.println "✓ ALL 8 CUDA KERNEL TESTS PASSED"
   else
     IO.println "✗ SOME TESTS FAILED"
     IO.Process.exit 1
