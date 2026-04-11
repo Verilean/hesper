@@ -41,9 +41,11 @@ open Hesper.WGSL (WorkgroupSize)
     Hesper.WebGPU.writeBuffer device buf offset data
   readBuffer device buf size :=
     mapBufferRead device buf 0 size
-  buildKernel device computation funcName workgroupSize numWorkgroups :=
+  buildKernel device computation (config : Hesper.ExecConfig) :=
     Hesper.WGSL.Execute.buildKernel device computation
-      { funcName, workgroupSize, numWorkgroups }
+      { funcName := config.funcName, workgroupSize := config.workgroupSize,
+        numWorkgroups := config.numWorkgroups,
+        extensions := config.extensions, diagnostics := config.diagnostics }
   dispatchCompiledKernel device kernel buffers numWorkgroups cacheRef := do
     let bg ← Hesper.WGSL.Execute.bindKernelDirect device kernel buffers
     match cacheRef with
