@@ -55,6 +55,29 @@ def main (args : List String) : IO Unit := do
   let promptTokens := Hesper.Tokenizer.SentencePiece.encode tokenizer prompt
   IO.println s!"[Tokenize] Prompt: {promptTokens.size} tokens"
 
+  -- Debug: compare logits after first token
+  IO.println "[Debug] Forward single token for logit comparison..."
+  let cacheState ← createKVCacheState ctx model
+  forwardSingleToken ctx model promptTokens[0]! 0 cacheState
+  let logitsBytes ← GPUBackend.readBuffer ctx cacheState.logitsBuf (min 40 (model.config.vocabSize * 4)).toUSize
+  IO.println s!"[Debug] First 10 logits after token {promptTokens[0]!}:"
+  for i in List.range 10 do
+    let off := i * 4
+    if off + 4 <= logitsBytes.size then
+      let b0 : UInt32 := logitsBytes.get! off |>.toUInt32
+      let b1 : UInt32 := logitsBytes.get! (off+1) |>.toUInt32
+      let b2 : UInt32 := logitsBytes.get! (off+2) |>.toUInt32
+      let b3 : UInt32 := logitsBytes.get! (off+3) |>.toUInt32
+      let bits := b0 ||| (b1 <<< 8) ||| (b2 <<< 16) ||| (b3 <<< 24)
+      let e := (bits >>> 23) &&& 0xFF; let m := bits &&& (0x7FFFFF : UInt32); let s := bits >>> 31
+      let v := if e == 0 then 0.0 else
+        let fv := (1.0 + m.toNat.toFloat / 8388608.0) * Float.pow 2.0 (e.toNat.toFloat - 127.0)
+        if s == 1 then -fv else fv
+      IO.println s!"  logit[{i}] = {v}"
+  -- argmax
+  let argResult ← gpuArgmax ctx cacheState.logitsBuf cacheState.argmaxBuf model.config.vocabSize
+  IO.println s!"[Debug] argmax = {argResult}"
+
   -- Generate
   IO.println "[Generate] Starting CUDA inference..."
   let allTokens ← generate ctx model promptTokens maxTokens .Greedy (some 2) (showStats := true)
