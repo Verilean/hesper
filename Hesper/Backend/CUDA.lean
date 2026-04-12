@@ -73,6 +73,9 @@ private def cudaLaunchWithBuffers (func : CUfunction) (namedBuffers : List (Stri
 structure CUDACompiledKernel where
   func : CUfunction
   declaredNames : Array String
+  blockX : UInt32 := 1
+  blockY : UInt32 := 1
+  blockZ : UInt32 := 1
 
 instance : GPUBackend CUDAContext where
   Buf := CUDABuffer
@@ -117,6 +120,7 @@ instance : GPUBackend CUDAContext where
   readBuffer _ctx buf size := readCUDABuffer buf size
   buildKernel _ctx computation config := do
     let ptx := generatePTX config.funcName config.workgroupSize computation
+    IO.FS.writeFile "/tmp/debug_bitlinear.ptx" ptx
     let sourceHash := hash ptx
     let cache ← cudaModuleCache.get
     let func ← match cache.find? (fun e => e.1 == sourceHash) with
@@ -127,13 +131,18 @@ instance : GPUBackend CUDAContext where
       cudaModuleCache.modify (·.push (sourceHash, f))
       pure f
     let state := Hesper.WGSL.Monad.ShaderM.exec computation
-    pure { func, declaredNames := state.declaredBuffers.map (·.1) |>.toArray }
+    pure { func, declaredNames := state.declaredBuffers.map (·.1) |>.toArray,
+           blockX := config.workgroupSize.x.toUInt32,
+           blockY := config.workgroupSize.y.toUInt32,
+           blockZ := config.workgroupSize.z.toUInt32 }
   dispatchCompiledKernel _ctx kernel buffers numWorkgroups _cacheRef := do
     let args := buffers.map (·.ptr)
     let (gx, gy, gz) := numWorkgroups
     cuLaunchKernel kernel.func
-      gx.toUInt32 gy.toUInt32 gz.toUInt32 1 1 1 0 args
-  hasSubgroupSupport _ctx := pure true   -- CUDA always has warp shuffle
+      gx.toUInt32 gy.toUInt32 gz.toUInt32
+      kernel.blockX kernel.blockY kernel.blockZ
+      0 args
+  hasSubgroupSupport _ctx := pure false  -- Use shared-mem fallback (warp shuffle has PTX issues)
   hasShaderF16Support _ctx := pure true  -- sm_89 has native f16
   newCacheRef := IO.mkRef none
 
