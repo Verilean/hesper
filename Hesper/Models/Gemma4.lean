@@ -1245,37 +1245,38 @@ structure InferenceState (BufT CacheT : Type) where
     90-330μs/dispatch of generatePTX overhead. -/
 structure CompiledKernels (KernelT : Type) where
   residAdd : KernelT
-  qNorm : KernelT               -- per-head RMS norm for Q
-  kNorm : KernelT               -- per-head RMS norm for K
-  vNorm : KernelT               -- per-head bare RMS norm for V
+  qNormFull : KernelT           -- per-head RMS norm for Q (full attention layers)
+  kNormFull : KernelT           -- per-head RMS norm for K (full)
+  vNormFull : KernelT           -- per-head bare RMS norm for V (full)
+  qNormSWA : KernelT            -- per-head RMS norm for Q (SWA layers)
+  kNormSWA : KernelT            -- per-head RMS norm for K (SWA)
+  vNormSWA : KernelT            -- per-head bare RMS norm for V (SWA)
   geluMul : KernelT             -- GELU * up activation
   embedScale : KernelT          -- embedding * sqrt(hiddenSize)
+  embedScaleZero : KernelT      -- scale by 0 (zeroing hack)
   logitSoftcap : KernelT        -- logit soft-capping
 
 /-- Build all compiled kernels for zero-overhead dispatch. -/
 def buildCompiledKernels [GPUBackend β] (ctx : β) (cfg : Config)
     : IO (CompiledKernels (GPUBackend.CompiledKernel β)) := do
-  let headDimFull := cfg.headDimFull
-  let numHeads := cfg.numAttentionHeads
-  let numKVFull := cfg.numKeyValueHeadsFull
-  let wgNorm := min headDimFull 256
   let mk := fun (kernel : ShaderM Unit) (config : Hesper.ExecConfig) =>
     GPUBackend.buildKernel ctx kernel config
+  let nH := cfg.numAttentionHeads
+  let hdF := cfg.headDimFull; let hdS := cfg.headDimSWA
+  let kvF := cfg.numKeyValueHeadsFull; let kvS := cfg.numKeyValueHeadsSWA
+  let wgF := min hdF 256; let wgS := min hdS 256
   pure {
-    residAdd := ← mk (residualAddKernel cfg.hiddenSize)
-      (.dispatch1D cfg.hiddenSize)
-    qNorm := ← mk (perHeadRMSNormKernel numHeads headDimFull cfg.rmsNormEps)
-      { numWorkgroups := (numHeads, 1, 1), workgroupSize := { x := wgNorm } }
-    kNorm := ← mk (perHeadRMSNormKernel numKVFull headDimFull cfg.rmsNormEps)
-      { numWorkgroups := (numKVFull, 1, 1), workgroupSize := { x := wgNorm } }
-    vNorm := ← mk (perHeadBareRMSNormKernel numKVFull headDimFull cfg.rmsNormEps)
-      { numWorkgroups := (numKVFull, 1, 1), workgroupSize := { x := wgNorm } }
-    geluMul := ← mk (geluMulKernel cfg.intermediateSize)
-      (.dispatch1D cfg.intermediateSize)
-    embedScale := ← mk (embeddingScaleKernel cfg.hiddenSize cfg.hiddenSize)
-      (.dispatch1D cfg.hiddenSize)
-    logitSoftcap := ← mk (logitSoftcapKernel cfg.vocabSize cfg.logitSoftcapScale)
-      (.dispatch1D cfg.vocabSize)
+    residAdd := ← mk (residualAddKernel cfg.hiddenSize) (.dispatch1D cfg.hiddenSize)
+    qNormFull := ← mk (perHeadRMSNormKernel nH hdF cfg.rmsNormEps) { numWorkgroups := (nH, 1, 1), workgroupSize := { x := wgF } }
+    kNormFull := ← mk (perHeadRMSNormKernel kvF hdF cfg.rmsNormEps) { numWorkgroups := (kvF, 1, 1), workgroupSize := { x := wgF } }
+    vNormFull := ← mk (perHeadBareRMSNormKernel kvF hdF cfg.rmsNormEps) { numWorkgroups := (kvF, 1, 1), workgroupSize := { x := wgF } }
+    qNormSWA := ← mk (perHeadRMSNormKernel nH hdS cfg.rmsNormEps) { numWorkgroups := (nH, 1, 1), workgroupSize := { x := wgS } }
+    kNormSWA := ← mk (perHeadRMSNormKernel kvS hdS cfg.rmsNormEps) { numWorkgroups := (kvS, 1, 1), workgroupSize := { x := wgS } }
+    vNormSWA := ← mk (perHeadBareRMSNormKernel kvS hdS cfg.rmsNormEps) { numWorkgroups := (kvS, 1, 1), workgroupSize := { x := wgS } }
+    geluMul := ← mk (geluMulKernel cfg.intermediateSize) (.dispatch1D cfg.intermediateSize)
+    embedScale := ← mk (embeddingScaleKernel cfg.hiddenSize cfg.hiddenSize) (.dispatch1D cfg.hiddenSize)
+    embedScaleZero := ← mk (embeddingScaleKernel cfg.hiddenSize 0) (.dispatch1D cfg.hiddenSize)
+    logitSoftcap := ← mk (logitSoftcapKernel cfg.vocabSize cfg.logitSoftcapScale) (.dispatch1D cfg.vocabSize)
   }
 
 /-- Create inference state with pre-allocated buffers -/
@@ -1390,24 +1391,27 @@ def forwardBlock [GPUBackend β] (ctx : β)
     numWorkgroups := (nHeads, 1, 1)
     workgroupSize := { x := wgSize, y := 1, z := 1 }
   } : Hesper.ExecConfig)
+  let isFull := cfg.isFullAttention li
   Hesper.WGSL.Execute.withSection "qkvNorm" do
     -- Q-norm: qBuf → qBuf2
-    GPUBackend.execute ctx
+    dispatch (ck.map (fun k => if isFull then k.qNormFull else k.qNormSWA))
       (perHeadRMSNormKernel numHeads headDim cfg.rmsNormEps)
+      #[state.qBuf, block.attention.qNormWeight, state.qBuf2]
       [("input", state.qBuf), ("weight", block.attention.qNormWeight), ("output", state.qBuf2)]
       (mkNormConfig numHeads)
 
     if cfg.hasKV li then
       -- K-norm: kBuf → kBuf2
-      GPUBackend.execute ctx
+      dispatch (ck.map (fun k => if isFull then k.kNormFull else k.kNormSWA))
         (perHeadRMSNormKernel numKVHeads headDim cfg.rmsNormEps)
+        #[state.kBuf, block.attention.kNormWeight, state.kBuf2]
         [("input", state.kBuf), ("weight", block.attention.kNormWeight), ("output", state.kBuf2)]
         (mkNormConfig numKVHeads)
 
       -- V-norm: bare per-head RMSNorm on V (no learned weights)
-      -- Each KV head normalized independently. vBuf → vBuf2
-      GPUBackend.execute ctx
+      dispatch (ck.map (fun k => if isFull then k.vNormFull else k.vNormSWA))
         (perHeadBareRMSNormKernel numKVHeads headDim cfg.rmsNormEps)
+        #[state.vBuf, state.vBuf2]
         [("input", state.vBuf), ("output", state.vBuf2)]
         { numWorkgroups := (numKVHeads, 1, 1), workgroupSize := { x := min headDim 256, y := 1, z := 1 } : Hesper.ExecConfig }
 
