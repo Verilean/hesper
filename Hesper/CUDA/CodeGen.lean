@@ -119,16 +119,13 @@ partial def expToPTX (e : Exp t) (s : GenState) : ExpResult :=
     (.pred r, s.emit (.and_pred r ra.toPred! rb.toPred!))
 
   | .or a b =>
-    -- PTX has or.pred (and.pred exists, or follows same pattern)
-    -- Use: convert preds to u32 via selp, or them, convert back
+    -- Convert predicates to u32 via selp, or them, convert back
     let (pa, s) := expToPTX a s; let (pb, s) := expToPTX b s
-    let (r, s) := s.freshU32
-    let (va, s) := s.freshU32; let (vb, s) := s.freshU32
     let (one, s) := s.freshU32; let (zero, s) := s.freshU32
     let s := s.emit (.mov_u32_imm one 1); let s := s.emit (.mov_u32_imm zero 0)
-    -- TODO: selp_u32 not in DSL yet, use or.b32 on u32 flags
-    let s := s.emit (.mov_u32_imm va 0); let s := s.emit (.mov_u32_imm vb 0)
-    let s := s.emit (.or_u32 r va vb)
+    let (va, s) := s.freshU32; let s := s.emit (.selp_u32 va one zero pa.toPred!)
+    let (vb, s) := s.freshU32; let s := s.emit (.selp_u32 vb one zero pb.toPred!)
+    let (r, s) := s.freshU32; let s := s.emit (.or_u32 r va vb)
     let (p, s) := s.freshPred; (.pred p, s.emit (.setp_u32 .ne p r zero))
   | .not e =>
     -- Negate a predicate: setp.eq %p, val, 0
@@ -152,9 +149,13 @@ partial def expToPTX (e : Exp t) (s : GenState) : ExpResult :=
     let (ra, s) := expToPTX a s; let (rb, s) := expToPTX b s
     let (r, s) := s.freshU32; (.u32 r, s.emit (.shr_u32 r ra.toU32! rb.toU32!))
   | .shiftLeft a b =>
-    let (ra, s) := expToPTX a s; let (_rb, s) := expToPTX b s
-    let shiftAmt := match b with | .litU32 n => n | _ => 0
-    let (r, s) := s.freshU32; (.u32 r, s.emit (.shl_u32 r ra.toU32! shiftAmt))
+    let (ra, s) := expToPTX a s
+    match b with
+    | .litU32 n =>
+      let (r, s) := s.freshU32; (.u32 r, s.emit (.shl_u32 r ra.toU32! n))
+    | _ =>
+      let (rb, s) := expToPTX b s
+      let (r, s) := s.freshU32; (.u32 r, s.emit (.shl_u32_reg r ra.toU32! rb.toU32!))
 
   -- Type conversions
   | .toF32 e =>
@@ -208,10 +209,9 @@ partial def expToPTX (e : Exp t) (s : GenState) : ExpResult :=
   | .ceil e =>
     let (re, s) := expToPTX e s; let (r, s) := s.freshF32; (.f32 r, s.emit (.ceil_f32 r re.toF32!))
   | .inverseSqrt e =>
-    let (re, s) := expToPTX e s; let (r, s) := s.freshF32; (.f32 r, s.emit (.rcp_f32 r re.toF32!))
-    -- Note: rsqrt = 1/sqrt. PTX rcp.approx is 1/x. Need sqrt first.
-    -- Actually: use rcp(sqrt(x))
-    -- TODO: proper rsqrt
+    let (re, s) := expToPTX e s
+    let (sq, s) := s.freshF32; let s := s.emit (.sqrt_f32 sq re.toF32!)
+    let (r, s) := s.freshF32; (.f32 r, s.emit (.rcp_f32 r sq))
   | .clamp x lo hi =>
     let (rx, s) := expToPTX x s; let (rlo, s) := expToPTX lo s; let (rhi, s) := expToPTX hi s
     let (t, s) := s.freshF32; let s := s.emit (.max_f32 t rx.toF32! rlo.toF32!)

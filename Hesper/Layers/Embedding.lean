@@ -118,7 +118,6 @@ def embeddingLookupKernel (config : Config) (batchSize seqLen : Nat) : ShaderM U
   let idx := Exp.vec3X gid
 
   let totalTokens := batchSize * seqLen
-  let inBounds := Exp.lt idx (Exp.litU32 totalTokens)
 
   -- Declare buffers
   let _tokenIds ← ShaderM.declareInputBuffer "token_ids" (.array (.scalar .u32) totalTokens)
@@ -127,25 +126,19 @@ def embeddingLookupKernel (config : Config) (batchSize seqLen : Nat) : ShaderM U
   let _output ← ShaderM.declareOutputBuffer "output"
     (.array (.scalar .f32) (totalTokens * config.dim))
 
-  -- Read token ID for this position
-  let tokenId ← ShaderM.readBuffer (ty := .scalar .u32) (n := totalTokens) "token_ids" idx
+  -- Early exit for out-of-bounds threads (required for CUDA — no robust buffer access)
+  ShaderM.if_ (Exp.lt idx (Exp.litU32 totalTokens)) (do
+    -- Read token ID for this position
+    let tokenId ← ShaderM.readBuffer (ty := .scalar .u32) (n := totalTokens) "token_ids" idx
 
-  -- Copy embedding vector from table to output using a GPU loop
-  -- Each token needs config.dim values copied
-  ShaderM.loop (Exp.litU32 0) (Exp.litU32 config.dim) (Exp.litU32 1) fun d => do
-    -- Source: embedding_table[tokenId * dim + d]
-    let srcIdx := Exp.add (Exp.mul tokenId (Exp.litU32 config.dim)) d
-
-    -- Destination: output[idx * dim + d]
-    let dstIdx := Exp.add (Exp.mul idx (Exp.litU32 config.dim)) d
-
-    -- Read from embedding table
-    let embVal ← ShaderM.readBuffer (ty := .scalar .f32)
-      (n := config.vocabSize * config.dim) "embedding_table" srcIdx
-
-    -- Write to output
-    let finalVal := Exp.select inBounds embVal (Exp.litF32 0.0)
-    ShaderM.writeBuffer (ty := .scalar .f32) "output" dstIdx finalVal
+    -- Copy embedding vector from table to output using a GPU loop
+    ShaderM.loop (Exp.litU32 0) (Exp.litU32 config.dim) (Exp.litU32 1) fun d => do
+      let srcIdx := Exp.add (Exp.mul tokenId (Exp.litU32 config.dim)) d
+      let dstIdx := Exp.add (Exp.mul idx (Exp.litU32 config.dim)) d
+      let embVal ← ShaderM.readBuffer (ty := .scalar .f32)
+        (n := config.vocabSize * config.dim) "embedding_table" srcIdx
+      ShaderM.writeBuffer (ty := .scalar .f32) "output" dstIdx embVal
+  ) (pure ())
 
 /-! ## Layer Structure -/
 
@@ -228,24 +221,18 @@ def unpackF16ToF32Kernel (numElements : Nat) (packedPerThread : Nat) : ShaderM U
   ShaderM.loop (Exp.litU32 0) (Exp.litU32 packedPerThread) (Exp.litU32 1) fun i => do
     let packedIdx := Exp.add basePackedIdx i
     let dstIdx0 := Exp.mul (Exp.litU32 2) packedIdx
-    let inBounds := Exp.lt packedIdx (Exp.litU32 numPacked)
 
-    -- Read packed u32 (contains two f16 values)
-    let packed ← ShaderM.readBuffer (ty := .scalar .u32)
-      (n := numPacked) "f16_data" packedIdx
-
-    -- Hardware unpack: u32 -> vec2<f32>
-    let unpacked := Exp.unpack2x16float packed
-
-    -- Write first element
-    let finalVal0 := Exp.select inBounds (Exp.vecX unpacked) (Exp.litF32 0.0)
-    ShaderM.writeBuffer (ty := .scalar .f32) "f32_data" dstIdx0 finalVal0
-
-    -- Write second element
-    let dstIdx1 := Exp.add dstIdx0 (Exp.litU32 1)
-    let secondInBounds := Exp.lt dstIdx1 (Exp.litU32 numElements)
-    let finalVal1 := Exp.select secondInBounds (Exp.vecY unpacked) (Exp.litF32 0.0)
-    ShaderM.writeBuffer (ty := .scalar .f32) "f32_data" dstIdx1 finalVal1
+    -- Guard all reads/writes for CUDA (no robust buffer access)
+    ShaderM.if_ (Exp.lt packedIdx (Exp.litU32 numPacked)) (do
+      let packed ← ShaderM.readBuffer (ty := .scalar .u32)
+        (n := numPacked) "f16_data" packedIdx
+      let unpacked := Exp.unpack2x16float packed
+      ShaderM.writeBuffer (ty := .scalar .f32) "f32_data" dstIdx0 (Exp.vecX unpacked)
+      let dstIdx1 := Exp.add dstIdx0 (Exp.litU32 1)
+      ShaderM.if_ (Exp.lt dstIdx1 (Exp.litU32 numElements)) (do
+        ShaderM.writeBuffer (ty := .scalar .f32) "f32_data" dstIdx1 (Exp.vecY unpacked)
+      ) (pure ())
+    ) (pure ())
 
 /-- Create embedding layer from F16 data (GPU-optimized version)
 
