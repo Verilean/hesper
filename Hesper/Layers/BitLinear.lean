@@ -1161,14 +1161,17 @@ def create [GPUBackend β] (ctx : β) (config : Config)
   GPUBackend.writeBuffer ctx scaleBuf scaleBytes
   let prepared ← GPUBackend.newCacheRef (β := β)
   let useSubgroups ← GPUBackend.hasSubgroupSupport ctx
+  IO.println s!"[DBG BitLinear.create] useSubgroups={useSubgroups}"
   let shaderM := if useSubgroups
     then fusedBitLinearM1Kernel config
     else fusedBitLinearM1KernelSharedMem config
-  let kernel ← GPUBackend.buildKernel ctx shaderM {
+  let buildCfg : Hesper.ExecConfig := {
     workgroupSize := { x := 32 }, numWorkgroups := (config.outDim, 1, 1),
     extensions := if useSubgroups then ["subgroups"] else [],
     diagnostics := if useSubgroups then [("off", "chromium.subgroup_matrix_uniformity")] else []
   }
+  IO.println s!"[DBG BitLinear.create] extensions={buildCfg.extensions}"
+  let kernel ← GPUBackend.buildKernel ctx shaderM buildCfg
   logVerbose s!"[BitLinear] Layer created: packed={paddedWeights.size} bytes (subgroups={useSubgroups})"
   pure { config, weightsPacked := weightsBuf, scaleBuf, prepared, kernel }
 
