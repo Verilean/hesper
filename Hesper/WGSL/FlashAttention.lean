@@ -566,6 +566,7 @@ def executeFlashAttentionWithParams [GPUBackend β] (ctx : β)
   let execConfig : Hesper.ExecConfig := {
     workgroupSize := {x := workgroupSize, y := 1, z := 1}
     numWorkgroups := (numHeads, 1, 1)
+    extensions := ["subgroups"]
     -- No diagnostic needed: params is var<storage, read> which is uniform
   }
   GPUBackend.executeWithConfigCached ctx shader namedBuffers execConfig cacheKey (← IO.mkRef none)
@@ -863,6 +864,7 @@ def executeFlashAttentionTiled [GPUBackend β] (ctx : β)
     let execConfig1 : Hesper.ExecConfig := {
       workgroupSize := {x := workgroupSize, y := 1, z := 1}
       numWorkgroups := (numHeads, numTiles, 1)
+      extensions := ["subgroups"]
     }
     let cacheKey1 : UInt64 := hash ("flashT1", numHeads, numKVHeads, maxSeqLen, headDim, cacheLen, tileSize)
     GPUBackend.executeWithConfigCached ctx shader1 namedBuffers1 execConfig1 cacheKey1 (← IO.mkRef none)
@@ -885,6 +887,7 @@ def executeFlashAttentionDynamic [GPUBackend β] (ctx : β)
   let execConfig : Hesper.ExecConfig := {
     workgroupSize := {x := workgroupSize, y := 1, z := 1}
     numWorkgroups := (numHeads, 1, 1)
+    extensions := ["subgroups"]
   }
   -- Note: shader compilation is cached by pipeline cache (Execute.lean).
   -- First call with a new cacheLen compiles, subsequent calls with same cacheLen reuse.
