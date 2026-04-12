@@ -726,6 +726,22 @@ lean_exe «cuda-bitlinear-test» where
   root := `Tests.CUDA.CUDABitLinearTest
   moreLinkArgs := stdLinkArgs ++ #["./.lake/build/native/libhesper_cuda.a", "-lcuda"]
 
+lean_exe «cuda-flash-test» where
+  root := `Tests.CUDA.CUDAFlashAttnTest
+  moreLinkArgs := stdLinkArgs ++ #["./.lake/build/native/libhesper_cuda.a", "-lcuda"]
+
+lean_exe «cuda-ptx-inst-test» where
+  root := `Tests.CUDA.CUDAPTXInstTest
+  moreLinkArgs := stdLinkArgs ++ #["./.lake/build/native/libhesper_cuda.a", "-lcuda"]
+
+lean_exe «cuda-fa-golden-test» where
+  root := `Tests.CUDA.CUDAFlashAttnGoldenTest
+  moreLinkArgs := stdLinkArgs ++ #["./.lake/build/native/libhesper_cuda.a", "-lcuda"]
+
+lean_exe «cuda-bitnet-golden-test» where
+  root := `Tests.CUDA.CUDABitNetGoldenTest
+  moreLinkArgs := stdLinkArgs ++ #["./.lake/build/native/libhesper_cuda.a", "-lcuda"]
+
 -- ============================================================================
 -- SIMD CPU BACKEND (Google Highway)
 -- ============================================================================
