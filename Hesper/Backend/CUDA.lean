@@ -83,7 +83,6 @@ instance : GPUBackend CUDAContext where
   CompiledKernel := CUDACompiledKernel
   executeWithConfig _ctx computation namedBuffers config := do
     let func ← cudaExecuteImpl computation namedBuffers config.funcName config.workgroupSize config.numWorkgroups
-    -- Resolve buffer args (ShaderM.exec already called in cudaExecuteImpl, avoid 2nd call)
     let state := Hesper.WGSL.Monad.ShaderM.exec computation
     let declaredNames := state.declaredBuffers.map (·.1)
     let args ← declaredNames.foldlM (init := #[]) fun acc name => do
