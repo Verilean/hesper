@@ -1238,6 +1238,7 @@ structure InferenceState (BufT CacheT : Type) where
   -- applying logit softcap. When `none` (default), no copy is done
   -- and there is zero performance impact.
   preSoftcapBuf : Option BufT := none
+  argmaxBuf : BufT              -- [1] u32 for GPU-side argmax result
 
 /-- Create inference state with pre-allocated buffers -/
 def createInferenceState [GPUBackend β] (ctx : β) (cfg : Config) : IO (InferenceState (GPUBackend.Buf β) (GPUBackend.CachedDispatch β)) := do
@@ -1303,6 +1304,7 @@ def createInferenceState [GPUBackend β] (ctx : β) (cfg : Config) : IO (Inferen
       let blocksPerRow := (totalPL + 255) / 256
       let rowBytes := blocksPerRow * 210
       GPUBackend.allocBuffer ctx (max rowBytes 4).toUSize
+    argmaxBuf := ← GPUBackend.allocBuffer ctx (4 : USize)
   }
 
 /-! ## Single-Token Forward Pass -/
@@ -1685,17 +1687,6 @@ def forwardSingleToken [GPUBackend β] (ctx : β)
       -- F32 / F16 / Q4_K: use existing Embedding.forward (assumes F32 interpretation)
       Embedding.forward ctx model.embedding state.tokenBuf state.buf1 1 1
 
-  -- Debug: dump embedding output
-  if (← IO.getEnv "HESPER_DEBUG") == some "1" then
-    let tokData ← GPUBackend.readBuffer ctx state.tokenBuf (4 : USize)
-    let tokId := Hesper.Basic.bytesToUInt32 tokData 0
-    let embData ← GPUBackend.readBuffer ctx state.buf1 (min 16 (model.config.hiddenSize * 4)).toUSize
-    let v0 := Hesper.Basic.bytesToFloat embData 0
-    let v1 := Hesper.Basic.bytesToFloat embData 4
-    let v2 := Hesper.Basic.bytesToFloat embData 8
-    let v3 := Hesper.Basic.bytesToFloat embData 12
-    IO.println s!"[DEBUG] pos={pos} tokId={tokId} emb[0..3]: {v0}, {v1}, {v2}, {v3}"
-
   -- Scale embeddings by sqrt(hiddenSize)
   -- Cannot alias input/output in WebGPU, so output to buf2
   Hesper.WGSL.Execute.withSection "embedScale" do
@@ -1850,6 +1841,50 @@ def forwardSingleToken [GPUBackend β] (ctx : β)
 
 /-! ## Text Generation -/
 
+/-- GPU argmax: parallel reduction to find token with highest logit. -/
+private def argmaxKernel (vocabSize : Nat) : ShaderM Unit := do
+  let tid ← ShaderM.localId
+  let tid := Exp.vec3X tid
+  ShaderM.sharedNamed "shared_vals" (.array (.scalar .f32) 256)
+  ShaderM.sharedNamed "shared_idxs" (.array (.scalar .u32) 256)
+  let _logits ← ShaderM.declareInputBuffer "logits" (.array (.scalar .f32) vocabSize)
+  let _result ← ShaderM.declareOutputBuffer "result" (.array (.scalar .u32) 1)
+  ShaderM.varNamed "local_max" (.scalar .f32) (Exp.litF32 (-1.0e38))
+  ShaderM.varNamed "local_idx" (.scalar .u32) (Exp.litU32 0)
+  ShaderM.loop tid (Exp.litU32 vocabSize) (Exp.litU32 256) fun i => do
+    let val ← ShaderM.readBuffer (ty := .scalar .f32) (n := vocabSize) "logits" i
+    ShaderM.if_ (Exp.gt val (Exp.var "local_max")) (do
+      ShaderM.assign "local_max" val
+      ShaderM.assign "local_idx" i
+    ) (pure ())
+  ShaderM.writeWorkgroup (ty := .scalar .f32) "shared_vals" tid (Exp.var "local_max")
+  ShaderM.writeWorkgroup (ty := .scalar .u32) "shared_idxs" tid (Exp.var "local_idx")
+  ShaderM.barrier
+  let mut stride := 128
+  while stride > 0 do
+    ShaderM.if_ (Exp.lt tid (Exp.litU32 stride)) (do
+      let a ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := 256) "shared_vals" tid
+      let b ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := 256) "shared_vals" (Exp.add tid (Exp.litU32 stride))
+      ShaderM.if_ (Exp.gt b a) (do
+        ShaderM.writeWorkgroup (ty := .scalar .f32) "shared_vals" tid b
+        let bIdx ← ShaderM.readWorkgroup (ty := .scalar .u32) (n := 256) "shared_idxs" (Exp.add tid (Exp.litU32 stride))
+        ShaderM.writeWorkgroup (ty := .scalar .u32) "shared_idxs" tid bIdx
+      ) (pure ())
+    ) (pure ())
+    ShaderM.barrier
+    stride := stride / 2
+  ShaderM.if_ (Exp.eq tid (Exp.litU32 0)) (do
+    let maxIdx ← ShaderM.readWorkgroup (ty := .scalar .u32) (n := 256) "shared_idxs" (Exp.litU32 0)
+    ShaderM.writeBuffer (ty := .scalar .u32) "result" (Exp.litU32 0) maxIdx
+  ) (pure ())
+
+private def gpuArgmax [GPUBackend β] (ctx : β) (logitsBuf argmaxBuf : GPUBackend.Buf β) (vocabSize : Nat) : IO Nat := do
+  GPUBackend.execute ctx (argmaxKernel vocabSize)
+    [("logits", logitsBuf), ("result", argmaxBuf)]
+    { workgroupSize := { x := 256 }, numWorkgroups := (1, 1, 1) }
+  let bytes ← GPUBackend.readBuffer ctx argmaxBuf (4 : USize)
+  return (Hesper.Basic.bytesToUInt32 bytes 0).toNat
+
 /-- Generate tokens from a Gemma 4 model.
 
     @param device WebGPU device
@@ -1886,10 +1921,8 @@ def generate [GPUBackend β] (ctx : β) (model : Gemma4Model (GPUBackend.Buf β)
   for _ in [0:maxTokens] do
     if tokens.size >= model.config.maxSeqLen then break
 
-    -- Sample: greedy argmax (download logits to CPU)
-    let logitBytes ← GPUBackend.readBuffer ctx state.logitsBuf (model.config.vocabSize * 4).toUSize
-    let logits ← Hesper.Basic.bytesToFloatArray logitBytes
-    let nextToken := Hesper.Inference.Sampling.argmax logits
+    -- Sample: GPU-side greedy argmax (download 4 bytes instead of 1 MB)
+    let nextToken ← gpuArgmax ctx state.logitsBuf state.argmaxBuf model.config.vocabSize
 
     tokens := tokens.push nextToken
     genCount := genCount + 1
