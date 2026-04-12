@@ -33,7 +33,10 @@ def CUDAContext.init : IO CUDAContext := do
 structure CUDACachedDispatch where
   func : CUfunction
   sourceHash : UInt64
-  args : Array USize  -- device pointers for replay
+  args : Array USize
+  blockX : UInt32 := 1
+  blockY : UInt32 := 1
+  blockZ : UInt32 := 1
 
 initialize cudaModuleCache : IO.Ref (Array (UInt64 × CUfunction)) ← IO.mkRef #[]
 
@@ -92,13 +95,22 @@ instance : GPUBackend CUDAContext where
         match namedBuffers.find? (fun p => p.1 == name) with
         | some (_, buf) => return acc.push buf.ptr
         | none => return acc
-      cacheRef.set (some { func := f, sourceHash := hash (generatePTX config.funcName config.workgroupSize computation), args })
+      cacheRef.set (some {
+        func := f
+        sourceHash := hash (generatePTX config.funcName config.workgroupSize computation)
+        args
+        blockX := config.workgroupSize.x.toUInt32
+        blockY := config.workgroupSize.y.toUInt32
+        blockZ := config.workgroupSize.z.toUInt32
+      })
       pure f
     cudaLaunchWithBuffers func namedBuffers computation config.workgroupSize config.numWorkgroups
   replayCached _ctx cached dims := do
     let (gx, gy, gz) := dims
     cuLaunchKernel cached.func
-      gx.toUInt32 gy.toUInt32 gz.toUInt32 1 1 1 0 cached.args
+      gx.toUInt32 gy.toUInt32 gz.toUInt32
+      cached.blockX cached.blockY cached.blockZ
+      0 cached.args
   allocBuffer _ctx size := createCUDABuffer size
   freeBuffer _ctx buf := freeCUDABuffer buf
   writeBuffer _ctx buf data := writeCUDABuffer buf data
