@@ -55,7 +55,13 @@ def main (args : List String) : IO Unit := do
   let promptTokens := Hesper.Tokenizer.SentencePiece.encode tokenizer prompt
   IO.println s!"[Tokenize] Prompt: {promptTokens.size} tokens"
 
-  -- Generate
+  -- Generate 1 token to check logits
+  IO.println "[Generate] 1 token test..."
+  let testTokens ← generate ctx model promptTokens 1 .Greedy (some 2)
+  -- Read logits after the 1-token generate
+  IO.println s!"First generated token: {testTokens.getD promptTokens.size 0}"
+
+  -- Full generate
   IO.println "[Generate] Starting CUDA inference..."
   let allTokens ← generate ctx model promptTokens maxTokens .Greedy (some 2) (showStats := true)
 
