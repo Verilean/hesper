@@ -200,6 +200,16 @@ def main : IO Unit := do
   let r ← run1 c selK #[("a", pf #[3.0])] "o"; expectF c "select(3>2,10,20)=10" (uf r 0) 10.0
   let r ← run1 c selK #[("a", pf #[1.0])] "o"; expectF c "select(1>2,10,20)=20" (uf r 0) 20.0
 
+  -- select u32 (was broken: selp_f32 used for u32 values → bit reinterpretation)
+  let selU32K : ShaderM Unit := do
+    let _a ← declareInputBuffer "a" (.array (.scalar .u32) 1)
+    let _o ← declareOutputBuffer "o" (.array (.scalar .u32) 1)
+    let v ← readBuffer (ty := .scalar .u32) (n := 1) "a" (Exp.litU32 0)
+    writeBuffer (ty := .scalar .u32) "o" (Exp.litU32 0)
+      (Exp.select (Exp.gt v (Exp.litU32 5)) (Exp.litU32 100) (Exp.litU32 200))
+  let r ← run1 c selU32K #[("a", pu #[10])] "o"; expectU c "select_u32(10>5,100,200)=100" (uu r 0) 100
+  let r ← run1 c selU32K #[("a", pu #[3])] "o"; expectU c "select_u32(3>5,100,200)=200" (uu r 0) 200
+
   -- ── u32 arithmetic ──
   IO.println "── u32 arithmetic ──"
   let r ← run1 c (binU Exp.add) #[("a", pu #[7]), ("b", pu #[3])] "o"; expectU c "add_u32(7,3)" (uu r 0) 10
