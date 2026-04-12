@@ -1685,6 +1685,17 @@ def forwardSingleToken [GPUBackend β] (ctx : β)
       -- F32 / F16 / Q4_K: use existing Embedding.forward (assumes F32 interpretation)
       Embedding.forward ctx model.embedding state.tokenBuf state.buf1 1 1
 
+  -- Debug: dump embedding output
+  if (← IO.getEnv "HESPER_DEBUG") == some "1" then
+    let tokData ← GPUBackend.readBuffer ctx state.tokenBuf (4 : USize)
+    let tokId := Hesper.Basic.bytesToUInt32 tokData 0
+    let embData ← GPUBackend.readBuffer ctx state.buf1 (min 16 (model.config.hiddenSize * 4)).toUSize
+    let v0 := Hesper.Basic.bytesToFloat embData 0
+    let v1 := Hesper.Basic.bytesToFloat embData 4
+    let v2 := Hesper.Basic.bytesToFloat embData 8
+    let v3 := Hesper.Basic.bytesToFloat embData 12
+    IO.println s!"[DEBUG] pos={pos} tokId={tokId} emb[0..3]: {v0}, {v1}, {v2}, {v3}"
+
   -- Scale embeddings by sqrt(hiddenSize)
   -- Cannot alias input/output in WebGPU, so output to buf2
   Hesper.WGSL.Execute.withSection "embedScale" do

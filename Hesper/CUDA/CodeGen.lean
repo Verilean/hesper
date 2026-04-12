@@ -223,10 +223,14 @@ partial def expToPTX (e : Exp t) (s : GenState) : ExpResult :=
     let (t, s) := s.freshF32; let s := s.emit (.mul_f32 t rb.toF32! lg)
     let (r, s) := s.freshF32; (.f32 r, s.emit (.ex2_f32 r t))
 
-  -- Select
+  -- Select (type-dispatched: f32 or u32)
   | .select cond t f =>
     let (pc, s) := expToPTX cond s; let (rt, s) := expToPTX t s; let (rf, s) := expToPTX f s
-    let (r, s) := s.freshF32; (.f32 r, s.emit (.selp_f32 r rt.toF32! rf.toF32! pc.toPred!))
+    match rt, rf with
+    | .u32 a, .u32 b =>
+      let (r, s) := s.freshU32; (.u32 r, s.emit (.selp_u32 r a b pc.toPred!))
+    | _, _ =>
+      let (r, s) := s.freshF32; (.f32 r, s.emit (.selp_f32 r rt.toF32! rf.toF32! pc.toPred!))
 
   -- Vec2 component extraction (f16 unpack pattern)
   | .vecX (.unpack2x16float packed) =>
