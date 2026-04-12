@@ -45,6 +45,7 @@ structure ShaderState where
   varCounter : Nat                                      -- For generating unique variable names
   sharedVars : List (String × WGSLType)                -- Shared memory declarations
   declaredBuffers : List (String × WGSLType × BufferAccessMode)  -- Auto-tracked buffer bindings (name, type, access mode)
+  needsSubgroups : Bool := false                       -- Set automatically when subgroupAdd is used
 
 /-- The Shader Monad -/
 abbrev ShaderM (α : Type) := StateM ShaderState α
@@ -56,7 +57,8 @@ def initialState : ShaderState :=
   { stmts := []
     varCounter := 0
     sharedVars := []
-    declaredBuffers := [] }
+    declaredBuffers := []
+    needsSubgroups := false }
 
 /-- Run a shader computation and extract the result and final state -/
 def run (m : ShaderM α) : α × ShaderState :=
