@@ -784,58 +784,53 @@ def Config.fromGGUF (gguf : Hesper.GGUF.GGUFFile) : Except String Config := do
 /-! ## Layer Structures -/
 
 /-- Gemma 4 attention layer (single layer) -/
-structure Gemma4Attention where
-  wQ : Linear.LinearLayer Buffer PreparedDispatch         -- Q projection [hiddenSize → numHeads * headDim]
-  wK : Linear.LinearLayer Buffer PreparedDispatch         -- K projection [hiddenSize → numKVHeads * headDim]
-  wV : Linear.LinearLayer Buffer PreparedDispatch         -- V projection [hiddenSize → numKVHeads * headDim]
-  wO : Linear.LinearLayer Buffer PreparedDispatch         -- Output projection [numHeads * headDim → hiddenSize]
-  qNormWeight : Buffer            -- Per-head Q norm [headDim]
-  kNormWeight : Buffer            -- Per-head K norm [headDim]
+structure Gemma4Attention (BufT CacheT : Type) where
+  wQ : Linear.LinearLayer BufT CacheT         -- Q projection [hiddenSize → numHeads * headDim]
+  wK : Linear.LinearLayer BufT CacheT         -- K projection [hiddenSize → numKVHeads * headDim]
+  wV : Linear.LinearLayer BufT CacheT         -- V projection [hiddenSize → numKVHeads * headDim]
+  wO : Linear.LinearLayer BufT CacheT         -- Output projection [numHeads * headDim → hiddenSize]
+  qNormWeight : BufT            -- Per-head Q norm [headDim]
+  kNormWeight : BufT            -- Per-head K norm [headDim]
 
 /-- Gemma 4 dense FFN layer -/
-structure Gemma4FFN where
-  gate : Linear.LinearLayer Buffer PreparedDispatch       -- Gate projection [hiddenSize → intermediateSize]
-  up : Linear.LinearLayer Buffer PreparedDispatch         -- Up projection [hiddenSize → intermediateSize]
-  down : Linear.LinearLayer Buffer PreparedDispatch       -- Down projection [intermediateSize → hiddenSize]
-  -- Prepared-dispatch cache for the fused gate+up+gelu_mul kernel
-  -- (`Linear.forwardFusedGateUp`). Separate from `gate.prepared` and
-  -- `up.prepared` because the fused dispatch binds both weight buffers
-  -- plus the distinct output buffer, so the prepared state is not
-  -- interchangeable with either single-linear prepared state.
-  fusedGateUpPrepared : IO.Ref (Option Hesper.WGSL.Execute.PreparedDispatch)
+structure Gemma4FFN (BufT CacheT : Type) where
+  gate : Linear.LinearLayer BufT CacheT
+  up : Linear.LinearLayer BufT CacheT
+  down : Linear.LinearLayer BufT CacheT
+  fusedGateUpPrepared : IO.Ref (Option CacheT)
 
 /-- Gemma 4 transformer block (single layer) -/
-structure Gemma4Block where
+structure Gemma4Block (BufT CacheT : Type) where
   layerIdx : Nat
   layerType : LayerType
   -- Norms
-  attnNorm : RMSNorm.RMSNorm Buffer PreparedDispatch
-  postAttnNorm : RMSNorm.RMSNorm Buffer PreparedDispatch
-  ffnNorm : RMSNorm.RMSNorm Buffer PreparedDispatch
-  postFFNNorm : RMSNorm.RMSNorm Buffer PreparedDispatch
+  attnNorm : RMSNorm.RMSNorm BufT CacheT
+  postAttnNorm : RMSNorm.RMSNorm BufT CacheT
+  ffnNorm : RMSNorm.RMSNorm BufT CacheT
+  postFFNNorm : RMSNorm.RMSNorm BufT CacheT
   -- Attention
-  attention : Gemma4Attention
+  attention : Gemma4Attention BufT CacheT
   -- FFN (shared/dense expert)
-  ffn : Gemma4FFN
+  ffn : Gemma4FFN BufT CacheT
   -- MoE (optional: present only for MoE layers)
-  isMoE : Bool                        -- true if this is a MoE layer
-  moeRouterWeight : Option Buffer     -- ffn_gate_inp [numExperts, hiddenSize]
-  moeRouterScale : Option Buffer      -- ffn_gate_inp.scale [hiddenSize]
-  moeGateUpExps : Option Buffer       -- ffn_gate_up_exps [numExperts, 2*expertFFSize, hiddenSize]
-  moeDownExps : Option Buffer         -- ffn_down_exps [numExperts, hiddenSize, expertFFSize]
-  moePreNorm2 : Option (RMSNorm.RMSNorm Buffer PreparedDispatch)  -- ffn_pre_norm_2
-  moePostNorm1 : Option (RMSNorm.RMSNorm Buffer PreparedDispatch) -- ffn_post_norm_1 (after shared expert)
-  moePostNorm2 : Option (RMSNorm.RMSNorm Buffer PreparedDispatch) -- ffn_post_norm_2 (after routed experts)
+  isMoE : Bool
+  moeRouterWeight : Option BufT
+  moeRouterScale : Option BufT
+  moeGateUpExps : Option BufT
+  moeDownExps : Option BufT
+  moePreNorm2 : Option (RMSNorm.RMSNorm BufT CacheT)
+  moePostNorm1 : Option (RMSNorm.RMSNorm BufT CacheT)
+  moePostNorm2 : Option (RMSNorm.RMSNorm BufT CacheT)
   -- Optional: RoPE frequency factors (full attention layers only)
-  ropeFreqFactors : Option Buffer
+  ropeFreqFactors : Option BufT
   -- Optional: layer output scale
-  outScale : Option Buffer
+  outScale : Option BufT
 
 /-- Per-layer embedding weights for a single block -/
-structure Gemma4PerLayerEmbd where
-  inpGate : Linear.LinearLayer Buffer PreparedDispatch   -- per_layer_inp_gate Q4_K [hiddenSize → embdPerLayer]
-  proj : Linear.LinearLayer Buffer PreparedDispatch      -- per_layer_proj Q4_K [embdPerLayer → hiddenSize]
-  postNorm : RMSNorm.RMSNorm Buffer PreparedDispatch     -- per_layer_post_norm
+structure Gemma4PerLayerEmbd (BufT CacheT : Type) where
+  inpGate : Linear.LinearLayer BufT CacheT
+  proj : Linear.LinearLayer BufT CacheT
+  postNorm : RMSNorm.RMSNorm BufT CacheT
 
 /-- Embedding format for token embedding table -/
 inductive EmbdFormat where
@@ -846,22 +841,18 @@ inductive EmbdFormat where
   deriving Repr, BEq, Inhabited
 
 /-- Complete Gemma 4 model -/
-structure Gemma4Model where
+structure Gemma4Model (BufT CacheT : Type) where
   config : Config
-  embedding : Embedding.Embedding Buffer   -- Used when embdFormat = F32 or F16
-  embdFormat : EmbdFormat                 -- How to interpret the embedding buffer
-  blocks : Array Gemma4Block
-  finalNorm : RMSNorm.RMSNorm Buffer PreparedDispatch
-  outputWeight : Buffer           -- LM head [vocabSize, hiddenSize]
-  -- Per-layer embeddings (optional)
-  -- perLayerEmbdTableCPU: kept on CPU because the full table can be > 2 GB,
-  -- exceeding WebGPU's 256 MB single-buffer binding limit. We dequant just the
-  -- row for the input token at inference time and upload (~43 KB) per token.
+  embedding : Embedding.Embedding BufT
+  embdFormat : EmbdFormat
+  blocks : Array (Gemma4Block BufT CacheT)
+  finalNorm : RMSNorm.RMSNorm BufT CacheT
+  outputWeight : BufT
   perLayerEmbdTableCPU : Option ByteArray
-  perLayerEmbdRowBytes : Nat                -- Bytes per row in the Q6_K table (8820 for 10752 elements)
-  perLayerModelProj : Option Buffer         -- per_layer_model_proj [embdPerLayer * numLayers, hiddenSize]
-  perLayerProjNorm : Option (RMSNorm.RMSNorm Buffer PreparedDispatch) -- per_layer_proj_norm
-  perLayerBlocks : Array (Option Gemma4PerLayerEmbd)  -- per-layer gate/proj/norm
+  perLayerEmbdRowBytes : Nat
+  perLayerModelProj : Option BufT
+  perLayerProjNorm : Option (RMSNorm.RMSNorm BufT CacheT)
+  perLayerBlocks : Array (Option (Gemma4PerLayerEmbd BufT CacheT))
 
 /-! ## Helper: Create GPU Buffer from ByteArray -/
 
@@ -909,7 +900,7 @@ private def loadLinear (device : Device) (gguf : Hesper.GGUF.GGUFFile)
 
 /-- Load Gemma 4 model from GGUF file -/
 def Gemma4Model.fromGGUF (device : Device) (ggufPath : String)
-    (configOverride : Option Config := none) : IO Gemma4Model := do
+    (configOverride : Option Config := none) : IO (Gemma4Model Buffer PreparedDispatch) := do
   IO.println s!"[Gemma4] Loading model from {ggufPath}..."
 
   -- Step 1: Parse GGUF file
@@ -970,7 +961,7 @@ def Gemma4Model.fromGGUF (device : Device) (ggufPath : String)
 
   -- Step 4: Load transformer blocks
   IO.println s!"[Gemma4] Loading {cfg.numHiddenLayers} transformer blocks..."
-  let mut blocks : Array Gemma4Block := #[]
+  let mut blocks : Array (Gemma4Block Buffer PreparedDispatch) := #[]
 
   for layerIdx in [0:cfg.numHiddenLayers] do
     if layerIdx % 10 == 0 then
@@ -1007,7 +998,7 @@ def Gemma4Model.fromGGUF (device : Device) (ggufPath : String)
     let qNormBuf ← uploadBuffer device qNormData
     let kNormBuf ← uploadBuffer device kNormData
 
-    let attention : Gemma4Attention := {
+    let attention : Gemma4Attention Buffer PreparedDispatch := {
       wQ, wK, wV, wO
       qNormWeight := qNormBuf
       kNormWeight := kNormBuf
@@ -1019,7 +1010,7 @@ def Gemma4Model.fromGGUF (device : Device) (ggufPath : String)
     let ffnDown ← loadLinear device gguf s!"blk.{li}.ffn_down.weight" cfg.intermediateSize cfg.hiddenSize
 
     let fusedGateUpPrepared ← IO.mkRef (none : Option Hesper.WGSL.Execute.PreparedDispatch)
-    let ffn : Gemma4FFN :=
+    let ffn : Gemma4FFN Buffer PreparedDispatch :=
       { gate := ffnGate, up := ffnUp, down := ffnDown, fusedGateUpPrepared }
 
     -- Load optional RoPE frequency factors
@@ -1135,7 +1126,7 @@ def Gemma4Model.fromGGUF (device : Device) (ggufPath : String)
       pure (none, 0, none, none)
 
   -- Per-layer gate/proj/norm per block
-  let mut perLayerBlocks : Array (Option Gemma4PerLayerEmbd) := #[]
+  let mut perLayerBlocks : Array (Option (Gemma4PerLayerEmbd Buffer PreparedDispatch)) := #[]
   for li in [0:cfg.numHiddenLayers] do
     if cfg.hasPerLayerEmbeddings then
       -- Load Q4_K linear layers for inp_gate and proj
@@ -1158,7 +1149,7 @@ def Gemma4Model.fromGGUF (device : Device) (ggufPath : String)
               bytes := bytes.push 0x3f
             pure bytes
           RMSNorm.create (β := Device) device normConfig dummyData
-      perLayerBlocks := perLayerBlocks.push (some { inpGate, proj, postNorm : Gemma4PerLayerEmbd })
+      perLayerBlocks := perLayerBlocks.push (some { inpGate, proj, postNorm : Gemma4PerLayerEmbd Buffer PreparedDispatch })
     else
       perLayerBlocks := perLayerBlocks.push none
 
@@ -1190,54 +1181,54 @@ def loadGGUF (path : String) : IO Hesper.GGUF.GGUFFile := do
 /-! ## KV Cache State -/
 
 /-- Per-layer KV cache for Gemma 4 -/
-structure Gemma4KVCache where
-  kBuf : Buffer    -- [numKVHeads, maxSeqLen, headDim]
-  vBuf : Buffer    -- [numKVHeads, maxSeqLen, headDim]
+structure Gemma4KVCache (BufT : Type) where
+  kBuf : BufT    -- [numKVHeads, maxSeqLen, headDim]
+  vBuf : BufT    -- [numKVHeads, maxSeqLen, headDim]
 
 /-- Full inference state -/
-structure InferenceState where
-  kvCaches : Array Gemma4KVCache
-  buf1 : Buffer          -- [hiddenSize] ping-pong
-  buf2 : Buffer          -- [hiddenSize] ping-pong
-  qBuf : Buffer          -- [numHeads * headDim] Q projection output
-  kBuf : Buffer          -- [numKVHeads * headDim] K projection output
-  vBuf : Buffer          -- [numKVHeads * headDim] V projection output
-  attnOutBuf : Buffer    -- [numHeads * headDim] attention output
-  gateBuf : Buffer       -- [intermediateSize] FFN gate output
-  upBuf : Buffer         -- [intermediateSize] FFN up output
-  geluBuf : Buffer       -- [intermediateSize] GELU*up output
-  ffnOutBuf : Buffer     -- [hiddenSize] FFN down output
-  normedBuf : Buffer     -- [hiddenSize] normalized output
-  attnResidualBuf : Buffer  -- [hiddenSize] attn output + residual (between attn and FFN)
-  qBuf2 : Buffer            -- [maxQDim] alternate Q buffer (for in-place ops)
-  kBuf2 : Buffer            -- [maxKVDim] alternate K buffer
-  vBuf2 : Buffer            -- [maxKVDim] alternate V buffer
-  normedBuf2 : Buffer       -- [hiddenSize] alternate normed buffer
-  logitsBuf : Buffer     -- [vocabSize]
-  logitsBuf2 : Buffer    -- [vocabSize] scratch for logit softcap (no aliasing)
-  tokenBuf : Buffer      -- [1] u32 for single token
-  paramsBuf : Buffer     -- [2] u32: (pos, cacheLen) for RoPE
+structure InferenceState (BufT CacheT : Type) where
+  kvCaches : Array (Gemma4KVCache BufT)
+  buf1 : BufT          -- [hiddenSize] ping-pong
+  buf2 : BufT          -- [hiddenSize] ping-pong
+  qBuf : BufT          -- [numHeads * headDim] Q projection output
+  kBuf : BufT          -- [numKVHeads * headDim] K projection output
+  vBuf : BufT          -- [numKVHeads * headDim] V projection output
+  attnOutBuf : BufT    -- [numHeads * headDim] attention output
+  gateBuf : BufT       -- [intermediateSize] FFN gate output
+  upBuf : BufT         -- [intermediateSize] FFN up output
+  geluBuf : BufT       -- [intermediateSize] GELU*up output
+  ffnOutBuf : BufT     -- [hiddenSize] FFN down output
+  normedBuf : BufT     -- [hiddenSize] normalized output
+  attnResidualBuf : BufT  -- [hiddenSize] attn output + residual (between attn and FFN)
+  qBuf2 : BufT            -- [maxQDim] alternate Q buffer (for in-place ops)
+  kBuf2 : BufT            -- [maxKVDim] alternate K buffer
+  vBuf2 : BufT            -- [maxKVDim] alternate V buffer
+  normedBuf2 : BufT       -- [hiddenSize] alternate normed buffer
+  logitsBuf : BufT     -- [vocabSize]
+  logitsBuf2 : BufT    -- [vocabSize] scratch for logit softcap (no aliasing)
+  tokenBuf : BufT      -- [1] u32 for single token
+  paramsBuf : BufT     -- [2] u32: (pos, cacheLen) for RoPE
   -- MoE buffers
-  moeRouterOutBuf : Buffer    -- [hiddenSize] router preprocessed input
-  moeLogitsBuf : Buffer       -- [numExperts] router logits
-  moeIndicesBuf : Buffer      -- [numExpertsUsed] selected expert indices
-  moeWeightsBuf : Buffer      -- [numExpertsUsed] expert weights
-  moeExpertOutBuf : Buffer    -- [hiddenSize] combined expert output
-  moeExpertGateBuf : Buffer   -- [expertFFSize] expert gate projection output
-  moeExpertUpBuf : Buffer     -- [expertFFSize] expert up projection output
-  moeExpertGeluBuf : Buffer   -- [expertFFSize] expert GELU*up output
-  moeExpertDownBuf : Buffer   -- [hiddenSize] single expert down output
-  moeNormedBuf : Buffer       -- [hiddenSize] pre_norm_2 output for routed experts
+  moeRouterOutBuf : BufT    -- [hiddenSize] router preprocessed input
+  moeLogitsBuf : BufT       -- [numExperts] router logits
+  moeIndicesBuf : BufT      -- [numExpertsUsed] selected expert indices
+  moeWeightsBuf : BufT      -- [numExpertsUsed] expert weights
+  moeExpertOutBuf : BufT    -- [hiddenSize] combined expert output
+  moeExpertGateBuf : BufT   -- [expertFFSize] expert gate projection output
+  moeExpertUpBuf : BufT     -- [expertFFSize] expert up projection output
+  moeExpertGeluBuf : BufT   -- [expertFFSize] expert GELU*up output
+  moeExpertDownBuf : BufT   -- [hiddenSize] single expert down output
+  moeNormedBuf : BufT       -- [hiddenSize] pre_norm_2 output for routed experts
   -- Per-layer embedding buffers
-  plGateBuf : Buffer          -- [embdPerLayer] per-layer gate output
-  plProjBuf : Buffer          -- [hiddenSize] per-layer projected output
+  plGateBuf : BufT          -- [embdPerLayer] per-layer gate output
+  plProjBuf : BufT          -- [hiddenSize] per-layer projected output
   -- Per-layer input precomputation (computed once per token, used by all layers)
-  plTokenSelected : Buffer    -- [embdPerLayer * numLayers] tok_embd_per_layer[token] dequantized
-  plModelProj : Buffer        -- [embdPerLayer * numLayers] per_layer_model_proj @ scaled_embed
-  plInputAll : Buffer         -- [embdPerLayer * numLayers] final per-layer input (sum, normed, scaled)
+  plTokenSelected : BufT    -- [embdPerLayer * numLayers] tok_embd_per_layer[token] dequantized
+  plModelProj : BufT        -- [embdPerLayer * numLayers] per_layer_model_proj @ scaled_embed
+  plInputAll : BufT         -- [embdPerLayer * numLayers] final per-layer input (sum, normed, scaled)
   -- Partial buffer for tiled (split-K) flash attention. Pre-allocated
   -- at createInferenceState with size for the maximum tile count.
-  flashPartialBuf : Buffer
+  flashPartialBuf : BufT
   -- Small GPU-side scratch for the raw Q6_K bytes of one per-layer
   -- embedding row (~33 KB for Gemma 4 e4b). The full per-layer
   -- embedding table lives on CPU (> WebGPU single-buffer limit); at
@@ -1245,15 +1236,15 @@ structure InferenceState where
   -- upload it here, and dequant on-GPU via `q6kSingleRowDequantScaleKernel`.
   -- Sized to the maximum row bytes seen at load time; left as a small
   -- placeholder when per-layer embeddings are absent.
-  plRawRowBuf : Buffer
+  plRawRowBuf : BufT
   -- Optional: pre-softcap logits buffer for TTT surprise sensor.
   -- When `some`, forwardSingleToken copies logitsBuf here BEFORE
   -- applying logit softcap. When `none` (default), no copy is done
   -- and there is zero performance impact.
-  preSoftcapBuf : Option Buffer := none
+  preSoftcapBuf : Option BufT := none
 
 /-- Create inference state with pre-allocated buffers -/
-def createInferenceState (device : Device) (cfg : Config) : IO InferenceState := do
+def createInferenceState (device : Device) (cfg : Config) : IO (InferenceState Buffer PreparedDispatch) := do
   let mkBuf := fun (size : Nat) => createBuffer device {
     size := (size * 4).toUSize  -- f32 = 4 bytes
     usage := [.storage, .copySrc, .copyDst]
@@ -1264,7 +1255,7 @@ def createInferenceState (device : Device) (cfg : Config) : IO InferenceState :=
   let maxKVDim := (max cfg.numKeyValueHeadsFull cfg.numKeyValueHeadsSWA) * maxHeadDim
 
   -- Create per-layer KV caches
-  let mut kvCaches : Array Gemma4KVCache := #[]
+  let mut kvCaches : Array (Gemma4KVCache Buffer) := #[]
   for li in [0:cfg.numHiddenLayers] do
     let numKVHeads := cfg.numKVHeads li
     let headDim := cfg.headDim li
@@ -1334,9 +1325,9 @@ def createInferenceState (device : Device) (cfg : Config) : IO InferenceState :=
     1. attnNorm(input) → Q/K/V projections → Q-norm, K-norm → attention → postAttnNorm → + residual
     2. ffnNorm(attn_out) → GeGLU FFN → postFFNNorm → + residual
 -/
-def forwardBlock (device : Device) (block : Gemma4Block) (cfg : Config)
-    (inputBuf outputBuf : Buffer) (state : InferenceState) (pos : Nat)
-    (perLayerEmbd : Option Gemma4PerLayerEmbd := none)
+def forwardBlock (device : Device) (block : Gemma4Block Buffer PreparedDispatch) (cfg : Config)
+    (inputBuf outputBuf : Buffer) (state : InferenceState Buffer PreparedDispatch) (pos : Nat)
+    (perLayerEmbd : Option (Gemma4PerLayerEmbd Buffer PreparedDispatch) := none)
     (perLayerInput : Option Buffer := none) : IO Unit := do
   let li := block.layerIdx
   let headDim := cfg.headDim li
@@ -1686,8 +1677,8 @@ def forwardBlock (device : Device) (block : Gemma4Block) (cfg : Config)
 
 /-- Run full single-token forward pass through the model.
     Returns logits in state.logitsBuf. -/
-def forwardSingleToken (device : Device) (model : Gemma4Model)
-    (tokenId : Nat) (pos : Nat) (state : InferenceState) : IO Unit := do
+def forwardSingleToken (device : Device) (model : Gemma4Model Buffer PreparedDispatch)
+    (tokenId : Nat) (pos : Nat) (state : InferenceState Buffer PreparedDispatch) : IO Unit := do
   -- Step 1: Embedding lookup (format-dependent)
   let tokenBytes := Hesper.WebGPU.BufferOps.uint32ToBytes tokenId.toUInt32
   writeBuffer device state.tokenBuf 0 tokenBytes
@@ -1867,7 +1858,7 @@ def forwardSingleToken (device : Device) (model : Gemma4Model)
     @param maxTokens Maximum new tokens to generate
     @param eosToken Optional EOS token ID for early stopping
 -/
-def generate (device : Device) (model : Gemma4Model)
+def generate (device : Device) (model : Gemma4Model Buffer PreparedDispatch)
     (promptTokens : Array Nat) (maxTokens : Nat)
     (eosToken : Option Nat := none)
     (extraEosTokens : Array Nat := #[]) : IO (Array Nat) := do
