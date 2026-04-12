@@ -164,6 +164,7 @@ inductive Inst where
   | floor_f32   (dst src : RegF32)
   | ceil_f32    (dst src : RegF32)
   | selp_f32    (dst ifTrue ifFalse : RegF32) (pred : RegPred)
+  | selp_u32    (dst ifTrue ifFalse : RegU32) (pred : RegPred)
 
   -- ── u32 arithmetic ── (all operands: RegU32)
   | mov_u32     (dst src : RegU32)
@@ -175,6 +176,7 @@ inductive Inst where
   | div_u32     (dst src1 src2 : RegU32)
   | rem_u32     (dst src1 src2 : RegU32)
   | shl_u32     (dst src : RegU32) (bits : Nat)
+  | shl_u32_reg (dst src1 src2 : RegU32)
   | shr_u32     (dst src1 src2 : RegU32)
   | and_u32     (dst src1 src2 : RegU32)
   | or_u32      (dst src1 src2 : RegU32)
@@ -258,6 +260,7 @@ def Inst.toString : Inst → String
   | .floor_f32 d s       => s!"  cvt.rmi.f32.f32 {d}, {s};"
   | .ceil_f32 d s        => s!"  cvt.rpi.f32.f32 {d}, {s};"
   | .selp_f32 d t f p    => s!"  selp.f32 {d}, {t}, {f}, {p};"
+  | .selp_u32 d t f p    => s!"  selp.u32 {d}, {t}, {f}, {p};"
   | .mov_u32 d s         => s!"  mov.u32 {d}, {s};"
   | .mov_u32_imm d n     => s!"  mov.u32 {d}, {n};"
   | .add_u32 d a b       => s!"  add.u32 {d}, {a}, {b};"
@@ -267,6 +270,7 @@ def Inst.toString : Inst → String
   | .div_u32 d a b       => s!"  div.u32 {d}, {a}, {b};"
   | .rem_u32 d a b       => s!"  rem.u32 {d}, {a}, {b};"
   | .shl_u32 d s n       => s!"  shl.b32 {d}, {s}, {n};"
+  | .shl_u32_reg d a b   => s!"  shl.b32 {d}, {a}, {b};"
   | .shr_u32 d a b       => s!"  shr.u32 {d}, {a}, {b};"
   | .and_u32 d a b       => s!"  and.b32 {d}, {a}, {b};"
   | .or_u32 d a b        => s!"  or.b32 {d}, {a}, {b};"
