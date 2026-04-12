@@ -104,6 +104,28 @@ def runGeneration (args : List String) : IO Unit := do
   IO.println s!"Prompt tokens ({promptTokens.size}): {promptTokens}"
   IO.println ""
 
+  -- Debug: logits after first token
+  IO.println "[Debug] Forward single token for logit comparison..."
+  let dbgCache ← createKVCacheState (β := Device) device model
+  forwardSingleToken (β := Device) device model promptTokens[0]! 0 dbgCache
+  let dbgBytes ← GPUBackend.readBuffer (β := Device) device dbgCache.logitsBuf (min 40 (model.config.vocabSize * 4)).toUSize
+  IO.println s!"[Debug] First 10 logits after token {promptTokens[0]!}:"
+  for i in List.range 10 do
+    let off := i * 4
+    if off + 4 <= dbgBytes.size then
+      let b0 : UInt32 := dbgBytes.get! off |>.toUInt32
+      let b1 : UInt32 := dbgBytes.get! (off+1) |>.toUInt32
+      let b2 : UInt32 := dbgBytes.get! (off+2) |>.toUInt32
+      let b3 : UInt32 := dbgBytes.get! (off+3) |>.toUInt32
+      let bits := b0 ||| (b1 <<< 8) ||| (b2 <<< 16) ||| (b3 <<< 24)
+      let e := (bits >>> 23) &&& 0xFF; let m := bits &&& (0x7FFFFF : UInt32); let s := bits >>> 31
+      let v := if e == 0 then 0.0 else
+        let fv := (1.0 + m.toNat.toFloat / 8388608.0) * Float.pow 2.0 (e.toNat.toFloat - 127.0)
+        if s == 1 then -fv else fv
+      IO.println s!"  logit[{i}] = {v}"
+  let dbgArgmax ← gpuArgmax (β := Device) device dbgCache.logitsBuf dbgCache.argmaxBuf model.config.vocabSize
+  IO.println s!"[Debug] argmax = {dbgArgmax}"
+
   let outputTokens ← match loraPath with
   | some p =>
     -- Load LoRA adapter and generate with it
