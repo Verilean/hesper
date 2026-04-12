@@ -135,6 +135,7 @@ extern "C" lean_obj_res lean_hesper_cuda_memcpy_htod(
 }
 
 extern "C" lean_obj_res lean_hesper_cuda_memcpy_dtoh(size_t src_val, size_t size) {
+    CUDA_CHECK(cuCtxSynchronize(), "cuCtxSynchronize (before readback)");
     lean_obj_res arr = lean_alloc_sarray(1, size, size);
     CUDA_CHECK(cuMemcpyDtoH(lean_sarray_cptr(arr), (CUdeviceptr)src_val, size),
                "cuMemcpyDtoH");
@@ -167,7 +168,7 @@ extern "C" lean_obj_res lean_hesper_cuda_launch_kernel(
     CUDA_CHECK(cuLaunchKernel((CUfunction)func_val,
         gx, gy, gz, bx, by, bz,
         smem, nullptr, args, nullptr), "cuLaunchKernel");
-    CUDA_CHECK(cuCtxSynchronize(), "cuCtxSynchronize");
+    // No sync here — async launch. Sync happens in readBuffer.
     free(ptrs); free(args);
     return lean_io_result_mk_ok(lean_box(0));
 }
