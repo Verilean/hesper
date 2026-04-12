@@ -856,23 +856,19 @@ structure Gemma4Model (BufT CacheT : Type) where
 
 /-! ## Helper: Create GPU Buffer from ByteArray -/
 
-private def uploadBuffer (device : Device) (data : ByteArray) (usage : List WebGPU.BufferUsage := [.storage, .copyDst]) : IO Buffer := do
+private def uploadBuffer [GPUBackend β] (ctx : β) (data : ByteArray) : IO (GPUBackend.Buf β) := do
   let bufSize := if data.size == 0 then 4 else data.size
-  let buf ← createBuffer device {
-    size := bufSize.toUSize
-    usage := usage
-    mappedAtCreation := false
-  }
+  let buf ← GPUBackend.allocBuffer ctx bufSize.toUSize
   if data.size > 0 then
-    writeBuffer device buf 0 data
+    GPUBackend.writeBuffer ctx buf data
   return buf
 
 /-! ## GGUF Model Loading -/
 
 /-- Load a single quantized linear layer from GGUF tensor.
     Detects quant format (Q4_K vs Q6_K) and selects the appropriate fused kernel. -/
-private def loadLinear (device : Device) (gguf : Hesper.GGUF.GGUFFile)
-    (name : String) (inDim outDim : Nat) : IO (Linear.LinearLayer Buffer PreparedDispatch) := do
+private def loadLinear [GPUBackend β] (ctx : β) (gguf : Hesper.GGUF.GGUFFile)
+    (name : String) (inDim outDim : Nat) : IO (Linear.LinearLayer (GPUBackend.Buf β) (GPUBackend.CachedDispatch β)) := do
   -- Detect quant format from tensor type
   let tensorInfo ← match Hesper.GGUF.Loader.findTensor gguf name with
     | .ok ti => pure ti
@@ -883,11 +879,11 @@ private def loadLinear (device : Device) (gguf : Hesper.GGUF.GGUFFile)
   let (_, data) ← match Hesper.GGUF.Loader.getTensorData gguf name with
     | .ok r => pure r
     | .error e => throw $ IO.userError e
-  let weightBuf ← uploadBuffer device data
-  let prepared ← IO.mkRef none
+  let weightBuf ← uploadBuffer ctx data
+  let prepared ← GPUBackend.newCacheRef (β := β)
   let splitKBuf ← IO.mkRef none
-  let splitKPartialPrepared ← IO.mkRef none
-  let splitKReducePrepared ← IO.mkRef none
+  let splitKPartialPrepared ← GPUBackend.newCacheRef (β := β)
+  let splitKReducePrepared ← GPUBackend.newCacheRef (β := β)
   return {
     config := { inDim, outDim }
     weightBuf
@@ -899,8 +895,8 @@ private def loadLinear (device : Device) (gguf : Hesper.GGUF.GGUFFile)
   }
 
 /-- Load Gemma 4 model from GGUF file -/
-def Gemma4Model.fromGGUF (device : Device) (ggufPath : String)
-    (configOverride : Option Config := none) : IO (Gemma4Model Buffer PreparedDispatch) := do
+def Gemma4Model.fromGGUF [GPUBackend β] (ctx : β) (ggufPath : String)
+    (configOverride : Option Config := none) : IO (Gemma4Model (GPUBackend.Buf β) (GPUBackend.CachedDispatch β)) := do
   IO.println s!"[Gemma4] Loading model from {ggufPath}..."
 
   -- Step 1: Parse GGUF file
@@ -935,33 +931,33 @@ def Gemma4Model.fromGGUF (device : Device) (ggufPath : String)
     | .F16 =>
       IO.println "  Using F16 embeddings"
       let embData ← Hesper.GGUF.Loader.extractF16Tensor gguf "token_embd.weight"
-      let e ← Embedding.createFromF16 (β := Device) device embConfig embData
+      let e ← Embedding.createFromF16 ctx embConfig embData
       pure (e, EmbdFormat.F16)
     | .Q6_K =>
       IO.println "  Using Q6_K embeddings (GPU on-the-fly dequant)"
       let (_, data) ← match Hesper.GGUF.Loader.getTensorData gguf "token_embd.weight" with
         | .ok r => pure r
         | .error e => throw $ IO.userError e
-      let buf ← uploadBuffer device data
-      pure ({ config := embConfig, embeddingTable := buf, f16Table := none : Embedding.Embedding Buffer }, EmbdFormat.Q6_K)
+      let buf ← uploadBuffer ctx data
+      pure ({ config := embConfig, embeddingTable := buf, f16Table := none : Embedding.Embedding (GPUBackend.Buf β) }, EmbdFormat.Q6_K)
     | .Q4_K =>
       IO.println "  Using Q4_K embeddings (GPU on-the-fly dequant)"
       let (_, data) ← match Hesper.GGUF.Loader.getTensorData gguf "token_embd.weight" with
         | .ok r => pure r
         | .error e => throw $ IO.userError e
-      let buf ← uploadBuffer device data
-      pure ({ config := embConfig, embeddingTable := buf, f16Table := none : Embedding.Embedding Buffer }, EmbdFormat.Q4_K)
+      let buf ← uploadBuffer ctx data
+      pure ({ config := embConfig, embeddingTable := buf, f16Table := none : Embedding.Embedding (GPUBackend.Buf β) }, EmbdFormat.Q4_K)
     | other =>
       IO.println s!"  Embedding type: {other} — loading as raw bytes (F32 fallback)"
       let (_, data) ← match Hesper.GGUF.Loader.getTensorData gguf "token_embd.weight" with
         | .ok r => pure r
         | .error e => throw $ IO.userError e
-      let buf ← uploadBuffer device data
-      pure ({ config := embConfig, embeddingTable := buf, f16Table := none : Embedding.Embedding Buffer }, EmbdFormat.F32)
+      let buf ← uploadBuffer ctx data
+      pure ({ config := embConfig, embeddingTable := buf, f16Table := none : Embedding.Embedding (GPUBackend.Buf β) }, EmbdFormat.F32)
 
   -- Step 4: Load transformer blocks
   IO.println s!"[Gemma4] Loading {cfg.numHiddenLayers} transformer blocks..."
-  let mut blocks : Array (Gemma4Block Buffer PreparedDispatch) := #[]
+  let mut blocks : Array (Gemma4Block (GPUBackend.Buf β) (GPUBackend.CachedDispatch β)) := #[]
 
   for layerIdx in [0:cfg.numHiddenLayers] do
     if layerIdx % 10 == 0 then
@@ -979,38 +975,38 @@ def Gemma4Model.fromGGUF (device : Device) (ggufPath : String)
     let postFFNNormData ← Hesper.GGUF.Loader.extractFloat32Tensor gguf s!"blk.{li}.post_ffw_norm.weight"
 
     let normConfig : RMSNorm.Config := { dim := cfg.hiddenSize, eps := cfg.rmsNormEps }
-    let attnNorm ← RMSNorm.create (β := Device) device normConfig attnNormData
-    let postAttnNorm ← RMSNorm.create (β := Device) device normConfig postAttnNormData
-    let ffnNorm ← RMSNorm.create (β := Device) device normConfig ffnNormData
-    let postFFNNorm ← RMSNorm.create (β := Device) device normConfig postFFNNormData
+    let attnNorm ← RMSNorm.create ctx normConfig attnNormData
+    let postAttnNorm ← RMSNorm.create ctx normConfig postAttnNormData
+    let ffnNorm ← RMSNorm.create ctx normConfig ffnNormData
+    let postFFNNorm ← RMSNorm.create ctx normConfig postFFNNormData
 
     -- Load attention projections (Q4_K)
     let qDim := cfg.numAttentionHeads * headDim
     let kvDim := numKVHeads * headDim
-    let wQ ← loadLinear device gguf s!"blk.{li}.attn_q.weight" cfg.hiddenSize qDim
-    let wK ← loadLinear device gguf s!"blk.{li}.attn_k.weight" cfg.hiddenSize kvDim
-    let wV ← loadLinear device gguf s!"blk.{li}.attn_v.weight" cfg.hiddenSize kvDim
-    let wO ← loadLinear device gguf s!"blk.{li}.attn_output.weight" qDim cfg.hiddenSize
+    let wQ ← loadLinear ctx gguf s!"blk.{li}.attn_q.weight" cfg.hiddenSize qDim
+    let wK ← loadLinear ctx gguf s!"blk.{li}.attn_k.weight" cfg.hiddenSize kvDim
+    let wV ← loadLinear ctx gguf s!"blk.{li}.attn_v.weight" cfg.hiddenSize kvDim
+    let wO ← loadLinear ctx gguf s!"blk.{li}.attn_output.weight" qDim cfg.hiddenSize
 
     -- Load Q/K norm weights (Float32, per-head dimension)
     let qNormData ← Hesper.GGUF.Loader.extractFloat32Tensor gguf s!"blk.{li}.attn_q_norm.weight"
     let kNormData ← Hesper.GGUF.Loader.extractFloat32Tensor gguf s!"blk.{li}.attn_k_norm.weight"
-    let qNormBuf ← uploadBuffer device qNormData
-    let kNormBuf ← uploadBuffer device kNormData
+    let qNormBuf ← uploadBuffer ctx qNormData
+    let kNormBuf ← uploadBuffer ctx kNormData
 
-    let attention : Gemma4Attention Buffer PreparedDispatch := {
+    let attention : Gemma4Attention (GPUBackend.Buf β) (GPUBackend.CachedDispatch β) := {
       wQ, wK, wV, wO
       qNormWeight := qNormBuf
       kNormWeight := kNormBuf
     }
 
     -- Load FFN projections (Q4_K)
-    let ffnGate ← loadLinear device gguf s!"blk.{li}.ffn_gate.weight" cfg.hiddenSize cfg.intermediateSize
-    let ffnUp ← loadLinear device gguf s!"blk.{li}.ffn_up.weight" cfg.hiddenSize cfg.intermediateSize
-    let ffnDown ← loadLinear device gguf s!"blk.{li}.ffn_down.weight" cfg.intermediateSize cfg.hiddenSize
+    let ffnGate ← loadLinear ctx gguf s!"blk.{li}.ffn_gate.weight" cfg.hiddenSize cfg.intermediateSize
+    let ffnUp ← loadLinear ctx gguf s!"blk.{li}.ffn_up.weight" cfg.hiddenSize cfg.intermediateSize
+    let ffnDown ← loadLinear ctx gguf s!"blk.{li}.ffn_down.weight" cfg.intermediateSize cfg.hiddenSize
 
-    let fusedGateUpPrepared ← IO.mkRef (none : Option Hesper.WGSL.Execute.PreparedDispatch)
-    let ffn : Gemma4FFN Buffer PreparedDispatch :=
+    let fusedGateUpPrepared ← GPUBackend.newCacheRef (β := β)
+    let ffn : Gemma4FFN (GPUBackend.Buf β) (GPUBackend.CachedDispatch β) :=
       { gate := ffnGate, up := ffnUp, down := ffnDown, fusedGateUpPrepared }
 
     -- Load optional RoPE frequency factors
@@ -1018,13 +1014,13 @@ def Gemma4Model.fromGGUF (device : Device) (ggufPath : String)
     let ropeFreqFactors ← if cfg.isFullAttention li then
       match Hesper.GGUF.Loader.getTensorData gguf "rope_freqs.weight" with
       | .ok (_, data) =>
-        let buf ← uploadBuffer device data
+        let buf ← uploadBuffer ctx data
         pure (some buf)
       | .error _ =>
         -- Try per-layer
         match Hesper.GGUF.Loader.getTensorData gguf s!"blk.{li}.rope_freqs.weight" with
         | .ok (_, data) =>
-          let buf ← uploadBuffer device data
+          let buf ← uploadBuffer ctx data
           pure (some buf)
         | .error _ => pure none
     else pure none
@@ -1032,7 +1028,7 @@ def Gemma4Model.fromGGUF (device : Device) (ggufPath : String)
     -- Load optional layer output scale
     let outScale ← match Hesper.GGUF.Loader.getTensorData gguf s!"blk.{li}.layer_output_scale.weight" with
       | .ok (_, data) =>
-        let buf ← uploadBuffer device data
+        let buf ← uploadBuffer ctx data
         pure (some buf)
       | .error _ => pure none
 
@@ -1043,31 +1039,31 @@ def Gemma4Model.fromGGUF (device : Device) (ggufPath : String)
       if isMoE then do
         IO.println s!"    Layer {li}: MoE layer"
         let routerW ← match Hesper.GGUF.Loader.getTensorData gguf s!"blk.{li}.ffn_gate_inp.weight" with
-          | .ok (_, data) => pure (some (← uploadBuffer device data))
+          | .ok (_, data) => pure (some (← uploadBuffer ctx data))
           | .error _ => pure none
         let routerS ← match Hesper.GGUF.Loader.getTensorData gguf s!"blk.{li}.ffn_gate_inp.scale" with
-          | .ok (_, data) => pure (some (← uploadBuffer device data))
+          | .ok (_, data) => pure (some (← uploadBuffer ctx data))
           | .error _ => pure none
         let gateUpE ← match Hesper.GGUF.Loader.getTensorData gguf s!"blk.{li}.ffn_gate_up_exps.weight" with
-          | .ok (_, data) => pure (some (← uploadBuffer device data))
+          | .ok (_, data) => pure (some (← uploadBuffer ctx data))
           | .error _ => pure none
         let downE ← match Hesper.GGUF.Loader.getTensorData gguf s!"blk.{li}.ffn_down_exps.weight" with
-          | .ok (_, data) => pure (some (← uploadBuffer device data))
+          | .ok (_, data) => pure (some (← uploadBuffer ctx data))
           | .error _ => pure none
         let preN2 ← match Hesper.GGUF.Loader.findTensor gguf s!"blk.{li}.ffn_pre_norm_2.weight" with
           | .ok _ =>
             let d ← Hesper.GGUF.Loader.extractFloat32Tensor gguf s!"blk.{li}.ffn_pre_norm_2.weight"
-            pure (some (← RMSNorm.create (β := Device) device normConfig d))
+            pure (some (← RMSNorm.create ctx normConfig d))
           | .error _ => pure none
         let postN1 ← match Hesper.GGUF.Loader.findTensor gguf s!"blk.{li}.ffn_post_norm_1.weight" with
           | .ok _ =>
             let d ← Hesper.GGUF.Loader.extractFloat32Tensor gguf s!"blk.{li}.ffn_post_norm_1.weight"
-            pure (some (← RMSNorm.create (β := Device) device normConfig d))
+            pure (some (← RMSNorm.create ctx normConfig d))
           | .error _ => pure none
         let postN2 ← match Hesper.GGUF.Loader.findTensor gguf s!"blk.{li}.ffn_post_norm_2.weight" with
           | .ok _ =>
             let d ← Hesper.GGUF.Loader.extractFloat32Tensor gguf s!"blk.{li}.ffn_post_norm_2.weight"
-            pure (some (← RMSNorm.create (β := Device) device normConfig d))
+            pure (some (← RMSNorm.create ctx normConfig d))
           | .error _ => pure none
         pure (routerW, routerS, gateUpE, downE, preN2, postN1, postN2)
       else
@@ -1088,13 +1084,13 @@ def Gemma4Model.fromGGUF (device : Device) (ggufPath : String)
   IO.println "[Gemma4] Loading final norm and LM head..."
   let finalNormData ← Hesper.GGUF.Loader.extractFloat32Tensor gguf "output_norm.weight"
   let finalNormConfig : RMSNorm.Config := { dim := cfg.hiddenSize, eps := cfg.rmsNormEps }
-  let finalNorm ← RMSNorm.create (β := Device) device finalNormConfig finalNormData
+  let finalNorm ← RMSNorm.create ctx finalNormConfig finalNormData
 
   -- Step 6: LM head (output.weight or weight-tied with embedding)
   let outputWeight ← match Hesper.GGUF.Loader.getTensorData gguf "output.weight" with
     | .ok (_, data) =>
       IO.println "  Using separate LM head weights"
-      uploadBuffer device data
+      uploadBuffer ctx data
     | .error _ =>
       IO.println "  Using weight-tied LM head (reusing embedding)"
       pure embedding.embeddingTable
@@ -1113,30 +1109,30 @@ def Gemma4Model.fromGGUF (device : Device) (ggufPath : String)
           pure (some data)
         | .error _ => pure none
       let proj ← match Hesper.GGUF.Loader.getTensorData gguf "per_layer_model_proj.weight" with
-        | .ok (_, data) => pure (some (← uploadBuffer device data))
+        | .ok (_, data) => pure (some (← uploadBuffer ctx data))
         | .error _ => pure none
       let projNorm ← match Hesper.GGUF.Loader.findTensor gguf "per_layer_proj_norm.weight" with
         | .ok _ =>
           let d ← Hesper.GGUF.Loader.extractFloat32Tensor gguf "per_layer_proj_norm.weight"
           let plNormConfig : RMSNorm.Config := { dim := cfg.embdPerLayer, eps := cfg.rmsNormEps }
-          pure (some (← RMSNorm.create (β := Device) device plNormConfig d))
+          pure (some (← RMSNorm.create ctx plNormConfig d))
         | .error _ => pure none
       pure (tableData, rowBytes, proj, projNorm)
     else
       pure (none, 0, none, none)
 
   -- Per-layer gate/proj/norm per block
-  let mut perLayerBlocks : Array (Option (Gemma4PerLayerEmbd Buffer PreparedDispatch)) := #[]
+  let mut perLayerBlocks : Array (Option (Gemma4PerLayerEmbd (GPUBackend.Buf β) (GPUBackend.CachedDispatch β))) := #[]
   for li in [0:cfg.numHiddenLayers] do
     if cfg.hasPerLayerEmbeddings then
       -- Load Q4_K linear layers for inp_gate and proj
-      let inpGate ← loadLinear device gguf s!"blk.{li}.inp_gate.weight" cfg.hiddenSize cfg.embdPerLayer
-      let proj ← loadLinear device gguf s!"blk.{li}.proj.weight" cfg.embdPerLayer cfg.hiddenSize
+      let inpGate ← loadLinear ctx gguf s!"blk.{li}.inp_gate.weight" cfg.hiddenSize cfg.embdPerLayer
+      let proj ← loadLinear ctx gguf s!"blk.{li}.proj.weight" cfg.embdPerLayer cfg.hiddenSize
       let normConfig : RMSNorm.Config := { dim := cfg.hiddenSize, eps := cfg.rmsNormEps }
       let postNorm ← match Hesper.GGUF.Loader.findTensor gguf s!"blk.{li}.post_norm.weight" with
         | .ok _ =>
           let d ← Hesper.GGUF.Loader.extractFloat32Tensor gguf s!"blk.{li}.post_norm.weight"
-          RMSNorm.create (β := Device) device normConfig d
+          RMSNorm.create ctx normConfig d
         | .error _ =>
           -- Fallback: create with all-ones weights
           let dummyData : ByteArray ← do
@@ -1148,8 +1144,8 @@ def Gemma4Model.fromGGUF (device : Device) (ggufPath : String)
               bytes := bytes.push 0x80
               bytes := bytes.push 0x3f
             pure bytes
-          RMSNorm.create (β := Device) device normConfig dummyData
-      perLayerBlocks := perLayerBlocks.push (some { inpGate, proj, postNorm : Gemma4PerLayerEmbd Buffer PreparedDispatch })
+          RMSNorm.create ctx normConfig dummyData
+      perLayerBlocks := perLayerBlocks.push (some { inpGate, proj, postNorm : Gemma4PerLayerEmbd (GPUBackend.Buf β) (GPUBackend.CachedDispatch β) })
     else
       perLayerBlocks := perLayerBlocks.push none
 
