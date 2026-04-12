@@ -285,11 +285,13 @@ partial def expToPTX (e : Exp t) (s : GenState) : ExpResult :=
     let isU32 := match arrName with | some n => s.isU32Buffer n | none => false
     if isShared then
       let name := arrName.getD "unknown"
-      let (r, s) := s.freshF32
       let (off, s) := s.freshU32; let s := s.emit (.shl_u32 off rIdx.toU32! 2)
       let (symR, s) := s.freshU32; let s := s.emit (.mov_shared_addr symR name)
       let (addr, s) := s.freshU32; let s := s.emit (.add_u32 addr symR off)
-      (.f32 r, s.emit (.ld_shared_sym r symR off addr))
+      if s.isU32Shared name then
+        let (r, s) := s.freshU32; (.u32 r, s.emit (.ld_shared_sym_u32 r symR off addr))
+      else
+        let (r, s) := s.freshF32; (.f32 r, s.emit (.ld_shared_sym r symR off addr))
     else if isU32 then
       -- u32 buffer → ld.global.u32
       let (r, s) := s.freshU32
@@ -354,7 +356,10 @@ partial def stmtToPTX (stmt : Stmt) (s : GenState) : GenState :=
       let (off, s) := s.freshU32; let s := s.emit (.shl_u32 off rIdx.toU32! 2)
       let (symR, s) := s.freshU32; let s := s.emit (.mov_shared_addr symR arrName)
       let (addr, s) := s.freshU32; let s := s.emit (.add_u32 addr symR off)
-      s.emit (.st_shared_sym rVal.toF32! symR off addr)
+      if s.isU32Shared arrName then
+        s.emit (.st_shared_sym_u32 rVal.toU32! symR off addr)
+      else
+        s.emit (.st_shared_sym rVal.toF32! symR off addr)
     else if s.isU32Buffer arrName then match s.lookupVar arrName with
     | some (.u64 base) =>
       let (off, s) := s.freshU64; let s := s.emit (.mul_wide_u32 off rIdx.toU32! 4)
@@ -421,9 +426,13 @@ def generatePTX
     | .array (.scalar .u32) _ => name :: acc
     | .array (.scalar .atomicU32) _ => name :: acc
     | _ => acc) []
+  let u32SharedNames := state.sharedVars.foldl (fun (acc : List String) (name, ty) =>
+    match ty with
+    | .array (.scalar .u32) _ => name :: acc
+    | _ => acc) []
   let initState := state.declaredBuffers.foldl (fun (s : GenState) (name, _, _) =>
     let (r, s) := s.freshU64; let s := s.emit (.ld_param_u64 r name); s.bindVar name (.u64 r))
-    ({ sharedNames, u32BufferNames } : GenState)
+    ({ sharedNames, u32BufferNames, u32SharedNames } : GenState)
   let finalState := (state.stmts.foldl (fun s st => stmtToPTX st s) initState).emit .ret
   (Module.mk ptxVersion targetArch funcName paramNames sharedDecls
     finalState.insts finalState.fRegs finalState.rRegs finalState.rdRegs finalState.pRegs finalState.hRegs).render
