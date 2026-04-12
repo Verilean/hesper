@@ -1161,7 +1161,6 @@ def create [GPUBackend β] (ctx : β) (config : Config)
   GPUBackend.writeBuffer ctx scaleBuf scaleBytes
   let prepared ← GPUBackend.newCacheRef (β := β)
   let useSubgroups ← GPUBackend.hasSubgroupSupport ctx
-  IO.println s!"[DBG BitLinear.create] useSubgroups={useSubgroups}"
   let shaderM := if useSubgroups
     then fusedBitLinearM1Kernel config
     else fusedBitLinearM1KernelSharedMem config
@@ -1170,7 +1169,6 @@ def create [GPUBackend β] (ctx : β) (config : Config)
     extensions := if useSubgroups then ["subgroups"] else [],
     diagnostics := if useSubgroups then [("off", "chromium.subgroup_matrix_uniformity")] else []
   }
-  IO.println s!"[DBG BitLinear.create] extensions={buildCfg.extensions}"
   let kernel ← GPUBackend.buildKernel ctx shaderM buildCfg
   logVerbose s!"[BitLinear] Layer created: packed={paddedWeights.size} bytes (subgroups={useSubgroups})"
   pure { config, weightsPacked := weightsBuf, scaleBuf, prepared, kernel }
@@ -1271,6 +1269,7 @@ def forward [GPUBackend β] (ctx : β) (layer : BitLinear (GPUBackend.Buf β) (G
       let execConfig : Hesper.ExecConfig := {
         workgroupSize := { x := 32, y := 1, z := 1 }
         numWorkgroups := (layer.config.outDim / 16, numRowTiles, 1)
+        extensions := ["f16", "chromium_experimental_subgroup_matrix"]
       }
       let cacheKey : UInt64 :=
         hash ("bl-sm", layer.config.inDim, layer.config.outDim, numRows)
@@ -1335,6 +1334,7 @@ def forwardWithResidual [GPUBackend β] (ctx : β) (layer : BitLinear (GPUBacken
     let execConfig : Hesper.ExecConfig := {
       workgroupSize := { x := 32, y := 1, z := 1 }
       numWorkgroups := (layer.config.outDim, 1, 1)
+      extensions := if useSubgroups then ["subgroups"] else []
     }
     let cacheKey : UInt64 := hash ("blrm1", layer.config.inDim, layer.config.outDim, useSubgroups)
     GPUBackend.executeWithConfigCached ctx shader namedBuffers execConfig cacheKey layer.prepared
@@ -1397,6 +1397,7 @@ def forwardFusedRMSNormResidual [GPUBackend β] (ctx : β) (layer : BitLinear (G
   let execConfig : Hesper.ExecConfig := {
     workgroupSize := { x := 32, y := 1, z := 1 }
     numWorkgroups := (layer.config.outDim, 1, 1)
+    extensions := if useSubgroups then ["subgroups"] else []
   }
   let cacheKey : UInt64 := hash ("frnblrm1", layer.config.inDim, layer.config.outDim, useSubgroups)
   match preparedRef with
@@ -1444,6 +1445,7 @@ def forwardFusedGateUpReluSqrMul [GPUBackend β] (ctx : β) (gateLayer upLayer :
   let execConfig : Hesper.ExecConfig := {
     workgroupSize := { x := 32, y := 1, z := 1 }
     numWorkgroups := (gateLayer.config.outDim, 1, 1)
+    extensions := if useSubgroups then ["subgroups"] else []
   }
   let cacheKey : UInt64 := hash ("fgurelum1", gateLayer.config.inDim, gateLayer.config.outDim, useSubgroups)
   match preparedRef with
