@@ -82,7 +82,6 @@ instance : GPUBackend CUDAContext where
   CachedDispatch := CUDACachedDispatch
   CompiledKernel := CUDACompiledKernel
   executeWithConfig _ctx computation namedBuffers config := do
-    -- CUDA ignores extensions/diagnostics
     let func ← cudaExecuteImpl computation namedBuffers config.funcName config.workgroupSize config.numWorkgroups
     cudaLaunchWithBuffers func namedBuffers computation config.workgroupSize config.numWorkgroups
   executeWithConfigCached _ctx computation namedBuffers config _cacheKey cacheRef := do
@@ -120,7 +119,6 @@ instance : GPUBackend CUDAContext where
   readBuffer _ctx buf size := readCUDABuffer buf size
   buildKernel _ctx computation config := do
     let ptx := generatePTX config.funcName config.workgroupSize computation
-    IO.FS.writeFile "/tmp/debug_bitlinear.ptx" ptx
     let sourceHash := hash ptx
     let cache ← cudaModuleCache.get
     let func ← match cache.find? (fun e => e.1 == sourceHash) with

@@ -104,6 +104,10 @@ def runGeneration (args : List String) : IO Unit := do
   IO.println s!"Prompt tokens ({promptTokens.size}): {promptTokens}"
   IO.println ""
 
+  -- 1 token test
+  let testTokens ← generate (β := Device) device model promptTokens 1 .Greedy eosToken
+  IO.println s!"First generated token: {testTokens.getD promptTokens.size 0}"
+
   let outputTokens ← match loraPath with
   | some p =>
     -- Load LoRA adapter and generate with it
