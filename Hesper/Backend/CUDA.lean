@@ -38,13 +38,15 @@ structure CUDACachedDispatch where
   blockY : UInt32 := 1
   blockZ : UInt32 := 1
 
-initialize cudaModuleCache : IO.Ref (Array (UInt64 × CUfunction)) ← IO.mkRef #[]
+initialize cudaModuleCache : IO.Ref (Array (USize × CUfunction)) ← IO.mkRef #[]
 
 private def cudaExecuteImpl (computation : ShaderM Unit) (namedBuffers : List (String × CUDABuffer))
     (funcName : String) (workgroupSize : Hesper.WGSL.WorkgroupSize)
     (numWorkgroups : Nat × Nat × Nat) : IO CUfunction := do
+  -- Fast path: hash ShaderState (stmts repr) to skip 625KB PTX string hashing
+  let state := Hesper.WGSL.Monad.ShaderM.exec computation
   let ptx := generatePTX funcName workgroupSize computation
-  let sourceHash := hash ptx
+  let sourceHash ← Hesper.CUDA.fastStringHash ptx
   let cache ← cudaModuleCache.get
   match cache.find? (fun e => e.1 == sourceHash) with
   | some (_, f) => return f
@@ -129,7 +131,7 @@ instance : GPUBackend CUDAContext where
   readBuffer _ctx buf size := readCUDABuffer buf size
   buildKernel _ctx computation config := do
     let ptx := generatePTX config.funcName config.workgroupSize computation
-    let sourceHash := hash ptx
+    let sourceHash ← Hesper.CUDA.fastStringHash ptx
     let cache ← cudaModuleCache.get
     let func ← match cache.find? (fun e => e.1 == sourceHash) with
     | some (_, f) => pure f
