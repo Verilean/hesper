@@ -63,6 +63,11 @@ opaque cuModuleGetFunction (mod : CUmodule) (funcName : @& String) : IO CUfuncti
 @[extern "lean_hesper_cuda_module_unload"]
 opaque cuModuleUnload (mod : CUmodule) : IO Unit
 
+/-! ## Utilities -/
+
+@[extern "lean_hesper_fast_string_hash"]
+opaque fastStringHash (s : @& String) : IO USize
+
 /-! ## Memory -/
 
 @[extern "lean_hesper_cuda_malloc"]
