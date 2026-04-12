@@ -142,7 +142,7 @@ instance : GPUBackend CUDAContext where
       gx.toUInt32 gy.toUInt32 gz.toUInt32
       kernel.blockX kernel.blockY kernel.blockZ
       0 args
-  hasSubgroupSupport _ctx := pure false  -- Use shared-mem fallback (warp shuffle has PTX issues)
+  hasSubgroupSupport _ctx := pure true   -- CUDA warp shuffle
   hasShaderF16Support _ctx := pure true  -- sm_89 has native f16
   newCacheRef := IO.mkRef none
 
