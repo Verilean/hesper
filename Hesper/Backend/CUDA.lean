@@ -83,7 +83,18 @@ instance : GPUBackend CUDAContext where
   CompiledKernel := CUDACompiledKernel
   executeWithConfig _ctx computation namedBuffers config := do
     let func ← cudaExecuteImpl computation namedBuffers config.funcName config.workgroupSize config.numWorkgroups
-    cudaLaunchWithBuffers func namedBuffers computation config.workgroupSize config.numWorkgroups
+    -- Resolve buffer args (ShaderM.exec already called in cudaExecuteImpl, avoid 2nd call)
+    let state := Hesper.WGSL.Monad.ShaderM.exec computation
+    let declaredNames := state.declaredBuffers.map (·.1)
+    let args ← declaredNames.foldlM (init := #[]) fun acc name => do
+      match namedBuffers.find? (fun p => p.1 == name) with
+      | some (_, buf) => return acc.push buf.ptr
+      | none => throw (IO.userError s!"CUDA execute: missing buffer '{name}'")
+    let (gx, gy, gz) := config.numWorkgroups
+    cuLaunchKernel func
+      gx.toUInt32 gy.toUInt32 gz.toUInt32
+      config.workgroupSize.x.toUInt32 config.workgroupSize.y.toUInt32 config.workgroupSize.z.toUInt32
+      0 args
   executeWithConfigCached _ctx computation namedBuffers config _cacheKey cacheRef := do
     let cached ← cacheRef.get
     let func ← match cached with
