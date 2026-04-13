@@ -87,7 +87,33 @@ GPUBackend.execute ctx myKernel [("a", buf)] (.dispatch1D n)
 GPUBackend.executeWithConfigCached ctx myKernel [("a", buf)] (.dispatch1D n) cacheKey ref
 ```
 
-## 3. Kernel Safety (CUDA Compatibility)
+## 3. Cacheable Kernels: Static vs Dynamic Parameters
+
+**Rule**: ShaderM computation arguments that change per-token or per-iteration
+MUST be passed via buffer, NOT as compile-time constants. Otherwise the kernel
+cannot be cached (generatePTX regenerated every call = 90-330μs overhead).
+
+```lean
+-- BAD: cacheLen is compile-time → PTX changes every token → uncacheable
+def myKernel (cacheLen : Nat) : ShaderM Unit := do
+  loop (Exp.litU32 0) (Exp.litU32 cacheLen) ...  -- cacheLen baked into PTX
+
+-- GOOD: cacheLen read from params buffer at runtime → PTX is fixed → cacheable
+def myKernel (maxSeqLen : Nat) : ShaderM Unit := do
+  let cacheLen ← readBuffer (ty := .scalar .u32) (n := 2) "params" (Exp.litU32 1)
+  loop (Exp.litU32 0) cacheLen ...  -- cacheLen is runtime value
+```
+
+**Examples from hesper:**
+- `flashAttentionParamsKernel`: cacheLen from params buffer (BitNet) ✓
+- `flashAttentionDynamicKernel`: cacheLen as Nat argument (Gemma4) ✗
+- `MoE.expertGateUpKernel k`: expert index as Nat argument ✗
+
+**Static (safe to cache):** hiddenSize, vocabSize, numHeads, headDim, intermediateSize, rmsNormEps, ropeTheta — these are model hyperparameters that never change.
+
+**Dynamic (must use buffer):** cacheLen, pos, expert index, per-layer offset — these change per token, per iteration, or per layer.
+
+## 4. Kernel Safety (CUDA Compatibility)
 
 ### Bounds checking: `if_` not `select`
 
