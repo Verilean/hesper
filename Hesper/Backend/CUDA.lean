@@ -181,6 +181,8 @@ instance : GPUBackend CUDAContext where
   allocBuffer _ctx size := createCUDABuffer size
   freeBuffer _ctx buf := freeCUDABuffer buf
   writeBuffer _ctx buf data := writeCUDABuffer buf data
+  writeBufferOffset _ctx buf offset data :=
+    cuMemcpyHtoD buf.ptr data offset data.size.toUSize
   readBuffer _ctx buf size := readCUDABuffer buf size
   buildKernel _ctx computation config := do
     let ptx := generatePTX config.funcName config.workgroupSize computation
