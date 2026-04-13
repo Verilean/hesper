@@ -1458,31 +1458,23 @@ def forwardBlock [GPUBackend β] (ctx : β)
     -- magnitudes are bounded without the 1/sqrt(headDim) temperature.
     -- See llama.cpp llama-model.cpp:1272 and gemma4-iswa.cpp:94.
     let scale : Float := 1.0
+    -- Write cacheLen to params buffer for FlashAttention (params = [pos, cacheLen])
+    let cacheLenBytes := Hesper.WebGPU.BufferOps.uint32ToBytes cacheLen.toUInt32
+    GPUBackend.writeBufferOffset ctx state.paramsBuf 4 cacheLenBytes
     Hesper.WGSL.Execute.withSection "flashAttn" do
-      match block.layerType with
-      | .swa =>
-        -- Sliding window attention: only attend within windowSize.
-        -- SWA layers have short effective cacheLen (≤ windowSize), so
-        -- the 1-WG-per-head dispatch is fine — no split-K needed.
-        GPUBackend.execute ctx  -- cacheLen/pos change per token — uncacheable
-          (FlashAttention.flashAttentionSWAKernel numHeads numKVHeads cfg.maxSeqLen headDim cacheLen cfg.slidingWindowSize pos scale)
-          [("q", state.qBuf), ("k_cache", kvCache.kBuf), ("v_cache", kvCache.vBuf), ("output", state.attnOutBuf)]
+      -- Use params-buffer kernel for ALL attention types (cacheable — PTX is fixed).
+      -- SWA masking is unnecessary: cacheLen already ≤ windowSize for SWA layers.
+      if cacheLen > 32 then
+        FlashAttention.executeFlashAttentionTiled ctx
+          state.qBuf kvCache.kBuf kvCache.vBuf state.attnOutBuf
+          numHeads numKVHeads cfg.maxSeqLen headDim cacheLen scale
+          (partialBuf := some state.flashPartialBuf)
+      else
+        GPUBackend.execute ctx
+          (FlashAttention.flashAttentionDynamicKernel numHeads numKVHeads cfg.maxSeqLen headDim cacheLen scale)
+          [("q", state.qBuf), ("k_cache", kvCache.kBuf), ("v_cache", kvCache.vBuf),
+           ("output", state.attnOutBuf)]
           ({ numWorkgroups := (numHeads, 1, 1) : Hesper.ExecConfig })
-      | .full =>
-        -- Full attention: use tiled (split-K) flash attention when
-        -- cacheLen is large enough to benefit from multiple tiles.
-        -- For small cacheLen (≤ tileSize=32), the single-WG-per-head
-        -- kernel is faster (1 dispatch vs 2 + intermediate buffer).
-        if cacheLen > 32 then
-          FlashAttention.executeFlashAttentionTiled ctx
-            state.qBuf kvCache.kBuf kvCache.vBuf state.attnOutBuf
-            numHeads numKVHeads cfg.maxSeqLen headDim cacheLen scale
-            (partialBuf := some state.flashPartialBuf)
-        else
-          GPUBackend.execute ctx  -- cacheLen changes per token — uncacheable
-            (FlashAttention.flashAttentionDynamicKernel numHeads numKVHeads cfg.maxSeqLen headDim cacheLen scale)
-            [("q", state.qBuf), ("k_cache", kvCache.kBuf), ("v_cache", kvCache.vBuf), ("output", state.attnOutBuf)]
-            ({ numWorkgroups := (numHeads, 1, 1) : Hesper.ExecConfig })
 
     -- Output projection: attnOut [numHeads * headDim] → normedBuf [hiddenSize]
     Hesper.WGSL.Execute.withSection "oProj" do
