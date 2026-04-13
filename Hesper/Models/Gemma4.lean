@@ -1347,9 +1347,11 @@ def forwardBlock [GPUBackend β] (ctx : β)
       (namedBufs : List (String × GPUBackend.Buf β)) (config : Hesper.ExecConfig) => do
     -- Key includes name + config (numWorkgroups, workgroupSize) to distinguish
     -- same-named kernels with different parameters (e.g., full vs SWA attention)
-    let key := hash (name, config.numWorkgroups, config.workgroupSize.x, config.workgroupSize.y)
     match kcr with
     | some k =>
+      -- Use WGSL-content hash as cache key for pipeline cache correctness
+      let wgsl := Hesper.WGSL.CodeGen.generateWGSL config.funcName config.workgroupSize config.extensions config.diagnostics shader
+      let key := hash wgsl
       let ref ← k.getRef key
       GPUBackend.executeWithConfigCached ctx shader namedBufs config key ref
     | none => GPUBackend.execute ctx shader namedBufs config
@@ -1709,9 +1711,11 @@ def forwardSingleToken [GPUBackend β] (ctx : β)
       (namedBufs : List (String × GPUBackend.Buf β)) (config : Hesper.ExecConfig) => do
     -- Key includes name + config (numWorkgroups, workgroupSize) to distinguish
     -- same-named kernels with different parameters (e.g., full vs SWA attention)
-    let key := hash (name, config.numWorkgroups, config.workgroupSize.x, config.workgroupSize.y)
     match kcr with
     | some k =>
+      -- Use WGSL-content hash as cache key for pipeline cache correctness
+      let wgsl := Hesper.WGSL.CodeGen.generateWGSL config.funcName config.workgroupSize config.extensions config.diagnostics shader
+      let key := hash wgsl
       let ref ← k.getRef key
       GPUBackend.executeWithConfigCached ctx shader namedBufs config key ref
     | none => GPUBackend.execute ctx shader namedBufs config
@@ -1952,7 +1956,7 @@ def generate [GPUBackend β] (ctx : β) (model : Gemma4Model (GPUBackend.Buf β)
   let prefillStart ← IO.monoNanosNow
   for i in [0:promptTokens.size] do
     if i >= model.config.maxSeqLen then break
-    forwardSingleToken ctx model promptTokens[i]! i state (kcr := none)
+    forwardSingleToken ctx model promptTokens[i]! i state (kcr := some kcr)
   let prefillEnd ← IO.monoNanosNow
   let prefillMs := (prefillEnd - prefillStart).toFloat / 1_000_000.0
   IO.println s!"[Prefill] Done in {prefillMs} ms"
@@ -1981,7 +1985,7 @@ def generate [GPUBackend β] (ctx : β) (model : Gemma4Model (GPUBackend.Buf β)
     -- Forward pass for next token
     let newPos := tokens.size - 1
     if newPos < model.config.maxSeqLen then
-      forwardSingleToken ctx model nextToken newPos state (kcr := none)
+      forwardSingleToken ctx model nextToken newPos state (kcr := some kcr)
 
   let genEnd ← IO.monoNanosNow
   let genMs := (genEnd - genStart).toFloat / 1_000_000.0
