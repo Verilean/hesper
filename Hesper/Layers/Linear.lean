@@ -657,9 +657,10 @@ def fusedQ4KMLinearBlockCoop2RowKernel (config : Config) : ShaderM Unit := do
   let cLane := Exp.div laneId (Exp.litU32 8)
   let l32Lane := Exp.sub laneId (Exp.mul cLane (Exp.litU32 8))
 
-  for block in [0:blocksPerRow] do
-    let blockU32Base := Exp.add rowBaseU32 (Exp.litU32 (block * 36))
-    let elemBase := block * 256
+  -- Runtime block loop (avoids compile-time unroll → register spill)
+  ShaderM.loop (Exp.litU32 0) (Exp.litU32 blocksPerRow) (Exp.litU32 1) fun blockIdx => do
+    let blockU32Base := Exp.add rowBaseU32 (Exp.mul blockIdx (Exp.litU32 36))
+    let elemBase := Exp.mul blockIdx (Exp.litU32 256)
 
     let dmU32 ← ShaderM.readBuffer (ty := .scalar .u32) (n := totalWeightU32) "weights" blockU32Base
     let d := fp16ToF32 (Exp.bitAnd dmU32 (Exp.litU32 0xFFFF))
@@ -706,7 +707,7 @@ def fusedQ4KMLinearBlockCoop2RowKernel (config : Config) : ShaderM Unit := do
 
     let elemOffset := Exp.add (Exp.mul cLane (Exp.litU32 64))
                       (Exp.mul l32Lane (Exp.litU32 4))
-    let elemBaseAbs := Exp.add (Exp.litU32 elemBase) elemOffset
+    let elemBaseAbs := Exp.add elemBase elemOffset
 
     for b in [0:4] do
       let byte := Exp.bitAnd (Exp.shiftRight qsU32 (Exp.litU32 (b * 8))) (Exp.litU32 0xFF)
