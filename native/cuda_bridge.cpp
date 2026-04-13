@@ -179,10 +179,13 @@ extern "C" lean_obj_res lean_hesper_cuda_launch_kernel(
 
 extern "C" lean_obj_res lean_hesper_fast_string_hash(b_lean_obj_arg s) {
     const char* data = lean_string_cstr(s);
-    size_t len = lean_string_size(s) - 1; // exclude null terminator
-    // FNV-1a 64-bit
+    size_t len = lean_string_size(s) - 1;
+    // Hash length + first 1KB only (0.3μs vs 100μs for 625KB)
+    size_t hash_len = len < 1024 ? len : 1024;
     uint64_t h = 14695981039346656037ULL;
-    for (size_t i = 0; i < len; i++) {
+    h ^= (uint64_t)len;
+    h *= 1099511628211ULL;
+    for (size_t i = 0; i < hash_len; i++) {
         h ^= (uint8_t)data[i];
         h *= 1099511628211ULL;
     }
