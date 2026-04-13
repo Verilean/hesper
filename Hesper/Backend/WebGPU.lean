@@ -22,12 +22,15 @@ open Hesper.WGSL (WorkgroupSize)
       { funcName := config.funcName, workgroupSize := config.workgroupSize,
         numWorkgroups := config.numWorkgroups,
         extensions := config.extensions, diagnostics := config.diagnostics }
-  executeWithConfigCached device computation namedBuffers (config : Hesper.ExecConfig) cacheKey cacheRef :=
+  executeWithConfigCached device computation namedBuffers (config : Hesper.ExecConfig) _cacheKey cacheRef :=
+    -- cacheKey is ignored for pipeline cache — WGSL hash is always used
+    -- (external cacheKey can collide with other modules' keys).
+    -- cacheRef is still passed for PreparedDispatch fast-path.
     executeShaderNamed device computation namedBuffers
       { funcName := config.funcName, workgroupSize := config.workgroupSize,
         numWorkgroups := config.numWorkgroups,
         extensions := config.extensions, diagnostics := config.diagnostics }
-      (some cacheKey) (some cacheRef)
+      none (some cacheRef)
   replayCached device cached dims :=
     replayPreparedDispatch device cached dims.1 dims.2.1 dims.2.2
   allocBuffer device size :=
