@@ -1470,10 +1470,10 @@ def forwardBlock [GPUBackend β] (ctx : β)
           numHeads numKVHeads cfg.maxSeqLen headDim cacheLen scale
           (partialBuf := some state.flashPartialBuf)
       else
-        GPUBackend.execute ctx
-          (FlashAttention.flashAttentionDynamicKernel numHeads numKVHeads cfg.maxSeqLen headDim cacheLen scale)
+        ce s!"flashAttnP_{headDim}_{numKVHeads}"
+          (FlashAttention.flashAttentionDynamicParamsKernel numHeads numKVHeads cfg.maxSeqLen headDim scale)
           [("q", state.qBuf), ("k_cache", kvCache.kBuf), ("v_cache", kvCache.vBuf),
-           ("output", state.attnOutBuf)]
+           ("output", state.attnOutBuf), ("params", state.paramsBuf)]
           ({ numWorkgroups := (numHeads, 1, 1) : Hesper.ExecConfig })
 
     -- Output projection: attnOut [numHeads * headDim] → normedBuf [hiddenSize]
