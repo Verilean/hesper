@@ -895,12 +895,9 @@ private def loadLinear [GPUBackend β] (ctx : β) (gguf : Hesper.GGUF.GGUFFile)
   }
 
 /-- Load Gemma 4 model from GGUF file -/
-def Gemma4Model.fromGGUF [GPUBackend β] (ctx : β) (ggufPath : String)
+def Gemma4Model.fromGGUFData [GPUBackend β] (ctx : β) (ggufData : ByteArray)
     (configOverride : Option Config := none) : IO (Gemma4Model (GPUBackend.Buf β) (GPUBackend.CachedDispatch β)) := do
-  IO.println s!"[Gemma4] Loading model from {ggufPath}..."
-
-  -- Step 1: Parse GGUF file
-  let ggufData ← IO.FS.readBinFile ggufPath
+  IO.println s!"[Gemma4] Parsing GGUF ({ggufData.size} bytes)..."
   let gguf ← match Hesper.GGUF.Parser.parseGGUF ggufData with
     | .ok gf => pure gf
     | .error e => throw $ IO.userError s!"GGUF parse error: {e}"
@@ -1173,6 +1170,13 @@ def loadGGUF (path : String) : IO Hesper.GGUF.GGUFFile := do
   match Hesper.GGUF.Parser.parseGGUF data with
   | .ok gf => pure gf
   | .error e => throw $ IO.userError s!"GGUF parse error: {e}"
+
+/-- Load model from GGUF file path (reads file with IO.FS.readBinFile). -/
+def Gemma4Model.fromGGUF [GPUBackend β] (ctx : β) (ggufPath : String)
+    (configOverride : Option Config := none) : IO (Gemma4Model (GPUBackend.Buf β) (GPUBackend.CachedDispatch β)) := do
+  IO.println s!"[Gemma4] Loading model from {ggufPath}..."
+  let ggufData ← IO.FS.readBinFile ggufPath
+  Gemma4Model.fromGGUFData ctx ggufData configOverride
 
 /-! ## KV Cache State -/
 

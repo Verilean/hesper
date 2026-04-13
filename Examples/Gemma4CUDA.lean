@@ -1,4 +1,5 @@
 import Hesper.Backend.CUDA
+import Hesper.CUDA.FFI
 import Hesper.Models.Gemma4
 import Hesper.Tokenizer.SentencePiece
 import Hesper.GGUF.Parser
@@ -30,13 +31,14 @@ def main (args : List String) : IO Unit := do
   -- Initialize CUDA
   let ctx ← CUDAContext.init
 
-  -- Load model on CUDA (same fromGGUF, different backend)
-  IO.println "[Load] Loading Gemma 4 model on CUDA..."
-  let model ← Gemma4Model.fromGGUF ctx ggufPath
+  -- Load model on CUDA (fast file read via mmap)
+  IO.println "[Load] Reading GGUF file..."
+  let ggufData ← Hesper.CUDA.readFileFast ggufPath
+  IO.println s!"[Load] Read {ggufData.size} bytes, loading model..."
+  let model ← Gemma4Model.fromGGUFData ctx ggufData
 
-  -- Load tokenizer
+  -- Load tokenizer (reuse already-read ggufData)
   IO.println "[Tokenize] Loading tokenizer..."
-  let ggufData ← IO.FS.readBinFile ggufPath
   let gguf ← match Hesper.GGUF.Parser.parseGGUF ggufData with
     | .ok g => pure g
     | .error e => throw (IO.userError s!"GGUF parse error: {e}")
