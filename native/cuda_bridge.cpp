@@ -180,8 +180,8 @@ extern "C" lean_obj_res lean_hesper_cuda_launch_kernel(
 extern "C" lean_obj_res lean_hesper_fast_string_hash(b_lean_obj_arg s) {
     const char* data = lean_string_cstr(s);
     size_t len = lean_string_size(s) - 1;
-    // Hash length + first 1KB only (0.3μs vs 100μs for 625KB)
-    size_t hash_len = len < 1024 ? len : 1024;
+    // Full hash — correctness over speed (衝突はsilent corruption)
+    size_t hash_len = len;
     uint64_t h = 14695981039346656037ULL;
     h ^= (uint64_t)len;
     h *= 1099511628211ULL;
