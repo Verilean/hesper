@@ -82,6 +82,36 @@ def GPUBackend.execute [GPUBackend β] (ctx : β) (computation : ShaderM Unit)
     (config : ExecConfig) : IO Unit :=
   GPUBackend.executeWithConfig ctx computation namedBuffers config
 
+/-- A kernel bundled with its dispatch cache. Production code should use
+    this instead of bare `GPUBackend.execute` to ensure dispatch caching.
+    Create with `CachedKernel.create`, dispatch with `CachedKernel.exec`. -/
+structure CachedKernel (β : Type) [GPUBackend β] where
+  computation : ShaderM Unit
+  cacheKey : UInt64
+  cacheRef : IO.Ref (Option (GPUBackend.CachedDispatch β))
+
+namespace CachedKernel
+
+/-- Create a cached kernel. Call once at init time (e.g., in createInferenceState). -/
+def create [GPUBackend β] (computation : ShaderM Unit) (name : String) : IO (CachedKernel β) := do
+  pure { computation, cacheKey := hash name, cacheRef := ← IO.mkRef none }
+
+/-- Dispatch with caching. First call compiles; subsequent calls skip PTX generation. -/
+@[inline]
+def exec [GPUBackend β] (k : CachedKernel β) (ctx : β)
+    (namedBuffers : List (String × GPUBackend.Buf β))
+    (config : ExecConfig) : IO Unit :=
+  GPUBackend.executeWithConfigCached ctx k.computation namedBuffers config k.cacheKey k.cacheRef
+
+end CachedKernel
+
+/-- For debug/test use only. Creates an ephemeral cache (not reused). -/
+def GPUBackend.debugExecuteOnce [GPUBackend β] (ctx : β) (computation : ShaderM Unit)
+    (namedBuffers : List (String × GPUBackend.Buf β))
+    (config : ExecConfig) : IO Unit := do
+  let ref ← IO.mkRef none
+  GPUBackend.executeWithConfigCached ctx computation namedBuffers config 0 ref
+
 /-- Smart dispatch: 1D if fits, 2D otherwise.
     Returns `(config, gridDimX)` — same signature as TTT.Kernels.smartDispatch. -/
 def smartDispatch (totalThreads : Nat) (wgSize : Nat := 256) : ExecConfig × Nat :=
