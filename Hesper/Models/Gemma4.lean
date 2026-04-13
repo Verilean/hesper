@@ -1403,32 +1403,27 @@ def forwardBlock [GPUBackend β] (ctx : β)
     -- RoPE on Q: qBuf2 → qBuf
     match block.ropeFreqFactors with
     | some freqFactors =>
-      -- Full attention: RoPE with frequency factors
-      GPUBackend.execute ctx
+      ce s!"ropeFreqQ_{headDim}"
         (ropeWithFreqFactorsKernel headDim numHeads cfg.ropeTheta)
         [("input", state.qBuf2), ("output", state.qBuf), ("params", state.paramsBuf), ("freq_factors", freqFactors)]
         (.dispatch1D (numHeads * headDim / 2))
     | none =>
-      -- SWA: standard RoPE (use existing dynamic kernel)
       let ropeConfig : RoPE.Config := { dim := numHeads * headDim, maxSeqLen := cfg.maxSeqLen, base := cfg.ropeTheta }
-      GPUBackend.execute ctx
+      ce s!"ropeDynQ_{headDim}"
         (RoPE.ropeKernelDynamic ropeConfig 1 1 numHeads headDim)
         [("input", state.qBuf2), ("output", state.qBuf), ("params", state.paramsBuf)]
         (.dispatch1D (numHeads * headDim / 2))
 
     if cfg.hasKV li then
-      -- RoPE on K: kBuf2 → kBuf
-      -- Must mirror Q's RoPE branch: full attention layers use freq_factors,
-      -- otherwise Q and K end up rotated with different frequencies (mismatch).
       match block.ropeFreqFactors with
       | some freqFactors =>
-        GPUBackend.execute ctx
+        ce s!"ropeFreqK_{headDim}_{numKVHeads}"
           (ropeWithFreqFactorsKernel headDim numKVHeads cfg.ropeTheta)
           [("input", state.kBuf2), ("output", state.kBuf), ("params", state.paramsBuf), ("freq_factors", freqFactors)]
           (.dispatch1D (numKVHeads * headDim / 2))
       | none =>
         let ropeConfig : RoPE.Config := { dim := numKVHeads * headDim, maxSeqLen := cfg.maxSeqLen, base := cfg.ropeTheta }
-        GPUBackend.execute ctx
+        ce s!"ropeDynK_{headDim}_{numKVHeads}"
           (RoPE.ropeKernelDynamic ropeConfig 1 1 numKVHeads headDim)
           [("input", state.kBuf2), ("output", state.kBuf), ("params", state.paramsBuf)]
           (.dispatch1D (numKVHeads * headDim / 2))
@@ -1445,7 +1440,7 @@ def forwardBlock [GPUBackend β] (ctx : β)
     -- K is now in kBuf (after RoPE), V is in vBuf2 (after V-norm)
     if cfg.hasKV li then
       Hesper.WGSL.Execute.withSection "kvWrite" do
-        GPUBackend.execute ctx
+        ce s!"kvWrite_{headDim}_{numKVHeads}"
           (Attention.fusedCacheWriteKVKernel numKVHeads cfg.maxSeqLen headDim kvDim)
           [("new_k", state.kBuf), ("new_v", state.vBuf2),
            ("k_cache", kvCache.kBuf), ("v_cache", kvCache.vBuf),
@@ -1499,7 +1494,7 @@ def forwardBlock [GPUBackend β] (ctx : β)
     RMSNorm.forward ctx block.ffnNorm state.attnResidualBuf state.normedBuf
     Linear.LinearLayer.forward ctx block.ffn.gate state.normedBuf state.gateBuf
     Linear.LinearLayer.forward ctx block.ffn.up state.normedBuf state.upBuf
-    GPUBackend.execute ctx
+    ce "geluMul"
       (geluMulKernel cfg.intermediateSize)
       [("gate", state.gateBuf), ("up", state.upBuf), ("output", state.geluBuf)]
       (.dispatch1D cfg.intermediateSize)
@@ -1510,7 +1505,7 @@ def forwardBlock [GPUBackend β] (ctx : β)
     | some norm =>
       RMSNorm.forward ctx norm state.ffnOutBuf state.normedBuf2
       -- Copy back: normedBuf2 → ffnOutBuf
-      GPUBackend.execute ctx
+      ce "pleScale1"
         (PerLayerEmbedding.scaleKernel cfg.hiddenSize 1.0)
         [("input", state.normedBuf2), ("output", state.ffnOutBuf)]
         (.dispatch1D cfg.hiddenSize)
@@ -1519,7 +1514,7 @@ def forwardBlock [GPUBackend β] (ctx : β)
     -- 2. Router: rms_norm(attn_out) * (1/sqrt(n_embd)) * router_scale → logits → softmax → top-K
     match block.moeRouterWeight, block.moeRouterScale with
     | some routerW, some routerS =>
-      GPUBackend.execute ctx
+      ce "moeRouterPre"
         (MoE.routerPreprocessKernel cfg.hiddenSize cfg.rmsNormEps)
         [("input", state.attnResidualBuf), ("router_scale", routerS), ("output", state.moeRouterOutBuf)]
         ({ numWorkgroups := (1, 1, 1) : Hesper.ExecConfig })
@@ -1529,7 +1524,7 @@ def forwardBlock [GPUBackend β] (ctx : β)
       }
       Hesper.WGSL.MatMul.executeMatMulTranspose ctx state.moeRouterOutBuf routerW state.moeLogitsBuf routerMatmulConfig
       -- Top-K selection
-      GPUBackend.execute ctx
+      ce "moeSoftmaxTopK"
         (MoE.softmaxTopKKernel cfg.numExperts cfg.numExpertsUsed)
         [("logits", state.moeLogitsBuf), ("indices", state.moeIndicesBuf), ("weights", state.moeWeightsBuf)]
         (.dispatch1D 1)
@@ -1542,12 +1537,12 @@ def forwardBlock [GPUBackend β] (ctx : β)
       RMSNorm.forward ctx preNorm2 state.attnResidualBuf state.moeNormedBuf
 
       -- Zero the accumulator
-      GPUBackend.execute ctx
+      ce "residAddZero"
         (residualAddKernel cfg.hiddenSize)  -- hack: 0 + 0 = 0 (both inputs are same zeroed buf)
         [("a", state.moeExpertOutBuf), ("b", state.moeExpertOutBuf), ("output", state.moeExpertOutBuf)]
         (.dispatch1D cfg.hiddenSize)
       -- Actually zero it properly
-      GPUBackend.execute ctx
+      ce "embedScaleZero"
         (embeddingScaleKernel cfg.hiddenSize 0)  -- scale by 0 to zero
         [("input", state.moeExpertOutBuf), ("output", state.moeExpertOutBuf)]
         (.dispatch1D cfg.hiddenSize)
@@ -1575,7 +1570,7 @@ def forwardBlock [GPUBackend β] (ctx : β)
            ("expert_indices", state.moeIndicesBuf), ("output", state.moeExpertUpBuf)]
           ({ numWorkgroups := (cfg.expertFFSize, 1, 1) : Hesper.ExecConfig })
         -- GELU * up
-        GPUBackend.execute ctx
+        ce "moeExpertGelu"
           (MoE.expertGeluMulKernel cfg.expertFFSize)
           [("gate", state.moeExpertGateBuf), ("up", state.moeExpertUpBuf), ("output", state.moeExpertGeluBuf)]
           (.dispatch1D cfg.expertFFSize)
@@ -1595,13 +1590,13 @@ def forwardBlock [GPUBackend β] (ctx : β)
       -- post_norm_2 on routed expert output
       -- Avoid aliasing: moeExpertOutBuf → normedBuf2 → moeExpertOutBuf
       RMSNorm.forward ctx postNorm2 state.moeExpertOutBuf state.normedBuf2
-      GPUBackend.execute ctx
+      ce "pleScale2"
         (PerLayerEmbedding.scaleKernel cfg.hiddenSize 1.0)
         [("input", state.normedBuf2), ("output", state.moeExpertOutBuf)]
         (.dispatch1D cfg.hiddenSize)
 
       -- 4. Combined: shared_expert + routed_experts
-      GPUBackend.execute ctx
+      ce "residAddMoePost"
         (residualAddKernel cfg.hiddenSize)
         [("a", state.ffnOutBuf), ("b", state.moeExpertOutBuf), ("output", state.ffnOutBuf)]
         (.dispatch1D cfg.hiddenSize)
@@ -1609,7 +1604,7 @@ def forwardBlock [GPUBackend β] (ctx : β)
 
     -- Post-FFN norm + residual (avoid aliasing: ffnOutBuf → normedBuf2 → outputBuf)
     RMSNorm.forward ctx block.postFFNNorm state.ffnOutBuf state.normedBuf2
-    GPUBackend.execute ctx
+    ce "residAddFFN"
       (residualAddKernel cfg.hiddenSize)
       [("a", state.normedBuf2), ("b", state.attnResidualBuf), ("output", outputBuf)]
       (.dispatch1D cfg.hiddenSize)
@@ -1621,7 +1616,7 @@ def forwardBlock [GPUBackend β] (ctx : β)
       Linear.LinearLayer.forward ctx block.ffn.gate state.normedBuf state.gateBuf
       Linear.LinearLayer.forward ctx block.ffn.up state.normedBuf state.upBuf
     Hesper.WGSL.Execute.withSection "ffnGeluMul" do
-      GPUBackend.execute ctx
+      ce "geluMul2"
         (geluMulKernel cfg.intermediateSize)
         [("gate", state.gateBuf), ("up", state.upBuf), ("output", state.geluBuf)]
         (.dispatch1D cfg.intermediateSize)
@@ -1631,7 +1626,7 @@ def forwardBlock [GPUBackend β] (ctx : β)
     -- Post-FFN norm + residual (avoid aliasing: ffnOutBuf → normedBuf2 → outputBuf)
     Hesper.WGSL.Execute.withSection "postFFNNorm" do
       RMSNorm.forward ctx block.postFFNNorm state.ffnOutBuf state.normedBuf2
-      GPUBackend.execute ctx
+      ce "residAddFFN2"
         (residualAddKernel cfg.hiddenSize)
         [("a", state.normedBuf2), ("b", state.attnResidualBuf), ("output", outputBuf)]
         (.dispatch1D cfg.hiddenSize)
@@ -1664,7 +1659,7 @@ def forwardBlock [GPUBackend β] (ctx : β)
       -- Replaces three dispatches (postNorm, copyBack, residAdd) with
       -- one: `outputBuf[i] += rmsNorm(plProjBuf)[i] * postNorm.scale[i]`.
       Hesper.WGSL.Execute.withSection "ple.postNormAdd" do
-        GPUBackend.execute ctx
+        ce "fusedPLPost"
           (fusedPerLayerPostKernel cfg.hiddenSize cfg.rmsNormEps)
           [("proj", state.plProjBuf), ("weight", plEmbd.postNorm.scale), ("residual", outputBuf)]
           { numWorkgroups := (1, 1, 1)
@@ -1677,12 +1672,12 @@ def forwardBlock [GPUBackend β] (ctx : β)
   -- Use normedBuf2 as temp to avoid input/output aliasing
   match block.outScale with
   | some scale =>
-    GPUBackend.execute ctx
+    ce "layerScale"
       (PerLayerEmbedding.layerScaleKernel cfg.hiddenSize)
       [("input", outputBuf), ("scale", scale), ("output", state.normedBuf2)]
       (.dispatch1D cfg.hiddenSize)
     -- Copy back: normedBuf2 → outputBuf
-    GPUBackend.execute ctx
+    ce "pleScale3"
       (PerLayerEmbedding.scaleKernel cfg.hiddenSize 1.0)
       [("input", state.normedBuf2), ("output", outputBuf)]
       (.dispatch1D cfg.hiddenSize)
@@ -1713,7 +1708,7 @@ def forwardSingleToken [GPUBackend β] (ctx : β)
     match model.embdFormat with
     | .Q6_K =>
       -- Q6_K on-the-fly dequant lookup
-      GPUBackend.execute ctx
+      ce "q6kEmbLookup"
         (Hesper.Quantization.Q6_K.q6kEmbeddingLookupKernel model.config.vocabSize model.config.hiddenSize)
         [("token_ids", state.tokenBuf), ("embedding_table", model.embedding.embeddingTable), ("output", state.buf1)]
         (.dispatch1D model.config.hiddenSize)
@@ -1724,7 +1719,7 @@ def forwardSingleToken [GPUBackend β] (ctx : β)
   -- Scale embeddings by sqrt(hiddenSize)
   -- Cannot alias input/output in WebGPU, so output to buf2
   Hesper.WGSL.Execute.withSection "embedScale" do
-    GPUBackend.execute ctx
+    ce "embedScale"
       (embeddingScaleKernel model.config.hiddenSize model.config.hiddenSize)
       [("input", state.buf1), ("output", state.buf2)]
       (.dispatch1D model.config.hiddenSize)
@@ -1753,7 +1748,7 @@ def forwardSingleToken [GPUBackend β] (ctx : β)
         GPUBackend.writeBufferOffset ctx state.plRawRowBuf 0 rowBytes
       Hesper.WGSL.Execute.withSection "plPre.gpuDequant" do
         let scaleFactor : Float := Float.sqrt embdPL.toFloat
-        GPUBackend.execute ctx
+        ce "q6kDequantScale"
           (Hesper.Quantization.Q6_K.q6kSingleRowDequantScaleKernel totalPL scaleFactor)
           [("row", state.plRawRowBuf), ("output", state.plModelProj)]
           (.dispatch1D totalPL)
@@ -1769,19 +1764,19 @@ def forwardSingleToken [GPUBackend β] (ctx : β)
           Hesper.WGSL.MatMul.executeMatMulTransposeF16 ctx state.buf2 modelProj state.plTokenSelected projConfig
 
       Hesper.WGSL.Execute.withSection "plPre.scale" do
-        GPUBackend.execute ctx
+        ce "pleScalePL"
           (PerLayerEmbedding.scaleKernel totalPL (1.0 / Float.sqrt model.config.hiddenSize.toFloat))
           [("input", state.plTokenSelected), ("output", state.plInputAll)]
           (.dispatch1D totalPL)
 
       Hesper.WGSL.Execute.withSection "plPre.chunkedNorm" do
-        GPUBackend.execute ctx
+        ce "chunkedRMSNorm"
           (chunkedRMSNormKernel embdPL nLayers model.config.rmsNormEps)
           [("input", state.plInputAll), ("weight", projNorm.scale), ("output", state.plTokenSelected)]
           { numWorkgroups := (nLayers, 1, 1), workgroupSize := { x := min embdPL 256, y := 1, z := 1 } : Hesper.ExecConfig }
 
       Hesper.WGSL.Execute.withSection "plPre.scaledAdd" do
-        GPUBackend.execute ctx
+        ce "scaledAdd"
           (scaledAddKernel totalPL (1.0 / Float.sqrt 2.0))
           [("a", state.plTokenSelected), ("b", state.plModelProj), ("output", state.plInputAll)]
           (.dispatch1D totalPL)
@@ -1836,7 +1831,7 @@ def forwardSingleToken [GPUBackend β] (ctx : β)
       let wgSize := if useSubgroups then 32 else 256
       let lmBufs : List (String × GPUBackend.Buf β) :=
         [("weights", model.outputWeight), ("input", nextBuf), ("output", state.logitsBuf)]
-      GPUBackend.execute ctx
+      ce "lmHead"
         shader
         lmBufs
         { numWorkgroups := (gridX, gridY, 1)
@@ -1853,7 +1848,7 @@ def forwardSingleToken [GPUBackend β] (ctx : β)
   -- Only runs when preSoftcapBuf is set (zero cost otherwise).
   match state.preSoftcapBuf with
   | some psBuf =>
-    GPUBackend.execute ctx
+    ce "pleScaleVocab"
       (PerLayerEmbedding.scaleKernel model.config.vocabSize 1.0)
       [("input", state.logitsBuf), ("output", psBuf)]
       (.dispatch1D model.config.vocabSize)
@@ -1862,11 +1857,11 @@ def forwardSingleToken [GPUBackend β] (ctx : β)
   -- Step 5: Logit softcapping (y = scale * tanh(x / scale))
   Hesper.WGSL.Execute.withSection "logitSoftcap" do
     if model.config.logitSoftcapScale > 0.0 then
-      GPUBackend.execute ctx
+      ce "logitSoftcap"
         (logitSoftcapKernel model.config.vocabSize model.config.logitSoftcapScale)
         [("input", state.logitsBuf), ("output", state.logitsBuf2)]
         (.dispatch1D model.config.vocabSize)
-      GPUBackend.execute ctx
+      ce "pleScaleVocab2"
         (PerLayerEmbedding.scaleKernel model.config.vocabSize 1.0)
         [("input", state.logitsBuf2), ("output", state.logitsBuf)]
         (.dispatch1D model.config.vocabSize)
