@@ -504,57 +504,45 @@ def fusedQ4KMLinearBlockCoopKernel (config : Config) : ShaderM Unit := do
   ShaderM.varNamed "nextSc2" (.scalar .u32) init0Sc2
   ShaderM.varNamed "nextQs"  (.scalar .u32) init0Qs
 
-  for block in [0:blocksPerRow] do
-    let elemBase := block * 256
+  -- ## Runtime block loop (avoids compile-time unroll → register spill)
+  ShaderM.varNamed "currDm"  (.scalar .u32) (Exp.var "nextDm")
+  ShaderM.varNamed "currSc0" (.scalar .u32) (Exp.var "nextSc0")
+  ShaderM.varNamed "currSc1" (.scalar .u32) (Exp.var "nextSc1")
+  ShaderM.varNamed "currSc2" (.scalar .u32) (Exp.var "nextSc2")
+  ShaderM.varNamed "currQs"  (.scalar .u32) (Exp.var "nextQs")
 
-    -- Snapshot the prefetched "next" values into per-iteration `curr`
-    -- WGSL vars BEFORE issuing the block+1 loads. Unique names per
-    -- block so the Lean-level unroll doesn't emit duplicate decls.
-    let cDm  := s!"currDm_{block}"
-    let cSc0 := s!"currSc0_{block}"
-    let cSc1 := s!"currSc1_{block}"
-    let cSc2 := s!"currSc2_{block}"
-    let cQs  := s!"currQs_{block}"
-    ShaderM.varNamed cDm  (.scalar .u32) (Exp.var "nextDm")
-    ShaderM.varNamed cSc0 (.scalar .u32) (Exp.var "nextSc0")
-    ShaderM.varNamed cSc1 (.scalar .u32) (Exp.var "nextSc1")
-    ShaderM.varNamed cSc2 (.scalar .u32) (Exp.var "nextSc2")
-    ShaderM.varNamed cQs  (.scalar .u32) (Exp.var "nextQs")
-    let dmU32 : Exp (.scalar .u32) := Exp.var cDm
-    let sc0   : Exp (.scalar .u32) := Exp.var cSc0
-    let sc1   : Exp (.scalar .u32) := Exp.var cSc1
-    let sc2   : Exp (.scalar .u32) := Exp.var cSc2
-    let qsU32 : Exp (.scalar .u32) := Exp.var cQs
+  ShaderM.loop (Exp.litU32 0) (Exp.litU32 blocksPerRow) (Exp.litU32 1) fun blockIdx => do
+    let elemBase := Exp.mul blockIdx (Exp.litU32 256)
+
+    -- Snapshot prefetched values
+    ShaderM.assign "currDm"  (Exp.var (t := .scalar .u32) "nextDm")
+    ShaderM.assign "currSc0" (Exp.var (t := .scalar .u32) "nextSc0")
+    ShaderM.assign "currSc1" (Exp.var (t := .scalar .u32) "nextSc1")
+    ShaderM.assign "currSc2" (Exp.var (t := .scalar .u32) "nextSc2")
+    ShaderM.assign "currQs"  (Exp.var (t := .scalar .u32) "nextQs")
+    let dmU32 : Exp (.scalar .u32) := Exp.var "currDm"
+    let sc0   : Exp (.scalar .u32) := Exp.var "currSc0"
+    let sc1   : Exp (.scalar .u32) := Exp.var "currSc1"
+    let sc2   : Exp (.scalar .u32) := Exp.var "currSc2"
+    let qsU32 : Exp (.scalar .u32) := Exp.var "currQs"
     let d := fp16ToF32 (Exp.bitAnd dmU32 (Exp.litU32 0xFFFF))
     let dmin := fp16ToF32 (Exp.shiftRight dmU32 (Exp.litU32 16))
 
-    -- Issue block+1 loads. These happen AFTER the curr snapshot but
-    -- BEFORE the dequant+FMA chain below, so the backend sees them as
-    -- independent writes that can be issued in parallel with the
-    -- subsequent math on curr*.
-    if block + 1 < blocksPerRow then
-      let nbBaseNext := Exp.add rowBaseU32 (Exp.litU32 ((block + 1) * 36))
+    -- Prefetch next block (overlaps with current block's FMAs)
+    let nextBlockIdx := Exp.add blockIdx (Exp.litU32 1)
+    ShaderM.if_ (Exp.lt nextBlockIdx (Exp.litU32 blocksPerRow)) (do
+      let nbBaseNext := Exp.add rowBaseU32 (Exp.mul nextBlockIdx (Exp.litU32 36))
       ShaderM.assign "nextDm"  (← ShaderM.readBuffer (ty := .scalar .u32) (n := totalWeightU32) "weights" nbBaseNext)
       ShaderM.assign "nextSc0" (← ShaderM.readBuffer (ty := .scalar .u32) (n := totalWeightU32) "weights" (Exp.add nbBaseNext (Exp.litU32 1)))
       ShaderM.assign "nextSc1" (← ShaderM.readBuffer (ty := .scalar .u32) (n := totalWeightU32) "weights" (Exp.add nbBaseNext (Exp.litU32 2)))
       ShaderM.assign "nextSc2" (← ShaderM.readBuffer (ty := .scalar .u32) (n := totalWeightU32) "weights" (Exp.add nbBaseNext (Exp.litU32 3)))
       ShaderM.assign "nextQs"  (← ShaderM.readBuffer (ty := .scalar .u32) (n := totalWeightU32) "weights" (Exp.add nbBaseNext qsOffsetInBlock))
+    ) (pure ())
 
-    -- Per-lane scale/min for this block. `cLane` is a runtime value so
-    -- we cannot use the tuple-returning `getScaleMin` (it pattern-matches
-    -- on a Lean-level `Nat`). We inline the same math using the 6-bit
-    -- packed layout: see Hesper.Quantization.Q4_K_M.getScaleMin for the
-    -- static version. Sub-block indices 0..3 and 4..7 pack differently.
-    -- is0 = 2*cLane (low), is1 = 2*cLane + 1 (high)
+    -- Scale/min extraction (runtime cLane)
     let is0 := Exp.mul cLane (Exp.litU32 2)
     let is1 := Exp.add is0 (Exp.litU32 1)
 
-    -- Helper: given a dynamic sub-block index `is ∈ [0,8)`, return its
-    -- 6-bit scale and min extracted from sc0/sc1/sc2 per Q4_K layout.
-    -- For is < 4: scale = sc0[is*8:is*8+6], min = sc1[is*8:is*8+6]
-    -- For is >= 4: scale = (sc2[(is-4)*8:(is-4)*8+4]) | (sc0[(is-4)*8+6:(is-4)*8+8] << 4)
-    --              min   = (sc2[(is-4)*8+4:(is-4)*8+8]) | (sc1[(is-4)*8+6:(is-4)*8+8] << 4)
-    -- We compute both possibilities and select via `isLow := is < 4`.
     let extractScaleMin (is : Exp (.scalar .u32)) : Exp (.scalar .f32) × Exp (.scalar .f32) :=
       let isLow := Exp.lt is (Exp.litU32 4)
       let shift4 := Exp.mul is (Exp.litU32 8)
@@ -583,18 +571,11 @@ def fusedQ4KMLinearBlockCoopKernel (config : Config) : ShaderM Unit := do
     let d2 := Exp.mul d scaleB
     let m2 := Exp.mul dmin minB
 
-    -- qsU32 comes from the software-pipelined `curr` snapshot above.
-
-    -- 4 bytes → 4 low nibbles + 4 high nibbles = 8 weights.
-    -- Low nibble weights go to elements `elemBase + c*64 + l32*4 + b`,
-    -- high nibble weights to `elemBase + c*64 + 32 + l32*4 + b`, for
-    -- b ∈ [0,4). c = cLane, l32 = l32Lane.
-    -- Precompute the shared element-base offset contributed by c and l32
-    -- (c*64 + l32*4).
     let elemOffset := Exp.add (Exp.mul cLane (Exp.litU32 64))
                       (Exp.mul l32Lane (Exp.litU32 4))
-    let elemBaseAbs := Exp.add (Exp.litU32 elemBase) elemOffset
+    let elemBaseAbs := Exp.add elemBase elemOffset
 
+    -- 4 bytes → 8 weights (still compile-time unrolled — only 4 iterations)
     for b in [0:4] do
       let byte := Exp.bitAnd (Exp.shiftRight qsU32 (Exp.litU32 (b * 8))) (Exp.litU32 0xFF)
       let qLow := Exp.bitAnd byte (Exp.litU32 0xF)
