@@ -33,6 +33,7 @@ def CUDAContext.init : IO CUDAContext := do
 structure CUDACachedDispatch where
   func : CUfunction
   sourceHash : UInt64
+  declaredNames : Array String  -- buffer names in declaration order
   args : Array USize
   blockX : UInt32 := 1
   blockY : UInt32 := 1
@@ -133,33 +134,29 @@ instance : GPUBackend CUDAContext where
                 config.workgroupSize.z.toUInt32 0 args
   executeWithConfigCached _ctx computation namedBuffers config _cacheKey cacheRef := do
     let cached ← cacheRef.get
-    let func ← match cached with
-    | some c => pure c.func
+    -- Fast path: cacheRef hit — skip generatePTX + ShaderM.exec entirely
+    let (func, declaredNames) ← match cached with
+    | some c => pure (c.func, c.declaredNames.toList)
     | none => do
       let f ← cudaExecuteImpl computation namedBuffers config.funcName config.workgroupSize config.numWorkgroups
-      -- Collect buffer args for replay
       let state := Hesper.WGSL.Monad.ShaderM.exec computation
-      let declaredNames := state.declaredBuffers.map (·.1)
-      let args ← declaredNames.foldlM (init := #[]) fun acc name => do
+      let dn := state.declaredBuffers.map (·.1)
+      let args ← dn.foldlM (init := #[]) fun acc name => do
         match namedBuffers.find? (fun p => p.1 == name) with
         | some (_, buf) => return acc.push buf.ptr
         | none => return acc
       cacheRef.set (some {
-        func := f
-        sourceHash := hash (generatePTX config.funcName config.workgroupSize computation)
-        args
+        func := f, sourceHash := 0, declaredNames := dn.toArray, args
         blockX := config.workgroupSize.x.toUInt32
         blockY := config.workgroupSize.y.toUInt32
         blockZ := config.workgroupSize.z.toUInt32
       })
-      pure f
-    -- Resolve args and launch (or queue if batching)
-    let state := Hesper.WGSL.Monad.ShaderM.exec computation
-    let declaredNames := state.declaredBuffers.map (·.1)
+      pure (f, dn)
+    -- Resolve buffer args fresh (buffers may differ between calls)
     let args ← declaredNames.foldlM (init := #[]) fun acc name => do
       match namedBuffers.find? (fun p => p.1 == name) with
       | some (_, buf) => return acc.push buf.ptr
-      | none => throw (IO.userError s!"CUDA execute: missing buffer '{name}'")
+      | none => throw (IO.userError s!"CUDA executeCached: missing buffer '{name}'")
     let (gx, gy, gz) := config.numWorkgroups
     let pending : PendingLaunch := {
       func, gridX := gx.toUInt32, gridY := gy.toUInt32, gridZ := gz.toUInt32,
