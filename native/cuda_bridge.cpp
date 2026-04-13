@@ -86,7 +86,10 @@ extern "C" lean_obj_res lean_hesper_cuda_ctx_destroy(size_t ctx_val) {
 extern "C" lean_obj_res lean_hesper_cuda_module_load_data(b_lean_obj_arg ptx_str) {
     const char* ptx = lean_string_cstr(ptx_str);
     CUmodule mod;
-    CUresult err = cuModuleLoadData(&mod, ptx);
+    // Use cuModuleLoadDataEx with max optimization level (4)
+    CUjit_option opts[] = { CU_JIT_OPTIMIZATION_LEVEL };
+    void* optVals[] = { (void*)(uintptr_t)4 };
+    CUresult err = cuModuleLoadDataEx(&mod, ptx, 1, opts, optVals);
     if (err != CUDA_SUCCESS) {
         const char* errName = nullptr;
         cuGetErrorName(err, &errName);
