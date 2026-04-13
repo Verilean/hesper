@@ -462,41 +462,42 @@ def fusedQ6KLinearBlockCoopKernel (inDim outDim : Nat) (gridX : Nat := 0) : Shad
   ShaderM.varNamed "nextQl96" (.scalar .u32) nextQl96Init
   ShaderM.varNamed "nextQh32" (.scalar .u32) nextQh32Init
 
-  for block in [0:blocksPerRow] do
-    let blockByteBase := Exp.add rowByteBase (Exp.litU32 (block * blockSizeBytes))
-    let elemBase := block * blockSize
+  -- Runtime block loop (avoids compile-time unroll → register spill on large inDim)
+  ShaderM.varNamed "currQl0"  (.scalar .u32) (Exp.var "nextQl0"  : Exp (.scalar .u32))
+  ShaderM.varNamed "currQl32" (.scalar .u32) (Exp.var "nextQl32" : Exp (.scalar .u32))
+  ShaderM.varNamed "currQh0"  (.scalar .u32) (Exp.var "nextQh0"  : Exp (.scalar .u32))
+  ShaderM.varNamed "currQl64" (.scalar .u32) (Exp.var "nextQl64" : Exp (.scalar .u32))
+  ShaderM.varNamed "currQl96" (.scalar .u32) (Exp.var "nextQl96" : Exp (.scalar .u32))
+  ShaderM.varNamed "currQh32" (.scalar .u32) (Exp.var "nextQh32" : Exp (.scalar .u32))
 
-    -- Snapshot "next" → "curr" per-iteration before issuing the next block's loads.
-    let cQl0  := s!"currQl0_{block}"
-    let cQl32 := s!"currQl32_{block}"
-    let cQh0  := s!"currQh0_{block}"
-    let cQl64 := s!"currQl64_{block}"
-    let cQl96 := s!"currQl96_{block}"
-    let cQh32 := s!"currQh32_{block}"
-    ShaderM.varNamed cQl0  (.scalar .u32) (Exp.var "nextQl0"  : Exp (.scalar .u32))
-    ShaderM.varNamed cQl32 (.scalar .u32) (Exp.var "nextQl32" : Exp (.scalar .u32))
-    ShaderM.varNamed cQh0  (.scalar .u32) (Exp.var "nextQh0"  : Exp (.scalar .u32))
-    ShaderM.varNamed cQl64 (.scalar .u32) (Exp.var "nextQl64" : Exp (.scalar .u32))
-    ShaderM.varNamed cQl96 (.scalar .u32) (Exp.var "nextQl96" : Exp (.scalar .u32))
-    ShaderM.varNamed cQh32 (.scalar .u32) (Exp.var "nextQh32" : Exp (.scalar .u32))
-    let qlByte0  : Exp (.scalar .u32) := Exp.var cQl0
-    let qlByte32 : Exp (.scalar .u32) := Exp.var cQl32
-    let qhByte0  : Exp (.scalar .u32) := Exp.var cQh0
-    let qlByte64 : Exp (.scalar .u32) := Exp.var cQl64
-    let qlByte96 : Exp (.scalar .u32) := Exp.var cQl96
-    let qhByte32 : Exp (.scalar .u32) := Exp.var cQh32
+  ShaderM.loop (Exp.litU32 0) (Exp.litU32 blocksPerRow) (Exp.litU32 1) fun blockIdx => do
+    let blockByteBase := Exp.add rowByteBase (Exp.mul blockIdx (Exp.litU32 blockSizeBytes))
+    let elemBase := Exp.mul blockIdx (Exp.litU32 blockSize)
 
-    -- Issue block+1's per-lane loads into the `next*` slots. Happens
-    -- BEFORE the dequant+FMA chain below so load latency overlaps
-    -- with the compute that uses the `curr*` values.
-    if block + 1 < blocksPerRow then
-      let nbBase := Exp.add rowByteBase (Exp.litU32 ((block + 1) * blockSizeBytes))
+    ShaderM.assign "currQl0"  (Exp.var (t := .scalar .u32) "nextQl0")
+    ShaderM.assign "currQl32" (Exp.var (t := .scalar .u32) "nextQl32")
+    ShaderM.assign "currQh0"  (Exp.var (t := .scalar .u32) "nextQh0")
+    ShaderM.assign "currQl64" (Exp.var (t := .scalar .u32) "nextQl64")
+    ShaderM.assign "currQl96" (Exp.var (t := .scalar .u32) "nextQl96")
+    ShaderM.assign "currQh32" (Exp.var (t := .scalar .u32) "nextQh32")
+    let qlByte0  : Exp (.scalar .u32) := Exp.var "currQl0"
+    let qlByte32 : Exp (.scalar .u32) := Exp.var "currQl32"
+    let qhByte0  : Exp (.scalar .u32) := Exp.var "currQh0"
+    let qlByte64 : Exp (.scalar .u32) := Exp.var "currQl64"
+    let qlByte96 : Exp (.scalar .u32) := Exp.var "currQl96"
+    let qhByte32 : Exp (.scalar .u32) := Exp.var "currQh32"
+
+    -- Prefetch next block
+    let nextBlockIdx := Exp.add blockIdx (Exp.litU32 1)
+    ShaderM.if_ (Exp.lt nextBlockIdx (Exp.litU32 blocksPerRow)) (do
+      let nbBase := Exp.add rowByteBase (Exp.mul nextBlockIdx (Exp.litU32 blockSizeBytes))
       ShaderM.assign "nextQl0"  (← readByteExp nbBase offQl0)
       ShaderM.assign "nextQl32" (← readByteExp nbBase offQl32)
       ShaderM.assign "nextQh0"  (← readByteExp nbBase offQh0)
       ShaderM.assign "nextQl64" (← readByteExp nbBase offQl64)
       ShaderM.assign "nextQl96" (← readByteExp nbBase offQl96)
       ShaderM.assign "nextQh32" (← readByteExp nbBase offQh32)
+    ) (pure ())
 
     -- Shared block header: d (fp16 at byte 208), scales[0..15] at bytes 192..207.
     -- All 32 lanes read the same addresses → hardware broadcast.
@@ -584,7 +585,7 @@ def fusedQ6KLinearBlockCoopKernel (inDim outDim : Nat) (gridX : Nat := 0) : Shad
       let w4 := Exp.mul dsc6 q4
 
       -- Input addresses: elemBase + (chunkOutBase + l + {0,32,64,96}), l = tid.
-      let chunkBaseU := Exp.add (Exp.litU32 elemBase) (Exp.litU32 chunkOutBase)
+      let chunkBaseU := Exp.add elemBase (Exp.litU32 chunkOutBase)
       let inIdx1 := Exp.add chunkBaseU tid
       let inIdx2 := Exp.add chunkBaseU (Exp.add tid (Exp.litU32 32))
       let inIdx3 := Exp.add chunkBaseU (Exp.add tid (Exp.litU32 64))
