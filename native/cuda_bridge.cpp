@@ -194,3 +194,82 @@ extern "C" lean_obj_res lean_hesper_fast_string_hash(b_lean_obj_arg s) {
     }
     return lean_io_result_mk_ok(lean_box_usize((size_t)h));
 }
+
+// ============================================================================
+// Memory-mapped file I/O
+// ============================================================================
+
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <unistd.h>
+
+// mmap a file, return (pointer, size) as two USize values packed in an array
+extern "C" lean_obj_res lean_hesper_mmap_file(b_lean_obj_arg path_str) {
+    const char* path = lean_string_cstr(path_str);
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) {
+        return lean_io_result_mk_error(lean_mk_io_user_error(
+            lean_mk_string("mmap: open failed")));
+    }
+    struct stat st;
+    if (fstat(fd, &st) < 0) {
+        close(fd);
+        return lean_io_result_mk_error(lean_mk_io_user_error(lean_mk_string("mmap: fstat failed")));
+    }
+    size_t size = st.st_size;
+    void* ptr = mmap(nullptr, size, PROT_READ, MAP_PRIVATE | MAP_POPULATE, fd, 0);
+    close(fd);
+    if (ptr == MAP_FAILED) {
+        return lean_io_result_mk_error(lean_mk_io_user_error(lean_mk_string("mmap: mmap failed")));
+    }
+    // Return as pair (ptr, size)
+    lean_obj_res pair = lean_alloc_ctor(0, 2, 0);
+    lean_ctor_set(pair, 0, lean_box_usize((size_t)ptr));
+    lean_ctor_set(pair, 1, lean_box_usize(size));
+    return lean_io_result_mk_ok(pair);
+}
+
+extern "C" lean_obj_res lean_hesper_munmap(size_t ptr, size_t size) {
+    munmap((void*)ptr, size);
+    return lean_io_result_mk_ok(lean_box(0));
+}
+
+// Copy a slice of mmapped memory to a Lean ByteArray (for small metadata)
+extern "C" lean_obj_res lean_hesper_mmap_slice_to_bytes(size_t ptr, size_t offset, size_t size) {
+    lean_obj_res arr = lean_alloc_sarray(1, size, size);
+    memcpy(lean_sarray_cptr(arr), (const char*)ptr + offset, size);
+    return lean_io_result_mk_ok(arr);
+}
+
+// Copy a slice of mmapped memory directly to GPU (zero Lean-side copy)
+extern "C" lean_obj_res lean_hesper_mmap_to_gpu(size_t mmap_ptr, size_t offset, size_t gpu_ptr, size_t size) {
+    CUDA_CHECK(cuMemcpyHtoD((CUdeviceptr)gpu_ptr, (const char*)mmap_ptr + offset, size), "mmap_to_gpu");
+    return lean_io_result_mk_ok(lean_box(0));
+}
+
+// Fast file read using mmap + memcpy (avoids Lean's IO.FS.readBinFile overhead)
+extern "C" lean_obj_res lean_hesper_read_file_fast(b_lean_obj_arg path_str) {
+    const char* path = lean_string_cstr(path_str);
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) {
+        return lean_io_result_mk_error(lean_mk_io_user_error(lean_mk_string("readFileFast: open failed")));
+    }
+    struct stat st;
+    fstat(fd, &st);
+    size_t size = st.st_size;
+    
+    // mmap with MAP_POPULATE to prefault all pages
+    void* src = mmap(nullptr, size, PROT_READ, MAP_PRIVATE | MAP_POPULATE, fd, 0);
+    close(fd);
+    if (src == MAP_FAILED) {
+        return lean_io_result_mk_error(lean_mk_io_user_error(lean_mk_string("readFileFast: mmap failed")));
+    }
+    
+    // Allocate Lean ByteArray and copy (memcpy from mmap is fast — pages already in memory)
+    lean_obj_res arr = lean_alloc_sarray(1, size, size);
+    memcpy(lean_sarray_cptr(arr), src, size);
+    munmap(src, size);
+    
+    return lean_io_result_mk_ok(arr);
+}

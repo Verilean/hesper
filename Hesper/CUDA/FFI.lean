@@ -68,6 +68,27 @@ opaque cuModuleUnload (mod : CUmodule) : IO Unit
 @[extern "lean_hesper_fast_string_hash"]
 opaque fastStringHash (s : @& String) : IO USize
 
+/-! ## Memory-mapped file I/O -/
+
+/-- mmap a file. Returns (pointer, size). -/
+@[extern "lean_hesper_mmap_file"]
+opaque mmapFile (path : @& String) : IO (USize × USize)
+
+@[extern "lean_hesper_munmap"]
+opaque munmap (ptr : USize) (size : USize) : IO Unit
+
+/-- Copy a slice from mmapped memory to a Lean ByteArray (for metadata). -/
+@[extern "lean_hesper_mmap_slice_to_bytes"]
+opaque mmapSliceToBytes (ptr : USize) (offset : USize) (size : USize) : IO ByteArray
+
+/-- Copy mmapped data directly to GPU buffer (zero Lean-side copy). -/
+@[extern "lean_hesper_mmap_to_gpu"]
+opaque mmapToGPU (mmapPtr : USize) (offset : USize) (gpuPtr : USize) (size : USize) : IO Unit
+
+/-- Fast file read: mmap + memcpy. Faster than IO.FS.readBinFile for large files. -/
+@[extern "lean_hesper_read_file_fast"]
+opaque readFileFast (path : @& String) : IO ByteArray
+
 /-! ## Memory -/
 
 @[extern "lean_hesper_cuda_malloc"]
