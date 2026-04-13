@@ -1557,31 +1557,26 @@ def forwardBlock [GPUBackend β] (ctx : β)
 
       -- For each selected expert: gate+up → GELU*up → down → weighted accumulate
       for k in [0:cfg.numExpertsUsed] do
-        -- Gate projection
-        GPUBackend.execute ctx  -- expert k varies per iter
+        ce s!"moeGate_{k}"
           (MoE.expertGateUpKernel moeConfig k true)
           [("input", state.moeNormedBuf), ("gate_up_weights", gateUpExps),
            ("expert_indices", state.moeIndicesBuf), ("output", state.moeExpertGateBuf)]
           ({ numWorkgroups := (cfg.expertFFSize, 1, 1) : Hesper.ExecConfig })
-        -- Up projection
-        GPUBackend.execute ctx  -- expert k varies per iter
+        ce s!"moeUp_{k}"
           (MoE.expertGateUpKernel moeConfig k false)
           [("input", state.moeNormedBuf), ("gate_up_weights", gateUpExps),
            ("expert_indices", state.moeIndicesBuf), ("output", state.moeExpertUpBuf)]
           ({ numWorkgroups := (cfg.expertFFSize, 1, 1) : Hesper.ExecConfig })
-        -- GELU * up
         ce "moeExpertGelu"
           (MoE.expertGeluMulKernel cfg.expertFFSize)
           [("gate", state.moeExpertGateBuf), ("up", state.moeExpertUpBuf), ("output", state.moeExpertGeluBuf)]
           (.dispatch1D cfg.expertFFSize)
-        -- Down projection
-        GPUBackend.execute ctx  -- expert k varies per iter
+        ce s!"moeDown_{k}"
           (MoE.expertDownKernel moeConfig k)
           [("input", state.moeExpertGeluBuf), ("down_weights", downExps),
            ("expert_indices", state.moeIndicesBuf), ("output", state.moeExpertDownBuf)]
           ({ numWorkgroups := (cfg.hiddenSize, 1, 1) : Hesper.ExecConfig })
-        -- Weighted accumulate: moeExpertOutBuf += weight[k] * expertDownBuf
-        GPUBackend.execute ctx  -- expert k varies per iter
+        ce s!"moeAccum_{k}"
           (MoE.weightedAccumulateKernel cfg.hiddenSize cfg.numExpertsUsed k)
           [("accumulator", state.moeExpertOutBuf), ("expert_output", state.moeExpertDownBuf),
            ("weights", state.moeWeightsBuf)]
@@ -1648,7 +1643,7 @@ def forwardBlock [GPUBackend β] (ctx : β)
       let plOffset := li * cfg.embdPerLayer
       let plTotalSize := cfg.embdPerLayer * cfg.numHiddenLayers
       Hesper.WGSL.Execute.withSection "ple.geluGateMul" do
-        GPUBackend.execute ctx
+        ce s!"pleGeluGateMul_{plOffset}"
           (PerLayerEmbedding.geluGateMulSliceKernel cfg.embdPerLayer plTotalSize plOffset)
           [("gate", state.plGateBuf), ("per_layer_input", plInputAll), ("output", state.moeRouterOutBuf)]
           (.dispatch1D cfg.embdPerLayer)
