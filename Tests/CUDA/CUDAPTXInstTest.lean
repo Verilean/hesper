@@ -218,6 +218,21 @@ def main : IO Unit := do
   let r ← run1 c (binU Exp.div) #[("a", pu #[20]), ("b", pu #[3])] "o"; expectU c "div_u32(20,3)" (uu r 0) 6
   let r ← run1 c (binU Exp.mod) #[("a", pu #[20]), ("b", pu #[3])] "o"; expectU c "rem_u32(20,3)" (uu r 0) 2
 
+  -- ── dp4a (packed 4x int8 dot product) ──
+  IO.println "── dp4a ──"
+  -- dot4U8Packed(a, b) = a[0]*b[0] + a[1]*b[1] + a[2]*b[2] + a[3]*b[3] where each byte is uint8
+  -- Example: a=[1,2,3,4], b=[5,6,7,8] → 5+12+21+32 = 70
+  let a_bytes : Nat := 1 + 2 * 256 + 3 * 65536 + 4 * 16777216
+  let b_bytes : Nat := 5 + 6 * 256 + 7 * 65536 + 8 * 16777216
+  let r ← run1 c (binU Exp.dot4U8Packed) #[("a", pu #[a_bytes]), ("b", pu #[b_bytes])] "o"
+  expectU c "dot4U8Packed([1,2,3,4],[5,6,7,8])=70" (uu r 0) 70
+  -- All 1s against all 1s: 1+1+1+1 = 4
+  let r ← run1 c (binU Exp.dot4U8Packed) #[("a", pu #[0x01010101]), ("b", pu #[0x01010101])] "o"
+  expectU c "dot4U8Packed(0x01010101, 0x01010101)=4" (uu r 0) 4
+  -- Against 0x01010101: gets sum of bytes (useful for sum-of-quants)
+  let r ← run1 c (binU Exp.dot4U8Packed) #[("a", pu #[0x01010101]), ("b", pu #[a_bytes])] "o"
+  expectU c "dot4U8Packed(ones, [1,2,3,4])=10" (uu r 0) 10
+
   -- ── bitwise ──
   IO.println "── bitwise ──"
   let r ← run1 c (binU Exp.bitAnd) #[("a", pu #[0xFF0F]), ("b", pu #[0x0FF0])] "o"; expectU c "bitAnd" (uu r 0) 0x0F00

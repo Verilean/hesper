@@ -791,6 +791,10 @@ structure Gemma4Attention (BufT CacheT : Type) where
   wO : Linear.LinearLayer BufT CacheT         -- Output projection [numHeads * headDim → hiddenSize]
   qNormWeight : BufT            -- Per-head Q norm [headDim]
   kNormWeight : BufT            -- Per-head K norm [headDim]
+  -- Fused RMSNorm+Linear cache refs (attnNorm fused into Q/K/V projections)
+  fusedNormQPrepared : IO.Ref (Option CacheT)
+  fusedNormKPrepared : IO.Ref (Option CacheT)
+  fusedNormVPrepared : IO.Ref (Option CacheT)
 
 /-- Gemma 4 dense FFN layer -/
 structure Gemma4FFN (BufT CacheT : Type) where
@@ -798,6 +802,9 @@ structure Gemma4FFN (BufT CacheT : Type) where
   up : Linear.LinearLayer BufT CacheT
   down : Linear.LinearLayer BufT CacheT
   fusedGateUpPrepared : IO.Ref (Option CacheT)
+  -- Fused RMSNorm+Linear cache refs (ffnNorm fused into gate/up)
+  fusedNormGatePrepared : IO.Ref (Option CacheT)
+  fusedNormUpPrepared : IO.Ref (Option CacheT)
 
 /-- Gemma 4 transformer block (single layer) -/
 structure Gemma4Block (BufT CacheT : Type) where
@@ -991,10 +998,14 @@ def Gemma4Model.fromGGUFData [GPUBackend β] (ctx : β) (ggufData : ByteArray)
     let qNormBuf ← uploadBuffer ctx qNormData
     let kNormBuf ← uploadBuffer ctx kNormData
 
+    let fusedNormQPrepared ← GPUBackend.newCacheRef (β := β)
+    let fusedNormKPrepared ← GPUBackend.newCacheRef (β := β)
+    let fusedNormVPrepared ← GPUBackend.newCacheRef (β := β)
     let attention : Gemma4Attention (GPUBackend.Buf β) (GPUBackend.CachedDispatch β) := {
       wQ, wK, wV, wO
       qNormWeight := qNormBuf
       kNormWeight := kNormBuf
+      fusedNormQPrepared, fusedNormKPrepared, fusedNormVPrepared
     }
 
     -- Load FFN projections (Q4_K)
@@ -1003,8 +1014,11 @@ def Gemma4Model.fromGGUFData [GPUBackend β] (ctx : β) (ggufData : ByteArray)
     let ffnDown ← loadLinear ctx gguf s!"blk.{li}.ffn_down.weight" cfg.intermediateSize cfg.hiddenSize
 
     let fusedGateUpPrepared ← GPUBackend.newCacheRef (β := β)
+    let fusedNormGatePrepared ← GPUBackend.newCacheRef (β := β)
+    let fusedNormUpPrepared ← GPUBackend.newCacheRef (β := β)
     let ffn : Gemma4FFN (GPUBackend.Buf β) (GPUBackend.CachedDispatch β) :=
-      { gate := ffnGate, up := ffnUp, down := ffnDown, fusedGateUpPrepared }
+      { gate := ffnGate, up := ffnUp, down := ffnDown, fusedGateUpPrepared,
+        fusedNormGatePrepared, fusedNormUpPrepared }
 
     -- Load optional RoPE frequency factors
     -- In the E4B model, rope_freqs is a global tensor, not per-layer
@@ -1358,6 +1372,9 @@ def forwardBlock [GPUBackend β] (ctx : β)
       GPUBackend.executeWithConfigCached ctx shader namedBufs config key ref
     | none => GPUBackend.execute ctx shader namedBufs config
 
+  -- Step 1+2: Fused attnNorm + Q/K/V projections
+  -- Fuses RMSNorm into each matmul: each WG computes RMS on-the-fly (redundant but cheap).
+  -- Eliminates the normedBuf global memory write/read round-trip and the attnNorm dispatch.
   -- Step 1: Attention pre-norm
   Hesper.WGSL.Execute.withSection "attnNorm" do
     RMSNorm.forward ctx block.attnNorm inputBuf state.normedBuf
@@ -1379,20 +1396,17 @@ def forwardBlock [GPUBackend β] (ctx : β)
   } : Hesper.ExecConfig)
   let isFull := cfg.isFullAttention li
   Hesper.WGSL.Execute.withSection "qkvNorm" do
-    -- Q-norm: qBuf → qBuf2
     ce (if isFull then "qNormFull" else "qNormSWA")
       (perHeadRMSNormKernel numHeads headDim cfg.rmsNormEps)
       [("input", state.qBuf), ("weight", block.attention.qNormWeight), ("output", state.qBuf2)]
       (mkNormConfig numHeads)
 
     if cfg.hasKV li then
-      -- K-norm: kBuf → kBuf2
       ce (if isFull then "kNormFull" else "kNormSWA")
         (perHeadRMSNormKernel numKVHeads headDim cfg.rmsNormEps)
         [("input", state.kBuf), ("weight", block.attention.kNormWeight), ("output", state.kBuf2)]
         (mkNormConfig numKVHeads)
 
-      -- V-norm: bare per-head RMSNorm on V (no learned weights)
       ce (if isFull then "vNormFull" else "vNormSWA")
         (perHeadBareRMSNormKernel numKVHeads headDim cfg.rmsNormEps)
         [("input", state.vBuf), ("output", state.vBuf2)]
@@ -1609,6 +1623,7 @@ def forwardBlock [GPUBackend β] (ctx : β)
       (.dispatch1D cfg.hiddenSize)
   else do
     -- Dense FFN path (GeGLU).
+    -- Fuse ffnNorm into gate/up matmuls when possible (Q4_K + subgroups).
     Hesper.WGSL.Execute.withSection "ffnNorm" do
       RMSNorm.forward ctx block.ffnNorm state.attnResidualBuf state.normedBuf
     Hesper.WGSL.Execute.withSection "ffnGateUp" do

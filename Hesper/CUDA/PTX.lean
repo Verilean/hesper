@@ -183,6 +183,16 @@ inductive Inst where
   | xor_u32     (dst src1 src2 : RegU32)
   | not_u32     (dst src : RegU32)
 
+  -- ── bitcast (f32 ↔ u32 reinterpret, same 32-bit register file) ──
+  | mov_b32_f32_to_u32 (dst : RegU32) (src : RegF32)
+  | mov_b32_u32_to_f32 (dst : RegF32) (src : RegU32)
+
+  -- ── dp4a (packed 4×int8 dot product + accumulate) ──
+  -- dp4a.s32.s32 d, a, b, c: d = c + dot(int8x4(a), int8x4(b))
+  | dp4a_s32    (dst a b c : RegU32)
+  -- dp4a.u32.u32 d, a, b, c: d = c + dot(uint8x4(a), uint8x4(b))
+  | dp4a_u32    (dst a b c : RegU32)
+
   -- ── u64 arithmetic ── (all operands: RegU64, except mul_wide src is RegU32)
   | mov_u64     (dst src : RegU64)
   | add_u64     (dst src1 src2 : RegU64)
@@ -222,6 +232,8 @@ inductive Inst where
 
   -- ── warp shuffle ──
   | shfl_bfly_f32 (dst src : RegF32) (offset : Nat)
+  -- shfl.sync.idx.b32 d, src, lane_idx, 31, 0xFFFFFFFF;  -- read val from specific lane
+  | shfl_idx_f32  (dst src : RegF32) (laneIdx : RegU32)
 
   -- ── control flow ──
   | bar_sync     (id : Nat)
@@ -276,6 +288,10 @@ def Inst.toString : Inst → String
   | .or_u32 d a b        => s!"  or.b32 {d}, {a}, {b};"
   | .xor_u32 d a b       => s!"  xor.b32 {d}, {a}, {b};"
   | .not_u32 d s         => s!"  not.b32 {d}, {s};"
+  | .dp4a_s32 d a b c    => s!"  dp4a.s32.s32 {d}, {a}, {b}, {c};"
+  | .dp4a_u32 d a b c    => s!"  dp4a.u32.u32 {d}, {a}, {b}, {c};"
+  | .mov_b32_f32_to_u32 d s => s!"  mov.b32 {d}, {s};"
+  | .mov_b32_u32_to_f32 d s => s!"  mov.b32 {d}, {s};"
   | .mov_u64 d s         => s!"  mov.u64 {d}, {s};"
   | .add_u64 d a b       => s!"  add.u64 {d}, {a}, {b};"
   | .mul_wide_u32 d s n  => s!"  mul.wide.u32 {d}, {s}, {n};"
@@ -299,6 +315,7 @@ def Inst.toString : Inst → String
   | .mov_shared_addr d sym         => s!"  mov.u32 {d}, {sym};"
   | .ld_param_u64 d name => s!"  ld.param.u64 {d}, [param_{name}];"
   | .shfl_bfly_f32 d s off => s!"  shfl.sync.bfly.b32 {d}, {s}, {off}, 31, 0xFFFFFFFF;"
+  | .shfl_idx_f32 d s l    => s!"  shfl.sync.idx.b32 {d}, {s}, {l}, 31, 0xFFFFFFFF;"
   | .bar_sync id         => s!"  bar.sync {id};"
   | .bra target          => s!"  bra {target};"
   | .bra_not p target    => s!"  @!{p} bra {target};"

@@ -320,8 +320,57 @@ partial def expToPTX (e : Exp t) (s : GenState) : ExpResult :=
     let (t5, s) := s.freshF32; let s := s.emit (.shfl_bfly_f32 t5 r 1);  let s := s.emit (.add_f32 r r t5)
     (.f32 r, s)
 
+  -- Subgroup max (warp butterfly with max)
+  | .subgroupMax val =>
+    let (rv, s) := expToPTX val s; let (r, s) := s.freshF32
+    let s := s.emit (.mov_f32 r rv.toF32!)
+    let (t1, s) := s.freshF32; let s := s.emit (.shfl_bfly_f32 t1 r 16); let s := s.emit (.max_f32 r r t1)
+    let (t2, s) := s.freshF32; let s := s.emit (.shfl_bfly_f32 t2 r 8);  let s := s.emit (.max_f32 r r t2)
+    let (t3, s) := s.freshF32; let s := s.emit (.shfl_bfly_f32 t3 r 4);  let s := s.emit (.max_f32 r r t3)
+    let (t4, s) := s.freshF32; let s := s.emit (.shfl_bfly_f32 t4 r 2);  let s := s.emit (.max_f32 r r t4)
+    let (t5, s) := s.freshF32; let s := s.emit (.shfl_bfly_f32 t5 r 1);  let s := s.emit (.max_f32 r r t5)
+    (.f32 r, s)
+
+  -- Subgroup shuffle (read value from specific lane)
+  | .subgroupShuffle val laneIdx =>
+    let (rv, s) := expToPTX val s
+    let (rl, s) := expToPTX laneIdx s
+    let (r, s) := s.freshF32; (.f32 r, s.emit (.shfl_idx_f32 r rv.toF32! rl.toU32!))
+
   -- Barrier
   | .workgroupBarrier => let (r, s) := s.freshU32; (.u32 r, s.emit (.bar_sync 0))
+
+  -- Bitcast: reinterpret 32-bit register between f32/u32/i32.
+  -- On PTX, all 32-bit types share register file, so bitcast is free:
+  -- just return the register tagged as the target type.
+  -- Note: we rely on context (e.g. read/write buffer) to know what type
+  -- the caller wants. Since AnyReg carries the type tag, we need mov.b32
+  -- to a new register of the target type inferred from usage.
+  -- Simple approach: f32 → u32 via mov.b32; u32 → f32 via mov.b32.
+  -- But we can't know the target type from Exp.bitcast's erased type param.
+  -- Workaround: emit mov.b32 to both a u32 and f32 register, caller picks.
+  -- Actually, simpler: just pass through the register, reinterpreting as u32
+  -- if needed by subsequent ops. Most common case: f32 → u32 for packing.
+  | .bitcast e =>
+    let (re, s) := expToPTX e s
+    match re with
+    | .f32 f =>
+      -- f32 → u32: use mov.b32 to copy bits (free on PTX hardware)
+      let (r, s) := s.freshU32; (.u32 r, s.emit (.mov_b32_f32_to_u32 r f))
+    | .u32 u =>
+      -- u32 → f32: use mov.b32 to copy bits
+      let (r, s) := s.freshF32; (.f32 r, s.emit (.mov_b32_u32_to_f32 r u))
+    | _ => (re, s)
+
+  -- dp4a: packed 4×int8 dot product
+  | .dot4I8Packed a b =>
+    let (ra, s) := expToPTX a s; let (rb, s) := expToPTX b s
+    let (zero, s) := s.freshU32; let s := s.emit (.mov_u32_imm zero 0)
+    let (r, s) := s.freshU32; (.u32 r, s.emit (.dp4a_s32 r ra.toU32! rb.toU32! zero))
+  | .dot4U8Packed a b =>
+    let (ra, s) := expToPTX a s; let (rb, s) := expToPTX b s
+    let (zero, s) := s.freshU32; let s := s.emit (.mov_u32_imm zero 0)
+    let (r, s) := s.freshU32; (.u32 r, s.emit (.dp4a_u32 r ra.toU32! rb.toU32! zero))
 
   -- FMA
   | .fma a b c =>
