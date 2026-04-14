@@ -295,7 +295,9 @@ def Inst.toString : Inst → String
   | .mov_u64 d s         => s!"  mov.u64 {d}, {s};"
   | .add_u64 d a b       => s!"  add.u64 {d}, {a}, {b};"
   | .mul_wide_u32 d s n  => s!"  mul.wide.u32 {d}, {s}, {n};"
-  | .cvt_f32_u32 d s     => s!"  cvt.rn.f32.u32 {d}, {s};"
+  -- Use signed conversion so negative i32 (from dp4a.s32) round-trips correctly.
+  -- cvt.rn.f32.s32 produces the same result as .u32 variant for positive inputs.
+  | .cvt_f32_u32 d s     => s!"  cvt.rn.f32.s32 {d}, {s};"
   | .cvt_u32_f32 d s     => s!"  cvt.rzi.u32.f32 {d}, {s};"
   | .cvt_f32_f16 d s     => s!"  cvt.f32.f16 {d}, {s};"
   | .cvt_f16_f32 d s     => s!"  cvt.rn.f16.f32 {d}, {s};"

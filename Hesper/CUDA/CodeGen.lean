@@ -161,9 +161,19 @@ partial def expToPTX (e : Exp t) (s : GenState) : ExpResult :=
   | .toF32 e =>
     let (re, s) := expToPTX e s
     let (r, s) := s.freshF32; (.f32 r, s.emit (.cvt_f32_u32 r re.toU32!))
+    -- Note: for negative i32, cvt.rn.f32.u32 reinterprets as unsigned.
+    -- Use cvt_f32_s32 variant for signed if needed (added below).
   | .toU32 e =>
     let (re, s) := expToPTX e s
     let (r, s) := s.freshU32; (.u32 r, s.emit (.cvt_u32_f32 r re.toF32!))
+  | .toI32 e =>
+    -- f32 → i32 (round toward zero, like toU32 but signed).
+    -- Also handles u32 → i32 (identity bitcast) and i32 → i32 (identity).
+    let (re, s) := expToPTX e s
+    match re with
+    | .f32 f => let (r, s) := s.freshU32; (.u32 r, s.emit (.cvt_u32_f32 r f))
+    | .u32 u => (.u32 u, s)  -- reinterpret (PTX s32/u32 share register file)
+    | _ => (re, s)
   | .toF16 e =>
     -- f32 → f16 (stored as AnyReg.u32 holding the b16 value for shared mem writes)
     let (re, s) := expToPTX e s
