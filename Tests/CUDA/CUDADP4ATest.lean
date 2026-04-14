@@ -177,6 +177,9 @@ def main : IO Unit := do
   let inputBytes := packF32 input
   let weightBytes := packU32Array weights
 
+  -- Dump weights to binary file for external reference kernel comparison
+  IO.FS.writeBinFile "/tmp/test_weights.bin" weightBytes
+
   -- Allocate buffers
   let inputBuf ← GPUBackend.allocBuffer cuda (4 * inDim).toUSize
   GPUBackend.writeBuffer cuda inputBuf inputBytes
@@ -236,6 +239,10 @@ def main : IO Unit := do
     [("weights", weightBuf), ("input_q8", q8Buf), ("output", outputDP4ABuf)]
     { numWorkgroups := (outDim, 1, 1), workgroupSize := { x := 32, y := 1, z := 1 }
       extensions := ["subgroups"] }
+
+  -- Also dump Q8_1 quantized input for external reference
+  let q8DataForDump ← GPUBackend.readBuffer cuda q8Buf q8BufSize
+  IO.FS.writeBinFile "/tmp/test_q8input.bin" q8DataForDump
 
   let dp4aResult ← GPUBackend.readBuffer cuda outputDP4ABuf (4 * outDim).toUSize
   let dp4aVal := unpackF32 dp4aResult 0
