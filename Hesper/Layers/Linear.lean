@@ -50,6 +50,10 @@ Only meaningful when dispatches run in non-batch mode (each call
 deviceWaits), so the caller should profile without `beginBatch`. Reset
 `totalNanosRef` between measurements. -/
 initialize profilingRef  : IO.Ref Bool  ← IO.mkRef false
+/-- Toggle: use dp4a (Q8_1 quantize + INT8 SIMD matmul) for Q4_K linears.
+    Off by default; enable via `dp4aEnabled.set true` before inference to
+    activate llama.cpp-style accelerated matmul. -/
+initialize dp4aEnabled   : IO.Ref Bool  ← IO.mkRef false
 initialize totalNanosRef : IO.Ref UInt64 ← IO.mkRef 0
 initialize callCountRef  : IO.Ref Nat    ← IO.mkRef 0
 /-- Per-shape cumulative time, keyed by (inDim, outDim). Array of
@@ -1637,27 +1641,77 @@ structure LinearLayer (BufT : Type) (CacheT : Type := Unit) where
   -- Prepared dispatch for the split-K partial kernel and the reduce kernel.
   splitKPartialPrepared : IO.Ref (Option CacheT)
   splitKReducePrepared : IO.Ref (Option CacheT)
+  -- dp4a path: Q8_1 quantized input scratch (inDim/32 * 9 u32 bytes), lazy.
+  dp4aQ8Buf : IO.Ref (Option BufT)
+  -- Prepared dispatches for (quantize, matmul) of the dp4a pipeline.
+  dp4aQuantizePrepared : IO.Ref (Option CacheT)
+  dp4aMatmulPrepared : IO.Ref (Option CacheT)
+
+/-- Q8_1 quantize input + Q4_K dp4a matmul (2 dispatches).
+    Uses lazily-allocated per-layer Q8_1 scratch buffer and cache refs. -/
+def forwardDP4A [GPUBackend β] (ctx : β)
+    (layer : LinearLayer (GPUBackend.Buf β) (GPUBackend.CachedDispatch β))
+    (inputBuf outputBuf : GPUBackend.Buf β)
+    : IO Unit := do
+  if layer.quantFormat != .Q4_K then
+    throw (IO.userError s!"forwardDP4A: must be Q4_K, got {repr layer.quantFormat}")
+
+  let profiling ← profilingRef.get
+  let startNs ← if profiling then IO.monoNanosNow else pure 0
+
+  let nQ8Blocks := layer.config.inDim / 32
+  let q8BufBytes : USize := (nQ8Blocks * 9 * 4).toUSize
+
+  -- Lazily allocate Q8_1 scratch buffer on first call.
+  let q8Buf ← match ← layer.dp4aQ8Buf.get with
+    | some b => pure b
+    | none =>
+      let b ← GPUBackend.allocBuffer ctx q8BufBytes
+      layer.dp4aQ8Buf.set (some b)
+      pure b
+
+  -- Step 1: Quantize input f32 → Q8_1
+  GPUBackend.executeWithConfigCached ctx
+    (quantizeQ8_1Kernel layer.config.inDim)
+    [("input", inputBuf), ("output", q8Buf)]
+    { numWorkgroups := (nQ8Blocks, 1, 1), workgroupSize := { x := 32, y := 1, z := 1 } }
+    (hash ("q8_1-quantize", layer.config.inDim))
+    layer.dp4aQuantizePrepared
+
+  -- Step 2: Q4_K × Q8_1 matmul via dp4a
+  GPUBackend.executeWithConfigCached ctx
+    (fusedQ4KMLinearDP4AKernel layer.config)
+    [("weights", layer.weightBuf), ("input_q8", q8Buf), ("output", outputBuf)]
+    { numWorkgroups := (layer.config.outDim, 1, 1), workgroupSize := { x := 32, y := 1, z := 1 } }
+    (hash ("q4k-dp4a-matmul", layer.config.inDim, layer.config.outDim))
+    layer.dp4aMatmulPrepared
+
+  if profiling then
+    let endNs ← IO.monoNanosNow
+    let delta := (endNs - startNs).toUInt64
+    totalNanosRef.modify (· + delta)
+    callCountRef.modify (· + 1)
+    perShapeAdd layer.config.inDim layer.config.outDim delta
 
 /-- Execute the linear layer: output = input @ weights^T
 
     Fast path: after the first call, the prepared dispatch is cached in
     `layer.prepared` and subsequent calls bypass WGSL regeneration / hash
-    lookup entirely via `replayPreparedDispatch`. This is critical for
-    Gemma 4 where Q4_K/Q6_K linears are called dozens of times per layer
-    × 42 layers per token — the non-fast path would pay a ~tens-of-ms
-    WGSL-emit-and-hash cost per call for these large unrolled kernels.
-
-    @param device WebGPU device
-    @param layer The linear layer
-    @param inputBuf GPU buffer with input vector [inDim]
-    @param outputBuf GPU buffer for output vector [outDim]
--/
+    lookup entirely via `replayPreparedDispatch`. -/
 def LinearLayer.forward [GPUBackend β] (ctx : β) (layer : LinearLayer (GPUBackend.Buf β) (GPUBackend.CachedDispatch β))
     (inputBuf outputBuf : GPUBackend.Buf β) : IO Unit := do
   let profiling ← profilingRef.get
   let startNs ← if profiling then IO.monoNanosNow else pure 0
 
   let useSubgroups ← GPUBackend.hasSubgroupSupport ctx
+
+  -- dp4a fast path: Q8_1 quantize + INT8 SIMD matmul for Q4_K linears.
+  -- Requires subgroups (used for warp-reduce) and inDim divisible by 32.
+  if (← dp4aEnabled.get) && layer.quantFormat == .Q4_K && useSubgroups
+     && layer.config.inDim % 32 == 0 then
+    forwardDP4A ctx layer inputBuf outputBuf
+    return
+
   let splits := if layer.quantFormat == .Q4_K && useSubgroups
                 then splitKFactorFor layer.config else 1
 
@@ -1908,67 +1962,6 @@ def forwardFusedRMSNormLinear [GPUBackend β] (ctx : β)
   GPUBackend.executeWithConfigCached ctx
     (fusedRMSNormQ4KMLinearKernel layer.config eps)
     namedBuffers execConfig cacheKey preparedRef
-  if profiling then
-    let endNs ← IO.monoNanosNow
-    let delta := (endNs - startNs).toUInt64
-    totalNanosRef.modify (· + delta)
-    callCountRef.modify (· + 1)
-    perShapeAdd layer.config.inDim layer.config.outDim delta
-
-/-- Q8_1 quantize input + Q4_K dp4a matmul (2 dispatches).
-
-    llama.cpp strategy: input f32 → Q8_1 (block=32 elements, 36 bytes),
-    then Q4_K × Q8_1 dot product via dp4a (4× INT8 SIMD per instruction).
-
-    @param layer The Q4_K linear layer
-    @param inputBuf Raw f32 input
-    @param q8InputBuf Scratch buffer for Q8_1 quantized input (size = inDim/32 * 9 u32)
-    @param outputBuf f32 output
-    @param quantizePrepared Cache ref for quantize dispatch
-    @param matmulPrepared Cache ref for matmul dispatch -/
-def forwardDP4A [GPUBackend β] (ctx : β)
-    (layer : LinearLayer (GPUBackend.Buf β) (GPUBackend.CachedDispatch β))
-    (inputBuf q8InputBuf outputBuf : GPUBackend.Buf β)
-    (quantizePrepared matmulPrepared : IO.Ref (Option (GPUBackend.CachedDispatch β)))
-    : IO Unit := do
-  if layer.quantFormat != .Q4_K then
-    throw (IO.userError s!"forwardDP4A: must be Q4_K, got {repr layer.quantFormat}")
-
-  let profiling ← profilingRef.get
-  let startNs ← if profiling then IO.monoNanosNow else pure 0
-
-  let nQ8Blocks := layer.config.inDim / 32
-
-  -- Step 1: Quantize input f32 → Q8_1
-  let quantizeBuffers := [
-    ("input", inputBuf),
-    ("output", q8InputBuf)
-  ]
-  let quantizeCfg : Hesper.ExecConfig := {
-    numWorkgroups := (nQ8Blocks, 1, 1)
-    workgroupSize := { x := 32, y := 1, z := 1 }
-  }
-  let quantizeCacheKey : UInt64 := hash ("q8_1-quantize", layer.config.inDim)
-  GPUBackend.executeWithConfigCached ctx
-    (quantizeQ8_1Kernel layer.config.inDim)
-    quantizeBuffers quantizeCfg quantizeCacheKey quantizePrepared
-
-  -- Step 2: Q4_K × Q8_1 matmul via dp4a
-  let matmulBuffers := [
-    ("weights", layer.weightBuf),
-    ("input_q8", q8InputBuf),
-    ("output", outputBuf)
-  ]
-  let matmulCfg : Hesper.ExecConfig := {
-    numWorkgroups := (layer.config.outDim, 1, 1)
-    workgroupSize := { x := 32, y := 1, z := 1 }
-  }
-  let matmulCacheKey : UInt64 :=
-    hash ("q4k-dp4a-matmul", layer.config.inDim, layer.config.outDim)
-  GPUBackend.executeWithConfigCached ctx
-    (fusedQ4KMLinearDP4AKernel layer.config)
-    matmulBuffers matmulCfg matmulCacheKey matmulPrepared
-
   if profiling then
     let endNs ← IO.monoNanosNow
     let delta := (endNs - startNs).toUInt64
