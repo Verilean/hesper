@@ -54,6 +54,9 @@ initialize profilingRef  : IO.Ref Bool  ← IO.mkRef false
     Off by default; enable via `dp4aEnabled.set true` before inference to
     activate llama.cpp-style accelerated matmul. -/
 initialize dp4aEnabled   : IO.Ref Bool  ← IO.mkRef false
+/-- Separately toggle Q6_K (lmHead) dp4a path. On by default when dp4aEnabled=true;
+    set to false via HESPER_DP4A_Q6K=0 to debug Q6_K issues while keeping Q4_K dp4a. -/
+initialize dp4aQ6KEnabled : IO.Ref Bool ← IO.mkRef false
 initialize totalNanosRef : IO.Ref UInt64 ← IO.mkRef 0
 initialize callCountRef  : IO.Ref Nat    ← IO.mkRef 0
 /-- Per-shape cumulative time, keyed by (inDim, outDim). Array of
@@ -1150,6 +1153,204 @@ def fusedQ4KMLinearDP4AKernel (config : Config) : ShaderM Unit := do
 
   -- Subgroup reduction. Since 32 lanes compute duplicate work (lanes 0..15
   -- and 16..31 both cover all sub-blocks), divide by 2.
+  ShaderM.varNamed "total" (.scalar .f32)
+    (Exp.mul (Exp.subgroupAdd acc) (Exp.litF32 0.5))
+  let total : Exp (.scalar .f32) := Exp.var "total"
+
+  ShaderM.if_ (Exp.and (Exp.eq tid (Exp.litU32 0)) inBounds) (do
+    ShaderM.writeBuffer (ty := .scalar .f32) "output" outIdx total
+  ) (pure ())
+
+/-! ## Q6_K × Q8_1 dp4a MatVec (lmHead) -/
+
+/-- Q6_K × Q8_1 mat-vec using dp4a.
+
+    llama.cpp's `vec_dot_q6_K_q8_1_impl_mmvq` algorithm.
+    Each lane (of 32 in the subgroup) processes iqs = lane*1 = lane (since VDR_Q6_K_Q8_1_MMVQ=1).
+    Only lanes 0..15 do useful work (QI6_K/VDR = 16), lanes 16..31 duplicate.
+
+    Q6_K block layout (210 bytes per 256 elements):
+      bytes [0, 128): ql[128] — 4-bit lower quants (2 elements per byte)
+      bytes [128, 192): qh[64] — 2-bit upper quants (4 elements per byte)
+      bytes [192, 208): scales[16] — signed int8 scales
+      bytes [208, 210): d — fp16 super-block scale
+
+    Algorithm per lane (iqs = 0..15):
+      bq8_offset = 4*(iqs/8) + (iqs%8)/4         ∈ {0, 1, 4, 5}
+      scale_offset = 4*(iqs/8) + (iqs%8)/2       ∈ {0, 1, 2, 3, 4, 5, 6, 7}
+      vh_shift = 2 * ((iqs%8)/4)                 ∈ {0, 2}
+
+      vl = ql as int[] @ index iqs                 (4 bytes of packed lower 4-bit nibbles)
+      vh = qh as int[] @ index (2*(iqs/8) + (iqs%4)), shifted right by vh_shift
+      u[0] = q8[bq8_offset].qs   @ iqs%8
+      u[1] = q8[bq8_offset+2].qs @ iqs%8
+      d8[0] = q8[bq8_offset].d,  d8[1] = q8[bq8_offset+2].d
+      scale[0] = scales[scale_offset + 0]
+      scale[1] = scales[scale_offset + 4]
+      For i ∈ {0, 1}:
+        vil = (vl >> (4*i)) & 0x0F0F0F0F
+        vih = ((vh >> (4*i)) << 4) & 0x30303030
+        vi  = vsub_s8(vil | vih, 0x20202020)        (signed subtraction: subtract 32 per byte)
+        sumf += d8[i] * scale[i] * dp4a(vi, u[i], 0)
+      lane_result = d * sumf
+    Subgroup reduce → output[outIdx].
+
+    @param inDim Input dimension
+    @param outDim Output dimension (often 262144 for Gemma 4 lmHead)
+    @param gridX Grid X dimension for 2D grid (≤ 65535 WebGPU limit); 0 for 1D. -/
+def fusedQ6KLinearDP4AKernel (inDim outDim : Nat) (gridX : Nat := 0) : ShaderM Unit := do
+  let wid ← ShaderM.workgroupId
+  let lid ← ShaderM.localId
+  let outIdx :=
+    if gridX == 0 then Exp.vec3X wid
+    else Exp.add (Exp.vec3X wid) (Exp.mul (Exp.vec3Y wid) (Exp.litU32 gridX))
+  let tid := Exp.vec3X lid
+
+  let blocksPerRow := inDim / 256
+  let blockSizeBytes : Nat := 210
+  let totalWeightBytes := outDim * blocksPerRow * blockSizeBytes
+  let totalWeightU32 := (totalWeightBytes + 3) / 4
+  let q8BlocksPerRow := inDim / 32
+  let q8InputU32Size := q8BlocksPerRow * 9
+
+  let _weights ← ShaderM.declareInputBuffer "weights" (.array (.scalar .u32) totalWeightU32)
+  let _input ← ShaderM.declareInputBuffer "input_q8" (.array (.scalar .u32) q8InputU32Size)
+  let _output ← ShaderM.declareOutputBuffer "output" (.array (.scalar .f32) outDim)
+
+  let inBounds := Exp.lt outIdx (Exp.litU32 outDim)
+
+  -- Only lanes 0..15 do work. Lanes 16..31 duplicate (handled via /2 at end).
+  let laneLow := Exp.bitAnd tid (Exp.litU32 15)  -- iqs ∈ [0, 16)
+  let iqs := laneLow
+
+  -- bq8_offset = 4*(iqs/8) + (iqs%8)/4
+  let iqsDiv8 := Exp.shiftRight iqs (Exp.litU32 3)
+  let iqsMod8 := Exp.bitAnd iqs (Exp.litU32 7)
+  let bq8Off := Exp.add (Exp.mul iqsDiv8 (Exp.litU32 4)) (Exp.shiftRight iqsMod8 (Exp.litU32 2))
+  -- scale_offset = 4*(iqs/8) + (iqs%8)/2
+  let scaleOff := Exp.add (Exp.mul iqsDiv8 (Exp.litU32 4)) (Exp.shiftRight iqsMod8 (Exp.litU32 1))
+  -- vh_shift = 2 * ((iqs%8)/4)
+  let vhShift := Exp.mul (Exp.shiftRight iqsMod8 (Exp.litU32 2)) (Exp.litU32 2)
+  -- vh index = 4*(iqs/8) + iqs%4  (matches llama.cpp: (QI6_K/4) * (iqs/(QI6_K/2)) + iqs%(QI6_K/4))
+  let iqsMod4 := Exp.bitAnd iqs (Exp.litU32 3)
+  let vhIdx := Exp.add (Exp.mul iqsDiv8 (Exp.litU32 4)) iqsMod4
+  -- q8 element offset within sub-block = iqs%8
+  let q8ElemOff := iqsMod8
+
+  ShaderM.varNamed "acc" (.scalar .f32) (Exp.litF32 0.0)
+  let acc : Exp (.scalar .f32) := Exp.var "acc"
+
+  let rowByteBase := Exp.mul outIdx (Exp.litU32 (blocksPerRow * blockSizeBytes))
+
+  -- Byte-read helper (Q6_K block is 210 bytes, not a multiple of 4).
+  let readByte (blockBase : Exp (.scalar .u32)) (offset : Exp (.scalar .u32)) : ShaderM (Exp (.scalar .u32)) := do
+    let byteIdx := Exp.add blockBase offset
+    let u32Idx := Exp.shiftRight byteIdx (Exp.litU32 2)
+    let byteShift := Exp.mul (Exp.bitAnd byteIdx (Exp.litU32 3)) (Exp.litU32 8)
+    let u32 ← ShaderM.readBuffer (ty := .scalar .u32) (n := totalWeightU32) "weights" u32Idx
+    pure (Exp.bitAnd (Exp.shiftRight u32 byteShift) (Exp.litU32 0xFF))
+
+  -- Read 4 consecutive bytes starting at `base` and pack into one u32
+  -- (little-endian: byte[base] in lowest 8 bits).
+  let read4Bytes (blockBase : Exp (.scalar .u32)) (offset : Exp (.scalar .u32)) : ShaderM (Exp (.scalar .u32)) := do
+    let b0 ← readByte blockBase offset
+    let b1 ← readByte blockBase (Exp.add offset (Exp.litU32 1))
+    let b2 ← readByte blockBase (Exp.add offset (Exp.litU32 2))
+    let b3 ← readByte blockBase (Exp.add offset (Exp.litU32 3))
+    pure (Exp.bitOr (Exp.bitOr b0 (Exp.shiftLeft b1 (Exp.litU32 8)))
+                    (Exp.bitOr (Exp.shiftLeft b2 (Exp.litU32 16)) (Exp.shiftLeft b3 (Exp.litU32 24))))
+
+  -- Per-byte signed subtract-32: emits the per-byte (x - 32) without cross-byte
+  -- borrow. Bit-parallel trick:
+  --   - split x into high-bit (0x80 per byte) and low 7 bits (0x7F per byte)
+  --   - if we bias both operands up by 0x80 per byte, sub wraps cleanly within each byte
+  --   - (x ^ 0x80) - 0xA0  = (x + 0x80 - 0x20 - 0x80) mod 256 per byte = x - 0x20 per byte
+  --     ^ 0x80 at end re-centers.
+  -- Equivalent identity:  (x | 0x80) - 0x20   produces correct two's-complement
+  -- byte values for x ∈ [0, 63], because the borrow from bit 7 never propagates
+  -- (bit 7 is forced ON before the sub, so bit 7 - bit 5 borrows into bit 7 only,
+  -- never into the next byte).
+  -- Then flip bit 7 back:  result = ((x | 0x80) - 0x20) ^ 0x80.
+  -- Verification:
+  --   x = 0x00: (0x80) - 0x20 = 0x60; ^ 0x80 = 0xE0 = -32 ✓
+  --   x = 0x1F: (0x9F) - 0x20 = 0x7F; ^ 0x80 = 0xFF = -1  ✓
+  --   x = 0x20: (0xA0) - 0x20 = 0x80; ^ 0x80 = 0x00 = 0   ✓
+  --   x = 0x3F: (0xBF) - 0x20 = 0x9F; ^ 0x80 = 0x1F = 31  ✓
+  let sub32PerByte (x : Exp (.scalar .u32)) : Exp (.scalar .u32) :=
+    Exp.bitXor
+      (Exp.sub (Exp.bitOr x (Exp.litU32 0x80808080)) (Exp.litU32 0x20202020))
+      (Exp.litU32 0x80808080)
+
+  ShaderM.loop (Exp.litU32 0) (Exp.litU32 blocksPerRow) (Exp.litU32 1) fun blockIdx => do
+    let blockByteBase := Exp.add rowByteBase (Exp.mul blockIdx (Exp.litU32 blockSizeBytes))
+
+    -- Read d (fp16 at byte offset 208)
+    let dLo ← readByte blockByteBase (Exp.litU32 208)
+    let dHi ← readByte blockByteBase (Exp.litU32 209)
+    let dBits := Exp.bitOr dLo (Exp.shiftLeft dHi (Exp.litU32 8))
+    let d := fp16ToF32 dBits
+
+    -- Read vl (4 bytes of ql at byte offset 4*iqs)
+    let vlOffset := Exp.mul iqs (Exp.litU32 4)
+    let vl ← read4Bytes blockByteBase vlOffset
+    -- Read vh_raw (4 bytes of qh at byte offset 128 + 4*vhIdx), shift right by vh_shift
+    let vhOffset := Exp.add (Exp.litU32 128) (Exp.mul vhIdx (Exp.litU32 4))
+    let vhRaw ← read4Bytes blockByteBase vhOffset
+    let vh := Exp.shiftRight vhRaw vhShift
+
+    -- Read 2 scales: scales[scale_offset], scales[scale_offset + 4]
+    -- (scales start at byte 192, each is 1 signed byte)
+    let sc0Byte ← readByte blockByteBase (Exp.add (Exp.litU32 192) scaleOff)
+    let sc1Byte ← readByte blockByteBase (Exp.add (Exp.litU32 192) (Exp.add scaleOff (Exp.litU32 4)))
+    -- Sign-extend: if byte ≥ 128, subtract 256.
+    let scaleToF32 (b : Exp (.scalar .u32)) : Exp (.scalar .f32) :=
+      Exp.select (Exp.ge b (Exp.litU32 128))
+        (Exp.sub (Exp.toF32 b) (Exp.litF32 256.0))
+        (Exp.toF32 b)
+    let sc0 := scaleToF32 sc0Byte
+    let sc1 := scaleToF32 sc1Byte
+
+    -- Read Q8_1 sub-blocks bq8_offset and bq8_offset+2.
+    -- Q8_1 layout per block: u32[0] = d (f32 bitcast), u32[1..8] = 32 int8 packed.
+    -- In input_q8 buffer, block k starts at u32 index k*9.
+    -- q8[sub].qs as int[] @ offset (iqs%8): each int = 4 bytes = u32 index 1 + (iqs%8/4)...
+    --   wait, qs[32] int8s = 8 ints. q8[sub].qs as (int*) [0..7]. q8[sub].qs @ iqs%8
+    --   requires iqs%8 < 8 → u32 index = 1 + (iqs%8).
+    -- Per block: 9 u32 (1 header + 8 quants).
+    let q8BlockIdx i :=
+      Exp.add (Exp.mul blockIdx (Exp.litU32 (8 * 9)))
+              (Exp.mul (Exp.add bq8Off (Exp.mul (Exp.litU32 i) (Exp.litU32 2))) (Exp.litU32 9))
+    let q8Sub0 := q8BlockIdx 0
+    let q8Sub1 := q8BlockIdx 1
+    let u0 ← ShaderM.readBuffer (ty := .scalar .u32) (n := q8InputU32Size) "input_q8"
+              (Exp.add q8Sub0 (Exp.add (Exp.litU32 1) q8ElemOff))
+    let u1 ← ShaderM.readBuffer (ty := .scalar .u32) (n := q8InputU32Size) "input_q8"
+              (Exp.add q8Sub1 (Exp.add (Exp.litU32 1) q8ElemOff))
+    let q8Hdr0 ← ShaderM.readBuffer (ty := .scalar .u32) (n := q8InputU32Size) "input_q8" q8Sub0
+    let q8Hdr1 ← ShaderM.readBuffer (ty := .scalar .u32) (n := q8InputU32Size) "input_q8" q8Sub1
+    let d8A : Exp (.scalar .f32) := Exp.bitcast q8Hdr0
+    let d8B : Exp (.scalar .f32) := Exp.bitcast q8Hdr1
+
+    -- QR6_K=2 iterations.
+    -- i=0:
+    let vil_0 := Exp.bitAnd vl (Exp.litU32 0x0F0F0F0F)
+    let vih_0 := Exp.bitAnd (Exp.shiftLeft vh (Exp.litU32 4)) (Exp.litU32 0x30303030)
+    let vi_0 := sub32PerByte (Exp.bitOr vil_0 vih_0)
+    let dot_0 := Exp.dot4I8Packed vi_0 u0
+    let sumf_0 := Exp.mul d8A (Exp.mul (Exp.toF32 dot_0) sc0)
+
+    -- i=1: shift vl right by 4, vh right by 4
+    let vil_1 := Exp.bitAnd (Exp.shiftRight vl (Exp.litU32 4)) (Exp.litU32 0x0F0F0F0F)
+    let vih_1 := Exp.bitAnd (Exp.shiftLeft (Exp.shiftRight vh (Exp.litU32 4)) (Exp.litU32 4))
+                            (Exp.litU32 0x30303030)
+    let vi_1 := sub32PerByte (Exp.bitOr vil_1 vih_1)
+    let dot_1 := Exp.dot4I8Packed vi_1 u1
+    let sumf_1 := Exp.mul d8B (Exp.mul (Exp.toF32 dot_1) sc1)
+
+    -- Per-block: acc += d * (sumf_0 + sumf_1)
+    ShaderM.assign "acc" (Exp.add acc (Exp.mul d (Exp.add sumf_0 sumf_1)))
+
+  -- Subgroup reduction; divide by 2 because lanes 16..31 duplicate 0..15.
   ShaderM.varNamed "total" (.scalar .f32)
     (Exp.mul (Exp.subgroupAdd acc) (Exp.litF32 0.5))
   let total : Exp (.scalar .f32) := Exp.var "total"

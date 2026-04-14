@@ -1263,6 +1263,11 @@ structure InferenceState (BufT CacheT : Type) where
   -- and there is zero performance impact.
   preSoftcapBuf : Option BufT := none
   argmaxBuf : BufT              -- [1] u32 for GPU-side argmax result
+  -- Scratch buffer for Q8_1 quantized lmHead input (hiddenSize/32 * 9 u32),
+  -- lazily allocated on first dp4a-enabled lmHead call.
+  lmHeadQ8Buf : IO.Ref (Option BufT)
+  lmHeadQuantizePrepared : IO.Ref (Option CacheT)
+  lmHeadDP4APrepared : IO.Ref (Option CacheT)
 
 /-- Dynamic cache ref store. Lazily creates IO.Ref per unique cacheKey. -/
 structure KernelCacheRefs (CacheT : Type) where
@@ -1345,6 +1350,9 @@ def createInferenceState [GPUBackend β] (ctx : β) (cfg : Config) : IO (Inferen
       let rowBytes := blocksPerRow * 210
       GPUBackend.allocBuffer ctx (max rowBytes 4).toUSize
     argmaxBuf := ← GPUBackend.allocBuffer ctx (4 : USize)
+    lmHeadQ8Buf := ← IO.mkRef none
+    lmHeadQuantizePrepared := ← GPUBackend.newCacheRef (β := β)
+    lmHeadDP4APrepared := ← GPUBackend.newCacheRef (β := β)
   }
 
 /-! ## Single-Token Forward Pass -/
@@ -1836,28 +1844,58 @@ def forwardSingleToken [GPUBackend β] (ctx : β)
   Hesper.WGSL.Execute.withSection "lmHead" do
     match model.embdFormat with
     | .Q6_K =>
-      -- 2D dispatch because vocabSize (262144) exceeds the 65535 per-dimension limit.
+      let useSubgroups ← GPUBackend.hasSubgroupSupport ctx
+      let dp4aOn ← do
+        let a ← Hesper.Layers.Linear.dp4aEnabled.get
+        let b ← Hesper.Layers.Linear.dp4aQ6KEnabled.get
+        pure (a && b)
       let gridX : Nat := 4096
       let gridY : Nat := (model.config.vocabSize + gridX - 1) / gridX
-      -- Prefer the subgroup variant when available — 32-thread workgroups
-      -- with hardware `subgroupAdd` instead of 256-thread tree reduction.
-      let useSubgroups ← GPUBackend.hasSubgroupSupport ctx
-      let shader := if useSubgroups then
-          Hesper.Quantization.Q6_K.fusedQ6KLinearBlockCoopKernel
-            model.config.hiddenSize model.config.vocabSize gridX
-        else
-          Hesper.Quantization.Q6_K.fusedQ6KLinearKernel
-            model.config.hiddenSize model.config.vocabSize 256 gridX
-      let wgSize := if useSubgroups then 32 else 256
-      let lmBufs : List (String × GPUBackend.Buf β) :=
-        [("weights", model.outputWeight), ("input", nextBuf), ("output", state.logitsBuf)]
-      ce "lmHead"
-        shader
-        lmBufs
-        { numWorkgroups := (gridX, gridY, 1)
-          workgroupSize := { x := wgSize, y := 1, z := 1 }
-          extensions := if useSubgroups then ["subgroups"] else []
-          : Hesper.ExecConfig }
+      if dp4aOn && useSubgroups && model.config.hiddenSize % 32 == 0 then
+        -- dp4a path: quantize input to Q8_1, then Q6_K × Q8_1 matmul.
+        let nQ8Blocks := model.config.hiddenSize / 32
+        let q8BufBytes : USize := (nQ8Blocks * 9 * 4).toUSize
+        let q8Buf ← match ← state.lmHeadQ8Buf.get with
+          | some b => pure b
+          | none =>
+            let b ← GPUBackend.allocBuffer ctx q8BufBytes
+            state.lmHeadQ8Buf.set (some b)
+            pure b
+        -- Quantize
+        GPUBackend.executeWithConfigCached ctx
+          (Hesper.Layers.Linear.quantizeQ8_1Kernel model.config.hiddenSize)
+          [("input", nextBuf), ("output", q8Buf)]
+          { numWorkgroups := (nQ8Blocks, 1, 1), workgroupSize := { x := 32, y := 1, z := 1 }
+            extensions := ["subgroups"] : Hesper.ExecConfig }
+          (hash ("q8_1-quantize-lmhead", model.config.hiddenSize))
+          state.lmHeadQuantizePrepared
+        -- Q6_K dp4a matmul (2D grid for vocabSize > 65535)
+        GPUBackend.executeWithConfigCached ctx
+          (Hesper.Layers.Linear.fusedQ6KLinearDP4AKernel
+            model.config.hiddenSize model.config.vocabSize gridX)
+          [("weights", model.outputWeight), ("input_q8", q8Buf), ("output", state.logitsBuf)]
+          { numWorkgroups := (gridX, gridY, 1), workgroupSize := { x := 32, y := 1, z := 1 }
+            extensions := ["subgroups"] : Hesper.ExecConfig }
+          (hash ("q6k-dp4a-lmhead", model.config.hiddenSize, model.config.vocabSize))
+          state.lmHeadDP4APrepared
+      else
+        -- Original f32 path (block-coop with subgroups or 256-thread tree reduction).
+        let shader := if useSubgroups then
+            Hesper.Quantization.Q6_K.fusedQ6KLinearBlockCoopKernel
+              model.config.hiddenSize model.config.vocabSize gridX
+          else
+            Hesper.Quantization.Q6_K.fusedQ6KLinearKernel
+              model.config.hiddenSize model.config.vocabSize 256 gridX
+        let wgSize := if useSubgroups then 32 else 256
+        let lmBufs : List (String × GPUBackend.Buf β) :=
+          [("weights", model.outputWeight), ("input", nextBuf), ("output", state.logitsBuf)]
+        ce "lmHead"
+          shader
+          lmBufs
+          { numWorkgroups := (gridX, gridY, 1)
+            workgroupSize := { x := wgSize, y := 1, z := 1 }
+            extensions := if useSubgroups then ["subgroups"] else []
+            : Hesper.ExecConfig }
     | _ =>
       let lmHeadConfig : Hesper.WGSL.MatMul.Config := {
         M := 1, N := model.config.vocabSize, K := model.config.hiddenSize
