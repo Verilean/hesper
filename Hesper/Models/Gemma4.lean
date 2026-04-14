@@ -1851,6 +1851,44 @@ def forwardSingleToken [GPUBackend β] (ctx : β)
         pure (a && b)
       let gridX : Nat := 4096
       let gridY : Nat := (model.config.vocabSize + gridX - 1) / gridX
+      -- DEBUG: when HESPER_DP4A_Q6K_DEBUG is set, run BOTH the f32 and
+      -- the dp4a kernel and dump first 8 logits of each for comparison.
+      let debugMode ← do
+        match ← IO.getEnv "HESPER_DP4A_Q6K_DEBUG" with
+        | some "1" => pure true
+        | _ => pure false
+      if debugMode && dp4aOn then
+        IO.println "[Q6K_DEBUG] Running f32 lmHead for comparison..."
+        let shaderF32 := if useSubgroups then
+            Hesper.Quantization.Q6_K.fusedQ6KLinearBlockCoopKernel
+              model.config.hiddenSize model.config.vocabSize gridX
+          else
+            Hesper.Quantization.Q6_K.fusedQ6KLinearKernel
+              model.config.hiddenSize model.config.vocabSize 256 gridX
+        let wgSize := if useSubgroups then 32 else 256
+        GPUBackend.execute ctx shaderF32
+          [("weights", model.outputWeight), ("input", nextBuf), ("output", state.logitsBuf)]
+          { numWorkgroups := (gridX, gridY, 1), workgroupSize := { x := wgSize, y := 1, z := 1 }
+            extensions := if useSubgroups then ["subgroups"] else []
+            : Hesper.ExecConfig }
+        let logitsBytes ← GPUBackend.readBuffer ctx state.logitsBuf (132 * 4 : USize)
+        IO.print "[Q6K_DEBUG] f32  logits[5000..5007]: "
+        for i in [100:108] do
+          let o := i * 4
+          let bits := (logitsBytes.get! o).toUInt32 |||
+                      ((logitsBytes.get! (o+1)).toUInt32 <<< 8) |||
+                      ((logitsBytes.get! (o+2)).toUInt32 <<< 16) |||
+                      ((logitsBytes.get! (o+3)).toUInt32 <<< 24)
+          let e := (bits >>> 23) &&& 0xFF
+          let m := bits &&& (0x7FFFFF : UInt32)
+          let s := bits >>> 31
+          let v := if e == 0 then 0.0 else
+            (1.0 + m.toNat.toFloat / 8388608.0) * Float.pow 2.0 (e.toNat.toFloat - 127.0)
+          let v := if s == 1 then -v else v
+          IO.print s!"{v} "
+        IO.println ""
+
+      let _ := debugMode
       if dp4aOn && useSubgroups && model.config.hiddenSize % 32 == 0 then
         -- dp4a path: quantize input to Q8_1, then Q6_K × Q8_1 matmul.
         let nQ8Blocks := model.config.hiddenSize / 32
@@ -1878,6 +1916,24 @@ def forwardSingleToken [GPUBackend β] (ctx : β)
             extensions := ["subgroups"] : Hesper.ExecConfig }
           (hash ("q6k-dp4a-lmhead", model.config.hiddenSize, model.config.vocabSize))
           state.lmHeadDP4APrepared
+        if debugMode then
+          -- Read logits[5000..5007] (skip reserved tokens which are often 0)
+          let logitsBytes ← GPUBackend.readBuffer ctx state.logitsBuf (5008 * 4 : USize)
+          IO.print "[Q6K_DEBUG] dp4a logits[5000..5007]: "
+          for i in [5000:5008] do
+            let o := i * 4
+            let bits := (logitsBytes.get! o).toUInt32 |||
+                        ((logitsBytes.get! (o+1)).toUInt32 <<< 8) |||
+                        ((logitsBytes.get! (o+2)).toUInt32 <<< 16) |||
+                        ((logitsBytes.get! (o+3)).toUInt32 <<< 24)
+            let e := (bits >>> 23) &&& 0xFF
+            let m := bits &&& (0x7FFFFF : UInt32)
+            let s := bits >>> 31
+            let v := if e == 0 then 0.0 else
+              (1.0 + m.toNat.toFloat / 8388608.0) * Float.pow 2.0 (e.toNat.toFloat - 127.0)
+            let v := if s == 1 then -v else v
+            IO.print s!"{v} "
+          IO.println ""
       else
         -- Original f32 path (block-coop with subgroups or 256-thread tree reduction).
         let shader := if useSubgroups then
