@@ -1110,22 +1110,24 @@ def fusedQ4KMLinearDP4AKernel (config : Config) : ShaderM Unit := do
     -- i=0:
     let v0i0 := Exp.bitAnd v0 (Exp.litU32 0x0F0F0F0F)
     let v1i0 := Exp.bitAnd v1 (Exp.litU32 0x0F0F0F0F)
-    let acc0 := Exp.dot4U8Packed v0i0 u0
-    let dot1_0 := Exp.toI32 (Exp.dot4U8Packed v1i0 u1)
-    let dot1_0Combined := Exp.add (Exp.toI32 acc0) dot1_0
-    let sumU_0 := Exp.add (Exp.toI32 (Exp.dot4U8Packed (Exp.litU32 0x01010101) u0))
-                          (Exp.toI32 (Exp.dot4U8Packed (Exp.litU32 0x01010101) u1))
+    -- Use signed dp4a: v0i/v1i are nibbles in [0,15] (fit int8 fine),
+    -- u is signed int8 per Q8_1 spec. llama.cpp uses dp4a.s32.s32 throughout.
+    let acc0 := Exp.dot4I8Packed v0i0 u0
+    let dot1_0 := Exp.dot4I8Packed v1i0 u1
+    let dot1_0Combined := Exp.add acc0 dot1_0
+    let sumU_0 := Exp.add (Exp.dot4I8Packed (Exp.litU32 0x01010101) u0)
+                          (Exp.dot4I8Packed (Exp.litU32 0x01010101) u1)
     let sumfD_0 := Exp.mul d8A (Exp.mul (Exp.toF32 dot1_0Combined) scA)
     let sumfM_0 := Exp.mul d8A (Exp.mul (Exp.toF32 sumU_0) mA)
 
     -- i=1: shift v by 4 then mask
     let v0i1 := Exp.bitAnd (Exp.shiftRight v0 (Exp.litU32 4)) (Exp.litU32 0x0F0F0F0F)
     let v1i1 := Exp.bitAnd (Exp.shiftRight v1 (Exp.litU32 4)) (Exp.litU32 0x0F0F0F0F)
-    let acc1 := Exp.dot4U8Packed v0i1 u2
-    let dot1_1 := Exp.toI32 (Exp.dot4U8Packed v1i1 u3)
-    let dot1_1Combined := Exp.add (Exp.toI32 acc1) dot1_1
-    let sumU_1 := Exp.add (Exp.toI32 (Exp.dot4U8Packed (Exp.litU32 0x01010101) u2))
-                          (Exp.toI32 (Exp.dot4U8Packed (Exp.litU32 0x01010101) u3))
+    let acc1 := Exp.dot4I8Packed v0i1 u2
+    let dot1_1 := Exp.dot4I8Packed v1i1 u3
+    let dot1_1Combined := Exp.add acc1 dot1_1
+    let sumU_1 := Exp.add (Exp.dot4I8Packed (Exp.litU32 0x01010101) u2)
+                          (Exp.dot4I8Packed (Exp.litU32 0x01010101) u3)
     let sumfD_1 := Exp.mul d8B (Exp.mul (Exp.toF32 dot1_1Combined) scB)
     let sumfM_1 := Exp.mul d8B (Exp.mul (Exp.toF32 sumU_1) mB)
 
