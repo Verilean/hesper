@@ -201,6 +201,8 @@ inductive Inst where
   -- ── type conversions ──
   | cvt_f32_u32 (dst : RegF32) (src : RegU32)
   | cvt_u32_f32 (dst : RegU32) (src : RegF32)
+  -- Round-to-nearest-even signed conversion (matches roundf behavior).
+  | cvt_rni_s32_f32 (dst : RegU32) (src : RegF32)
   | cvt_f32_f16 (dst : RegF32) (src : RegB16)   -- f16 → f32
   | cvt_f16_f32 (dst : RegB16) (src : RegF32)   -- f32 → f16
 
@@ -299,6 +301,7 @@ def Inst.toString : Inst → String
   -- cvt.rn.f32.s32 produces the same result as .u32 variant for positive inputs.
   | .cvt_f32_u32 d s     => s!"  cvt.rn.f32.s32 {d}, {s};"
   | .cvt_u32_f32 d s     => s!"  cvt.rzi.u32.f32 {d}, {s};"
+  | .cvt_rni_s32_f32 d s => s!"  cvt.rni.s32.f32 {d}, {s};"
   | .cvt_f32_f16 d s     => s!"  cvt.f32.f16 {d}, {s};"
   | .cvt_f16_f32 d s     => s!"  cvt.rn.f16.f32 {d}, {s};"
   | .mov_b32_unpack l h src => s!"  mov.b32 " ++ "{" ++ s!"{l}, {h}" ++ "}" ++ s!", {src};"

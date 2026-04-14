@@ -946,17 +946,16 @@ def quantizeQ8_1Kernel (inDim : Nat) : ShaderM Unit := do
   let d : Exp (.scalar .f32) := Exp.var "d_q8"
 
   -- 3. Quantize: q = round(x / d). Guard against d==0 → produce 0.
-  -- Store as f32 (rounded-to-integer), then bitcast to u32 for packing.
+  -- Use round-to-nearest (matches llama.cpp's roundf). cvt.rzi (truncate
+  -- toward zero) was producing ±0.5 systematic errors that accumulated
+  -- over 256-element dot products into wildly wrong outputs.
   ShaderM.varNamed "qF32" (.scalar .f32)
     (Exp.select (Exp.eq d (Exp.litF32 0.0)) (Exp.litF32 0.0) (Exp.div x d))
   let qF32 : Exp (.scalar .f32) := Exp.var "qF32"
-  -- Convert to signed int (round-to-nearest), then mask low byte for int8 packing.
-  -- Exp.toU32 uses cvt.rzi (truncation toward zero); for quantization we want
-  -- round-to-nearest. Use toI32 first to get correct rounding, then bitcast.
-  -- But Exp.toI32 goes through f32 → i32 which is fine.
-  -- Simpler: cast to U32 (which is just the low 32 bits of the int representation).
-  let qU32 : Exp (.scalar .u32) := Exp.toU32 qF32
-  ShaderM.varNamed "qByte" (.scalar .u32) (Exp.bitAnd qU32 (Exp.litU32 0xFF))
+  -- roundToI32: round-to-nearest-even, two's-complement i32 stored as u32.
+  -- Mask low 8 bits for int8 packing.
+  ShaderM.varNamed "qByte" (.scalar .u32)
+    (Exp.bitAnd (Exp.roundToI32 qF32) (Exp.litU32 0xFF))
   let qByte : Exp (.scalar .u32) := Exp.var "qByte"
 
   -- 4. Thread 0 writes header: d as f32 (bitcast to u32 for storage).
@@ -1037,12 +1036,20 @@ def fusedQ4KMLinearDP4AKernel (config : Config) : ShaderM Unit := do
   --   tid ∈ [12,16)→ bq8_offset = 6   (pair 6,7)
   --   tid ∈ [16,20)→ bq8_offset = 0 (DUPLICATE!) — this is only 16 unique partitions
   -- NOTE: llama.cpp uses only 16 lanes; the 32-lane version here needs different mapping.
-  -- Simpler mapping: each lane handles 1 unique (sub_block_pair, element_offset_within_pair).
-  --   8 sub-block pairs × 4 offsets = 32 → perfect match.
-  let pairIdx := Exp.div tid (Exp.litU32 4)     -- 0..7, which Q8_1 sub-block pair
-  let elemOff := Exp.sub tid (Exp.mul pairIdx (Exp.litU32 4))  -- 0..3, which int within pair
-  -- bq8_offset = 2 * pairIdx (we process sub-blocks [2*pairIdx, 2*pairIdx+1])
-  let bq8Off := Exp.mul pairIdx (Exp.litU32 2)
+  -- llama.cpp's vec_dot_q4_K_q8_1 uses iqs ∈ {0, 2, ..., 30} = 16 values.
+  -- bq8_offset = 2 * ((iqs/2) / 4) = 2 * (pairIdx), pairIdx ∈ {0..3}, 4 unique pairs.
+  -- elemOff = (iqs/2) % 4 ∈ {0..3}.
+  --
+  -- So only 16 lanes (4 pairs × 4 elems) do useful work. For a 32-lane warp
+  -- we duplicate: lanes 0..15 and lanes 16..31 each compute the same result.
+  -- The final subgroupAdd then double-counts, so we divide by 2 at the end.
+  --
+  -- This exactly matches the reference kernel's logic and produces correct
+  -- Q4_K × Q8_1 dot products.
+  let laneLow := Exp.bitAnd tid (Exp.litU32 15)  -- tid % 16, 0..15
+  let pairIdx := Exp.div laneLow (Exp.litU32 4)  -- 0..3
+  let elemOff := Exp.sub laneLow (Exp.mul pairIdx (Exp.litU32 4))  -- 0..3
+  let bq8Off := Exp.mul pairIdx (Exp.litU32 2)  -- 0,2,4,6 — valid sub-block indices
 
   ShaderM.loop (Exp.litU32 0) (Exp.litU32 blocksPerRow) (Exp.litU32 1) fun blockIdx => do
     let blockU32Base := Exp.add rowBaseU32 (Exp.mul blockIdx (Exp.litU32 36))
@@ -1141,8 +1148,10 @@ def fusedQ4KMLinearDP4AKernel (config : Config) : ShaderM Unit := do
     let blockContrib := Exp.sub (Exp.mul dF blockSumfD) (Exp.mul dminF blockSumfM)
     ShaderM.assign "acc" (Exp.add acc blockContrib)
 
-  -- Subgroup reduction
-  ShaderM.varNamed "total" (.scalar .f32) (Exp.subgroupAdd acc)
+  -- Subgroup reduction. Since 32 lanes compute duplicate work (lanes 0..15
+  -- and 16..31 both cover all sub-blocks), divide by 2.
+  ShaderM.varNamed "total" (.scalar .f32)
+    (Exp.mul (Exp.subgroupAdd acc) (Exp.litF32 0.5))
   let total : Exp (.scalar .f32) := Exp.var "total"
 
   ShaderM.if_ (Exp.and (Exp.eq tid (Exp.litU32 0)) inBounds) (do
