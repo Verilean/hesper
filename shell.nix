@@ -1,4 +1,4 @@
-{ pkgs ? import <nixpkgs> {} }:
+{ pkgs ? import <nixpkgs> {config.cudaSupport=true;config.allowUnfree=true;} }:
 
 pkgs.mkShell {
   name = "hesper-webgpu-dev-shell";
@@ -57,6 +57,12 @@ pkgs.mkShell {
     # Node.js for WebAssembly tooling
     nodejs
     emscripten
+    cudatoolkit
+    cudaPackages.cuda_nsight
+    cudaPackages.cuda_nvprof
+    # Modern profilers (required for sm_80+; nvprof deprecated since CC 8.0)
+    cudaPackages.nsight_systems     # `nsys` — system-wide timeline profiler
+    cudaPackages.nsight_compute     # `ncu`  — kernel-level profiler
   ];
 
   # Environment variables

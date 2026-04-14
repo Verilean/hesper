@@ -132,13 +132,19 @@ instance : GPUBackend CUDAContext where
     | none => cuLaunchKernel func gx.toUInt32 gy.toUInt32 gz.toUInt32
                 config.workgroupSize.x.toUInt32 config.workgroupSize.y.toUInt32
                 config.workgroupSize.z.toUInt32 0 args
-  executeWithConfigCached _ctx computation namedBuffers config _cacheKey cacheRef := do
+  executeWithConfigCached _ctx computation namedBuffers config cacheKey cacheRef := do
     let cached ← cacheRef.get
     -- Fast path: cacheRef hit — skip generatePTX + ShaderM.exec entirely
     let (func, declaredNames) ← match cached with
     | some c => pure (c.func, c.declaredNames.toList)
     | none => do
-      let f ← cudaExecuteImpl computation namedBuffers config.funcName config.workgroupSize config.numWorkgroups
+      -- Derive a unique PTX entry-point name from the caller's cacheKey so
+      -- nsys/ncu can distinguish kernels in profiles. When cacheKey=0 (i.e.
+      -- user didn't supply one) fall back to config.funcName.
+      let funcName :=
+        if cacheKey == 0 then config.funcName
+        else s!"k_{(toString cacheKey.toNat).take 16}"
+      let f ← cudaExecuteImpl computation namedBuffers funcName config.workgroupSize config.numWorkgroups
       let state := Hesper.WGSL.Monad.ShaderM.exec computation
       let dn := state.declaredBuffers.map (·.1)
       let args ← dn.foldlM (init := #[]) fun acc name => do
