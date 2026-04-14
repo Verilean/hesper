@@ -1385,7 +1385,12 @@ def fusedQ6KLinearDP4AKernel (inDim outDim : Nat) (gridX : Nat := 0) : ShaderM U
   ShaderM.varNamed "acc" (.scalar .f32) (Exp.litF32 0.0)
   let acc : Exp (.scalar .f32) := Exp.var "acc"
 
-  let rowByteBase := Exp.mul outIdx (Exp.litU32 (blocksPerRow * blockSizeBytes))
+  -- Bind `outIdx * 2100` to a DSL variable so it materialises once in PTX
+  -- (ShaderM re-evaluates Exp structures every read otherwise → ~50 copies
+  -- of `mov.u32 %r, 2100; mul.lo.u32 %r2, %outIdx, %r` in the generated PTX).
+  ShaderM.varNamed "rowByteBase" (.scalar .u32)
+    (Exp.mul outIdx (Exp.litU32 (blocksPerRow * blockSizeBytes)))
+  let rowByteBase : Exp (.scalar .u32) := Exp.var "rowByteBase"
 
   -- Byte-read helper (Q6_K block is 210 bytes, not a multiple of 4).
   let readByte (blockBase : Exp (.scalar .u32)) (offset : Exp (.scalar .u32)) : ShaderM (Exp (.scalar .u32)) := do
