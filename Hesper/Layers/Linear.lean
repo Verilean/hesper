@@ -106,8 +106,8 @@ def fusedQ4KMLinearKernel (config : Config) (workgroupSize : Nat := 256) : Shade
   let totalWeightU32 := config.outDim * blocksPerRow * 36  -- 144 bytes = 36 u32s per block
 
   -- Declare buffers
-  let _weights ← ShaderM.declareInputBuffer "weights" (.array (.scalar .u32) totalWeightU32)
-  let _input ← ShaderM.declareInputBuffer "input" (.array (.scalar .f32) config.inDim)
+  let _weights ← ShaderM.declareReadOnlyBuffer "weights" (.array (.scalar .u32) totalWeightU32)
+  let _input ← ShaderM.declareReadOnlyBuffer "input" (.array (.scalar .f32) config.inDim)
   let _output ← ShaderM.declareOutputBuffer "output" (.array (.scalar .f32) config.outDim)
 
   -- Shared memory for reduction
@@ -223,8 +223,8 @@ def fusedQ4KMLinearSubgroupKernel (config : Config) : ShaderM Unit := do
   let blocksPerRow := config.inDim / 256
   let totalWeightU32 := config.outDim * blocksPerRow * 36
 
-  let _weights ← ShaderM.declareInputBuffer "weights" (.array (.scalar .u32) totalWeightU32)
-  let _input ← ShaderM.declareInputBuffer "input" (.array (.scalar .f32) config.inDim)
+  let _weights ← ShaderM.declareReadOnlyBuffer "weights" (.array (.scalar .u32) totalWeightU32)
+  let _input ← ShaderM.declareReadOnlyBuffer "input" (.array (.scalar .f32) config.inDim)
   let _output ← ShaderM.declareOutputBuffer "output" (.array (.scalar .f32) config.outDim)
 
   let inBounds := Exp.lt outIdx (Exp.litU32 config.outDim)
@@ -318,8 +318,8 @@ def fusedQ4KMLinear2RowSubgroupKernel (config : Config) : ShaderM Unit := do
   let rowStrideU32 := blocksPerRow * 36
   let totalWeightU32 := config.outDim * rowStrideU32
 
-  let _weights ← ShaderM.declareInputBuffer "weights" (.array (.scalar .u32) totalWeightU32)
-  let _input ← ShaderM.declareInputBuffer "input" (.array (.scalar .f32) config.inDim)
+  let _weights ← ShaderM.declareReadOnlyBuffer "weights" (.array (.scalar .u32) totalWeightU32)
+  let _input ← ShaderM.declareReadOnlyBuffer "input" (.array (.scalar .f32) config.inDim)
   let _output ← ShaderM.declareOutputBuffer "output" (.array (.scalar .f32) config.outDim)
 
   -- Two output rows: row0 = 2*pairIdx, row1 = row0 + 1.
@@ -462,8 +462,8 @@ def fusedQ4KMLinearBlockCoopKernel (config : Config) : ShaderM Unit := do
   let blocksPerRow := config.inDim / 256
   let totalWeightU32 := config.outDim * blocksPerRow * 36
 
-  let _weights ← ShaderM.declareInputBuffer "weights" (.array (.scalar .u32) totalWeightU32)
-  let _input ← ShaderM.declareInputBuffer "input" (.array (.scalar .f32) config.inDim)
+  let _weights ← ShaderM.declareReadOnlyBuffer "weights" (.array (.scalar .u32) totalWeightU32)
+  let _input ← ShaderM.declareReadOnlyBuffer "input" (.array (.scalar .f32) config.inDim)
   let _output ← ShaderM.declareOutputBuffer "output" (.array (.scalar .f32) config.outDim)
 
   let inBounds := Exp.lt outIdx (Exp.litU32 config.outDim)
@@ -645,8 +645,8 @@ def fusedQ4KMLinearBlockCoop2RowKernel (config : Config) : ShaderM Unit := do
   let blocksPerRow := config.inDim / 256
   let totalWeightU32 := config.outDim * blocksPerRow * 36
 
-  let _weights ← ShaderM.declareInputBuffer "weights" (.array (.scalar .u32) totalWeightU32)
-  let _input ← ShaderM.declareInputBuffer "input" (.array (.scalar .f32) config.inDim)
+  let _weights ← ShaderM.declareReadOnlyBuffer "weights" (.array (.scalar .u32) totalWeightU32)
+  let _input ← ShaderM.declareReadOnlyBuffer "input" (.array (.scalar .f32) config.inDim)
   let _output ← ShaderM.declareOutputBuffer "output" (.array (.scalar .f32) config.outDim)
 
   let inBounds := Exp.lt outIdx (Exp.litU32 config.outDim)
@@ -778,8 +778,8 @@ def fusedQ4KMLinearMultiSubgroupKernel (config : Config) (numSubgroups : Nat := 
   let totalWeightU32 := config.outDim * blocksPerRow * 36
   let wgSize := numSubgroups * 32
 
-  let _weights ← ShaderM.declareInputBuffer "weights" (.array (.scalar .u32) totalWeightU32)
-  let _input ← ShaderM.declareInputBuffer "input" (.array (.scalar .f32) config.inDim)
+  let _weights ← ShaderM.declareReadOnlyBuffer "weights" (.array (.scalar .u32) totalWeightU32)
+  let _input ← ShaderM.declareReadOnlyBuffer "input" (.array (.scalar .f32) config.inDim)
   let _output ← ShaderM.declareOutputBuffer "output" (.array (.scalar .f32) config.outDim)
 
   -- Shared memory for cross-subgroup reduction
@@ -931,7 +931,7 @@ def quantizeQ8_1Kernel (inDim : Nat) : ShaderM Unit := do
   let nBlocks := inDim / 32
   let outU32Size := nBlocks * 9
 
-  let _input ← ShaderM.declareInputBuffer "input" (.array (.scalar .f32) inDim)
+  let _input ← ShaderM.declareReadOnlyBuffer "input" (.array (.scalar .f32) inDim)
   let _output ← ShaderM.declareOutputBuffer "output" (.array (.scalar .u32) outU32Size)
 
   -- Each thread reads one f32 element
@@ -1565,9 +1565,9 @@ def fusedRMSNormQ4KMLinearKernel (config : Config) (eps : Float) : ShaderM Unit 
   let blocksPerRow := config.inDim / 256
   let totalWeightU32 := config.outDim * blocksPerRow * 36
 
-  let _weights ← ShaderM.declareInputBuffer "weights" (.array (.scalar .u32) totalWeightU32)
-  let _input ← ShaderM.declareInputBuffer "input" (.array (.scalar .f32) config.inDim)
-  let _normScale ← ShaderM.declareInputBuffer "norm_scale" (.array (.scalar .f32) config.inDim)
+  let _weights ← ShaderM.declareReadOnlyBuffer "weights" (.array (.scalar .u32) totalWeightU32)
+  let _input ← ShaderM.declareReadOnlyBuffer "input" (.array (.scalar .f32) config.inDim)
+  let _normScale ← ShaderM.declareReadOnlyBuffer "norm_scale" (.array (.scalar .f32) config.inDim)
   let _output ← ShaderM.declareOutputBuffer "output" (.array (.scalar .f32) config.outDim)
 
   let inBounds := Exp.lt outIdx (Exp.litU32 config.outDim)
@@ -1711,8 +1711,8 @@ def fusedQ4KMLinearSplitKKernel (config : Config) (splits : Nat) : ShaderM Unit 
   let blocksPerSplit := blocksPerRow / splits
   let totalWeightU32 := config.outDim * blocksPerRow * 36
 
-  let _weights ← ShaderM.declareInputBuffer "weights" (.array (.scalar .u32) totalWeightU32)
-  let _input ← ShaderM.declareInputBuffer "input" (.array (.scalar .f32) config.inDim)
+  let _weights ← ShaderM.declareReadOnlyBuffer "weights" (.array (.scalar .u32) totalWeightU32)
+  let _input ← ShaderM.declareReadOnlyBuffer "input" (.array (.scalar .f32) config.inDim)
   -- Partial-sums scratch: outDim * splits f32s, row-major
   -- [outIdx * splits + splitIdx].
   let _partial ← ShaderM.declareOutputBuffer "partial"
@@ -1844,7 +1844,7 @@ def splitKReduceKernel (outDim splits : Nat) : ShaderM Unit := do
   let gid ← ShaderM.globalId
   let outIdx := Exp.vec3X gid
 
-  let _partial ← ShaderM.declareInputBuffer "partial" (.array (.scalar .f32) (outDim * splits))
+  let _partial ← ShaderM.declareReadOnlyBuffer "partial" (.array (.scalar .f32) (outDim * splits))
   let _output ← ShaderM.declareOutputBuffer "output" (.array (.scalar .f32) outDim)
 
   let inBounds := Exp.lt outIdx (Exp.litU32 outDim)
@@ -1901,9 +1901,9 @@ def fusedQ4KMGateUpSubgroupKernel (config : Config) : ShaderM Unit := do
   let totalWeightU32 := config.outDim * blocksPerRow * 36
 
   -- Two weight buffers with identical shape.
-  let _weightsGate ← ShaderM.declareInputBuffer "weights_gate" (.array (.scalar .u32) totalWeightU32)
-  let _weightsUp   ← ShaderM.declareInputBuffer "weights_up"   (.array (.scalar .u32) totalWeightU32)
-  let _input       ← ShaderM.declareInputBuffer "input"        (.array (.scalar .f32) config.inDim)
+  let _weightsGate ← ShaderM.declareReadOnlyBuffer "weights_gate" (.array (.scalar .u32) totalWeightU32)
+  let _weightsUp   ← ShaderM.declareReadOnlyBuffer "weights_up"   (.array (.scalar .u32) totalWeightU32)
+  let _input       ← ShaderM.declareReadOnlyBuffer "input"        (.array (.scalar .f32) config.inDim)
   let _output      ← ShaderM.declareOutputBuffer "output"      (.array (.scalar .f32) config.outDim)
 
   let inBounds := Exp.lt outIdx (Exp.litU32 config.outDim)

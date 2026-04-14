@@ -83,8 +83,8 @@ def fusedQ6KLinearKernel (inDim outDim : Nat) (workgroupSize : Nat := 256)
   let totalWeightBytes := outDim * blocksPerRow * blockSizeBytes
   let totalWeightU32 := (totalWeightBytes + 3) / 4
 
-  let _weights ← ShaderM.declareInputBuffer "weights" (.array (.scalar .u32) totalWeightU32)
-  let _input ← ShaderM.declareInputBuffer "input" (.array (.scalar .f32) inDim)
+  let _weights ← ShaderM.declareReadOnlyBuffer "weights" (.array (.scalar .u32) totalWeightU32)
+  let _input ← ShaderM.declareReadOnlyBuffer "input" (.array (.scalar .f32) inDim)
   let _output ← ShaderM.declareOutputBuffer "output" (.array (.scalar .f32) outDim)
 
   ShaderM.sharedNamed "shared_partial" (.array (.scalar .f32) workgroupSize)
@@ -263,8 +263,8 @@ def fusedQ6KLinearSubgroupKernel (inDim outDim : Nat) (gridX : Nat := 0) : Shade
   let totalWeightBytes := outDim * blocksPerRow * blockSizeBytes
   let totalWeightU32 := (totalWeightBytes + 3) / 4
 
-  let _weights ← ShaderM.declareInputBuffer "weights" (.array (.scalar .u32) totalWeightU32)
-  let _input ← ShaderM.declareInputBuffer "input" (.array (.scalar .f32) inDim)
+  let _weights ← ShaderM.declareReadOnlyBuffer "weights" (.array (.scalar .u32) totalWeightU32)
+  let _input ← ShaderM.declareReadOnlyBuffer "input" (.array (.scalar .f32) inDim)
   let _output ← ShaderM.declareOutputBuffer "output" (.array (.scalar .f32) outDim)
 
   -- NOTE: no barriers, no shared memory. outIdx bounds check is fine as a
@@ -411,8 +411,8 @@ def fusedQ6KLinearBlockCoopKernel (inDim outDim : Nat) (gridX : Nat := 0) : Shad
   let totalWeightBytes := outDim * blocksPerRow * blockSizeBytes
   let totalWeightU32 := (totalWeightBytes + 3) / 4
 
-  let _weights ← ShaderM.declareInputBuffer "weights" (.array (.scalar .u32) totalWeightU32)
-  let _input ← ShaderM.declareInputBuffer "input" (.array (.scalar .f32) inDim)
+  let _weights ← ShaderM.declareReadOnlyBuffer "weights" (.array (.scalar .u32) totalWeightU32)
+  let _input ← ShaderM.declareReadOnlyBuffer "input" (.array (.scalar .f32) inDim)
   let _output ← ShaderM.declareOutputBuffer "output" (.array (.scalar .f32) outDim)
 
   let inBounds := Exp.lt outIdx (Exp.litU32 outDim)
@@ -737,8 +737,8 @@ def q6kEmbeddingLookupKernel (vocabSize dim : Nat) : ShaderM Unit := do
   let blocksPerRow := dim / 256
   let totalU32 := (vocabSize * blocksPerRow * blockSizeBytes + 3) / 4
 
-  let _tokenIds ← ShaderM.declareInputBuffer "token_ids" (.array (.scalar .u32) 1)
-  let _table ← ShaderM.declareInputBuffer "embedding_table" (.array (.scalar .u32) totalU32)
+  let _tokenIds ← ShaderM.declareReadOnlyBuffer "token_ids" (.array (.scalar .u32) 1)
+  let _table ← ShaderM.declareReadOnlyBuffer "embedding_table" (.array (.scalar .u32) totalU32)
   let _output ← ShaderM.declareOutputBuffer "output" (.array (.scalar .f32) dim)
 
   ShaderM.if_ (Exp.lt idx (Exp.litU32 dim)) (do
@@ -765,7 +765,7 @@ def q6kSingleRowDequantScaleKernel (dim : Nat) (scale : Float) : ShaderM Unit :=
   -- One row only; totalU32 covers just `blocksPerRow` blocks.
   let totalU32 := (blocksPerRow * blockSizeBytes + 3) / 4
 
-  let _row ← ShaderM.declareInputBuffer "row" (.array (.scalar .u32) totalU32)
+  let _row ← ShaderM.declareReadOnlyBuffer "row" (.array (.scalar .u32) totalU32)
   let _output ← ShaderM.declareOutputBuffer "output" (.array (.scalar .f32) dim)
 
   ShaderM.if_ (Exp.lt idx (Exp.litU32 dim)) (do
