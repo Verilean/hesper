@@ -240,6 +240,16 @@ def declareStorageBuffer (name : String) (ty : WGSLType)
   modify fun s => { s with declaredBuffers := s.declaredBuffers ++ [(name, ty, mode)] }
   return name
 
+/-- Declare a read-only storage buffer.
+
+    Semantically equivalent to `declareInputBuffer` on WGSL, but on CUDA this
+    emits `ld.global.nc.*` (the read-only L1/tex cache hint, aka `__ldg`).
+    Use for weight matrices and other buffers the kernel never writes to.
+    It is a logical error to call `writeBuffer` on the returned name. -/
+def declareReadOnlyBuffer (name : String) (ty : WGSLType) : ShaderM String := do
+  modify fun s => { s with declaredBuffers := s.declaredBuffers ++ [(name, ty, .read)] }
+  return name
+
 -- ============================================================================
 -- High-level Helpers
 -- ============================================================================
