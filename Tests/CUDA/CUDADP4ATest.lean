@@ -1,5 +1,6 @@
 import Hesper.CUDA.FFI
 import Hesper.CUDA.Buffer
+import Hesper.CUDA.CodeGen
 import Hesper.Backend
 import Hesper.Backend.CUDA
 import Hesper.Layers.Linear
@@ -152,12 +153,19 @@ private def packU32Array (arr : Array UInt32) : ByteArray :=
 
 def main : IO Unit := do
   IO.println "═══ Q4_K × Q8_1 dp4a Correctness Test ═══\n"
-  let cuda ← CUDAContext.init
 
   -- Test configuration: 1 output row × 256 input elements (1 Q4_K block)
   let inDim := 256
   let outDim := 1
   let config : Config := { inDim, outDim }
+
+  -- Dump the dp4a matmul PTX for analysis.
+  let ptx := Hesper.CUDA.CodeGen.generatePTX "main" { x := 32, y := 1, z := 1 }
+    (fusedQ4KMLinearDP4AKernel config)
+  IO.FS.writeFile "/tmp/hesper_q4k_dp4a.ptx" ptx
+  IO.println s!"[PTX] Wrote {ptx.length} chars to /tmp/hesper_q4k_dp4a.ptx"
+
+  let cuda ← CUDAContext.init
 
   -- Generate input
   let input := genInput inDim
