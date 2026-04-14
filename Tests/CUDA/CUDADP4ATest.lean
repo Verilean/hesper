@@ -29,12 +29,29 @@ open Hesper.Layers.Linear
 
 -- Byte array helpers
 private def f64ToF32Bits (f : Float) : UInt32 :=
-  let b := f.toBits; let s := (b >>> 63) &&& 1; let e := (b >>> 52) &&& 0x7FF
-  let m := b &&& 0x000FFFFFFFFFFFFF
-  if e == 0 then 0
-  else let e32 := e.toNat - 1023 + 127
-    if e32 <= 0 then 0 else if e32 >= 255 then (s.toUInt32 <<< 31) ||| ((0xFF : UInt32) <<< 23)
-    else (s.toUInt32 <<< 31) ||| (e32.toUInt32 <<< 23) ||| ((m >>> 29).toUInt32 &&& (0x7FFFFF : UInt32))
+  let b := f.toBits
+  let s := (b >>> 63) &&& 1
+  let e64 := (b >>> 52) &&& 0x7FF
+  let m64 := b &&& 0x000FFFFFFFFFFFFF
+  if e64 == 0 then 0
+  else
+    let eUnb : Int := Int.ofNat e64.toNat - 1023
+    let e32i : Int := eUnb + 127
+    if e32i ≤ 0 then 0
+    else if e32i ≥ 255 then (s.toUInt32 <<< 31) ||| ((0xFF : UInt32) <<< 23)
+    else
+      let lower29 := m64 &&& (0x1FFFFFFF : UInt64)
+      let m32Truncated := (m64 >>> 29).toUInt32 &&& (0x7FFFFF : UInt32)
+      let halfway : UInt64 := 0x10000000
+      let roundUp :=
+        lower29 > halfway ||
+        (lower29 == halfway && (m32Truncated &&& 1) == 1)
+      let m32 := if roundUp then m32Truncated + 1 else m32Truncated
+      let (m32Final, e32i') := if m32 == 0x800000 then (0, e32i + 1) else (m32, e32i)
+      if e32i' ≥ 255 then (s.toUInt32 <<< 31) ||| ((0xFF : UInt32) <<< 23)
+      else
+        let e32 : UInt32 := e32i'.toNat.toUInt32
+        (s.toUInt32 <<< 31) ||| (e32 <<< 23) ||| m32Final
 
 private def f32BitsToF64 (bits : UInt32) : Float :=
   let e := (bits >>> 23) &&& 0xFF; let m := bits &&& (0x7FFFFF : UInt32); let s := bits >>> 31

@@ -962,12 +962,10 @@ def quantizeQ8_1Kernel (inDim : Nat) : ShaderM Unit := do
     ShaderM.writeBuffer (ty := .scalar .u32) "output" hdrOff dBits
   ) (pure ())
 
-  -- 5. Pack quants via shared memory: all threads write their q to shared mem,
-  -- then every 4th thread reads 4 consecutive values and packs them.
+  -- 5. Pack quants via shared memory: all threads write their q byte to shared mem,
+  -- then every 4th thread reads 4 consecutive values and packs them into one u32.
   ShaderM.sharedNamed "shared_q" (.array (.scalar .u32) 32)
-  -- DEBUG: write toU32(x * 10) to verify qByte computation
-  let debug := Exp.bitAnd (Exp.toU32 (Exp.mul x (Exp.litF32 10.0))) (Exp.litU32 0xFF)
-  ShaderM.writeWorkgroup (ty := .scalar .u32) "shared_q" tid debug
+  ShaderM.writeWorkgroup (ty := .scalar .u32) "shared_q" tid qByte
   ShaderM.barrier
 
   -- Every 4th thread (tid = 0, 4, 8, ..., 28) packs 4 consecutive quants.
