@@ -734,6 +734,14 @@ lean_exe «cuda-ptx-inst-test» where
   root := `Tests.CUDA.CUDAPTXInstTest
   moreLinkArgs := stdLinkArgs ++ #["./.lake/build/native/libhesper_cuda.a", "-lcuda"]
 
+lean_exe «cuda-dp4a-test» where
+  root := `Tests.CUDA.CUDADP4ATest
+  moreLinkArgs := stdLinkArgs ++ #["./.lake/build/native/libhesper_cuda.a", "-lcuda"]
+
+lean_exe «cuda-quantize-test» where
+  root := `Tests.CUDA.CUDAQuantizeTest
+  moreLinkArgs := stdLinkArgs ++ #["./.lake/build/native/libhesper_cuda.a", "-lcuda"]
+
 lean_exe «cuda-fa-golden-test» where
   root := `Tests.CUDA.CUDAFlashAttnGoldenTest
   moreLinkArgs := stdLinkArgs ++ #["./.lake/build/native/libhesper_cuda.a", "-lcuda"]
