@@ -350,6 +350,12 @@ partial def expToPTX (e : Exp t) (s : GenState) : ExpResult :=
   -- Barrier
   | .workgroupBarrier => let (r, s) := s.freshU32; (.u32 r, s.emit (.bar_sync 0))
 
+  -- Round-to-nearest-even f32 → i32 (matches llama.cpp's roundf semantics).
+  | .roundToI32 v =>
+    let (rv, s) := expToPTX v s
+    let (r, s) := s.freshU32
+    (.u32 r, s.emit (.cvt_rni_s32_f32 r rv.toF32!))
+
   -- Bitcast: reinterpret 32-bit register between f32/u32/i32.
   -- On PTX, all 32-bit types share register file, so bitcast is free:
   -- just return the register tagged as the target type.
