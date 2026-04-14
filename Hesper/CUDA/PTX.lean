@@ -220,9 +220,11 @@ inductive Inst where
   | mov_sreg    (dst : RegU32) (sreg : SReg)
 
   -- ── memory ──
-  | ld_f32        (space : AddrSpace) (dst : RegF32) (addr : RegU64)
+  -- `nc := true` emits `ld.global.nc.*` (read-only L1/tex cache hint, __ldg).
+  -- Valid only when `space = .global` and the buffer is never written by the kernel.
+  | ld_f32        (space : AddrSpace) (dst : RegF32) (addr : RegU64) (nc : Bool := false)
   | st_f32        (space : AddrSpace) (addr : RegU64) (val : RegF32)
-  | ld_u32        (space : AddrSpace) (dst : RegU32) (addr : RegU64)
+  | ld_u32        (space : AddrSpace) (dst : RegU32) (addr : RegU64) (nc : Bool := false)
   | st_u32        (space : AddrSpace) (addr : RegU64) (val : RegU32)
   -- shared memory via symbol: mov.u32 %r, sym; add.u32 %r, %r, off; ld/st
   | ld_shared_sym (dst : RegF32) (symAddr : RegU32) (offset : RegU32) (addr : RegU32)
@@ -309,9 +311,13 @@ def Inst.toString : Inst → String
   | .setp_u32 op d a b   => s!"  setp.{op}.u32 {d}, {a}, {b};"
   | .and_pred d a b      => s!"  and.pred {d}, {a}, {b};"
   | .mov_sreg d sr       => s!"  mov.u32 {d}, {sr};"
-  | .ld_f32 sp d a       => s!"  ld.{spStr sp}.f32 {d}, [{a}];"
+  | .ld_f32 sp d a nc    =>
+    let ncStr := if nc && sp matches .global then ".nc" else ""
+    s!"  ld.{spStr sp}{ncStr}.f32 {d}, [{a}];"
   | .st_f32 sp a v       => s!"  st.{spStr sp}.f32 [{a}], {v};"
-  | .ld_u32 sp d a       => s!"  ld.{spStr sp}.u32 {d}, [{a}];"
+  | .ld_u32 sp d a nc    =>
+    let ncStr := if nc && sp matches .global then ".nc" else ""
+    s!"  ld.{spStr sp}{ncStr}.u32 {d}, [{a}];"
   | .st_u32 sp a v       => s!"  st.{spStr sp}.u32 [{a}], {v};"
   | .ld_shared_sym d _sa _off addr => s!"  ld.shared.f32 {d}, [{addr}];"
   | .st_shared_sym v _sa _off addr => s!"  st.shared.f32 [{addr}], {v};"
@@ -389,6 +395,16 @@ structure GenState where
   u32BufferNames : List String := []
   /-- Shared memory names with u32 element type (for ld/st.shared.u32) -/
   u32SharedNames : List String := []
+  /-- Buffer names declared read-only (emit ld.global.nc, i.e. `__ldg`/read-only L1).
+      Must never appear on the LHS of a writeBuffer in the kernel. -/
+  readOnlyBufferNames : List String := []
+  /-- CSE cache for special-register reads (ctaid.x/y/z, tid.x/y/z, ntid.*).
+      Their values are kernel-invariant (fixed by launch config), so emit once
+      per kernel and reuse the register instead of re-issuing `mov.u32 %r, %sreg`
+      hundreds of times.  Cleared only when a barrier or label is emitted
+      (conservative — sreg values don't actually change, but this keeps the
+      optimisation local to straight-line code for safety). -/
+  sregCache : List (SReg × RegU32) := []
   deriving Inhabited
 
 namespace GenState
@@ -428,6 +444,26 @@ def isU32Buffer (s : GenState) (name : String) : Bool :=
 
 def isU32Shared (s : GenState) (name : String) : Bool :=
   s.u32SharedNames.any (· == name)
+
+def isReadOnlyBuffer (s : GenState) (name : String) : Bool :=
+  s.readOnlyBufferNames.any (· == name)
+
+/-- CSE entry point for reading a special register.
+    Returns the register holding `sreg`'s value, emitting `mov.u32 %r, sreg`
+    only on first use. Subsequent calls return the cached register.
+    Safe because sregs (ctaid/tid/ntid) are kernel-launch-invariant. -/
+def readSReg (s : GenState) (sreg : SReg) : RegU32 × GenState :=
+  match s.sregCache.find? (·.1 == sreg) with
+  | some (_, r) => (r, s)
+  | none =>
+    let (r, s) := s.freshU32
+    let s := s.emit (.mov_sreg r sreg)
+    (r, { s with sregCache := (sreg, r) :: s.sregCache })
+
+/-- Invalidate the sreg cache at control-flow boundaries.
+    Called when emitting a label/branch target so cached registers (which may
+    have been SSA-defined before the branch) are re-materialised afterwards. -/
+def clearSregCache (s : GenState) : GenState := { s with sregCache := [] }
 
 end GenState
 

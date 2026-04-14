@@ -263,33 +263,37 @@ partial def expToPTX (e : Exp t) (s : GenState) : ExpResult :=
   | .vecY v =>
     let (rv, s) := expToPTX v s; (rv, s)
 
-  -- Thread IDs
+  -- Thread IDs.  Special registers are kernel-launch-invariant, so cache
+  -- the register holding each sreg's value via `readSReg`; subsequent uses
+  -- of the same sreg reuse the register instead of re-issuing `mov.u32`.
   | .vec3X v =>
-    let (rv, s) := expToPTX v s; let (r, s) := s.freshU32
+    let (rv, s) := expToPTX v s
     let isGlobal := s.varMap.any (fun (n, reg) => reg == rv && n == "global_invocation_id")
     let isLocal  := s.varMap.any (fun (n, reg) => reg == rv && n == "local_invocation_id")
     let isWG     := s.varMap.any (fun (n, reg) => reg == rv && n == "workgroup_id")
     if isGlobal then
-      let (c, s) := s.freshU32; let s := s.emit (.mov_sreg c .ctaid_x)
-      let (n, s) := s.freshU32; let s := s.emit (.mov_sreg n .ntid_x)
-      let (t, s) := s.freshU32; let s := s.emit (.mov_sreg t .tid_x)
+      let (c, s) := s.readSReg .ctaid_x
+      let (n, s) := s.readSReg .ntid_x
+      let (t, s) := s.readSReg .tid_x
+      let (r, s) := s.freshU32
       (.u32 r, s.emit (.mad_lo_u32 r c n t))
-    else if isLocal then (.u32 r, s.emit (.mov_sreg r .tid_x))
-    else if isWG    then (.u32 r, s.emit (.mov_sreg r .ctaid_x))
-    else (.u32 r, s)
+    else if isLocal then let (r, s) := s.readSReg .tid_x; (.u32 r, s)
+    else if isWG    then let (r, s) := s.readSReg .ctaid_x; (.u32 r, s)
+    else let (r, s) := s.freshU32; (.u32 r, s)
   | .vec3Y v =>
-    let (rv, s) := expToPTX v s; let (r, s) := s.freshU32
+    let (rv, s) := expToPTX v s
     let isGlobal := s.varMap.any (fun (n, reg) => reg == rv && n == "global_invocation_id")
     let isLocal  := s.varMap.any (fun (n, reg) => reg == rv && n == "local_invocation_id")
     let isWG     := s.varMap.any (fun (n, reg) => reg == rv && n == "workgroup_id")
     if isGlobal then
-      let (c, s) := s.freshU32; let s := s.emit (.mov_sreg c .ctaid_y)
-      let (n, s) := s.freshU32; let s := s.emit (.mov_sreg n .ntid_y)
-      let (t, s) := s.freshU32; let s := s.emit (.mov_sreg t .tid_y)
+      let (c, s) := s.readSReg .ctaid_y
+      let (n, s) := s.readSReg .ntid_y
+      let (t, s) := s.readSReg .tid_y
+      let (r, s) := s.freshU32
       (.u32 r, s.emit (.mad_lo_u32 r c n t))
-    else if isLocal then (.u32 r, s.emit (.mov_sreg r .tid_y))
-    else if isWG then (.u32 r, s.emit (.mov_sreg r .ctaid_y))
-    else (.u32 r, s)
+    else if isLocal then let (r, s) := s.readSReg .tid_y; (.u32 r, s)
+    else if isWG then let (r, s) := s.readSReg .ctaid_y; (.u32 r, s)
+    else let (r, s) := s.freshU32; (.u32 r, s)
 
   -- Memory access
   | .index arr idx =>
@@ -297,6 +301,7 @@ partial def expToPTX (e : Exp t) (s : GenState) : ExpResult :=
     let arrName := match arr with | .var n => some n | _ => none
     let isShared := match arrName with | some n => s.isSharedVar n | none => false
     let isU32 := match arrName with | some n => s.isU32Buffer n | none => false
+    let isRO := match arrName with | some n => s.isReadOnlyBuffer n | none => false
     if isShared then
       let name := arrName.getD "unknown"
       let (off, s) := s.freshU32; let s := s.emit (.shl_u32 off rIdx.toU32! 2)
@@ -307,17 +312,17 @@ partial def expToPTX (e : Exp t) (s : GenState) : ExpResult :=
       else
         let (r, s) := s.freshF32; (.f32 r, s.emit (.ld_shared_sym r symR off addr))
     else if isU32 then
-      -- u32 buffer → ld.global.u32
+      -- u32 buffer → ld.global[.nc].u32 (nc hint for readOnly buffers → read-only L1)
       let (r, s) := s.freshU32
       let (off, s) := s.freshU64; let s := s.emit (.mul_wide_u32 off rIdx.toU32! 4)
       let (addr, s) := s.freshU64; let s := s.emit (.add_u64 addr rArr.toU64! off)
-      (.u32 r, s.emit (.ld_u32 .global r addr))
+      (.u32 r, s.emit (.ld_u32 .global r addr isRO))
     else
-      -- f32 buffer → ld.global.f32
+      -- f32 buffer → ld.global[.nc].f32
       let (r, s) := s.freshF32
       let (off, s) := s.freshU64; let s := s.emit (.mul_wide_u32 off rIdx.toU32! 4)
       let (addr, s) := s.freshU64; let s := s.emit (.add_u64 addr rArr.toU64! off)
-      (.f32 r, s.emit (.ld_f32 .global r addr))
+      (.f32 r, s.emit (.ld_f32 .global r addr isRO))
 
   -- Subgroup add (warp butterfly)
   | .subgroupAdd val =>
@@ -499,9 +504,14 @@ def generatePTX
     match ty with
     | .array (.scalar .u32) _ => name :: acc
     | _ => acc) []
+  -- Buffers declared with access mode `.read` get `ld.global.nc` (read-only L1).
+  let readOnlyBufferNames := state.declaredBuffers.foldl (fun (acc : List String) (name, _, mode) =>
+    match mode with
+    | .read => name :: acc
+    | _ => acc) []
   let initState := state.declaredBuffers.foldl (fun (s : GenState) (name, _, _) =>
     let (r, s) := s.freshU64; let s := s.emit (.ld_param_u64 r name); s.bindVar name (.u64 r))
-    ({ sharedNames, u32BufferNames, u32SharedNames } : GenState)
+    ({ sharedNames, u32BufferNames, u32SharedNames, readOnlyBufferNames } : GenState)
   let finalState := (state.stmts.foldl (fun s st => stmtToPTX st s) initState).emit .ret
   (Module.mk ptxVersion targetArch funcName paramNames sharedDecls
     finalState.insts finalState.fRegs finalState.rRegs finalState.rdRegs finalState.pRegs finalState.hRegs).render
