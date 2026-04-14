@@ -56,7 +56,7 @@ initialize profilingRef  : IO.Ref Bool  ← IO.mkRef false
 initialize dp4aEnabled   : IO.Ref Bool  ← IO.mkRef false
 /-- Separately toggle Q6_K (lmHead) dp4a path. On by default when dp4aEnabled=true;
     set to false via HESPER_DP4A_Q6K=0 to debug Q6_K issues while keeping Q4_K dp4a. -/
-initialize dp4aQ6KEnabled : IO.Ref Bool ← IO.mkRef false
+initialize dp4aQ6KEnabled : IO.Ref Bool ← IO.mkRef true
 initialize totalNanosRef : IO.Ref UInt64 ← IO.mkRef 0
 initialize callCountRef  : IO.Ref Nat    ← IO.mkRef 0
 /-- Per-shape cumulative time, keyed by (inDim, outDim). Array of
@@ -1219,22 +1219,25 @@ def fusedQ6KLinearDP4AKernel (inDim outDim : Nat) (gridX : Nat := 0) : ShaderM U
 
   let inBounds := Exp.lt outIdx (Exp.litU32 outDim)
 
-  -- Only lanes 0..15 do work. Lanes 16..31 duplicate (handled via /2 at end).
-  let laneLow := Exp.bitAnd tid (Exp.litU32 15)  -- iqs ∈ [0, 16)
-  let iqs := laneLow
-
-  -- bq8_offset = 4*(iqs/8) + (iqs%8)/4
-  let iqsDiv8 := Exp.shiftRight iqs (Exp.litU32 3)
+  -- QI6_K = QK_K / (4*QR6_K) = 256 / 8 = 32.
+  -- iqs ∈ [0, 32) — each lane processes a unique (kbx, kqs) combo; llama.cpp
+  -- uses all 32 lanes for Q6_K (VDR=1, qi=32, tid%(qi/vdr)=tid%32).
+  let iqs : Exp (.scalar .u32) := tid
+  -- bq8_offset = 2*QR6_K*(iqs / (QI6_K/2)) + (iqs%(QI6_K/2)) / (QI6_K/4)
+  --            = 4*(iqs/16) + (iqs%16)/8
+  let iqsDiv16 := Exp.shiftRight iqs (Exp.litU32 4)
+  let iqsMod16 := Exp.bitAnd iqs (Exp.litU32 15)
+  let bq8Off := Exp.add (Exp.mul iqsDiv16 (Exp.litU32 4)) (Exp.shiftRight iqsMod16 (Exp.litU32 3))
+  -- scale_offset = (QI6_K/4) * (iqs / (QI6_K/2)) + (iqs%(QI6_K/2)) / (QI6_K/8)
+  --              = 8*(iqs/16) + (iqs%16)/4
+  let scaleOff := Exp.add (Exp.mul iqsDiv16 (Exp.litU32 8)) (Exp.shiftRight iqsMod16 (Exp.litU32 2))
+  -- vh_shift = 2 * ((iqs%(QI6_K/2)) / (QI6_K/4)) = 2 * ((iqs%16)/8)
+  let vhShift := Exp.mul (Exp.shiftRight iqsMod16 (Exp.litU32 3)) (Exp.litU32 2)
+  -- vh_idx = (QI6_K/4) * (iqs/(QI6_K/2)) + iqs%(QI6_K/4)
+  --        = 8*(iqs/16) + iqs%8
   let iqsMod8 := Exp.bitAnd iqs (Exp.litU32 7)
-  let bq8Off := Exp.add (Exp.mul iqsDiv8 (Exp.litU32 4)) (Exp.shiftRight iqsMod8 (Exp.litU32 2))
-  -- scale_offset = 4*(iqs/8) + (iqs%8)/2
-  let scaleOff := Exp.add (Exp.mul iqsDiv8 (Exp.litU32 4)) (Exp.shiftRight iqsMod8 (Exp.litU32 1))
-  -- vh_shift = 2 * ((iqs%8)/4)
-  let vhShift := Exp.mul (Exp.shiftRight iqsMod8 (Exp.litU32 2)) (Exp.litU32 2)
-  -- vh index = 4*(iqs/8) + iqs%4  (matches llama.cpp: (QI6_K/4) * (iqs/(QI6_K/2)) + iqs%(QI6_K/4))
-  let iqsMod4 := Exp.bitAnd iqs (Exp.litU32 3)
-  let vhIdx := Exp.add (Exp.mul iqsDiv8 (Exp.litU32 4)) iqsMod4
-  -- q8 element offset within sub-block = iqs%8
+  let vhIdx := Exp.add (Exp.mul iqsDiv16 (Exp.litU32 8)) iqsMod8
+  -- q8 element offset within sub-block = iqs % QI8_1 = iqs % 8
   let q8ElemOff := iqsMod8
 
   ShaderM.varNamed "acc" (.scalar .f32) (Exp.litF32 0.0)
@@ -1350,9 +1353,8 @@ def fusedQ6KLinearDP4AKernel (inDim outDim : Nat) (gridX : Nat := 0) : ShaderM U
     -- Per-block: acc += d * (sumf_0 + sumf_1)
     ShaderM.assign "acc" (Exp.add acc (Exp.mul d (Exp.add sumf_0 sumf_1)))
 
-  -- Subgroup reduction; divide by 2 because lanes 16..31 duplicate 0..15.
-  ShaderM.varNamed "total" (.scalar .f32)
-    (Exp.mul (Exp.subgroupAdd acc) (Exp.litF32 0.5))
+  -- All 32 lanes contribute unique partials (iqs=tid). Standard subgroupAdd.
+  ShaderM.varNamed "total" (.scalar .f32) (Exp.subgroupAdd acc)
   let total : Exp (.scalar .f32) := Exp.var "total"
 
   ShaderM.if_ (Exp.and (Exp.eq tid (Exp.litU32 0)) inBounds) (do
