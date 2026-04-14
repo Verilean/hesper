@@ -21,6 +21,13 @@ def main (args : List String) : IO Unit := do
   let prompt := args.getD 1 "Hello"
   let maxTokens := (args.getD 2 "10").toNat!
 
+  -- Enable dp4a path if HESPER_DP4A=1 is set in environment.
+  match ← IO.getEnv "HESPER_DP4A" with
+  | some "1" =>
+    Hesper.Layers.Linear.dp4aEnabled.set true
+    IO.println "[Config] dp4a Q4_K path: ENABLED"
+  | _ => IO.println "[Config] dp4a Q4_K path: disabled (set HESPER_DP4A=1 to enable)"
+
   IO.println "╔══════════════════════════════════════════╗"
   IO.println "║  Gemma 4 CUDA PTX Inference              ║"
   IO.println "╚══════════════════════════════════════════╝"

@@ -891,6 +891,9 @@ private def loadLinear [GPUBackend β] (ctx : β) (gguf : Hesper.GGUF.GGUFFile)
   let splitKBuf ← IO.mkRef none
   let splitKPartialPrepared ← GPUBackend.newCacheRef (β := β)
   let splitKReducePrepared ← GPUBackend.newCacheRef (β := β)
+  let dp4aQ8Buf ← IO.mkRef none
+  let dp4aQuantizePrepared ← GPUBackend.newCacheRef (β := β)
+  let dp4aMatmulPrepared ← GPUBackend.newCacheRef (β := β)
   return {
     config := { inDim, outDim }
     weightBuf
@@ -899,6 +902,9 @@ private def loadLinear [GPUBackend β] (ctx : β) (gguf : Hesper.GGUF.GGUFFile)
     splitKBuf
     splitKPartialPrepared
     splitKReducePrepared
+    dp4aQ8Buf
+    dp4aQuantizePrepared
+    dp4aMatmulPrepared
   }
 
 /-- Load Gemma 4 model from GGUF file -/
