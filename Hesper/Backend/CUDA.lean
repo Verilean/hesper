@@ -70,6 +70,10 @@ private def cudaExecuteImpl (computation : ShaderM Unit) (namedBuffers : List (S
   match cache.find? (fun e => e.1 == sourceHash) with
   | some (_, f) => return f
   | none =>
+    -- Optional: dump PTX for profiling/static analysis (HESPER_PTX_DUMP=dir).
+    match ← IO.getEnv "HESPER_PTX_DUMP" with
+    | some dir => IO.FS.writeFile s!"{dir}/{funcName}.ptx" ptx
+    | none => pure ()
     let cudaMod ← cuModuleLoadData ptx
     let f ← cuModuleGetFunction cudaMod funcName
     cudaModuleCache.modify (·.push (sourceHash, f))
