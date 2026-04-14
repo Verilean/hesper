@@ -497,6 +497,12 @@ inductive Exp : WGSLType → Type where
   | unpack2x16unorm : Exp (.scalar .u32) → Exp (.vec2 .f32)
   | unpack2x16float : Exp (.scalar .u32) → Exp (.vec2 .f32)
 
+  -- Packed 4x8 integer dot product (WGSL builtin, maps to dp4a on NVIDIA)
+  -- dot4I8Packed(a, b): treat each u32 as 4 signed int8s, compute dot product → i32
+  | dot4I8Packed : Exp (.scalar .u32) → Exp (.scalar .u32) → Exp (.scalar .i32)
+  -- dot4U8Packed(a, b): treat each u32 as 4 unsigned int8s, compute dot product → u32
+  | dot4U8Packed : Exp (.scalar .u32) → Exp (.scalar .u32) → Exp (.scalar .u32)
+
   -- Workgroup barrier (duplicate, already defined above - will be removed from toWGSL)
   | workgroupBarrier : Exp (.scalar .u32)  -- Returns unit
 
@@ -856,6 +862,10 @@ partial def Exp.toWGSL {t : WGSLType} : Exp t → String
     s!"unpack2x16unorm({toWGSL v})"
   | unpack2x16float v =>
     s!"unpack2x16float({toWGSL v})"
+  | dot4I8Packed a b =>
+    s!"dot4I8Packed({toWGSL a}, {toWGSL b})"
+  | dot4U8Packed a b =>
+    s!"dot4U8Packed({toWGSL a}, {toWGSL b})"
   | workgroupBarrier =>
     "workgroupBarrier()"
 
