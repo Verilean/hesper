@@ -27,6 +27,12 @@ def main (args : List String) : IO Unit := do
     Hesper.Layers.Linear.dp4aEnabled.set true
     IO.println "[Config] dp4a Q4_K path: ENABLED"
   | _ => IO.println "[Config] dp4a Q4_K path: disabled (set HESPER_DP4A=1 to enable)"
+  -- Optionally enable Q6_K dp4a lmHead (still has correctness bugs — off by default).
+  match ← IO.getEnv "HESPER_DP4A_Q6K" with
+  | some "1" =>
+    Hesper.Layers.Linear.dp4aQ6KEnabled.set true
+    IO.println "[Config] dp4a Q6_K lmHead: ENABLED (experimental — may produce wrong output)"
+  | _ => IO.println "[Config] dp4a Q6_K lmHead: disabled"
 
   IO.println "╔══════════════════════════════════════════╗"
   IO.println "║  Gemma 4 CUDA PTX Inference              ║"
