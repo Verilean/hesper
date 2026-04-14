@@ -27,12 +27,17 @@ def main (args : List String) : IO Unit := do
     Hesper.Layers.Linear.dp4aEnabled.set true
     IO.println "[Config] dp4a Q4_K path: ENABLED"
   | _ => IO.println "[Config] dp4a Q4_K path: disabled (set HESPER_DP4A=1 to enable)"
-  -- Optionally enable Q6_K dp4a lmHead (still has correctness bugs — off by default).
+  -- Q6_K lmHead dp4a is on by default when HESPER_DP4A=1; disable via
+  -- HESPER_DP4A_Q6K=0 (for debugging only — correctness verified against
+  -- nvcc reference kernel).
   match ← IO.getEnv "HESPER_DP4A_Q6K" with
-  | some "1" =>
-    Hesper.Layers.Linear.dp4aQ6KEnabled.set true
-    IO.println "[Config] dp4a Q6_K lmHead: ENABLED (experimental — may produce wrong output)"
-  | _ => IO.println "[Config] dp4a Q6_K lmHead: disabled"
+  | some "0" =>
+    Hesper.Layers.Linear.dp4aQ6KEnabled.set false
+    IO.println "[Config] dp4a Q6_K lmHead: DISABLED (HESPER_DP4A_Q6K=0)"
+  | _ =>
+    let q6on ← Hesper.Layers.Linear.dp4aQ6KEnabled.get
+    let status := if q6on then "enabled (default)" else "disabled"
+    IO.println s!"[Config] dp4a Q6_K lmHead: {status}"
 
   IO.println "╔══════════════════════════════════════════╗"
   IO.println "║  Gemma 4 CUDA PTX Inference              ║"
