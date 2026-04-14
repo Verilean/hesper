@@ -497,6 +497,11 @@ inductive Exp : WGSLType → Type where
   | unpack2x16unorm : Exp (.scalar .u32) → Exp (.vec2 .f32)
   | unpack2x16float : Exp (.scalar .u32) → Exp (.vec2 .f32)
 
+  -- Round-to-nearest-even float → signed i32, returned as u32 (same bits).
+  -- Matches PTX cvt.rni.s32.f32 / C roundf. For negative values, the u32
+  -- representation holds the two's-complement i32 bit pattern.
+  | roundToI32 : Exp (.scalar .f32) → Exp (.scalar .u32)
+
   -- Packed 4x8 integer dot product (WGSL builtin, maps to dp4a on NVIDIA)
   -- dot4I8Packed(a, b): treat each u32 as 4 signed int8s, compute dot product → i32
   | dot4I8Packed : Exp (.scalar .u32) → Exp (.scalar .u32) → Exp (.scalar .i32)
@@ -862,6 +867,9 @@ partial def Exp.toWGSL {t : WGSLType} : Exp t → String
     s!"unpack2x16unorm({toWGSL v})"
   | unpack2x16float v =>
     s!"unpack2x16float({toWGSL v})"
+  | roundToI32 v =>
+    -- WGSL: treat i32 as u32 via bitcast (same 32-bit pattern)
+    s!"bitcast<u32>(i32(round({toWGSL v})))"
   | dot4I8Packed a b =>
     s!"dot4I8Packed({toWGSL a}, {toWGSL b})"
   | dot4U8Packed a b =>
