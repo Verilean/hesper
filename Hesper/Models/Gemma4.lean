@@ -1393,12 +1393,27 @@ def forwardBlock [GPUBackend β] (ctx : β)
   Hesper.WGSL.Execute.withSection "attnNorm" do
     RMSNorm.forward ctx block.attnNorm inputBuf state.normedBuf
 
-  -- Step 2: Q/K/V projections
+  -- Step 2: Q/K/V projections.  wK and wV share the same input and shape
+  -- (and both are Q4_K in Gemma 4); combine them into a single fused
+  -- kernel when possible to halve the per-layer attention-projection
+  -- dispatch count.  wQ stays separate because its outDim differs.
   Hesper.WGSL.Execute.withSection "qkvProj" do
     Linear.LinearLayer.forward ctx block.attention.wQ state.normedBuf state.qBuf
     if cfg.hasKV li then
-      Linear.LinearLayer.forward ctx block.attention.wK state.normedBuf state.kBuf
-      Linear.LinearLayer.forward ctx block.attention.wV state.normedBuf state.vBuf
+      let useFusedKV := block.attention.wK.quantFormat == .Q4_K
+                    && block.attention.wV.quantFormat == .Q4_K
+                    && block.attention.wK.config.inDim == block.attention.wV.config.inDim
+                    && block.attention.wK.config.outDim == block.attention.wV.config.outDim
+      if useFusedKV then
+        let key := hash ("kvFusedDP4A", block.attention.wK.config.inDim, block.attention.wK.config.outDim)
+        let ref ← match kcr with
+          | some k => k.getRef key
+          | none => IO.mkRef none
+        Linear.forwardFusedKV ctx block.attention.wK block.attention.wV
+          state.normedBuf state.kBuf state.vBuf ref
+      else
+        Linear.LinearLayer.forward ctx block.attention.wK state.normedBuf state.kBuf
+        Linear.LinearLayer.forward ctx block.attention.wV state.normedBuf state.vBuf
 
   -- Step 3: Q-norm, K-norm (per-head RMSNorm)
   let numHeads := cfg.numAttentionHeads
