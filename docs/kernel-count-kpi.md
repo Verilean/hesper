@@ -28,7 +28,18 @@ Empirically, each kernel launch costs ~10 µs of wall-clock
 | hesper (fused RoPE-K+KVwrite) | " | 36,696 | 1,223 | 6.5× |
 | hesper (Circuit DSL: wO via runCached) | 2026-04-15 | 35,326 | 1,178 | 6.3× |
 | hesper (Circuit DSL: layerScale+pleScale3 auto-fused via ScalarExp) | 2026-04-15 | 34,191 | 1,140 | 6.1× |
-| **hesper (current)** | " | **34,191** | **1,140** | **6.1×** |
+| hesper (Circuit DSL: 3 RMSNorm sites via reduce-with-epilogue fusion) | 2026-04-15 | 33,997 | 1,133 | 6.1× |
+| **hesper (current)** | " | **33,997** | **1,133** | **6.1×** |
+
+`finalNorm`, `attnNorm`, and `ffnNorm` (~67 sites/tok) now go through
+`CircuitM.rmsNorm`, which lowers as 4 ops (reduce + 3 pointwise) and
+the `fuseReduceEpilogue` compiler pass collapses them to a single
+GPU dispatch — matching the hand-written `RMSNorm.forward` baseline
+in dispatch count, but with the kernel **generated from `ScalarExp`**
+rather than being a hand-maintained ShaderM.  The net kernels/tok
+delta is ~0 (each site already cost 1 dispatch); the value is the
+architectural pivot — adding norm+matmul-quantize fusion is now an
+IR rewrite, not a new hand-written kernel.
 
 The last row is the **first production fusion driven entirely by the
 element-wise compiler pass** (`fusePointwise`), not a hand-written

@@ -50,24 +50,25 @@ unsafe def main : IO Unit := do
 
   let outBuf ← GPUBackend.allocBuffer (β := β) ctx (4 * D).toUSize
 
+  -- Probe the IR pipeline directly so we can report op count after
+  -- each pass.  Then run the fused circuit through runCachedFused for
+  -- the actual GPU dispatch.
+  let buildRmsNorm : CircuitM (GPUBackend.Buf β) (GPUBackend.CachedDispatch β) Unit := do
+    let x ← CircuitM.registerExternal xBuf #[D] .f32 .Global
+    let s ← CircuitM.registerExternal scaleBuf #[D] .f32 .Global
+    let _y ← CircuitM.rmsNorm x s eps
+    pure ()
+  let ((), st) := CircuitM.run buildRmsNorm
+  IO.println s!"Builder produced {st.ops.size} ops"
+  let extIds : Array Nat := st.externals.map (fun (tr, _) => tr.id)
+  let protectedIds : Array Nat := extIds.push 5  -- final output is the last produced
+  let afterRedEpi := fuseReduceEpilogue st.ops protectedIds
+  IO.println s!"After fuseReduceEpilogue: {afterRedEpi.size} ops"
+  let afterPointwise := fusePointwise afterRedEpi protectedIds
+  IO.println s!"After fusePointwise: {afterPointwise.size} ops"
+
   let cacheRef : IO.Ref (Option (CompiledCircuit β)) ← IO.mkRef none
-  Hesper.Circuit.runCachedFused ctx cacheRef
-    (do
-      let x ← CircuitM.registerExternal
-                (BufT := GPUBackend.Buf β) (CacheT := GPUBackend.CachedDispatch β)
-                xBuf #[D] .f32 .Global
-      let s ← CircuitM.registerExternal
-                (BufT := GPUBackend.Buf β) (CacheT := GPUBackend.CachedDispatch β)
-                scaleBuf #[D] .f32 .Global
-      let _y ← CircuitM.rmsNorm x s eps
-      pure ())
-    -- Tensor ids assigned by builder:
-    --   0 = x (external)        -- full [D]
-    --   1 = scale (external)    -- full [D]
-    --   2 = sumSq               (reduce → [1])
-    --   3 = meanSqPlusEps       (pointwise, fused away)
-    --   4 = invRms              (pointwise, fused away)
-    --   5 = final output        (pointwise, kept)
+  Hesper.Circuit.runCachedFused ctx cacheRef buildRmsNorm
     [(0, xBuf), (1, scaleBuf), (5, outBuf)]
 
   let expected := cpuRmsNorm xArr scaleArr eps

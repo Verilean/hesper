@@ -138,6 +138,92 @@ def runReduceOp [GPUBackend β]
       workgroupSize := { x := wgSize, y := 1, z := 1 } }
   GPUBackend.executeWithConfigCached ctx shader namedBufs config cacheKey cacheRef
 
+/-- Reduce + per-lane epilogue, fused into one kernel.  Phase 1 is the
+    same strided-accum + tree reduce as `lowerReduceLastAxis`; phase 2
+    reads the scalar back from shared memory and every lane writes
+    `body[input 0 := scratch[0], input (k+1) := epilogueInput[k][lane]]`
+    to its slot of the output.  Used to collapse the canonical
+    "reduce → use-result-broadcast-in-pointwise" pattern (RMSNorm,
+    softmax-pre-norm, etc.) into a single dispatch. -/
+def lowerReduceLastAxisWithEpilogue
+    (op : ReduceOp)
+    (reduceInputName : String)
+    (epilogueInputNames : Array String)
+    (outputName : String)
+    (D : Nat) (workgroupSize : Nat)
+    (body : ScalarExp) : ShaderM Unit := do
+  ShaderM.sharedNamed "scratch" (.array (.scalar .f32) workgroupSize)
+  let _ ← ShaderM.declareInputBuffer reduceInputName (.array (.scalar .f32) D)
+  for name in epilogueInputNames do
+    let _ ← ShaderM.declareInputBuffer name (.array (.scalar .f32) D)
+  let _ ← ShaderM.declareOutputBuffer outputName (.array (.scalar .f32) D)
+  let lid ← ShaderM.localId
+  let localIdx := Exp.vec3X lid
+  -- Phase 1: strided accumulate.
+  ShaderM.varNamed "accum" (.scalar .f32) (Exp.litF32 0.0)
+  let accumE : Exp (.scalar .f32) := Exp.var "accum"
+  ShaderM.loop localIdx (Exp.litU32 D) (Exp.litU32 workgroupSize) fun loopIdx => do
+    let v ← ShaderM.readBuffer (ty := .scalar .f32) (n := D) reduceInputName loopIdx
+    let contrib := match op with
+      | .sum          => v
+      | .sumOfSquares => Exp.mul v v
+    ShaderM.assign "accum" (Exp.add accumE contrib)
+  ShaderM.writeWorkgroup (ty := .scalar .f32) "scratch" localIdx accumE
+  ShaderM.barrier
+  -- Tree reduction.
+  let mut stride := workgroupSize / 2
+  while stride > 0 do
+    ShaderM.if_ (Exp.lt localIdx (Exp.litU32 stride)) (do
+      let a ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := workgroupSize) "scratch" localIdx
+      let b ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := workgroupSize) "scratch"
+                (Exp.add localIdx (Exp.litU32 stride))
+      ShaderM.writeWorkgroup (ty := .scalar .f32) "scratch" localIdx (Exp.add a b)
+    ) (pure ())
+    ShaderM.barrier
+    stride := stride / 2
+  -- Phase 2: every lane writes its slot of the output.  Strided over D
+  -- so workgroupSize lanes cover all D elements.
+  let total ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := workgroupSize) "scratch" (Exp.litU32 0)
+  let totalName ← ShaderM.var (.scalar .f32) total
+  let totalRef : Exp (.scalar .f32) := Exp.var totalName
+  ShaderM.loop localIdx (Exp.litU32 D) (Exp.litU32 workgroupSize) fun loopIdx => do
+    -- Build slot array: input 0 = scalar reduction; input (k+1) = epilogueInputs[k][loopIdx]
+    let mut slots : Array (Exp (.scalar .f32)) := #[totalRef]
+    for name in epilogueInputNames do
+      let v ← ShaderM.readBuffer (ty := .scalar .f32) (n := D) name loopIdx
+      let vName ← ShaderM.var (.scalar .f32) v
+      slots := slots.push (Exp.var vName)
+    let result := lowerScalarExp slots body
+    ShaderM.writeBuffer (ty := .scalar .f32) outputName loopIdx result
+
+/-- Dispatch a `Prim.reduceLastAxisWithEpilogue` through cached exec. -/
+def runReduceWithEpilogueOp [GPUBackend β]
+    (ctx : β) (op : ReduceOp) (D : Nat) (body : ScalarExp)
+    (reduceInputBuf : GPUBackend.Buf β)
+    (epilogueInputBufs : Array (GPUBackend.Buf β))
+    (outputBuf : GPUBackend.Buf β)
+    (cacheKey : UInt64) (cacheRef : IO.Ref (Option (GPUBackend.CachedDispatch β)))
+    : IO Unit := do
+  let wgSize := min D 256
+  let reduceInputName := "in0"
+  let epilogueInputNames : Array String :=
+    Array.ofFn (fun (i : Fin epilogueInputBufs.size) => s!"in{i.val + 1}")
+  let outputName := "out"
+  let shader : ShaderM Unit :=
+    lowerReduceLastAxisWithEpilogue op reduceInputName epilogueInputNames
+      outputName D wgSize body
+  let mut namedBufs : List (String × GPUBackend.Buf β) :=
+    [(outputName, outputBuf), (reduceInputName, reduceInputBuf)]
+  let n := epilogueInputBufs.size
+  for i in [0:n] do
+    match epilogueInputBufs[i]? with
+    | some buf => namedBufs := (s!"in{i + 1}", buf) :: namedBufs
+    | none     => pure ()
+  let config : ExecConfig :=
+    { numWorkgroups := (1, 1, 1)
+      workgroupSize := { x := wgSize, y := 1, z := 1 } }
+  GPUBackend.executeWithConfigCached ctx shader namedBufs config cacheKey cacheRef
+
 /-- Build a complete `ShaderM Unit` that implements a `Prim.pointwise`
     op.  `inputNames[i]` is the buffer binding name for input slot i;
     `inputBroadcast[i] = true` means that input is a 1-element scalar
@@ -255,6 +341,24 @@ def compile [GPUBackend β]
         runReduceOp ctx rop inShape.numel inBuf outBuf 0 cacheRef
       | _, _ =>
         throw (IO.userError s!"Circuit.compile: missing buffer for reduce op (in={inTr.id} out={outTr.id})")
+    | Prim.reduceLastAxisWithEpilogue rop reduceInShape _epiShapes body =>
+      let inTr  := op.inputs[0]!
+      let outTr := op.outputs[0]!
+      match lookup inTr.id, lookup outTr.id with
+      | some reduceInBuf, some outBuf =>
+        let mut epiBufs : Array (GPUBackend.Buf β) := #[]
+        for k in [1 : op.inputs.size] do
+          match op.inputs[k]? with
+          | some tr =>
+            match lookup tr.id with
+            | some b => epiBufs := epiBufs.push b
+            | none => throw (IO.userError s!"Circuit.compile: missing epilogue input id={tr.id}")
+          | none => pure ()
+        let cacheRef ← IO.mkRef (α := Option (GPUBackend.CachedDispatch β)) none
+        runReduceWithEpilogueOp ctx rop reduceInShape.numel body
+          reduceInBuf epiBufs outBuf 0 cacheRef
+      | _, _ =>
+        throw (IO.userError s!"Circuit.compile: missing buffer for reduce-with-epilogue op (in={inTr.id} out={outTr.id})")
 
 /-! ## Build-once, replay-many — zero-overhead dispatch path
 
@@ -354,6 +458,29 @@ def compileOnce [GPUBackend β]
               runReduceOp _ctx rop D inBuf outBuf cacheKey cacheRef
             | _, _ =>
               throw (IO.userError s!"CompiledCircuit: missing reduce buffer (in={inId} out={outId})")
+        }
+    | Prim.reduceLastAxisWithEpilogue rop reduceInShape epiShapes body =>
+      let D := reduceInShape.numel
+      let inId  := op.inputs[0]!.id
+      let outId := op.outputs[0]!.id
+      let epiIds : Array Nat :=
+        (op.inputs.extract 1 op.inputs.size).map (·.id)
+      let cacheRef : IO.Ref (Option (GPUBackend.CachedDispatch β)) ← IO.mkRef none
+      let cacheKey : UInt64 :=
+        hash ("circuit-reduce-epi", reprStr rop, D, reprStr body,
+              reprStr epiShapes.toList)
+      closures := closures.push
+        { run := fun lookup => do
+            match lookup inId, lookup outId with
+            | some reduceBuf, some outBuf =>
+              let mut epiBufs : Array (GPUBackend.Buf β) := #[]
+              for id in epiIds do
+                match lookup id with
+                | some b => epiBufs := epiBufs.push b
+                | none => throw (IO.userError s!"CompiledCircuit: missing epilogue input id={id}")
+              runReduceWithEpilogueOp _ctx rop D body reduceBuf epiBufs outBuf cacheKey cacheRef
+            | _, _ =>
+              throw (IO.userError s!"CompiledCircuit: missing reduce-epi buffer (in={inId} out={outId})")
         }
   let externalIds := state.externals.map (fun (tr, _) => tr.id)
   -- producedIds := tensor ids that are produced by some op's outputs
