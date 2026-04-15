@@ -1,5 +1,7 @@
 import Hesper.Circuit.IR
 import Hesper.Backend
+import Hesper.WGSL.Monad
+import Hesper.WGSL.Exp
 
 /-!
 # Circuit Lowering — MVP
@@ -17,11 +19,111 @@ inlineProducer, …) that rewrite the `ops` list before emit.
 namespace Hesper.Circuit
 
 open Hesper
+open Hesper.WGSL
+open Hesper.WGSL.Monad
+
+/-! ## Generic pointwise lowering
+
+`lowerScalarExp` folds a `ScalarExp` tree into a typed `Exp` over the
+`f32` tensor element at the current lane.  `lowerPointwise` builds the
+entire `ShaderM Unit` from the body + input-slot names.
+
+Key property: the lowering is a **function of the IR alone**.  There is
+no pattern registry that maps `Prim.pointwise scaleBody → scaleKernel`;
+instead, any `ScalarExp` body — whether hand-written, fusion-produced,
+or constant-folded — flows through the same lowering.  That's what
+makes this a compiler pass instead of a dispatcher. -/
+
+/-- Lower a `ScalarExp` to a typed WGSL `Exp` of f32.  Per-element
+    reads from the input slots are pre-loaded into `slot : Array (Exp f32)`
+    so the same `input i` reference inside `body` compiles to a single
+    shared `var` read, not N redundant buffer loads. -/
+def lowerScalarExp (slot : Array (Exp (.scalar .f32)))
+    : ScalarExp → Exp (.scalar .f32)
+  | .input i      =>
+    match slot[i]? with
+    | some e => e
+    | none   => Exp.litF32 0.0  -- unreachable: caller shape-checks
+  | .const v      => Exp.litF32 v
+  | .add a b      => Exp.add (lowerScalarExp slot a) (lowerScalarExp slot b)
+  | .sub a b      => Exp.sub (lowerScalarExp slot a) (lowerScalarExp slot b)
+  | .mul a b      => Exp.mul (lowerScalarExp slot a) (lowerScalarExp slot b)
+  | .div a b      => Exp.div (lowerScalarExp slot a) (lowerScalarExp slot b)
+  | .neg a        => Exp.neg (lowerScalarExp slot a)
+  | .rsqrt a      => Exp.inverseSqrt (lowerScalarExp slot a)
+  | .exp a        => Exp.exp (lowerScalarExp slot a)
+  | .tanh a       => Exp.tanh (lowerScalarExp slot a)
+  | .gelu a       =>
+    -- tanh approximation: 0.5 * x * (1 + tanh(√(2/π) * (x + 0.044715 * x³)))
+    let x := lowerScalarExp slot a
+    let c : Float := 0.7978845608028654
+    let k : Float := 0.044715
+    let x3 := Exp.mul (Exp.mul x x) x
+    let inner := Exp.mul (Exp.litF32 c)
+                         (Exp.add x (Exp.mul (Exp.litF32 k) x3))
+    Exp.mul (Exp.mul (Exp.litF32 0.5) x)
+            (Exp.add (Exp.litF32 1.0) (Exp.tanh inner))
+  | .silu a       =>
+    -- x / (1 + exp(-x))
+    let x := lowerScalarExp slot a
+    Exp.div x (Exp.add (Exp.litF32 1.0) (Exp.exp (Exp.neg x)))
+
+/-- Build a complete `ShaderM Unit` that implements a `Prim.pointwise`
+    op.  `inputNames` are the buffer binding names (positional, so
+    `inputNames[i]` is what `ScalarExp.input i` reads); `outputName` is
+    where to write.  `numel` is the total tensor element count.
+
+    Dispatch shape is a fixed 1D `(numel+255)/256 × 256`.  Inside the
+    kernel, each thread computes one output element if its global id is
+    in range. -/
+def lowerPointwise
+    (inputNames : Array String) (outputName : String)
+    (numel : Nat) (body : ScalarExp) : ShaderM Unit := do
+  let _ ← inputNames.mapM fun name =>
+    ShaderM.declareInputBuffer name (.array (.scalar .f32) numel)
+  let _ ← ShaderM.declareOutputBuffer outputName (.array (.scalar .f32) numel)
+  let gid ← ShaderM.globalId
+  let idx := Exp.vec3X gid
+  ShaderM.if_ (Exp.lt idx (Exp.litU32 numel)) (do
+    -- Pre-load every input slot once, bind to a local var, then
+    -- ScalarExp references re-use them (free CSE).
+    let mut slots : Array (Exp (.scalar .f32)) := #[]
+    for name in inputNames do
+      let v ← ShaderM.readBuffer (ty := .scalar .f32) (n := numel) name idx
+      let vName ← ShaderM.var (.scalar .f32) v
+      slots := slots.push (Exp.var vName)
+    let result := lowerScalarExp slots body
+    ShaderM.writeBuffer (ty := .scalar .f32) outputName idx result
+  ) (pure ())
 
 /-- A mapping from TensorRef id to the concrete device buffer.
     Represented as a simple association list; linear lookup is fine
     for MVP circuit sizes (<100 tensors per compile). -/
 abbrev BufferMap (BufT : Type) := List (Nat × BufT)
+
+/-- Dispatch a `Prim.pointwise` op through `executeWithConfigCached`.
+    All pointwise ops use the same 1D dispatch `(numel+255)/256 × 256`
+    (Prim.pointwise invariant), so the caller just passes the resolved
+    input/output buffers and a unique cacheKey. -/
+def runPointwiseOp [GPUBackend β]
+    (ctx : β) (numel : Nat) (body : ScalarExp)
+    (inputBufs : Array (GPUBackend.Buf β))
+    (outputBuf : GPUBackend.Buf β)
+    (cacheKey : UInt64) (cacheRef : IO.Ref (Option (GPUBackend.CachedDispatch β)))
+    : IO Unit := do
+  -- Buffer binding names positional: "in0", "in1", …, "out".
+  let inputNames : Array String :=
+    Array.ofFn (fun (i : Fin inputBufs.size) => s!"in{i.val}")
+  let outputName := "out"
+  let shader : ShaderM Unit := lowerPointwise inputNames outputName numel body
+  let mut namedBufs : List (String × GPUBackend.Buf β) := [(outputName, outputBuf)]
+  let n := inputBufs.size
+  for i in [0:n] do
+    match inputBufs[i]? with
+    | some buf => namedBufs := (s!"in{i}", buf) :: namedBufs
+    | none     => pure ()
+  let config : ExecConfig := ExecConfig.dispatch1D numel
+  GPUBackend.executeWithConfigCached ctx shader namedBufs config cacheKey cacheRef
 
 /-- Lower a Circuit: execute each Op in order.  Buffers for produced
     tensors are supplied by the caller via `outputBufs` — the caller
@@ -51,11 +153,19 @@ def compile [GPUBackend β]
         Hesper.Layers.Linear.LinearLayer.forward ctx layer inputBuf outputBuf
       | _, _ =>
         throw (IO.userError s!"Circuit.compile: missing buffer for matmul op (in={inTr.id}, out={outTr.id})")
-    | Prim.pointwise _ _ =>
-      -- Step 1 placeholder: generic lowering comes in Step 2
-      -- (`lowerPointwise`).  Until then, no user-facing caller emits
-      -- `pointwise`, so reaching here is a compiler bug.
-      throw (IO.userError "Circuit.compile: Prim.pointwise lowering not yet implemented (Step 2)")
+    | Prim.pointwise shape body =>
+      -- Resolve every input + the single output, then dispatch.
+      let outTr := op.outputs[0]!
+      let mut inBufs : Array (GPUBackend.Buf β) := #[]
+      for inTr in op.inputs do
+        match lookup inTr.id with
+        | some b => inBufs := inBufs.push b
+        | none   => throw (IO.userError s!"Circuit.compile: missing buffer for pointwise input {inTr.id}")
+      match lookup outTr.id with
+      | some outBuf =>
+        let cacheRef ← IO.mkRef (α := Option (GPUBackend.CachedDispatch β)) none
+        runPointwiseOp ctx (shape.numel) body inBufs outBuf 0 cacheRef
+      | none => throw (IO.userError s!"Circuit.compile: missing output buffer for pointwise op (out={outTr.id})")
 
 /-! ## Build-once, replay-many — zero-overhead dispatch path
 
@@ -99,23 +209,43 @@ def compileOnce [GPUBackend β]
     : IO (CompiledCircuit β) := do
   -- Convert each Op to an OpClosure that captures its metadata
   -- (layer, tensor ids) but defers buffer resolution to replay time.
-  let mkClosure (op : Op (GPUBackend.Buf β) (GPUBackend.CachedDispatch β))
-      : OpClosure β :=
+  -- Pointwise ops allocate their own cacheRef in IO so the replay
+  -- closure can close over it and skip PTX regeneration.
+  let mut closures : Array (OpClosure β) := #[]
+  for op in state.ops do
     match op.prim with
     | Prim.matmulQ4K layer =>
       let inId := op.inputs[0]!.id
       let outId := op.outputs[0]!.id
-      { run := fun lookup => do
-          match lookup inId, lookup outId with
-          | some inputBuf, some outputBuf =>
-            Hesper.Layers.Linear.LinearLayer.forward (β := β) _ctx layer inputBuf outputBuf
-          | _, _ =>
-            throw (IO.userError s!"CompiledCircuit: missing buffer (in={inId} out={outId})")
-      }
-    | Prim.pointwise _ _ =>
-      { run := fun _ =>
-          throw (IO.userError "CompiledCircuit: Prim.pointwise lowering not yet implemented (Step 2)") }
-  let closures := state.ops.map mkClosure
+      closures := closures.push
+        { run := fun lookup => do
+            match lookup inId, lookup outId with
+            | some inputBuf, some outputBuf =>
+              Hesper.Layers.Linear.LinearLayer.forward (β := β) _ctx layer inputBuf outputBuf
+            | _, _ =>
+              throw (IO.userError s!"CompiledCircuit: missing buffer (in={inId} out={outId})")
+        }
+    | Prim.pointwise shape body =>
+      let numel := shape.numel
+      let inIds := op.inputs.map (·.id)
+      let outId := op.outputs[0]!.id
+      let cacheRef : IO.Ref (Option (GPUBackend.CachedDispatch β)) ← IO.mkRef none
+      -- Structural cache key: same body + same shape + same input arity ⇒
+      -- same PTX, so hash the IR directly.  (The untyped global Circuit
+      -- cache keys differ across call sites, which keeps refs distinct.)
+      let cacheKey : UInt64 := hash ("circuit-pointwise", numel, reprStr body, inIds.size)
+      closures := closures.push
+        { run := fun lookup => do
+            let mut inBufs : Array (GPUBackend.Buf β) := #[]
+            for id in inIds do
+              match lookup id with
+              | some b => inBufs := inBufs.push b
+              | none   => throw (IO.userError s!"CompiledCircuit: missing pointwise input buffer id={id}")
+            match lookup outId with
+            | some outBuf =>
+              runPointwiseOp _ctx numel body inBufs outBuf cacheKey cacheRef
+            | none => throw (IO.userError s!"CompiledCircuit: missing pointwise output buffer id={outId}")
+        }
   let externalIds := state.externals.map (fun (tr, _) => tr.id)
   -- producedIds := tensor ids that are produced by some op's outputs
   let producedIds := state.ops.foldl (init := (#[] : Array Nat)) fun acc op =>

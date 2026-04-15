@@ -672,6 +672,10 @@ lean_exe «ttt-golden-gpu» where
   root := `Tests.TTT.TTTGoldenGPUMain
   moreLinkArgs := stdLinkArgs
 
+lean_exe «fuse-pointwise-test» where
+  root := `Tests.Circuit.FusePointwiseTest
+  moreLinkArgs := stdLinkArgs
+
 lean_exe «bitnet-ttt-mqar» where
   root := `Examples.BitNetTTT_MQAR
   moreLinkArgs := stdLinkArgs
