@@ -134,6 +134,17 @@ end ScalarExp
 /-- Number of elements in a shape. -/
 def Shape.numel (s : Shape) : Nat := s.foldl (· * ·) 1
 
+/-- Reduction operators supported by `Prim.reduceLastAxis`.  Kept
+    small on purpose: add a constructor here when a caller needs one,
+    and add the matching case in the lowering.  `sumOfSquares` is its
+    own constructor (rather than being expressed as map-then-sum) so
+    the reduce kernel can compute `x*x` in-register and never
+    materialise a squared tensor in global memory. -/
+inductive ReduceOp where
+  | sum
+  | sumOfSquares
+  deriving Repr, Inhabited, BEq
+
 /-- A typed description of a primitive operation.  Each Prim has a
     well-defined (input shapes, output shapes, dispatch shape) mapping
     that the lowering pass consumes. -/
@@ -143,6 +154,18 @@ inductive Prim (BufT : Type) (CacheT : Type) where
       layer, so it owns the prepared-dispatch cache. -/
   | matmulQ4K
       (layer : Hesper.Layers.Linear.LinearLayer BufT CacheT)
+  /-- Reduction along the last axis.  For the MVP we handle only
+      `inShape = [D]`; the output is always `#[1]` (one scalar), which
+      composes with pointwise ops via the existing broadcast path.
+      `D` must fit in a single workgroup's lane count (D ≤ 1024) —
+      multi-WG split-reductions are out of scope for this round.
+
+      The dispatch shape for `reduceLastAxis` is fixed:
+      `numWorkgroups = 1`, `workgroupSize = min D 256`.  Each lane
+      processes `D / wgSize` elements, then the WG does a tree
+      reduction in shared memory. -/
+  | reduceLastAxis
+      (op : ReduceOp) (inShape : Shape)
   /-- Pure pointwise op.  `outShape` is the shape of the output tensor
       AND of the dispatch grid (fixed 1D `(numel+255)/256 × 256`).
       `inShapes[i]` describes the i-th input:
@@ -280,6 +303,40 @@ def scaleByBroadcast (a scale : TensorRef) : CircuitM BufT CacheT TensorRef :=
 /-- Elementwise add: `out[i] = a[i] + b[i]`. -/
 def addT (a b : TensorRef) : CircuitM BufT CacheT TensorRef :=
   zip2 a b (.add (.input 0) (.input 1))
+
+/-- Reduction along the last axis: `[D] → [1]`.  Emits a single-WG
+    shared-memory reduction.  Downstream consumers can broadcast the
+    resulting scalar through the existing `#[1]`-shape pointwise path. -/
+def reduceLastAxis (op : ReduceOp) (x : TensorRef)
+    : CircuitM BufT CacheT TensorRef := do
+  let outs ← emitOp (Prim.reduceLastAxis op x.shape) #[x]
+    #[(#[1], .f32, .Global)]
+  return outs[0]!
+
+/-- Composite: RMSNorm computed from primitives.
+
+      out[i] = x[i] * rsqrt(sum(x²) / D + eps) * scale[i]
+
+    Emits 5 ops:
+      1. reduceLastAxis sumOfSquares x       -- sumSq : [1]
+      2. pointwise (sumSq / D + eps)         -- meanSqPlusEps : [1]
+      3. pointwise (rsqrt _)                 -- invRms : [1]
+      4. pointwise (x * invRms * scale)      -- out : [D]    (the tail)
+    fusePointwise collapses ops 2+3 into step 4's producer chain,
+    yielding net 2 dispatches (one reduce + one fused pointwise).
+    Cross-domain fusion (reduce+epilogue) is Stage 2b and will bring
+    this down to 1 dispatch. -/
+def rmsNorm (x scale : TensorRef) (eps : Float)
+    : CircuitM BufT CacheT TensorRef := do
+  let D := x.shape[0]!
+  let invD : Float := 1.0 / D.toFloat
+  let sumSq ← reduceLastAxis .sumOfSquares x
+  let meanSqPlusEps ← map sumSq
+    (.add (.mul (.input 0) (.const invD)) (.const eps))
+  let invRms ← map meanSqPlusEps (.rsqrt (.input 0))
+  -- x[i] * invRms[0] * scale[i] — invRms is #[1] broadcast.
+  pointwise #[x, invRms, scale]
+    (.mul (.mul (.input 0) (.input 1)) (.input 2))
 
 end CircuitM
 
