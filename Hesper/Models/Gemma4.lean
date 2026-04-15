@@ -1908,14 +1908,31 @@ def forwardSingleToken [GPUBackend β] (ctx : β)
           (hash ("q8_1-quantize-lmhead", model.config.hiddenSize))
           state.lmHeadQuantizePrepared
         -- Q6_K dp4a matmul (2D grid for vocabSize > 65535).
-        -- HESPER_DP4A_Q6K_2ROW=1 selects the 2-row + shared-memory variant
-        -- (2 output rows per WG, shared Q8_1 input, 64 threads).
-        let use2Row ← do
-          match ← IO.getEnv "HESPER_DP4A_Q6K_2ROW" with
-          | some "1" => pure true
-          | _ => pure false
-        if use2Row then
-          -- 2-row variant: outDim/2 WGs, each 64 threads. Grid X capped at 4096.
+        -- Variant selection via env vars (priority: 4ROW > 2ROW > default):
+        --   HESPER_DP4A_Q6K_4ROW=1  → 4-warp cooperative, 128 threads, 4 rows/WG
+        --   HESPER_DP4A_Q6K_2ROW=1  → 2-warp cooperative, 64 threads,  2 rows/WG
+        --   (default)               → single-warp,        32 threads,  1 row/WG
+        let variant ← do
+          match ← IO.getEnv "HESPER_DP4A_Q6K_4ROW" with
+          | some "1" => pure "4row"
+          | _ =>
+            match ← IO.getEnv "HESPER_DP4A_Q6K_2ROW" with
+            | some "1" => pure "2row"
+            | _ => pure "1row"
+        match variant with
+        | "4row" =>
+          let quadCount := (model.config.vocabSize + 3) / 4
+          let gridX4 : Nat := 4096
+          let gridY4 : Nat := (quadCount + gridX4 - 1) / gridX4
+          GPUBackend.executeWithConfigCached ctx
+            (Hesper.Layers.Linear.fusedQ6KLinearDP4A4RowKernel
+              model.config.hiddenSize model.config.vocabSize gridX4)
+            [("weights", model.outputWeight), ("input_q8", q8Buf), ("output", state.logitsBuf)]
+            { numWorkgroups := (gridX4, gridY4, 1), workgroupSize := { x := 128, y := 1, z := 1 }
+              extensions := ["subgroups"] : Hesper.ExecConfig }
+            (hash ("q6k-dp4a-lmhead-4row", model.config.hiddenSize, model.config.vocabSize))
+            state.lmHeadDP4APrepared
+        | "2row" =>
           let pairCount := (model.config.vocabSize + 1) / 2
           let gridX2 : Nat := 4096
           let gridY2 : Nat := (pairCount + gridX2 - 1) / gridX2
@@ -1927,7 +1944,7 @@ def forwardSingleToken [GPUBackend β] (ctx : β)
               extensions := ["subgroups"] : Hesper.ExecConfig }
             (hash ("q6k-dp4a-lmhead-2row", model.config.hiddenSize, model.config.vocabSize))
             state.lmHeadDP4APrepared
-        else
+        | _ =>
           GPUBackend.executeWithConfigCached ctx
             (Hesper.Layers.Linear.fusedQ6KLinearDP4AKernel
               model.config.hiddenSize model.config.vocabSize gridX)
