@@ -1953,14 +1953,45 @@ def forwardBlock [GPUBackend β] (ctx : β)
         plEmbd.inpGate.quantFormat == .Q4_K &&
         plEmbd.inpGate.config.inDim % 256 == 0
       if useFusedPLGate then
+        -- Circuit-DSL: one generic `Prim.matmulQ4KWithEpilogue` node
+        -- carries the PLE matmul + GELU + slice-mul tail.  Lowering
+        -- emits (Q8_1 quantize dispatch) + (fused matmul-epilogue
+        -- kernel) — same two dispatches as the prior hand-composed
+        -- `forwardFusedPLInpGate`, but from the IR rather than a
+        -- duplicated ShaderM kernel.
+        --
+        -- Epilogue body: `gelu(input 0) * input 1` where
+        --   input 0 = matmul dot product (per-row)
+        --   input 1 = per_layer_input[plOffset + outIdx]
         Hesper.WGSL.Execute.withSection "ple.inpGateGeluSlice" do
-          let key := hash ("pleInpGateGeluSlice", plEmbd.inpGate.config.inDim,
-                           plEmbd.inpGate.config.outDim, plOffset)
-          let ref ← match kcr with
-            | some k => k.getRef key
-            | none => IO.mkRef none
-          Linear.forwardFusedPLInpGate ctx plEmbd.inpGate
-            outputBuf plInputAll state.moeRouterOutBuf plTotalSize plOffset ref
+          let key := hash ("circuitPLEInpGateGeluSlice",
+            plEmbd.inpGate.config.inDim, plEmbd.inpGate.config.outDim, plOffset)
+          let ccRef ← Hesper.Circuit.getGlobalCircuitRef (β := β) key
+          Hesper.Circuit.runCached ctx ccRef
+            (do
+              let x ← Hesper.Circuit.CircuitM.registerExternal
+                (BufT := GPUBackend.Buf β) (CacheT := GPUBackend.CachedDispatch β)
+                outputBuf #[plEmbd.inpGate.config.inDim] .f32 .Global
+              let plAll ← Hesper.Circuit.CircuitM.registerExternal
+                (BufT := GPUBackend.Buf β) (CacheT := GPUBackend.CachedDispatch β)
+                plInputAll #[plTotalSize] .f32 .Global
+              -- gelu(input 0) * input 1  via tanh approximation.
+              let x0 : Hesper.Circuit.ScalarExp := .input 0
+              let x3 := .mul (.mul x0 x0) x0
+              let inner :=
+                .mul (.const 0.7978845608028654)  -- sqrt(2/π)
+                     (.add x0 (.mul (.const 0.044715) x3))
+              let gelu :=
+                .mul (.mul (.const 0.5) x0)
+                     (.add (.const 1.0) (.tanh inner))
+              let body : Hesper.Circuit.ScalarExp :=
+                .mul gelu (.input 1)
+              let _out ← Hesper.Circuit.CircuitM.matmulQ4KWithEpilogue
+                x plEmbd.inpGate #[plAll] body (epiReadOffsets := #[plOffset])
+              pure ())
+            -- Tensor ids: 0 = outputBuf external, 1 = plInputAll external,
+            -- 2 = matmul-epi output (caller-facing).
+            [(0, outputBuf), (1, plInputAll), (2, state.moeRouterOutBuf)]
       else do
         Hesper.WGSL.Execute.withSection "ple.inpGate" do
           Linear.LinearLayer.forward ctx plEmbd.inpGate outputBuf state.plGateBuf
