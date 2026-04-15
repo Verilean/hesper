@@ -1392,9 +1392,31 @@ def forwardBlock [GPUBackend β] (ctx : β)
   -- Step 1+2: Fused attnNorm + Q/K/V projections
   -- Fuses RMSNorm into each matmul: each WG computes RMS on-the-fly (redundant but cheap).
   -- Eliminates the normedBuf global memory write/read round-trip and the attnNorm dispatch.
+  -- Local helper: a Gemma RMSNorm via the Circuit DSL.  Builds 4 ops
+  -- (reduce + 3 pointwise) which fuseReduceEpilogue collapses to one
+  -- dispatch, matching the hand-written `RMSNorm.forward` baseline
+  -- but with the kernel generated from ScalarExp instead of being a
+  -- hand-maintained ShaderM.  Reuse for any 1D-row RMSNorm site.
+  let circuitRMSNorm := fun (tag : String)
+      (norm : RMSNorm.RMSNorm (GPUBackend.Buf β) (GPUBackend.CachedDispatch β))
+      (inB outB : GPUBackend.Buf β) => do
+    let key := hash ("circuitRMSNorm-cuda", tag, norm.config.dim, li)
+    let ccRef ← Hesper.Circuit.getGlobalCircuitRef (β := β) key
+    Hesper.Circuit.runCachedFused ctx ccRef
+      (do
+        let xT ← Hesper.Circuit.CircuitM.registerExternal
+          (BufT := GPUBackend.Buf β) (CacheT := GPUBackend.CachedDispatch β)
+          inB #[norm.config.dim] .f32 .Global
+        let sT ← Hesper.Circuit.CircuitM.registerExternal
+          (BufT := GPUBackend.Buf β) (CacheT := GPUBackend.CachedDispatch β)
+          norm.scale #[norm.config.dim] .f32 .Global
+        let _y ← Hesper.Circuit.CircuitM.rmsNorm xT sT norm.config.eps
+        pure ())
+      [(0, inB), (1, norm.scale), (5, outB)]
+
   -- Step 1: Attention pre-norm
   Hesper.WGSL.Execute.withSection "attnNorm" do
-    RMSNorm.forward ctx block.attnNorm inputBuf state.normedBuf
+    circuitRMSNorm "attnNorm" block.attnNorm inputBuf state.normedBuf
 
   -- Step 2: Q/K/V projections.  All three share the same RMSNormed input,
   -- so fuse the three matmuls + Q8_1 quantize into a single path:
@@ -1719,7 +1741,7 @@ def forwardBlock [GPUBackend β] (ctx : β)
     -- Dense FFN path (GeGLU).
     -- Fuse ffnNorm into gate/up matmuls when possible (Q4_K + subgroups).
     Hesper.WGSL.Execute.withSection "ffnNorm" do
-      RMSNorm.forward ctx block.ffnNorm state.attnResidualBuf state.normedBuf
+      circuitRMSNorm "ffnNorm" block.ffnNorm state.attnResidualBuf state.normedBuf
     -- Fused gate + up + GELU × mul.  When dp4a + subgroups are enabled
     -- and both layers are Q4_K, `forwardFusedGateUp` does (Q8_1 quantize) +
     -- 1 matmul kernel writing GELU(gate)·up directly into geluBuf, saving
@@ -1960,9 +1982,28 @@ def forwardSingleToken [GPUBackend β] (ctx : β)
     nextBuf := oldCb
     blockIdx := blockIdx + 1
 
-  -- Step 3: Final norm
+  -- Step 3: Final norm — Circuit DSL path.  The hand-written
+  -- RMSNorm.forward emits one fused dispatch; CircuitM.rmsNorm builds
+  -- the same shape (reduce + 3 pointwise) and the fuseReduceEpilogue
+  -- pass collapses it to one dispatch via β-reduction over ScalarExp.
+  -- Equivalent kernels/tok, but the kernel is now generated from the
+  -- IR rather than being a hand-maintained ShaderM.
   Hesper.WGSL.Execute.withSection "finalNorm" do
-    RMSNorm.forward ctx model.finalNorm currentBuf nextBuf
+    let key := hash ("circuitFinalNorm-cuda", model.finalNorm.config.dim)
+    let ccRef ← Hesper.Circuit.getGlobalCircuitRef (β := β) key
+    Hesper.Circuit.runCachedFused ctx ccRef
+      (do
+        let xT ← Hesper.Circuit.CircuitM.registerExternal
+          (BufT := GPUBackend.Buf β) (CacheT := GPUBackend.CachedDispatch β)
+          currentBuf #[model.finalNorm.config.dim] .f32 .Global
+        let sT ← Hesper.Circuit.CircuitM.registerExternal
+          (BufT := GPUBackend.Buf β) (CacheT := GPUBackend.CachedDispatch β)
+          model.finalNorm.scale #[model.finalNorm.config.dim] .f32 .Global
+        let _y ← Hesper.Circuit.CircuitM.rmsNorm xT sT model.finalNorm.config.eps
+        pure ())
+      -- Tensor ids: 0 = currentBuf (external), 1 = scale (external),
+      -- 2..5 are intermediates fused away, final epilogue output id is the last.
+      [(0, currentBuf), (1, model.finalNorm.scale), (5, nextBuf)]
 
   -- Step 4: LM head matmul (1 × hiddenSize @ hiddenSize × vocabSize)
   Hesper.WGSL.Execute.withSection "lmHead" do
