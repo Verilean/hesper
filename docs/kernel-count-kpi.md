@@ -29,7 +29,19 @@ Empirically, each kernel launch costs ~10 µs of wall-clock
 | hesper (Circuit DSL: wO via runCached) | 2026-04-15 | 35,326 | 1,178 | 6.3× |
 | hesper (Circuit DSL: layerScale+pleScale3 auto-fused via ScalarExp) | 2026-04-15 | 34,191 | 1,140 | 6.1× |
 | hesper (Circuit DSL: 3 RMSNorm sites via reduce-with-epilogue fusion) | 2026-04-15 | 33,997 | 1,133 | 6.1× |
-| **hesper (current)** | " | **33,997** | **1,133** | **6.1×** |
+| hesper (fused RMSNorm+Q8_1 for attnNorm→wQKV + ffnNorm→gate+up) | 2026-04-15 | 32,202 | 1,073 | 5.7× |
+| **hesper (current)** | " | **32,202** | **1,073** | **5.7×** |
+
+First real cross-domain fusion: RMSNorm (global sum-of-squares reduce)
+merged with the Q8_1 quantize step (per-block max-abs reduce) of the
+subsequent matmul.  Single-WG kernel: 256 lanes first compute the
+RMS-normalised value, then split into 8 warps that each handle one
+32-element Q8_1 block via subgroup max-abs reduction.  Eliminates the
+f32 normedBuf VRAM round-trip (~10 KB/layer/token) AND one standalone
+dispatch per fused site.
+
+Wired at `attnNorm → wQ+wK+wV` and `ffnNorm → gate+up` → net −60
+kernels/tok (47.4 TPS vs 46.1 before).  Decode bit-identical.
 
 `finalNorm`, `attnNorm`, and `ffnNorm` (~67 sites/tok) now go through
 `CircuitM.rmsNorm`, which lowers as 4 ops (reduce + 3 pointwise) and

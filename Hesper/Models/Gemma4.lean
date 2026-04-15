@@ -1414,70 +1414,87 @@ def forwardBlock [GPUBackend β] (ctx : β)
         pure ())
       [(0, inB), (1, norm.scale), (5, outB)]
 
-  -- Step 1: Attention pre-norm
-  Hesper.WGSL.Execute.withSection "attnNorm" do
-    circuitRMSNorm "attnNorm" block.attnNorm inputBuf state.normedBuf
-
-  -- Step 2: Q/K/V projections.  All three share the same RMSNormed input,
-  -- so fuse the three matmuls + Q8_1 quantize into a single path:
-  -- `forwardFusedQKV` runs ONE quantize and reuses the Q8_1 buffer for
-  -- wQ + (wK,wV) matmuls.  wK and wV further share one fused kernel.
-  -- Overall: 4 dispatches instead of 6 (Q8_1 x 2 + Q x 1 + K x 1 + V x 1
-  -- before → Q8_1 x 1 + Q x 1 + KV x 1).
-  Hesper.WGSL.Execute.withSection "qkvProj" do
-    if cfg.hasKV li then
-      let useFusedQKV := block.attention.wQ.quantFormat == .Q4_K
-                    && block.attention.wK.quantFormat == .Q4_K
-                    && block.attention.wV.quantFormat == .Q4_K
-                    && block.attention.wK.config.inDim == block.attention.wQ.config.inDim
-                    && block.attention.wV.config.inDim == block.attention.wQ.config.inDim
-                    && block.attention.wK.config.outDim == block.attention.wV.config.outDim
-      if useFusedQKV then
-        let key := hash ("qkvFusedDP4A",
-          block.attention.wQ.config.inDim, block.attention.wQ.config.outDim,
-          block.attention.wK.config.outDim)
-        let kvRef ← match kcr with
-          | some k => k.getRef key
-          | none => IO.mkRef none
-        Linear.forwardFusedQKV ctx block.attention.wQ block.attention.wK block.attention.wV
-          state.normedBuf state.qBuf state.kBuf state.vBuf kvRef
+  -- Step 1+2 (combined): Attention pre-norm + Q/K/V projections.
+  --
+  -- The fused path collapses the standalone RMSNorm dispatch INTO the
+  -- Q8_1 quantize step of the QKV pipeline (`forwardFusedNormQKV`).
+  -- That eliminates the f32 normedBuf round-trip to VRAM (~10 KB/layer)
+  -- AND saves one dispatch per layer (4 → 3).  Preconditions: all
+  -- three Q/K/V projections Q4_K + inDim divisible by 256 (for dp4a).
+  --
+  -- Falls back to the prior 4-dispatch sequence otherwise: standalone
+  -- RMSNorm via Circuit DSL, then `forwardFusedQKV` reading normedBuf.
+  let useFusedQKV := cfg.hasKV li
+                  && block.attention.wQ.quantFormat == .Q4_K
+                  && block.attention.wK.quantFormat == .Q4_K
+                  && block.attention.wV.quantFormat == .Q4_K
+                  && block.attention.wK.config.inDim == block.attention.wQ.config.inDim
+                  && block.attention.wV.config.inDim == block.attention.wQ.config.inDim
+                  && block.attention.wK.config.outDim == block.attention.wV.config.outDim
+  let useFusedNormQKV := useFusedQKV
+                      && block.attention.wQ.config.inDim == block.attnNorm.config.dim
+                      && block.attention.wQ.config.inDim % 256 == 0
+  if useFusedNormQKV then
+    Hesper.WGSL.Execute.withSection "attnNormQKV" do
+      let key := hash ("qkvFusedNormDP4A",
+        block.attention.wQ.config.inDim, block.attention.wQ.config.outDim,
+        block.attention.wK.config.outDim)
+      let kvRef ← match kcr with
+        | some k => k.getRef key
+        | none => IO.mkRef none
+      Linear.forwardFusedNormQKV ctx block.attnNorm
+        block.attention.wQ block.attention.wK block.attention.wV
+        inputBuf state.qBuf state.kBuf state.vBuf kvRef
+  else do
+    -- Standalone attnNorm via Circuit DSL.
+    Hesper.WGSL.Execute.withSection "attnNorm" do
+      circuitRMSNorm "attnNorm" block.attnNorm inputBuf state.normedBuf
+    Hesper.WGSL.Execute.withSection "qkvProj" do
+      if cfg.hasKV li then
+        if useFusedQKV then
+          let key := hash ("qkvFusedDP4A",
+            block.attention.wQ.config.inDim, block.attention.wQ.config.outDim,
+            block.attention.wK.config.outDim)
+          let kvRef ← match kcr with
+            | some k => k.getRef key
+            | none => IO.mkRef none
+          Linear.forwardFusedQKV ctx block.attention.wQ block.attention.wK block.attention.wV
+            state.normedBuf state.qBuf state.kBuf state.vBuf kvRef
+        else
+          -- Circuit-DSL: three Q4_K matmuls sharing one input.  Built once,
+          -- then `Hesper.Circuit.runCachedFused` runs the Stage 2
+          -- `mergeSameDispatch` pass before lowering.  The pass detects
+          -- the [matmul wK; matmul wV] pair (same input + same shape) and
+          -- merges them into one fusedKV op, mechanically reproducing what
+          -- our hand-written `forwardFusedKV` does.
+          let key3 := hash ("circuitQKV-fused-cuda", block.attention.wQ.config.inDim,
+                            block.attention.wQ.config.outDim,
+                            block.attention.wK.config.outDim, li)
+          let ccRef3 ← Hesper.Circuit.getGlobalCircuitRef (β := β) key3
+          Hesper.Circuit.runCachedFused ctx ccRef3
+            (do
+              let normed ← Hesper.Circuit.CircuitM.registerExternal
+                (BufT := GPUBackend.Buf β) (CacheT := GPUBackend.CachedDispatch β)
+                state.normedBuf #[cfg.hiddenSize] .f32 .Global
+              let _q ← Hesper.Circuit.CircuitM.matmulQ4K normed block.attention.wQ
+              let _k ← Hesper.Circuit.CircuitM.matmulQ4K normed block.attention.wK
+              let _v ← Hesper.Circuit.CircuitM.matmulQ4K normed block.attention.wV
+              pure ())
+            [(0, state.normedBuf), (1, state.qBuf), (2, state.kBuf), (3, state.vBuf)]
       else
-        -- Circuit-DSL: three Q4_K matmuls sharing one input.  Built once,
-        -- then `Hesper.Circuit.runCachedFused` runs the Stage 2
-        -- `mergeSameDispatch` pass before lowering.  The pass detects
-        -- the [matmul wK; matmul wV] pair (same input + same shape) and
-        -- merges them into one fusedKV op, mechanically reproducing what
-        -- our hand-written `forwardFusedKV` does.
-        let key3 := hash ("circuitQKV-fused-cuda", block.attention.wQ.config.inDim,
-                          block.attention.wQ.config.outDim,
-                          block.attention.wK.config.outDim, li)
-        let ccRef3 ← Hesper.Circuit.getGlobalCircuitRef (β := β) key3
-        Hesper.Circuit.runCachedFused ctx ccRef3
+        -- No-KV layer: wQ only, via Circuit DSL.  `runCached` builds
+        -- the Circuit ONCE per (inDim, outDim, backend), caches the
+        -- compiled artifact, and replays.
+        let key := hash ("circuitWQ-cuda", block.attention.wQ.config.inDim, block.attention.wQ.config.outDim, li)
+        let ccRef ← Hesper.Circuit.getGlobalCircuitRef (β := β) key
+        Hesper.Circuit.runCached ctx ccRef
           (do
             let normed ← Hesper.Circuit.CircuitM.registerExternal
               (BufT := GPUBackend.Buf β) (CacheT := GPUBackend.CachedDispatch β)
               state.normedBuf #[cfg.hiddenSize] .f32 .Global
             let _q ← Hesper.Circuit.CircuitM.matmulQ4K normed block.attention.wQ
-            let _k ← Hesper.Circuit.CircuitM.matmulQ4K normed block.attention.wK
-            let _v ← Hesper.Circuit.CircuitM.matmulQ4K normed block.attention.wV
             pure ())
-          [(0, state.normedBuf), (1, state.qBuf), (2, state.kBuf), (3, state.vBuf)]
-    else
-      -- Circuit-DSL pilot (Stage 1): replace this single matmul with the
-      -- new IR.  `runCached` builds the Circuit ONCE per (inDim, outDim,
-      -- backend), caches the resulting `CompiledCircuit` in the module-
-      -- global table, and replays it on subsequent calls.
-      let key := hash ("circuitWQ-cuda", block.attention.wQ.config.inDim, block.attention.wQ.config.outDim, li)
-      let ccRef ← Hesper.Circuit.getGlobalCircuitRef (β := β) key
-      Hesper.Circuit.runCached ctx ccRef
-        (do
-          let normed ← Hesper.Circuit.CircuitM.registerExternal
-            (BufT := GPUBackend.Buf β) (CacheT := GPUBackend.CachedDispatch β)
-            state.normedBuf #[cfg.hiddenSize] .f32 .Global
-          let _q ← Hesper.Circuit.CircuitM.matmulQ4K normed block.attention.wQ
-          pure ())
-        -- Tensor ids: 0 = normed (external), 1 = q output (produced by matmulQ4K).
-        [(0, state.normedBuf), (1, state.qBuf)]
+          [(0, state.normedBuf), (1, state.qBuf)]
 
   -- Step 3: Q-norm, K-norm (per-head RMSNorm)
   let numHeads := cfg.numAttentionHeads
@@ -1739,34 +1756,45 @@ def forwardBlock [GPUBackend β] (ctx : β)
       state.ffnOutBuf state.attnResidualBuf outputBuf refFFN
   else do
     -- Dense FFN path (GeGLU).
-    -- Fuse ffnNorm into gate/up matmuls when possible (Q4_K + subgroups).
-    Hesper.WGSL.Execute.withSection "ffnNorm" do
-      circuitRMSNorm "ffnNorm" block.ffnNorm state.attnResidualBuf state.normedBuf
-    -- Fused gate + up + GELU × mul.  When dp4a + subgroups are enabled
-    -- and both layers are Q4_K, `forwardFusedGateUp` does (Q8_1 quantize) +
-    -- 1 matmul kernel writing GELU(gate)·up directly into geluBuf, saving
-    -- the separate geluMul dispatch and one full Q8_1 input read vs the
-    -- two-dispatch path.  Falls back to the 2-dispatch + geluMul sequence
-    -- when conditions aren't met.
-    Hesper.WGSL.Execute.withSection "ffnGateUpMul" do
-      let useFused := block.ffn.gate.quantFormat == .Q4_K
-                    && block.ffn.up.quantFormat == .Q4_K
-                    && block.ffn.gate.config.inDim == block.ffn.up.config.inDim
-                    && block.ffn.gate.config.outDim == block.ffn.up.config.outDim
-      if useFused then
-        let key := hash ("ffnGateUpDP4A", block.ffn.gate.config.inDim, block.ffn.gate.config.outDim)
+    -- The fused-norm path collapses ffnNorm + Q8_1 + gate+up into 2
+    -- dispatches (vs unfused 3): one fused norm-quantize, one fused
+    -- gate+up GeGLU matmul that consumes the Q8_1 buffer.  Eliminates
+    -- the f32 normedBuf round-trip AND the standalone ffnNorm dispatch.
+    let useFused := block.ffn.gate.quantFormat == .Q4_K
+                  && block.ffn.up.quantFormat == .Q4_K
+                  && block.ffn.gate.config.inDim == block.ffn.up.config.inDim
+                  && block.ffn.gate.config.outDim == block.ffn.up.config.outDim
+    let useFusedNorm := useFused
+                     && block.ffn.gate.config.inDim == block.ffnNorm.config.dim
+                     && block.ffn.gate.config.inDim % 256 == 0
+    if useFusedNorm then
+      Hesper.WGSL.Execute.withSection "ffnNormGateUp" do
+        let key := hash ("ffnGateUpFusedNormDP4A",
+          block.ffn.gate.config.inDim, block.ffn.gate.config.outDim)
         let ref ← match kcr with
           | some k => k.getRef key
           | none => IO.mkRef none
-        Linear.forwardFusedGateUp ctx block.ffn.gate block.ffn.up
-          state.normedBuf state.geluBuf ref
-      else
-        Linear.LinearLayer.forward ctx block.ffn.gate state.normedBuf state.gateBuf
-        Linear.LinearLayer.forward ctx block.ffn.up state.normedBuf state.upBuf
-        ce "geluMul2"
-          (geluMulKernel cfg.intermediateSize)
-          [("gate", state.gateBuf), ("up", state.upBuf), ("output", state.geluBuf)]
-          (.dispatch1D cfg.intermediateSize)
+        Linear.forwardFusedNormGateUp ctx block.ffnNorm
+          block.ffn.gate block.ffn.up
+          state.attnResidualBuf state.geluBuf ref
+    else do
+      Hesper.WGSL.Execute.withSection "ffnNorm" do
+        circuitRMSNorm "ffnNorm" block.ffnNorm state.attnResidualBuf state.normedBuf
+      Hesper.WGSL.Execute.withSection "ffnGateUpMul" do
+        if useFused then
+          let key := hash ("ffnGateUpDP4A", block.ffn.gate.config.inDim, block.ffn.gate.config.outDim)
+          let ref ← match kcr with
+            | some k => k.getRef key
+            | none => IO.mkRef none
+          Linear.forwardFusedGateUp ctx block.ffn.gate block.ffn.up
+            state.normedBuf state.geluBuf ref
+        else
+          Linear.LinearLayer.forward ctx block.ffn.gate state.normedBuf state.gateBuf
+          Linear.LinearLayer.forward ctx block.ffn.up state.normedBuf state.upBuf
+          ce "geluMul2"
+            (geluMulKernel cfg.intermediateSize)
+            [("gate", state.gateBuf), ("up", state.upBuf), ("output", state.geluBuf)]
+            (.dispatch1D cfg.intermediateSize)
     -- ffn.down: gelu*up [intermediateSize] → ffnOut [hiddenSize].  Same
     -- Circuit DSL pattern as wO above.
     Hesper.WGSL.Execute.withSection "ffnDown" do
