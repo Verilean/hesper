@@ -706,6 +706,10 @@ lean_exe «cuda-matmul-test» where
   root := `Tests.CUDA.CUDAMatMulTest
   moreLinkArgs := stdLinkArgs ++ #["./.lake/build/native/libhesper_cuda.a", "-lcuda"]
 
+lean_exe «cuda-matmul-microbench» where
+  root := `Tests.CUDA.CUDAMatmulMicrobench
+  moreLinkArgs := stdLinkArgs ++ #["./.lake/build/native/libhesper_cuda.a", "-lcuda"]
+
 lean_exe «cuda-backend-test» where
   root := `Tests.CUDA.CUDABackendTest
   moreLinkArgs := stdLinkArgs ++ #["./.lake/build/native/libhesper_cuda.a", "-lcuda"]
