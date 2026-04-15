@@ -101,16 +101,208 @@ def mergeSameDispatch {BufT CacheT : Type}
       i := i + 1
   return out
 
+/-! ## Pointwise fusion — β-reduction on pointwise op DAG
+
+`fusePointwise` is the core compiler pass.  It repeatedly picks a
+producer `A : pointwise` whose unique consumer `B` is also a
+`pointwise`, and inlines A's body into B — replacing the input slot
+that referred to A with A's expression, and folding A's input tensors
+into B's input array.
+
+Invariants (all automatic from `Prim.pointwise`):
+- same element count ⇒ 1:1 thread-to-element mapping
+- no inter-thread dependency ⇒ inlining changes nothing observable
+- dispatch shape is fixed 1D so merged ops have the same grid
+
+The "unique consumer" guard avoids duplicating producer work across
+multiple consumers.  Without it, fusion could degrade performance by
+recomputing; refusing is always safe.
+
+After substitution the producer becomes unreachable and is removed by
+the trailing filter step. -/
+
+/-- Count how many surviving ops reference `tid` as one of their inputs,
+    plus "is `tid` a caller-requested output buffer" (which we can't know
+    here; callers supply this via `isExternalOutput` — in the `runCached*`
+    path, all tensor ids registered via `registerExternal` are fixed, but
+    produced TensorRefs may be wired by the caller too).
+
+    Because `runCached` passes an explicit `buffers` list on replay, we
+    conservatively treat *any* TensorRef whose id appears in some
+    op's input list as internal-only; the caller's `buffers` list is
+    opaque to this pass.  See the `protectedIds` argument. -/
+private def countConsumers {BufT CacheT : Type}
+    (ops : Array (Op BufT CacheT)) (tid : Nat) : Nat :=
+  ops.foldl (init := 0) fun acc op =>
+    op.inputs.foldl (init := acc) fun acc' tr =>
+      if tr.id == tid then acc' + 1 else acc'
+
+/-- One fusion step: scan for a producer/consumer pair and return
+    `some newOps` if we found one to inline; `none` otherwise.  The
+    caller iterates until fixpoint. -/
+private def fusePointwiseStep {BufT CacheT : Type}
+    (ops : Array (Op BufT CacheT)) (protectedIds : Array Nat)
+    : Option (Array (Op BufT CacheT)) := Id.run do
+  let isProtected (id : Nat) : Bool := protectedIds.any (· == id)
+  -- Search for a consumer op B such that one of its pointwise inputs
+  -- is produced by an earlier pointwise A with B as its unique
+  -- surviving consumer (and A's output is not caller-facing).
+  for hB : bIdx in [0 : ops.size] do
+    let B := ops[bIdx]
+    let .pointwise bShape bBody := B.prim | continue
+    -- Walk B's inputs looking for a fusable producer.
+    for hI : iIdx in [0 : B.inputs.size] do
+      let prodRef := B.inputs[iIdx]!
+      if isProtected prodRef.id then continue
+      -- Find the (single) op in `ops` whose outputs contain prodRef.id.
+      let mut aIdxOpt : Option Nat := none
+      for hA : aIdx in [0 : ops.size] do
+        match ops[aIdx]? with
+        | some A =>
+          if A.outputs.any (fun tr => tr.id == prodRef.id) then
+            aIdxOpt := some aIdx
+            break
+        | none => pure ()
+      let some aIdx := aIdxOpt | continue
+      let some A := ops[aIdx]? | continue
+      let .pointwise aShape aBody := A.prim | continue
+      if aShape != bShape then continue
+      -- Uniqueness: prodRef.id is consumed by exactly one op in `ops`.
+      if countConsumers ops prodRef.id != 1 then continue
+      -- Inline A into B.  A's inputs (with their output slots unchanged)
+      -- become new slots at the end of B's input array.  B's original
+      -- inputs keep their indices; the slot that was `input iIdx` (the
+      -- producer) is replaced by A's body (with its `input j` shifted
+      -- to refer to position `B.inputs.size + j` in the combined array).
+      let bInputs := B.inputs
+      let aInputs := A.inputs
+      let baseShift := bInputs.size - 1  -- we're removing one slot and…
+      -- actually: we keep all of B's slots (so the already-placed `input j`
+      -- for j ≠ iIdx keeps meaning the same thing), we drop slot `iIdx`
+      -- conceptually by substituting A's body at it, and we append A's
+      -- inputs at the end; A's own `input j` referred to `aInputs[j]`, so
+      -- after appending they live at `bInputs.size + j`.  But A's body
+      -- substituted into position iIdx would still carry `input j`
+      -- references — so shift those by `bInputs.size`.
+      let _ := baseShift  -- silence unused; intentional for clarity above
+      let aShifted := aBody.shiftInputs bInputs.size
+      let mut argMap : Array ScalarExp := #[]
+      for hJ : j in [0 : bInputs.size] do
+        if j == iIdx then
+          argMap := argMap.push aShifted
+        else
+          argMap := argMap.push (.input j)
+      let newBody := bBody.subst argMap
+      let newInputs := bInputs ++ aInputs
+      let newB : Op BufT CacheT :=
+        { prim := Prim.pointwise bShape newBody
+          inputs := newInputs
+          outputs := B.outputs }
+      -- Produce a new op array: drop A, replace B with newB.  If A is
+      -- still needed by any other op (shouldn't happen given the
+      -- uniqueness check), we leave it — but here it isn't.
+      let mut out : Array (Op BufT CacheT) := #[]
+      for hK : k in [0 : ops.size] do
+        if k == aIdx then continue
+        if k == bIdx then
+          out := out.push newB
+        else
+          match ops[k]? with
+          | some opk => out := out.push opk
+          | none => pure ()
+      return some out
+  return none
+
+/-- Collect the set of `input i` indices actually referenced inside a
+    ScalarExp.  Used to prune dead input slots after fusion. -/
+partial def ScalarExp.usedInputs : ScalarExp → Array Nat
+  | .input i      => #[i]
+  | .const _      => #[]
+  | .add a b      => a.usedInputs ++ b.usedInputs
+  | .sub a b      => a.usedInputs ++ b.usedInputs
+  | .mul a b      => a.usedInputs ++ b.usedInputs
+  | .div a b      => a.usedInputs ++ b.usedInputs
+  | .neg a        => a.usedInputs
+  | .rsqrt a      => a.usedInputs
+  | .exp a        => a.usedInputs
+  | .tanh a       => a.usedInputs
+  | .gelu a       => a.usedInputs
+  | .silu a       => a.usedInputs
+
+/-- Rewrite every `input i` inside `e` using the mapping `remap[i]`. -/
+private partial def renumberInputs (remap : Array Nat) : ScalarExp → ScalarExp
+  | .input i      => .input (remap[i]!)
+  | .const v      => .const v
+  | .add a b      => .add (renumberInputs remap a) (renumberInputs remap b)
+  | .sub a b      => .sub (renumberInputs remap a) (renumberInputs remap b)
+  | .mul a b      => .mul (renumberInputs remap a) (renumberInputs remap b)
+  | .div a b      => .div (renumberInputs remap a) (renumberInputs remap b)
+  | .neg a        => .neg (renumberInputs remap a)
+  | .rsqrt a      => .rsqrt (renumberInputs remap a)
+  | .exp a        => .exp (renumberInputs remap a)
+  | .tanh a       => .tanh (renumberInputs remap a)
+  | .gelu a       => .gelu (renumberInputs remap a)
+  | .silu a       => .silu (renumberInputs remap a)
+
+/-- Drop input slots from a pointwise op that the body never references.
+    Builds a permutation `old→new` and substitutes `input i` accordingly.
+    Safe for correctness: unused slots are by definition irrelevant. -/
+private def compactPointwiseInputs {BufT CacheT : Type} (op : Op BufT CacheT)
+    : Op BufT CacheT := Id.run do
+  match op.prim with
+  | .pointwise shape body =>
+    let used := body.usedInputs
+    let mut newSlot : Array Nat := Array.replicate op.inputs.size 0
+    let mut newInputs : Array TensorRef := #[]
+    let mut next : Nat := 0
+    for i in [0 : op.inputs.size] do
+      let keep := used.any (· == i)
+      match keep, op.inputs[i]? with
+      | true, some tr =>
+        newSlot := newSlot.set! i next
+        newInputs := newInputs.push tr
+        next := next + 1
+      | _, _ => pure ()
+    return { op with prim := .pointwise shape (renumberInputs newSlot body), inputs := newInputs }
+  | _ => return op
+
+/-- Apply `fusePointwiseStep` until fixpoint, then compact every
+    pointwise op's input list.  `protectedIds` lists TensorRef ids the
+    caller promises to use externally (the `buffers` argument in
+    `runCached`-style APIs): they cannot be fused away.
+    Termination: each step reduces op count by 1, bounded by
+    `ops.size`. -/
+def fusePointwise {BufT CacheT : Type}
+    (ops : Array (Op BufT CacheT)) (protectedIds : Array Nat)
+    : Array (Op BufT CacheT) := Id.run do
+  let mut current := ops
+  for _ in [0 : ops.size] do
+    match fusePointwiseStep current protectedIds with
+    | some next => current := next
+    | none      => break
+  return current.map compactPointwiseInputs
+
 /-! ## Lowering for OpExt -/
 
-/-- Stage 2 compile: run mergeSameDispatch, then lower each OpExt into
-    an `OpClosure`.  Allocates the per-fusedKV `preparedRef`s in IO
-    context so they persist across replay calls. -/
+/-- Stage 2 compile: run fusePointwise + mergeSameDispatch, then
+    lower each OpExt into an `OpClosure`.  `protectedIds` are the
+    tensor ids the caller guarantees to supply a buffer for on replay
+    (externals + caller-facing outputs); the fusion pass will not
+    collapse them away even if they have a unique internal consumer.
+
+    Allocates per-op IO refs (prepared dispatches, pointwise caches) in
+    IO context so the replay closures can close over them. -/
 def compileWithPasses [GPUBackend β]
     (ctx : β)
     (state : CircuitState (GPUBackend.Buf β) (GPUBackend.CachedDispatch β))
+    (protectedIds : Array Nat := #[])
     : IO (CompiledCircuit β) := do
-  let opsExt := mergeSameDispatch state.ops
+  -- External tensor ids are always protected — they come from the
+  -- caller so we can't legally inline them away.
+  let mergedProtected : Array Nat :=
+    state.externals.foldl (init := protectedIds) (fun acc (tr, _) => acc.push tr.id)
+  let opsFused := fusePointwise state.ops mergedProtected
+  let opsExt := mergeSameDispatch opsFused
   -- For each fusedKV op we need a fresh `IO.Ref` allocated *here*
   -- (in IO context) so the closure can close over it.
   let mut closures : Array (OpClosure β) := #[]
@@ -146,11 +338,24 @@ def compileWithPasses [GPUBackend β]
                 throw (IO.userError s!"compileWithPasses: missing buffer (in={inId}, out={outId})")
           }
       | _, _ => throw (IO.userError "compileWithPasses: matmulQ4K op missing in/out tensor")
-    | PrimExt.base (Prim.pointwise _ _) =>
-      -- Step 1 placeholder: generic lowering comes in Step 2.
+    | PrimExt.base (Prim.pointwise shape body) =>
+      let numel := shape.numel
+      let inIds := op.inputs.map (·.id)
+      let outId := op.outputs[0]!.id
+      let cacheRef : IO.Ref (Option (GPUBackend.CachedDispatch β)) ← IO.mkRef none
+      let cacheKey : UInt64 := hash ("circuit-pointwise", numel, reprStr body, inIds.size)
       closures := closures.push
-        { run := fun _ =>
-            throw (IO.userError "compileWithPasses: Prim.pointwise lowering not yet implemented (Step 2)") }
+        { run := fun lookup => do
+            let mut inBufs : Array (GPUBackend.Buf β) := #[]
+            for id in inIds do
+              match lookup id with
+              | some b => inBufs := inBufs.push b
+              | none   => throw (IO.userError s!"compileWithPasses: missing pointwise input id={id}")
+            match lookup outId with
+            | some outBuf =>
+              runPointwiseOp ctx numel body inBufs outBuf cacheKey cacheRef
+            | none => throw (IO.userError s!"compileWithPasses: missing pointwise output id={outId}")
+        }
   let externalIds := state.externals.map (fun (tr, _) => tr.id)
   let producedIds := state.ops.foldl (init := (#[] : Array Nat)) fun acc op =>
     op.outputs.foldl (init := acc) fun acc' tr => acc'.push tr.id
@@ -168,7 +373,10 @@ def runCachedFused [GPUBackend β]
   | some cc => cc.replay buffers
   | none =>
     let (_, st) := CircuitM.run build
-    let cc ← compileWithPasses ctx st
+    -- Every tensor id the caller wires on replay is protected from
+    -- pointwise fusion: it must survive as a real buffer.
+    let protectedIds : Array Nat := (buffers.map (·.1)).toArray
+    let cc ← compileWithPasses ctx st protectedIds
     cacheRef.set (some cc)
     cc.replay buffers
 
