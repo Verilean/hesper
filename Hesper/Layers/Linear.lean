@@ -1306,6 +1306,168 @@ def fusedQ4KMGateUpDP4AKernel (config : Config) : ShaderM Unit := do
     ShaderM.writeBuffer (ty := .scalar .f32) "output" outIdx (Exp.mul gelu totalU)
   ) (pure ())
 
+/-- 4-warp cooperative variant of `fusedQ4KMGateUpDP4AKernel`.
+
+    1 WG = 128 threads = 4 warps = 4 output rows. All 128 threads
+    cooperatively load the Q8_1 input into shared memory, then each
+    warp independently computes one row's (gate, up) dot products and
+    writes GELU(gate) × up. The smem input is reused by 4 warps → 4×
+    reduction in global-memory input traffic vs the 1-row variant.
+
+    Weight traffic is unchanged (still 4 rows × 2 buffers per WG), so
+    the win comes from (a) halved input BW, (b) fewer dispatch /
+    launch overheads, and (c) better SM occupancy for small outDim.
+
+    Dispatch: (⌈outDim / 4⌉, 1, 1) × 128 threads. -/
+def fusedQ4KMGateUpDP4A4RowKernel (config : Config) : ShaderM Unit := do
+  let wid ← ShaderM.workgroupId
+  let lid ← ShaderM.localId
+  let quadIdx := Exp.vec3X wid
+  let tid := Exp.vec3X lid                           -- 0..127
+  let subgroupId := Exp.shiftRight tid (Exp.litU32 5) -- 0..3 (row in quad)
+  let laneId := Exp.bitAnd tid (Exp.litU32 31)        -- 0..31 (dp4a lane)
+  let outIdx := Exp.add (Exp.mul quadIdx (Exp.litU32 4)) subgroupId
+
+  let blocksPerRow := config.inDim / 256
+  let totalWeightU32 := config.outDim * blocksPerRow * 36
+  let q8BlocksPerRow := config.inDim / 32
+  let q8InputU32Size := q8BlocksPerRow * 9
+
+  let _weightsGate ← ShaderM.declareReadOnlyBuffer "weights_gate" (.array (.scalar .u32) totalWeightU32)
+  let _weightsUp   ← ShaderM.declareReadOnlyBuffer "weights_up"   (.array (.scalar .u32) totalWeightU32)
+  let _input       ← ShaderM.declareReadOnlyBuffer "input_q8"     (.array (.scalar .u32) q8InputU32Size)
+  let _output      ← ShaderM.declareOutputBuffer "output"         (.array (.scalar .f32) config.outDim)
+
+  -- Cooperative smem staging of Q8_1 input: 128 threads load q8InputU32Size
+  -- words total, ~6 per lane for Gemma 4's 2560-wide hidden state.
+  ShaderM.sharedNamed "s_input_q8" (.array (.scalar .u32) q8InputU32Size)
+  let perThread : Nat := (q8InputU32Size + 127) / 128
+  for i in [0 : perThread] do
+    let idx := Exp.add tid (Exp.litU32 (i * 128))
+    ShaderM.if_ (Exp.lt idx (Exp.litU32 q8InputU32Size)) (do
+      let v ← ShaderM.readBuffer (ty := .scalar .u32) (n := q8InputU32Size) "input_q8" idx
+      ShaderM.writeWorkgroup (ty := .scalar .u32) "s_input_q8" idx v
+    ) (pure ())
+  ShaderM.barrier
+
+  let inBounds := Exp.lt outIdx (Exp.litU32 config.outDim)
+
+  ShaderM.varNamed "accG" (.scalar .f32) (Exp.litF32 0.0)
+  ShaderM.varNamed "accU" (.scalar .f32) (Exp.litF32 0.0)
+  let accG : Exp (.scalar .f32) := Exp.var "accG"
+  let accU : Exp (.scalar .f32) := Exp.var "accU"
+
+  let rowBaseU32 := Exp.mul outIdx (Exp.litU32 (blocksPerRow * 36))
+
+  -- Lane decomposition uses laneId (not tid) — same as 1-row kernel.
+  let laneLow := Exp.bitAnd laneId (Exp.litU32 15)
+  let pairIdx := Exp.div laneLow (Exp.litU32 4)
+  let elemOff := Exp.sub laneLow (Exp.mul pairIdx (Exp.litU32 4))
+  let bq8Off := Exp.mul pairIdx (Exp.litU32 2)
+
+  ShaderM.loop (Exp.litU32 0) (Exp.litU32 blocksPerRow) (Exp.litU32 1) fun blockIdx => do
+    let blockU32Base := Exp.add rowBaseU32 (Exp.mul blockIdx (Exp.litU32 36))
+
+    let processWeight (which : String) (acc : Exp (.scalar .f32))
+        (u0 u1 u2 u3 : Exp (.scalar .u32)) (d8A d8B : Exp (.scalar .f32))
+        : ShaderM (Exp (.scalar .f32)) := do
+      let dmU32 ← ShaderM.readBuffer (ty := .scalar .u32) (n := totalWeightU32) which blockU32Base
+      let dF := fp16ToF32 (Exp.bitAnd dmU32 (Exp.litU32 0xFFFF))
+      let dminF := fp16ToF32 (Exp.shiftRight dmU32 (Exp.litU32 16))
+
+      let sc0 ← ShaderM.readBuffer (ty := .scalar .u32) (n := totalWeightU32) which (Exp.add blockU32Base (Exp.litU32 1))
+      let sc1 ← ShaderM.readBuffer (ty := .scalar .u32) (n := totalWeightU32) which (Exp.add blockU32Base (Exp.litU32 2))
+      let sc2 ← ShaderM.readBuffer (ty := .scalar .u32) (n := totalWeightU32) which (Exp.add blockU32Base (Exp.litU32 3))
+
+      let extractScaleMin (is : Exp (.scalar .u32)) : Exp (.scalar .f32) × Exp (.scalar .f32) :=
+        let isLow := Exp.lt is (Exp.litU32 4)
+        let shift4 := Exp.mul is (Exp.litU32 8)
+        let scaleLow := Exp.bitAnd (Exp.shiftRight sc0 shift4) (Exp.litU32 0x3F)
+        let minLow   := Exp.bitAnd (Exp.shiftRight sc1 shift4) (Exp.litU32 0x3F)
+        let isHi := Exp.sub is (Exp.litU32 4)
+        let shiftHi := Exp.mul isHi (Exp.litU32 8)
+        let scaleHiLo := Exp.bitAnd (Exp.shiftRight sc2 shiftHi) (Exp.litU32 0x0F)
+        let scaleHiHi := Exp.shiftLeft
+          (Exp.bitAnd (Exp.shiftRight sc0 (Exp.add shiftHi (Exp.litU32 6))) (Exp.litU32 0x03))
+          (Exp.litU32 4)
+        let scaleHigh := Exp.bitOr scaleHiLo scaleHiHi
+        let minHiLo := Exp.bitAnd (Exp.shiftRight sc2 (Exp.add shiftHi (Exp.litU32 4))) (Exp.litU32 0x0F)
+        let minHiHi := Exp.shiftLeft
+          (Exp.bitAnd (Exp.shiftRight sc1 (Exp.add shiftHi (Exp.litU32 6))) (Exp.litU32 0x03))
+          (Exp.litU32 4)
+        let minHigh := Exp.bitOr minHiLo minHiHi
+        let scaleU := Exp.select isLow scaleLow scaleHigh
+        let minU   := Exp.select isLow minLow   minHigh
+        (Exp.toF32 scaleU, Exp.toF32 minU)
+
+      let (scA, mA) := extractScaleMin bq8Off
+      let (scB, mB) := extractScaleMin (Exp.add bq8Off (Exp.litU32 1))
+
+      let q4BaseIdx := Exp.add blockU32Base
+        (Exp.add (Exp.litU32 4) (Exp.add (Exp.mul bq8Off (Exp.litU32 4)) elemOff))
+      let v0 ← ShaderM.readBuffer (ty := .scalar .u32) (n := totalWeightU32) which q4BaseIdx
+      let v1 ← ShaderM.readBuffer (ty := .scalar .u32) (n := totalWeightU32) which (Exp.add q4BaseIdx (Exp.litU32 4))
+
+      let v0i0 := Exp.bitAnd v0 (Exp.litU32 0x0F0F0F0F)
+      let v1i0 := Exp.bitAnd v1 (Exp.litU32 0x0F0F0F0F)
+      let acc0 := Exp.dot4I8Packed v0i0 u0
+      let dot1_0 := Exp.dot4I8Packed v1i0 u1
+      let dot1_0Combined := Exp.add acc0 dot1_0
+      let sumU_0 := Exp.add (Exp.dot4I8Packed (Exp.litU32 0x01010101) u0)
+                            (Exp.dot4I8Packed (Exp.litU32 0x01010101) u1)
+      let sumfD_0 := Exp.mul d8A (Exp.mul (Exp.toF32 dot1_0Combined) scA)
+      let sumfM_0 := Exp.mul d8A (Exp.mul (Exp.toF32 sumU_0) mA)
+
+      let v0i1 := Exp.bitAnd (Exp.shiftRight v0 (Exp.litU32 4)) (Exp.litU32 0x0F0F0F0F)
+      let v1i1 := Exp.bitAnd (Exp.shiftRight v1 (Exp.litU32 4)) (Exp.litU32 0x0F0F0F0F)
+      let acc1 := Exp.dot4I8Packed v0i1 u2
+      let dot1_1 := Exp.dot4I8Packed v1i1 u3
+      let dot1_1Combined := Exp.add acc1 dot1_1
+      let sumU_1 := Exp.add (Exp.dot4I8Packed (Exp.litU32 0x01010101) u2)
+                            (Exp.dot4I8Packed (Exp.litU32 0x01010101) u3)
+      let sumfD_1 := Exp.mul d8B (Exp.mul (Exp.toF32 dot1_1Combined) scB)
+      let sumfM_1 := Exp.mul d8B (Exp.mul (Exp.toF32 sumU_1) mB)
+
+      let blockSumfD := Exp.add sumfD_0 sumfD_1
+      let blockSumfM := Exp.add sumfM_0 sumfM_1
+      let blockContrib := Exp.sub (Exp.mul dF blockSumfD) (Exp.mul dminF blockSumfM)
+      pure (Exp.add acc blockContrib)
+
+    -- Q8_1 input from smem (shared across 4 warps in this WG).
+    let q8Sub0Base := Exp.add (Exp.mul blockIdx (Exp.litU32 (8 * 9))) (Exp.mul bq8Off (Exp.litU32 9))
+    let q8Sub1Base := Exp.add q8Sub0Base (Exp.litU32 9)
+    let u0 ← ShaderM.readWorkgroup (ty := .scalar .u32) (n := q8InputU32Size) "s_input_q8" (Exp.add q8Sub0Base (Exp.add (Exp.litU32 1) elemOff))
+    let u1 ← ShaderM.readWorkgroup (ty := .scalar .u32) (n := q8InputU32Size) "s_input_q8" (Exp.add q8Sub0Base (Exp.add (Exp.litU32 5) elemOff))
+    let u2 ← ShaderM.readWorkgroup (ty := .scalar .u32) (n := q8InputU32Size) "s_input_q8" (Exp.add q8Sub1Base (Exp.add (Exp.litU32 1) elemOff))
+    let u3 ← ShaderM.readWorkgroup (ty := .scalar .u32) (n := q8InputU32Size) "s_input_q8" (Exp.add q8Sub1Base (Exp.add (Exp.litU32 5) elemOff))
+    let q8Hdr0 ← ShaderM.readWorkgroup (ty := .scalar .u32) (n := q8InputU32Size) "s_input_q8" q8Sub0Base
+    let q8Hdr1 ← ShaderM.readWorkgroup (ty := .scalar .u32) (n := q8InputU32Size) "s_input_q8" q8Sub1Base
+    let d8A : Exp (.scalar .f32) := Exp.bitcast q8Hdr0
+    let d8B : Exp (.scalar .f32) := Exp.bitcast q8Hdr1
+
+    let newAccG ← processWeight "weights_gate" accG u0 u1 u2 u3 d8A d8B
+    ShaderM.assign "accG" newAccG
+    let newAccU ← processWeight "weights_up" accU u0 u1 u2 u3 d8A d8B
+    ShaderM.assign "accU" newAccU
+
+  -- Per-warp subgroup reductions (duplicate-work correction ×0.5).
+  ShaderM.varNamed "totalG" (.scalar .f32)
+    (Exp.mul (Exp.subgroupAdd accG) (Exp.litF32 0.5))
+  ShaderM.varNamed "totalU" (.scalar .f32)
+    (Exp.mul (Exp.subgroupAdd accU) (Exp.litF32 0.5))
+  let totalG : Exp (.scalar .f32) := Exp.var "totalG"
+  let totalU : Exp (.scalar .f32) := Exp.var "totalU"
+
+  -- Each warp's lane 0 writes its own row.
+  ShaderM.if_ (Exp.and (Exp.eq laneId (Exp.litU32 0)) inBounds) (do
+    let sqrt2OverPi := Exp.litF32 0.7978845608028654
+    let z := totalG
+    let z3 := Exp.mul (Exp.mul z z) z
+    let inner := Exp.mul sqrt2OverPi (Exp.add z (Exp.mul (Exp.litF32 0.044715) z3))
+    let gelu := Exp.mul (Exp.mul (Exp.litF32 0.5) z) (Exp.add (Exp.litF32 1.0) (Exp.tanh inner))
+    ShaderM.writeBuffer (ty := .scalar .f32) "output" outIdx (Exp.mul gelu totalU)
+  ) (pure ())
+
 /-! ## Q4_K × Q8_1 dp4a, 2 rows per workgroup (high occupancy for ffnDown) -/
 
 /-- 2-rows-per-workgroup variant of `fusedQ4KMLinearDP4AKernel`.
@@ -2784,16 +2946,30 @@ def forwardFusedGateUp [GPUBackend β] (ctx : β)
       { numWorkgroups := (nQ8Blocks, 1, 1), workgroupSize := { x := 32, y := 1, z := 1 } }
       (hash ("q8_1-quantize", gate.config.inDim))
       gate.dp4aQuantizePrepared
-    -- Step 2: dp4a gate+up+GELU×mul.
-    GPUBackend.executeWithConfigCached ctx
-      (fusedQ4KMGateUpDP4AKernel gate.config)
-      [("weights_gate", gate.weightBuf),
-       ("weights_up",   up.weightBuf),
-       ("input_q8",     q8Buf),
-       ("output",       outputBuf)]
-      { numWorkgroups := (gate.config.outDim, 1, 1), workgroupSize := { x := 32, y := 1, z := 1 } }
-      (hash ("q4k-gate-up-dp4a", gate.config.inDim, gate.config.outDim))
-      preparedRef
+    -- Step 2: dp4a gate+up+GELU×mul.  Select 4-row variant when outDim
+    -- is a multiple of 4 (smem-shared input across 4 warps, halves the
+    -- effective input-memory traffic).
+    if gate.config.outDim % 4 == 0 then
+      GPUBackend.executeWithConfigCached ctx
+        (fusedQ4KMGateUpDP4A4RowKernel gate.config)
+        [("weights_gate", gate.weightBuf),
+         ("weights_up",   up.weightBuf),
+         ("input_q8",     q8Buf),
+         ("output",       outputBuf)]
+        { numWorkgroups := (gate.config.outDim / 4, 1, 1)
+          workgroupSize := { x := 128, y := 1, z := 1 } }
+        (hash ("q4k-gate-up-dp4a-4row", gate.config.inDim, gate.config.outDim))
+        preparedRef
+    else
+      GPUBackend.executeWithConfigCached ctx
+        (fusedQ4KMGateUpDP4AKernel gate.config)
+        [("weights_gate", gate.weightBuf),
+         ("weights_up",   up.weightBuf),
+         ("input_q8",     q8Buf),
+         ("output",       outputBuf)]
+        { numWorkgroups := (gate.config.outDim, 1, 1), workgroupSize := { x := 32, y := 1, z := 1 } }
+        (hash ("q4k-gate-up-dp4a", gate.config.inDim, gate.config.outDim))
+        preparedRef
     if profiling then
       let endNs ← IO.monoNanosNow
       let delta := (endNs - startNs).toUInt64
