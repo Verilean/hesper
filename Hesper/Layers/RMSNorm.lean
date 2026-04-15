@@ -202,6 +202,111 @@ def rmsNormFusedKernel (config : Config) (numRows : Nat) (workgroupSize : Nat :=
     let result := Exp.mul normalized scaleVal
     ShaderM.writeBuffer (ty := .scalar .f32) "output" (Exp.add rowBase dimIdx) result
 
+/-! ## Fused post-norm (Gemma 4 style): RMSNorm(layer_out) + residual -/
+
+/-- Computes `output = RMSNorm(layer_out) * scale + residual` in one kernel.
+
+    This is Gemma 4's post-norm shape: the normalisation is applied to the
+    attention / FFN output FIRST, and only then the pre-block residual is
+    added back in.  Replaces the two-dispatch pattern
+    `RMSNorm.forward → residualAddKernel` used after attention and FFN.
+
+    Dispatch: 1 workgroup × workgroupSize threads.
+-/
+def rmsNormThenAddKernel (config : Config) (workgroupSize : Nat := 256) : ShaderM Unit := do
+  let lid ← ShaderM.localId
+  let localIdx := Exp.vec3X lid
+  ShaderM.sharedNamed "shared_sum" (.array (.scalar .f32) workgroupSize)
+  let _layerOut ← ShaderM.declareInputBuffer "layer_out" (.array (.scalar .f32) config.dim)
+  let _residual ← ShaderM.declareInputBuffer "residual" (.array (.scalar .f32) config.dim)
+  let _scale    ← ShaderM.declareInputBuffer "scale" (.array (.scalar .f32) config.dim)
+  let _output   ← ShaderM.declareOutputBuffer "output" (.array (.scalar .f32) config.dim)
+
+  -- Pass 1: sum of squares of layer_out.
+  ShaderM.varNamed "partial_sum" (.scalar .f32) (Exp.litF32 0.0)
+  let partialSum : Exp (.scalar .f32) := Exp.var "partial_sum"
+  ShaderM.loop localIdx (Exp.litU32 config.dim) (Exp.litU32 workgroupSize) fun i => do
+    let v ← ShaderM.readBuffer (ty := .scalar .f32) (n := config.dim) "layer_out" i
+    ShaderM.assign "partial_sum" (Exp.add partialSum (Exp.mul v v))
+  ShaderM.writeWorkgroup (ty := .scalar .f32) "shared_sum" localIdx partialSum
+  ShaderM.barrier
+  let mut stride := workgroupSize / 2
+  while stride > 0 do
+    ShaderM.if_ (Exp.lt localIdx (Exp.litU32 stride)) (do
+      let a ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := workgroupSize) "shared_sum" localIdx
+      let b ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := workgroupSize) "shared_sum" (Exp.add localIdx (Exp.litU32 stride))
+      ShaderM.writeWorkgroup (ty := .scalar .f32) "shared_sum" localIdx (Exp.add a b)
+    ) (pure ())
+    ShaderM.barrier
+    stride := stride / 2
+  let totalSum ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := workgroupSize) "shared_sum" (Exp.litU32 0)
+  let mean := Exp.div totalSum (Exp.litF32 config.dim.toFloat)
+  let rms := Exp.sqrt (Exp.add mean (Exp.litF32 config.eps))
+
+  -- Pass 2: normalise × scale, then add residual.
+  ShaderM.loop localIdx (Exp.litU32 config.dim) (Exp.litU32 workgroupSize) fun i => do
+    let v ← ShaderM.readBuffer (ty := .scalar .f32) (n := config.dim) "layer_out" i
+    let s ← ShaderM.readBuffer (ty := .scalar .f32) (n := config.dim) "scale" i
+    let r ← ShaderM.readBuffer (ty := .scalar .f32) (n := config.dim) "residual" i
+    let y := Exp.add (Exp.mul (Exp.div v rms) s) r
+    ShaderM.writeBuffer (ty := .scalar .f32) "output" i y
+
+/-! ## Fused residual-add + RMSNorm -/
+
+/-- Compute `residualOut = a + b` and `output = RMSNorm(residualOut) * scale`
+    in one dispatch.  Replaces the two-kernel pattern `residualAddKernel
+    + RMSNorm.forward` used after attention/FFN.
+
+    Dispatch: 1 workgroup × `workgroupSize` threads per row.  Each row
+    independently loads `a[row]+b[row]`, reduces to RMS, and writes both
+    `residualOut[row]` (for the next residual chain) and `output[row]`
+    (the normalised result).
+-/
+def residualAddRmsNormKernel (config : Config) (workgroupSize : Nat := 256) : ShaderM Unit := do
+  let lid ← ShaderM.localId
+  let localIdx := Exp.vec3X lid
+  -- One workgroup per row.  Single-row case (hidden state = one flat row).
+  ShaderM.sharedNamed "shared_sum" (.array (.scalar .f32) workgroupSize)
+  let _a     ← ShaderM.declareInputBuffer "a" (.array (.scalar .f32) config.dim)
+  let _b     ← ShaderM.declareInputBuffer "b" (.array (.scalar .f32) config.dim)
+  let _scale ← ShaderM.declareInputBuffer "scale" (.array (.scalar .f32) config.dim)
+  let _resid ← ShaderM.declareOutputBuffer "residualOut" (.array (.scalar .f32) config.dim)
+  let _out   ← ShaderM.declareOutputBuffer "output" (.array (.scalar .f32) config.dim)
+
+  -- Pass 1: compute sum-of-squares over (a + b) via strided loop.  We
+  -- also write the sum to residualOut as we go so pass 2 doesn't re-add.
+  ShaderM.varNamed "partial_sum" (.scalar .f32) (Exp.litF32 0.0)
+  let partialSum : Exp (.scalar .f32) := Exp.var "partial_sum"
+  ShaderM.loop localIdx (Exp.litU32 config.dim) (Exp.litU32 workgroupSize) fun i => do
+    let va ← ShaderM.readBuffer (ty := .scalar .f32) (n := config.dim) "a" i
+    let vb ← ShaderM.readBuffer (ty := .scalar .f32) (n := config.dim) "b" i
+    let s := Exp.add va vb
+    ShaderM.writeBuffer (ty := .scalar .f32) "residualOut" i s
+    ShaderM.assign "partial_sum" (Exp.add partialSum (Exp.mul s s))
+
+  ShaderM.writeWorkgroup (ty := .scalar .f32) "shared_sum" localIdx partialSum
+  ShaderM.barrier
+  let mut stride := workgroupSize / 2
+  while stride > 0 do
+    ShaderM.if_ (Exp.lt localIdx (Exp.litU32 stride)) (do
+      let a ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := workgroupSize) "shared_sum" localIdx
+      let b ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := workgroupSize) "shared_sum" (Exp.add localIdx (Exp.litU32 stride))
+      ShaderM.writeWorkgroup (ty := .scalar .f32) "shared_sum" localIdx (Exp.add a b)
+    ) (pure ())
+    ShaderM.barrier
+    stride := stride / 2
+
+  let totalSum ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := workgroupSize) "shared_sum" (Exp.litU32 0)
+  let mean := Exp.div totalSum (Exp.litF32 config.dim.toFloat)
+  let rms := Exp.sqrt (Exp.add mean (Exp.litF32 config.eps))
+
+  -- Pass 2: read residualOut (which we just wrote), normalise, apply scale.
+  ShaderM.loop localIdx (Exp.litU32 config.dim) (Exp.litU32 workgroupSize) fun i => do
+    let s ← ShaderM.readBuffer (ty := .scalar .f32) (n := config.dim) "residualOut" i
+    let scale ← ShaderM.readBuffer (ty := .scalar .f32) (n := config.dim) "scale" i
+    let y := Exp.mul (Exp.div s rms) scale
+    ShaderM.writeBuffer (ty := .scalar .f32) "output" i y
+
 /-! ## Optimized Two-Pass Kernel -/
 
 /-- First pass: Compute RMS value
@@ -349,6 +454,40 @@ def forward [GPUBackend β] (ctx : β)
     { workgroupSize := { x := workgroupSize }, numWorkgroups := (numRows, 1, 1) }
     cacheKey layer.prepared
   logVerbose "[RMSNorm] ✓ Forward pass complete"
+
+/-- Fused post-norm: `output = RMSNorm(layer_out) * scale + residual`.
+    Gemma 4's post-attention / post-FFN pattern in a single dispatch.  -/
+@[inline]
+def forwardNormThenAdd [GPUBackend β] (ctx : β)
+    (layer : RMSNorm (GPUBackend.Buf β) (GPUBackend.CachedDispatch β))
+    (layerOutBuf residualBuf outputBuf : GPUBackend.Buf β)
+    (preparedRef : IO.Ref (Option (GPUBackend.CachedDispatch β)))
+    (workgroupSize : Nat := 256) : IO Unit := do
+  let shader := rmsNormThenAddKernel layer.config workgroupSize
+  let cacheKey : UInt64 := hash ("rms-then-add", layer.config.dim, workgroupSize)
+  GPUBackend.executeWithConfigCached ctx shader
+    [("layer_out", layerOutBuf), ("residual", residualBuf), ("scale", layer.scale),
+     ("output", outputBuf)]
+    { workgroupSize := { x := workgroupSize }, numWorkgroups := (1, 1, 1) }
+    cacheKey preparedRef
+
+/-- Fused residual-add + RMSNorm forward.  Computes
+    `residualOut = a + b` and `output = RMSNorm(residualOut) * scale` in
+    a single kernel — replaces the two-dispatch pattern
+    `residualAddKernel + RMSNorm.forward`. -/
+@[inline]
+def forwardResidualAdd [GPUBackend β] (ctx : β)
+    (layer : RMSNorm (GPUBackend.Buf β) (GPUBackend.CachedDispatch β))
+    (aBuf bBuf residualOutBuf outputBuf : GPUBackend.Buf β)
+    (preparedRef : IO.Ref (Option (GPUBackend.CachedDispatch β)))
+    (workgroupSize : Nat := 256) : IO Unit := do
+  let shader := residualAddRmsNormKernel layer.config workgroupSize
+  let cacheKey : UInt64 := hash ("rms-resid", layer.config.dim, workgroupSize)
+  GPUBackend.executeWithConfigCached ctx shader
+    [("a", aBuf), ("b", bBuf), ("scale", layer.scale),
+     ("residualOut", residualOutBuf), ("output", outputBuf)]
+    { workgroupSize := { x := workgroupSize }, numWorkgroups := (1, 1, 1) }
+    cacheKey preparedRef
 
 /-- Execute forward pass (two-pass optimized version)
 
