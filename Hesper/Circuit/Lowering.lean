@@ -68,6 +68,76 @@ def lowerScalarExp (slot : Array (Exp (.scalar .f32)))
     let x := lowerScalarExp slot a
     Exp.div x (Exp.add (Exp.litF32 1.0) (Exp.exp (Exp.neg x)))
 
+/-- Build a single-WG shared-memory reduction `ShaderM` for
+    `Prim.reduceLastAxis`.  Caller passes the element count `D` and
+    the `ReduceOp`.  Dispatch shape is `numWorkgroups = 1`,
+    `workgroupSize = min D 256`.
+
+    Algorithm:
+      1. Each lane accumulates a partial using strided pass over the
+         input, materialising `x*x` (for sumOfSquares) in-register.
+      2. Partial written to shared memory, barrier.
+      3. Classic power-of-two tree reduction with barriers.
+      4. Lane 0 writes shared[0] to out[0].
+
+    Limitation: `D ≤ 256` fully parallel, or strided for larger D.
+    Multi-WG split-reduction is a Stage 2b follow-up. -/
+def lowerReduceLastAxis
+    (op : ReduceOp) (inputName outputName : String)
+    (D : Nat) (workgroupSize : Nat) : ShaderM Unit := do
+  ShaderM.sharedNamed "scratch" (.array (.scalar .f32) workgroupSize)
+  let _ ← ShaderM.declareInputBuffer inputName (.array (.scalar .f32) D)
+  let _ ← ShaderM.declareOutputBuffer outputName (.array (.scalar .f32) 1)
+  let lid ← ShaderM.localId
+  let localIdx := Exp.vec3X lid
+  ShaderM.varNamed "accum" (.scalar .f32) (Exp.litF32 0.0)
+  let accumE : Exp (.scalar .f32) := Exp.var "accum"
+  -- Strided accumulation.  `contrib` is per-lane-per-iteration
+  -- contribution — `x*x` for sumOfSquares, `x` for plain sum.
+  ShaderM.loop localIdx (Exp.litU32 D) (Exp.litU32 workgroupSize) fun loopIdx => do
+    let v ← ShaderM.readBuffer (ty := .scalar .f32) (n := D) inputName loopIdx
+    let contrib := match op with
+      | .sum          => v
+      | .sumOfSquares => Exp.mul v v
+    ShaderM.assign "accum" (Exp.add accumE contrib)
+  ShaderM.writeWorkgroup (ty := .scalar .f32) "scratch" localIdx accumE
+  ShaderM.barrier
+  -- Tree reduction.
+  let mut stride := workgroupSize / 2
+  while stride > 0 do
+    ShaderM.if_ (Exp.lt localIdx (Exp.litU32 stride)) (do
+      let a ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := workgroupSize) "scratch" localIdx
+      let b ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := workgroupSize) "scratch"
+                (Exp.add localIdx (Exp.litU32 stride))
+      ShaderM.writeWorkgroup (ty := .scalar .f32) "scratch" localIdx (Exp.add a b)
+    ) (pure ())
+    ShaderM.barrier
+    stride := stride / 2
+  -- Lane 0 writes the result.
+  ShaderM.if_ (Exp.eq localIdx (Exp.litU32 0)) (do
+    let total ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := workgroupSize) "scratch" (Exp.litU32 0)
+    ShaderM.writeBuffer (ty := .scalar .f32) outputName (Exp.litU32 0) total
+  ) (pure ())
+
+/-- Dispatch a `Prim.reduceLastAxis` through `executeWithConfigCached`.
+    Single-WG reduction; caller provides the input + output buffers. -/
+def runReduceOp [GPUBackend β]
+    (ctx : β) (op : ReduceOp) (D : Nat)
+    (inputBuf outputBuf : GPUBackend.Buf β)
+    (cacheKey : UInt64) (cacheRef : IO.Ref (Option (GPUBackend.CachedDispatch β)))
+    : IO Unit := do
+  let wgSize := min D 256
+  let inputName := "in0"
+  let outputName := "out"
+  let shader : ShaderM Unit :=
+    lowerReduceLastAxis op inputName outputName D wgSize
+  let namedBufs : List (String × GPUBackend.Buf β) :=
+    [(outputName, outputBuf), (inputName, inputBuf)]
+  let config : ExecConfig :=
+    { numWorkgroups := (1, 1, 1)
+      workgroupSize := { x := wgSize, y := 1, z := 1 } }
+  GPUBackend.executeWithConfigCached ctx shader namedBufs config cacheKey cacheRef
+
 /-- Build a complete `ShaderM Unit` that implements a `Prim.pointwise`
     op.  `inputNames[i]` is the buffer binding name for input slot i;
     `inputBroadcast[i] = true` means that input is a 1-element scalar
@@ -176,6 +246,15 @@ def compile [GPUBackend β]
         let cacheRef ← IO.mkRef (α := Option (GPUBackend.CachedDispatch β)) none
         runPointwiseOp ctx outShape.numel inShapes body inBufs outBuf 0 cacheRef
       | none => throw (IO.userError s!"Circuit.compile: missing output buffer for pointwise op (out={outTr.id})")
+    | Prim.reduceLastAxis rop inShape =>
+      let inTr  := op.inputs[0]!
+      let outTr := op.outputs[0]!
+      match lookup inTr.id, lookup outTr.id with
+      | some inBuf, some outBuf =>
+        let cacheRef ← IO.mkRef (α := Option (GPUBackend.CachedDispatch β)) none
+        runReduceOp ctx rop inShape.numel inBuf outBuf 0 cacheRef
+      | _, _ =>
+        throw (IO.userError s!"Circuit.compile: missing buffer for reduce op (in={inTr.id} out={outTr.id})")
 
 /-! ## Build-once, replay-many — zero-overhead dispatch path
 
@@ -210,6 +289,13 @@ structure CompiledCircuit (β : Type) [GPUBackend β] where
       replay. -/
   externalIds : Array Nat
   producedIds : Array Nat
+  /-- Intermediate buffers allocated once at compile time for
+      TensorRefs produced by surviving ops that the caller did NOT
+      register in `buffers` on replay — e.g. the scalar output of a
+      `reduceLastAxis` that feeds a fused pointwise tail.  These are
+      prepended to the caller's buffers on every replay so the ops'
+      lookup fn sees them. -/
+  baseBuffers : List (Nat × GPUBackend.Buf β) := []
 
 /-- Compile a CircuitState into a CompiledCircuit that can be replayed
     with minimal overhead.  Runs once per unique circuit. -/
@@ -255,6 +341,20 @@ def compileOnce [GPUBackend β]
               runPointwiseOp _ctx numel inShapes body inBufs outBuf cacheKey cacheRef
             | none => throw (IO.userError s!"CompiledCircuit: missing pointwise output buffer id={outId}")
         }
+    | Prim.reduceLastAxis rop inShape =>
+      let D := inShape.numel
+      let inId  := op.inputs[0]!.id
+      let outId := op.outputs[0]!.id
+      let cacheRef : IO.Ref (Option (GPUBackend.CachedDispatch β)) ← IO.mkRef none
+      let cacheKey : UInt64 := hash ("circuit-reduce", reprStr rop, D)
+      closures := closures.push
+        { run := fun lookup => do
+            match lookup inId, lookup outId with
+            | some inBuf, some outBuf =>
+              runReduceOp _ctx rop D inBuf outBuf cacheKey cacheRef
+            | _, _ =>
+              throw (IO.userError s!"CompiledCircuit: missing reduce buffer (in={inId} out={outId})")
+        }
   let externalIds := state.externals.map (fun (tr, _) => tr.id)
   -- producedIds := tensor ids that are produced by some op's outputs
   let producedIds := state.ops.foldl (init := (#[] : Array Nat)) fun acc op =>
@@ -268,10 +368,11 @@ def CompiledCircuit.replay [GPUBackend β]
     (cc : CompiledCircuit β)
     (buffers : List (Nat × GPUBackend.Buf β))
     : IO Unit := do
-  -- Small associative lookup.  For MVP circuits (<5 entries) linear
-  -- search is faster than hash construction.
+  -- Caller buffers win on id collisions (cons'd first); intermediate
+  -- `baseBuffers` fill in the tensor ids the caller didn't supply.
+  let combined := buffers ++ cc.baseBuffers
   let lookup (id : Nat) : Option (GPUBackend.Buf β) :=
-    (buffers.find? (fun e => e.1 == id)).map (·.2)
+    (combined.find? (fun e => e.1 == id)).map (·.2)
   for op in cc.ops do
     op.run lookup
 

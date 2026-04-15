@@ -306,6 +306,23 @@ def compileWithPasses [GPUBackend β]
     state.externals.foldl (init := protectedIds) (fun acc (tr, _) => acc.push tr.id)
   let opsFused := fusePointwise state.ops mergedProtected
   let opsExt := mergeSameDispatch opsFused
+
+  -- Allocate intermediate buffers for op outputs the caller didn't
+  -- reserve (e.g. the scalar output of a reduceLastAxis that feeds a
+  -- fused pointwise tail).  One-shot alloc at compile time; persists
+  -- for the life of the CompiledCircuit.
+  let callerIds : Array Nat :=
+    state.externals.foldl (init := protectedIds) (fun acc (tr, _) => acc.push tr.id)
+  let mut baseBuffers : List (Nat × GPUBackend.Buf β) := []
+  for op in opsExt do
+    for outTr in op.outputs do
+      if !(callerIds.any (· == outTr.id)) &&
+         !(baseBuffers.any (·.1 == outTr.id)) then
+        -- f32 size for now; extend if other dtypes land.
+        let bytes : USize := (outTr.shape.numel * 4).toUSize
+        let buf ← GPUBackend.allocBuffer (β := β) ctx bytes
+        baseBuffers := (outTr.id, buf) :: baseBuffers
+
   -- For each fusedKV op we need a fresh `IO.Ref` allocated *here*
   -- (in IO context) so the closure can close over it.
   let mut closures : Array (OpClosure β) := #[]
@@ -361,10 +378,24 @@ def compileWithPasses [GPUBackend β]
               runPointwiseOp ctx numel inShapes body inBufs outBuf cacheKey cacheRef
             | none => throw (IO.userError s!"compileWithPasses: missing pointwise output id={outId}")
         }
+    | PrimExt.base (Prim.reduceLastAxis rop inShape) =>
+      let D := inShape.numel
+      let inId  := op.inputs[0]!.id
+      let outId := op.outputs[0]!.id
+      let cacheRef : IO.Ref (Option (GPUBackend.CachedDispatch β)) ← IO.mkRef none
+      let cacheKey : UInt64 := hash ("circuit-reduce", reprStr rop, D)
+      closures := closures.push
+        { run := fun lookup => do
+            match lookup inId, lookup outId with
+            | some inBuf, some outBuf =>
+              runReduceOp ctx rop D inBuf outBuf cacheKey cacheRef
+            | _, _ =>
+              throw (IO.userError s!"compileWithPasses: missing reduce buffer (in={inId} out={outId})")
+        }
   let externalIds := state.externals.map (fun (tr, _) => tr.id)
   let producedIds := state.ops.foldl (init := (#[] : Array Nat)) fun acc op =>
     op.outputs.foldl (init := acc) fun acc' tr => acc'.push tr.id
-  return { ops := closures, externalIds, producedIds }
+  return { ops := closures, externalIds, producedIds, baseBuffers }
 
 /-- Build-once-replay-many with fusion passes enabled.  Drop-in for
     `runCached` when the caller wants the Stage 2 fusion behaviour. -/
