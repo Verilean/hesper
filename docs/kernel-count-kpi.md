@@ -181,3 +181,31 @@ bandwidth bottleneck at 4 warps × 72 KB.
 
 Closing this single kernel's gap (122 → 74 µs) would save 2.2 ms/tok
 = **+10 TPS**.  More than any fusion work remaining.
+
+## Experiment A (2026-04-16): Q4_K 4-row smem-sharing kernel — **NO EFFECT**
+
+Hypothesis: wO's 47 GB/s vs theoretical 400 GB/s meant it was
+DRAM-bandwidth-starved; adding smem input sharing (like the existing
+gate+up and Q6_K 4-row kernels) would give a 3× speedup.
+
+Implementation: `fusedQ4KMLinearDP4A4RowKernel` with cooperative
+smem Q8_1 input staging; wired into `forwardDP4A` and
+`forwardFusedQKV` when `outDim % 4 == 0`.
+
+Measured:
+  wO (m=2560, k=2560):   78.9 → 78.8 µs  (no change)
+  wQ (m=2048, k=2560):   18.1 → 17.7 µs  (noise)
+  wK+wV (m=1024):        17.0 → 16.6 µs  (noise)
+  Decode TPS:            48.4 → 48.6     (noise)
+
+**Hypothesis refuted.**  The 47 GB/s figure measured
+`weight_bytes / kernel_time`, but these small matrices (3.7 MB for
+wO) sit entirely in the 48 MB L2 cache after the first access.
+Second and subsequent calls hit L2, so DRAM bandwidth is not the
+bottleneck — the kernels are compute-limited or warp-scheduling
+limited.  smem staging just adds a redundant copy.
+
+Change reverted.  Next candidate: eliminate Q8_1 pre-quantize
+(llama.cpp Vulkan's approach) — save the 45 Q8_1 quantize dispatches
+per token AND the Q8_1-round-trip latency, at the cost of rewriting
+the matmul kernels to consume f32 directly (longer but more generic).
