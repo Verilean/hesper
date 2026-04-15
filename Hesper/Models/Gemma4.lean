@@ -1907,15 +1907,35 @@ def forwardSingleToken [GPUBackend β] (ctx : β)
             extensions := ["subgroups"] : Hesper.ExecConfig }
           (hash ("q8_1-quantize-lmhead", model.config.hiddenSize))
           state.lmHeadQuantizePrepared
-        -- Q6_K dp4a matmul (2D grid for vocabSize > 65535)
-        GPUBackend.executeWithConfigCached ctx
-          (Hesper.Layers.Linear.fusedQ6KLinearDP4AKernel
-            model.config.hiddenSize model.config.vocabSize gridX)
-          [("weights", model.outputWeight), ("input_q8", q8Buf), ("output", state.logitsBuf)]
-          { numWorkgroups := (gridX, gridY, 1), workgroupSize := { x := 32, y := 1, z := 1 }
-            extensions := ["subgroups"] : Hesper.ExecConfig }
-          (hash ("q6k-dp4a-lmhead", model.config.hiddenSize, model.config.vocabSize))
-          state.lmHeadDP4APrepared
+        -- Q6_K dp4a matmul (2D grid for vocabSize > 65535).
+        -- HESPER_DP4A_Q6K_2ROW=1 selects the 2-row + shared-memory variant
+        -- (2 output rows per WG, shared Q8_1 input, 64 threads).
+        let use2Row ← do
+          match ← IO.getEnv "HESPER_DP4A_Q6K_2ROW" with
+          | some "1" => pure true
+          | _ => pure false
+        if use2Row then
+          -- 2-row variant: outDim/2 WGs, each 64 threads. Grid X capped at 4096.
+          let pairCount := (model.config.vocabSize + 1) / 2
+          let gridX2 : Nat := 4096
+          let gridY2 : Nat := (pairCount + gridX2 - 1) / gridX2
+          GPUBackend.executeWithConfigCached ctx
+            (Hesper.Layers.Linear.fusedQ6KLinearDP4A2RowKernel
+              model.config.hiddenSize model.config.vocabSize gridX2)
+            [("weights", model.outputWeight), ("input_q8", q8Buf), ("output", state.logitsBuf)]
+            { numWorkgroups := (gridX2, gridY2, 1), workgroupSize := { x := 64, y := 1, z := 1 }
+              extensions := ["subgroups"] : Hesper.ExecConfig }
+            (hash ("q6k-dp4a-lmhead-2row", model.config.hiddenSize, model.config.vocabSize))
+            state.lmHeadDP4APrepared
+        else
+          GPUBackend.executeWithConfigCached ctx
+            (Hesper.Layers.Linear.fusedQ6KLinearDP4AKernel
+              model.config.hiddenSize model.config.vocabSize gridX)
+            [("weights", model.outputWeight), ("input_q8", q8Buf), ("output", state.logitsBuf)]
+            { numWorkgroups := (gridX, gridY, 1), workgroupSize := { x := 32, y := 1, z := 1 }
+              extensions := ["subgroups"] : Hesper.ExecConfig }
+            (hash ("q6k-dp4a-lmhead", model.config.hiddenSize, model.config.vocabSize))
+            state.lmHeadDP4APrepared
         if debugMode then
           -- Read logits[5000..5007] (skip reserved tokens which are often 0)
           let logitsBytes ← GPUBackend.readBuffer ctx state.logitsBuf (5008 * 4 : USize)
