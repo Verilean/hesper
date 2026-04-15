@@ -403,6 +403,137 @@ def rmsApplyKernel (config : Config) (numRows : Nat) : ShaderM Unit := do
   let finalResult := Exp.select inBounds result (Exp.litF32 0.0)
   ShaderM.writeBuffer (ty := .scalar .f32) "output" idx finalResult
 
+/-! ## Fused RMSNorm + Q8_1 quantize
+
+Eliminates the VRAM round-trip between RMSNorm output and the matmul's
+Q8_1 quantize phase by combining both into a single dispatch.
+
+Algorithm:
+  Phase 1 — Single-WG cooperative RMSNorm reduction
+    - 256 threads stride over D=`config.dim` input elements (each lane
+      processes `D / 256` elements via the strided loop).
+    - Tree reduction in shared memory yields the sum-of-squares.
+    - All threads compute `invRms = rsqrt(sumSq/D + eps)` from
+      `scratch[0]`.
+  Phase 2 — Per-block Q8_1 quantize (10 strided passes for D=2560)
+    Per pass `p`, lane `tid` handles input element `tid + p*256`.
+    The 256 lanes split into 8 warps of 32 lanes each.  Warp `w`
+    owns the 32-element block at `8*p + w` of the output.
+
+    Inside each warp (lanes l=0..31, owning one Q8_1 block):
+      - x_normed[l] = inputBuf[elemIdx] * scale[elemIdx] * invRms
+      - amax = subgroupMax(|x_normed[l]|)
+      - d = amax / 127
+      - q[l] = round(x_normed[l] / d)  (clamped to int8)
+      - shared_q[warpId * 32 + l] = q[l]; barrier
+      - lane l divisible by 4 packs 4 quants into one u32 → output
+
+    Lane 0 of each warp writes the d|s header (s=0; subsequent
+    Q4_K dp4a path doesn't use s).
+
+This stays within Hesper's hand-written-kernel inventory but is wired
+through the IR as `Prim.rmsNormQ8_1Quantize`, so callers see it as a
+proper compiler op.  The Stage 3 follow-up will replace the body
+with auto-generated reduce + double-reduce-epilogue lowering. -/
+def fusedRMSNormQ8_1Kernel (config : Config) (workgroupSize : Nat := 256) : ShaderM Unit := do
+  let lid ← ShaderM.localId
+  let localIdx := Exp.vec3X lid
+  let D := config.dim
+  let nBlocks := D / 32
+  let outU32Size := nBlocks * 9
+
+  ShaderM.sharedNamed "scratch_norm" (.array (.scalar .f32) workgroupSize)
+  -- One byte slot per lane; reused across the 10 strided quantize passes.
+  ShaderM.sharedNamed "shared_q" (.array (.scalar .u32) workgroupSize)
+
+  let _input  ← ShaderM.declareReadOnlyBuffer "input"  (.array (.scalar .f32) D)
+  let _scale  ← ShaderM.declareReadOnlyBuffer "scale"  (.array (.scalar .f32) D)
+  let _output ← ShaderM.declareOutputBuffer "output" (.array (.scalar .u32) outU32Size)
+
+  -- ── Phase 1: cooperative RMSNorm reduction over the input ──
+  ShaderM.varNamed "accum" (.scalar .f32) (Exp.litF32 0.0)
+  let accumE : Exp (.scalar .f32) := Exp.var "accum"
+  ShaderM.loop localIdx (Exp.litU32 D) (Exp.litU32 workgroupSize) fun loopIdx => do
+    let v ← ShaderM.readBuffer (ty := .scalar .f32) (n := D) "input" loopIdx
+    ShaderM.assign "accum" (Exp.add accumE (Exp.mul v v))
+  ShaderM.writeWorkgroup (ty := .scalar .f32) "scratch_norm" localIdx accumE
+  ShaderM.barrier
+  -- Tree reduction.
+  let mut stride := workgroupSize / 2
+  while stride > 0 do
+    ShaderM.if_ (Exp.lt localIdx (Exp.litU32 stride)) (do
+      let a ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := workgroupSize) "scratch_norm" localIdx
+      let b ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := workgroupSize) "scratch_norm"
+                (Exp.add localIdx (Exp.litU32 stride))
+      ShaderM.writeWorkgroup (ty := .scalar .f32) "scratch_norm" localIdx (Exp.add a b)
+    ) (pure ())
+    ShaderM.barrier
+    stride := stride / 2
+  -- All lanes read the total sum-of-squares from scratch[0] and compute invRms.
+  let sumSq ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := workgroupSize) "scratch_norm" (Exp.litU32 0)
+  ShaderM.varNamed "invRms" (.scalar .f32)
+    (Exp.inverseSqrt (Exp.add (Exp.div sumSq (Exp.litF32 D.toFloat)) (Exp.litF32 config.eps)))
+  let invRms : Exp (.scalar .f32) := Exp.var "invRms"
+
+  -- ── Phase 2: per-32-element-block Q8_1 quantize, strided over D ──
+  -- numPasses = D / wgSize.  Each pass: 256 lanes write their normed
+  -- value, then 8 warps each own one Q8_1 block.
+  let numPasses := D / workgroupSize
+  let warpId   := Exp.div localIdx (Exp.litU32 32)             -- 0..7
+  let laneInW  := Exp.sub localIdx (Exp.mul warpId (Exp.litU32 32))  -- 0..31
+  let mut p : Nat := 0
+  while p < numPasses do
+    let elemIdx := Exp.add (Exp.litU32 (p * workgroupSize)) localIdx
+    let blockIdx := Exp.add (Exp.litU32 (p * (workgroupSize / 32))) warpId
+    let x  ← ShaderM.readBuffer (ty := .scalar .f32) (n := D) "input" elemIdx
+    let s  ← ShaderM.readBuffer (ty := .scalar .f32) (n := D) "scale" elemIdx
+    let xN := Exp.mul (Exp.mul x invRms) s
+    -- Materialise the normalised value before reductions branch on it.
+    let xnName ← ShaderM.var (.scalar .f32) xN
+    let xNRef : Exp (.scalar .f32) := Exp.var xnName
+    -- Per-warp max-abs reduction (subgroupMax operates over the warp).
+    let absXN := Exp.select (Exp.lt xNRef (Exp.litF32 0.0))
+                            (Exp.sub (Exp.litF32 0.0) xNRef) xNRef
+    let amaxName ← ShaderM.var (.scalar .f32) (Exp.subgroupMax absXN)
+    let amax : Exp (.scalar .f32) := Exp.var amaxName
+    -- Q8_1 scale d = amax / 127.
+    let dName ← ShaderM.var (.scalar .f32) (Exp.div amax (Exp.litF32 127.0))
+    let d : Exp (.scalar .f32) := Exp.var dName
+    -- Quantize: q = round(xN / d), guarded against d==0.
+    let qF32 := Exp.select (Exp.eq d (Exp.litF32 0.0))
+                           (Exp.litF32 0.0) (Exp.div xNRef d)
+    let qByte := Exp.bitAnd (Exp.roundToI32 qF32) (Exp.litU32 0xFF)
+    -- Stage byte in shared mem (each lane writes its slot).
+    ShaderM.writeWorkgroup (ty := .scalar .u32) "shared_q" localIdx qByte
+    ShaderM.barrier
+    -- Write the d|s header (s=0; downstream Q4_K dp4a kernel ignores s
+    -- — see fusedQ4KMLinearDP4AKernel which reconstructs sums per
+    -- block from the int8 quants).  Lane 0 of each warp owns its block.
+    let hdrOff := Exp.mul blockIdx (Exp.litU32 9)
+    ShaderM.if_ (Exp.eq laneInW (Exp.litU32 0)) (do
+      let dBits : Exp (.scalar .u32) := Exp.bitcast d
+      ShaderM.writeBuffer (ty := .scalar .u32) "output" hdrOff dBits
+    ) (pure ())
+    -- Pack 4 bytes per output u32.  Lanes with laneInW % 4 == 0 (that
+    -- is, lanes 0,4,8,…,28 within each warp) write one packed u32.
+    let laneQuarter := Exp.div laneInW (Exp.litU32 4)
+    let isQuarterLane := Exp.eq (Exp.sub laneInW (Exp.mul laneQuarter (Exp.litU32 4))) (Exp.litU32 0)
+    ShaderM.if_ isQuarterLane (do
+      let warpBase := Exp.mul warpId (Exp.litU32 32)
+      let base := Exp.add warpBase (Exp.mul laneQuarter (Exp.litU32 4))
+      let b0 ← ShaderM.readWorkgroup (ty := .scalar .u32) (n := workgroupSize) "shared_q" base
+      let b1 ← ShaderM.readWorkgroup (ty := .scalar .u32) (n := workgroupSize) "shared_q" (Exp.add base (Exp.litU32 1))
+      let b2 ← ShaderM.readWorkgroup (ty := .scalar .u32) (n := workgroupSize) "shared_q" (Exp.add base (Exp.litU32 2))
+      let b3 ← ShaderM.readWorkgroup (ty := .scalar .u32) (n := workgroupSize) "shared_q" (Exp.add base (Exp.litU32 3))
+      let packed := Exp.bitOr (Exp.bitOr b0 (Exp.shiftLeft b1 (Exp.litU32 8)))
+                              (Exp.bitOr (Exp.shiftLeft b2 (Exp.litU32 16)) (Exp.shiftLeft b3 (Exp.litU32 24)))
+      let outIdx := Exp.add hdrOff (Exp.add (Exp.litU32 1) laneQuarter)
+      ShaderM.writeBuffer (ty := .scalar .u32) "output" outIdx packed
+    ) (pure ())
+    -- Barrier before the next pass so shared_q is free to overwrite.
+    ShaderM.barrier
+    p := p + 1
+
 /-! ## High-Level API -/
 
 /-- RMSNorm layer structure -/
