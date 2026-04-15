@@ -51,6 +51,11 @@ def compile [GPUBackend β]
         Hesper.Layers.Linear.LinearLayer.forward ctx layer inputBuf outputBuf
       | _, _ =>
         throw (IO.userError s!"Circuit.compile: missing buffer for matmul op (in={inTr.id}, out={outTr.id})")
+    | Prim.pointwise _ _ =>
+      -- Step 1 placeholder: generic lowering comes in Step 2
+      -- (`lowerPointwise`).  Until then, no user-facing caller emits
+      -- `pointwise`, so reaching here is a compiler bug.
+      throw (IO.userError "Circuit.compile: Prim.pointwise lowering not yet implemented (Step 2)")
 
 /-! ## Build-once, replay-many — zero-overhead dispatch path
 
@@ -107,6 +112,9 @@ def compileOnce [GPUBackend β]
           | _, _ =>
             throw (IO.userError s!"CompiledCircuit: missing buffer (in={inId} out={outId})")
       }
+    | Prim.pointwise _ _ =>
+      { run := fun _ =>
+          throw (IO.userError "CompiledCircuit: Prim.pointwise lowering not yet implemented (Step 2)") }
   let closures := state.ops.map mkClosure
   let externalIds := state.externals.map (fun (tr, _) => tr.id)
   -- producedIds := tensor ids that are produced by some op's outputs
