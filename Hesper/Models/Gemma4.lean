@@ -1393,27 +1393,35 @@ def forwardBlock [GPUBackend β] (ctx : β)
   Hesper.WGSL.Execute.withSection "attnNorm" do
     RMSNorm.forward ctx block.attnNorm inputBuf state.normedBuf
 
-  -- Step 2: Q/K/V projections.  wK and wV share the same input and shape
-  -- (and both are Q4_K in Gemma 4); combine them into a single fused
-  -- kernel when possible to halve the per-layer attention-projection
-  -- dispatch count.  wQ stays separate because its outDim differs.
+  -- Step 2: Q/K/V projections.  All three share the same RMSNormed input,
+  -- so fuse the three matmuls + Q8_1 quantize into a single path:
+  -- `forwardFusedQKV` runs ONE quantize and reuses the Q8_1 buffer for
+  -- wQ + (wK,wV) matmuls.  wK and wV further share one fused kernel.
+  -- Overall: 4 dispatches instead of 6 (Q8_1 x 2 + Q x 1 + K x 1 + V x 1
+  -- before → Q8_1 x 1 + Q x 1 + KV x 1).
   Hesper.WGSL.Execute.withSection "qkvProj" do
-    Linear.LinearLayer.forward ctx block.attention.wQ state.normedBuf state.qBuf
     if cfg.hasKV li then
-      let useFusedKV := block.attention.wK.quantFormat == .Q4_K
+      let useFusedQKV := block.attention.wQ.quantFormat == .Q4_K
+                    && block.attention.wK.quantFormat == .Q4_K
                     && block.attention.wV.quantFormat == .Q4_K
-                    && block.attention.wK.config.inDim == block.attention.wV.config.inDim
+                    && block.attention.wK.config.inDim == block.attention.wQ.config.inDim
+                    && block.attention.wV.config.inDim == block.attention.wQ.config.inDim
                     && block.attention.wK.config.outDim == block.attention.wV.config.outDim
-      if useFusedKV then
-        let key := hash ("kvFusedDP4A", block.attention.wK.config.inDim, block.attention.wK.config.outDim)
-        let ref ← match kcr with
+      if useFusedQKV then
+        let key := hash ("qkvFusedDP4A",
+          block.attention.wQ.config.inDim, block.attention.wQ.config.outDim,
+          block.attention.wK.config.outDim)
+        let kvRef ← match kcr with
           | some k => k.getRef key
           | none => IO.mkRef none
-        Linear.forwardFusedKV ctx block.attention.wK block.attention.wV
-          state.normedBuf state.kBuf state.vBuf ref
+        Linear.forwardFusedQKV ctx block.attention.wQ block.attention.wK block.attention.wV
+          state.normedBuf state.qBuf state.kBuf state.vBuf kvRef
       else
+        Linear.LinearLayer.forward ctx block.attention.wQ state.normedBuf state.qBuf
         Linear.LinearLayer.forward ctx block.attention.wK state.normedBuf state.kBuf
         Linear.LinearLayer.forward ctx block.attention.wV state.normedBuf state.vBuf
+    else
+      Linear.LinearLayer.forward ctx block.attention.wQ state.normedBuf state.qBuf
 
   -- Step 3: Q-norm, K-norm (per-head RMSNorm)
   let numHeads := cfg.numAttentionHeads
