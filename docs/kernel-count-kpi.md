@@ -27,7 +27,16 @@ Empirically, each kernel launch costs ~10 µs of wall-clock
 | hesper (fused RoPE-K+KVwrite) | " | 36,696 | 1,223 | 6.5× |
 | hesper (fused RoPE-K+KVwrite) | " | 36,696 | 1,223 | 6.5× |
 | hesper (Circuit DSL: wO via runCached) | 2026-04-15 | 35,326 | 1,178 | 6.3× |
-| **hesper (current)** | " | **35,326** | **1,178** | **6.3×** |
+| hesper (Circuit DSL: layerScale+pleScale3 auto-fused via ScalarExp) | 2026-04-15 | 34,191 | 1,140 | 6.1× |
+| **hesper (current)** | " | **34,191** | **1,140** | **6.1×** |
+
+The last row is the **first production fusion driven entirely by the
+element-wise compiler pass** (`fusePointwise`), not a hand-written
+macro kernel.  The `layerScaleKernel + scaleKernel` chain in
+`Gemma4.forwardBlock` is expressed as two CircuitM.pointwise ops and
+collapses to one dispatch via β-reduction on `ScalarExp`.  Adding the
+next pointwise fusion is now a data change to the IR, not a new
+ShaderM.
 
 ## Corresponding TPS
 

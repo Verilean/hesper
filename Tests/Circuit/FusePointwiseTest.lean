@@ -28,8 +28,8 @@ def run : IO Unit := do
   IO.println s!"Before fuse: {st.ops.size} ops"
   for op in st.ops do
     match op.prim with
-    | Prim.pointwise shape body =>
-      IO.println s!"  pointwise shape={shape} body={repr body}"
+    | Prim.pointwise outShape inShapes body =>
+      IO.println s!"  pointwise out={outShape} ins={inShapes} body={repr body}"
     | _ => IO.println "  (other prim)"
 
   -- Protect only the final caller-facing buffer (the last produced id).
@@ -38,8 +38,8 @@ def run : IO Unit := do
   IO.println s!"After fuse (protecting id={lastId}): {fused.size} ops"
   for op in fused do
     match op.prim with
-    | Prim.pointwise shape body =>
-      IO.println s!"  pointwise shape={shape} body={repr body}"
+    | Prim.pointwise outShape inShapes body =>
+      IO.println s!"  pointwise out={outShape} ins={inShapes} body={repr body}"
     | _ => IO.println "  (other prim)"
 
   if fused.size == 1 then

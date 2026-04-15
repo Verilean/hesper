@@ -69,27 +69,37 @@ def lowerScalarExp (slot : Array (Exp (.scalar .f32)))
     Exp.div x (Exp.add (Exp.litF32 1.0) (Exp.exp (Exp.neg x)))
 
 /-- Build a complete `ShaderM Unit` that implements a `Prim.pointwise`
-    op.  `inputNames` are the buffer binding names (positional, so
-    `inputNames[i]` is what `ScalarExp.input i` reads); `outputName` is
-    where to write.  `numel` is the total tensor element count.
+    op.  `inputNames[i]` is the buffer binding name for input slot i;
+    `inputBroadcast[i] = true` means that input is a 1-element scalar
+    broadcast (every lane reads slot 0), false means indexed by thread
+    id.  `outputName` is where to write.  `numel` is the total output
+    element count.
 
     Dispatch shape is a fixed 1D `(numel+255)/256 × 256`.  Inside the
     kernel, each thread computes one output element if its global id is
     in range. -/
 def lowerPointwise
-    (inputNames : Array String) (outputName : String)
+    (inputNames : Array String) (inputBroadcast : Array Bool) (outputName : String)
     (numel : Nat) (body : ScalarExp) : ShaderM Unit := do
-  let _ ← inputNames.mapM fun name =>
-    ShaderM.declareInputBuffer name (.array (.scalar .f32) numel)
+  -- Declare broadcast inputs with length 1; full inputs with length numel.
+  for i in [0:inputNames.size] do
+    let name := inputNames[i]!
+    let bc := inputBroadcast[i]?.getD false
+    let len := if bc then 1 else numel
+    let _ ← ShaderM.declareInputBuffer name (.array (.scalar .f32) len)
   let _ ← ShaderM.declareOutputBuffer outputName (.array (.scalar .f32) numel)
   let gid ← ShaderM.globalId
   let idx := Exp.vec3X gid
   ShaderM.if_ (Exp.lt idx (Exp.litU32 numel)) (do
-    -- Pre-load every input slot once, bind to a local var, then
-    -- ScalarExp references re-use them (free CSE).
+    -- Pre-load every input slot once, bind to a local var.  Broadcast
+    -- inputs read at index 0; full inputs at the thread's id.
     let mut slots : Array (Exp (.scalar .f32)) := #[]
-    for name in inputNames do
-      let v ← ShaderM.readBuffer (ty := .scalar .f32) (n := numel) name idx
+    for i in [0:inputNames.size] do
+      let name := inputNames[i]!
+      let bc := inputBroadcast[i]?.getD false
+      let len := if bc then 1 else numel
+      let readIdx := if bc then Exp.litU32 0 else idx
+      let v ← ShaderM.readBuffer (ty := .scalar .f32) (n := len) name readIdx
       let vName ← ShaderM.var (.scalar .f32) v
       slots := slots.push (Exp.var vName)
     let result := lowerScalarExp slots body
@@ -102,20 +112,21 @@ def lowerPointwise
 abbrev BufferMap (BufT : Type) := List (Nat × BufT)
 
 /-- Dispatch a `Prim.pointwise` op through `executeWithConfigCached`.
-    All pointwise ops use the same 1D dispatch `(numel+255)/256 × 256`
-    (Prim.pointwise invariant), so the caller just passes the resolved
-    input/output buffers and a unique cacheKey. -/
+    `numel` is the output element count (= dispatch grid).  `inShapes`
+    describes each input: shape `#[1]` ⇒ broadcast; otherwise full. -/
 def runPointwiseOp [GPUBackend β]
-    (ctx : β) (numel : Nat) (body : ScalarExp)
+    (ctx : β) (numel : Nat) (inShapes : Array Shape) (body : ScalarExp)
     (inputBufs : Array (GPUBackend.Buf β))
     (outputBuf : GPUBackend.Buf β)
     (cacheKey : UInt64) (cacheRef : IO.Ref (Option (GPUBackend.CachedDispatch β)))
     : IO Unit := do
-  -- Buffer binding names positional: "in0", "in1", …, "out".
   let inputNames : Array String :=
     Array.ofFn (fun (i : Fin inputBufs.size) => s!"in{i.val}")
+  let inputBroadcast : Array Bool :=
+    inShapes.map (fun s => s == #[1])
   let outputName := "out"
-  let shader : ShaderM Unit := lowerPointwise inputNames outputName numel body
+  let shader : ShaderM Unit :=
+    lowerPointwise inputNames inputBroadcast outputName numel body
   let mut namedBufs : List (String × GPUBackend.Buf β) := [(outputName, outputBuf)]
   let n := inputBufs.size
   for i in [0:n] do
@@ -153,8 +164,7 @@ def compile [GPUBackend β]
         Hesper.Layers.Linear.LinearLayer.forward ctx layer inputBuf outputBuf
       | _, _ =>
         throw (IO.userError s!"Circuit.compile: missing buffer for matmul op (in={inTr.id}, out={outTr.id})")
-    | Prim.pointwise shape body =>
-      -- Resolve every input + the single output, then dispatch.
+    | Prim.pointwise outShape inShapes body =>
       let outTr := op.outputs[0]!
       let mut inBufs : Array (GPUBackend.Buf β) := #[]
       for inTr in op.inputs do
@@ -164,7 +174,7 @@ def compile [GPUBackend β]
       match lookup outTr.id with
       | some outBuf =>
         let cacheRef ← IO.mkRef (α := Option (GPUBackend.CachedDispatch β)) none
-        runPointwiseOp ctx (shape.numel) body inBufs outBuf 0 cacheRef
+        runPointwiseOp ctx outShape.numel inShapes body inBufs outBuf 0 cacheRef
       | none => throw (IO.userError s!"Circuit.compile: missing output buffer for pointwise op (out={outTr.id})")
 
 /-! ## Build-once, replay-many — zero-overhead dispatch path
@@ -225,15 +235,14 @@ def compileOnce [GPUBackend β]
             | _, _ =>
               throw (IO.userError s!"CompiledCircuit: missing buffer (in={inId} out={outId})")
         }
-    | Prim.pointwise shape body =>
-      let numel := shape.numel
+    | Prim.pointwise outShape inShapes body =>
+      let numel := outShape.numel
       let inIds := op.inputs.map (·.id)
       let outId := op.outputs[0]!.id
       let cacheRef : IO.Ref (Option (GPUBackend.CachedDispatch β)) ← IO.mkRef none
-      -- Structural cache key: same body + same shape + same input arity ⇒
-      -- same PTX, so hash the IR directly.  (The untyped global Circuit
-      -- cache keys differ across call sites, which keeps refs distinct.)
-      let cacheKey : UInt64 := hash ("circuit-pointwise", numel, reprStr body, inIds.size)
+      let cacheKey : UInt64 :=
+        hash ("circuit-pointwise", numel, reprStr body,
+              reprStr inShapes.toList)
       closures := closures.push
         { run := fun lookup => do
             let mut inBufs : Array (GPUBackend.Buf β) := #[]
@@ -243,7 +252,7 @@ def compileOnce [GPUBackend β]
               | none   => throw (IO.userError s!"CompiledCircuit: missing pointwise input buffer id={id}")
             match lookup outId with
             | some outBuf =>
-              runPointwiseOp _ctx numel body inBufs outBuf cacheKey cacheRef
+              runPointwiseOp _ctx numel inShapes body inBufs outBuf cacheKey cacheRef
             | none => throw (IO.userError s!"CompiledCircuit: missing pointwise output buffer id={outId}")
         }
   let externalIds := state.externals.map (fun (tr, _) => tr.id)

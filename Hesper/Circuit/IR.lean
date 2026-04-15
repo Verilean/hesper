@@ -143,15 +143,24 @@ inductive Prim (BufT : Type) (CacheT : Type) where
       layer, so it owns the prepared-dispatch cache. -/
   | matmulQ4K
       (layer : Hesper.Layers.Linear.LinearLayer BufT CacheT)
-  /-- Pure pointwise op over `inputs.size` f32 tensors of the SAME
-      shape.  Output has that same shape.  `body` is a `ScalarExp`
-      tree where `input i` refers to `inputs[i]` evaluated at the
-      current lane.  The dispatch shape is *always* 1D
-      `(numel + 255) / 256` × 256 — this is a hard invariant that
-      makes pointwise fusion trivially safe (matching tensor shapes ⇒
-      matching dispatch grids ⇒ matching thread-element mapping). -/
+  /-- Pure pointwise op.  `outShape` is the shape of the output tensor
+      AND of the dispatch grid (fixed 1D `(numel+255)/256 × 256`).
+      `inShapes[i]` describes the i-th input:
+        * equal to `outShape` ⇒ full element-wise, indexed by the
+          thread's global id at every lane;
+        * `#[1]` (a 1-element tensor) ⇒ **scalar broadcast**; every
+          lane reads slot 0.  Used for scalar biases / scales that are
+          loaded from GPU buffers rather than baked as `const` in the
+          body.
+      Any other shape is rejected at build time (for now — general
+      NumPy-style broadcast is out of scope).
+
+      `body` is a `ScalarExp` where `input i` refers to `inputs[i]`.
+      Fusion is trivially safe: the output shape uniquely determines
+      the grid, and broadcast inputs compose (scalar-of-scalar is
+      still scalar). -/
   | pointwise
-      (shape : Shape) (body : ScalarExp)
+      (outShape : Shape) (inShapes : Array Shape) (body : ScalarExp)
   -- Future primitives will go here: rmsNorm, residualAdd, rope, …
 
 /-- An op in the circuit: a Prim plus the concrete tensor wiring. -/
@@ -231,15 +240,20 @@ All sugar below lowers to `Prim.pointwise`.  The body uses
 — the builder chooses that layout so the fusion pass can inline
 `input` indices by shifting. -/
 
-/-- Generic pointwise: caller supplies the inputs array and a body
-    tree whose free `input i` refer to `inputs[i]`.  All inputs must
-    share the same shape and dtype f32; output is one f32 tensor at
-    that shape, Global scope. -/
+/-- Generic pointwise: caller supplies the inputs array (each either
+    of the output shape or scalar `#[1]`) and a body tree.  Output shape
+    is taken from the first full-shape input, or falls back to the
+    first input's shape.  For the purely-broadcast degenerate case
+    (all inputs scalar) the output is also scalar `#[1]`. -/
 def pointwise (inputs : Array TensorRef) (body : ScalarExp)
     : CircuitM BufT CacheT TensorRef := do
-  let shape := (inputs[0]?).map (·.shape) |>.getD #[]
-  let outs ← emitOp (Prim.pointwise shape body) inputs
-    #[(shape, .f32, .Global)]
+  -- Pick the output shape: first non-broadcast input, else any input's shape.
+  let outShape : Shape :=
+    (inputs.find? (fun tr => tr.shape != #[1])).map (·.shape)
+      |>.getD ((inputs[0]?).map (·.shape) |>.getD #[])
+  let inShapes : Array Shape := inputs.map (·.shape)
+  let outs ← emitOp (Prim.pointwise outShape inShapes body) inputs
+    #[(outShape, .f32, .Global)]
   return outs[0]!
 
 /-- Unary map: `out[i] = f(a[i])`.  `f` is a ScalarExp with a single
@@ -248,7 +262,8 @@ def map (a : TensorRef) (f : ScalarExp) : CircuitM BufT CacheT TensorRef :=
   pointwise #[a] f
 
 /-- Binary zip: `out[i] = f(a[i], b[i])`.  `f` has free `input 0`
-    (=`a`) and `input 1` (=`b`). -/
+    (=`a`) and `input 1` (=`b`).  If either input has shape `#[1]` it
+    broadcasts across the full shape of the other. -/
 def zip2 (a b : TensorRef) (f : ScalarExp)
     : CircuitM BufT CacheT TensorRef :=
   pointwise #[a, b] f
@@ -256,6 +271,11 @@ def zip2 (a b : TensorRef) (f : ScalarExp)
 /-- Scalar multiply: `out[i] = a[i] * k`. -/
 def scale (a : TensorRef) (k : Float) : CircuitM BufT CacheT TensorRef :=
   map a (.mul (.input 0) (.const k))
+
+/-- Scalar broadcast multiply: `out[i] = a[i] * scale[0]`.  `scale`
+    must be a `#[1]`-shape TensorRef. -/
+def scaleByBroadcast (a scale : TensorRef) : CircuitM BufT CacheT TensorRef :=
+  zip2 a scale (.mul (.input 0) (.input 1))
 
 /-- Elementwise add: `out[i] = a[i] + b[i]`. -/
 def addT (a b : TensorRef) : CircuitM BufT CacheT TensorRef :=

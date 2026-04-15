@@ -147,13 +147,20 @@ private def fusePointwiseStep {BufT CacheT : Type}
   -- Search for a consumer op B such that one of its pointwise inputs
   -- is produced by an earlier pointwise A with B as its unique
   -- surviving consumer (and A's output is not caller-facing).
-  for hB : bIdx in [0 : ops.size] do
-    let B := ops[bIdx]
-    let .pointwise bShape bBody := B.prim | continue
+  for bIdx in [0 : ops.size] do
+    match ops[bIdx]? with
+    | none => pure ()
+    | some B =>
+    let .pointwise bOutShape bInShapes bBody := B.prim | continue
     -- Walk B's inputs looking for a fusable producer.
-    for hI : iIdx in [0 : B.inputs.size] do
+    for iIdx in [0 : B.inputs.size] do
       let prodRef := B.inputs[iIdx]!
       if isProtected prodRef.id then continue
+      -- Refuse to fuse when B consumes this slot as a scalar broadcast:
+      -- inlining a non-broadcast producer would violate the "all inputs
+      -- are either outShape or #[1]" invariant.
+      let consumedAsBroadcast : Bool := (bInShapes[iIdx]?.getD #[]) == #[1]
+      if consumedAsBroadcast then continue
       -- Find the (single) op in `ops` whose outputs contain prodRef.id.
       let mut aIdxOpt : Option Nat := none
       for hA : aIdx in [0 : ops.size] do
@@ -165,26 +172,17 @@ private def fusePointwiseStep {BufT CacheT : Type}
         | none => pure ()
       let some aIdx := aIdxOpt | continue
       let some A := ops[aIdx]? | continue
-      let .pointwise aShape aBody := A.prim | continue
-      if aShape != bShape then continue
+      let .pointwise aOutShape aInShapes aBody := A.prim | continue
+      -- Fusion legality: A's output shape must match B's.
+      if aOutShape != bOutShape then continue
       -- Uniqueness: prodRef.id is consumed by exactly one op in `ops`.
       if countConsumers ops prodRef.id != 1 then continue
-      -- Inline A into B.  A's inputs (with their output slots unchanged)
-      -- become new slots at the end of B's input array.  B's original
-      -- inputs keep their indices; the slot that was `input iIdx` (the
-      -- producer) is replaced by A's body (with its `input j` shifted
-      -- to refer to position `B.inputs.size + j` in the combined array).
+      -- Inline A into B.  B's slot iIdx is replaced by A's body; A's
+      -- own `input j` originally referred to aInputs[j], which after
+      -- append live at position `bInputs.size + j` — so shift by
+      -- `bInputs.size`.
       let bInputs := B.inputs
       let aInputs := A.inputs
-      let baseShift := bInputs.size - 1  -- we're removing one slot and…
-      -- actually: we keep all of B's slots (so the already-placed `input j`
-      -- for j ≠ iIdx keeps meaning the same thing), we drop slot `iIdx`
-      -- conceptually by substituting A's body at it, and we append A's
-      -- inputs at the end; A's own `input j` referred to `aInputs[j]`, so
-      -- after appending they live at `bInputs.size + j`.  But A's body
-      -- substituted into position iIdx would still carry `input j`
-      -- references — so shift those by `bInputs.size`.
-      let _ := baseShift  -- silence unused; intentional for clarity above
       let aShifted := aBody.shiftInputs bInputs.size
       let mut argMap : Array ScalarExp := #[]
       for hJ : j in [0 : bInputs.size] do
@@ -194,8 +192,9 @@ private def fusePointwiseStep {BufT CacheT : Type}
           argMap := argMap.push (.input j)
       let newBody := bBody.subst argMap
       let newInputs := bInputs ++ aInputs
+      let newInShapes := bInShapes ++ aInShapes
       let newB : Op BufT CacheT :=
-        { prim := Prim.pointwise bShape newBody
+        { prim := Prim.pointwise bOutShape newInShapes newBody
           inputs := newInputs
           outputs := B.outputs }
       -- Produce a new op array: drop A, replace B with newB.  If A is
@@ -250,20 +249,24 @@ private partial def renumberInputs (remap : Array Nat) : ScalarExp → ScalarExp
 private def compactPointwiseInputs {BufT CacheT : Type} (op : Op BufT CacheT)
     : Op BufT CacheT := Id.run do
   match op.prim with
-  | .pointwise shape body =>
+  | .pointwise outShape inShapes body =>
     let used := body.usedInputs
     let mut newSlot : Array Nat := Array.replicate op.inputs.size 0
     let mut newInputs : Array TensorRef := #[]
+    let mut newInShapes : Array Shape := #[]
     let mut next : Nat := 0
     for i in [0 : op.inputs.size] do
       let keep := used.any (· == i)
-      match keep, op.inputs[i]? with
-      | true, some tr =>
+      match keep, op.inputs[i]?, inShapes[i]? with
+      | true, some tr, some sh =>
         newSlot := newSlot.set! i next
         newInputs := newInputs.push tr
+        newInShapes := newInShapes.push sh
         next := next + 1
-      | _, _ => pure ()
-    return { op with prim := .pointwise shape (renumberInputs newSlot body), inputs := newInputs }
+      | _, _, _ => pure ()
+    return { op with
+      prim := .pointwise outShape newInShapes (renumberInputs newSlot body)
+      inputs := newInputs }
   | _ => return op
 
 /-- Apply `fusePointwiseStep` until fixpoint, then compact every
@@ -338,12 +341,14 @@ def compileWithPasses [GPUBackend β]
                 throw (IO.userError s!"compileWithPasses: missing buffer (in={inId}, out={outId})")
           }
       | _, _ => throw (IO.userError "compileWithPasses: matmulQ4K op missing in/out tensor")
-    | PrimExt.base (Prim.pointwise shape body) =>
-      let numel := shape.numel
+    | PrimExt.base (Prim.pointwise outShape inShapes body) =>
+      let numel := outShape.numel
       let inIds := op.inputs.map (·.id)
       let outId := op.outputs[0]!.id
       let cacheRef : IO.Ref (Option (GPUBackend.CachedDispatch β)) ← IO.mkRef none
-      let cacheKey : UInt64 := hash ("circuit-pointwise", numel, reprStr body, inIds.size)
+      let cacheKey : UInt64 :=
+        hash ("circuit-pointwise", numel, reprStr body,
+              reprStr inShapes.toList)
       closures := closures.push
         { run := fun lookup => do
             let mut inBufs : Array (GPUBackend.Buf β) := #[]
@@ -353,7 +358,7 @@ def compileWithPasses [GPUBackend β]
               | none   => throw (IO.userError s!"compileWithPasses: missing pointwise input id={id}")
             match lookup outId with
             | some outBuf =>
-              runPointwiseOp ctx numel body inBufs outBuf cacheKey cacheRef
+              runPointwiseOp ctx numel inShapes body inBufs outBuf cacheKey cacheRef
             | none => throw (IO.userError s!"compileWithPasses: missing pointwise output id={outId}")
         }
   let externalIds := state.externals.map (fun (tr, _) => tr.id)

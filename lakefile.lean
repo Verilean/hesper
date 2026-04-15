@@ -680,6 +680,10 @@ lean_exe «pointwise-gpu-test» where
   root := `Tests.Circuit.PointwiseGPUTest
   moreLinkArgs := stdLinkArgs ++ #["./.lake/build/native/libhesper_cuda.a", "-lcuda"]
 
+lean_exe «broadcast-gpu-test» where
+  root := `Tests.Circuit.BroadcastGPUTest
+  moreLinkArgs := stdLinkArgs ++ #["./.lake/build/native/libhesper_cuda.a", "-lcuda"]
+
 lean_exe «bitnet-ttt-mqar» where
   root := `Examples.BitNetTTT_MQAR
   moreLinkArgs := stdLinkArgs
