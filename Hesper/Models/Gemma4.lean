@@ -1806,19 +1806,33 @@ def forwardBlock [GPUBackend β] (ctx : β)
             : Hesper.ExecConfig }
     | _, _ => pure ()
 
-  -- Step 9: Layer output scale (optional)
-  -- Use normedBuf2 as temp to avoid input/output aliasing
+  -- Step 9: Layer output scale (optional).  Was two dispatches:
+  --   layerScale: normedBuf2[i] = outputBuf[i] * scale[0]  (broadcast)
+  --   pleScale3:  outputBuf[i]  = normedBuf2[i] * 1.0       (copy-back)
+  -- Now lowered through the Circuit DSL: fusePointwise collapses the
+  -- chain into a single dispatch whose body is `(outputBuf[i] * scale[0]) * 1`.
+  -- The normedBuf2 round-trip is gone; outputBuf is consumed + written
+  -- in one kernel (safe because every lane's read precedes its write).
   match block.outScale with
   | some scale =>
-    ce "layerScale"
-      (PerLayerEmbedding.layerScaleKernel cfg.hiddenSize)
-      [("input", outputBuf), ("scale", scale), ("output", state.normedBuf2)]
-      (.dispatch1D cfg.hiddenSize)
-    -- Copy back: normedBuf2 → outputBuf
-    ce "pleScale3"
-      (PerLayerEmbedding.scaleKernel cfg.hiddenSize 1.0)
-      [("input", state.normedBuf2), ("output", outputBuf)]
-      (.dispatch1D cfg.hiddenSize)
+    Hesper.WGSL.Execute.withSection "layerOutScale" do
+      let key := hash ("circuitLayerOutScale-cuda", cfg.hiddenSize, li)
+      let ccRef ← Hesper.Circuit.getGlobalCircuitRef (β := β) key
+      Hesper.Circuit.runCachedFused ctx ccRef
+        (do
+          let x ← Hesper.Circuit.CircuitM.registerExternal
+                    (BufT := GPUBackend.Buf β) (CacheT := GPUBackend.CachedDispatch β)
+                    outputBuf #[cfg.hiddenSize] .f32 .Global
+          let s ← Hesper.Circuit.CircuitM.registerExternal
+                    (BufT := GPUBackend.Buf β) (CacheT := GPUBackend.CachedDispatch β)
+                    scale #[1] .f32 .Global
+          let scaled ← Hesper.Circuit.CircuitM.scaleByBroadcast x s
+          let _out   ← Hesper.Circuit.CircuitM.map scaled
+                         (.mul (.input 0) (.const 1.0))
+          pure ())
+        -- ids: 0=x (outputBuf), 1=s (scale), 2=scaled (fused away),
+        -- 3=final (written back to outputBuf).
+        [(0, outputBuf), (1, scale), (3, outputBuf)]
   | none => pure ()
 
 /-- Run full single-token forward pass through the model.
