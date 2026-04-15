@@ -117,4 +117,23 @@ opaque cuLaunchKernel
     (args : @& Array USize)  -- device pointers
     : IO Unit
 
+/-! ## L2 cache persistence (Ampere+ / Ada / Hopper, CC ≥ 8.0) -/
+
+/-- Set the persisting-L2 limit on the current context.  The value is
+    clamped to the device's `MAX_PERSISTING_L2_CACHE_SIZE` attribute.
+    Returns the effective limit the driver applied. -/
+@[extern "lean_hesper_cuda_set_l2_persist_limit"]
+opaque cuSetL2PersistLimit (size : USize) : IO USize
+
+/-- Install a persisting access-policy window on the default (null) stream.
+    Subsequent launches on this stream will prefer keeping
+    `[ptr, ptr+size)` in L2 across kernel boundaries. -/
+@[extern "lean_hesper_cuda_set_l2_access_window"]
+opaque cuSetL2AccessWindow (ptr : USize) (size : USize) : IO Unit
+
+/-- Evict all persisting lines from L2 and return the cache to its default
+    non-persistent behaviour. -/
+@[extern "lean_hesper_cuda_reset_l2_persisting_cache"]
+opaque cuResetL2PersistingCache : IO Unit
+
 end Hesper.CUDA

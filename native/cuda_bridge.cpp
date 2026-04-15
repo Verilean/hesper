@@ -151,6 +151,54 @@ extern "C" lean_obj_res lean_hesper_cuda_memset(size_t ptr_val, size_t size) {
 }
 
 // ============================================================================
+// L2 cache persistence (compute capability ≥ 8.0: Ampere+, Ada, Hopper)
+// Lets the driver keep specific address ranges in L2 across kernel launches.
+// ============================================================================
+
+// Query the device's MAX_PERSISTING_L2_CACHE_SIZE and set the current
+// context's CU_LIMIT_PERSISTING_L2_CACHE_SIZE to that maximum (or `size` if
+// smaller).  Returns the effective limit applied.
+extern "C" lean_obj_res lean_hesper_cuda_set_l2_persist_limit(size_t size) {
+    CUdevice dev;
+    CUDA_CHECK(cuCtxGetDevice(&dev), "cuCtxGetDevice");
+    int maxL2 = 0;
+    CUDA_CHECK(cuDeviceGetAttribute(&maxL2,
+        CU_DEVICE_ATTRIBUTE_MAX_PERSISTING_L2_CACHE_SIZE, dev),
+        "cuDeviceGetAttribute(MAX_PERSISTING_L2_CACHE_SIZE)");
+    size_t limit = size;
+    if ((size_t)maxL2 > 0 && limit > (size_t)maxL2) limit = (size_t)maxL2;
+    CUDA_CHECK(cuCtxSetLimit(CU_LIMIT_PERSISTING_L2_CACHE_SIZE, limit),
+               "cuCtxSetLimit(PERSISTING_L2_CACHE_SIZE)");
+    return lean_io_result_mk_ok(lean_box_usize(limit));
+}
+
+// Install a persisting access-policy window on the default (null) stream.
+// Subsequent kernel launches on this stream will prefer keeping `[ptr, ptr+size)`
+// resident in L2.  hitRatio=1.0 marks 100% of the range as persisting; bytes
+// beyond ::MAX_ACCESS_POLICY_WINDOW_SIZE are silently clipped by the driver.
+extern "C" lean_obj_res lean_hesper_cuda_set_l2_access_window(size_t ptr_val, size_t size) {
+    CUstreamAttrValue attr = {};
+    attr.accessPolicyWindow.base_ptr = (void*)ptr_val;
+    attr.accessPolicyWindow.num_bytes = size;
+    attr.accessPolicyWindow.hitRatio = 1.0f;
+    attr.accessPolicyWindow.hitProp = CU_ACCESS_PROPERTY_PERSISTING;
+    attr.accessPolicyWindow.missProp = CU_ACCESS_PROPERTY_STREAMING;
+    CUDA_CHECK(cuStreamSetAttribute(
+        /*hStream=*/0,
+        CU_STREAM_ATTRIBUTE_ACCESS_POLICY_WINDOW,
+        &attr),
+        "cuStreamSetAttribute(ACCESS_POLICY_WINDOW)");
+    return lean_io_result_mk_ok(lean_box(0));
+}
+
+// Clear the persisting access window on the default stream.  Use before
+// swapping to a new window so the old one doesn't keep its L2 allocation.
+extern "C" lean_obj_res lean_hesper_cuda_reset_l2_persisting_cache() {
+    CUDA_CHECK(cuCtxResetPersistingL2Cache(), "cuCtxResetPersistingL2Cache");
+    return lean_io_result_mk_ok(lean_box(0));
+}
+
+// ============================================================================
 // Kernel launch
 // ============================================================================
 
