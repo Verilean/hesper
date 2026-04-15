@@ -1,5 +1,7 @@
 import Hesper.Backend
 import Hesper.Backend.WebGPU
+import Hesper.Circuit.IR
+import Hesper.Circuit.Lowering
 import Hesper.WGSL.Monad
 import Hesper.WGSL.Execute
 import Hesper.WGSL.Exp
@@ -1421,7 +1423,21 @@ def forwardBlock [GPUBackend β] (ctx : β)
         Linear.LinearLayer.forward ctx block.attention.wK state.normedBuf state.kBuf
         Linear.LinearLayer.forward ctx block.attention.wV state.normedBuf state.vBuf
     else
-      Linear.LinearLayer.forward ctx block.attention.wQ state.normedBuf state.qBuf
+      -- Circuit-DSL pilot (Stage 1): replace this single matmul with the
+      -- new IR.  `runCached` builds the Circuit ONCE per (inDim, outDim,
+      -- backend), caches the resulting `CompiledCircuit` in the module-
+      -- global table, and replays it on subsequent calls.
+      let key := hash ("circuitWQ-cuda", block.attention.wQ.config.inDim, block.attention.wQ.config.outDim, li)
+      let ccRef ← Hesper.Circuit.getGlobalCircuitRef (β := β) key
+      Hesper.Circuit.runCached ctx ccRef
+        (do
+          let normed ← Hesper.Circuit.CircuitM.registerExternal
+            (BufT := GPUBackend.Buf β) (CacheT := GPUBackend.CachedDispatch β)
+            state.normedBuf #[cfg.hiddenSize] .f32 .Global
+          let _q ← Hesper.Circuit.CircuitM.matmulQ4K normed block.attention.wQ
+          pure ())
+        -- Tensor ids: 0 = normed (external), 1 = q output (produced by matmulQ4K).
+        [(0, state.normedBuf), (1, state.qBuf)]
 
   -- Step 3: Q-norm, K-norm (per-head RMSNorm)
   let numHeads := cfg.numAttentionHeads
