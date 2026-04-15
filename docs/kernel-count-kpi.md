@@ -20,7 +20,12 @@ Empirically, each kernel launch costs ~10 µs of wall-clock
 | hesper (fused gate+up) | " | — | ~1,400 | 7.5× |
 | hesper (fused KV) | " | 40,097 | 1,336 | 7.1× |
 | hesper (fused Q/K/V share q8_1) | " | ~38,800 est. | ~1,295 | 6.9× |
-| **hesper (fused post-norm)** | " | **36,827** | **1,227** | **6.6×** |
+| hesper (fused post-norm) | " | 36,827 | 1,227 | 6.6× |
+| hesper (fused wK+wV) | " | 40,097 | 1,336 | 7.1× |
+| hesper (fused QKV q8_1 share) | " | ~38,800 | ~1,295 | 6.9× |
+| hesper (fused post-norm) | " | 36,827 | 1,227 | 6.6× |
+| hesper (fused RoPE-K+KVwrite) | " | 36,696 | 1,223 | 6.5× |
+| **hesper (current)** | " | **36,684** | **1,222** | **6.5×** |
 
 ## Corresponding TPS
 
@@ -29,7 +34,7 @@ Empirically, each kernel launch costs ~10 µs of wall-clock
 | llama.cpp CUDA | 115 | ~260 ms |
 | llama.cpp Vulkan | 109 | ~275 ms |
 | hesper (session start) | 31.6 | 949 ms |
-| hesper (current) | 46.3 | 648 ms |
+| hesper (current) | 46.6 | 643 ms |
 
 ## Kernel count breakdown (llama.cpp, 30 tok, 187/token)
 
