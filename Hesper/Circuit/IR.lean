@@ -67,6 +67,73 @@ structure ExternalTensor (BufT : Type) where
   dtype : DType
   deriving Inhabited
 
+/-! ## Scalar expression language
+
+`ScalarExp` is the body of a pointwise op.  It is a pure inductive AST,
+NOT a Lean closure — the whole point is that we can structurally
+inspect, hash, substitute into, and rewrite it from the fusion pass.
+
+`input i` refers to the i-th input tensor of the surrounding
+`Prim.pointwise` op, evaluated at the current lane.  `const v` is a
+compile-time float literal.  The remaining constructors are standard
+arithmetic / transcendentals, added as Gemma 4 demands them. -/
+inductive ScalarExp where
+  | input  (idx : Nat)
+  | const  (v : Float)
+  | add    (a b : ScalarExp)
+  | sub    (a b : ScalarExp)
+  | mul    (a b : ScalarExp)
+  | div    (a b : ScalarExp)
+  | neg    (a : ScalarExp)
+  | rsqrt  (a : ScalarExp)
+  | exp    (a : ScalarExp)
+  | tanh   (a : ScalarExp)
+  | gelu   (a : ScalarExp)
+  | silu   (a : ScalarExp)
+  deriving Repr, Inhabited
+
+namespace ScalarExp
+
+/-- Shift every `input i` inside `e` by `k` — used when inlining a
+    producer into a consumer so that the producer's input indices
+    continue to reference the right slots after the consumer's input
+    array is rewritten. -/
+partial def shiftInputs (k : Nat) : ScalarExp → ScalarExp
+  | input i      => input (i + k)
+  | const v      => const v
+  | add a b      => add (shiftInputs k a) (shiftInputs k b)
+  | sub a b      => sub (shiftInputs k a) (shiftInputs k b)
+  | mul a b      => mul (shiftInputs k a) (shiftInputs k b)
+  | div a b      => div (shiftInputs k a) (shiftInputs k b)
+  | neg a        => neg (shiftInputs k a)
+  | rsqrt a      => rsqrt (shiftInputs k a)
+  | exp a        => exp (shiftInputs k a)
+  | tanh a       => tanh (shiftInputs k a)
+  | gelu a       => gelu (shiftInputs k a)
+  | silu a       => silu (shiftInputs k a)
+
+/-- Substitute `args[i]` for `input i` everywhere in `e`.  Missing
+    indices default to `input i` unchanged — callers should ensure
+    `args` covers all free `input i`s that appear. -/
+partial def subst (args : Array ScalarExp) : ScalarExp → ScalarExp
+  | input i      => match args[i]? with | some a => a | none => input i
+  | const v      => const v
+  | add a b      => add (subst args a) (subst args b)
+  | sub a b      => sub (subst args a) (subst args b)
+  | mul a b      => mul (subst args a) (subst args b)
+  | div a b      => div (subst args a) (subst args b)
+  | neg a        => neg (subst args a)
+  | rsqrt a      => rsqrt (subst args a)
+  | exp a        => exp (subst args a)
+  | tanh a       => tanh (subst args a)
+  | gelu a       => gelu (subst args a)
+  | silu a       => silu (subst args a)
+
+end ScalarExp
+
+/-- Number of elements in a shape. -/
+def Shape.numel (s : Shape) : Nat := s.foldl (· * ·) 1
+
 /-- A typed description of a primitive operation.  Each Prim has a
     well-defined (input shapes, output shapes, dispatch shape) mapping
     that the lowering pass consumes. -/
@@ -76,6 +143,15 @@ inductive Prim (BufT : Type) (CacheT : Type) where
       layer, so it owns the prepared-dispatch cache. -/
   | matmulQ4K
       (layer : Hesper.Layers.Linear.LinearLayer BufT CacheT)
+  /-- Pure pointwise op over `inputs.size` f32 tensors of the SAME
+      shape.  Output has that same shape.  `body` is a `ScalarExp`
+      tree where `input i` refers to `inputs[i]` evaluated at the
+      current lane.  The dispatch shape is *always* 1D
+      `(numel + 255) / 256` × 256 — this is a hard invariant that
+      makes pointwise fusion trivially safe (matching tensor shapes ⇒
+      matching dispatch grids ⇒ matching thread-element mapping). -/
+  | pointwise
+      (shape : Shape) (body : ScalarExp)
   -- Future primitives will go here: rmsNorm, residualAdd, rope, …
 
 /-- An op in the circuit: a Prim plus the concrete tensor wiring. -/
@@ -147,6 +223,43 @@ def matmulQ4K (input : TensorRef) (layer : Hesper.Layers.Linear.LinearLayer BufT
   let outs ← emitOp (Prim.matmulQ4K layer) #[input]
     #[(#[layer.config.outDim], .f32, .Global)]
   return outs[0]!
+
+/-! ### Pointwise builder sugar
+
+All sugar below lowers to `Prim.pointwise`.  The body uses
+`ScalarExp.input i` to refer to the i-th tensor in the `inputs` array
+— the builder chooses that layout so the fusion pass can inline
+`input` indices by shifting. -/
+
+/-- Generic pointwise: caller supplies the inputs array and a body
+    tree whose free `input i` refer to `inputs[i]`.  All inputs must
+    share the same shape and dtype f32; output is one f32 tensor at
+    that shape, Global scope. -/
+def pointwise (inputs : Array TensorRef) (body : ScalarExp)
+    : CircuitM BufT CacheT TensorRef := do
+  let shape := (inputs[0]?).map (·.shape) |>.getD #[]
+  let outs ← emitOp (Prim.pointwise shape body) inputs
+    #[(shape, .f32, .Global)]
+  return outs[0]!
+
+/-- Unary map: `out[i] = f(a[i])`.  `f` is a ScalarExp with a single
+    free variable `input 0`. -/
+def map (a : TensorRef) (f : ScalarExp) : CircuitM BufT CacheT TensorRef :=
+  pointwise #[a] f
+
+/-- Binary zip: `out[i] = f(a[i], b[i])`.  `f` has free `input 0`
+    (=`a`) and `input 1` (=`b`). -/
+def zip2 (a b : TensorRef) (f : ScalarExp)
+    : CircuitM BufT CacheT TensorRef :=
+  pointwise #[a, b] f
+
+/-- Scalar multiply: `out[i] = a[i] * k`. -/
+def scale (a : TensorRef) (k : Float) : CircuitM BufT CacheT TensorRef :=
+  map a (.mul (.input 0) (.const k))
+
+/-- Elementwise add: `out[i] = a[i] + b[i]`. -/
+def addT (a b : TensorRef) : CircuitM BufT CacheT TensorRef :=
+  zip2 a b (.add (.input 0) (.input 1))
 
 end CircuitM
 
