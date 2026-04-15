@@ -91,6 +91,11 @@ def mergeSameDispatch {BufT CacheT : Type}
         else
           out := out.push { prim := PrimExt.base op.prim, inputs := op.inputs, outputs := op.outputs }
           i := i + 1
+      | _, _ =>
+        -- Other prim combinations (including Prim.pointwise) pass through unchanged here.
+        -- Pointwise fusion is handled by `fusePointwise` upstream of this pass.
+        out := out.push { prim := PrimExt.base op.prim, inputs := op.inputs, outputs := op.outputs }
+        i := i + 1
     | none =>
       out := out.push { prim := PrimExt.base op.prim, inputs := op.inputs, outputs := op.outputs }
       i := i + 1
@@ -141,6 +146,11 @@ def compileWithPasses [GPUBackend β]
                 throw (IO.userError s!"compileWithPasses: missing buffer (in={inId}, out={outId})")
           }
       | _, _ => throw (IO.userError "compileWithPasses: matmulQ4K op missing in/out tensor")
+    | PrimExt.base (Prim.pointwise _ _) =>
+      -- Step 1 placeholder: generic lowering comes in Step 2.
+      closures := closures.push
+        { run := fun _ =>
+            throw (IO.userError "compileWithPasses: Prim.pointwise lowering not yet implemented (Step 2)") }
   let externalIds := state.externals.map (fun (tr, _) => tr.id)
   let producedIds := state.ops.foldl (init := (#[] : Array Nat)) fun acc op =>
     op.outputs.foldl (init := acc) fun acc' tr => acc'.push tr.id
