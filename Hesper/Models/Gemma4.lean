@@ -1533,14 +1533,16 @@ def forwardBlock [GPUBackend β] (ctx : β)
     -- Fallback: skip attention (shouldn't happen)
     Linear.LinearLayer.forward ctx block.attention.wO state.qBuf state.normedBuf
 
-  -- Step 6: Post-attention norm + residual
-  -- normedBuf → normedBuf2 (avoid aliasing)
+  -- Step 6: Post-attention norm + residual.  Gemma 4 is post-norm:
+  -- `attnResidualBuf = RMSNorm(attn_out) * scale + inputBuf`.  Fused into
+  -- a single kernel via forwardNormThenAdd to save one dispatch.
   Hesper.WGSL.Execute.withSection "postAttnNorm" do
-    RMSNorm.forward ctx block.postAttnNorm state.normedBuf state.normedBuf2
-    ce "residAdd_postAttn"
-      (residualAddKernel cfg.hiddenSize)
-      [("a", state.normedBuf2), ("b", inputBuf), ("output", state.attnResidualBuf)]
-      (.dispatch1D cfg.hiddenSize)
+    let key := hash ("postAttnNormAdd", cfg.hiddenSize)
+    let ref ← match kcr with
+      | some k => k.getRef key
+      | none => IO.mkRef none
+    RMSNorm.forwardNormThenAdd ctx block.postAttnNorm
+      state.normedBuf inputBuf state.attnResidualBuf ref
 
   -- Step 7: FFN (dense or MoE)
   if block.isMoE then do
@@ -1652,12 +1654,13 @@ def forwardBlock [GPUBackend β] (ctx : β)
         (.dispatch1D cfg.hiddenSize)
     | _, _, _, _ => pure ()  -- No MoE weights: shared expert only
 
-    -- Post-FFN norm + residual (avoid aliasing: ffnOutBuf → normedBuf2 → outputBuf)
-    RMSNorm.forward ctx block.postFFNNorm state.ffnOutBuf state.normedBuf2
-    ce "residAddFFN"
-      (residualAddKernel cfg.hiddenSize)
-      [("a", state.normedBuf2), ("b", state.attnResidualBuf), ("output", outputBuf)]
-      (.dispatch1D cfg.hiddenSize)
+    -- Post-FFN norm + residual, fused: output = RMSNorm(ffn_out) * scale + attn_residual.
+    let keyFFN := hash ("postFFNNormAdd", cfg.hiddenSize)
+    let refFFN ← match kcr with
+      | some k => k.getRef keyFFN
+      | none => IO.mkRef none
+    RMSNorm.forwardNormThenAdd ctx block.postFFNNorm
+      state.ffnOutBuf state.attnResidualBuf outputBuf refFFN
   else do
     -- Dense FFN path (GeGLU).
     -- Fuse ffnNorm into gate/up matmuls when possible (Q4_K + subgroups).
@@ -1691,13 +1694,14 @@ def forwardBlock [GPUBackend β] (ctx : β)
     Hesper.WGSL.Execute.withSection "ffnDown" do
       Linear.LinearLayer.forward ctx block.ffn.down state.geluBuf state.ffnOutBuf
 
-    -- Post-FFN norm + residual (avoid aliasing: ffnOutBuf → normedBuf2 → outputBuf)
+    -- Post-FFN norm + residual, fused.  output = RMSNorm(ffn_out) * scale + attn_residual.
     Hesper.WGSL.Execute.withSection "postFFNNorm" do
-      RMSNorm.forward ctx block.postFFNNorm state.ffnOutBuf state.normedBuf2
-      ce "residAddFFN2"
-        (residualAddKernel cfg.hiddenSize)
-        [("a", state.normedBuf2), ("b", state.attnResidualBuf), ("output", outputBuf)]
-        (.dispatch1D cfg.hiddenSize)
+      let keyFFN2 := hash ("postFFNNormAdd", cfg.hiddenSize)
+      let refFFN2 ← match kcr with
+        | some k => k.getRef keyFFN2
+        | none => IO.mkRef none
+      RMSNorm.forwardNormThenAdd ctx block.postFFNNorm
+        state.ffnOutBuf state.attnResidualBuf outputBuf refFFN2
 
   -- Step 8: Per-layer embedding (optional, from gemma4-iswa.cpp:192-213)
   -- pe_in = cur (= outputBuf at this point)
