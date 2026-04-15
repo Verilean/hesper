@@ -459,6 +459,129 @@ def fuseReduceEpilogue {BufT CacheT : Type}
     | none      => break
   return current
 
+/-! ## Matmul-epilogue fusion
+
+Detects `[A : Prim.matmulQ4K layer] → [B : Prim.pointwise outShape inShapes body]`
+chains where the matmul's output feeds the pointwise body as a **full-shape**
+input slot (shape `[layer.outDim]`), and rewrites the pair into a
+single `Prim.matmulQ4KWithEpilogue` op.
+
+Refuses to fuse when:
+- A's output is caller-protected (appears in the replay `buffers` list);
+- A's output has multiple consumers;
+- B's output shape ≠ `[layer.outDim]` (shape transformation would
+  require a reshape Prim we don't have);
+- B consumes A's output via a broadcast slot (shape `[1]`) — the
+  current `matmulQ4KWithEpilogue` expects its slot 0 to BE the
+  matmul scalar result, not a lane-broadcast of it;
+- any OTHER slot of B has shape ≠ outShape (i.e. anything that
+  requires a slice offset or a broadcast in the epilogue); the
+  matmulQ4KWithEpilogue Prim supports slice offsets but the pass
+  doesn't try to infer them — the caller can explicitly use
+  `CircuitM.matmulQ4KWithEpilogue` for that case.
+
+Termination: each fire reduces op count by 1. -/
+
+private def fuseMatmulEpilogueStep {BufT CacheT : Type}
+    (ops : Array (Op BufT CacheT)) (protectedIds : Array Nat)
+    : Option (Array (Op BufT CacheT)) := Id.run do
+  let isProtected (id : Nat) : Bool := protectedIds.any (· == id)
+  for aIdx in [0 : ops.size] do
+    match ops[aIdx]? with
+    | none => pure ()
+    | some A =>
+    let .matmulQ4K layer := A.prim | continue
+    let aOutId := A.outputs[0]!.id
+    if isProtected aOutId then continue
+    if countConsumers ops aOutId != 1 then continue
+    -- Find the unique consumer B.
+    let mut bIdxOpt : Option Nat := none
+    for bIdx in [0 : ops.size] do
+      match ops[bIdx]? with
+      | some B =>
+        if B.inputs.any (fun tr => tr.id == aOutId) then
+          bIdxOpt := some bIdx; break
+      | none => pure ()
+    let some bIdx := bIdxOpt | continue
+    let some B := ops[bIdx]? | continue
+    let .pointwise bOutShape bInShapes bBody := B.prim | continue
+    -- Output shape of B must equal `[outDim]`.  Anything else implies
+    -- a reshape the matmul-epilogue kernel can't absorb.
+    if bOutShape != #[layer.config.outDim] then continue
+    -- Locate the slot in B that consumes A.  Must be full-shape
+    -- (broadcast slots would mean "lane-broadcast the matmul scalar",
+    -- which doesn't fit the one-scalar-per-row model).
+    let mut aSlotOpt : Option Nat := none
+    for j in [0 : B.inputs.size] do
+      match B.inputs[j]? with
+      | some tr =>
+        if tr.id == aOutId then aSlotOpt := some j; break
+      | none => pure ()
+    let some aSlot := aSlotOpt | continue
+    if (bInShapes[aSlot]?.getD #[]) != bOutShape then continue
+    -- All OTHER slots must be full-shape (== bOutShape) too.  A
+    -- future relaxation could derive read offsets from size-mismatched
+    -- slots, but that's out of scope.
+    let mut otherSlotsValid : Bool := true
+    for j in [0 : B.inputs.size] do
+      if j != aSlot then
+        if (bInShapes[j]?.getD #[]) != bOutShape then
+          otherSlotsValid := false
+    if !otherSlotsValid then continue
+    -- Build the new epilogue body.  Slot mapping:
+    --   B's aSlot     →  `input 0` (the matmul scalar)
+    --   B's other j   →  `input (kPosition + 1)`
+    -- where kPosition is the j-th kept slot in original order
+    -- (skipping aSlot).  Collect the same order into newInputs.
+    let mut remap : Array Nat := Array.replicate B.inputs.size 0
+    let mut nextK : Nat := 1
+    for j in [0 : B.inputs.size] do
+      if j == aSlot then
+        remap := remap.set! j 0
+      else
+        remap := remap.set! j nextK
+        nextK := nextK + 1
+    let newBody := renumberInputs remap bBody
+    -- Build new op: inputs[0] = A's matmul input;
+    -- inputs[1..] = B's other inputs in order.
+    let mut newInputs : Array TensorRef := #[A.inputs[0]!]
+    let mut epiBufferSizes : Array Nat := #[]
+    for j in [0 : B.inputs.size] do
+      if j != aSlot then
+        match B.inputs[j]?, bInShapes[j]? with
+        | some tr, some _ =>
+          newInputs := newInputs.push tr
+          epiBufferSizes := epiBufferSizes.push layer.config.outDim
+        | _, _ => pure ()
+    -- All offsets zero: pass only fuses the read-at-outIdx case.
+    let epiReadOffsets : Array Nat := Array.replicate epiBufferSizes.size 0
+    let newOp : Op BufT CacheT :=
+      { prim := Prim.matmulQ4KWithEpilogue layer epiBufferSizes epiReadOffsets newBody
+        inputs := newInputs
+        outputs := B.outputs }
+    -- Splice: drop A (idx aIdx), replace B (idx bIdx) with newOp.
+    let mut out : Array (Op BufT CacheT) := #[]
+    for k in [0 : ops.size] do
+      if k == aIdx then continue
+      if k == bIdx then out := out.push newOp
+      else
+        match ops[k]? with
+        | some opk => out := out.push opk
+        | none => pure ()
+    return some out
+  return none
+
+/-- Iterate `fuseMatmulEpilogueStep` to fixpoint. -/
+def fuseMatmulEpilogue {BufT CacheT : Type}
+    (ops : Array (Op BufT CacheT)) (protectedIds : Array Nat)
+    : Array (Op BufT CacheT) := Id.run do
+  let mut current := ops
+  for _ in [0 : ops.size] do
+    match fuseMatmulEpilogueStep current protectedIds with
+    | some next => current := next
+    | none      => break
+  return current
+
 /-! ## Lowering for OpExt -/
 
 /-- Stage 2 compile: run fusePointwise + mergeSameDispatch, then
@@ -484,7 +607,15 @@ def compileWithPasses [GPUBackend β]
   -- patterns and collapses them to a single reduce-with-epilogue op;
   -- fusePointwise then handles any remaining same-shape pointwise
   -- chains.
-  let opsRedFused := fuseReduceEpilogue state.ops mergedProtected
+  -- Pass order:
+  --   1. fuseMatmulEpilogue: [matmulQ4K → pointwise] → matmulQ4KWithEpilogue
+  --   2. fuseReduceEpilogue: [reduceLastAxis → … → pointwise] → reduceLastAxisWithEpilogue
+  --   3. fusePointwise: same-shape pointwise chain β-reduction
+  --   4. mergeSameDispatch: KV matmul pair → fusedKV
+  -- Running matmul-epilogue first lets a following `pointwise` get absorbed
+  -- before fusePointwise tries to collapse it into ANOTHER downstream pointwise.
+  let opsMmEpi  := fuseMatmulEpilogue state.ops mergedProtected
+  let opsRedFused := fuseReduceEpilogue opsMmEpi mergedProtected
   let opsFused := fusePointwise opsRedFused mergedProtected
   let opsExt := mergeSameDispatch opsFused
 
