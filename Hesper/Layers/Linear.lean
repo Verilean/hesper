@@ -2345,14 +2345,15 @@ structure LinearLayer (BufT : Type) (CacheT : Type := Unit) where
   dp4aQuantizePrepared : IO.Ref (Option CacheT)
   dp4aMatmulPrepared : IO.Ref (Option CacheT)
 
-/-- Q8_1 quantize input + Q4_K dp4a matmul (2 dispatches).
-    Uses lazily-allocated per-layer Q8_1 scratch buffer and cache refs. -/
+/-- Q8_1 quantize input + Q4_K/Q6_K dp4a matmul (2 dispatches).
+    Uses lazily-allocated per-layer Q8_1 scratch buffer and cache refs.
+    Dispatches to the appropriate dp4a matmul kernel by `layer.quantFormat`. -/
 def forwardDP4A [GPUBackend β] (ctx : β)
     (layer : LinearLayer (GPUBackend.Buf β) (GPUBackend.CachedDispatch β))
     (inputBuf outputBuf : GPUBackend.Buf β)
     : IO Unit := do
-  if layer.quantFormat != .Q4_K then
-    throw (IO.userError s!"forwardDP4A: must be Q4_K, got {repr layer.quantFormat}")
+  if layer.quantFormat != .Q4_K && layer.quantFormat != .Q6_K then
+    throw (IO.userError s!"forwardDP4A: must be Q4_K or Q6_K, got {repr layer.quantFormat}")
 
   let profiling ← profilingRef.get
   let startNs ← if profiling then IO.monoNanosNow else pure 0
@@ -2376,27 +2377,54 @@ def forwardDP4A [GPUBackend β] (ctx : β)
     (hash ("q8_1-quantize", layer.config.inDim))
     layer.dp4aQuantizePrepared
 
-  -- Step 2: Q4_K × Q8_1 matmul via dp4a.
-  -- Use 2-rows-per-workgroup variant when outDim is small enough that a
-  -- 1-row dispatch would have low SM occupancy (e.g. ffnDown 10240→2560).
-  -- Threshold ~5120 covers Gemma 4's ffnDown (outDim=2560) but keeps the
-  -- single-row variant for ffnGateUp (outDim=10240, already 3.5+ waves).
-  let useTwoRow := layer.config.outDim ≤ 5120 && layer.config.outDim % 2 == 0
-  if useTwoRow then
-    GPUBackend.executeWithConfigCached ctx
-      (fusedQ4KMLinearDP4A2RowKernel layer.config)
-      [("weights", layer.weightBuf), ("input_q8", q8Buf), ("output", outputBuf)]
-      { numWorkgroups := (layer.config.outDim / 2, 1, 1)
-        workgroupSize := { x := 64, y := 1, z := 1 } }
-      (hash ("q4k-dp4a-matmul-2row", layer.config.inDim, layer.config.outDim))
-      layer.dp4aMatmulPrepared
-  else
-    GPUBackend.executeWithConfigCached ctx
-      (fusedQ4KMLinearDP4AKernel layer.config)
-      [("weights", layer.weightBuf), ("input_q8", q8Buf), ("output", outputBuf)]
-      { numWorkgroups := (layer.config.outDim, 1, 1), workgroupSize := { x := 32, y := 1, z := 1 } }
-      (hash ("q4k-dp4a-matmul", layer.config.inDim, layer.config.outDim))
-      layer.dp4aMatmulPrepared
+  -- Step 2: Weights × Q8_1 matmul via dp4a.
+  -- Select kernel by quant format and shape:
+  --   Q4_K + small outDim → 2-row variant (high occupancy)
+  --   Q4_K + large outDim → 1-row variant
+  --   Q6_K + outDim % 4 == 0 → 4-warp cooperative (smem input reuse)
+  --   Q6_K + outDim % 2 == 0 → 2-warp cooperative
+  --   Q6_K fallback         → 1-row (single-warp)
+  if layer.quantFormat == .Q4_K then
+    let useTwoRow := layer.config.outDim ≤ 5120 && layer.config.outDim % 2 == 0
+    if useTwoRow then
+      GPUBackend.executeWithConfigCached ctx
+        (fusedQ4KMLinearDP4A2RowKernel layer.config)
+        [("weights", layer.weightBuf), ("input_q8", q8Buf), ("output", outputBuf)]
+        { numWorkgroups := (layer.config.outDim / 2, 1, 1)
+          workgroupSize := { x := 64, y := 1, z := 1 } }
+        (hash ("q4k-dp4a-matmul-2row", layer.config.inDim, layer.config.outDim))
+        layer.dp4aMatmulPrepared
+    else
+      GPUBackend.executeWithConfigCached ctx
+        (fusedQ4KMLinearDP4AKernel layer.config)
+        [("weights", layer.weightBuf), ("input_q8", q8Buf), ("output", outputBuf)]
+        { numWorkgroups := (layer.config.outDim, 1, 1), workgroupSize := { x := 32, y := 1, z := 1 } }
+        (hash ("q4k-dp4a-matmul", layer.config.inDim, layer.config.outDim))
+        layer.dp4aMatmulPrepared
+  else  -- Q6_K
+    if layer.config.outDim % 4 == 0 then
+      GPUBackend.executeWithConfigCached ctx
+        (fusedQ6KLinearDP4A4RowKernel layer.config.inDim layer.config.outDim)
+        [("weights", layer.weightBuf), ("input_q8", q8Buf), ("output", outputBuf)]
+        { numWorkgroups := (layer.config.outDim / 4, 1, 1)
+          workgroupSize := { x := 128, y := 1, z := 1 } }
+        (hash ("q6k-dp4a-matmul-4row", layer.config.inDim, layer.config.outDim))
+        layer.dp4aMatmulPrepared
+    else if layer.config.outDim % 2 == 0 then
+      GPUBackend.executeWithConfigCached ctx
+        (fusedQ6KLinearDP4A2RowKernel layer.config.inDim layer.config.outDim)
+        [("weights", layer.weightBuf), ("input_q8", q8Buf), ("output", outputBuf)]
+        { numWorkgroups := (layer.config.outDim / 2, 1, 1)
+          workgroupSize := { x := 64, y := 1, z := 1 } }
+        (hash ("q6k-dp4a-matmul-2row", layer.config.inDim, layer.config.outDim))
+        layer.dp4aMatmulPrepared
+    else
+      GPUBackend.executeWithConfigCached ctx
+        (fusedQ6KLinearDP4AKernel layer.config.inDim layer.config.outDim)
+        [("weights", layer.weightBuf), ("input_q8", q8Buf), ("output", outputBuf)]
+        { numWorkgroups := (layer.config.outDim, 1, 1), workgroupSize := { x := 32, y := 1, z := 1 } }
+        (hash ("q6k-dp4a-matmul", layer.config.inDim, layer.config.outDim))
+        layer.dp4aMatmulPrepared
 
   if profiling then
     let endNs ← IO.monoNanosNow
@@ -2417,9 +2445,12 @@ def LinearLayer.forward [GPUBackend β] (ctx : β) (layer : LinearLayer (GPUBack
 
   let useSubgroups ← GPUBackend.hasSubgroupSupport ctx
 
-  -- dp4a fast path: Q8_1 quantize + INT8 SIMD matmul for Q4_K linears.
+  -- dp4a fast path: Q8_1 quantize + INT8 SIMD matmul for Q4_K and Q6_K linears.
   -- Requires subgroups (used for warp-reduce) and inDim divisible by 32.
-  if (← dp4aEnabled.get) && layer.quantFormat == .Q4_K && useSubgroups
+  -- Q6_K additionally requires inDim % 256 == 0 (super-block size).
+  let dp4aQ4K := layer.quantFormat == .Q4_K
+  let dp4aQ6K := layer.quantFormat == .Q6_K && layer.config.inDim % 256 == 0
+  if (← dp4aEnabled.get) && (dp4aQ4K || dp4aQ6K) && useSubgroups
      && layer.config.inDim % 32 == 0 then
     forwardDP4A ctx layer inputBuf outputBuf
     return
