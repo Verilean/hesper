@@ -3155,6 +3155,97 @@ def forwardFusedGateUp [GPUBackend β] (ctx : β)
     callCountRef.modify (· + 2)
     perShapeAdd gate.config.inDim gate.config.outDim delta
 
+/-- Fused Q/K/V projection forward pass.
+
+    Runs the Q8_1 quantize ONCE on the shared input, then three dp4a
+    matmuls that reuse the same Q8_1 buffer: wQ (outDim_q), wK (outDim_kv),
+    wV (outDim_kv).  Because wK and wV have identical shape, they're
+    combined into one fused kernel (`fusedQ4KMKVDP4AKernel`); wQ runs as
+    a separate matmul.  Overall: 3 projection matmuls + 1 quantize =
+    4 dispatches, vs naive 3 + 3 = 6.
+
+    Requires all three layers to be Q4_K.  wQ may have a different
+    outDim than wK/wV (the typical Gemma-4 case 2048 vs 256). -/
+def forwardFusedQKV [GPUBackend β] (ctx : β)
+    (wQ wK wV : LinearLayer (GPUBackend.Buf β) (GPUBackend.CachedDispatch β))
+    (inputBuf qBuf kBuf vBuf : GPUBackend.Buf β)
+    (kvPreparedRef : IO.Ref (Option (GPUBackend.CachedDispatch β)))
+    : IO Unit := do
+  if wQ.quantFormat != .Q4_K || wK.quantFormat != .Q4_K || wV.quantFormat != .Q4_K then
+    throw (IO.userError "forwardFusedQKV: all three layers must be Q4_K")
+  if wQ.config.inDim != wK.config.inDim || wK.config.inDim != wV.config.inDim then
+    throw (IO.userError "forwardFusedQKV: inDim mismatch between Q/K/V")
+  if wK.config.outDim != wV.config.outDim then
+    throw (IO.userError s!"forwardFusedQKV: wK/wV outDim mismatch {wK.config.outDim} vs {wV.config.outDim}")
+
+  let profiling ← profilingRef.get
+  let startNs ← if profiling then IO.monoNanosNow else pure 0
+
+  let useDP4A ← do
+    let on ← dp4aEnabled.get
+    pure (on && wQ.config.inDim % 32 == 0)
+  if !useDP4A then
+    LinearLayer.forward ctx wQ inputBuf qBuf
+    LinearLayer.forward ctx wK inputBuf kBuf
+    LinearLayer.forward ctx wV inputBuf vBuf
+    return
+
+  let nQ8Blocks := wQ.config.inDim / 32
+  let q8BufBytes : USize := (nQ8Blocks * 9 * 4).toUSize
+  -- Reuse wQ's scratch as the canonical shared Q8_1 buffer.
+  let q8Buf ← match ← wQ.dp4aQ8Buf.get with
+    | some b => pure b
+    | none =>
+      let b ← GPUBackend.allocBuffer ctx q8BufBytes
+      wQ.dp4aQ8Buf.set (some b)
+      pure b
+
+  -- Step 1: quantize input once.  Keyed on wQ so subsequent Q/K/V reuse.
+  GPUBackend.executeWithConfigCached ctx
+    (quantizeQ8_1Kernel wQ.config.inDim)
+    [("input", inputBuf), ("output", q8Buf)]
+    { numWorkgroups := (nQ8Blocks, 1, 1), workgroupSize := { x := 32, y := 1, z := 1 } }
+    (hash ("q8_1-quantize", wQ.config.inDim))
+    wQ.dp4aQuantizePrepared
+
+  -- Step 2: wQ matmul (separate kernel since its outDim differs).  Pick
+  -- 2-row when outDim is even (typical, matches forwardDP4A's heuristic).
+  let qIs2Row := wQ.config.outDim ≤ 5120 && wQ.config.outDim % 2 == 0
+  if qIs2Row then
+    GPUBackend.executeWithConfigCached ctx
+      (fusedQ4KMLinearDP4A2RowKernel wQ.config)
+      [("weights", wQ.weightBuf), ("input_q8", q8Buf), ("output", qBuf)]
+      { numWorkgroups := (wQ.config.outDim / 2, 1, 1)
+        workgroupSize := { x := 64, y := 1, z := 1 } }
+      (hash ("q4k-dp4a-matmul-2row", wQ.config.inDim, wQ.config.outDim))
+      wQ.dp4aMatmulPrepared
+  else
+    GPUBackend.executeWithConfigCached ctx
+      (fusedQ4KMLinearDP4AKernel wQ.config)
+      [("weights", wQ.weightBuf), ("input_q8", q8Buf), ("output", qBuf)]
+      { numWorkgroups := (wQ.config.outDim, 1, 1), workgroupSize := { x := 32, y := 1, z := 1 } }
+      (hash ("q4k-dp4a-matmul", wQ.config.inDim, wQ.config.outDim))
+      wQ.dp4aMatmulPrepared
+
+  -- Step 3: fused wK + wV matmul sharing the same Q8_1 buffer.
+  GPUBackend.executeWithConfigCached ctx
+    (fusedQ4KMKVDP4AKernel wK.config)
+    [("weights_k", wK.weightBuf),
+     ("weights_v", wV.weightBuf),
+     ("input_q8",  q8Buf),
+     ("output_k",  kBuf),
+     ("output_v",  vBuf)]
+    { numWorkgroups := (wK.config.outDim, 1, 1), workgroupSize := { x := 32, y := 1, z := 1 } }
+    (hash ("q4k-kv-dp4a", wK.config.inDim, wK.config.outDim))
+    kvPreparedRef
+
+  if profiling then
+    let endNs ← IO.monoNanosNow
+    let delta := (endNs - startNs).toUInt64
+    totalNanosRef.modify (· + delta)
+    callCountRef.modify (· + 3)
+    perShapeAdd wQ.config.inDim wQ.config.outDim delta
+
 /-- Fused Q4_K dp4a wK + wV forward pass (attention KV projection).
 
     Runs `quantizeQ8_1` once on the shared input, then the fused dp4a
