@@ -991,24 +991,27 @@ def quantizeQ8_1Kernel (inDim : Nat) : ShaderM Unit := do
     ShaderM.writeBuffer (ty := .scalar .u32) "output" outIdx packed
   ) (pure ())
 
-/-- Q4_K × Q8_1 mat-vec kernel using dp4a (INT8 SIMD dot product).
+/-- Q4_K × Q8_1 mat-vec body emitter (dp4a).
 
     llama.cppの `vec_dot_q4_K_q8_1_impl_vmmq` と同じアルゴリズム。
     各32スレッド subgroup が1出力要素 (1行) を計算。
 
-    Per block (256 elements = 8 Q8_1 sub-blocks):
-    - Q4_K header: u32[0] = fp16(d)|fp16(dmin), u32[1..3] = scales/mins
-    - Q4_K quants: u32[4..35] = 128 bytes packed 4-bit values
-    - Q8_1 header: u32[0] per sub-block = fp16(d8)|fp16(s8)
-    - Q8_1 quants: u32[1..8] per sub-block = 32 int8 packed 4-per-u32
-
     Thread layout: lane `t` ∈ [0,32) processes 2 Q8_1 sub-blocks
-    (sub-block pair `t/4`, element offset `t%4`).
-    QR4_K = 2: each lane processes 2 adjacent sub-blocks (low/high nibbles).
+    (sub-block pair `t/4`, element offset `t%4`).  Grid is
+    `(outDim, 1, 1) × 32`.
 
-    Grid: (outDim, 1, 1) workgroups × 32 threads.
--/
-def fusedQ4KMLinearDP4AKernel (config : Config) : ShaderM Unit := do
+    Declares `weights` and `input_q8` buffers, runs the subgroup
+    accumulation, and returns `(outIdx, tid, inBounds, total)` where
+    `total` is the f32 dot-product result (valid on lane 0 of each
+    warp).  The caller is responsible for declaring the output buffer
+    and writing `total` (or a function of it) back.
+
+    Reused by:
+      * `fusedQ4KMLinearDP4AKernel` — identity epilogue (writes `total`).
+      * `lowerMatmulQ4KWithEpilogueKernel` — evaluates a `ScalarExp`
+        tail over `total` and caller-provided side buffers. -/
+def emitQ4KMLinearDP4ABody (config : Config)
+    : ShaderM (Exp (.scalar .u32) × Exp (.scalar .u32) × Exp (.scalar .bool) × Exp (.scalar .f32)) := do
   let wid ← ShaderM.workgroupId
   let lid ← ShaderM.localId
   let outIdx := Exp.vec3X wid
@@ -1021,7 +1024,6 @@ def fusedQ4KMLinearDP4AKernel (config : Config) : ShaderM Unit := do
 
   let _weights ← ShaderM.declareReadOnlyBuffer "weights" (.array (.scalar .u32) totalWeightU32)
   let _input ← ShaderM.declareReadOnlyBuffer "input_q8" (.array (.scalar .u32) q8InputU32Size)
-  let _output ← ShaderM.declareOutputBuffer "output" (.array (.scalar .f32) config.outDim)
 
   let inBounds := Exp.lt outIdx (Exp.litU32 config.outDim)
 
@@ -1157,7 +1159,14 @@ def fusedQ4KMLinearDP4AKernel (config : Config) : ShaderM Unit := do
   ShaderM.varNamed "total" (.scalar .f32)
     (Exp.mul (Exp.subgroupAdd acc) (Exp.litF32 0.5))
   let total : Exp (.scalar .f32) := Exp.var "total"
+  return (outIdx, tid, inBounds, total)
 
+/-- The plain Q4_K dp4a matmul kernel: runs `emitQ4KMLinearDP4ABody`
+    and writes the scalar result to `output` on lane 0.  Epilogue-less
+    dispatch path; `Prim.matmulQ4K` lowers to this. -/
+def fusedQ4KMLinearDP4AKernel (config : Config) : ShaderM Unit := do
+  let (outIdx, tid, inBounds, total) ← emitQ4KMLinearDP4ABody config
+  let _output ← ShaderM.declareOutputBuffer "output" (.array (.scalar .f32) config.outDim)
   ShaderM.if_ (Exp.and (Exp.eq tid (Exp.litU32 0)) inBounds) (do
     ShaderM.writeBuffer (ty := .scalar .f32) "output" outIdx total
   ) (pure ())

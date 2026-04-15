@@ -224,6 +224,106 @@ def runReduceWithEpilogueOp [GPUBackend β]
       workgroupSize := { x := wgSize, y := 1, z := 1 } }
   GPUBackend.executeWithConfigCached ctx shader namedBufs config cacheKey cacheRef
 
+/-- Q4_K matmul (dp4a) with a lane-local pointwise epilogue.
+
+    The matmul body is shared with `fusedQ4KMLinearDP4AKernel` via
+    `Hesper.Layers.Linear.emitQ4KMLinearDP4ABody`, which returns the
+    per-warp `total` scalar and the `(outIdx, tid, inBounds)` triple.
+
+    On lane 0 (`tid == 0`), we evaluate the caller's epilogue
+    `ScalarExp` against the slot array:
+      slot[0]   = `total` (the matmul dot product)
+      slot[k+1] = `epiInputs[k][outIdx + epiReadOffsets[k]]`
+    and write the result to `output`.
+
+    Other lanes of the warp do nothing in the epilogue (matches the
+    base kernel's `if tid == 0` guard).
+
+    Buffer binding naming:
+      "weights", "input_q8"   — owned by the matmul body
+      "epi0", "epi1", …       — the k-th epilogue side input
+      "output"                — result
+-/
+def lowerMatmulQ4KWithEpilogueKernel
+    (config : Hesper.Layers.Linear.Config)
+    (epiInputNames : Array String) (epiBufferSizes : Array Nat)
+    (epiReadOffsets : Array Nat) (epiBody : ScalarExp) : ShaderM Unit := do
+  let (outIdx, tid, inBounds, total) ←
+    Hesper.Layers.Linear.emitQ4KMLinearDP4ABody config
+  -- Declare epilogue side inputs + output.
+  for i in [0 : epiInputNames.size] do
+    let name := epiInputNames[i]!
+    let sz   := epiBufferSizes[i]?.getD config.outDim
+    let _ ← ShaderM.declareReadOnlyBuffer name (.array (.scalar .f32) sz)
+  let _output ← ShaderM.declareOutputBuffer "output" (.array (.scalar .f32) config.outDim)
+  ShaderM.if_ (Exp.and (Exp.eq tid (Exp.litU32 0)) inBounds) (do
+    -- Bind `total` to a named var so the body can reference it via slot 0.
+    let totalName ← ShaderM.var (.scalar .f32) total
+    let mut slots : Array (Exp (.scalar .f32)) := #[Exp.var totalName]
+    for i in [0 : epiInputNames.size] do
+      let name   := epiInputNames[i]!
+      let offset := epiReadOffsets[i]?.getD 0
+      let sz     := epiBufferSizes[i]?.getD config.outDim
+      let idx    := Exp.add outIdx (Exp.litU32 offset)
+      let v      ← ShaderM.readBuffer (ty := .scalar .f32) (n := sz) name idx
+      let vName  ← ShaderM.var (.scalar .f32) v
+      slots := slots.push (Exp.var vName)
+    let result := lowerScalarExp slots epiBody
+    ShaderM.writeBuffer (ty := .scalar .f32) "output" outIdx result
+  ) (pure ())
+
+/-- Dispatch a `Prim.matmulQ4KWithEpilogue` through cached exec.
+
+    Emits TWO dispatches:
+      1. Q8_1 quantize of the f32 `inputBuf` into the layer's own
+         `dp4aQ8Buf`.  Cached on `layer.dp4aQuantizePrepared`, so
+         repeat calls to the same layer reuse the prepared kernel.
+      2. The fused matmul + lane-local epilogue.
+
+    The caller hands us `cacheRef` for the second (matmul+epilogue)
+    kernel; we manage the quantize cache via the layer. -/
+def runMatmulQ4KWithEpilogueOp [GPUBackend β]
+    (ctx : β) (layer : Hesper.Layers.Linear.LinearLayer (GPUBackend.Buf β) (GPUBackend.CachedDispatch β))
+    (inputBuf : GPUBackend.Buf β)
+    (epiInputBufs : Array (GPUBackend.Buf β))
+    (epiBufferSizes : Array Nat) (epiReadOffsets : Array Nat)
+    (epiBody : ScalarExp)
+    (outputBuf : GPUBackend.Buf β)
+    (cacheKey : UInt64) (cacheRef : IO.Ref (Option (GPUBackend.CachedDispatch β)))
+    : IO Unit := do
+  -- Step 1: ensure the Q8_1 scratch buffer exists, then quantize the input.
+  let nQ8Blocks := layer.config.inDim / 32
+  let q8BufBytes : USize := (nQ8Blocks * 9 * 4).toUSize
+  let q8Buf ← match ← layer.dp4aQ8Buf.get with
+    | some b => pure b
+    | none =>
+      let b ← GPUBackend.allocBuffer ctx q8BufBytes
+      layer.dp4aQ8Buf.set (some b)
+      pure b
+  GPUBackend.executeWithConfigCached ctx
+    (Hesper.Layers.Linear.quantizeQ8_1Kernel layer.config.inDim)
+    [("input", inputBuf), ("output", q8Buf)]
+    { numWorkgroups := (nQ8Blocks, 1, 1), workgroupSize := { x := 32, y := 1, z := 1 } }
+    (hash ("q8_1-quantize", layer.config.inDim))
+    layer.dp4aQuantizePrepared
+  -- Step 2: the fused matmul + epilogue.
+  let epiInputNames : Array String :=
+    Array.ofFn (fun (i : Fin epiInputBufs.size) => s!"epi{i.val}")
+  let shader : ShaderM Unit :=
+    lowerMatmulQ4KWithEpilogueKernel layer.config
+      epiInputNames epiBufferSizes epiReadOffsets epiBody
+  let mut namedBufs : List (String × GPUBackend.Buf β) :=
+    [("output", outputBuf), ("weights", layer.weightBuf), ("input_q8", q8Buf)]
+  let n := epiInputBufs.size
+  for i in [0:n] do
+    match epiInputBufs[i]? with
+    | some buf => namedBufs := (s!"epi{i}", buf) :: namedBufs
+    | none     => pure ()
+  let config : ExecConfig :=
+    { numWorkgroups := (layer.config.outDim, 1, 1),
+      workgroupSize := { x := 32, y := 1, z := 1 } }
+  GPUBackend.executeWithConfigCached ctx shader namedBufs config cacheKey cacheRef
+
 /-- Build a complete `ShaderM Unit` that implements a `Prim.pointwise`
     op.  `inputNames[i]` is the buffer binding name for input slot i;
     `inputBroadcast[i] = true` means that input is a 1-element scalar
@@ -320,6 +420,24 @@ def compile [GPUBackend β]
         Hesper.Layers.Linear.LinearLayer.forward ctx layer inputBuf outputBuf
       | _, _ =>
         throw (IO.userError s!"Circuit.compile: missing buffer for matmul op (in={inTr.id}, out={outTr.id})")
+    | Prim.matmulQ4KWithEpilogue layer epiBufferSizes epiReadOffsets epiBody =>
+      let inTr := op.inputs[0]!
+      let outTr := op.outputs[0]!
+      let mut epiBufs : Array (GPUBackend.Buf β) := #[]
+      for k in [1 : op.inputs.size] do
+        match op.inputs[k]? with
+        | some tr =>
+          match lookup tr.id with
+          | some b => epiBufs := epiBufs.push b
+          | none => throw (IO.userError s!"Circuit.compile: missing epi input id={tr.id}")
+        | none => pure ()
+      match lookup inTr.id, lookup outTr.id with
+      | some inputBuf, some outputBuf =>
+        let cacheRef ← IO.mkRef (α := Option (GPUBackend.CachedDispatch β)) none
+        runMatmulQ4KWithEpilogueOp ctx layer inputBuf epiBufs
+          epiBufferSizes epiReadOffsets epiBody outputBuf 0 cacheRef
+      | _, _ =>
+        throw (IO.userError s!"Circuit.compile: missing buffer for matmul-epi op (in={inTr.id}, out={outTr.id})")
     | Prim.pointwise outShape inShapes body =>
       let outTr := op.outputs[0]!
       let mut inBufs : Array (GPUBackend.Buf β) := #[]
@@ -424,6 +542,31 @@ def compileOnce [GPUBackend β]
               Hesper.Layers.Linear.LinearLayer.forward (β := β) _ctx layer inputBuf outputBuf
             | _, _ =>
               throw (IO.userError s!"CompiledCircuit: missing buffer (in={inId} out={outId})")
+        }
+    | Prim.matmulQ4KWithEpilogue layer epiBufferSizes epiReadOffsets epiBody =>
+      let inId := op.inputs[0]!.id
+      let outId := op.outputs[0]!.id
+      let epiIds : Array Nat :=
+        (op.inputs.extract 1 op.inputs.size).map (·.id)
+      let cacheRef : IO.Ref (Option (GPUBackend.CachedDispatch β)) ← IO.mkRef none
+      let cacheKey : UInt64 :=
+        hash ("circuit-matmulQ4K-epi",
+              layer.config.inDim, layer.config.outDim,
+              reprStr epiBody, reprStr epiBufferSizes.toList,
+              reprStr epiReadOffsets.toList)
+      closures := closures.push
+        { run := fun lookup => do
+            match lookup inId, lookup outId with
+            | some inputBuf, some outputBuf =>
+              let mut epiBufs : Array (GPUBackend.Buf β) := #[]
+              for id in epiIds do
+                match lookup id with
+                | some b => epiBufs := epiBufs.push b
+                | none => throw (IO.userError s!"CompiledCircuit: missing matmul-epi input id={id}")
+              runMatmulQ4KWithEpilogueOp _ctx layer inputBuf epiBufs
+                epiBufferSizes epiReadOffsets epiBody outputBuf cacheKey cacheRef
+            | _, _ =>
+              throw (IO.userError s!"CompiledCircuit: missing matmul-epi buffer (in={inId} out={outId})")
         }
     | Prim.pointwise outShape inShapes body =>
       let numel := outShape.numel
