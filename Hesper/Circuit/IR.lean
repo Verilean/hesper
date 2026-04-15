@@ -166,6 +166,29 @@ inductive Prim (BufT : Type) (CacheT : Type) where
       reduction in shared memory. -/
   | reduceLastAxis
       (op : ReduceOp) (inShape : Shape)
+  /-- Reduce-then-pointwise fused into one kernel.
+
+      `inputs[0]` is the reduction input (shape `reduceInShape`); the
+      remaining `inputs[1..]` are the epilogue's full-shape inputs
+      whose shapes are listed in `epilogueInShapes`.  The output has
+      the SAME shape as the reduction input — the body computes one
+      output element per input lane.
+
+      In `body`:
+        * `input 0`        = the scalar reduction result
+        * `input (1..k)`   = `inputs[1..k][lane_id]`
+
+      Dispatch: 1 WG of `min D 256` lanes.  Phase 1 does the strided
+      accumulate + tree reduce just like `Prim.reduceLastAxis`; phase 2
+      reads the scalar from shared memory and every lane evaluates the
+      epilogue body, writing its slot of the output.  This collapses
+      "reduce + use of result via broadcast in a pointwise" into a
+      single kernel — the canonical RMSNorm pattern. -/
+  | reduceLastAxisWithEpilogue
+      (op : ReduceOp)
+      (reduceInShape : Shape)
+      (epilogueInShapes : Array Shape)
+      (epilogueBody : ScalarExp)
   /-- Pure pointwise op.  `outShape` is the shape of the output tensor
       AND of the dispatch grid (fixed 1D `(numel+255)/256 × 256`).
       `inShapes[i]` describes the i-th input:

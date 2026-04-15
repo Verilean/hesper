@@ -285,6 +285,180 @@ def fusePointwise {BufT CacheT : Type}
     | none      => break
   return current.map compactPointwiseInputs
 
+/-! ## Reduce-with-epilogue fusion
+
+When a `reduceLastAxis` is consumed by a single `pointwise` whose
+body uses the reduction's result as a scalar broadcast (slot shape
+`#[1]`), we can collapse them into one kernel — `Phase 1`: the
+reduction; `Phase 2`: per-lane evaluation of the pointwise body with
+the reduction result substituted for `input 0`.  This is the canonical
+RMSNorm-style "reduce → use-result-broadcast" pattern.
+
+Output shape of the consumer must equal the reduction's input shape
+(the epilogue "expands" back to the reduction's domain).  Other
+consumer inputs must be full-shape — no nested broadcasts in the
+epilogue tail (they'd require multi-WG handling we don't have yet).
+
+Termination: each step strictly reduces op count by 1. -/
+
+/-- Walk a chain of scalar-only pointwise ops starting from a tensor
+    id `startId`.  Returns `(scalarChainExp, finalConsumerIdx,
+    finalConsumerSlotIdx)`:
+
+      - `scalarChainExp`: a `ScalarExp` over a single `input 0` (which
+        the caller will substitute for the reduction result) that
+        represents the composed scalar computation reaching the final
+        full-shape consumer.  If `startId` is consumed directly by a
+        full-shape op, this is just `.input 0` (identity).
+      - `finalConsumerIdx`: index in `ops` of the full-shape pointwise
+        op that ultimately consumes the chain.
+      - `finalConsumerSlotIdx`: which slot of that op the chain feeds.
+
+    Returns `none` if there's no path to a full-shape consumer (e.g.
+    the chain dead-ends, branches, or the consumer is non-pointwise),
+    or if the chain has multiple consumers at any step (uniqueness
+    required for safe inlining), or if any intermediate op is the
+    caller-protected output.
+
+    Each scalar-stage hop must be a pointwise op whose:
+      - output shape is `#[1]` (still scalar);
+      - inputs are all `#[1]` (purely scalar — no full-shape mixed in);
+      - is the unique consumer of its input scalar.
+-/
+private partial def followScalarChain {BufT CacheT : Type}
+    (ops : Array (Op BufT CacheT))
+    (protectedIds : Array Nat)
+    (startId : Nat)
+    (acc : ScalarExp)
+    : Option (ScalarExp × Nat × Nat) := Id.run do
+  if protectedIds.any (· == startId) then return none
+  if countConsumers ops startId != 1 then return none
+  -- Find the unique consumer.
+  let mut consumerOpt : Option (Nat × { op : Op BufT CacheT // True }) := none
+  for cIdx in [0 : ops.size] do
+    match ops[cIdx]? with
+    | some C =>
+      if C.inputs.any (fun tr => tr.id == startId) then
+        consumerOpt := some (cIdx, ⟨C, trivial⟩); break
+    | none => pure ()
+  let some (cIdx, ⟨C, _⟩) := consumerOpt | return none
+  let .pointwise cOutShape cInShapes cBody := C.prim | return none
+  -- Locate the slot in C that consumes startId.
+  let mut slotOpt : Option Nat := none
+  for j in [0 : C.inputs.size] do
+    match C.inputs[j]? with
+    | some tr => if tr.id == startId then slotOpt := some j; break
+    | none => pure ()
+  let some slot := slotOpt | return none
+  if (cInShapes[slot]?.getD #[]) != #[1] then return none
+  if cOutShape != #[1] then
+    -- Reached the full-shape tail.  All non-startId slots must be
+    -- full-shape (no nested broadcasts in the tail).  Return the chain
+    -- expression and the consumer position; caller will splice it.
+    let mut otherShapesOK := true
+    for j in [0 : C.inputs.size] do
+      if j != slot then
+        if (cInShapes[j]?.getD #[]) != cOutShape then
+          otherShapesOK := false
+    if !otherShapesOK then return none
+    return some (acc, cIdx, slot)
+  -- Still scalar-stage.  All inputs must be `#[1]` so the body is
+  -- evaluable from `acc` + scalar broadcasts of the OTHER inputs.
+  -- For now we only allow chains where the scalar-stage op's only
+  -- input is the producer's scalar (no extra broadcast scalars at
+  -- intermediate stages — keeps the body composition simple).
+  if C.inputs.size != 1 then return none
+  -- Compose: substitute acc for `input 0` in cBody.
+  let nextAcc := cBody.subst #[acc]
+  let cOutId := C.outputs[0]!.id
+  followScalarChain ops protectedIds cOutId nextAcc
+
+private def fuseReduceEpilogueStep {BufT CacheT : Type}
+    (ops : Array (Op BufT CacheT)) (protectedIds : Array Nat)
+    : Option (Array (Op BufT CacheT)) := Id.run do
+  for pIdx in [0 : ops.size] do
+    match ops[pIdx]? with
+    | none => pure ()
+    | some P =>
+    let .reduceLastAxis rop pInShape := P.prim | continue
+    let pOutId := P.outputs[0]!.id
+    -- Walk the scalar chain starting from P's output.  acc = `.input 0`
+    -- (the reduction's scalar; the caller of the chain function will
+    -- bind it to the actual scratch[0] read in the lowering).
+    let some (chainExp, qIdx, pSlot) :=
+      followScalarChain ops protectedIds pOutId (.input 0) | continue
+    let some Q := ops[qIdx]? | continue
+    let .pointwise qOutShape qInShapes qBody := Q.prim | continue
+    if qOutShape != pInShape then continue
+    -- Build the epilogue body: substitute the chain expression at the
+    -- pSlot and renumber other slots to 1, 2, …
+    let mut argMap : Array ScalarExp := #[]
+    let mut nextOther : Nat := 1
+    for j in [0 : Q.inputs.size] do
+      if j == pSlot then
+        argMap := argMap.push chainExp
+      else
+        argMap := argMap.push (.input nextOther)
+        nextOther := nextOther + 1
+    let newBody := qBody.subst argMap
+    -- Build new op.
+    let pIn := P.inputs[0]!
+    let mut newInputs : Array TensorRef := #[pIn]
+    let mut epiShapes : Array Shape := #[]
+    for j in [0 : Q.inputs.size] do
+      if j != pSlot then
+        match Q.inputs[j]?, qInShapes[j]? with
+        | some tr, some sh =>
+          newInputs := newInputs.push tr
+          epiShapes := epiShapes.push sh
+        | _, _ => pure ()
+    let newOp : Op BufT CacheT :=
+      { prim := Prim.reduceLastAxisWithEpilogue rop pInShape epiShapes newBody
+        inputs := newInputs
+        outputs := Q.outputs }
+    -- Determine which scalar-chain ops to drop: walk the chain from
+    -- pOutId again, collect their indices.
+    let mut toDrop : Array Nat := #[pIdx, qIdx]
+    let mut cursor := pOutId
+    while true do
+      let mut nextIdx : Option Nat := none
+      for kIdx in [0 : ops.size] do
+        if kIdx == qIdx then continue  -- Q is the tail, already in toDrop
+        match ops[kIdx]? with
+        | some opK =>
+          if opK.inputs.any (fun tr => tr.id == cursor) then
+            nextIdx := some kIdx; break
+        | none => pure ()
+      match nextIdx with
+      | some kIdx =>
+        toDrop := toDrop.push kIdx
+        match ops[kIdx]? with
+        | some opK => cursor := opK.outputs[0]!.id
+        | none => break
+      | none => break
+    -- Splice: drop everything in toDrop, push newOp at qIdx's position.
+    let mut out : Array (Op BufT CacheT) := #[]
+    for k in [0 : ops.size] do
+      if toDrop.any (· == k) then
+        if k == qIdx then out := out.push newOp
+      else
+        match ops[k]? with
+        | some opk => out := out.push opk
+        | none => pure ()
+    return some out
+  return none
+
+/-- Iterate `fuseReduceEpilogueStep` until fixpoint. -/
+def fuseReduceEpilogue {BufT CacheT : Type}
+    (ops : Array (Op BufT CacheT)) (protectedIds : Array Nat)
+    : Array (Op BufT CacheT) := Id.run do
+  let mut current := ops
+  for _ in [0 : ops.size] do
+    match fuseReduceEpilogueStep current protectedIds with
+    | some next => current := next
+    | none      => break
+  return current
+
 /-! ## Lowering for OpExt -/
 
 /-- Stage 2 compile: run fusePointwise + mergeSameDispatch, then
@@ -304,7 +478,14 @@ def compileWithPasses [GPUBackend β]
   -- caller so we can't legally inline them away.
   let mergedProtected : Array Nat :=
     state.externals.foldl (init := protectedIds) (fun acc (tr, _) => acc.push tr.id)
-  let opsFused := fusePointwise state.ops mergedProtected
+  -- Pass order: reduce-with-epilogue first, then pointwise chain
+  -- fusion, then matmul same-dispatch merge.  fuseReduceEpilogue
+  -- looks for `reduce → (scalar-pointwise chain) → full-shape pointwise`
+  -- patterns and collapses them to a single reduce-with-epilogue op;
+  -- fusePointwise then handles any remaining same-shape pointwise
+  -- chains.
+  let opsRedFused := fuseReduceEpilogue state.ops mergedProtected
+  let opsFused := fusePointwise opsRedFused mergedProtected
   let opsExt := mergeSameDispatch opsFused
 
   -- Allocate intermediate buffers for op outputs the caller didn't
@@ -391,6 +572,29 @@ def compileWithPasses [GPUBackend β]
               runReduceOp ctx rop D inBuf outBuf cacheKey cacheRef
             | _, _ =>
               throw (IO.userError s!"compileWithPasses: missing reduce buffer (in={inId} out={outId})")
+        }
+    | PrimExt.base (Prim.reduceLastAxisWithEpilogue rop reduceInShape epiShapes body) =>
+      let D := reduceInShape.numel
+      let inId := op.inputs[0]!.id
+      let outId := op.outputs[0]!.id
+      let epiIds : Array Nat :=
+        (op.inputs.extract 1 op.inputs.size).map (·.id)
+      let cacheRef : IO.Ref (Option (GPUBackend.CachedDispatch β)) ← IO.mkRef none
+      let cacheKey : UInt64 :=
+        hash ("circuit-reduce-epi", reprStr rop, D, reprStr body,
+              reprStr epiShapes.toList)
+      closures := closures.push
+        { run := fun lookup => do
+            match lookup inId, lookup outId with
+            | some reduceBuf, some outBuf =>
+              let mut epiBufs : Array (GPUBackend.Buf β) := #[]
+              for id in epiIds do
+                match lookup id with
+                | some b => epiBufs := epiBufs.push b
+                | none => throw (IO.userError s!"compileWithPasses: missing epi input id={id}")
+              runReduceWithEpilogueOp ctx rop D body reduceBuf epiBufs outBuf cacheKey cacheRef
+            | _, _ =>
+              throw (IO.userError s!"compileWithPasses: missing reduce-epi buffer (in={inId} out={outId})")
         }
   let externalIds := state.externals.map (fun (tr, _) => tr.id)
   let producedIds := state.ops.foldl (init := (#[] : Array Nat)) fun acc op =>
