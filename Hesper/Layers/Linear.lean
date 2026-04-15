@@ -1776,24 +1776,24 @@ def fusedQ6KLinearDP4AKernel (inDim outDim : Nat) (gridX : Nat := 0) : ShaderM U
     let vh := Exp.shiftRight vhRaw vhShift
 
     -- Read 2 scales: scales[scale_offset], scales[scale_offset + 4]
-    -- (scales start at byte 192, each is 1 signed byte)
+    -- (scales start at byte 192, each is 1 signed byte).
+    -- Keep scales as i32 (sign-extended from i8) throughout the inner loop;
+    -- defer the f32 cast until after the int×int multiply with dot_0.
+    -- This matches llama.cpp's `d8[i] * (dp4a × sc)` pattern — 1 FFMA per
+    -- iter instead of 2 (the old `d8 * (f32(dot) * f32(sc))` required two
+    -- f32 conversions and two FFMAs).  SASS confirms: llama has 3 FFMA
+    -- vs hesper's 24 in the old version.
     let sc0Byte ← readByte blockByteBase (Exp.add (Exp.litU32 192) scaleOff)
     let sc1Byte ← readByte blockByteBase (Exp.add (Exp.litU32 192) (Exp.add scaleOff (Exp.litU32 4)))
-    -- Sign-extend: if byte ≥ 128, subtract 256.
-    let scaleToF32 (b : Exp (.scalar .u32)) : Exp (.scalar .f32) :=
+    -- Sign-extend i8 → i32 via "or 0xFFFFFF00 when byte ≥ 128" trick; bit
+    -- pattern is identical to two's-complement signed extension, so reinterpret
+    -- the u32 as i32 afterwards for the signed multiply with dot_0 (i32).
+    let signExtI8 (b : Exp (.scalar .u32)) : Exp (.scalar .u32) :=
       Exp.select (Exp.ge b (Exp.litU32 128))
-        (Exp.sub (Exp.toF32 b) (Exp.litF32 256.0))
-        (Exp.toF32 b)
-    let sc0 := scaleToF32 sc0Byte
-    let sc1 := scaleToF32 sc1Byte
+        (Exp.bitOr b (Exp.litU32 0xFFFFFF00)) b
+    let sc0I : Exp (.scalar .i32) := Exp.toI32 (signExtI8 sc0Byte)
+    let sc1I : Exp (.scalar .i32) := Exp.toI32 (signExtI8 sc1Byte)
 
-    -- Read Q8_1 sub-blocks bq8_offset and bq8_offset+2.
-    -- Q8_1 layout per block: u32[0] = d (f32 bitcast), u32[1..8] = 32 int8 packed.
-    -- In input_q8 buffer, block k starts at u32 index k*9.
-    -- q8[sub].qs as int[] @ offset (iqs%8): each int = 4 bytes = u32 index 1 + (iqs%8/4)...
-    --   wait, qs[32] int8s = 8 ints. q8[sub].qs as (int*) [0..7]. q8[sub].qs @ iqs%8
-    --   requires iqs%8 < 8 → u32 index = 1 + (iqs%8).
-    -- Per block: 9 u32 (1 header + 8 quants).
     let q8BlockIdx i :=
       Exp.add (Exp.mul blockIdx (Exp.litU32 (8 * 9)))
               (Exp.mul (Exp.add bq8Off (Exp.mul (Exp.litU32 i) (Exp.litU32 2))) (Exp.litU32 9))
@@ -1808,23 +1808,22 @@ def fusedQ6KLinearDP4AKernel (inDim outDim : Nat) (gridX : Nat := 0) : ShaderM U
     let d8A : Exp (.scalar .f32) := Exp.bitcast q8Hdr0
     let d8B : Exp (.scalar .f32) := Exp.bitcast q8Hdr1
 
-    -- QR6_K=2 iterations.
-    -- i=0:
+    -- QR6_K=2 iterations. dot × sc done in i32; single FFMA d8 × f32(dot*sc).
     let vil_0 := Exp.bitAnd vl (Exp.litU32 0x0F0F0F0F)
     let vih_0 := Exp.bitAnd (Exp.shiftLeft vh (Exp.litU32 4)) (Exp.litU32 0x30303030)
     let vi_0 := sub32PerByte (Exp.bitOr vil_0 vih_0)
     let dot_0 := Exp.dot4I8Packed vi_0 u0
-    let sumf_0 := Exp.mul d8A (Exp.mul (Exp.toF32 dot_0) sc0)
+    let dotSc_0 := Exp.mul dot_0 sc0I
+    let sumf_0 := Exp.mul d8A (Exp.toF32 dotSc_0)
 
-    -- i=1: shift vl right by 4, vh right by 4
     let vil_1 := Exp.bitAnd (Exp.shiftRight vl (Exp.litU32 4)) (Exp.litU32 0x0F0F0F0F)
     let vih_1 := Exp.bitAnd (Exp.shiftLeft (Exp.shiftRight vh (Exp.litU32 4)) (Exp.litU32 4))
                             (Exp.litU32 0x30303030)
     let vi_1 := sub32PerByte (Exp.bitOr vil_1 vih_1)
     let dot_1 := Exp.dot4I8Packed vi_1 u1
-    let sumf_1 := Exp.mul d8B (Exp.mul (Exp.toF32 dot_1) sc1)
+    let dotSc_1 := Exp.mul dot_1 sc1I
+    let sumf_1 := Exp.mul d8B (Exp.toF32 dotSc_1)
 
-    -- Per-block: acc += d * (sumf_0 + sumf_1)
     ShaderM.assign "acc" (Exp.add acc (Exp.mul d (Exp.add sumf_0 sumf_1)))
 
   -- All 32 lanes contribute unique partials (iqs=tid). Standard subgroupAdd.
