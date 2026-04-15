@@ -146,3 +146,38 @@ much-larger kernels (mul_mat_q does whole prefill rows in one call) and
 from CUDA graphs in recent builds.
 
 Last updated: 2026-04-15.
+
+## Per-kernel execution time profile (2026-04-16)
+
+**Key finding: kernel count is NOT the bottleneck.**
+
+Measured dispatch counts:
+  llama.cpp Vulkan (Gemma 4 E4B Q4_K_M): **1,186 kernels/tok**, 98 TPS
+  llama.cpp CUDA  (same):                   187 kernels/tok,  115 TPS
+  hesper (current):                         975 kernels/tok,  49 TPS
+
+hesper already has FEWER dispatches than Vulkan (975 vs 1186) but 2×
+slower.  The gap is per-dispatch execution time, not count.
+
+**Top 5 hot kernels (hesper, nsys decode 30 tokens):**
+
+| Rank | Total ms |  %  | /tok | Avg µs | Kernel                                  |
+|-----:|---------:|----:|-----:|-------:|-----------------------------------------|
+|    1 | 167      | 34% |  45  |  122.6 | q4k-gate-up-dp4a-4row (ffn gate+up)    |
+|    2 |  54      | 11% |  23  |   78.9 | q4k-dp4a-matmul-2row (wO)              |
+|    3 |  53      | 11% |  23  |   78.4 | q6k-dp4a-matmul-4row (ffn_down)        |
+|    4 |  40      |  8% |   1  | 1259   | q6k-dp4a-matmul-4row (lm_head)         |
+|    5 |  21      |  4% |  38  |   18.1 | q4k-dp4a-matmul-2row (wQ)              |
+
+**FFN gate+up analysis:**
+- Theoretical memory-bound time: 29.4 MB / 400 GB/s sustained = 74 µs
+- Hesper actual: **122 µs (60% efficiency)**
+- llama.cpp Vulkan's 2-dispatch equivalent (2 × mul_mat_vec_q4_k): estimated ~74 µs
+
+hesper's "fused" gate+up kernel is **~1.6× slower than the naive
+2-dispatch path on Vulkan**.  Candidate causes: 4-row cooperative
+smem access patterns, register pressure (34 regs), Q8_1 smem
+bandwidth bottleneck at 4 warps × 72 KB.
+
+Closing this single kernel's gap (122 → 74 µs) would save 2.2 ms/tok
+= **+10 TPS**.  More than any fusion work remaining.
