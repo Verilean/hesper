@@ -154,6 +154,30 @@ inductive Prim (BufT : Type) (CacheT : Type) where
       layer, so it owns the prepared-dispatch cache. -/
   | matmulQ4K
       (layer : Hesper.Layers.Linear.LinearLayer BufT CacheT)
+  /-- Q4_K matmul with a lane-local pointwise epilogue.
+
+      `inputs[0]`  = matmul input (f32, pre-Q8_1 quantize)  [shape inDim]
+      `inputs[1..]` = epilogue side inputs, each length = epiBufferSizes[k]
+
+      In `epiBody`:
+        `input 0`         = the matmul dot product (f32) at outIdx
+        `input (k+1)`     = `inputs[k+1][outIdx + epiReadOffsets[k]]`
+
+      The matmul's dispatch shape is unchanged `(outDim, 1, 1) × 32`;
+      the epilogue runs on lane 0 after the subgroup reduction — so
+      it's purely lane-local.  Cross-lane / cross-WG reductions in
+      the epilogue are NOT supported (the whole kernel is one warp
+      per output row).
+
+      `epiReadOffsets[k]` lets the caller slice a larger buffer by a
+      compile-time offset — used e.g. for PLE where the per-layer
+      input table is `plTotalSize = outDim * numLayers` and we read
+      at `outIdx + plOffset`.  Default 0 = read at outIdx. -/
+  | matmulQ4KWithEpilogue
+      (layer          : Hesper.Layers.Linear.LinearLayer BufT CacheT)
+      (epiBufferSizes : Array Nat)
+      (epiReadOffsets : Array Nat)
+      (epiBody        : ScalarExp)
   /-- Reduction along the last axis.  For the MVP we handle only
       `inShape = [D]`; the output is always `#[1]` (one scalar), which
       composes with pointwise ops via the existing broadcast path.
@@ -276,6 +300,30 @@ def emitOp (prim : Prim BufT CacheT) (inputs : Array TensorRef)
 def matmulQ4K (input : TensorRef) (layer : Hesper.Layers.Linear.LinearLayer BufT CacheT)
     : CircuitM BufT CacheT TensorRef := do
   let outs ← emitOp (Prim.matmulQ4K layer) #[input]
+    #[(#[layer.config.outDim], .f32, .Global)]
+  return outs[0]!
+
+/-- Q4_K matmul with a lane-local pointwise epilogue.
+
+    `epiInputs[k]` is a TensorRef; `epiReadOffsets[k]` is the offset
+    at which each epilogue lane reads its k-th side input (defaults to
+    zero when the array is shorter than `epiInputs`).
+
+    In `epiBody`, `input 0` refers to the matmul dot product and
+    `input (k+1)` to `epiInputs[k][outIdx + epiReadOffsets[k]]`. -/
+def matmulQ4KWithEpilogue
+    (input : TensorRef)
+    (layer : Hesper.Layers.Linear.LinearLayer BufT CacheT)
+    (epiInputs : Array TensorRef)
+    (epiBody : ScalarExp)
+    (epiReadOffsets : Array Nat := #[])
+    : CircuitM BufT CacheT TensorRef := do
+  let epiBufferSizes : Array Nat := epiInputs.map (fun tr => tr.shape.numel)
+  let offsets : Array Nat :=
+    Array.ofFn (n := epiInputs.size) (fun i => epiReadOffsets[i.val]?.getD 0)
+  let outs ← emitOp
+    (Prim.matmulQ4KWithEpilogue layer epiBufferSizes offsets epiBody)
+    (#[input] ++ epiInputs)
     #[(#[layer.config.outDim], .f32, .Global)]
   return outs[0]!
 

@@ -539,6 +539,34 @@ def compileWithPasses [GPUBackend β]
                 throw (IO.userError s!"compileWithPasses: missing buffer (in={inId}, out={outId})")
           }
       | _, _ => throw (IO.userError "compileWithPasses: matmulQ4K op missing in/out tensor")
+    | PrimExt.base (Prim.matmulQ4KWithEpilogue layer epiBufferSizes epiReadOffsets epiBody) =>
+      match op.inputs[0]?, op.outputs[0]? with
+      | some inT, some outT =>
+        let inId := inT.id
+        let outId := outT.id
+        let epiIds : Array Nat :=
+          (op.inputs.extract 1 op.inputs.size).map (·.id)
+        let cacheRef : IO.Ref (Option (GPUBackend.CachedDispatch β)) ← IO.mkRef none
+        let cacheKey : UInt64 :=
+          hash ("circuit-matmulQ4K-epi",
+                layer.config.inDim, layer.config.outDim,
+                reprStr epiBody, reprStr epiBufferSizes.toList,
+                reprStr epiReadOffsets.toList)
+        closures := closures.push
+          { run := fun lookup => do
+              match lookup inId, lookup outId with
+              | some inputBuf, some outputBuf =>
+                let mut epiBufs : Array (GPUBackend.Buf β) := #[]
+                for id in epiIds do
+                  match lookup id with
+                  | some b => epiBufs := epiBufs.push b
+                  | none => throw (IO.userError s!"compileWithPasses: missing matmul-epi input id={id}")
+                runMatmulQ4KWithEpilogueOp ctx layer inputBuf epiBufs
+                  epiBufferSizes epiReadOffsets epiBody outputBuf cacheKey cacheRef
+              | _, _ =>
+                throw (IO.userError s!"compileWithPasses: missing matmul-epi buffer (in={inId}, out={outId})")
+          }
+      | _, _ => throw (IO.userError "compileWithPasses: matmul-epi op missing in/out tensor")
     | PrimExt.base (Prim.pointwise outShape inShapes body) =>
       let numel := outShape.numel
       let inIds := op.inputs.map (·.id)
