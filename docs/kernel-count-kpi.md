@@ -25,7 +25,9 @@ Empirically, each kernel launch costs ~10 µs of wall-clock
 | hesper (fused QKV q8_1 share) | " | ~38,800 | ~1,295 | 6.9× |
 | hesper (fused post-norm) | " | 36,827 | 1,227 | 6.6× |
 | hesper (fused RoPE-K+KVwrite) | " | 36,696 | 1,223 | 6.5× |
-| **hesper (current)** | " | **36,684** | **1,222** | **6.5×** |
+| hesper (fused RoPE-K+KVwrite) | " | 36,696 | 1,223 | 6.5× |
+| hesper (Circuit DSL: wO via runCached) | 2026-04-15 | 35,326 | 1,178 | 6.3× |
+| **hesper (current)** | " | **35,326** | **1,178** | **6.3×** |
 
 ## Corresponding TPS
 

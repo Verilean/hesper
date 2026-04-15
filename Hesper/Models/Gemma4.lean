@@ -1568,8 +1568,21 @@ def forwardBlock [GPUBackend β] (ctx : β)
           ({ numWorkgroups := (numHeads, 1, 1) : Hesper.ExecConfig })
 
     -- Output projection: attnOut [numHeads * headDim] → normedBuf [hiddenSize]
+    -- Circuit-DSL: single matmulQ4K op via runCached (build once, replay).
+    -- Equivalent to direct LinearLayer.forward; sets up the IR for later
+    -- fusion with the post-attn norm chain.
     Hesper.WGSL.Execute.withSection "oProj" do
-      Linear.LinearLayer.forward ctx block.attention.wO state.attnOutBuf state.normedBuf
+      let keyO := hash ("circuitWO-cuda", block.attention.wO.config.inDim,
+                        block.attention.wO.config.outDim, li)
+      let ccRefO ← Hesper.Circuit.getGlobalCircuitRef (β := β) keyO
+      Hesper.Circuit.runCached ctx ccRefO
+        (do
+          let attnOut ← Hesper.Circuit.CircuitM.registerExternal
+            (BufT := GPUBackend.Buf β) (CacheT := GPUBackend.CachedDispatch β)
+            state.attnOutBuf #[block.attention.wO.config.inDim] .f32 .Global
+          let _o ← Hesper.Circuit.CircuitM.matmulQ4K attnOut block.attention.wO
+          pure ())
+        [(0, state.attnOutBuf), (1, state.normedBuf)]
   else
     -- Fallback: skip attention (shouldn't happen)
     Linear.LinearLayer.forward ctx block.attention.wO state.qBuf state.normedBuf
@@ -1732,8 +1745,20 @@ def forwardBlock [GPUBackend β] (ctx : β)
           (geluMulKernel cfg.intermediateSize)
           [("gate", state.gateBuf), ("up", state.upBuf), ("output", state.geluBuf)]
           (.dispatch1D cfg.intermediateSize)
+    -- ffn.down: gelu*up [intermediateSize] → ffnOut [hiddenSize].  Same
+    -- Circuit DSL pattern as wO above.
     Hesper.WGSL.Execute.withSection "ffnDown" do
-      Linear.LinearLayer.forward ctx block.ffn.down state.geluBuf state.ffnOutBuf
+      let keyFD := hash ("circuitFFNDown-cuda", block.ffn.down.config.inDim,
+                         block.ffn.down.config.outDim, li)
+      let ccRefFD ← Hesper.Circuit.getGlobalCircuitRef (β := β) keyFD
+      Hesper.Circuit.runCached ctx ccRefFD
+        (do
+          let gelu ← Hesper.Circuit.CircuitM.registerExternal
+            (BufT := GPUBackend.Buf β) (CacheT := GPUBackend.CachedDispatch β)
+            state.geluBuf #[block.ffn.down.config.inDim] .f32 .Global
+          let _o ← Hesper.Circuit.CircuitM.matmulQ4K gelu block.ffn.down
+          pure ())
+        [(0, state.geluBuf), (1, state.ffnOutBuf)]
 
     -- Post-FFN norm + residual, fused.  output = RMSNorm(ffn_out) * scale + attn_residual.
     Hesper.WGSL.Execute.withSection "postFFNNorm" do
