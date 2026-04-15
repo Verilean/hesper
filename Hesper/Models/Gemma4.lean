@@ -1640,14 +1640,31 @@ def forwardBlock [GPUBackend β] (ctx : β)
     -- Fuse ffnNorm into gate/up matmuls when possible (Q4_K + subgroups).
     Hesper.WGSL.Execute.withSection "ffnNorm" do
       RMSNorm.forward ctx block.ffnNorm state.attnResidualBuf state.normedBuf
-    Hesper.WGSL.Execute.withSection "ffnGateUp" do
-      Linear.LinearLayer.forward ctx block.ffn.gate state.normedBuf state.gateBuf
-      Linear.LinearLayer.forward ctx block.ffn.up state.normedBuf state.upBuf
-    Hesper.WGSL.Execute.withSection "ffnGeluMul" do
-      ce "geluMul2"
-        (geluMulKernel cfg.intermediateSize)
-        [("gate", state.gateBuf), ("up", state.upBuf), ("output", state.geluBuf)]
-        (.dispatch1D cfg.intermediateSize)
+    -- Fused gate + up + GELU × mul.  When dp4a + subgroups are enabled
+    -- and both layers are Q4_K, `forwardFusedGateUp` does (Q8_1 quantize) +
+    -- 1 matmul kernel writing GELU(gate)·up directly into geluBuf, saving
+    -- the separate geluMul dispatch and one full Q8_1 input read vs the
+    -- two-dispatch path.  Falls back to the 2-dispatch + geluMul sequence
+    -- when conditions aren't met.
+    Hesper.WGSL.Execute.withSection "ffnGateUpMul" do
+      let useFused := block.ffn.gate.quantFormat == .Q4_K
+                    && block.ffn.up.quantFormat == .Q4_K
+                    && block.ffn.gate.config.inDim == block.ffn.up.config.inDim
+                    && block.ffn.gate.config.outDim == block.ffn.up.config.outDim
+      if useFused then
+        let key := hash ("ffnGateUpDP4A", block.ffn.gate.config.inDim, block.ffn.gate.config.outDim)
+        let ref ← match kcr with
+          | some k => k.getRef key
+          | none => IO.mkRef none
+        Linear.forwardFusedGateUp ctx block.ffn.gate block.ffn.up
+          state.normedBuf state.geluBuf ref
+      else
+        Linear.LinearLayer.forward ctx block.ffn.gate state.normedBuf state.gateBuf
+        Linear.LinearLayer.forward ctx block.ffn.up state.normedBuf state.upBuf
+        ce "geluMul2"
+          (geluMulKernel cfg.intermediateSize)
+          [("gate", state.gateBuf), ("up", state.upBuf), ("output", state.geluBuf)]
+          (.dispatch1D cfg.intermediateSize)
     Hesper.WGSL.Execute.withSection "ffnDown" do
       Linear.LinearLayer.forward ctx block.ffn.down state.geluBuf state.ffnOutBuf
 
