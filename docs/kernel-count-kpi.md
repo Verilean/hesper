@@ -30,7 +30,19 @@ Empirically, each kernel launch costs ~10 µs of wall-clock
 | hesper (Circuit DSL: layerScale+pleScale3 auto-fused via ScalarExp) | 2026-04-15 | 34,191 | 1,140 | 6.1× |
 | hesper (Circuit DSL: 3 RMSNorm sites via reduce-with-epilogue fusion) | 2026-04-15 | 33,997 | 1,133 | 6.1× |
 | hesper (fused RMSNorm+Q8_1 for attnNorm→wQKV + ffnNorm→gate+up) | 2026-04-15 | 32,202 | 1,073 | 5.7× |
-| **hesper (current)** | " | **32,202** | **1,073** | **5.7×** |
+| hesper (fused 3-in-1 per-head qkvNorm)                           | 2026-04-15 | 30,721 | 1,024 | 5.5× |
+| **hesper (current)** | " | **30,721** | **1,024** | **5.5×** |
+
+Per-head qNorm+kNorm+vNorm previously ran as 3 separate dispatches per
+`hasKV` layer.  A single hand-composed kernel with grid
+`(numHeads, 3, 1)` now multiplexes them via `wg_id.y` — q uses its
+scale (8 heads), k uses its scale (4 heads, WGs with x>=4 early-return),
+v is bare (4 heads).  `wg_id.x/y` are workgroup-uniform so the
+early-return branch never straddles a barrier.
+
+Savings: −49 kernels/tok, +0.4 TPS (47.8).  Decode bit-identical, and
+`fused-qkv-norm-gpu-test` proves the GPU output matches a per-head
+CPU reference to f32 precision on all three Q/K/V output buffers.
 
 First real cross-domain fusion: RMSNorm (global sum-of-squares reduce)
 merged with the Q8_1 quantize step (per-block max-abs reduce) of the

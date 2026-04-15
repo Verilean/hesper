@@ -473,6 +473,114 @@ def perHeadBareRMSNormKernel (numHeads headDim : Nat) (eps : Float) (workgroupSi
     let val ← ShaderM.readBuffer (ty := .scalar .f32) (n := totalElements) "input" (Exp.add headBase i)
     ShaderM.writeBuffer (ty := .scalar .f32) "output" (Exp.add headBase i) (Exp.mul val rms)
 
+/-- Fused per-head qNorm + kNorm + vNorm, 3 separate dispatches collapsed
+    into one.
+
+    Dispatch: `(numHeads, 3, 1)`, workgroup size `min headDim 256`.
+    `wg_id.y` multiplexes:
+      0 = qNorm  (learned scale; active for `wg_id.x < numHeads`)
+      1 = kNorm  (learned scale; active for `wg_id.x < numKVHeads`)
+      2 = vNorm  (NO scale;      active for `wg_id.x < numKVHeads`)
+
+    Each WG handles exactly one head's `[headDim]` slice: cooperative
+    sum-of-squares + tree reduction + per-lane normalise-and-write.
+    Identical math to `perHeadRMSNormKernel` / `perHeadBareRMSNormKernel`
+    — just multiplexed by the grid's y dimension.
+
+    WGs outside the valid head range (`wg_id.y in {1,2}` and
+    `wg_id.x >= numKVHeads`) early-return BEFORE touching shared memory
+    or barriers.  That's safe because `wg_id.x/y` are workgroup-uniform:
+    the whole WG takes the same branch so no lane ever reaches a
+    barrier its siblings skipped.
+
+    Saves 2 dispatches per `cfg.hasKV` layer per token (3 → 1). -/
+def fusedPerHeadQKVNormKernel
+    (numHeads numKVHeads headDim : Nat) (eps : Float) : ShaderM Unit := do
+  let wid ← ShaderM.workgroupId
+  let lid ← ShaderM.localId
+  let headIdx := Exp.vec3X wid
+  let yIdx := Exp.vec3Y wid
+  let tid := Exp.vec3X lid
+  let qTotal := numHeads * headDim
+  let kvTotal := numKVHeads * headDim
+  -- Buffer declarations.  All six (q in/scale/out, k in/scale/out, v
+  -- in/out) are bound; the branch picks which ones this WG reads.
+  let _qIn    ← ShaderM.declareInputBuffer  "q_in"    (.array (.scalar .f32) qTotal)
+  let _qScale ← ShaderM.declareInputBuffer  "q_scale" (.array (.scalar .f32) headDim)
+  let _qOut   ← ShaderM.declareOutputBuffer "q_out"   (.array (.scalar .f32) qTotal)
+  let _kIn    ← ShaderM.declareInputBuffer  "k_in"    (.array (.scalar .f32) kvTotal)
+  let _kScale ← ShaderM.declareInputBuffer  "k_scale" (.array (.scalar .f32) headDim)
+  let _kOut   ← ShaderM.declareOutputBuffer "k_out"   (.array (.scalar .f32) kvTotal)
+  let _vIn    ← ShaderM.declareInputBuffer  "v_in"    (.array (.scalar .f32) kvTotal)
+  let _vOut   ← ShaderM.declareOutputBuffer "v_out"   (.array (.scalar .f32) kvTotal)
+  let wgSize := if headDim < 256 then headDim else 256
+  ShaderM.sharedNamed "shared_sum" (.array (.scalar .f32) wgSize)
+  -- Early-return for K/V lanes beyond numKVHeads.  All lanes of the WG
+  -- share `headIdx` and `yIdx`, so the branch is WG-uniform — safe to
+  -- skip the entire body (including barriers).
+  let invalidKV : Exp (.scalar .bool) :=
+    Exp.and (Exp.ne yIdx (Exp.litU32 0))
+            (Exp.ge headIdx (Exp.litU32 numKVHeads))
+  ShaderM.if_ invalidKV (pure ()) (do
+    -- Pick input and output buffer pair per y.  Reads from unused
+    -- buffers are gated by the `ShaderM.if_` tree below so we never
+    -- issue a load against a mismatched size.
+    let headBase := Exp.mul headIdx (Exp.litU32 headDim)
+    ShaderM.varNamed "local_sum" (.scalar .f32) (Exp.litF32 0.0)
+    let localSum : Exp (.scalar .f32) := Exp.var "local_sum"
+    -- ── Phase 1: cooperative sum-of-squares for this head/variant ──
+    ShaderM.loop tid (Exp.litU32 headDim) (Exp.litU32 wgSize) fun i => do
+      let elemIdx := Exp.add headBase i
+      ShaderM.if_ (Exp.eq yIdx (Exp.litU32 0)) (do
+        let v ← ShaderM.readBuffer (ty := .scalar .f32) (n := qTotal) "q_in" elemIdx
+        ShaderM.assign "local_sum" (Exp.add localSum (Exp.mul v v))
+      ) (do
+        ShaderM.if_ (Exp.eq yIdx (Exp.litU32 1)) (do
+          let v ← ShaderM.readBuffer (ty := .scalar .f32) (n := kvTotal) "k_in" elemIdx
+          ShaderM.assign "local_sum" (Exp.add localSum (Exp.mul v v))
+        ) (do
+          let v ← ShaderM.readBuffer (ty := .scalar .f32) (n := kvTotal) "v_in" elemIdx
+          ShaderM.assign "local_sum" (Exp.add localSum (Exp.mul v v)))
+      )
+    ShaderM.writeWorkgroup (ty := .scalar .f32) "shared_sum" tid localSum
+    ShaderM.barrier
+    -- Tree reduction.
+    let mut stride := wgSize / 2
+    while stride > 0 do
+      ShaderM.if_ (Exp.lt tid (Exp.litU32 stride)) (do
+        let a ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := wgSize) "shared_sum" tid
+        let b ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := wgSize) "shared_sum"
+                  (Exp.add tid (Exp.litU32 stride))
+        ShaderM.writeWorkgroup (ty := .scalar .f32) "shared_sum" tid (Exp.add a b)
+      ) (pure ())
+      ShaderM.barrier
+      stride := stride / 2
+    -- ── Phase 2: normalise and write output ──
+    let sumSq ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := wgSize) "shared_sum" (Exp.litU32 0)
+    let rms := Exp.inverseSqrt
+                 (Exp.add (Exp.div sumSq (Exp.litF32 headDim.toFloat))
+                          (Exp.litF32 eps))
+    let rmsName ← ShaderM.var (.scalar .f32) rms
+    let rmsRef : Exp (.scalar .f32) := Exp.var rmsName
+    ShaderM.loop tid (Exp.litU32 headDim) (Exp.litU32 wgSize) fun i => do
+      let elemIdx := Exp.add headBase i
+      ShaderM.if_ (Exp.eq yIdx (Exp.litU32 0)) (do
+        let v ← ShaderM.readBuffer (ty := .scalar .f32) (n := qTotal) "q_in" elemIdx
+        let w ← ShaderM.readBuffer (ty := .scalar .f32) (n := headDim) "q_scale" i
+        let normed := Exp.mul (Exp.mul v rmsRef) w
+        ShaderM.writeBuffer (ty := .scalar .f32) "q_out" elemIdx normed
+      ) (do
+        ShaderM.if_ (Exp.eq yIdx (Exp.litU32 1)) (do
+          let v ← ShaderM.readBuffer (ty := .scalar .f32) (n := kvTotal) "k_in" elemIdx
+          let w ← ShaderM.readBuffer (ty := .scalar .f32) (n := headDim) "k_scale" i
+          let normed := Exp.mul (Exp.mul v rmsRef) w
+          ShaderM.writeBuffer (ty := .scalar .f32) "k_out" elemIdx normed
+        ) (do
+          let v ← ShaderM.readBuffer (ty := .scalar .f32) (n := kvTotal) "v_in" elemIdx
+          ShaderM.writeBuffer (ty := .scalar .f32) "v_out" elemIdx (Exp.mul v rmsRef))
+      )
+  )
+
 /-- Legacy: bare RMSNorm over a single vector of size `dim`. Kept for backward
     compatibility; for Gemma 4 V-norm use perHeadBareRMSNormKernel instead. -/
 def bareRMSNormKernel (dim : Nat) (eps : Float) (workgroupSize : Nat := 256) : ShaderM Unit := do
@@ -1506,21 +1614,27 @@ def forwardBlock [GPUBackend β] (ctx : β)
   } : Hesper.ExecConfig)
   let isFull := cfg.isFullAttention li
   Hesper.WGSL.Execute.withSection "qkvNorm" do
-    ce (if isFull then "qNormFull" else "qNormSWA")
-      (perHeadRMSNormKernel numHeads headDim cfg.rmsNormEps)
-      [("input", state.qBuf), ("weight", block.attention.qNormWeight), ("output", state.qBuf2)]
-      (mkNormConfig numHeads)
-
+    -- When this layer has its own KV, fuse the three per-head norms
+    -- (qNorm, kNorm, vNorm) into a single dispatch.  Grid is
+    -- `(numHeads, 3, 1)`; `wg_id.y` picks Q/K/V; WGs with
+    -- `wg_id.y > 0 && wg_id.x >= numKVHeads` early-return.  Saves 2
+    -- dispatches per layer per token.
+    --
+    -- When the layer shares KV with an earlier block, only qNorm runs
+    -- — keep the existing single-dispatch path for that case.
     if cfg.hasKV li then
-      ce (if isFull then "kNormFull" else "kNormSWA")
-        (perHeadRMSNormKernel numKVHeads headDim cfg.rmsNormEps)
-        [("input", state.kBuf), ("weight", block.attention.kNormWeight), ("output", state.kBuf2)]
-        (mkNormConfig numKVHeads)
-
-      ce (if isFull then "vNormFull" else "vNormSWA")
-        (perHeadBareRMSNormKernel numKVHeads headDim cfg.rmsNormEps)
-        [("input", state.vBuf), ("output", state.vBuf2)]
-        { numWorkgroups := (numKVHeads, 1, 1), workgroupSize := { x := min headDim 256, y := 1, z := 1 } : Hesper.ExecConfig }
+      ce (if isFull then "qkvNormFull" else "qkvNormSWA")
+        (fusedPerHeadQKVNormKernel numHeads numKVHeads headDim cfg.rmsNormEps)
+        [("q_in", state.qBuf), ("q_scale", block.attention.qNormWeight), ("q_out", state.qBuf2),
+         ("k_in", state.kBuf), ("k_scale", block.attention.kNormWeight), ("k_out", state.kBuf2),
+         ("v_in", state.vBuf),                                              ("v_out", state.vBuf2)]
+        { numWorkgroups := (numHeads, 3, 1),
+          workgroupSize := { x := wgSize, y := 1, z := 1 } : Hesper.ExecConfig }
+    else
+      ce (if isFull then "qNormFull" else "qNormSWA")
+        (perHeadRMSNormKernel numHeads headDim cfg.rmsNormEps)
+        [("input", state.qBuf), ("weight", block.attention.qNormWeight), ("output", state.qBuf2)]
+        (mkNormConfig numHeads)
 
   -- Step 4: RoPE on Q and K
   -- Upload position to params buffer
