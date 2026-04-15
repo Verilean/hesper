@@ -692,6 +692,10 @@ lean_exe «fused-norm-q8-gpu-test» where
   root := `Tests.Circuit.FusedNormQ8GPUTest
   moreLinkArgs := stdLinkArgs ++ #["./.lake/build/native/libhesper_cuda.a", "-lcuda"]
 
+lean_exe «fused-qkv-norm-gpu-test» where
+  root := `Tests.Circuit.FusedQKVNormGPUTest
+  moreLinkArgs := stdLinkArgs ++ #["./.lake/build/native/libhesper_cuda.a", "-lcuda"]
+
 lean_exe «bitnet-ttt-mqar» where
   root := `Examples.BitNetTTT_MQAR
   moreLinkArgs := stdLinkArgs
