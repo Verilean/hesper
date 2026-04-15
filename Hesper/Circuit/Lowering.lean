@@ -52,4 +52,80 @@ def compile [GPUBackend β]
       | _, _ =>
         throw (IO.userError s!"Circuit.compile: missing buffer for matmul op (in={inTr.id}, out={outTr.id})")
 
+/-! ## Build-once, replay-many — zero-overhead dispatch path
+
+`CompiledCircuit` holds a pre-resolved list of op closures that take
+only the caller's per-call buffers (hidden state in, Q out, etc.) and
+execute the backing kernels directly.  No CircuitM evaluation, no
+buffer-map construction, no pattern-matching on Prim on the hot path.
+
+Usage (cached):
+  state.compiledQ : IO.Ref (Option (CompiledCircuit β))
+  ...
+  let cc ← state.compiledQ.get >>= fun
+    | some cc => pure cc
+    | none =>
+      let cc ← Circuit.compileOnce ctx (buildCircuit ...)
+      state.compiledQ.set (some cc)
+      pure cc
+  cc.replay [(tensorQNormed, state.normedBuf), (tensorQOut, state.qBuf)]
+-/
+
+/-- An op compiled down to a single closure.  The closure takes the
+    resolver function (input/output id → buffer) and runs the dispatch. -/
+structure OpClosure (β : Type) [GPUBackend β] where
+  run : (lookup : Nat → Option (GPUBackend.Buf β)) → IO Unit
+
+/-- A circuit compiled into a flat, cache-friendly representation.
+    No Lean-side allocation on replay — just a walk over the closures. -/
+structure CompiledCircuit (β : Type) [GPUBackend β] where
+  ops : Array (OpClosure β)
+  /-- TensorRefs the caller needs to supply a buffer for (externals +
+      every produced tensor).  Kept so callers know what to pass on
+      replay. -/
+  externalIds : Array Nat
+  producedIds : Array Nat
+
+/-- Compile a CircuitState into a CompiledCircuit that can be replayed
+    with minimal overhead.  Runs once per unique circuit. -/
+def compileOnce [GPUBackend β]
+    (_ctx : β)
+    (state : CircuitState (GPUBackend.Buf β) (GPUBackend.CachedDispatch β))
+    : IO (CompiledCircuit β) := do
+  -- Convert each Op to an OpClosure that captures its metadata
+  -- (layer, tensor ids) but defers buffer resolution to replay time.
+  let mkClosure (op : Op (GPUBackend.Buf β) (GPUBackend.CachedDispatch β))
+      : OpClosure β :=
+    match op.prim with
+    | Prim.matmulQ4K layer =>
+      let inId := op.inputs[0]!.id
+      let outId := op.outputs[0]!.id
+      { run := fun lookup => do
+          match lookup inId, lookup outId with
+          | some inputBuf, some outputBuf =>
+            Hesper.Layers.Linear.LinearLayer.forward (β := β) _ctx layer inputBuf outputBuf
+          | _, _ =>
+            throw (IO.userError s!"CompiledCircuit: missing buffer (in={inId} out={outId})")
+      }
+  let closures := state.ops.map mkClosure
+  let externalIds := state.externals.map (fun (tr, _) => tr.id)
+  -- producedIds := tensor ids that are produced by some op's outputs
+  let producedIds := state.ops.foldl (init := (#[] : Array Nat)) fun acc op =>
+    op.outputs.foldl (init := acc) fun acc' tr => acc'.push tr.id
+  return { ops := closures, externalIds, producedIds }
+
+/-- Replay a compiled circuit.  `buffers` lists the (tensorId, buffer)
+    pairs the caller wants to wire in for this invocation — externals
+    AND produced-tensor outputs they want preserved. -/
+def CompiledCircuit.replay [GPUBackend β]
+    (cc : CompiledCircuit β)
+    (buffers : List (Nat × GPUBackend.Buf β))
+    : IO Unit := do
+  -- Small associative lookup.  For MVP circuits (<5 entries) linear
+  -- search is faster than hash construction.
+  let lookup (id : Nat) : Option (GPUBackend.Buf β) :=
+    (buffers.find? (fun e => e.1 == id)).map (·.2)
+  for op in cc.ops do
+    op.run lookup
+
 end Hesper.Circuit
