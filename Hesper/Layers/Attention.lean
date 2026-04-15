@@ -611,12 +611,81 @@ def cacheWriteKernel (numKVHeads maxSeqLen headDim kvDim : Nat) : ShaderM Unit :
     ShaderM.writeBuffer (ty := .scalar .f32) "cache" cacheIdx val
   ) (pure ())
 
-/-- Fused write K and V data into cache at position read from params[0].
-    Processes both K and V in a single dispatch (saves 1 dispatch per layer).
-    Input: new_k [kvDim], new_v [kvDim]
-    Cache: k_cache [numKVHeads, maxSeqLen, headDim], v_cache [numKVHeads, maxSeqLen, headDim]
-    Params: [pos: u32, cacheLen: u32]
+/-- Fused RoPE-on-K + KV cache write.  Applies NeoX RoPE to the K
+    tensor (using `ropeWithFreqFactors`'s formula) and writes the rotated
+    K plus the V tensor straight into the KV cache slot at position `pos`.
+
+    Dispatch: 1D over `kvDim = numKVHeads * headDim` threads.  Each thread
+    handles ONE (k_head, dim) element for V (plain copy) and a half of a
+    rotation pair for K (the other half is read but only the local half
+    written).  The pair partner is at `dim + halfDim` if `dim < halfDim`.
+
+    Saves one dispatch per KV-bearing layer (RoPE-K + KV-write → 1
+    kernel).  K is read from `new_k` (post-norm), V from `new_v`.
 -/
+def fusedRopeKAndCacheWriteKernel
+    (numKVHeads maxSeqLen headDim kvDim : Nat) (ropeBase : Float) : ShaderM Unit := do
+  let gid ← ShaderM.globalId
+  let idx := Exp.vec3X gid
+
+  let halfDim := headDim / 2
+
+  let _newK ← ShaderM.declareReadOnlyBuffer "new_k" (.array (.scalar .f32) kvDim)
+  let _newV ← ShaderM.declareReadOnlyBuffer "new_v" (.array (.scalar .f32) kvDim)
+  let _kCache ← ShaderM.declareOutputBuffer "k_cache" (.array (.scalar .f32) (numKVHeads * maxSeqLen * headDim))
+  let _vCache ← ShaderM.declareOutputBuffer "v_cache" (.array (.scalar .f32) (numKVHeads * maxSeqLen * headDim))
+  let _params ← ShaderM.declareReadOnlyBuffer "params" (.array (.scalar .u32) 2)
+  let _freqFactors ← ShaderM.declareReadOnlyBuffer "freq_factors" (.array (.scalar .f32) halfDim)
+
+  let inBounds := Exp.lt idx (Exp.litU32 kvDim)
+  ShaderM.if_ inBounds (do
+    let pos ← ShaderM.readBuffer (ty := .scalar .u32) (n := 2) "params" (Exp.litU32 0)
+    let posF32 := Exp.toF32 pos
+    let kvHead := Exp.div idx (Exp.litU32 headDim)
+    let d := Exp.mod idx (Exp.litU32 headDim)
+    let cacheIdx := Exp.add
+      (Exp.mul kvHead (Exp.litU32 (maxSeqLen * headDim)))
+      (Exp.add (Exp.mul pos (Exp.litU32 headDim)) d)
+
+    -- V: plain copy (no rotation).
+    let v ← ShaderM.readBuffer (ty := .scalar .f32) (n := kvDim) "new_v" idx
+    ShaderM.writeBuffer (ty := .scalar .f32) "v_cache" cacheIdx v
+
+    -- K: NeoX-style RoPE — pair `d` with `d + halfDim` (if d < halfDim) or
+    -- `d - halfDim` (if d ≥ halfDim).  We compute the partner via a single
+    -- `select`, then apply the rotation.  Each thread writes ONE K element.
+    let dInLow := Exp.lt d (Exp.litU32 halfDim)
+    let dPair : Exp (.scalar .u32) := Exp.select dInLow
+      (Exp.add d (Exp.litU32 halfDim))                     -- partner above
+      (Exp.sub d (Exp.litU32 halfDim))                      -- partner below
+    let pairIdx := Exp.add (Exp.mul kvHead (Exp.litU32 headDim)) dPair
+    let xSelf ← ShaderM.readBuffer (ty := .scalar .f32) (n := kvDim) "new_k" idx
+    let xPair ← ShaderM.readBuffer (ty := .scalar .f32) (n := kvDim) "new_k" pairIdx
+
+    -- The "low" half (d < halfDim) is x0; the "high" half is x1.
+    -- After rotation:
+    --   x0_new = x0 * cos - x1 * sin
+    --   x1_new = x0 * sin + x1 * cos
+    -- For the local thread:  if dInLow, our index is x0, partner is x1.
+    -- If !dInLow, our index is x1, partner is x0.
+    let dimPair := Exp.select dInLow d (Exp.sub d (Exp.litU32 halfDim))  -- 0..halfDim-1
+    let freqFactor ← ShaderM.readBuffer (ty := .scalar .f32) (n := halfDim) "freq_factors" dimPair
+    let dimPairF32 := Exp.toF32 dimPair
+    let exponent := Exp.div (Exp.mul (Exp.litF32 2.0) dimPairF32) (Exp.litF32 headDim.toFloat)
+    let freqInv := Exp.pow (Exp.litF32 ropeBase) (Exp.neg exponent)
+    let theta := Exp.div (Exp.mul posF32 freqInv) freqFactor
+    let cosTheta := Exp.cos theta
+    let sinTheta := Exp.sin theta
+
+    -- xSelf is x0 if dInLow else x1.  xPair is the other.
+    let x0 := Exp.select dInLow xSelf xPair
+    let x1 := Exp.select dInLow xPair xSelf
+    let x0_new := Exp.sub (Exp.mul x0 cosTheta) (Exp.mul x1 sinTheta)
+    let x1_new := Exp.add (Exp.mul x0 sinTheta) (Exp.mul x1 cosTheta)
+    let myNew := Exp.select dInLow x0_new x1_new
+    ShaderM.writeBuffer (ty := .scalar .f32) "k_cache" cacheIdx myNew
+  ) (pure ())
+
 def fusedCacheWriteKVKernel (numKVHeads maxSeqLen headDim kvDim : Nat) : ShaderM Unit := do
   let gid ← ShaderM.globalId
   let idx := Exp.vec3X gid
