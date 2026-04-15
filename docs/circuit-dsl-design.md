@@ -341,6 +341,52 @@ floating-point ops, producing different but correct-within-tolerance
 outputs.  Mitigation: document the tolerance; test that the
 downstream argmax agrees.
 
+## Referential transparency & formal reasoning
+
+A subtle but large win of the Circuit DSL over raw ShaderM: **programs
+become values we can reason about**.
+
+In the current ShaderM-based path, `forwardBlock` is a sequence of
+effectful `ce "name" kernel [("input", srcBuf), ("output", dstBuf)] config`
+calls.  Buffer identity is a raw pointer captured in a closure; the
+data-flow graph is implicit, recoverable only by reading the string
+names and hoping the caller wired them consistently.  Claims like
+"swapping these two calls is safe" or "this residual add can be fused
+with the next norm" cannot be checked by the compiler — they require
+manual inspection of every user of every buffer.
+
+With Circuit DSL:
+
+```lean
+let normed  ← rmsNorm input attnNormScale           -- single static assignment
+let (q,k,v) ← fusedQKV normed wQ wK wV
+let q'      ← rope q posFactor
+let kc      ← writeKcache q'                          -- effectful, but its inputs are tracked
+```
+
+Every value is `let`-bound once and consumed by dependence.  The
+`CircuitM` monad's ordering captures the **data-flow DAG**, and the
+scope type (`Global` / `Shared` / `Register`) captures which values
+cross kernel boundaries.  Consequences:
+
+- **SSA-style equivalences** are Lean `rfl` or simple `decide`:
+  independent ops commute because the circuit has no edge between
+  them; re-ordering within a DAG is a graph lemma.
+- **Fusion legality is a typed predicate**, not a pattern-match on
+  strings.  The `inlineProducer` pass fires exactly when the consumer
+  op's single input has `Scope.Register` and dispatch-compatible
+  shape — a local, decidable property.
+- **Refactors are type-checked**: renaming a tensor, splitting a
+  kernel, or replacing an op with a fused equivalent produces the
+  same TensorRef ids and the same downstream consumers.  Broken
+  refactors fail to typecheck, not silently produce wrong output.
+
+This is what lets an HDL like Sparkle ship a logic synthesiser with
+confidence: the IR is a mathematical object you can transform by
+proof-preserving rewrites.  GPU kernel fusion has historically been a
+graveyard of subtle bugs precisely because the IR (when there is one)
+is an opaque ShaderM closure; moving to a typed DAG closes that gap.
+
 ## Appendix: why this is really a circuit
 
 The Sparkle `Signal` monad enforces a combinational DAG.  Our
