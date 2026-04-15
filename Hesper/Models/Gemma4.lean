@@ -1469,19 +1469,15 @@ def forwardBlock [GPUBackend β] (ctx : β)
         [("input", state.qBuf2), ("output", state.qBuf), ("params", state.paramsBuf)]
         (.dispatch1D (numHeads * headDim / 2))
 
-    if cfg.hasKV li then
-      match block.ropeFreqFactors with
-      | some freqFactors =>
-        ce s!"ropeFreqK_{headDim}_{numKVHeads}"
-          (ropeWithFreqFactorsKernel headDim numKVHeads cfg.ropeTheta)
-          [("input", state.kBuf2), ("output", state.kBuf), ("params", state.paramsBuf), ("freq_factors", freqFactors)]
-          (.dispatch1D (numKVHeads * headDim / 2))
-      | none =>
-        let ropeConfig : RoPE.Config := { dim := numKVHeads * headDim, maxSeqLen := cfg.maxSeqLen, base := cfg.ropeTheta }
-        ce s!"ropeDynK_{headDim}_{numKVHeads}"
-          (RoPE.ropeKernelDynamic ropeConfig 1 1 numKVHeads headDim)
-          [("input", state.kBuf2), ("output", state.kBuf), ("params", state.paramsBuf)]
-          (.dispatch1D (numKVHeads * headDim / 2))
+    -- ropeK is fused with KV cache write below (when ropeFreqFactors are available
+    -- and we have a KV cache).  When freq factors aren't present we fall back to
+    -- the legacy two-kernel path.
+    if cfg.hasKV li && block.ropeFreqFactors.isNone then
+      let ropeConfig : RoPE.Config := { dim := numKVHeads * headDim, maxSeqLen := cfg.maxSeqLen, base := cfg.ropeTheta }
+      ce s!"ropeDynK_{headDim}_{numKVHeads}"
+        (RoPE.ropeKernelDynamic ropeConfig 1 1 numKVHeads headDim)
+        [("input", state.kBuf2), ("output", state.kBuf), ("params", state.paramsBuf)]
+        (.dispatch1D (numKVHeads * headDim / 2))
 
   -- Step 5: Write K/V to cache and compute flash attention
   -- KV-shared layers reuse an earlier layer's cache (see Config.kvCacheLayer).
@@ -1491,16 +1487,27 @@ def forwardBlock [GPUBackend β] (ctx : β)
     let kvDim := numKVHeads * headDim
     let cacheLen := pos + 1  -- number of cached positions including current
 
-    -- Write K and V to cache at current position (fused kernel)
-    -- K is now in kBuf (after RoPE), V is in vBuf2 (after V-norm)
+    -- Write K and V to cache at current position.  When ropeFreqFactors are
+    -- available (Gemma 4 default), we use the fused RoPE-K + KV-write kernel
+    -- that takes K *before* RoPE (kBuf2) and applies the rotation in-kernel,
+    -- saving the separate ropeK dispatch above.
     if cfg.hasKV li then
       Hesper.WGSL.Execute.withSection "kvWrite" do
-        ce s!"kvWrite_{headDim}_{numKVHeads}"
-          (Attention.fusedCacheWriteKVKernel numKVHeads cfg.maxSeqLen headDim kvDim)
-          [("new_k", state.kBuf), ("new_v", state.vBuf2),
-           ("k_cache", kvCache.kBuf), ("v_cache", kvCache.vBuf),
-           ("params", state.paramsBuf)]
-          (.dispatch1D kvDim)
+        match block.ropeFreqFactors with
+        | some freqFactors =>
+          ce s!"ropeKAndKvWrite_{headDim}_{numKVHeads}"
+            (Attention.fusedRopeKAndCacheWriteKernel numKVHeads cfg.maxSeqLen headDim kvDim cfg.ropeTheta)
+            [("new_k", state.kBuf2), ("new_v", state.vBuf2),
+             ("k_cache", kvCache.kBuf), ("v_cache", kvCache.vBuf),
+             ("params", state.paramsBuf), ("freq_factors", freqFactors)]
+            (.dispatch1D kvDim)
+        | none =>
+          ce s!"kvWrite_{headDim}_{numKVHeads}"
+            (Attention.fusedCacheWriteKVKernel numKVHeads cfg.maxSeqLen headDim kvDim)
+            [("new_k", state.kBuf), ("new_v", state.vBuf2),
+             ("k_cache", kvCache.kBuf), ("v_cache", kvCache.vBuf),
+             ("params", state.paramsBuf)]
+            (.dispatch1D kvDim)
 
     -- Flash attention: Q @ K_cache^T → softmax → @ V_cache → output
     -- Gemma 4 uses hparams.f_attention_scale = 1.0 (NOT the usual 1/sqrt(headDim)),
