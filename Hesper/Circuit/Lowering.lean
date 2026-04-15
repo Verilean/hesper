@@ -128,4 +128,67 @@ def CompiledCircuit.replay [GPUBackend β]
   for op in cc.ops do
     op.run lookup
 
+/-- Build-or-replay helper.  On first call, runs `build` to produce the
+    Circuit, compiles it, and stores it in `cacheRef`.  On subsequent
+    calls, replays the cached CompiledCircuit directly.  This is the
+    zero-overhead production path: the CircuitM builder runs at most once
+    per unique cacheRef. -/
+def runCached [GPUBackend β]
+    (ctx : β)
+    (cacheRef : IO.Ref (Option (CompiledCircuit β)))
+    (build : CircuitM (GPUBackend.Buf β) (GPUBackend.CachedDispatch β) Unit)
+    (buffers : List (Nat × GPUBackend.Buf β))
+    : IO Unit := do
+  match ← cacheRef.get with
+  | some cc => cc.replay buffers
+  | none =>
+    let (_, st) := CircuitM.run build
+    let cc ← compileOnce ctx st
+    cacheRef.set (some cc)
+    cc.replay buffers
+
+/-- Per-cacheKey store for CompiledCircuits — sibling of
+    `Hesper.Models.Gemma4.KernelCacheRefs` but typed for our IR.  Lazily
+    creates IO.Refs on demand. -/
+structure CircuitCacheRefs (β : Type) [GPUBackend β] where
+  store : IO.Ref (Array (UInt64 × IO.Ref (Option (CompiledCircuit β))))
+
+def CircuitCacheRefs.create [GPUBackend β] : IO (CircuitCacheRefs β) := do
+  let r ← IO.mkRef #[]
+  return ⟨r⟩
+
+def CircuitCacheRefs.getRef [GPUBackend β]
+    (ccr : CircuitCacheRefs β) (key : UInt64)
+    : IO (IO.Ref (Option (CompiledCircuit β))) := do
+  let arr ← ccr.store.get
+  match arr.find? (fun e => e.1 == key) with
+  | some (_, r) => return r
+  | none =>
+    let r ← IO.mkRef none
+    ccr.store.modify (·.push (key, r))
+    return r
+
+/-! ## Module-level fallback cache
+
+Untyped global cache keyed by hash.  Used when callers can't (yet)
+thread a `CircuitCacheRefs` through their signatures.  The stored
+pointer is `unsafeCast`-erased; the caller must supply matching `β`
+on each lookup (typically by including the backend tag in the key). -/
+initialize circuitCacheGlobal : IO.Ref (Array (UInt64 × NonScalar)) ← IO.mkRef #[]
+
+/-- Get-or-create a cache slot.  Returns an `IO.Ref (Option (CompiledCircuit β))`. -/
+unsafe def getGlobalCircuitRefUnsafe [GPUBackend β] (key : UInt64)
+    : IO (IO.Ref (Option (CompiledCircuit β))) := do
+  let arr ← circuitCacheGlobal.get
+  match arr.find? (fun e => e.1 == key) with
+  | some (_, ptr) => return unsafeCast ptr
+  | none =>
+    let r : IO.Ref (Option (CompiledCircuit β)) ← IO.mkRef none
+    circuitCacheGlobal.modify (·.push (key, unsafeCast r))
+    return r
+
+@[implemented_by getGlobalCircuitRefUnsafe]
+opaque getGlobalCircuitRef [GPUBackend β] (key : UInt64)
+    : IO (IO.Ref (Option (CompiledCircuit β)))
+
 end Hesper.Circuit
