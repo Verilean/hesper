@@ -1943,17 +1943,32 @@ def forwardBlock [GPUBackend β] (ctx : β)
   Hesper.WGSL.Execute.withSection "perLayerEmbd" do
     match perLayerEmbd, perLayerInput with
     | some plEmbd, some plInputAll =>
-      -- per_layer_inp_gate @ outputBuf → plGateBuf [embdPerLayer]
-      Hesper.WGSL.Execute.withSection "ple.inpGate" do
-        Linear.LinearLayer.forward ctx plEmbd.inpGate outputBuf state.plGateBuf
-      -- GELU(gate) * per_layer_input[layerIdx] → moeRouterOutBuf (slice via offset kernel)
       let plOffset := li * cfg.embdPerLayer
       let plTotalSize := cfg.embdPerLayer * cfg.numHiddenLayers
-      Hesper.WGSL.Execute.withSection "ple.geluGateMul" do
-        ce s!"pleGeluGateMul_{plOffset}"
-          (PerLayerEmbedding.geluGateMulSliceKernel cfg.embdPerLayer plTotalSize plOffset)
-          [("gate", state.plGateBuf), ("per_layer_input", plInputAll), ("output", state.moeRouterOutBuf)]
-          (.dispatch1D cfg.embdPerLayer)
+      -- Fuse `ple.inpGate` matmul + `ple.geluGateMul` into one dispatch
+      -- pair (Q8_1 quantize + fused matmul-with-GELU-slice-mul epilogue).
+      -- Saves 1 dispatch per PLE site.  Falls back to the 2-step path
+      -- when preconditions fail.
+      let useFusedPLGate :=
+        plEmbd.inpGate.quantFormat == .Q4_K &&
+        plEmbd.inpGate.config.inDim % 256 == 0
+      if useFusedPLGate then
+        Hesper.WGSL.Execute.withSection "ple.inpGateGeluSlice" do
+          let key := hash ("pleInpGateGeluSlice", plEmbd.inpGate.config.inDim,
+                           plEmbd.inpGate.config.outDim, plOffset)
+          let ref ← match kcr with
+            | some k => k.getRef key
+            | none => IO.mkRef none
+          Linear.forwardFusedPLInpGate ctx plEmbd.inpGate
+            outputBuf plInputAll state.moeRouterOutBuf plTotalSize plOffset ref
+      else do
+        Hesper.WGSL.Execute.withSection "ple.inpGate" do
+          Linear.LinearLayer.forward ctx plEmbd.inpGate outputBuf state.plGateBuf
+        Hesper.WGSL.Execute.withSection "ple.geluGateMul" do
+          ce s!"pleGeluGateMul_{plOffset}"
+            (PerLayerEmbedding.geluGateMulSliceKernel cfg.embdPerLayer plTotalSize plOffset)
+            [("gate", state.plGateBuf), ("per_layer_input", plInputAll), ("output", state.moeRouterOutBuf)]
+            (.dispatch1D cfg.embdPerLayer)
       -- per_layer_proj @ moeRouterOutBuf → plProjBuf [hiddenSize]
       Hesper.WGSL.Execute.withSection "ple.proj" do
         Linear.LinearLayer.forward ctx plEmbd.proj state.moeRouterOutBuf state.plProjBuf

@@ -31,7 +31,20 @@ Empirically, each kernel launch costs ~10 µs of wall-clock
 | hesper (Circuit DSL: 3 RMSNorm sites via reduce-with-epilogue fusion) | 2026-04-15 | 33,997 | 1,133 | 6.1× |
 | hesper (fused RMSNorm+Q8_1 for attnNorm→wQKV + ffnNorm→gate+up) | 2026-04-15 | 32,202 | 1,073 | 5.7× |
 | hesper (fused 3-in-1 per-head qkvNorm)                           | 2026-04-15 | 30,721 | 1,024 | 5.5× |
-| **hesper (current)** | " | **30,721** | **1,024** | **5.5×** |
+| hesper (PLE inpGate matmul fused with GELU+slice-mul epilogue)   | 2026-04-15 | 29,261 |   975 | 5.2× |
+| **hesper (current)** | " | **29,261** | **975** | **5.2×** |
+
+**1000 barrier broken.**  The PLE `inpGate → geluGateMul` pair is a
+matmul followed by a pointwise tail (`GELU(x) * perLayerInput[plOffset + i]`).
+`fusedQ4KMLinearDP4AGeluSliceKernel` inlines the tail into the
+matmul's write-out (lane 0 reads one extra f32, applies tanh-approx
+GELU to the dot product, multiplies in, writes).  One fewer dispatch
+per PLE site × ~33 layers = −49 kernels/tok, decode bit-identical.
+
+Kernel body is a copy of `fusedQ4KMLinearDP4AKernel`'s matmul phase
+with a custom write-out — a deliberate Option B macro-Prim.  A future
+`Prim.matmulQ4KWithEpilogue` would let us remove the duplication by
+parameterising the shared lowering with a `ScalarExp` tail.
 
 Per-head qNorm+kNorm+vNorm previously ran as 3 separate dispatches per
 `hasKV` layer.  A single hand-composed kernel with grid
