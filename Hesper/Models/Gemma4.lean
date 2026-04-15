@@ -1419,9 +1419,26 @@ def forwardBlock [GPUBackend β] (ctx : β)
         Linear.forwardFusedQKV ctx block.attention.wQ block.attention.wK block.attention.wV
           state.normedBuf state.qBuf state.kBuf state.vBuf kvRef
       else
-        Linear.LinearLayer.forward ctx block.attention.wQ state.normedBuf state.qBuf
-        Linear.LinearLayer.forward ctx block.attention.wK state.normedBuf state.kBuf
-        Linear.LinearLayer.forward ctx block.attention.wV state.normedBuf state.vBuf
+        -- Circuit-DSL: three Q4_K matmuls sharing one input.  At
+        -- Stage 1 these emit three separate dispatches (no fusion yet),
+        -- but the entire Circuit is built once + cached.  When Stage 2
+        -- adds the mergeSameDispatch pass these will collapse if the
+        -- dispatch shapes match.
+        let key3 := hash ("circuitQKV-cuda", block.attention.wQ.config.inDim,
+                          block.attention.wQ.config.outDim,
+                          block.attention.wK.config.outDim, li)
+        let ccRef3 ← Hesper.Circuit.getGlobalCircuitRef (β := β) key3
+        Hesper.Circuit.runCached ctx ccRef3
+          (do
+            let normed ← Hesper.Circuit.CircuitM.registerExternal
+              (BufT := GPUBackend.Buf β) (CacheT := GPUBackend.CachedDispatch β)
+              state.normedBuf #[cfg.hiddenSize] .f32 .Global
+            let _q ← Hesper.Circuit.CircuitM.matmulQ4K normed block.attention.wQ
+            let _k ← Hesper.Circuit.CircuitM.matmulQ4K normed block.attention.wK
+            let _v ← Hesper.Circuit.CircuitM.matmulQ4K normed block.attention.wV
+            pure ())
+          -- Tensor ids: 0=normed, 1=q, 2=k, 3=v.
+          [(0, state.normedBuf), (1, state.qBuf), (2, state.kBuf), (3, state.vBuf)]
     else
       -- Circuit-DSL pilot (Stage 1): replace this single matmul with the
       -- new IR.  `runCached` builds the Circuit ONCE per (inDim, outDim,
