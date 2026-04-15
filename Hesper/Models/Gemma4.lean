@@ -1925,17 +1925,17 @@ def forwardSingleToken [GPUBackend β] (ctx : β)
           (hash ("q8_1-quantize-lmhead", model.config.hiddenSize))
           state.lmHeadQuantizePrepared
         -- Q6_K dp4a matmul (2D grid for vocabSize > 65535).
-        -- Variant selection via env vars (priority: 4ROW > 2ROW > default):
-        --   HESPER_DP4A_Q6K_4ROW=1  → 4-warp cooperative, 128 threads, 4 rows/WG
-        --   HESPER_DP4A_Q6K_2ROW=1  → 2-warp cooperative, 64 threads,  2 rows/WG
-        --   (default)               → single-warp,        32 threads,  1 row/WG
+        -- Default is the 4-warp cooperative variant (smem input reuse across
+        -- 4 output rows) — fastest on all shapes tested. Override via env:
+        --   HESPER_DP4A_Q6K_2ROW=1  → 2-warp variant  (64 threads, 2 rows/WG)
+        --   HESPER_DP4A_Q6K_1ROW=1  → single-warp     (32 threads, 1 row/WG)
         let variant ← do
-          match ← IO.getEnv "HESPER_DP4A_Q6K_4ROW" with
-          | some "1" => pure "4row"
+          match ← IO.getEnv "HESPER_DP4A_Q6K_1ROW" with
+          | some "1" => pure "1row"
           | _ =>
             match ← IO.getEnv "HESPER_DP4A_Q6K_2ROW" with
             | some "1" => pure "2row"
-            | _ => pure "1row"
+            | _ => pure "4row"
         match variant with
         | "4row" =>
           let quadCount := (model.config.vocabSize + 3) / 4
