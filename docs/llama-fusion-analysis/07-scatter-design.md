@@ -1,42 +1,48 @@
 ---
-title: "07 — Dynamic Offset / Scatter の設計課題"
+title: "07 — Dynamic offset / Scatter design discussion"
 date: 2026-04-16
-status: open — next session に持ち越し
+status: **IMPLEMENTED** (commit b515e13)
 ---
 
-# Dynamic Offset / Scatter の設計課題
+> **Update 2026-04-16**: this design item is now **implemented**.
+> Implementation details and verification results are in
+> [`08-scatter-impl-notes.md`](08-scatter-impl-notes.md). The text
+> below is preserved as the original design discussion.
 
-## 今日の発見
+# Dynamic offset / Scatter design discussion
 
-Pattern E (`ROPE + VIEW + SET_ROWS`) を hesper の Circuit DSL に取り込む
-過程で、**純粋な data-parallel Map** と **動的アドレス計算を伴う Scatter**
-の意味論的ギャップが浮上した。
+## What we found
 
-具体例: KV cache write の書き込み先アドレスは
+While trying to bring Pattern E (`ROPE + VIEW + SET_ROWS`) into hesper's
+Circuit DSL, a fundamental gap surfaced between **pure data-parallel Map
+operations** and **Scatter operations with dynamic addressing**.
+
+Concrete example: KV cache write addresses look like
 
 ```
 out[kvHead * maxSeqLen * headDim + pos * headDim + d] = ...
 ```
 
-で、`pos` は **runtime parameter buffer から読み出す動的値**。
-現状の `Prim.pointwise` / `Prim.writeSlice` ではこのアドレス計算を表現
-できない。
+where `pos` is a **runtime value read from a parameter buffer**. The
+DSL as it stood (`Prim.pointwise` / `Prim.writeSlice`) couldn't express
+this address calculation.
 
-## 現状の DSL セマンティクス
+## DSL semantics at the time
 
-### Map パターン（現状サポート）
+### Map pattern (supported)
 
 ```
 Prim.pointwise outShape inShapes body
   thread i:
-    slots[k] = inputs[k][i]   -- broadcast if inShapes[k] == #[1] else [i]
+    slots[k] = inputs[k][i]   -- broadcast if inShapes[k] == #[1]
     out[i]   = body(slots)
 ```
 
-**暗黙の前提**: 出力インデックス `i` と入力インデックス `i` が**同一** (identity map)。
-`ScalarExp` の `.input k` は「同じ lane の k 番目 input」を読むだけ。
+**Implicit assumption**: output index `i` equals input index `i`
+(identity map). `ScalarExp.input k` reads "the k-th input at the same
+lane".
 
-### 今日追加した `Prim.writeSlice`
+### `Prim.writeSlice` (added during this session)
 
 ```
 Prim.writeSlice dstShape dstOffset srcShape
@@ -44,98 +50,102 @@ Prim.writeSlice dstShape dstOffset srcShape
     out[dstOffset + i] = src[i]
 ```
 
-`dstOffset : ScalarExp` に汎化したが、この `ScalarExp` の `.input k`
-**何を参照するのか未定義**。現状は slot array が空なので参照不能。
+Even after we generalised `dstOffset` to `ScalarExp`, the `.input k`
+inside it had no defined meaning — the slot array was empty.
 
-## 意味論ギャップの本質
+## Where the gap really lived
 
-| 操作 | 出力アドレス | 入力アドレス | 現状 |
+| Operation | Output address | Input address | Status |
 |---|---|---|---|
 | Map (pointwise) | `i` (identity) | `i` (identity) | ✅ |
-| Gather | `i` | `f(i, params)` | ❌ 未対応 |
-| **Scatter** | `f(i, params)` | `i` | ❌ **Pattern E はこれ** |
-| General (MoE 的) | `g(i, params)` | `f(i, params)` | ❌ |
+| Gather | `i` | `f(i, params)` | ❌ |
+| **Scatter** | `f(i, params)` | `i` | ❌ **Pattern E is here** |
+| General (MoE-like) | `g(i, params)` | `f(i, params)` | ❌ |
 
-Scatter を表現するには **「値を計算する式」と「書き込み先アドレスを
-計算する式」を別々に、両方に runtime parameter を渡せる** 必要がある。
+To express scatter we need **separate ScalarExps for "what to write" and
+"where to write it"**, both with access to runtime parameters.
 
-## 現状の機能で足りる/足りないポイント
+## What helped, what was missing
 
-### ✅ 今日の改良で獲得したもの
+### ✅ Improvements made earlier in the session
 
-- `ScalarExp` に 9 演算子追加: `cos`, `sin`, `pow`, `lt`, `select`,
+- 9 new ScalarExp operators: `cos`, `sin`, `pow`, `lt`, `select`,
   `mod`, `idiv`, `toFloat`, `laneIdx`
-- `laneIdx` で thread index を式として取得可能
-- `+`, `-`, `*`, `/`, `neg`, `OfNat`, `OfScientific`, `BEq` オーバーロード
-- `writeSlice` / `pointwiseToSlice` の offset が `ScalarExp`（static const は OK）
-- `fuseWriteDestination` pass が動作
+- `laneIdx` exposes the thread index inside the body
+- Operator overloading: `+`, `-`, `*`, `/`, `Neg`, `OfNat`, `OfScientific`, `BEq`
+- `writeSlice` / `pointwiseToSlice` `dstOffset` generalised to `ScalarExp`
+- `fuseWriteDestination` pass
 
-### ❌ まだ不足
+### ❌ Still missing (at the time of this doc)
 
-1. **アドレス計算から parameter buffer を参照できない**
-   - 現状: `ScalarExp` の `.input k` は **pointwise body の slot** を指す
-   - 必要: offset 計算からも同じ方式で parameter buffer を読める枠組み
+1. **Address expressions can't read parameter buffers.**
+   `.input k` referred to the **pointwise body's slots**, not anything
+   visible to `addrExpr`.
+2. **Value and address are not separated.**
+   `Prim.pointwise.body` was the only `ScalarExp`, and the output index
+   was implicitly `laneIdx`.
 
-2. **値計算 (value) とアドレス計算 (index) が分離されていない**
-   - 現状: `Prim.pointwise.body` が唯一の `ScalarExp` で、暗黙に output index は thread id
-   - 必要: 「値はこう、書き込み先はこう」を明示的に書ける Prim
+## Proposal: `Prim.scatter`
 
-## 提案: `Prim.scatter`
-
-次セッションで検討する設計案：
+Sketch from the design discussion:
 
 ```lean
-/-- Scatter primitive: compute value + destination address per lane.
+/-- Scatter: compute value + destination address per lane.
 
     thread i:
       valueSlots[k]    = valueInputs[k][i]     (broadcast if [1])
       addrSlots[k]     = addrInputs[k][i]      (broadcast if [1])
-      out[addrExpr]    = valueExpr             (evaluated with above slots)
+      out[addrExpr]    = valueExpr             (with the slots above)
 
-    - `valueExpr`  : the value to write (uses `.input k` for valueSlots)
-    - `addrExpr`   : the destination index (uses `.input k` for addrSlots)
-    - `.laneIdx`   : thread's global id, available in both exprs
-    - `outShape`   : dispatch grid shape (one thread per output element to write)
-    - `dstShape`   : destination buffer shape (addrExpr must be in [0, dstShape.numel))
+    `valueExpr`  : value to write (uses `.input k` for valueSlots)
+    `addrExpr`   : destination index (uses `.input k` for addrSlots)
+    `.laneIdx`   : thread global id, available in both
+    `outShape`   : dispatch grid (one thread per write)
+    `dstShape`   : destination buffer shape (addrExpr ∈ [0, dstShape.numel))
 
-    Covers Map (identity addrExpr = laneIdx), writeSlice (addrExpr = laneIdx + const),
-    and Scatter (addrExpr uses parameter buffers + laneIdx arithmetic). -/
+    Subsumes Map (addrExpr = laneIdx), writeSlice
+    (addrExpr = laneIdx + const), and general Scatter
+    (addrExpr uses parameter buffers + laneIdx arithmetic). -/
 | scatter
-    (outShape    : Shape)             -- dispatch grid
+    (outShape    : Shape)              -- dispatch grid
     (dstShape    : Shape)              -- destination buffer shape
-    (valueInputs : Array Shape)        -- shapes of the value-path inputs
-    (addrInputs  : Array Shape)        -- shapes of the addr-path inputs
+    (valueInputs : Array Shape)        -- value-path input shapes
+    (addrInputs  : Array Shape)        -- addr-path input shapes
     (valueExpr   : ScalarExp)
     (addrExpr    : ScalarExp)
 ```
 
-呼び出し規約:
+Calling convention:
 - `inputs` array layout: `[dst, valueInputs..., addrInputs...]`
-- `valueExpr` の `.input k` → `valueInputs[k]`
-- `addrExpr` の `.input k` → `addrInputs[k]`
-- 両方で `.laneIdx` が使える
+- `valueExpr`'s `.input k` → `valueInputs[k]`
+- `addrExpr`'s `.input k` → `addrInputs[k]`
+- `.laneIdx` available in both
 
-### 既存の Prim との関係
+> **Implementation note (2026-04-16):** the actual implementation
+> simplified this further by **sharing one `inputs` array** between
+> `valueExpr` and `addrExpr`. See
+> [`08-scatter-impl-notes.md`](08-scatter-impl-notes.md) for the
+> rationale and final form.
 
-| 既存 Prim | `scatter` による表現 |
+### Reduction to existing Prims
+
+| Old Prim | Equivalent `scatter` form |
 |---|---|
 | `pointwise outShape inShapes body` | `scatter outShape outShape inShapes #[] body .laneIdx` |
 | `writeSlice dstShape dstOffset srcShape` | `scatter srcShape dstShape #[srcShape] #[] (.input 0) (.laneIdx + dstOffset)` |
-| `pointwiseToSlice` | 上記の合成（`valueExpr` に任意 body、`addrExpr = laneIdx + offset`） |
+| `pointwiseToSlice` | combination above (any body, addrExpr = laneIdx + offset) |
 
-つまり `scatter` は**これら全部を包含する一般化**。既存の Prim は
-lowering の特殊化（`addrExpr = .laneIdx` なら offset 計算 code を省略）と
-捉えられる。
+So `scatter` **is the generalisation that contains all of them**.
 
-## KV cache write が `scatter` でどう書けるか
+## How the KV cache write looks under `scatter`
 
-RoPE 無しの V cache write を例に：
+V cache write (no RoPE):
 
 ```lean
 -- external inputs
 let vNew    ← registerExternal newVBuf       #[kvDim]                .f32 .Global
 let vCache  ← registerExternal kvCacheV      #[numKVHeads * maxSeqLen * headDim] .f32 .Global
-let params  ← registerExternal paramsBuf     #[1]                    .f32 .Global  -- stores `pos`
+let params  ← registerExternal paramsBuf     #[1]                    .f32 .Global  -- pos
 
 -- scatter: v_cache[kvHead * maxSeqLen * headDim + pos * headDim + d] = v_new[i]
 --   where i = laneIdx, kvHead = i / headDim, d = i % headDim
@@ -143,7 +153,7 @@ open ScalarExp in
 let i     := laneIdx
 let d     := mod i (.const headDim.toFloat)
 let kvH   := idiv i (.const headDim.toFloat)
-let pos   := .input 0  -- addrInputs[0] = params
+let pos   := .input 0
 let addr  := kvH * .const (maxSeqLen * headDim).toFloat
            + pos * .const headDim.toFloat
            + d
@@ -156,58 +166,58 @@ let _out ← CircuitM.scatter
   (addrExpr := addr)
 ```
 
-RoPE K cache write は `valueExpr` に RoPE 計算 (`cos`/`sin`/`pow`) を
-書くだけで同じ枠組みに収まる。
+The K cache write with RoPE just changes `valueExpr` to a rotation
+expression (`cos`/`sin`/`pow`).
 
-## Lowering 方針
+## Lowering plan
 
-- `valueInputs` と `addrInputs` は別々に buffer read
-  - value path は lane indexing か broadcast
-  - addr path は常に broadcast（[1]-shape か同じ broadcast ルール）
-- `addrExpr` は f32 で計算して最後に `Exp.toU32` で integer に
-- output address bounds check は optional（debug only）
+- Read `valueInputs` and `addrInputs` into separate slot arrays
+  - value path: lane-local indexing or broadcast
+  - addr path: also broadcast (typically `[1]` shape)
+- Compute `addrExpr` in f32, `Exp.toU32` at the end for indexing
+- Output bounds check optional (debug only)
 
-## Fusion 側への影響
+## Impact on the fusion pass
 
-`fuseWriteDestination` pass も拡張が必要:
-- `[A: pointwise] → [B: writeSlice with dynamic offset]` を検出
-- B の addr inputs を A の inputs に merge して 1 つの `scatter` を生成
+`fuseWriteDestination` would need extending:
+- Detect `[A: pointwise] → [B: writeSlice with dynamic offset]`
+- Merge B's addr inputs into A's, emit a single `scatter`
 
-`writeSlice` を `scatter` の syntactic sugar として再定義すれば、既存
-fusion pass はほぼそのまま動くはず。
+If `writeSlice` becomes a syntactic sugar over `scatter`, existing
+fusion passes mostly continue to work as-is.
 
-## 次セッションのタスク
+## Tasks for the next session
 
-1. `Prim.scatter` を IR に追加（または `Prim.writeSlice` / `pointwiseToSlice`
-   を置き換え）
-2. Lowering を実装
-3. `fuseWriteDestination` pass を新 Prim に対応
-4. IR ユニットテスト（static offset / dynamic offset 両方）
-5. Gemma4.lean の KV cache write を Circuit DSL 経由に置換
-   - まず V cache (plain copy + dynamic offset) で動作確認
-   - 次に K cache (RoPE + plain scatter) — ここで `valueExpr` の複雑さも検証
-6. kernels/tok と decode bit-identical を確認
+1. Add `Prim.scatter` to IR (or replace `Prim.writeSlice` /
+   `pointwiseToSlice` outright)
+2. Implement the lowering
+3. Update `fuseWriteDestination` to operate on the new Prim
+4. IR unit tests (static and dynamic offset)
+5. Wire it into Gemma4.lean's KV cache write
+   - V first (plain copy + dynamic offset)
+   - K next (RoPE + plain scatter — exercises `valueExpr`'s complexity)
+6. Confirm kernels-per-token and decode bit-identical
 
-## 関連ファイル
+## Related files
 
-- 現状の IR: [`Hesper/Circuit/IR.lean`](../../../Hesper/Circuit/IR.lean)
-- 現状の Passes: [`Hesper/Circuit/Passes.lean`](../../../Hesper/Circuit/Passes.lean)
-- 現状の Lowering: [`Hesper/Circuit/Lowering.lean`](../../../Hesper/Circuit/Lowering.lean)
-- 既存テスト: [`Tests/Circuit/FuseWriteDestinationTest.lean`](../../../Tests/Circuit/FuseWriteDestinationTest.lean)
-- llama.cpp Pattern E 実装: [`llama.cpp/ggml/src/ggml-cuda/ggml-cuda.cu:3762`](../../../llama.cpp/ggml/src/ggml-cuda/ggml-cuda.cu)
-- 置換対象: [`Hesper/Models/Gemma4.lean:1682–1697`](../../../Hesper/Models/Gemma4.lean)
-  (RoPE-K + KV write の hand-coded kernel)
+- IR: [`Hesper/Circuit/IR.lean`](../../../Hesper/Circuit/IR.lean)
+- Passes: [`Hesper/Circuit/Passes.lean`](../../../Hesper/Circuit/Passes.lean)
+- Lowering: [`Hesper/Circuit/Lowering.lean`](../../../Hesper/Circuit/Lowering.lean)
+- Existing test: [`Tests/Circuit/FuseWriteDestinationTest.lean`](../../../Tests/Circuit/FuseWriteDestinationTest.lean)
+- llama.cpp Pattern E: [`llama.cpp/ggml/src/ggml-cuda/ggml-cuda.cu:3762`](../../../llama.cpp/ggml/src/ggml-cuda/ggml-cuda.cu)
+- Replacement target: [`Hesper/Models/Gemma4.lean:1682–1697`](../../../Hesper/Models/Gemma4.lean)
+  (RoPE-K + KV write hand-coded kernel)
 
-## 教訓
+## Lesson learned
 
-今回の設計課題は、**DSL の第一原則**を再確認させてくれた:
+The investigation reaffirms the **first principle of the DSL**:
 
-> **データ並列の意味論は「どこに書くか」と「何を書くか」が独立している**
+> **Data-parallel semantics separates "where to write" from "what to write".**
 
-hesper の現状 DSL はこの独立性を暗黙に identity にしてしまっていた。
-`scatter` を導入すれば、Map / Scatter / さらに将来的な Gather や
-atomic accumulator まで同じ枠組みで扱える。
+hesper's old DSL implicitly fixed the former to identity. Once we
+introduce `scatter`, Map / Scatter / future Gather and atomic-accumulate
+all live under the same framework.
 
-hand-coded kernel を急いで置き換えず、**DSL の表現力不足を発見した
-時点で立ち止まって設計し直す**という判断自体が、このプロジェクトの
-健全性を担保している。
+Pausing here — instead of rushing to swap the hand-coded kernel — was
+the right call: the discovery of the expressiveness gap was the actual
+finding worth recording.
