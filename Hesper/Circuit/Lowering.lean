@@ -110,6 +110,20 @@ def lowerScalarExp (slot : Array (Exp (.scalar .f32)))
     let va ← lowerScalarExp slot laneIdxExp decls a
     let vb ← lowerScalarExp slot laneIdxExp decls b
     return Exp.toF32 (Exp.toU32 (Exp.div va vb))
+  | .fastdiv n mp L d => do
+    -- Constant-folding: d=1 is the identity.  This catches llama.cpp's
+    -- nchannels_y = (0,0,1) / channel_ratio = (0,0,1) pattern where
+    -- the fastdiv reduces to "read n" at zero PTX cost.
+    if d == 1 then
+      lowerScalarExp slot laneIdxExp decls n
+    else
+      let vn ← lowerScalarExp slot laneIdxExp decls n
+      let nU32 := Exp.toU32 vn
+      let mpU32 : Exp (.scalar .u32) := Exp.litU32 mp
+      let hi : Exp (.scalar .u32) := Exp.mulhiU32 nU32 mpU32
+      let sum : Exp (.scalar .u32) := Exp.add hi nU32
+      let quot : Exp (.scalar .u32) := Exp.shiftRight sum (Exp.litU32 L)
+      return Exp.toF32 quot
   | .toFloat a    => lowerScalarExp slot laneIdxExp decls a
   | .warpSum a    => do
     let va ← lowerScalarExp slot laneIdxExp decls a

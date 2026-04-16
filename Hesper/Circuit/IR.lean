@@ -129,6 +129,16 @@ inductive ScalarExp where
   | select (cond t f : ScalarExp)
   | mod    (a b : ScalarExp)
   | idiv   (a b : ScalarExp)
+  /-- Fast integer division by a constant.
+      `fastdiv n mp L d` evaluates `n / d` using the multiply-high + shift
+      identity of Granlund-Montgomery, where `(mp, L)` are the precomputed
+      magic constants for divisor `d`.  On CUDA lowers to
+      `shr((mulhi(n, mp) + n), L)` (one `mul.hi.u32` + `add.u32` + `shr.u32`),
+      skipping the variable-latency `div.u32`.
+      Use `Hesper.Circuit.IR.initFastdivValues d = (mp, L)` to build the
+      constants host-side; pass `d` as well for WebGPU fallback that emits
+      a plain `n / d` when the integer-division path isn't a bottleneck. -/
+  | fastdiv (n : ScalarExp) (mp L d : Nat)
   | toFloat (a : ScalarExp)
   deriving Repr, Inhabited, BEq
 
@@ -163,6 +173,7 @@ partial def shiftInputs (k : Nat) : ScalarExp → ScalarExp
   | select c t f => select (shiftInputs k c) (shiftInputs k t) (shiftInputs k f)
   | mod a b      => mod (shiftInputs k a) (shiftInputs k b)
   | idiv a b     => idiv (shiftInputs k a) (shiftInputs k b)
+  | fastdiv n mp L d => fastdiv (shiftInputs k n) mp L d
   | toFloat a    => toFloat (shiftInputs k a)
 
 /-- Substitute `args[i]` for `input i` everywhere in `e`.  Missing
@@ -193,6 +204,7 @@ partial def subst (args : Array ScalarExp) : ScalarExp → ScalarExp
   | select c t f => select (subst args c) (subst args t) (subst args f)
   | mod a b      => mod (subst args a) (subst args b)
   | idiv a b     => idiv (subst args a) (subst args b)
+  | fastdiv n mp L d => fastdiv (subst args n) mp L d
   | toFloat a    => toFloat (subst args a)
 
 instance : Add ScalarExp      := ⟨ScalarExp.add⟩
@@ -207,6 +219,34 @@ instance : OfNat ScalarExp n  := ⟨ScalarExp.const n.toFloat⟩
 def ge (a b : ScalarExp) : ScalarExp := .lt b a
 def le (a b : ScalarExp) : ScalarExp := .lt a b
 def ite (c t f : ScalarExp) : ScalarExp := .select c t f
+
+/-- Granlund-Montgomery magic numbers for a constant u32 divisor.  Port of
+    llama.cpp's `init_fastdiv_values` (common.cuh:859).  Given a divisor
+    `d ∈ [1, 2^32)`, returns `(mp, L)` such that `(mulhi(n, mp) + n) >> L
+    == n / d` for all `n ∈ [0, 2^32)`.
+    Precondition: `1 ≤ d < 2^32`.  For `d = 0` returns `(0, 0)` (undefined
+    behavior, matches llama.cpp's GGML_ASSERT path). -/
+def initFastdivValues (d : Nat) : Nat × Nat :=
+  if d == 0 then (0, 0) else
+    -- L = ceil(log2(d))
+    let rec findL (L : Nat) (fuel : Nat) : Nat :=
+      match fuel with
+      | 0 => L
+      | fuel+1 => if (1 <<< L) < d then findL (L+1) fuel else L
+    let L := findL 0 32
+    -- mp = floor(2^32 * (2^L - d) / d) + 1
+    let twoL : Nat := 1 <<< L
+    let num : Nat := (1 <<< 32) * (twoL - d)
+    let mp : Nat := num / d + 1
+    -- Clamp mp to 32 bits (for d=1, raw value is 2^32, wraps to 0).
+    let mp32 := mp % (1 <<< 32)
+    (mp32, L)
+
+/-- Convenience: build a `fastdiv n d` ScalarExp with constants computed
+    from `d`.  Host-side call. -/
+def mkFastdiv (n : ScalarExp) (d : Nat) : ScalarExp :=
+  let (mp, L) := initFastdivValues d
+  .fastdiv n mp L d
 
 end ScalarExp
 
