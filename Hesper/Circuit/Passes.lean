@@ -230,6 +230,7 @@ partial def ScalarExp.usedInputs : ScalarExp → Array Nat
   | .select c t f => c.usedInputs ++ t.usedInputs ++ f.usedInputs
   | .mod a b      => a.usedInputs ++ b.usedInputs
   | .idiv a b     => a.usedInputs ++ b.usedInputs
+  | .fastdiv n _ _ _ => n.usedInputs
   | .toFloat a    => a.usedInputs
 
 /-- Rewrite every `input i` inside `e` using the mapping `remap[i]`. -/
@@ -258,6 +259,7 @@ private partial def renumberInputs (remap : Array Nat) : ScalarExp → ScalarExp
   | .select c t f => .select (renumberInputs remap c) (renumberInputs remap t) (renumberInputs remap f)
   | .mod a b      => .mod (renumberInputs remap a) (renumberInputs remap b)
   | .idiv a b     => .idiv (renumberInputs remap a) (renumberInputs remap b)
+  | .fastdiv n mp L d => .fastdiv (renumberInputs remap n) mp L d
   | .toFloat a    => .toFloat (renumberInputs remap a)
 
 /-- Drop input slots from a pointwise op that the body never references.

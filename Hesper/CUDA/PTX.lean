@@ -172,6 +172,7 @@ inductive Inst where
   | add_u32     (dst src1 src2 : RegU32)
   | sub_u32     (dst src1 src2 : RegU32)
   | mul_lo_u32  (dst src1 src2 : RegU32)
+  | mul_hi_u32  (dst src1 src2 : RegU32)
   | mad_lo_u32  (dst a b c : RegU32)
   | div_u32     (dst src1 src2 : RegU32)
   | rem_u32     (dst src1 src2 : RegU32)
@@ -282,6 +283,7 @@ def Inst.toString : Inst → String
   | .add_u32 d a b       => s!"  add.u32 {d}, {a}, {b};"
   | .sub_u32 d a b       => s!"  sub.u32 {d}, {a}, {b};"
   | .mul_lo_u32 d a b    => s!"  mul.lo.u32 {d}, {a}, {b};"
+  | .mul_hi_u32 d a b    => s!"  mul.hi.u32 {d}, {a}, {b};"
   | .mad_lo_u32 d a b c  => s!"  mad.lo.u32 {d}, {a}, {b}, {c};"
   | .div_u32 d a b       => s!"  div.u32 {d}, {a}, {b};"
   | .rem_u32 d a b       => s!"  rem.u32 {d}, {a}, {b};"

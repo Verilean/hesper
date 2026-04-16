@@ -148,6 +148,9 @@ partial def expToPTX (e : Exp t) (s : GenState) : ExpResult :=
   | .shiftRight a b =>
     let (ra, s) := expToPTX a s; let (rb, s) := expToPTX b s
     let (r, s) := s.freshU32; (.u32 r, s.emit (.shr_u32 r ra.toU32! rb.toU32!))
+  | .mulhiU32 a b =>
+    let (ra, s) := expToPTX a s; let (rb, s) := expToPTX b s
+    let (r, s) := s.freshU32; (.u32 r, s.emit (.mul_hi_u32 r ra.toU32! rb.toU32!))
   | .shiftLeft a b =>
     let (ra, s) := expToPTX a s
     match b with
