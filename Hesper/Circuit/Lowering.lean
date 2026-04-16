@@ -111,6 +111,15 @@ def lowerScalarExp (slot : Array (Exp (.scalar .f32)))
     let vb ← lowerScalarExp slot laneIdxExp decls b
     return Exp.toF32 (Exp.toU32 (Exp.div va vb))
   | .toFloat a    => lowerScalarExp slot laneIdxExp decls a
+  | .warpSum a    => do
+    let va ← lowerScalarExp slot laneIdxExp decls a
+    pure (Exp.subgroupAdd va)
+  | .warpBroadcast a => do
+    let va ← lowerScalarExp slot laneIdxExp decls a
+    pure (Exp.subgroupBroadcastFirst va)
+  | .warpShuffleXor a mask => do
+    let va ← lowerScalarExp slot laneIdxExp decls a
+    pure (Exp.subgroupShuffleXor va (Exp.litU32 mask))
 termination_by e => sizeOf e
 
 /-- Build a single-WG shared-memory reduction `ShaderM` for
