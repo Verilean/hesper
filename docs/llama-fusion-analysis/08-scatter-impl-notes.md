@@ -199,31 +199,36 @@ The unification reinforced four DSL design rules:
 
 ## 6. Follow-ups
 
-### 6.1 Multi-output scatter (Plan 5 candidate)
+### 6.1 Multi-output scatter (Plan 5) — DONE (commit a544eb2)
 
-Today `HESPER_SCATTER_KV=1` uses two dispatches (+4 kernels/tok).
-llama.cpp does it in one. To regain that, we'd need a kernel that
-writes to multiple destination buffers in one dispatch:
+`Prim.scatterMulti` writes to N destination buffers in one dispatch,
+sharing the dispatch grid and inputs array.  Wired into Gemma 4 as the
+new `HESPER_SCATTER_KV=1` path; restores kernel-count parity with the
+hand-coded fused kernel (957 kernels/tok, same as baseline).
 
-```lean
-| scatterMulti
-    (outShape : Shape)
-    (inShapes : Array Shape)
-    (outputs  : Array (Shape × ScalarExp × ScalarExp))
-    -- outputs[k] = (dstShape_k, valueExpr_k, addrExpr_k)
-```
+Verification:
+- gemma4-cuda decode bit-identical
+- `nsys`: 956.8 kernels/tok (parity with hand-coded), TPS 48.4
 
-### 6.2 matmul + scatter fusion (Plan 6 candidate)
+### 6.2 matmul + scatter fusion (open)
 
 Fuse `Prim.matmulQ4K → Prim.scatter` into one kernel (the equivalent of
-`matmulQ4KWithEpilogue` for the scatter case). hesper-side analogue of
+`matmulQ4KWithEpilogue` for the scatter case).  Hesper-side analogue of
 llama.cpp Patterns A/B/C.
 
-### 6.3 reduce + scatter fusion
+**Real-world target check (2026-04-16)**: the obvious candidates in
+`Gemma4.forwardBlock` (e.g. `wO → forwardNormThenAdd`) involve a reduce
+between the matmul and the scatter, which can't be folded into a single
+kernel without crossing the reduce wall.  The pattern that *does* fit
+(matmul output → scatter at dynamic addr) doesn't have a current
+production target — Gemma 4 doesn't write matmul outputs to dynamic
+positions.  Park this until a model with that pattern surfaces.
+
+### 6.3 reduce + scatter fusion (open)
 
 Fuse `Prim.reduceLastAxis → Prim.scatter` into one kernel (a scatter
-counterpart of `reduceLastAxisWithEpilogue`). Enables RMSNorm + dynamic
-write fusion.
+counterpart of `reduceLastAxisWithEpilogue`).  Enables RMSNorm + dynamic
+write fusion.  Same caveat as 6.2: needs a real production target.
 
 ## 7. Related commit and files
 
