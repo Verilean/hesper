@@ -252,6 +252,95 @@ def lowerReduceLastAxisWithEpilogue
     let result ← lowerScalarExp slots (Exp.litF32 0.0) decls body
     ShaderM.writeBuffer (ty := .scalar .f32) outputName loopIdx result
 
+/-- **Level 3**: block-cooperative reduce + dynamic-address scatter.
+    Same shape as `lowerReduceLastAxisWithEpilogue` but the epilogue
+    writes to `outputName[addrExpr]` (with `addrExpr` evaluated per
+    lane) instead of `outputName[loopIdx]`, and `outputName` has
+    `dstSize` elements. -/
+def lowerReduceScatterEpilogue
+    (op : ReduceOp)
+    (reduceInputName : String)
+    (epilogueInputNames : Array String)
+    (outputName : String)
+    (D : Nat) (dstSize : Nat) (workgroupSize : Nat)
+    (valueExpr addrExpr : ScalarExp) : ShaderM Unit := do
+  ShaderM.sharedNamed "scratch" (.array (.scalar .f32) workgroupSize)
+  let _ ← ShaderM.declareInputBuffer reduceInputName (.array (.scalar .f32) D)
+  for name in epilogueInputNames do
+    let _ ← ShaderM.declareInputBuffer name (.array (.scalar .f32) D)
+  let _ ← ShaderM.declareOutputBuffer outputName (.array (.scalar .f32) dstSize)
+  let lid ← ShaderM.localId
+  let localIdx := Exp.vec3X lid
+  -- Phase 1: strided accumulate.
+  ShaderM.varNamed "accum" (.scalar .f32) (Exp.litF32 0.0)
+  let accumE : Exp (.scalar .f32) := Exp.var "accum"
+  ShaderM.loop localIdx (Exp.litU32 D) (Exp.litU32 workgroupSize) fun loopIdx => do
+    let v ← ShaderM.readBuffer (ty := .scalar .f32) (n := D) reduceInputName loopIdx
+    let contrib := match op with
+      | .sum          => v
+      | .sumOfSquares => Exp.mul v v
+    ShaderM.assign "accum" (Exp.add accumE contrib)
+  ShaderM.writeWorkgroup (ty := .scalar .f32) "scratch" localIdx accumE
+  ShaderM.barrier
+  -- Tree reduction.
+  let mut stride := workgroupSize / 2
+  while stride > 0 do
+    ShaderM.if_ (Exp.lt localIdx (Exp.litU32 stride)) (do
+      let a ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := workgroupSize) "scratch" localIdx
+      let b ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := workgroupSize) "scratch"
+                (Exp.add localIdx (Exp.litU32 stride))
+      ShaderM.writeWorkgroup (ty := .scalar .f32) "scratch" localIdx (Exp.add a b)
+    ) (pure ())
+    ShaderM.barrier
+    stride := stride / 2
+  -- Phase 2: every lane evaluates value and addr, writes dst[addr] = value.
+  -- Strided over D so workgroupSize lanes cover all D elements.
+  let total ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := workgroupSize) "scratch" (Exp.litU32 0)
+  let totalName ← ShaderM.var (.scalar .f32) total
+  let totalRef : Exp (.scalar .f32) := Exp.var totalName
+  ShaderM.loop localIdx (Exp.litU32 D) (Exp.litU32 workgroupSize) fun loopIdx => do
+    -- slots[0] = scalar reduction; slots[k+1] = epilogueInputs[k][loopIdx]
+    let mut slots : Array (Exp (.scalar .f32)) := #[totalRef]
+    let mut decls : Array InputDecl := #[{ name := "__reduced__", len := 1 }]
+    for name in epilogueInputNames do
+      let v ← ShaderM.readBuffer (ty := .scalar .f32) (n := D) name loopIdx
+      let vName ← ShaderM.var (.scalar .f32) v
+      slots := slots.push (Exp.var vName)
+      decls := decls.push { name := name, len := D }
+    let laneIdxF32 := Exp.toF32 loopIdx
+    let value ← lowerScalarExp slots laneIdxF32 decls valueExpr
+    let addrF32 ← lowerScalarExp slots laneIdxF32 decls addrExpr
+    let addrU32 := Exp.toU32 addrF32
+    ShaderM.writeBuffer (ty := .scalar .f32) outputName addrU32 value
+
+def runReduceScatterEpilogueOp [GPUBackend β]
+    (ctx : β) (op : ReduceOp) (D : Nat) (dstSize : Nat)
+    (valueExpr addrExpr : ScalarExp)
+    (reduceInputBuf : GPUBackend.Buf β)
+    (epilogueInputBufs : Array (GPUBackend.Buf β))
+    (outputBuf : GPUBackend.Buf β)
+    (cacheKey : UInt64) (cacheRef : IO.Ref (Option (GPUBackend.CachedDispatch β)))
+    : IO Unit := do
+  let wgSize := min D 256
+  let reduceInputName := "in0"
+  let epilogueInputNames : Array String :=
+    Array.ofFn (fun (i : Fin epilogueInputBufs.size) => s!"in{i.val + 1}")
+  let outputName := "out"
+  let shader : ShaderM Unit :=
+    lowerReduceScatterEpilogue op reduceInputName epilogueInputNames outputName
+      D dstSize wgSize valueExpr addrExpr
+  let mut namedBufs : List (String × GPUBackend.Buf β) := [(outputName, outputBuf)]
+  let n := epilogueInputBufs.size
+  for i in [0:n] do
+    match epilogueInputBufs[i]? with
+    | some buf => namedBufs := (s!"in{i+1}", buf) :: namedBufs
+    | none     => pure ()
+  namedBufs := (reduceInputName, reduceInputBuf) :: namedBufs
+  let config : ExecConfig :=
+    { numWorkgroups := (1, 1, 1)
+      workgroupSize := { x := wgSize, y := 1, z := 1 } }
+  GPUBackend.executeWithConfigCached ctx shader namedBufs config cacheKey cacheRef
+
 /-- Dispatch a `Prim.reduceLastAxisWithEpilogue` through cached exec. -/
 def runReduceWithEpilogueOp [GPUBackend β]
     (ctx : β) (op : ReduceOp) (D : Nat) (body : ScalarExp)
@@ -636,6 +725,28 @@ def compile [GPUBackend β]
           reduceInBuf epiBufs outBuf 0 cacheRef
       | _, _ =>
         throw (IO.userError s!"Circuit.compile: missing buffer for reduce-with-epilogue op (in={inTr.id} out={outTr.id})")
+    | Prim.reduceScatterEpilogue rop reduceInShape epiShapes dstShape valueExpr addrExpr =>
+      -- inputs layout: [reduceIn, epi_1, ..., epi_k, dst]
+      let nInputs := op.inputs.size
+      let nEpi := epiShapes.size
+      let _ := nEpi  -- shape info already in epiShapes
+      let reduceTr := op.inputs[0]!
+      let dstTr := op.inputs[nInputs - 1]!
+      match lookup reduceTr.id, lookup dstTr.id with
+      | some reduceInBuf, some dstBuf =>
+        let mut epiBufs : Array (GPUBackend.Buf β) := #[]
+        for k in [1 : nInputs - 1] do
+          match op.inputs[k]? with
+          | some tr =>
+            match lookup tr.id with
+            | some b => epiBufs := epiBufs.push b
+            | none => throw (IO.userError s!"Circuit.compile: missing reduceScatter epi input id={tr.id}")
+          | none => pure ()
+        let cacheRef ← IO.mkRef (α := Option (GPUBackend.CachedDispatch β)) none
+        runReduceScatterEpilogueOp ctx rop reduceInShape.numel dstShape.numel
+          valueExpr addrExpr reduceInBuf epiBufs dstBuf 0 cacheRef
+      | _, _ =>
+        throw (IO.userError s!"Circuit.compile: missing buffer for reduceScatter")
 
 /-! ## Build-once, replay-many — zero-overhead dispatch path
 
@@ -811,6 +922,32 @@ def compileOnce [GPUBackend β]
               runReduceWithEpilogueOp _ctx rop D body reduceBuf epiBufs outBuf cacheKey cacheRef
             | _, _ =>
               throw (IO.userError s!"CompiledCircuit: missing reduce-epi buffer (in={inId} out={outId})")
+        }
+    | Prim.reduceScatterEpilogue rop reduceInShape epiShapes dstShape valueExpr addrExpr =>
+      let D := reduceInShape.numel
+      let dstSize := dstShape.numel
+      let nInputs := op.inputs.size
+      let reduceId := op.inputs[0]!.id
+      let dstId := op.inputs[nInputs - 1]!.id
+      let epiIds : Array Nat :=
+        (op.inputs.extract 1 (nInputs - 1)).map (·.id)
+      let cacheRef : IO.Ref (Option (GPUBackend.CachedDispatch β)) ← IO.mkRef none
+      let cacheKey : UInt64 :=
+        hash ("circuit-reduce-scatter", reprStr rop, D, dstSize,
+              reprStr valueExpr, reprStr addrExpr, reprStr epiShapes.toList)
+      closures := closures.push
+        { run := fun lookup => do
+            match lookup reduceId, lookup dstId with
+            | some reduceBuf, some dstBuf =>
+              let mut epiBufs : Array (GPUBackend.Buf β) := #[]
+              for id in epiIds do
+                match lookup id with
+                | some b => epiBufs := epiBufs.push b
+                | none => throw (IO.userError s!"CompiledCircuit: missing reduceScatter epi input id={id}")
+              runReduceScatterEpilogueOp _ctx rop D dstSize valueExpr addrExpr
+                reduceBuf epiBufs dstBuf cacheKey cacheRef
+            | _, _ =>
+              throw (IO.userError s!"CompiledCircuit: missing reduceScatter buffer")
         }
   let externalIds := state.externals.map (fun (tr, _) => tr.id)
   -- producedIds := tensor ids that are produced by some op's outputs
