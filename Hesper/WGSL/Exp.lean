@@ -45,6 +45,11 @@ inductive Exp : WGSLType → Type where
   | bitAnd : Exp (.scalar .u32) → Exp (.scalar .u32) → Exp (.scalar .u32)
   | bitOr : Exp (.scalar .u32) → Exp (.scalar .u32) → Exp (.scalar .u32)
   | bitXor : Exp (.scalar .u32) → Exp (.scalar .u32) → Exp (.scalar .u32)
+  /-- High 32 bits of a×b (u32 × u32 → u64, take hi).  Core primitive for
+      fastdiv (see llama.cpp's `init_fastdiv_values` / `fastdiv` in
+      common.cuh).  Lowered to PTX `mul.hi.u32`; WGSL path computes via
+      `u32(u64(a) * u64(b) >> 32)`. -/
+  | mulhiU32 : Exp (.scalar .u32) → Exp (.scalar .u32) → Exp (.scalar .u32)
 
   -- Type conversions
   | toF32 {t : WGSLType} : Exp t → Exp (.scalar .f32)
@@ -569,6 +574,10 @@ partial def Exp.toWGSL {t : WGSLType} : Exp t → String
   | bitAnd a b => s!"({toWGSL a} & {toWGSL b})"
   | bitOr a b => s!"({toWGSL a} | {toWGSL b})"
   | bitXor a b => s!"({toWGSL a} ^ {toWGSL b})"
+  | mulhiU32 a b =>
+    -- WGSL has no mulhi; emulate via 64-bit widening.  Host-side fastdiv
+    -- precompute (mp, L) keeps the u32 range safe.
+    s!"u32((u64({toWGSL a}) * u64({toWGSL b})) >> 32u)"
   | toF32 e => s!"f32({toWGSL e})"
   | toF16 e => s!"f16({toWGSL e})"
   | toI32 e => s!"i32({toWGSL e})"

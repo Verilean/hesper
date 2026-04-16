@@ -708,6 +708,10 @@ lean_exe «reduce-scatter-gpu-test» where
   root := `Tests.Circuit.ReduceScatterGPUTest
   moreLinkArgs := stdLinkArgs ++ #["./.lake/build/native/libhesper_cuda.a", "-lcuda"]
 
+lean_exe «fastdiv-gpu-test» where
+  root := `Tests.Circuit.FastdivGPUTest
+  moreLinkArgs := stdLinkArgs ++ #["./.lake/build/native/libhesper_cuda.a", "-lcuda"]
+
 lean_exe «pointwise-gpu-test» where
   root := `Tests.Circuit.PointwiseGPUTest
   moreLinkArgs := stdLinkArgs ++ #["./.lake/build/native/libhesper_cuda.a", "-lcuda"]
