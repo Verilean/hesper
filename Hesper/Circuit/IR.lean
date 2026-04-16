@@ -290,6 +290,25 @@ inductive Prim (BufT : Type) (CacheT : Type) where
       (inShapes  : Array Shape)
       (valueExpr : ScalarExp)
       (addrExpr  : ScalarExp)
+  /-- Multi-output scatter: same dispatch grid (`outShape`) and same
+      `inputs` array as `scatter`, but writes to N independent
+      destinations.  Each entry of `outputs` is `(dstShape_k,
+      valueExpr_k, addrExpr_k)`: per lane, evaluate value and address
+      for output k and write `dst_k[addr_k] = value_k`.
+
+      `inputs` layout in the Op: `[data inputs..., dst_0, dst_1, ..., dst_{N-1}]`
+      — i.e. the destinations are appended after the data inputs so
+      `.input k` in any sub-expr refers to `inputs[k]` (data only),
+      identically to the single-output `scatter`.  The destinations are
+      *external* TensorRefs supplied by the caller; their ids appear in
+      `op.outputs` (one entry per destination).
+
+      Used for K + V cache writes: one dispatch covers both outputs
+      with shared work (input loads, broadcast pos, etc.). -/
+  | scatterMulti
+      (outShape : Shape)
+      (inShapes : Array Shape)
+      (outputs  : Array (Shape × ScalarExp × ScalarExp))
 
 /-- An op in the circuit: a Prim plus the concrete tensor wiring. -/
 structure Op (BufT : Type) (CacheT : Type) where
@@ -503,6 +522,35 @@ def scatterInto (dst : TensorRef) (outShape : Shape) (inputs : Array TensorRef)
 def writeSlice (dst : TensorRef) (src : TensorRef) (dstOffset : ScalarExp)
     : CircuitM BufT CacheT TensorRef :=
   scatterInto dst src.shape #[src] (.input 0) (.add .laneIdx dstOffset)
+
+/-- Multi-output scatter: one dispatch grid (`outShape`) writes into
+    N pre-existing destination buffers, each with its own value and
+    address expression.
+
+    `inputs` are the shared data inputs (referenced by both `valueExpr_k`
+    and `addrExpr_k` via `.input k`).  `dsts[k]` is the k-th destination
+    TensorRef; the corresponding `(valueExpr_k, addrExpr_k)` lives at
+    `bodies[k]`.
+
+    Returns the array of destination TensorRefs (their ids are reused
+    so downstream ops can consume them like any external buffer). -/
+def scatterMulti (outShape : Shape) (inputs : Array TensorRef)
+    (dsts : Array TensorRef)
+    (bodies : Array (ScalarExp × ScalarExp))
+    : CircuitM BufT CacheT (Array TensorRef) := do
+  let inShapes : Array Shape := inputs.map (·.shape)
+  let outs : Array (Shape × ScalarExp × ScalarExp) :=
+    Array.ofFn (n := dsts.size) fun i =>
+      let dst := dsts[i.val]!
+      let (v, a) := bodies[i.val]!
+      (dst.shape, v, a)
+  let opInputs : Array TensorRef := inputs ++ dsts
+  let newOp : Op BufT CacheT :=
+    { prim := Prim.scatterMulti outShape inShapes outs,
+      inputs := opInputs,
+      outputs := dsts }
+  modify fun s => { s with ops := s.ops.push newOp }
+  return dsts
 
 end CircuitM
 

@@ -1698,17 +1698,23 @@ def forwardBlock [GPUBackend β] (ctx : β)
              ("params", state.paramsBuf), ("freq_factors", freqFactors)]
             (.dispatch1D kvDim)
         | some freqFactors, true =>
-          -- Circuit DSL path: two scatters (K with RoPE, V plain copy).
-          -- Same semantics as the fused kernel, expressed via Prim.scatter
-          -- with ScalarExp bodies.  Exercises the DSL's full expressive
-          -- power (.indexed gather, dynamic addrExpr, broadcast inputs).
+          -- Circuit DSL path: ONE scatterMulti dispatch writes K (with NeoX RoPE)
+          -- AND V (plain copy) into the cache.  Same semantics and same kernel
+          -- count as the hand-coded fusedRopeKAndCacheWriteKernel.
+          --
+          -- Inputs (4 data + 2 dst):
+          --   inputs[0] = state.kBuf2   (lane-local, [kvDim])
+          --   inputs[1] = freqFactors    (gather-only, [halfDim])
+          --   inputs[2] = state.posF32Buf (broadcast scalar, [1])
+          --   inputs[3] = state.vBuf2   (lane-local, [kvDim])
+          --   inputs[4] = kvCache.kBuf  (dst 0)
+          --   inputs[5] = kvCache.vBuf  (dst 1)
           let halfDim := headDim / 2
           let cacheSize := numKVHeads * cfg.maxSeqLen * headDim
-          -- K scatter: NeoX RoPE + write to k_cache[head*stride + pos*headDim + d].
-          let kScatterKey := hash ("gemma4-scatter-ropeK",
-                                    li, numKVHeads, cfg.maxSeqLen, headDim)
-          let kCcRef ← Hesper.Circuit.getGlobalCircuitRef (β := β) kScatterKey
-          Hesper.Circuit.runCachedFused ctx kCcRef
+          let key := hash ("gemma4-scatter-multi-kv",
+                            li, numKVHeads, cfg.maxSeqLen, headDim)
+          let ccRef ← Hesper.Circuit.getGlobalCircuitRef (β := β) key
+          Hesper.Circuit.runCachedFused ctx ccRef
             (do
               let kT ← Hesper.Circuit.CircuitM.registerExternal
                          (BufT := GPUBackend.Buf β) (CacheT := GPUBackend.CachedDispatch β)
@@ -1719,12 +1725,25 @@ def forwardBlock [GPUBackend β] (ctx : β)
               let posT ← Hesper.Circuit.CircuitM.registerExternal
                            (BufT := GPUBackend.Buf β) (CacheT := GPUBackend.CachedDispatch β)
                            state.posF32Buf #[1] .f32 .Global
-              let dstT ← Hesper.Circuit.CircuitM.registerExternal
+              let vT ← Hesper.Circuit.CircuitM.registerExternal
+                         (BufT := GPUBackend.Buf β) (CacheT := GPUBackend.CachedDispatch β)
+                         state.vBuf2 #[kvDim] .f32 .Global
+              let kDst ← Hesper.Circuit.CircuitM.registerExternal
                            (BufT := GPUBackend.Buf β) (CacheT := GPUBackend.CachedDispatch β)
                            kvCache.kBuf #[cacheSize] .f32 .Global
+              let vDst ← Hesper.Circuit.CircuitM.registerExternal
+                           (BufT := GPUBackend.Buf β) (CacheT := GPUBackend.CachedDispatch β)
+                           kvCache.vBuf #[cacheSize] .f32 .Global
+              -- Shared addr arithmetic.
               let i        : Hesper.Circuit.ScalarExp := .laneIdx
               let headSE   : Hesper.Circuit.ScalarExp := .idiv i (.const headDim.toFloat)
               let d        : Hesper.Circuit.ScalarExp := .mod  i (.const headDim.toFloat)
+              let posSE    : Hesper.Circuit.ScalarExp := .input 2
+              let addrExpr : Hesper.Circuit.ScalarExp :=
+                headSE * .const (cfg.maxSeqLen * headDim).toFloat
+                + posSE * .const headDim.toFloat
+                + d
+              -- K value: NeoX RoPE.
               let dLow     : Hesper.Circuit.ScalarExp := .lt d (.const halfDim.toFloat)
               let pairD    : Hesper.Circuit.ScalarExp :=
                 .select dLow (d + .const halfDim.toFloat) (d - .const halfDim.toFloat)
@@ -1735,7 +1754,6 @@ def forwardBlock [GPUBackend β] (ctx : β)
               let dimPair  : Hesper.Circuit.ScalarExp :=
                 .select dLow d (d - .const halfDim.toFloat)
               let freqFac  : Hesper.Circuit.ScalarExp := .indexed 1 dimPair
-              let posSE    : Hesper.Circuit.ScalarExp := .input 2
               let exponent : Hesper.Circuit.ScalarExp :=
                 .const 2.0 * dimPair / .const headDim.toFloat
               let freqInv  : Hesper.Circuit.ScalarExp := .pow (.const cfg.ropeTheta) (.neg exponent)
@@ -1746,43 +1764,16 @@ def forwardBlock [GPUBackend β] (ctx : β)
               let x1       : Hesper.Circuit.ScalarExp := .select dLow xPair xSelf
               let x0new    : Hesper.Circuit.ScalarExp := x0 * cosT - x1 * sinT
               let x1new    : Hesper.Circuit.ScalarExp := x0 * sinT + x1 * cosT
-              let valueExpr : Hesper.Circuit.ScalarExp := .select dLow x0new x1new
-              let addrExpr  : Hesper.Circuit.ScalarExp :=
-                headSE * .const (cfg.maxSeqLen * headDim).toFloat
-                + posSE * .const headDim.toFloat
-                + d
-              let _ ← Hesper.Circuit.CircuitM.scatterInto dstT #[kvDim]
-                        #[kT, ffT, posT] valueExpr addrExpr
+              let kValue   : Hesper.Circuit.ScalarExp := .select dLow x0new x1new
+              -- V value: plain copy from inputs[3].
+              let vValue   : Hesper.Circuit.ScalarExp := .input 3
+              let _ ← Hesper.Circuit.CircuitM.scatterMulti #[kvDim]
+                        #[kT, ffT, posT, vT]
+                        #[kDst, vDst]
+                        #[(kValue, addrExpr), (vValue, addrExpr)]
               pure ())
-            [(0, state.kBuf2), (1, freqFactors),
-             (2, state.posF32Buf), (3, kvCache.kBuf)]
-          -- V scatter: plain copy to v_cache[head*stride + pos*headDim + d].
-          let vScatterKey := hash ("gemma4-scatter-V",
-                                    li, numKVHeads, cfg.maxSeqLen, headDim)
-          let vCcRef ← Hesper.Circuit.getGlobalCircuitRef (β := β) vScatterKey
-          Hesper.Circuit.runCachedFused ctx vCcRef
-            (do
-              let vT ← Hesper.Circuit.CircuitM.registerExternal
-                         (BufT := GPUBackend.Buf β) (CacheT := GPUBackend.CachedDispatch β)
-                         state.vBuf2 #[kvDim] .f32 .Global
-              let posT ← Hesper.Circuit.CircuitM.registerExternal
-                           (BufT := GPUBackend.Buf β) (CacheT := GPUBackend.CachedDispatch β)
-                           state.posF32Buf #[1] .f32 .Global
-              let dstT ← Hesper.Circuit.CircuitM.registerExternal
-                           (BufT := GPUBackend.Buf β) (CacheT := GPUBackend.CachedDispatch β)
-                           kvCache.vBuf #[cacheSize] .f32 .Global
-              let i       : Hesper.Circuit.ScalarExp := .laneIdx
-              let headSE  : Hesper.Circuit.ScalarExp := .idiv i (.const headDim.toFloat)
-              let d       : Hesper.Circuit.ScalarExp := .mod  i (.const headDim.toFloat)
-              let posSE   : Hesper.Circuit.ScalarExp := .input 1
-              let addrExpr : Hesper.Circuit.ScalarExp :=
-                headSE * .const (cfg.maxSeqLen * headDim).toFloat
-                + posSE * .const headDim.toFloat
-                + d
-              let _ ← Hesper.Circuit.CircuitM.scatterInto dstT #[kvDim]
-                        #[vT, posT] (.input 0) addrExpr
-              pure ())
-            [(0, state.vBuf2), (1, state.posF32Buf), (2, kvCache.vBuf)]
+            [(0, state.kBuf2), (1, freqFactors), (2, state.posF32Buf),
+             (3, state.vBuf2), (4, kvCache.kBuf), (5, kvCache.vBuf)]
         | none, _ =>
           -- No freqFactors: fall back to the plain K+V copy hand-coded kernel.
           ce s!"kvWrite_{headDim}_{numKVHeads}"
