@@ -1,0 +1,333 @@
+import Hesper.CUDA.FFI
+import Hesper.CUDA.Buffer
+import Hesper.Layers.Linear
+
+/-!
+# llama.cpp PTX loader (Phase 0 hybrid prototype)
+
+Loads externally-compiled PTX from llama.cpp (mmvq.cu, quantize.cu) and
+exposes typed launch helpers.  Enabled via env flag `HESPER_USE_LLAMACPP_PTX=1`.
+
+Requires both PTXes present at:
+  `/tmp/llamacpp_ptx/mmvq.ptx`
+  `/tmp/llamacpp_ptx/quantize.ptx`
+
+Target kernels (sm_89):
+  * Q4_K decode matmul — `_Z13mul_mat_vec_qIL9ggml_type12ELi1ELb0ELb0EEv...`
+  * Q6_K decode matmul — `_Z13mul_mat_vec_qIL9ggml_type14ELi1ELb0ELb0EEv...`
+  * Q8_1 quantize      — `_Z13quantize_q8_1PKfPvlllllj5uint3`
+
+See docs/llama-fusion-analysis/09-hybrid-prototype.md §0.3-0.4 for ABI.
+-/
+
+namespace Hesper.LlamaCppPTX
+
+open Hesper.CUDA
+
+/-- Mangled symbols. -/
+def q4kMatmulSymbol : String :=
+  "_Z13mul_mat_vec_qIL9ggml_type12ELi1ELb0ELb0EEvPKvS2_PKi31ggml_cuda_mm_fusion_args_devicePfj5uint3jjjS7_jjjS7_jjjj"
+
+def q6kMatmulSymbol : String :=
+  "_Z13mul_mat_vec_qIL9ggml_type14ELi1ELb0ELb0EEvPKvS2_PKi31ggml_cuda_mm_fusion_args_devicePfj5uint3jjjS7_jjjS7_jjjj"
+
+def q8_1QuantizeSymbol : String :=
+  "_Z13quantize_q8_1PKfPvlllllj5uint3"
+
+/-- Cached compiled kernel handles. -/
+structure Kernels where
+  q4kMatmul : CUfunction
+  q6kMatmul : CUfunction
+  q8_1Quantize : CUfunction
+
+initialize kernelsRef : IO.Ref (Option Kernels) ← IO.mkRef none
+
+/-- Default paths.  Override by caller if needed. -/
+def defaultMmvqPath : String := "/tmp/llamacpp_ptx/mmvq.ptx"
+def defaultQuantizePath : String := "/tmp/llamacpp_ptx/quantize.ptx"
+
+/-- Load PTX modules and resolve the three target kernels.  Idempotent. -/
+def loadKernels (mmvqPath : String := defaultMmvqPath)
+    (quantizePath : String := defaultQuantizePath) : IO Kernels := do
+  match ← kernelsRef.get with
+  | some k => return k
+  | none =>
+    let mmvqSrc ← IO.FS.readFile mmvqPath
+    let qSrc ← IO.FS.readFile quantizePath
+    let mmvqMod ← cuModuleLoadData mmvqSrc
+    let qMod ← cuModuleLoadData qSrc
+    let q4k ← cuModuleGetFunction mmvqMod q4kMatmulSymbol
+    let q6k ← cuModuleGetFunction mmvqMod q6kMatmulSymbol
+    let q8q ← cuModuleGetFunction qMod q8_1QuantizeSymbol
+    let k : Kernels := { q4kMatmul := q4k, q6kMatmul := q6k, q8_1Quantize := q8q }
+    kernelsRef.set (some k)
+    return k
+
+/-- Check env flag `HESPER_USE_LLAMACPP_PTX` (truthy = "1"). -/
+def isEnabled : IO Bool := do
+  match ← IO.getEnv "HESPER_USE_LLAMACPP_PTX" with
+  | some "1" => return true
+  | _ => return false
+
+/-! ## Argument packing
+
+CUDA's `cuLaunchKernel` takes `void**` where each entry points at an arg's
+value.  For mixed-type args (u64, u32, uint3, 32-byte struct) we pack every
+value into a single `ByteArray` and pass per-arg byte offsets. -/
+
+/-- Append a `UInt64` little-endian to the buffer.  Returns new size. -/
+private def pushU64 (buf : ByteArray) (v : UInt64) : ByteArray := Id.run do
+  let mut b := buf
+  for i in [0:8] do
+    b := b.push ((v >>> (i.toUInt64 * 8)).toUInt8)
+  return b
+
+private def pushU32 (buf : ByteArray) (v : UInt32) : ByteArray := Id.run do
+  let mut b := buf
+  for i in [0:4] do
+    b := b.push ((v >>> (i.toUInt32 * 8)).toUInt8)
+  return b
+
+/-- Pad buffer up to `align`-byte boundary (align must be power of two). -/
+private def alignTo (buf : ByteArray) (align : Nat) : ByteArray := Id.run do
+  let mut b := buf
+  while b.size % align != 0 do
+    b := b.push 0
+  return b
+
+/-! ## Q8_1 quantize launch
+
+Signature (9 params):
+  quantize_q8_1(const float *x, void *vy,
+                int64_t ne00, s01, s02, s03, ne0,
+                uint32_t ne1, uint3 ne2_fastdiv)
+
+For single-row Q8_1 quantize (decode path):
+  ne00 = ne0 = inDim
+  s01 = s02 = s03 = 0
+  ne1 = 1
+  ne2 = (0, 0, 1)  (fastdiv values for divisor=1)
+
+Launch: block=(256,1,1), grid=(ceil(inDim/256), 1, 1). -/
+def launchQuantizeQ8_1 (k : Kernels) (xBuf : CUdeviceptr) (yBuf : CUdeviceptr)
+    (inDim : Nat) : IO Unit := do
+  if inDim % 32 != 0 then
+    throw (IO.userError s!"launchQuantizeQ8_1: inDim {inDim} not a multiple of QK8_1=32")
+  let mut bytes : ByteArray := ByteArray.empty
+  let mut offsets : Array USize := #[]
+  -- param 0: const float *x
+  offsets := offsets.push bytes.size.toUSize
+  bytes := pushU64 bytes xBuf.toUInt64
+  -- param 1: void *vy
+  offsets := offsets.push bytes.size.toUSize
+  bytes := pushU64 bytes yBuf.toUInt64
+  -- params 2-6: int64_t ne00, s01, s02, s03, ne0
+  for v in [inDim, 0, 0, 0, inDim] do
+    offsets := offsets.push bytes.size.toUSize
+    bytes := pushU64 bytes v.toUInt64
+  -- param 7: uint32_t ne1 = 1
+  offsets := offsets.push bytes.size.toUSize
+  bytes := pushU32 bytes 1
+  -- param 8: uint3 ne2_fastdiv = (0, 0, 1)  (12 bytes, 4-byte aligned — already is)
+  bytes := alignTo bytes 4
+  offsets := offsets.push bytes.size.toUSize
+  bytes := pushU32 bytes 0
+  bytes := pushU32 bytes 0
+  bytes := pushU32 bytes 1
+  let grid := (inDim + 255) / 256
+  cuLaunchKernelRaw k.q8_1Quantize
+    grid.toUInt32 1 1
+    256 1 1
+    0
+    bytes offsets
+
+/-! ## Q4_K / Q6_K matmul launch
+
+Signature (19 params) for `ncols_dst=1, has_fusion=false, small_k=false`:
+  mul_mat_vec_q(const void *vx, const void *vy, const int32_t *ids,
+                ggml_cuda_mm_fusion_args_device fusion,   // 32-byte all-zero
+                float *dst,
+                uint32_t ncols_x,                         // K-dim = inDim
+                uint3 nchannels_y,                        // (0,0,1)
+                uint32_t stride_row_x, stride_col_y, stride_col_dst,
+                uint3 channel_ratio,                      // (0,0,1)
+                uint32_t stride_channel_x, stride_channel_y, stride_channel_dst,
+                uint3 sample_ratio,                       // (0,0,1)
+                uint32_t stride_sample_x, stride_sample_y, stride_sample_dst,
+                uint32_t ids_stride)
+
+Block: (warp_size=32, nwarps=4, 1)
+Grid : (outDim / rows_per_cuda_block, 1, 1).  On sm_89 for typical decode
+       (ncols_dst=1, small_k=false), `rows_per_cuda_block = 1`, so grid.x = outDim.
+       (`small_k` only triggers when blocks_per_row_x < nwarps * 2 = 8, i.e. inDim<2048,
+       which does not occur in Gemma 4 E4B.)
+
+Strides (verified against mmvq.cu host code, `ggml_cuda_op_mul_mat_vec_q`):
+  stride_row_x   = ne00 / ggml_blck_size(type) = inDim / 256  (Q4_K/Q6_K block count/row)
+                   Kernel uses it as `kbx + i*stride_row_x` in block-index space.
+  stride_col_y   = src1_padded_row_size / QK8_1 = inDim / 32  (Q8_1 blocks per row)
+  stride_col_dst = outDim (rows written per column)
+-/
+private def packMatmulArgs (weightBuf : CUdeviceptr) (q8Buf : CUdeviceptr)
+    (dstBuf : CUdeviceptr) (inDim outDim : Nat)
+    (blocksPerRowX : Nat) : ByteArray × Array USize := Id.run do
+  let mut bytes : ByteArray := ByteArray.empty
+  let mut offsets : Array USize := #[]
+  -- 0: const void *vx (weights)
+  offsets := offsets.push bytes.size.toUSize
+  bytes := pushU64 bytes weightBuf.toUInt64
+  -- 1: const void *vy (Q8_1 input)
+  offsets := offsets.push bytes.size.toUSize
+  bytes := pushU64 bytes q8Buf.toUInt64
+  -- 2: const int32_t *ids (NULL)
+  offsets := offsets.push bytes.size.toUSize
+  bytes := pushU64 bytes 0
+  -- 3: ggml_cuda_mm_fusion_args_device (32 bytes, 8-byte aligned, all zero)
+  bytes := alignTo bytes 8
+  offsets := offsets.push bytes.size.toUSize
+  for _ in [0:32] do
+    bytes := bytes.push 0
+  -- 4: float *dst
+  offsets := offsets.push bytes.size.toUSize
+  bytes := pushU64 bytes dstBuf.toUInt64
+  -- 5: uint32_t ncols_x = inDim
+  offsets := offsets.push bytes.size.toUSize
+  bytes := pushU32 bytes inDim.toUInt32
+  -- 6: uint3 nchannels_y = (0, 0, 1)
+  bytes := alignTo bytes 4
+  offsets := offsets.push bytes.size.toUSize
+  bytes := pushU32 bytes 0
+  bytes := pushU32 bytes 0
+  bytes := pushU32 bytes 1
+  -- 7-9: uint32_t stride_row_x, stride_col_y, stride_col_dst
+  offsets := offsets.push bytes.size.toUSize
+  bytes := pushU32 bytes blocksPerRowX.toUInt32
+  offsets := offsets.push bytes.size.toUSize
+  bytes := pushU32 bytes (inDim / 32).toUInt32
+  offsets := offsets.push bytes.size.toUSize
+  bytes := pushU32 bytes outDim.toUInt32
+  -- 10: uint3 channel_ratio = (0, 0, 1)
+  bytes := alignTo bytes 4
+  offsets := offsets.push bytes.size.toUSize
+  bytes := pushU32 bytes 0
+  bytes := pushU32 bytes 0
+  bytes := pushU32 bytes 1
+  -- 11-13: stride_channel_{x,y,dst} = 0
+  for _ in [0:3] do
+    offsets := offsets.push bytes.size.toUSize
+    bytes := pushU32 bytes 0
+  -- 14: uint3 sample_ratio = (0, 0, 1)
+  bytes := alignTo bytes 4
+  offsets := offsets.push bytes.size.toUSize
+  bytes := pushU32 bytes 0
+  bytes := pushU32 bytes 0
+  bytes := pushU32 bytes 1
+  -- 15-17: stride_sample_{x,y,dst} = 0
+  for _ in [0:3] do
+    offsets := offsets.push bytes.size.toUSize
+    bytes := pushU32 bytes 0
+  -- 18: ids_stride = 0
+  offsets := offsets.push bytes.size.toUSize
+  bytes := pushU32 bytes 0
+  return (bytes, offsets)
+
+/-- Launch llama.cpp's Q4_K matmul.
+    `weightBuf` — Q4_K blocks (144 B each)
+    `q8Buf`     — Q8_1 blocks (36 B each) produced by `launchQuantizeQ8_1`
+    `dstBuf`    — f32 output
+    Strides assume a single-row vec×mat (standard decode path). -/
+def launchMulMatVecQ4K (k : Kernels) (weightBuf q8Buf dstBuf : CUdeviceptr)
+    (inDim outDim : Nat) : IO Unit := do
+  if inDim % 256 != 0 then
+    throw (IO.userError s!"Q4_K requires inDim % 256 == 0, got {inDim}")
+  -- stride_row_x is in Q4_K block units (host passes ne00 / blck_size(Q4_K)=256).
+  let blocksPerRowX := inDim / 256
+  let (bytes, offsets) := packMatmulArgs weightBuf q8Buf dstBuf inDim outDim blocksPerRowX
+  -- On sm_89 for ncols_dst=1 with inDim ≥ 2048: rows_per_cuda_block = 1.
+  cuLaunchKernelRaw k.q4kMatmul
+    outDim.toUInt32 1 1
+    32 4 1
+    0
+    bytes offsets
+
+/-- Launch llama.cpp's Q6_K matmul (same host signature as Q4_K, different kernel).
+    `weightBuf` — Q6_K blocks (210 B each, 256 weights/block).
+    Same stride semantics as Q4_K. -/
+def launchMulMatVecQ6K (k : Kernels) (weightBuf q8Buf dstBuf : CUdeviceptr)
+    (inDim outDim : Nat) : IO Unit := do
+  if inDim % 256 != 0 then
+    throw (IO.userError s!"Q6_K requires inDim % 256 == 0, got {inDim}")
+  let blocksPerRowX := inDim / 256
+  let (bytes, offsets) := packMatmulArgs weightBuf q8Buf dstBuf inDim outDim blocksPerRowX
+  cuLaunchKernelRaw k.q6kMatmul
+    outDim.toUInt32 1 1
+    32 4 1
+    0
+    bytes offsets
+
+/-! ## Installation as `Hesper.Layers.Linear` override
+
+Per-layer Q8_1 scratch buffer is sized `(inDim/32) * 36 B`.  To keep the
+override signature clean (no backend context in signature), we cache one
+scratch buffer per (inDim) globally.  A single decode call runs in one
+thread so no contention.  Buffer is lazily allocated on first use.
+-/
+
+initialize scratchQ8Ref : IO.Ref (Array (Nat × CUdeviceptr)) ← IO.mkRef #[]
+
+private def getQ8Scratch (inDim : Nat) : IO CUdeviceptr := do
+  let arr ← scratchQ8Ref.get
+  match arr.find? (·.1 == inDim) with
+  | some (_, p) => return p
+  | none =>
+    let bytes : USize := ((inDim / 32) * 36).toUSize
+    let p ← cuMalloc bytes
+    scratchQ8Ref.modify (·.push (inDim, p))
+    return p
+
+/-- Debug knobs.  Default: Q4_K on; Q6_K falls through to hesper kernel
+    (its 210-byte block layout hasn't been cross-checked against hesper yet). -/
+initialize enableQ4K : IO.Ref Bool ← IO.mkRef true
+initialize enableQ6K : IO.Ref Bool ← IO.mkRef false
+
+/-- Install `llamaCppDp4aOverride` so `forwardDP4A` dispatches to the llama.cpp
+    PTX path.  Call once after CUDA init if `HESPER_USE_LLAMACPP_PTX=1`.
+    Per-quant toggles: `HESPER_LLAMACPP_Q4K` (default on), `HESPER_LLAMACPP_Q6K`
+    (default off). -/
+def installOverride : IO Unit := do
+  let k ← loadKernels
+  let q4on ← enableQ4K.get
+  let q6on ← enableQ6K.get
+  -- Match env overrides: HESPER_LLAMACPP_Q4K=0 / HESPER_LLAMACPP_Q6K=1
+  let q4on := match ← IO.getEnv "HESPER_LLAMACPP_Q4K" with
+              | some "0" => false | _ => q4on
+  let q6on := match ← IO.getEnv "HESPER_LLAMACPP_Q6K" with
+              | some "1" => true | _ => q6on
+  enableQ4K.set q4on
+  enableQ6K.set q6on
+  IO.println s!"[hesper-llamacpp] Q4_K override = {q4on}, Q6_K override = {q6on}"
+  Hesper.Layers.Linear.llamaCppDp4aOverride.set (some fun inPtr wPtr outPtr inDim outDim tag => do
+    let useLlama := match tag with
+      | 0 => q4on  -- Q4_K
+      | 1 => q6on  -- Q6_K (lm_head)
+      | _ => false
+    if !useLlama then
+      return false  -- fall through to hesper's kernel
+    let q8Ptr ← getQ8Scratch inDim
+    launchQuantizeQ8_1 k inPtr q8Ptr inDim
+    match tag with
+    | 0 => launchMulMatVecQ4K k wPtr q8Ptr outPtr inDim outDim
+    | 1 => launchMulMatVecQ6K k wPtr q8Ptr outPtr inDim outDim
+    | _ => throw (IO.userError s!"llamacpp override: unknown quant tag {tag}")
+    return true)
+
+/-- Auto-install if env flag set.  Returns `true` if the override is now live. -/
+def autoInstall : IO Bool := do
+  if ← isEnabled then
+    installOverride
+    IO.println "[hesper] HESPER_USE_LLAMACPP_PTX=1 — llama.cpp PTX override installed."
+    return true
+  else
+    return false
+
+end Hesper.LlamaCppPTX

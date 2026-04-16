@@ -69,6 +69,12 @@ class GPUBackend (β : Type) where
   hasShaderF16Support : β → IO Bool := fun _ => pure false
   newCacheRef : IO (IO.Ref (Option CachedDispatch)) := IO.mkRef none
 
+  /-- Raw device pointer for a buffer, if the backend has a native address
+      space exposable as a USize.  CUDA returns `some` (CUdeviceptr), WebGPU
+      returns `none`.  Used by Phase-0 hybrid path that calls externally-JIT'd
+      PTX directly.  Must not be used by portable code. -/
+  rawDevicePtr : β → Buf → IO (Option USize) := fun _ _ => pure none
+
   -- ── Batching (optional) ──
   /-- Begin recording dispatches for batch submission. CUDA: no-op. -/
   beginBatch : β → IO Unit := fun _ => pure ()

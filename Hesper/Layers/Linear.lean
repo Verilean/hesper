@@ -58,6 +58,15 @@ initialize dp4aEnabled   : IO.Ref Bool  ← IO.mkRef false
 /-- Separately toggle Q6_K (lmHead) dp4a path. On by default when dp4aEnabled=true;
     set to false via HESPER_DP4A_Q6K=0 to debug Q6_K issues while keeping Q4_K dp4a. -/
 initialize dp4aQ6KEnabled : IO.Ref Bool ← IO.mkRef true
+
+/-- Phase-0 hybrid override.  When set, `forwardDP4A` skips hesper's Q8_1 quantize
+    + dp4a matmul and calls this function instead with raw device pointers:
+      `(inputF32Ptr, weightPtr, outputF32Ptr, inDim, outDim, quantFormatTag) : IO Bool`
+    where `quantFormatTag = 0` for Q4_K and `1` for Q6_K.  Return `true` if the
+    override dispatched the work; `false` to fall through to hesper's kernels.
+    Installed by `Hesper.LlamaCppPTX.installOverride` (CUDA-only). -/
+initialize llamaCppDp4aOverride :
+  IO.Ref (Option (USize → USize → USize → Nat → Nat → Nat → IO Bool)) ← IO.mkRef none
 initialize totalNanosRef : IO.Ref UInt64 ← IO.mkRef 0
 initialize callCountRef  : IO.Ref Nat    ← IO.mkRef 0
 /-- Per-shape cumulative time, keyed by (inDim, outDim). Array of
@@ -2816,6 +2825,25 @@ def forwardDP4A [GPUBackend β] (ctx : β)
 
   let profiling ← profilingRef.get
   let startNs ← if profiling then IO.monoNanosNow else pure 0
+
+  -- Phase-0 hybrid override: if installed and backend exposes raw device
+  -- pointers, dispatch to externally-JIT'd llama.cpp PTX instead.
+  if let some fn ← llamaCppDp4aOverride.get then
+    if let (some inPtr, some wPtr, some outPtr) ← (do
+        let a ← GPUBackend.rawDevicePtr ctx inputBuf
+        let b ← GPUBackend.rawDevicePtr ctx layer.weightBuf
+        let c ← GPUBackend.rawDevicePtr ctx outputBuf
+        pure (a, b, c)) then
+      let tag := if layer.quantFormat == .Q4_K then 0 else 1
+      let handled ← fn inPtr wPtr outPtr layer.config.inDim layer.config.outDim tag
+      if handled then
+        if profiling then
+          let endNs ← IO.monoNanosNow
+          let delta := (endNs - startNs).toUInt64
+          totalNanosRef.modify (· + delta)
+          callCountRef.modify (· + 1)
+          perShapeAdd layer.config.inDim layer.config.outDim delta
+        return
 
   let nQ8Blocks := layer.config.inDim / 32
   let q8BufBytes : USize := (nQ8Blocks * 9 * 4).toUSize
