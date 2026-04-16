@@ -684,6 +684,14 @@ lean_exe «fuse-write-destination-test» where
   root := `Tests.Circuit.FuseWriteDestinationTest
   moreLinkArgs := stdLinkArgs
 
+lean_exe «scatter-dynamic-gpu-test» where
+  root := `Tests.Circuit.ScatterDynamicGPUTest
+  moreLinkArgs := stdLinkArgs ++ #["./.lake/build/native/libhesper_cuda.a", "-lcuda"]
+
+lean_exe «rope-k-scatter-gpu-test» where
+  root := `Tests.Circuit.RopeKScatterGPUTest
+  moreLinkArgs := stdLinkArgs ++ #["./.lake/build/native/libhesper_cuda.a", "-lcuda"]
+
 lean_exe «pointwise-gpu-test» where
   root := `Tests.Circuit.PointwiseGPUTest
   moreLinkArgs := stdLinkArgs ++ #["./.lake/build/native/libhesper_cuda.a", "-lcuda"]

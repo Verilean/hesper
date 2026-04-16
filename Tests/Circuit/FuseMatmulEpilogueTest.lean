@@ -57,7 +57,7 @@ def run : IO Unit := do
     | .matmulQ4K _ => IO.println "  matmulQ4K"
     | .matmulQ4KWithEpilogue _ _ _ body =>
       IO.println s!"  matmulQ4K+epi body={repr body}"
-    | .pointwise _ _ body => IO.println s!"  pointwise body={repr body}"
+    | .scatter _ _ _ body _ => IO.println s!"  scatter body={repr body}"
     | _ => IO.println "  (other)"
 
   -- Protect the external inputs + the final op's output.  The
@@ -74,7 +74,7 @@ def run : IO Unit := do
     | .matmulQ4K _ => IO.println "  matmulQ4K"
     | .matmulQ4KWithEpilogue _ sz off body =>
       IO.println s!"  matmulQ4K+epi sizes={sz} offs={off} body={repr body}"
-    | .pointwise _ _ body => IO.println s!"  pointwise body={repr body}"
+    | .scatter _ _ _ body _ => IO.println s!"  scatter body={repr body}"
     | _ => IO.println "  (other)"
 
   -- Expectation: 1 op, a `matmulQ4KWithEpilogue` whose body reads
