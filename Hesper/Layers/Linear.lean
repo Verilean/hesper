@@ -1812,19 +1812,12 @@ def fusedQ4KMLinearDP4A4WarpKernel (config : Config) : ShaderM Unit := do
   let _input ← ShaderM.declareReadOnlyBuffer "input_q8" (.array (.scalar .u32) q8InputU32Size)
   let _output ← ShaderM.declareOutputBuffer "output" (.array (.scalar .f32) config.outDim)
 
-  -- Cooperatively stage Q8_1 input into smem (128 threads → ~few µs).
-  ShaderM.sharedNamed "s_input_q8" (.array (.scalar .u32) q8InputU32Size)
-  let perThread : Nat := (q8InputU32Size + 127) / 128
-  for i in [0 : perThread] do
-    let idx := Exp.add tid (Exp.litU32 (i * 128))
-    ShaderM.if_ (Exp.lt idx (Exp.litU32 q8InputU32Size)) (do
-      let v ← ShaderM.readBuffer (ty := .scalar .u32) (n := q8InputU32Size) "input_q8" idx
-      ShaderM.writeWorkgroup (ty := .scalar .u32) "s_input_q8" idx v
-    ) (pure ())
-
-  -- smem for cross-warp partial sums (warps 1..3 write, warp 0 reads).
+  -- smem for cross-warp partial sums only (4 floats = 16 B).
+  -- NOTE: no smem staging of Q8_1 input — global read directly.
+  -- This keeps smem usage minimal and maximizes occupancy (the key
+  -- difference vs the 2-row/4-row variants that staged Q8_1 in smem
+  -- at the cost of 11 KB smem → 67% occupancy).
   ShaderM.sharedNamed "s_partial" (.array (.scalar .f32) 4)
-  ShaderM.barrier
 
   let inBounds := Exp.lt outIdx (Exp.litU32 config.outDim)
 
@@ -1880,15 +1873,15 @@ def fusedQ4KMLinearDP4A4WarpKernel (config : Config) : ShaderM Unit := do
     let v0 ← ShaderM.readBuffer (ty := .scalar .u32) (n := totalWeightU32) "weights" q4BaseIdx
     let v1 ← ShaderM.readBuffer (ty := .scalar .u32) (n := totalWeightU32) "weights" (Exp.add q4BaseIdx (Exp.litU32 4))
 
-    -- Q8_1 reads from SMEM (shared between warps).
+    -- Q8_1 reads from global memory (no smem staging — maximizes occupancy).
     let q8Sub0Base := Exp.add (Exp.mul blockIdx (Exp.litU32 (8 * 9))) (Exp.mul bq8Off (Exp.litU32 9))
     let q8Sub1Base := Exp.add q8Sub0Base (Exp.litU32 9)
-    let u0 ← ShaderM.readWorkgroup (ty := .scalar .u32) (n := q8InputU32Size) "s_input_q8" (Exp.add q8Sub0Base (Exp.add (Exp.litU32 1) elemOff))
-    let u1 ← ShaderM.readWorkgroup (ty := .scalar .u32) (n := q8InputU32Size) "s_input_q8" (Exp.add q8Sub0Base (Exp.add (Exp.litU32 5) elemOff))
-    let u2 ← ShaderM.readWorkgroup (ty := .scalar .u32) (n := q8InputU32Size) "s_input_q8" (Exp.add q8Sub1Base (Exp.add (Exp.litU32 1) elemOff))
-    let u3 ← ShaderM.readWorkgroup (ty := .scalar .u32) (n := q8InputU32Size) "s_input_q8" (Exp.add q8Sub1Base (Exp.add (Exp.litU32 5) elemOff))
-    let q8Hdr0 ← ShaderM.readWorkgroup (ty := .scalar .u32) (n := q8InputU32Size) "s_input_q8" q8Sub0Base
-    let q8Hdr1 ← ShaderM.readWorkgroup (ty := .scalar .u32) (n := q8InputU32Size) "s_input_q8" q8Sub1Base
+    let u0 ← ShaderM.readBuffer (ty := .scalar .u32) (n := q8InputU32Size) "input_q8" (Exp.add q8Sub0Base (Exp.add (Exp.litU32 1) elemOff))
+    let u1 ← ShaderM.readBuffer (ty := .scalar .u32) (n := q8InputU32Size) "input_q8" (Exp.add q8Sub0Base (Exp.add (Exp.litU32 5) elemOff))
+    let u2 ← ShaderM.readBuffer (ty := .scalar .u32) (n := q8InputU32Size) "input_q8" (Exp.add q8Sub1Base (Exp.add (Exp.litU32 1) elemOff))
+    let u3 ← ShaderM.readBuffer (ty := .scalar .u32) (n := q8InputU32Size) "input_q8" (Exp.add q8Sub1Base (Exp.add (Exp.litU32 5) elemOff))
+    let q8Hdr0 ← ShaderM.readBuffer (ty := .scalar .u32) (n := q8InputU32Size) "input_q8" q8Sub0Base
+    let q8Hdr1 ← ShaderM.readBuffer (ty := .scalar .u32) (n := q8InputU32Size) "input_q8" q8Sub1Base
     let d8A : Exp (.scalar .f32) := Exp.bitcast q8Hdr0
     let d8B : Exp (.scalar .f32) := Exp.bitcast q8Hdr1
 
