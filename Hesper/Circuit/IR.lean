@@ -88,6 +88,30 @@ inductive ScalarExp where
       lowering casts the result of `addr` to u32 via truncation and
       reads that slot of `inputs[bufIdx]`. -/
   | indexed (bufIdx : Nat) (addr : ScalarExp)
+  /-- Warp-level sum: every lane in the warp/subgroup contributes its
+      evaluation of `a`; the result is the sum across all lanes
+      (broadcast to every lane — every lane sees the same result).
+
+      Typical use: reduce a partial dot-product across a warp so that
+      each lane ends up with the same total, without going through
+      shared memory.  Must be called *uniformly* by all lanes in the
+      warp (inside the common code path; guarded by `laneIdx < N`
+      won't work if any lane is excluded).
+
+      Lowers to `Exp.subgroupAdd` (WGSL `subgroupAdd` / CUDA-equivalent
+      `__shfl_xor_sync` tree reduction). -/
+  | warpSum (a : ScalarExp)
+  /-- Warp-level broadcast from the first lane (lane 0): every lane
+      receives the value that lane 0 computed for `a`.
+
+      Typical use: after `warpSum` gave everyone the total, extracting
+      a single-lane computed value (e.g. a scale or bias) and sharing
+      it across all lanes in the warp. -/
+  | warpBroadcast (a : ScalarExp)
+  /-- Warp-level shuffle XOR: receive the value that lane `(laneIdx ^ mask)`
+      computed for `a`.  Primitive building block for custom reductions;
+      `warpSum` is the common case.  `mask` is a compile-time constant. -/
+  | warpShuffleXor (a : ScalarExp) (mask : Nat)
   | add    (a b : ScalarExp)
   | sub    (a b : ScalarExp)
   | mul    (a b : ScalarExp)
@@ -119,6 +143,9 @@ partial def shiftInputs (k : Nat) : ScalarExp → ScalarExp
   | const v      => const v
   | laneIdx      => laneIdx
   | indexed i a  => indexed (i + k) (shiftInputs k a)
+  | warpSum a        => warpSum (shiftInputs k a)
+  | warpBroadcast a  => warpBroadcast (shiftInputs k a)
+  | warpShuffleXor a m => warpShuffleXor (shiftInputs k a) m
   | add a b      => add (shiftInputs k a) (shiftInputs k b)
   | sub a b      => sub (shiftInputs k a) (shiftInputs k b)
   | mul a b      => mul (shiftInputs k a) (shiftInputs k b)
@@ -146,6 +173,9 @@ partial def subst (args : Array ScalarExp) : ScalarExp → ScalarExp
   | const v      => const v
   | laneIdx      => laneIdx
   | indexed i a  => indexed i (subst args a)
+  | warpSum a        => warpSum (subst args a)
+  | warpBroadcast a  => warpBroadcast (subst args a)
+  | warpShuffleXor a m => warpShuffleXor (subst args a) m
   | add a b      => add (subst args a) (subst args b)
   | sub a b      => sub (subst args a) (subst args b)
   | mul a b      => mul (subst args a) (subst args b)
