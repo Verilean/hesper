@@ -821,6 +821,32 @@ def compileWithPasses [GPUBackend β]
             | _, _ =>
               throw (IO.userError s!"compileWithPasses: missing reduce-epi buffer (in={inId} out={outId})")
         }
+    | PrimExt.base (Prim.reduceScatterEpilogue rop reduceInShape epiShapes dstShape valueExpr addrExpr) =>
+      let D := reduceInShape.numel
+      let dstSize := dstShape.numel
+      let nInputs := op.inputs.size
+      let reduceId := op.inputs[0]!.id
+      let dstId := op.inputs[nInputs - 1]!.id
+      let epiIds : Array Nat :=
+        (op.inputs.extract 1 (nInputs - 1)).map (·.id)
+      let cacheRef : IO.Ref (Option (GPUBackend.CachedDispatch β)) ← IO.mkRef none
+      let cacheKey : UInt64 :=
+        hash ("circuit-reduce-scatter", reprStr rop, D, dstSize,
+              reprStr valueExpr, reprStr addrExpr, reprStr epiShapes.toList)
+      closures := closures.push
+        { run := fun lookup => do
+            match lookup reduceId, lookup dstId with
+            | some reduceBuf, some dstBuf =>
+              let mut epiBufs : Array (GPUBackend.Buf β) := #[]
+              for id in epiIds do
+                match lookup id with
+                | some b => epiBufs := epiBufs.push b
+                | none => throw (IO.userError s!"compileWithPasses: missing reduceScatter epi input id={id}")
+              runReduceScatterEpilogueOp ctx rop D dstSize valueExpr addrExpr
+                reduceBuf epiBufs dstBuf cacheKey cacheRef
+            | _, _ =>
+              throw (IO.userError s!"compileWithPasses: missing reduceScatter buffer")
+        }
   let externalIds := state.externals.map (fun (tr, _) => tr.id)
   let producedIds := state.ops.foldl (init := (#[] : Array Nat)) fun acc op =>
     op.outputs.foldl (init := acc) fun acc' tr => acc'.push tr.id

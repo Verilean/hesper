@@ -292,6 +292,45 @@ inductive Prim (BufT : Type) (CacheT : Type) where
       (reduceInShape : Shape)
       (epilogueInShapes : Array Shape)
       (epilogueBody : ScalarExp)
+  /-- **Level 3 (block-cooperative)**: reduce-then-scatter fused into
+      one kernel.
+
+      Like `reduceLastAxisWithEpilogue`, this dispatches a single
+      workgroup that:
+        Phase 1: tree-reduce `inputs[0]` (shape `reduceInShape`) using
+                 shared memory.
+        Phase 2: every lane re-reads the scalar reduction result
+                 (broadcast through smem), evaluates `valueExpr` and
+                 `addrExpr`, then writes `dst[addr] = value`.
+
+      Compared to `reduceLastAxisWithEpilogue`:
+        - Output goes to an **external `dst` buffer** of `dstShape`,
+          not a fresh allocation of `reduceInShape`.
+        - Each lane writes at a computed `addrExpr` (dynamic), not at
+          its own lane id.
+
+      In `valueExpr` and `addrExpr`:
+        * `.input 0`        = the scalar reduction result (broadcast)
+        * `.input (1..k)`   = `inputs[1..k][lane_id]`  (epilogueInShapes[k-1])
+        * `.laneIdx`        = the lane within the workgroup
+
+      `inputs` layout in the Op:
+        `inputs[0]`    = reduction input (`reduceInShape`)
+        `inputs[1..k]` = epilogue side inputs (`epilogueInShapes[0..k-1]`)
+        `inputs[k+1]`  = `dst` (the destination buffer, shape `dstShape`)
+
+      The output TensorRef is `dst` itself (in-place scatter into an
+      existing buffer), reusing its id like `scatterInto` does.
+
+      Used for: RMSNorm + dynamic-write fusion, where today RMSNorm is
+      computed and *then* scattered to a per-position cache slot. -/
+  | reduceScatterEpilogue
+      (op               : ReduceOp)
+      (reduceInShape    : Shape)
+      (epilogueInShapes : Array Shape)
+      (dstShape         : Shape)
+      (valueExpr        : ScalarExp)
+      (addrExpr         : ScalarExp)
   /-- Unified Map + Scatter primitive.
 
       `inputs` layout: there is **one** inputs array, shared by both
@@ -581,6 +620,32 @@ def scatterMulti (outShape : Shape) (inputs : Array TensorRef)
       outputs := dsts }
   modify fun s => { s with ops := s.ops.push newOp }
   return dsts
+
+/-- Block-cooperative reduce + dynamic-address scatter, fused into one
+    kernel.  See `Prim.reduceScatterEpilogue` for semantics.
+
+    `reduceIn`     : the tensor being reduced (shape will be queried).
+    `epilogueIns`  : side inputs visible in the epilogue at lane id.
+    `dst`          : pre-allocated destination buffer (any shape).
+    `valueExpr`    : per-lane f32 value to write.  `.input 0` = reduced
+                     scalar, `.input (1..k)` = epilogue inputs at laneIdx.
+    `addrExpr`     : per-lane address into `dst`.
+
+    Returns `dst` (in-place semantics).  -/
+def reduceScatterEpilogue
+    (op : ReduceOp) (reduceIn : TensorRef)
+    (epilogueIns : Array TensorRef) (dst : TensorRef)
+    (valueExpr addrExpr : ScalarExp)
+    : CircuitM BufT CacheT TensorRef := do
+  let epiShapes : Array Shape := epilogueIns.map (·.shape)
+  let inputs : Array TensorRef := #[reduceIn] ++ epilogueIns ++ #[dst]
+  let newOp : Op BufT CacheT :=
+    { prim := Prim.reduceScatterEpilogue op reduceIn.shape epiShapes
+                                          dst.shape valueExpr addrExpr,
+      inputs := inputs,
+      outputs := #[dst] }
+  modify fun s => { s with ops := s.ops.push newOp }
+  return dst
 
 end CircuitM
 
