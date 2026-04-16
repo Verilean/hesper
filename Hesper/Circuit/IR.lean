@@ -80,6 +80,7 @@ arithmetic / transcendentals, added as Gemma 4 demands them. -/
 inductive ScalarExp where
   | input  (idx : Nat)
   | const  (v : Float)
+  | laneIdx
   | add    (a b : ScalarExp)
   | sub    (a b : ScalarExp)
   | mul    (a b : ScalarExp)
@@ -90,7 +91,15 @@ inductive ScalarExp where
   | tanh   (a : ScalarExp)
   | gelu   (a : ScalarExp)
   | silu   (a : ScalarExp)
-  deriving Repr, Inhabited
+  | cos    (a : ScalarExp)
+  | sin    (a : ScalarExp)
+  | pow    (a b : ScalarExp)
+  | lt     (a b : ScalarExp)
+  | select (cond t f : ScalarExp)
+  | mod    (a b : ScalarExp)
+  | idiv   (a b : ScalarExp)
+  | toFloat (a : ScalarExp)
+  deriving Repr, Inhabited, BEq
 
 namespace ScalarExp
 
@@ -101,6 +110,7 @@ namespace ScalarExp
 partial def shiftInputs (k : Nat) : ScalarExp → ScalarExp
   | input i      => input (i + k)
   | const v      => const v
+  | laneIdx      => laneIdx
   | add a b      => add (shiftInputs k a) (shiftInputs k b)
   | sub a b      => sub (shiftInputs k a) (shiftInputs k b)
   | mul a b      => mul (shiftInputs k a) (shiftInputs k b)
@@ -111,6 +121,14 @@ partial def shiftInputs (k : Nat) : ScalarExp → ScalarExp
   | tanh a       => tanh (shiftInputs k a)
   | gelu a       => gelu (shiftInputs k a)
   | silu a       => silu (shiftInputs k a)
+  | cos a        => cos (shiftInputs k a)
+  | sin a        => sin (shiftInputs k a)
+  | pow a b      => pow (shiftInputs k a) (shiftInputs k b)
+  | lt a b       => lt (shiftInputs k a) (shiftInputs k b)
+  | select c t f => select (shiftInputs k c) (shiftInputs k t) (shiftInputs k f)
+  | mod a b      => mod (shiftInputs k a) (shiftInputs k b)
+  | idiv a b     => idiv (shiftInputs k a) (shiftInputs k b)
+  | toFloat a    => toFloat (shiftInputs k a)
 
 /-- Substitute `args[i]` for `input i` everywhere in `e`.  Missing
     indices default to `input i` unchanged — callers should ensure
@@ -118,6 +136,7 @@ partial def shiftInputs (k : Nat) : ScalarExp → ScalarExp
 partial def subst (args : Array ScalarExp) : ScalarExp → ScalarExp
   | input i      => match args[i]? with | some a => a | none => input i
   | const v      => const v
+  | laneIdx      => laneIdx
   | add a b      => add (subst args a) (subst args b)
   | sub a b      => sub (subst args a) (subst args b)
   | mul a b      => mul (subst args a) (subst args b)
@@ -128,6 +147,27 @@ partial def subst (args : Array ScalarExp) : ScalarExp → ScalarExp
   | tanh a       => tanh (subst args a)
   | gelu a       => gelu (subst args a)
   | silu a       => silu (subst args a)
+  | cos a        => cos (subst args a)
+  | sin a        => sin (subst args a)
+  | pow a b      => pow (subst args a) (subst args b)
+  | lt a b       => lt (subst args a) (subst args b)
+  | select c t f => select (subst args c) (subst args t) (subst args f)
+  | mod a b      => mod (subst args a) (subst args b)
+  | idiv a b     => idiv (subst args a) (subst args b)
+  | toFloat a    => toFloat (subst args a)
+
+instance : Add ScalarExp      := ⟨ScalarExp.add⟩
+instance : Sub ScalarExp      := ⟨ScalarExp.sub⟩
+instance : Mul ScalarExp      := ⟨ScalarExp.mul⟩
+instance : Div ScalarExp      := ⟨ScalarExp.div⟩
+instance : Neg ScalarExp      := ⟨ScalarExp.neg⟩
+instance : OfScientific ScalarExp :=
+  ⟨fun m e dp => ScalarExp.const (OfScientific.ofScientific m e dp)⟩
+instance : OfNat ScalarExp n  := ⟨ScalarExp.const n.toFloat⟩
+
+def ge (a b : ScalarExp) : ScalarExp := .lt b a
+def le (a b : ScalarExp) : ScalarExp := .lt a b
+def ite (c t f : ScalarExp) : ScalarExp := .select c t f
 
 end ScalarExp
 
@@ -231,7 +271,35 @@ inductive Prim (BufT : Type) (CacheT : Type) where
       still scalar). -/
   | pointwise
       (outShape : Shape) (inShapes : Array Shape) (body : ScalarExp)
-  -- Future primitives will go here: rmsNorm, residualAdd, rope, …
+  /-- Pointwise op that writes into a *slice* of the output buffer.
+      Identical to `pointwise` except the kernel writes at
+      `output[idx + writeOffset]` instead of `output[idx]`, and the
+      output buffer has shape `dstShape` (≥ outShape.numel + writeOffset).
+
+      Introduced by the `fuseWriteDestination` pass when a pointwise
+      op's sole consumer is a `writeSlice`.  The pass folds the copy
+      into the producer by redirecting its writes. -/
+  | pointwiseToSlice
+      (outShape : Shape) (inShapes : Array Shape) (body : ScalarExp)
+      (dstShape : Shape) (writeOffset : ScalarExp)
+  /-- Copy `inputs[1]` (shape `srcShape`) into `inputs[0]` (shape
+      `dstShape`) starting at element offset `dstOffset`.  The output
+      is a TensorRef of shape `dstShape` (the whole destination).
+
+      `writeSlice` is the IR representation of llama.cpp's
+      `VIEW + SET_ROWS` pattern — it lets a compute result land at
+      a specific offset inside a pre-existing buffer (e.g. KV cache).
+
+      The `fuseWriteDestination` pass detects `[A: compute] → [B:
+      writeSlice]` chains and rewrites A to write directly into B's
+      destination at the given offset, eliminating both the temporary
+      buffer and the copy kernel.
+
+      Dispatch shape: `(srcShape.numel + 255) / 256 × 256`. -/
+  | writeSlice
+      (dstShape  : Shape)
+      (dstOffset : ScalarExp)
+      (srcShape  : Shape)
 
 /-- An op in the circuit: a Prim plus the concrete tensor wiring. -/
 structure Op (BufT : Type) (CacheT : Type) where
@@ -408,6 +476,24 @@ def rmsNorm (x scale : TensorRef) (eps : Float)
   -- x[i] * invRms[0] * scale[i] — invRms is #[1] broadcast.
   pointwise #[x, invRms, scale]
     (.mul (.mul (.input 0) (.input 1)) (.input 2))
+
+/-- Write `src` into `dst` at element offset `dstOffset`.  `dst` is an
+    external buffer (typically a KV cache); `src` is the data to splice
+    in.  The output TensorRef has `dst`'s shape — downstream ops that
+    need the full buffer can consume it.
+
+    The `fuseWriteDestination` pass will look for a producer op whose
+    sole consumer is this `writeSlice` and rewrite the producer to emit
+    its result directly into `dst[dstOffset..]`, eliminating the
+    temporary and the copy.  Without fusion this lowers to a plain
+    `memcpy`-style pointwise copy kernel. -/
+def writeSlice (dst : TensorRef) (src : TensorRef) (dstOffset : ScalarExp)
+    : CircuitM BufT CacheT TensorRef := do
+  let outs ← emitOp
+    (Prim.writeSlice dst.shape dstOffset src.shape)
+    #[dst, src]
+    #[(dst.shape, .f32, .Global)]
+  return outs[0]!
 
 end CircuitM
 

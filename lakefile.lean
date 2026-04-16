@@ -680,6 +680,10 @@ lean_exe «fuse-matmul-epilogue-test» where
   root := `Tests.Circuit.FuseMatmulEpilogueTest
   moreLinkArgs := stdLinkArgs
 
+lean_exe «fuse-write-destination-test» where
+  root := `Tests.Circuit.FuseWriteDestinationTest
+  moreLinkArgs := stdLinkArgs
+
 lean_exe «pointwise-gpu-test» where
   root := `Tests.Circuit.PointwiseGPUTest
   moreLinkArgs := stdLinkArgs ++ #["./.lake/build/native/libhesper_cuda.a", "-lcuda"]
