@@ -34,57 +34,84 @@ instead, any `ScalarExp` body — whether hand-written, fusion-produced,
 or constant-folded — flows through the same lowering.  That's what
 makes this a compiler pass instead of a dispatcher. -/
 
+/-- Per-input metadata used by `ScalarExp.indexed` for gather reads.
+    `name` is the buffer binding; `len` is its element count (needed by
+    `ShaderM.readBuffer`'s size parameter). -/
+structure InputDecl where
+  name : String
+  len  : Nat
+  deriving Inhabited
+
 /-- Lower a `ScalarExp` to a typed WGSL `Exp` of f32.  Per-element
     reads from the input slots are pre-loaded into `slot : Array (Exp f32)`
     so the same `input i` reference inside `body` compiles to a single
-    shared `var` read, not N redundant buffer loads. -/
+    shared `var` read, not N redundant buffer loads.  `.indexed` nodes
+    perform a fresh buffer read at a computed address using `decls`. -/
 def lowerScalarExp (slot : Array (Exp (.scalar .f32)))
     (laneIdxExp : Exp (.scalar .f32) := Exp.litF32 0.0)
-    : ScalarExp → Exp (.scalar .f32)
+    (decls : Array InputDecl := #[])
+    : ScalarExp → ShaderM (Exp (.scalar .f32))
   | .input i      =>
     match slot[i]? with
-    | some e => e
-    | none   => Exp.litF32 0.0
-  | .const v      => Exp.litF32 v
-  | .laneIdx      => laneIdxExp
-  | .add a b      => Exp.add (lowerScalarExp slot laneIdxExp a) (lowerScalarExp slot laneIdxExp b)
-  | .sub a b      => Exp.sub (lowerScalarExp slot laneIdxExp a) (lowerScalarExp slot laneIdxExp b)
-  | .mul a b      => Exp.mul (lowerScalarExp slot laneIdxExp a) (lowerScalarExp slot laneIdxExp b)
-  | .div a b      => Exp.div (lowerScalarExp slot laneIdxExp a) (lowerScalarExp slot laneIdxExp b)
-  | .neg a        => Exp.neg (lowerScalarExp slot laneIdxExp a)
-  | .rsqrt a      => Exp.inverseSqrt (lowerScalarExp slot laneIdxExp a)
-  | .exp a        => Exp.exp (lowerScalarExp slot laneIdxExp a)
-  | .tanh a       => Exp.tanh (lowerScalarExp slot laneIdxExp a)
-  | .gelu a       =>
-    let x := lowerScalarExp slot laneIdxExp a
+    | some e => pure e
+    | none   => pure (Exp.litF32 0.0)
+  | .const v      => pure (Exp.litF32 v)
+  | .laneIdx      => pure laneIdxExp
+  | .indexed i addr => do
+    let ae ← lowerScalarExp slot laneIdxExp decls addr
+    let addrU32 := Exp.toU32 ae
+    match decls[i]? with
+    | some decl =>
+      ShaderM.readBuffer (ty := .scalar .f32) (n := decl.len) decl.name addrU32
+    | none =>
+      -- Caller didn't supply a buffer decl for this slot: fall back to 0.
+      pure (Exp.litF32 0.0)
+  | .add a b      => do
+    return Exp.add (← lowerScalarExp slot laneIdxExp decls a) (← lowerScalarExp slot laneIdxExp decls b)
+  | .sub a b      => do
+    return Exp.sub (← lowerScalarExp slot laneIdxExp decls a) (← lowerScalarExp slot laneIdxExp decls b)
+  | .mul a b      => do
+    return Exp.mul (← lowerScalarExp slot laneIdxExp decls a) (← lowerScalarExp slot laneIdxExp decls b)
+  | .div a b      => do
+    return Exp.div (← lowerScalarExp slot laneIdxExp decls a) (← lowerScalarExp slot laneIdxExp decls b)
+  | .neg a        => do return Exp.neg (← lowerScalarExp slot laneIdxExp decls a)
+  | .rsqrt a      => do return Exp.inverseSqrt (← lowerScalarExp slot laneIdxExp decls a)
+  | .exp a        => do return Exp.exp (← lowerScalarExp slot laneIdxExp decls a)
+  | .tanh a       => do return Exp.tanh (← lowerScalarExp slot laneIdxExp decls a)
+  | .gelu a       => do
+    let x ← lowerScalarExp slot laneIdxExp decls a
     let c : Float := 0.7978845608028654
     let k : Float := 0.044715
     let x3 := Exp.mul (Exp.mul x x) x
     let inner := Exp.mul (Exp.litF32 c) (Exp.add x (Exp.mul (Exp.litF32 k) x3))
-    Exp.mul (Exp.mul (Exp.litF32 0.5) x) (Exp.add (Exp.litF32 1.0) (Exp.tanh inner))
-  | .silu a       =>
-    let x := lowerScalarExp slot laneIdxExp a
-    Exp.div x (Exp.add (Exp.litF32 1.0) (Exp.exp (Exp.neg x)))
-  | .cos a        => Exp.cos (lowerScalarExp slot laneIdxExp a)
-  | .sin a        => Exp.sin (lowerScalarExp slot laneIdxExp a)
-  | .pow a b      => Exp.pow (lowerScalarExp slot laneIdxExp a) (lowerScalarExp slot laneIdxExp b)
-  | .lt a b       =>
-    let va := lowerScalarExp slot laneIdxExp a
-    let vb := lowerScalarExp slot laneIdxExp b
-    Exp.select (Exp.lt va vb) (Exp.litF32 1.0) (Exp.litF32 0.0)
-  | .select c t f =>
-    let vc := lowerScalarExp slot laneIdxExp c
-    let vt := lowerScalarExp slot laneIdxExp t
-    let vf := lowerScalarExp slot laneIdxExp f
-    Exp.select (Exp.lt (Exp.litF32 0.5) vc) vt vf
-  | .mod a b      =>
-    let va := lowerScalarExp slot laneIdxExp a
-    let vb := lowerScalarExp slot laneIdxExp b
+    return Exp.mul (Exp.mul (Exp.litF32 0.5) x) (Exp.add (Exp.litF32 1.0) (Exp.tanh inner))
+  | .silu a       => do
+    let x ← lowerScalarExp slot laneIdxExp decls a
+    return Exp.div x (Exp.add (Exp.litF32 1.0) (Exp.exp (Exp.neg x)))
+  | .cos a        => do return Exp.cos (← lowerScalarExp slot laneIdxExp decls a)
+  | .sin a        => do return Exp.sin (← lowerScalarExp slot laneIdxExp decls a)
+  | .pow a b      => do
+    return Exp.pow (← lowerScalarExp slot laneIdxExp decls a) (← lowerScalarExp slot laneIdxExp decls b)
+  | .lt a b       => do
+    let va ← lowerScalarExp slot laneIdxExp decls a
+    let vb ← lowerScalarExp slot laneIdxExp decls b
+    return Exp.select (Exp.lt va vb) (Exp.litF32 1.0) (Exp.litF32 0.0)
+  | .select c t f => do
+    let vc ← lowerScalarExp slot laneIdxExp decls c
+    let vt ← lowerScalarExp slot laneIdxExp decls t
+    let vf ← lowerScalarExp slot laneIdxExp decls f
+    return Exp.select (Exp.lt (Exp.litF32 0.5) vc) vt vf
+  | .mod a b      => do
+    let va ← lowerScalarExp slot laneIdxExp decls a
+    let vb ← lowerScalarExp slot laneIdxExp decls b
     let quotient := Exp.toF32 (Exp.toU32 (Exp.div va vb))
-    Exp.sub va (Exp.mul quotient vb)
-  | .idiv a b     =>
-    Exp.toF32 (Exp.toU32 (Exp.div (lowerScalarExp slot laneIdxExp a) (lowerScalarExp slot laneIdxExp b)))
-  | .toFloat a    => lowerScalarExp slot laneIdxExp a
+    return Exp.sub va (Exp.mul quotient vb)
+  | .idiv a b     => do
+    let va ← lowerScalarExp slot laneIdxExp decls a
+    let vb ← lowerScalarExp slot laneIdxExp decls b
+    return Exp.toF32 (Exp.toU32 (Exp.div va vb))
+  | .toFloat a    => lowerScalarExp slot laneIdxExp decls a
+termination_by e => sizeOf e
 
 /-- Build a single-WG shared-memory reduction `ShaderM` for
     `Prim.reduceLastAxis`.  Caller passes the element count `D` and
@@ -207,11 +234,13 @@ def lowerReduceLastAxisWithEpilogue
   ShaderM.loop localIdx (Exp.litU32 D) (Exp.litU32 workgroupSize) fun loopIdx => do
     -- Build slot array: input 0 = scalar reduction; input (k+1) = epilogueInputs[k][loopIdx]
     let mut slots : Array (Exp (.scalar .f32)) := #[totalRef]
+    let mut decls : Array InputDecl := #[{ name := "__reduced__", len := 1 }]
     for name in epilogueInputNames do
       let v ← ShaderM.readBuffer (ty := .scalar .f32) (n := D) name loopIdx
       let vName ← ShaderM.var (.scalar .f32) v
       slots := slots.push (Exp.var vName)
-    let result := lowerScalarExp slots (Exp.litF32 0.0) body
+      decls := decls.push { name := name, len := D }
+    let result ← lowerScalarExp slots (Exp.litF32 0.0) decls body
     ShaderM.writeBuffer (ty := .scalar .f32) outputName loopIdx result
 
 /-- Dispatch a `Prim.reduceLastAxisWithEpilogue` through cached exec. -/
@@ -278,6 +307,7 @@ def lowerMatmulQ4KWithEpilogueKernel
     -- Bind `total` to a named var so the body can reference it via slot 0.
     let totalName ← ShaderM.var (.scalar .f32) total
     let mut slots : Array (Exp (.scalar .f32)) := #[Exp.var totalName]
+    let mut decls : Array InputDecl := #[{ name := "__total__", len := 1 }]
     for i in [0 : epiInputNames.size] do
       let name   := epiInputNames[i]!
       let offset := epiReadOffsets[i]?.getD 0
@@ -286,7 +316,8 @@ def lowerMatmulQ4KWithEpilogueKernel
       let v      ← ShaderM.readBuffer (ty := .scalar .f32) (n := sz) name idx
       let vName  ← ShaderM.var (.scalar .f32) v
       slots := slots.push (Exp.var vName)
-    let result := lowerScalarExp slots (Exp.litF32 0.0) epiBody
+      decls := decls.push { name := name, len := sz }
+    let result ← lowerScalarExp slots (Exp.litF32 0.0) decls epiBody
     ShaderM.writeBuffer (ty := .scalar .f32) "output" outIdx result
   ) (pure ())
 
@@ -342,32 +373,35 @@ def runMatmulQ4KWithEpilogueOp [GPUBackend β]
       workgroupSize := { x := 32, y := 1, z := 1 } }
   GPUBackend.executeWithConfigCached ctx shader namedBufs config cacheKey cacheRef
 
-/-- Build a complete `ShaderM Unit` that implements a `Prim.pointwise`
-    op.  `inputNames[i]` is the buffer binding name for input slot i;
-    `inputBroadcast[i] = true` means that input is a 1-element scalar
-    broadcast (every lane reads slot 0), false means indexed by thread
-    id.  `outputName` is where to write.  `numel` is the total output
-    element count.
+/-- Build a complete `ShaderM Unit` that implements a `Prim.scatter`
+    op.
 
-    Dispatch shape is a fixed 1D `(numel+255)/256 × 256`.  Inside the
-    kernel, each thread computes one output element if its global id is
-    in range. -/
-def lowerPointwise
+    - `inputNames[k]` / `inputBroadcast[k]` describe inputs[k]
+      (broadcast ⇒ [1]-shape, else lane-local).
+    - `outputName` is the destination buffer binding.
+    - `numel` is the dispatch grid (= outShape.numel).
+    - `dstNumel` is the destination buffer total size.
+    - `valueExpr` / `addrExpr` are both evaluated per lane with:
+        `.input k`  → slots[k]
+        `.laneIdx`  → thread's f32-cast global id
+      `addrExpr` is cast to u32 at the end (truncation).
+
+    `dst[addr] = valueExpr`.  Map = `addrExpr = .laneIdx`, `dstNumel = numel`. -/
+def lowerScatter
     (inputNames : Array String) (inputBroadcast : Array Bool) (outputName : String)
-    (numel : Nat) (body : ScalarExp) : ShaderM Unit := do
-  -- Declare broadcast inputs with length 1; full inputs with length numel.
+    (numel : Nat) (dstNumel : Nat)
+    (valueExpr addrExpr : ScalarExp) : ShaderM Unit := do
   for i in [0:inputNames.size] do
     let name := inputNames[i]!
     let bc := inputBroadcast[i]?.getD false
     let len := if bc then 1 else numel
     let _ ← ShaderM.declareInputBuffer name (.array (.scalar .f32) len)
-  let _ ← ShaderM.declareOutputBuffer outputName (.array (.scalar .f32) numel)
+  let _ ← ShaderM.declareOutputBuffer outputName (.array (.scalar .f32) dstNumel)
   let gid ← ShaderM.globalId
   let idx := Exp.vec3X gid
   ShaderM.if_ (Exp.lt idx (Exp.litU32 numel)) (do
-    -- Pre-load every input slot once, bind to a local var.  Broadcast
-    -- inputs read at index 0; full inputs at the thread's id.
     let mut slots : Array (Exp (.scalar .f32)) := #[]
+    let mut decls : Array InputDecl := #[]
     for i in [0:inputNames.size] do
       let name := inputNames[i]!
       let bc := inputBroadcast[i]?.getD false
@@ -376,9 +410,12 @@ def lowerPointwise
       let v ← ShaderM.readBuffer (ty := .scalar .f32) (n := len) name readIdx
       let vName ← ShaderM.var (.scalar .f32) v
       slots := slots.push (Exp.var vName)
+      decls := decls.push { name := name, len := len }
     let idxF32 := Exp.toF32 idx
-    let result := lowerScalarExp slots idxF32 body
-    ShaderM.writeBuffer (ty := .scalar .f32) outputName idx result
+    let value ← lowerScalarExp slots idxF32 decls valueExpr
+    let addrF32 ← lowerScalarExp slots idxF32 decls addrExpr
+    let addrU32 := Exp.toU32 addrF32
+    ShaderM.writeBuffer (ty := .scalar .f32) outputName addrU32 value
   ) (pure ())
 
 /-- A mapping from TensorRef id to the concrete device buffer.
@@ -386,34 +423,12 @@ def lowerPointwise
     for MVP circuit sizes (<100 tensors per compile). -/
 abbrev BufferMap (BufT : Type) := List (Nat × BufT)
 
-/-- Dispatch a `Prim.pointwise` op through `executeWithConfigCached`.
-    `numel` is the output element count (= dispatch grid).  `inShapes`
-    describes each input: shape `#[1]` ⇒ broadcast; otherwise full. -/
-def runPointwiseOp [GPUBackend β]
-    (ctx : β) (numel : Nat) (inShapes : Array Shape) (body : ScalarExp)
-    (inputBufs : Array (GPUBackend.Buf β))
-    (outputBuf : GPUBackend.Buf β)
-    (cacheKey : UInt64) (cacheRef : IO.Ref (Option (GPUBackend.CachedDispatch β)))
-    : IO Unit := do
-  let inputNames : Array String :=
-    Array.ofFn (fun (i : Fin inputBufs.size) => s!"in{i.val}")
-  let inputBroadcast : Array Bool :=
-    inShapes.map (fun s => s == #[1])
-  let outputName := "out"
-  let shader : ShaderM Unit :=
-    lowerPointwise inputNames inputBroadcast outputName numel body
-  let mut namedBufs : List (String × GPUBackend.Buf β) := [(outputName, outputBuf)]
-  let n := inputBufs.size
-  for i in [0:n] do
-    match inputBufs[i]? with
-    | some buf => namedBufs := (s!"in{i}", buf) :: namedBufs
-    | none     => pure ()
-  let config : ExecConfig := ExecConfig.dispatch1D numel
-  GPUBackend.executeWithConfigCached ctx shader namedBufs config cacheKey cacheRef
-
-def runPointwiseToSliceOp [GPUBackend β]
-    (ctx : β) (numel : Nat) (inShapes : Array Shape) (body : ScalarExp)
-    (dstShapeNumel : Nat) (writeOffset : ScalarExp)
+/-- Dispatch a `Prim.scatter` op.  Handles Map / Slice / dynamic-scatter
+    uniformly; the `lowerScatter` body branches only at lowering time
+    on the `ScalarExp` structure. -/
+def runScatterOp [GPUBackend β]
+    (ctx : β) (numel : Nat) (dstNumel : Nat)
+    (inShapes : Array Shape) (valueExpr addrExpr : ScalarExp)
     (inputBufs : Array (GPUBackend.Buf β))
     (outputBuf : GPUBackend.Buf β)
     (cacheKey : UInt64) (cacheRef : IO.Ref (Option (GPUBackend.CachedDispatch β)))
@@ -422,55 +437,15 @@ def runPointwiseToSliceOp [GPUBackend β]
     Array.ofFn (fun (i : Fin inputBufs.size) => s!"in{i.val}")
   let inputBroadcast : Array Bool := inShapes.map (fun s => s == #[1])
   let outputName := "out"
-  let shader : ShaderM Unit := do
-    for i in [0:inputNames.size] do
-      let name := inputNames[i]!
-      let bc := inputBroadcast[i]?.getD false
-      let len := if bc then 1 else numel
-      let _ ← ShaderM.declareInputBuffer name (.array (.scalar .f32) len)
-    let _ ← ShaderM.declareOutputBuffer outputName (.array (.scalar .f32) dstShapeNumel)
-    let gid ← ShaderM.globalId
-    let idx := Exp.vec3X gid
-    ShaderM.if_ (Exp.lt idx (Exp.litU32 numel)) (do
-      let mut slots : Array (Exp (.scalar .f32)) := #[]
-      for i in [0:inputNames.size] do
-        let name := inputNames[i]!
-        let bc := inputBroadcast[i]?.getD false
-        let len := if bc then 1 else numel
-        let readIdx := if bc then Exp.litU32 0 else idx
-        let v ← ShaderM.readBuffer (ty := .scalar .f32) (n := len) name readIdx
-        let vName ← ShaderM.var (.scalar .f32) v
-        slots := slots.push (Exp.var vName)
-      let result := lowerScalarExp slots (Exp.litF32 0.0) body
-      let dstIdx := Exp.add idx (Exp.toU32 (lowerScalarExp #[] (Exp.toF32 idx) writeOffset))
-      ShaderM.writeBuffer (ty := .scalar .f32) outputName dstIdx result
-    ) (pure ())
+  let shader : ShaderM Unit :=
+    lowerScatter inputNames inputBroadcast outputName numel dstNumel valueExpr addrExpr
   let mut namedBufs : List (String × GPUBackend.Buf β) := [(outputName, outputBuf)]
   let n := inputBufs.size
   for i in [0:n] do
     match inputBufs[i]? with
     | some buf => namedBufs := (s!"in{i}", buf) :: namedBufs
     | none     => pure ()
-  let config := ExecConfig.dispatch1D numel
-  GPUBackend.executeWithConfigCached ctx shader namedBufs config cacheKey cacheRef
-
-def runWriteSliceOp [GPUBackend β]
-    (ctx : β) (numel : Nat) (dstShapeNumel : Nat) (dstOffset : ScalarExp)
-    (srcBuf : GPUBackend.Buf β) (dstBuf : GPUBackend.Buf β)
-    (cacheKey : UInt64) (cacheRef : IO.Ref (Option (GPUBackend.CachedDispatch β)))
-    : IO Unit := do
-  let shader : ShaderM Unit := do
-    let _ ← ShaderM.declareInputBuffer "src" (.array (.scalar .f32) numel)
-    let _ ← ShaderM.declareOutputBuffer "dst" (.array (.scalar .f32) dstShapeNumel)
-    let gid ← ShaderM.globalId
-    let idx := Exp.vec3X gid
-    ShaderM.if_ (Exp.lt idx (Exp.litU32 numel)) (do
-      let v ← ShaderM.readBuffer (ty := .scalar .f32) (n := numel) "src" idx
-      let dstIdx := Exp.add idx (Exp.toU32 (lowerScalarExp #[] (Exp.toF32 idx) dstOffset))
-      ShaderM.writeBuffer (ty := .scalar .f32) "dst" dstIdx v
-    ) (pure ())
-  let namedBufs : List (String × GPUBackend.Buf β) := [("src", srcBuf), ("dst", dstBuf)]
-  let config := ExecConfig.dispatch1D numel
+  let config : ExecConfig := ExecConfig.dispatch1D numel
   GPUBackend.executeWithConfigCached ctx shader namedBufs config cacheKey cacheRef
 
 /-- Lower a Circuit: execute each Op in order.  Buffers for produced
@@ -519,18 +494,18 @@ def compile [GPUBackend β]
           epiBufferSizes epiReadOffsets epiBody outputBuf 0 cacheRef
       | _, _ =>
         throw (IO.userError s!"Circuit.compile: missing buffer for matmul-epi op (in={inTr.id}, out={outTr.id})")
-    | Prim.pointwise outShape inShapes body =>
+    | Prim.scatter outShape dstShape inShapes valueExpr addrExpr =>
       let outTr := op.outputs[0]!
       let mut inBufs : Array (GPUBackend.Buf β) := #[]
       for inTr in op.inputs do
         match lookup inTr.id with
         | some b => inBufs := inBufs.push b
-        | none   => throw (IO.userError s!"Circuit.compile: missing buffer for pointwise input {inTr.id}")
+        | none   => throw (IO.userError s!"Circuit.compile: missing scatter input {inTr.id}")
       match lookup outTr.id with
       | some outBuf =>
         let cacheRef ← IO.mkRef (α := Option (GPUBackend.CachedDispatch β)) none
-        runPointwiseOp ctx outShape.numel inShapes body inBufs outBuf 0 cacheRef
-      | none => throw (IO.userError s!"Circuit.compile: missing output buffer for pointwise op (out={outTr.id})")
+        runScatterOp ctx outShape.numel dstShape.numel inShapes valueExpr addrExpr inBufs outBuf 0 cacheRef
+      | none => throw (IO.userError s!"Circuit.compile: missing scatter output {outTr.id}")
     | Prim.reduceLastAxis rop inShape =>
       let inTr  := op.inputs[0]!
       let outTr := op.outputs[0]!
@@ -540,78 +515,6 @@ def compile [GPUBackend β]
         runReduceOp ctx rop inShape.numel inBuf outBuf 0 cacheRef
       | _, _ =>
         throw (IO.userError s!"Circuit.compile: missing buffer for reduce op (in={inTr.id} out={outTr.id})")
-    | Prim.pointwiseToSlice outShape inShapes body dstShape writeOffset =>
-      let outTr := op.outputs[0]!
-      let mut inBufs : Array (GPUBackend.Buf β) := #[]
-      for inTr in op.inputs do
-        match lookup inTr.id with
-        | some b => inBufs := inBufs.push b
-        | none   => throw (IO.userError s!"Circuit.compile: missing buffer for pointwiseToSlice input {inTr.id}")
-      match lookup outTr.id with
-      | some outBuf =>
-        let numel := outShape.numel
-        let inputNames : Array String :=
-          Array.ofFn (fun (i : Fin inBufs.size) => s!"in{i.val}")
-        let inputBroadcast : Array Bool :=
-          inShapes.map (fun s => s == #[1])
-        let outputName := "out"
-        let shader : ShaderM Unit := do
-          for i in [0:inputNames.size] do
-            let name := inputNames[i]!
-            let bc := inputBroadcast[i]?.getD false
-            let len := if bc then 1 else numel
-            let _ ← ShaderM.declareInputBuffer name (.array (.scalar .f32) len)
-          let _ ← ShaderM.declareOutputBuffer outputName (.array (.scalar .f32) dstShape.numel)
-          let gid ← ShaderM.globalId
-          let idx := Exp.vec3X gid
-          ShaderM.if_ (Exp.lt idx (Exp.litU32 numel)) (do
-            let mut slots : Array (Exp (.scalar .f32)) := #[]
-            for i in [0:inputNames.size] do
-              let name := inputNames[i]!
-              let bc := inputBroadcast[i]?.getD false
-              let len := if bc then 1 else numel
-              let readIdx := if bc then Exp.litU32 0 else idx
-              let v ← ShaderM.readBuffer (ty := .scalar .f32) (n := len) name readIdx
-              let vName ← ShaderM.var (.scalar .f32) v
-              slots := slots.push (Exp.var vName)
-            let result := lowerScalarExp slots (Exp.litF32 0.0) body
-            let dstIdx := Exp.add idx (Exp.toU32 (lowerScalarExp #[] (Exp.toF32 idx) writeOffset))
-            ShaderM.writeBuffer (ty := .scalar .f32) outputName dstIdx result
-          ) (pure ())
-        let mut namedBufs : List (String × GPUBackend.Buf β) := [(outputName, outBuf)]
-        let n := inBufs.size
-        for i in [0:n] do
-          match inBufs[i]? with
-          | some buf => namedBufs := (s!"in{i}", buf) :: namedBufs
-          | none     => pure ()
-        let config := ExecConfig.dispatch1D numel
-        let cacheRef ← IO.mkRef (α := Option (GPUBackend.CachedDispatch β)) none
-        GPUBackend.executeWithConfigCached ctx shader namedBufs config 0 cacheRef
-      | none => throw (IO.userError s!"Circuit.compile: missing output buffer for pointwiseToSlice op (out={outTr.id})")
-    | Prim.writeSlice dstShape dstOffset srcShape =>
-      let dstTr := op.inputs[0]!
-      let srcTr := op.inputs[1]!
-      let outTr := op.outputs[0]!
-      match lookup dstTr.id, lookup srcTr.id, lookup outTr.id with
-      | some dstBuf, some srcBuf, some outBuf =>
-        let numel := srcShape.numel
-        let cacheRef ← IO.mkRef (α := Option (GPUBackend.CachedDispatch β)) none
-        let shader : ShaderM Unit := do
-          let _ ← ShaderM.declareInputBuffer "src" (.array (.scalar .f32) numel)
-          let _ ← ShaderM.declareOutputBuffer "dst" (.array (.scalar .f32) dstShape.numel)
-          let gid ← ShaderM.globalId
-          let idx := Exp.vec3X gid
-          ShaderM.if_ (Exp.lt idx (Exp.litU32 numel)) (do
-            let v ← ShaderM.readBuffer (ty := .scalar .f32) (n := numel) "src" idx
-            let dstIdx := Exp.add idx (Exp.toU32 (lowerScalarExp #[] (Exp.toF32 idx) dstOffset))
-            ShaderM.writeBuffer (ty := .scalar .f32) "dst" dstIdx v
-          ) (pure ())
-        let namedBufs : List (String × GPUBackend.Buf β) :=
-          [("src", srcBuf), ("dst", if outTr.id == dstTr.id then dstBuf else outBuf)]
-        let config := ExecConfig.dispatch1D numel
-        GPUBackend.executeWithConfigCached ctx shader namedBufs config 0 cacheRef
-      | _, _, _ =>
-        throw (IO.userError s!"Circuit.compile: missing buffer for writeSlice op (dst={dstTr.id}, src={srcTr.id}, out={outTr.id})")
     | Prim.reduceLastAxisWithEpilogue rop reduceInShape _epiShapes body =>
       let inTr  := op.inputs[0]!
       let outTr := op.outputs[0]!
@@ -721,25 +624,26 @@ def compileOnce [GPUBackend β]
             | _, _ =>
               throw (IO.userError s!"CompiledCircuit: missing matmul-epi buffer (in={inId} out={outId})")
         }
-    | Prim.pointwise outShape inShapes body =>
+    | Prim.scatter outShape dstShape inShapes valueExpr addrExpr =>
       let numel := outShape.numel
+      let dstNumel := dstShape.numel
       let inIds := op.inputs.map (·.id)
       let outId := op.outputs[0]!.id
       let cacheRef : IO.Ref (Option (GPUBackend.CachedDispatch β)) ← IO.mkRef none
       let cacheKey : UInt64 :=
-        hash ("circuit-pointwise", numel, reprStr body,
-              reprStr inShapes.toList)
+        hash ("circuit-scatter", numel, dstNumel,
+              reprStr valueExpr, reprStr addrExpr, reprStr inShapes.toList)
       closures := closures.push
         { run := fun lookup => do
             let mut inBufs : Array (GPUBackend.Buf β) := #[]
             for id in inIds do
               match lookup id with
               | some b => inBufs := inBufs.push b
-              | none   => throw (IO.userError s!"CompiledCircuit: missing pointwise input buffer id={id}")
+              | none   => throw (IO.userError s!"CompiledCircuit: missing scatter input id={id}")
             match lookup outId with
             | some outBuf =>
-              runPointwiseOp _ctx numel inShapes body inBufs outBuf cacheKey cacheRef
-            | none => throw (IO.userError s!"CompiledCircuit: missing pointwise output buffer id={outId}")
+              runScatterOp _ctx numel dstNumel inShapes valueExpr addrExpr inBufs outBuf cacheKey cacheRef
+            | none => throw (IO.userError s!"CompiledCircuit: missing scatter output id={outId}")
         }
     | Prim.reduceLastAxis rop inShape =>
       let D := inShape.numel
@@ -777,89 +681,6 @@ def compileOnce [GPUBackend β]
               runReduceWithEpilogueOp _ctx rop D body reduceBuf epiBufs outBuf cacheKey cacheRef
             | _, _ =>
               throw (IO.userError s!"CompiledCircuit: missing reduce-epi buffer (in={inId} out={outId})")
-        }
-    | Prim.pointwiseToSlice outShape inShapes body dstShape writeOffset =>
-      let numel := outShape.numel
-      let inIds := op.inputs.map (·.id)
-      let outId := op.outputs[0]!.id
-      let cacheRef : IO.Ref (Option (GPUBackend.CachedDispatch β)) ← IO.mkRef none
-      let cacheKey : UInt64 :=
-        hash ("circuit-pw-slice", numel, reprStr body,
-              reprStr inShapes.toList, dstShape.numel, reprStr writeOffset)
-      let inputBroadcast : Array Bool := inShapes.map (fun s => s == #[1])
-      closures := closures.push
-        { run := fun lookup => do
-            let mut inBufs : Array (GPUBackend.Buf β) := #[]
-            for id in inIds do
-              match lookup id with
-              | some b => inBufs := inBufs.push b
-              | none   => throw (IO.userError s!"CompiledCircuit: missing pointwiseToSlice input id={id}")
-            match lookup outId with
-            | some outBuf =>
-              let inputNames : Array String :=
-                Array.ofFn (fun (i : Fin inBufs.size) => s!"in{i.val}")
-              let outputName := "out"
-              let shader : ShaderM Unit := do
-                for i in [0:inputNames.size] do
-                  let name := inputNames[i]!
-                  let bc := inputBroadcast[i]?.getD false
-                  let len := if bc then 1 else numel
-                  let _ ← ShaderM.declareInputBuffer name (.array (.scalar .f32) len)
-                let _ ← ShaderM.declareOutputBuffer outputName (.array (.scalar .f32) dstShape.numel)
-                let gid ← ShaderM.globalId
-                let idx := Exp.vec3X gid
-                ShaderM.if_ (Exp.lt idx (Exp.litU32 numel)) (do
-                  let mut slots : Array (Exp (.scalar .f32)) := #[]
-                  for i in [0:inputNames.size] do
-                    let name := inputNames[i]!
-                    let bc := inputBroadcast[i]?.getD false
-                    let len := if bc then 1 else numel
-                    let readIdx := if bc then Exp.litU32 0 else idx
-                    let v ← ShaderM.readBuffer (ty := .scalar .f32) (n := len) name readIdx
-                    let vName ← ShaderM.var (.scalar .f32) v
-                    slots := slots.push (Exp.var vName)
-                  let result := lowerScalarExp slots (Exp.litF32 0.0) body
-                  let dstIdx := Exp.add idx (Exp.toU32 (lowerScalarExp #[] (Exp.toF32 idx) writeOffset))
-                  ShaderM.writeBuffer (ty := .scalar .f32) outputName dstIdx result
-                ) (pure ())
-              let mut namedBufs : List (String × GPUBackend.Buf β) :=
-                [(outputName, outBuf)]
-              let n := inBufs.size
-              for i in [0:n] do
-                match inBufs[i]? with
-                | some buf => namedBufs := (s!"in{i}", buf) :: namedBufs
-                | none     => pure ()
-              let config := ExecConfig.dispatch1D numel
-              GPUBackend.executeWithConfigCached _ctx shader namedBufs config cacheKey cacheRef
-            | none => throw (IO.userError s!"CompiledCircuit: missing pointwiseToSlice output id={outId}")
-        }
-    | Prim.writeSlice dstShape dstOffset srcShape =>
-      let dstId := op.inputs[0]!.id
-      let srcId := op.inputs[1]!.id
-      let outId := op.outputs[0]!.id
-      let numel := srcShape.numel
-      let cacheRef : IO.Ref (Option (GPUBackend.CachedDispatch β)) ← IO.mkRef none
-      let cacheKey : UInt64 := hash ("circuit-write-slice", dstShape.numel, reprStr dstOffset, numel)
-      closures := closures.push
-        { run := fun lookup => do
-            match lookup dstId, lookup srcId, lookup outId with
-            | some dstBuf, some srcBuf, some outBuf =>
-              let shader : ShaderM Unit := do
-                let _ ← ShaderM.declareInputBuffer "src" (.array (.scalar .f32) numel)
-                let _ ← ShaderM.declareOutputBuffer "dst" (.array (.scalar .f32) dstShape.numel)
-                let gid ← ShaderM.globalId
-                let idx := Exp.vec3X gid
-                ShaderM.if_ (Exp.lt idx (Exp.litU32 numel)) (do
-                  let v ← ShaderM.readBuffer (ty := .scalar .f32) (n := numel) "src" idx
-                  let dstIdx := Exp.add idx (Exp.toU32 (lowerScalarExp #[] (Exp.toF32 idx) dstOffset))
-                  ShaderM.writeBuffer (ty := .scalar .f32) "dst" dstIdx v
-                ) (pure ())
-              let namedBufs : List (String × GPUBackend.Buf β) :=
-                [("src", srcBuf), ("dst", if outId == dstId then dstBuf else outBuf)]
-              let config := ExecConfig.dispatch1D numel
-              GPUBackend.executeWithConfigCached _ctx shader namedBufs config cacheKey cacheRef
-            | _, _, _ =>
-              throw (IO.userError s!"CompiledCircuit: missing writeSlice buffer (dst={dstId} src={srcId} out={outId})")
         }
   let externalIds := state.externals.map (fun (tr, _) => tr.id)
   -- producedIds := tensor ids that are produced by some op's outputs
