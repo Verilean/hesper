@@ -217,6 +217,7 @@ private def fusePointwiseStep {BufT CacheT : Type}
 partial def ScalarExp.usedInputs : ScalarExp → Array Nat
   | .input i      => #[i]
   | .const _      => #[]
+  | .laneIdx      => #[]
   | .add a b      => a.usedInputs ++ b.usedInputs
   | .sub a b      => a.usedInputs ++ b.usedInputs
   | .mul a b      => a.usedInputs ++ b.usedInputs
@@ -227,11 +228,20 @@ partial def ScalarExp.usedInputs : ScalarExp → Array Nat
   | .tanh a       => a.usedInputs
   | .gelu a       => a.usedInputs
   | .silu a       => a.usedInputs
+  | .cos a        => a.usedInputs
+  | .sin a        => a.usedInputs
+  | .pow a b      => a.usedInputs ++ b.usedInputs
+  | .lt a b       => a.usedInputs ++ b.usedInputs
+  | .select c t f => c.usedInputs ++ t.usedInputs ++ f.usedInputs
+  | .mod a b      => a.usedInputs ++ b.usedInputs
+  | .idiv a b     => a.usedInputs ++ b.usedInputs
+  | .toFloat a    => a.usedInputs
 
 /-- Rewrite every `input i` inside `e` using the mapping `remap[i]`. -/
 private partial def renumberInputs (remap : Array Nat) : ScalarExp → ScalarExp
   | .input i      => .input (remap[i]!)
   | .const v      => .const v
+  | .laneIdx      => .laneIdx
   | .add a b      => .add (renumberInputs remap a) (renumberInputs remap b)
   | .sub a b      => .sub (renumberInputs remap a) (renumberInputs remap b)
   | .mul a b      => .mul (renumberInputs remap a) (renumberInputs remap b)
@@ -242,6 +252,14 @@ private partial def renumberInputs (remap : Array Nat) : ScalarExp → ScalarExp
   | .tanh a       => .tanh (renumberInputs remap a)
   | .gelu a       => .gelu (renumberInputs remap a)
   | .silu a       => .silu (renumberInputs remap a)
+  | .cos a        => .cos (renumberInputs remap a)
+  | .sin a        => .sin (renumberInputs remap a)
+  | .pow a b      => .pow (renumberInputs remap a) (renumberInputs remap b)
+  | .lt a b       => .lt (renumberInputs remap a) (renumberInputs remap b)
+  | .select c t f => .select (renumberInputs remap c) (renumberInputs remap t) (renumberInputs remap f)
+  | .mod a b      => .mod (renumberInputs remap a) (renumberInputs remap b)
+  | .idiv a b     => .idiv (renumberInputs remap a) (renumberInputs remap b)
+  | .toFloat a    => .toFloat (renumberInputs remap a)
 
 /-- Drop input slots from a pointwise op that the body never references.
     Builds a permutation `old→new` and substitutes `input i` accordingly.
@@ -582,6 +600,66 @@ def fuseMatmulEpilogue {BufT CacheT : Type}
     | none      => break
   return current
 
+/-! ## Output destination fusion (Pattern E)
+
+`fuseWriteDestination` detects `[A: pointwise] → [B: writeSlice]`
+chains where A's output is B's sole consumer, and replaces the pair
+with a single `pointwiseToSlice` op that writes directly into B's
+destination buffer at the given offset.  Eliminates both the temporary
+buffer and the copy kernel.
+
+This is the IR equivalent of llama.cpp's `ROPE + VIEW + SET_ROWS`
+fusion — a general "output destination propagation" transform. -/
+
+private def fuseWriteDestinationStep {BufT CacheT : Type}
+    (ops : Array (Op BufT CacheT)) (protectedIds : Array Nat)
+    : Option (Array (Op BufT CacheT)) := Id.run do
+  let isProtected (id : Nat) : Bool := protectedIds.any (· == id)
+  for bIdx in [0 : ops.size] do
+    match ops[bIdx]? with
+    | none => pure ()
+    | some B =>
+    let .writeSlice dstShape dstOffset srcShape := B.prim | continue
+    let dstRef := B.inputs[0]!
+    let srcRef := B.inputs[1]!
+    if isProtected srcRef.id then continue
+    if countConsumers ops srcRef.id != 1 then continue
+    let mut aIdxOpt : Option Nat := none
+    for aIdx in [0 : ops.size] do
+      match ops[aIdx]? with
+      | some A =>
+        if A.outputs.any (fun tr => tr.id == srcRef.id) then
+          aIdxOpt := some aIdx
+          break
+      | none => pure ()
+    let some aIdx := aIdxOpt | continue
+    let some A := ops[aIdx]? | continue
+    let .pointwise outShape inShapes body := A.prim | continue
+    if outShape.numel != srcShape.numel then continue
+    let newOp : Op BufT CacheT :=
+      { prim := Prim.pointwiseToSlice outShape inShapes body dstShape dstOffset
+        inputs := A.inputs
+        outputs := B.outputs }
+    let mut out : Array (Op BufT CacheT) := #[]
+    for k in [0 : ops.size] do
+      if k == aIdx then pure ()       -- drop producer
+      else if k == bIdx then out := out.push newOp  -- replace writeSlice
+      else match ops[k]? with
+        | some opk => out := out.push opk
+        | none     => pure ()
+    return some out
+  return none
+
+def fuseWriteDestination {BufT CacheT : Type}
+    (ops : Array (Op BufT CacheT)) (protectedIds : Array Nat)
+    : Array (Op BufT CacheT) := Id.run do
+  let mut current := ops
+  for _ in [0 : ops.size] do
+    match fuseWriteDestinationStep current protectedIds with
+    | some next => current := next
+    | none      => break
+  return current
+
 /-! ## Lowering for OpExt -/
 
 /-- Stage 2 compile: run fusePointwise + mergeSameDispatch, then
@@ -611,13 +689,15 @@ def compileWithPasses [GPUBackend β]
   --   1. fuseMatmulEpilogue: [matmulQ4K → pointwise] → matmulQ4KWithEpilogue
   --   2. fuseReduceEpilogue: [reduceLastAxis → … → pointwise] → reduceLastAxisWithEpilogue
   --   3. fusePointwise: same-shape pointwise chain β-reduction
-  --   4. mergeSameDispatch: KV matmul pair → fusedKV
+  --   4. fuseWriteDestination: [pointwise → writeSlice] → pointwiseToSlice
+  --   5. mergeSameDispatch: KV matmul pair → fusedKV
   -- Running matmul-epilogue first lets a following `pointwise` get absorbed
   -- before fusePointwise tries to collapse it into ANOTHER downstream pointwise.
   let opsMmEpi  := fuseMatmulEpilogue state.ops mergedProtected
   let opsRedFused := fuseReduceEpilogue opsMmEpi mergedProtected
   let opsFused := fusePointwise opsRedFused mergedProtected
-  let opsExt := mergeSameDispatch opsFused
+  let opsWriteFused := fuseWriteDestination opsFused mergedProtected
+  let opsExt := mergeSameDispatch opsWriteFused
 
   -- Allocate intermediate buffers for op outputs the caller didn't
   -- reserve (e.g. the scalar output of a reduceLastAxis that feeds a
@@ -754,6 +834,42 @@ def compileWithPasses [GPUBackend β]
               runReduceWithEpilogueOp ctx rop D body reduceBuf epiBufs outBuf cacheKey cacheRef
             | _, _ =>
               throw (IO.userError s!"compileWithPasses: missing reduce-epi buffer (in={inId} out={outId})")
+        }
+    | PrimExt.base (Prim.pointwiseToSlice outShape inShapes body dstShape writeOffset) =>
+      let numel := outShape.numel
+      let inIds := op.inputs.map (·.id)
+      let outId := op.outputs[0]!.id
+      let cacheRef : IO.Ref (Option (GPUBackend.CachedDispatch β)) ← IO.mkRef none
+      let cacheKey : UInt64 :=
+        hash ("circuit-pw-slice", numel, reprStr body,
+              reprStr inShapes.toList, dstShape.numel, reprStr writeOffset)
+      closures := closures.push
+        { run := fun lookup => do
+            let mut inBufs : Array (GPUBackend.Buf β) := #[]
+            for id in inIds do
+              match lookup id with
+              | some b => inBufs := inBufs.push b
+              | none   => throw (IO.userError s!"compileWithPasses: missing pointwiseToSlice input id={id}")
+            match lookup outId with
+            | some outBuf =>
+              runPointwiseToSliceOp ctx numel inShapes body dstShape.numel writeOffset
+                inBufs outBuf cacheKey cacheRef
+            | none => throw (IO.userError s!"compileWithPasses: missing pointwiseToSlice output id={outId}")
+        }
+    | PrimExt.base (Prim.writeSlice dstShape dstOffset srcShape) =>
+      let dstId := op.inputs[0]!.id
+      let srcId := op.inputs[1]!.id
+      let outId := op.outputs[0]!.id
+      let numel := srcShape.numel
+      let cacheRef : IO.Ref (Option (GPUBackend.CachedDispatch β)) ← IO.mkRef none
+      let cacheKey : UInt64 := hash ("circuit-write-slice", dstShape.numel, reprStr dstOffset, numel)
+      closures := closures.push
+        { run := fun lookup => do
+            match lookup dstId, lookup srcId, lookup outId with
+            | some dstBuf, some srcBuf, some _ =>
+              runWriteSliceOp ctx numel dstShape.numel dstOffset srcBuf dstBuf cacheKey cacheRef
+            | _, _, _ =>
+              throw (IO.userError s!"compileWithPasses: missing writeSlice buffer (dst={dstId} src={srcId} out={outId})")
         }
   let externalIds := state.externals.map (fun (tr, _) => tr.id)
   let producedIds := state.ops.foldl (init := (#[] : Array Nat)) fun acc op =>
