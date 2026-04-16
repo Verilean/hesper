@@ -144,24 +144,20 @@ private def fusePointwiseStep {BufT CacheT : Type}
     (ops : Array (Op BufT CacheT)) (protectedIds : Array Nat)
     : Option (Array (Op BufT CacheT)) := Id.run do
   let isProtected (id : Nat) : Bool := protectedIds.any (· == id)
-  -- Search for a consumer op B such that one of its pointwise inputs
-  -- is produced by an earlier pointwise A with B as its unique
-  -- surviving consumer (and A's output is not caller-facing).
+  -- Search for a consumer scatter op B such that one of its inputs
+  -- is produced by an earlier Map-shaped scatter A (addrExpr = .laneIdx)
+  -- with B as its unique surviving consumer.  Inline A's valueExpr into B.
   for bIdx in [0 : ops.size] do
     match ops[bIdx]? with
     | none => pure ()
     | some B =>
-    let .pointwise bOutShape bInShapes bBody := B.prim | continue
-    -- Walk B's inputs looking for a fusable producer.
+    let .scatter bOutShape bDstShape bInShapes bValue bAddr := B.prim | continue
     for iIdx in [0 : B.inputs.size] do
       let prodRef := B.inputs[iIdx]!
       if isProtected prodRef.id then continue
-      -- Refuse to fuse when B consumes this slot as a scalar broadcast:
-      -- inlining a non-broadcast producer would violate the "all inputs
-      -- are either outShape or #[1]" invariant.
       let consumedAsBroadcast : Bool := (bInShapes[iIdx]?.getD #[]) == #[1]
       if consumedAsBroadcast then continue
-      -- Find the (single) op in `ops` whose outputs contain prodRef.id.
+      -- Find the (single) op whose outputs contain prodRef.id.
       let mut aIdxOpt : Option Nat := none
       for hA : aIdx in [0 : ops.size] do
         match ops[aIdx]? with
@@ -172,34 +168,29 @@ private def fusePointwiseStep {BufT CacheT : Type}
         | none => pure ()
       let some aIdx := aIdxOpt | continue
       let some A := ops[aIdx]? | continue
-      let .pointwise aOutShape aInShapes aBody := A.prim | continue
-      -- Fusion legality: A's output shape must match B's.
+      let .scatter aOutShape _aDstShape aInShapes aValue aAddr := A.prim | continue
+      -- Producer must be Map-shaped (identity addressing) — otherwise its
+      -- "output" isn't a dense array addressable by lane id.
+      if aAddr != .laneIdx then continue
+      -- Shape compatibility: A's grid matches B's grid.
       if aOutShape != bOutShape then continue
-      -- Uniqueness: prodRef.id is consumed by exactly one op in `ops`.
       if countConsumers ops prodRef.id != 1 then continue
-      -- Inline A into B.  B's slot iIdx is replaced by A's body; A's
-      -- own `input j` originally referred to aInputs[j], which after
-      -- append live at position `bInputs.size + j` — so shift by
-      -- `bInputs.size`.
       let bInputs := B.inputs
       let aInputs := A.inputs
-      let aShifted := aBody.shiftInputs bInputs.size
+      let aShifted := aValue.shiftInputs bInputs.size
       let mut argMap : Array ScalarExp := #[]
       for hJ : j in [0 : bInputs.size] do
         if j == iIdx then
           argMap := argMap.push aShifted
         else
           argMap := argMap.push (.input j)
-      let newBody := bBody.subst argMap
+      let newValue := bValue.subst argMap
       let newInputs := bInputs ++ aInputs
       let newInShapes := bInShapes ++ aInShapes
       let newB : Op BufT CacheT :=
-        { prim := Prim.pointwise bOutShape newInShapes newBody
+        { prim := Prim.scatter bOutShape bDstShape newInShapes newValue bAddr
           inputs := newInputs
           outputs := B.outputs }
-      -- Produce a new op array: drop A, replace B with newB.  If A is
-      -- still needed by any other op (shouldn't happen given the
-      -- uniqueness check), we leave it — but here it isn't.
       let mut out : Array (Op BufT CacheT) := #[]
       for hK : k in [0 : ops.size] do
         if k == aIdx then continue
@@ -218,6 +209,7 @@ partial def ScalarExp.usedInputs : ScalarExp → Array Nat
   | .input i      => #[i]
   | .const _      => #[]
   | .laneIdx      => #[]
+  | .indexed i a  => #[i] ++ a.usedInputs
   | .add a b      => a.usedInputs ++ b.usedInputs
   | .sub a b      => a.usedInputs ++ b.usedInputs
   | .mul a b      => a.usedInputs ++ b.usedInputs
@@ -242,6 +234,7 @@ private partial def renumberInputs (remap : Array Nat) : ScalarExp → ScalarExp
   | .input i      => .input (remap[i]!)
   | .const v      => .const v
   | .laneIdx      => .laneIdx
+  | .indexed i a  => .indexed (remap[i]!) (renumberInputs remap a)
   | .add a b      => .add (renumberInputs remap a) (renumberInputs remap b)
   | .sub a b      => .sub (renumberInputs remap a) (renumberInputs remap b)
   | .mul a b      => .mul (renumberInputs remap a) (renumberInputs remap b)
@@ -267,8 +260,9 @@ private partial def renumberInputs (remap : Array Nat) : ScalarExp → ScalarExp
 private def compactPointwiseInputs {BufT CacheT : Type} (op : Op BufT CacheT)
     : Op BufT CacheT := Id.run do
   match op.prim with
-  | .pointwise outShape inShapes body =>
-    let used := body.usedInputs
+  | .scatter outShape dstShape inShapes valueExpr addrExpr =>
+    -- A slot is live if either the value body or the addr body references it.
+    let used := valueExpr.usedInputs ++ addrExpr.usedInputs
     let mut newSlot : Array Nat := Array.replicate op.inputs.size 0
     let mut newInputs : Array TensorRef := #[]
     let mut newInShapes : Array Shape := #[]
@@ -283,7 +277,9 @@ private def compactPointwiseInputs {BufT CacheT : Type} (op : Op BufT CacheT)
         next := next + 1
       | _, _, _ => pure ()
     return { op with
-      prim := .pointwise outShape newInShapes (renumberInputs newSlot body)
+      prim := .scatter outShape dstShape newInShapes
+                        (renumberInputs newSlot valueExpr)
+                        (renumberInputs newSlot addrExpr)
       inputs := newInputs }
   | _ => return op
 
@@ -360,7 +356,11 @@ private partial def followScalarChain {BufT CacheT : Type}
         consumerOpt := some (cIdx, ⟨C, trivial⟩); break
     | none => pure ()
   let some (cIdx, ⟨C, _⟩) := consumerOpt | return none
-  let .pointwise cOutShape cInShapes cBody := C.prim | return none
+  -- Only Map-shaped scatters (identity addressing) can participate in
+  -- the scalar chain — the chain operates on the reduced scalar value,
+  -- not arbitrary addresses.
+  let .scatter cOutShape _cDstShape cInShapes cBody cAddr := C.prim | return none
+  if cAddr != .laneIdx then return none
   -- Locate the slot in C that consumes startId.
   let mut slotOpt : Option Nat := none
   for j in [0 : C.inputs.size] do
@@ -406,7 +406,8 @@ private def fuseReduceEpilogueStep {BufT CacheT : Type}
     let some (chainExp, qIdx, pSlot) :=
       followScalarChain ops protectedIds pOutId (.input 0) | continue
     let some Q := ops[qIdx]? | continue
-    let .pointwise qOutShape qInShapes qBody := Q.prim | continue
+    let .scatter qOutShape _qDstShape qInShapes qBody qAddr := Q.prim | continue
+    if qAddr != .laneIdx then continue
     if qOutShape != pInShape then continue
     -- Build the epilogue body: substitute the chain expression at the
     -- pSlot and renumber other slots to 1, 2, …
@@ -522,7 +523,11 @@ private def fuseMatmulEpilogueStep {BufT CacheT : Type}
       | none => pure ()
     let some bIdx := bIdxOpt | continue
     let some B := ops[bIdx]? | continue
-    let .pointwise bOutShape bInShapes bBody := B.prim | continue
+    let .scatter bOutShape _bDstShape bInShapes bBody bAddr := B.prim | continue
+    -- Only absorb Map-shaped consumers (identity addressing).  A
+    -- scatter with dynamic addressing writes to arbitrary positions,
+    -- which the matmul-with-epilogue kernel doesn't support.
+    if bAddr != .laneIdx then continue
     -- Output shape of B must equal `[outDim]`.  Anything else implies
     -- a reshape the matmul-epilogue kernel can't absorb.
     if bOutShape != #[layer.config.outDim] then continue
@@ -600,65 +605,14 @@ def fuseMatmulEpilogue {BufT CacheT : Type}
     | none      => break
   return current
 
-/-! ## Output destination fusion (Pattern E)
+/-! ## Note: Output destination fusion (former `fuseWriteDestination`)
 
-`fuseWriteDestination` detects `[A: pointwise] → [B: writeSlice]`
-chains where A's output is B's sole consumer, and replaces the pair
-with a single `pointwiseToSlice` op that writes directly into B's
-destination buffer at the given offset.  Eliminates both the temporary
-buffer and the copy kernel.
-
-This is the IR equivalent of llama.cpp's `ROPE + VIEW + SET_ROWS`
-fusion — a general "output destination propagation" transform. -/
-
-private def fuseWriteDestinationStep {BufT CacheT : Type}
-    (ops : Array (Op BufT CacheT)) (protectedIds : Array Nat)
-    : Option (Array (Op BufT CacheT)) := Id.run do
-  let isProtected (id : Nat) : Bool := protectedIds.any (· == id)
-  for bIdx in [0 : ops.size] do
-    match ops[bIdx]? with
-    | none => pure ()
-    | some B =>
-    let .writeSlice dstShape dstOffset srcShape := B.prim | continue
-    let dstRef := B.inputs[0]!
-    let srcRef := B.inputs[1]!
-    if isProtected srcRef.id then continue
-    if countConsumers ops srcRef.id != 1 then continue
-    let mut aIdxOpt : Option Nat := none
-    for aIdx in [0 : ops.size] do
-      match ops[aIdx]? with
-      | some A =>
-        if A.outputs.any (fun tr => tr.id == srcRef.id) then
-          aIdxOpt := some aIdx
-          break
-      | none => pure ()
-    let some aIdx := aIdxOpt | continue
-    let some A := ops[aIdx]? | continue
-    let .pointwise outShape inShapes body := A.prim | continue
-    if outShape.numel != srcShape.numel then continue
-    let newOp : Op BufT CacheT :=
-      { prim := Prim.pointwiseToSlice outShape inShapes body dstShape dstOffset
-        inputs := A.inputs
-        outputs := B.outputs }
-    let mut out : Array (Op BufT CacheT) := #[]
-    for k in [0 : ops.size] do
-      if k == aIdx then pure ()       -- drop producer
-      else if k == bIdx then out := out.push newOp  -- replace writeSlice
-      else match ops[k]? with
-        | some opk => out := out.push opk
-        | none     => pure ()
-    return some out
-  return none
-
-def fuseWriteDestination {BufT CacheT : Type}
-    (ops : Array (Op BufT CacheT)) (protectedIds : Array Nat)
-    : Array (Op BufT CacheT) := Id.run do
-  let mut current := ops
-  for _ in [0 : ops.size] do
-    match fuseWriteDestinationStep current protectedIds with
-    | some next => current := next
-    | none      => break
-  return current
+This used to be a separate pass that collapsed `[pointwise → writeSlice]`
+into `pointwiseToSlice`.  With the unified `Prim.scatter`, the same
+fusion is now done by `fusePointwise`: a Map-shaped scatter (the
+producer, addr = .laneIdx) feeding into any scatter (the consumer) is
+inlined into the consumer's value expression, preserving the consumer's
+`addrExpr`.  No separate pass needed. -/
 
 /-! ## Lowering for OpExt -/
 
@@ -686,18 +640,16 @@ def compileWithPasses [GPUBackend β]
   -- fusePointwise then handles any remaining same-shape pointwise
   -- chains.
   -- Pass order:
-  --   1. fuseMatmulEpilogue: [matmulQ4K → pointwise] → matmulQ4KWithEpilogue
-  --   2. fuseReduceEpilogue: [reduceLastAxis → … → pointwise] → reduceLastAxisWithEpilogue
-  --   3. fusePointwise: same-shape pointwise chain β-reduction
-  --   4. fuseWriteDestination: [pointwise → writeSlice] → pointwiseToSlice
-  --   5. mergeSameDispatch: KV matmul pair → fusedKV
-  -- Running matmul-epilogue first lets a following `pointwise` get absorbed
-  -- before fusePointwise tries to collapse it into ANOTHER downstream pointwise.
+  --   1. fuseMatmulEpilogue: [matmulQ4K → scatter(identity)] → matmulQ4KWithEpilogue
+  --   2. fuseReduceEpilogue: [reduceLastAxis → … → scatter(identity)] → reduceLastAxisWithEpilogue
+  --   3. fusePointwise: [scatter(identity) → scatter(any)] chain β-reduction
+  --      (subsumes the old fuseWriteDestination: producer must be Map,
+  --       consumer can be Map/Slice/dynamic-scatter)
+  --   4. mergeSameDispatch: KV matmul pair → fusedKV
   let opsMmEpi  := fuseMatmulEpilogue state.ops mergedProtected
   let opsRedFused := fuseReduceEpilogue opsMmEpi mergedProtected
   let opsFused := fusePointwise opsRedFused mergedProtected
-  let opsWriteFused := fuseWriteDestination opsFused mergedProtected
-  let opsExt := mergeSameDispatch opsWriteFused
+  let opsExt := mergeSameDispatch opsFused
 
   -- Allocate intermediate buffers for op outputs the caller didn't
   -- reserve (e.g. the scalar output of a reduceLastAxis that feeds a
@@ -778,25 +730,26 @@ def compileWithPasses [GPUBackend β]
                 throw (IO.userError s!"compileWithPasses: missing matmul-epi buffer (in={inId}, out={outId})")
           }
       | _, _ => throw (IO.userError "compileWithPasses: matmul-epi op missing in/out tensor")
-    | PrimExt.base (Prim.pointwise outShape inShapes body) =>
+    | PrimExt.base (Prim.scatter outShape dstShape inShapes valueExpr addrExpr) =>
       let numel := outShape.numel
+      let dstNumel := dstShape.numel
       let inIds := op.inputs.map (·.id)
       let outId := op.outputs[0]!.id
       let cacheRef : IO.Ref (Option (GPUBackend.CachedDispatch β)) ← IO.mkRef none
       let cacheKey : UInt64 :=
-        hash ("circuit-pointwise", numel, reprStr body,
-              reprStr inShapes.toList)
+        hash ("circuit-scatter", numel, dstNumel,
+              reprStr valueExpr, reprStr addrExpr, reprStr inShapes.toList)
       closures := closures.push
         { run := fun lookup => do
             let mut inBufs : Array (GPUBackend.Buf β) := #[]
             for id in inIds do
               match lookup id with
               | some b => inBufs := inBufs.push b
-              | none   => throw (IO.userError s!"compileWithPasses: missing pointwise input id={id}")
+              | none   => throw (IO.userError s!"compileWithPasses: missing scatter input id={id}")
             match lookup outId with
             | some outBuf =>
-              runPointwiseOp ctx numel inShapes body inBufs outBuf cacheKey cacheRef
-            | none => throw (IO.userError s!"compileWithPasses: missing pointwise output id={outId}")
+              runScatterOp ctx numel dstNumel inShapes valueExpr addrExpr inBufs outBuf cacheKey cacheRef
+            | none => throw (IO.userError s!"compileWithPasses: missing scatter output id={outId}")
         }
     | PrimExt.base (Prim.reduceLastAxis rop inShape) =>
       let D := inShape.numel
@@ -834,42 +787,6 @@ def compileWithPasses [GPUBackend β]
               runReduceWithEpilogueOp ctx rop D body reduceBuf epiBufs outBuf cacheKey cacheRef
             | _, _ =>
               throw (IO.userError s!"compileWithPasses: missing reduce-epi buffer (in={inId} out={outId})")
-        }
-    | PrimExt.base (Prim.pointwiseToSlice outShape inShapes body dstShape writeOffset) =>
-      let numel := outShape.numel
-      let inIds := op.inputs.map (·.id)
-      let outId := op.outputs[0]!.id
-      let cacheRef : IO.Ref (Option (GPUBackend.CachedDispatch β)) ← IO.mkRef none
-      let cacheKey : UInt64 :=
-        hash ("circuit-pw-slice", numel, reprStr body,
-              reprStr inShapes.toList, dstShape.numel, reprStr writeOffset)
-      closures := closures.push
-        { run := fun lookup => do
-            let mut inBufs : Array (GPUBackend.Buf β) := #[]
-            for id in inIds do
-              match lookup id with
-              | some b => inBufs := inBufs.push b
-              | none   => throw (IO.userError s!"compileWithPasses: missing pointwiseToSlice input id={id}")
-            match lookup outId with
-            | some outBuf =>
-              runPointwiseToSliceOp ctx numel inShapes body dstShape.numel writeOffset
-                inBufs outBuf cacheKey cacheRef
-            | none => throw (IO.userError s!"compileWithPasses: missing pointwiseToSlice output id={outId}")
-        }
-    | PrimExt.base (Prim.writeSlice dstShape dstOffset srcShape) =>
-      let dstId := op.inputs[0]!.id
-      let srcId := op.inputs[1]!.id
-      let outId := op.outputs[0]!.id
-      let numel := srcShape.numel
-      let cacheRef : IO.Ref (Option (GPUBackend.CachedDispatch β)) ← IO.mkRef none
-      let cacheKey : UInt64 := hash ("circuit-write-slice", dstShape.numel, reprStr dstOffset, numel)
-      closures := closures.push
-        { run := fun lookup => do
-            match lookup dstId, lookup srcId, lookup outId with
-            | some dstBuf, some srcBuf, some _ =>
-              runWriteSliceOp ctx numel dstShape.numel dstOffset srcBuf dstBuf cacheKey cacheRef
-            | _, _, _ =>
-              throw (IO.userError s!"compileWithPasses: missing writeSlice buffer (dst={dstId} src={srcId} out={outId})")
         }
   let externalIds := state.externals.map (fun (tr, _) => tr.id)
   let producedIds := state.ops.foldl (init := (#[] : Array Nat)) fun acc op =>

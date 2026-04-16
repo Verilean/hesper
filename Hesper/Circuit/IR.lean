@@ -81,6 +81,13 @@ inductive ScalarExp where
   | input  (idx : Nat)
   | const  (v : Float)
   | laneIdx
+  /-- Gather read: read `inputs[bufIdx][addr]` at an arbitrary computed
+      address.  Distinct from `.input bufIdx`, which only reads at
+      `laneIdx` (or 0 for broadcast).  `addr` is a ScalarExp that can
+      reference `.laneIdx`, broadcast `.input k`s, or constants.  The
+      lowering casts the result of `addr` to u32 via truncation and
+      reads that slot of `inputs[bufIdx]`. -/
+  | indexed (bufIdx : Nat) (addr : ScalarExp)
   | add    (a b : ScalarExp)
   | sub    (a b : ScalarExp)
   | mul    (a b : ScalarExp)
@@ -111,6 +118,7 @@ partial def shiftInputs (k : Nat) : ScalarExp → ScalarExp
   | input i      => input (i + k)
   | const v      => const v
   | laneIdx      => laneIdx
+  | indexed i a  => indexed (i + k) (shiftInputs k a)
   | add a b      => add (shiftInputs k a) (shiftInputs k b)
   | sub a b      => sub (shiftInputs k a) (shiftInputs k b)
   | mul a b      => mul (shiftInputs k a) (shiftInputs k b)
@@ -137,6 +145,7 @@ partial def subst (args : Array ScalarExp) : ScalarExp → ScalarExp
   | input i      => match args[i]? with | some a => a | none => input i
   | const v      => const v
   | laneIdx      => laneIdx
+  | indexed i a  => indexed i (subst args a)
   | add a b      => add (subst args a) (subst args b)
   | sub a b      => sub (subst args a) (subst args b)
   | mul a b      => mul (subst args a) (subst args b)
@@ -253,53 +262,34 @@ inductive Prim (BufT : Type) (CacheT : Type) where
       (reduceInShape : Shape)
       (epilogueInShapes : Array Shape)
       (epilogueBody : ScalarExp)
-  /-- Pure pointwise op.  `outShape` is the shape of the output tensor
-      AND of the dispatch grid (fixed 1D `(numel+255)/256 × 256`).
-      `inShapes[i]` describes the i-th input:
-        * equal to `outShape` ⇒ full element-wise, indexed by the
-          thread's global id at every lane;
-        * `#[1]` (a 1-element tensor) ⇒ **scalar broadcast**; every
-          lane reads slot 0.  Used for scalar biases / scales that are
-          loaded from GPU buffers rather than baked as `const` in the
-          body.
-      Any other shape is rejected at build time (for now — general
-      NumPy-style broadcast is out of scope).
+  /-- Unified Map + Scatter primitive.
 
-      `body` is a `ScalarExp` where `input i` refers to `inputs[i]`.
-      Fusion is trivially safe: the output shape uniquely determines
-      the grid, and broadcast inputs compose (scalar-of-scalar is
-      still scalar). -/
-  | pointwise
-      (outShape : Shape) (inShapes : Array Shape) (body : ScalarExp)
-  /-- Pointwise op that writes into a *slice* of the output buffer.
-      Identical to `pointwise` except the kernel writes at
-      `output[idx + writeOffset]` instead of `output[idx]`, and the
-      output buffer has shape `dstShape` (≥ outShape.numel + writeOffset).
+      `inputs` layout: there is **one** inputs array, shared by both
+      `valueExpr` and `addrExpr`.  Each `.input k` in either expression
+      refers to `inputs[k]`.
 
-      Introduced by the `fuseWriteDestination` pass when a pointwise
-      op's sole consumer is a `writeSlice`.  The pass folds the copy
-      into the producer by redirecting its writes. -/
-  | pointwiseToSlice
-      (outShape : Shape) (inShapes : Array Shape) (body : ScalarExp)
-      (dstShape : Shape) (writeOffset : ScalarExp)
-  /-- Copy `inputs[1]` (shape `srcShape`) into `inputs[0]` (shape
-      `dstShape`) starting at element offset `dstOffset`.  The output
-      is a TensorRef of shape `dstShape` (the whole destination).
+      Shape semantics: `inShapes[k]` describes `inputs[k]`.
+        * equal to `outShape` ⇒ lane-local: `slots[k] = inputs[k][laneIdx]`
+        * `#[1]`            ⇒ broadcast: `slots[k] = inputs[k][0]`
 
-      `writeSlice` is the IR representation of llama.cpp's
-      `VIEW + SET_ROWS` pattern — it lets a compute result land at
-      a specific offset inside a pre-existing buffer (e.g. KV cache).
+      Per-lane evaluation (lane `i` in `[0, outShape.numel)`):
+        slots[k] = inputs[k][i] if lane-local, else inputs[k][0]
+        value    = valueExpr(slots, laneIdx := i)
+        addr     = addrExpr(slots, laneIdx := i) |> toU32
+        dst[addr] = value                        -- dst has shape `dstShape`
 
-      The `fuseWriteDestination` pass detects `[A: compute] → [B:
-      writeSlice]` chains and rewrites A to write directly into B's
-      destination at the given offset, eliminating both the temporary
-      buffer and the copy kernel.
+      Special cases:
+        * Map (old pointwise):         `dstShape = outShape`, `addrExpr = .laneIdx`
+        * writeSlice (old):             `dstShape` may be larger, `addrExpr = .laneIdx + offset`
+        * Dynamic scatter (KV cache):   `addrExpr` uses broadcast inputs (e.g. pos)
 
-      Dispatch shape: `(srcShape.numel + 255) / 256 × 256`. -/
-  | writeSlice
+      Dispatch grid: `(outShape.numel + 255) / 256 × 256`. -/
+  | scatter
+      (outShape  : Shape)
       (dstShape  : Shape)
-      (dstOffset : ScalarExp)
-      (srcShape  : Shape)
+      (inShapes  : Array Shape)
+      (valueExpr : ScalarExp)
+      (addrExpr  : ScalarExp)
 
 /-- An op in the circuit: a Prim plus the concrete tensor wiring. -/
 structure Op (BufT : Type) (CacheT : Type) where
@@ -402,19 +392,19 @@ All sugar below lowers to `Prim.pointwise`.  The body uses
 — the builder chooses that layout so the fusion pass can inline
 `input` indices by shifting. -/
 
-/-- Generic pointwise: caller supplies the inputs array (each either
-    of the output shape or scalar `#[1]`) and a body tree.  Output shape
-    is taken from the first full-shape input, or falls back to the
-    first input's shape.  For the purely-broadcast degenerate case
-    (all inputs scalar) the output is also scalar `#[1]`. -/
+/-- Generic pointwise (Map): caller supplies the inputs array (each
+    either of the output shape or scalar `#[1]`) and a body tree.
+    Lowers to `Prim.scatter` with `addrExpr = .laneIdx` (identity
+    addressing) and `dstShape = outShape` (fresh output buffer). -/
 def pointwise (inputs : Array TensorRef) (body : ScalarExp)
     : CircuitM BufT CacheT TensorRef := do
-  -- Pick the output shape: first non-broadcast input, else any input's shape.
   let outShape : Shape :=
     (inputs.find? (fun tr => tr.shape != #[1])).map (·.shape)
       |>.getD ((inputs[0]?).map (·.shape) |>.getD #[])
   let inShapes : Array Shape := inputs.map (·.shape)
-  let outs ← emitOp (Prim.pointwise outShape inShapes body) inputs
+  let outs ← emitOp
+    (Prim.scatter outShape outShape inShapes body .laneIdx)
+    inputs
     #[(outShape, .f32, .Global)]
   return outs[0]!
 
@@ -477,23 +467,42 @@ def rmsNorm (x scale : TensorRef) (eps : Float)
   pointwise #[x, invRms, scale]
     (.mul (.mul (.input 0) (.input 1)) (.input 2))
 
-/-- Write `src` into `dst` at element offset `dstOffset`.  `dst` is an
-    external buffer (typically a KV cache); `src` is the data to splice
-    in.  The output TensorRef has `dst`'s shape — downstream ops that
-    need the full buffer can consume it.
+/-- General Scatter: compute a value per lane and write it to `dst` at
+    a computed address.  `dst` is an existing buffer; the resulting
+    TensorRef reuses `dst.id` (the write is in-place semantically).
 
-    The `fuseWriteDestination` pass will look for a producer op whose
-    sole consumer is this `writeSlice` and rewrite the producer to emit
-    its result directly into `dst[dstOffset..]`, eliminating the
-    temporary and the copy.  Without fusion this lowers to a plain
-    `memcpy`-style pointwise copy kernel. -/
-def writeSlice (dst : TensorRef) (src : TensorRef) (dstOffset : ScalarExp)
+    - `inputs`    : data inputs for both `valueExpr` and `addrExpr`;
+                   each either same shape as `outShape` (lane-local)
+                   or `#[1]` (broadcast).
+    - `outShape`  : dispatch grid shape (= number of writes).
+    - `valueExpr` : what to write (uses `.input k` → `inputs[k]`,
+                    `.laneIdx` for thread index).
+    - `addrExpr`  : where to write (same slot semantics; result is
+                    converted to u32 via truncation).
+
+    Examples:
+      * Plain copy to offset:  `valueExpr = .input 0`, `addrExpr = .laneIdx + offset`
+      * KV cache write:        `addrExpr = .input 1 * kvDim + .laneIdx`
+                                (`inputs[1]` is a broadcast `pos` scalar)
+      * RoPE into cache:       `valueExpr` = RoPE computation, `addrExpr` = dyn offset -/
+def scatterInto (dst : TensorRef) (outShape : Shape) (inputs : Array TensorRef)
+    (valueExpr addrExpr : ScalarExp)
     : CircuitM BufT CacheT TensorRef := do
-  let outs ← emitOp
-    (Prim.writeSlice dst.shape dstOffset src.shape)
-    #[dst, src]
-    #[(dst.shape, .f32, .Global)]
-  return outs[0]!
+  let inShapes : Array Shape := inputs.map (·.shape)
+  -- Reuse dst's id: emit op with outputs := #[dst] directly, bypassing
+  -- `emitOp` (which always allocates a fresh TensorRef).
+  let newOp : Op BufT CacheT :=
+    { prim := Prim.scatter outShape dst.shape inShapes valueExpr addrExpr,
+      inputs := inputs,
+      outputs := #[dst] }
+  modify fun s => { s with ops := s.ops.push newOp }
+  return dst
+
+/-- Simple write-slice: copy `src` into `dst` starting at element
+    offset `dstOffset`.  Sugar over `scatterInto`. -/
+def writeSlice (dst : TensorRef) (src : TensorRef) (dstOffset : ScalarExp)
+    : CircuitM BufT CacheT TensorRef :=
+  scatterInto dst src.shape #[src] (.input 0) (.add .laneIdx dstOffset)
 
 end CircuitM
 
