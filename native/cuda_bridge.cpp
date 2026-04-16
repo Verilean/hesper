@@ -224,6 +224,33 @@ extern "C" lean_obj_res lean_hesper_cuda_launch_kernel(
     return lean_io_result_mk_ok(lean_box(0));
 }
 
+// Raw-arg launch: for external PTX (e.g. llama.cpp's mul_mat_vec_q) whose
+// kernels take mixed-type args (void*, u32, uint3, structs).  `arg_bytes`
+// is a single ByteArray of packed arg values; `arg_offsets` gives the
+// byte offset of each arg within that buffer.  CUDA's cuLaunchKernel
+// takes `void**` where each entry points at an arg's value storage.
+extern "C" lean_obj_res lean_hesper_cuda_launch_kernel_raw(
+    size_t func_val,
+    uint32_t gx, uint32_t gy, uint32_t gz,
+    uint32_t bx, uint32_t by, uint32_t bz,
+    uint32_t smem,
+    b_lean_obj_arg arg_bytes,
+    b_lean_obj_arg arg_offsets
+) {
+    size_t n = lean_array_size(arg_offsets);
+    uint8_t* base = lean_sarray_cptr(arg_bytes);
+    void** args = (void**)malloc(n * sizeof(void*));
+    for (size_t i = 0; i < n; i++) {
+        size_t off = lean_unbox_usize(lean_array_get_core(arg_offsets, i));
+        args[i] = (void*)(base + off);
+    }
+    CUDA_CHECK(cuLaunchKernel((CUfunction)func_val,
+        gx, gy, gz, bx, by, bz,
+        smem, nullptr, args, nullptr), "cuLaunchKernelRaw");
+    free(args);
+    return lean_io_result_mk_ok(lean_box(0));
+}
+
 // ============================================================================
 // Fast string hash (FNV-1a, ~4 GB/s on modern CPU)
 // ============================================================================

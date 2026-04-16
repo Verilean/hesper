@@ -1,4 +1,5 @@
 import Hesper.Backend.CUDA
+import Hesper.Backend.LlamaCppPTX
 import Hesper.CUDA.FFI
 import Hesper.Models.Gemma4
 import Hesper.Tokenizer.SentencePiece
@@ -48,6 +49,13 @@ unsafe def main (args : List String) : IO Unit := do
 
   -- Initialize CUDA
   let ctx ← CUDAContext.init
+
+  -- Phase 0: if HESPER_USE_LLAMACPP_PTX=1, install the llama.cpp PTX override
+  -- for forwardDP4A.  Requires `/tmp/llamacpp_ptx/{mmvq,quantize}.ptx` present.
+  -- Implies dp4aEnabled=true (the override only fires inside forwardDP4A).
+  let _ ← Hesper.LlamaCppPTX.autoInstall
+  if ← Hesper.LlamaCppPTX.isEnabled then
+    Hesper.Layers.Linear.dp4aEnabled.set true
 
   -- L2 persistence: bump the persisting cache limit to the device maximum
   -- (Ada / Ampere: typically 32 MB).  When HESPER_L2_PIN is set we'll install
