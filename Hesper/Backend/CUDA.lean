@@ -233,5 +233,6 @@ instance : GPUBackend CUDAContext where
   hasSubgroupSupport _ctx := pure true   -- CUDA warp shuffle
   hasShaderF16Support _ctx := pure true  -- sm_89 has native f16
   newCacheRef := IO.mkRef none
+  rawDevicePtr _ctx buf := pure (some buf.ptr)
 
 end Hesper

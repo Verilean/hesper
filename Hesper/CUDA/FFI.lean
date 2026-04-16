@@ -117,6 +117,20 @@ opaque cuLaunchKernel
     (args : @& Array USize)  -- device pointers
     : IO Unit
 
+/-- Raw-bytes launch for external PTX (e.g. llama.cpp) whose kernels take
+    mixed-type args (uint3 structs, f16 scalars, ...).  `argBytes` holds
+    packed arg values; `argOffsets[i]` = byte offset of the i-th arg.
+    CUDA receives `void**` where each entry points at `argBytes + offset`. -/
+@[extern "lean_hesper_cuda_launch_kernel_raw"]
+opaque cuLaunchKernelRaw
+    (func : CUfunction)
+    (gridX gridY gridZ : UInt32)
+    (blockX blockY blockZ : UInt32)
+    (sharedMem : UInt32)
+    (argBytes : @& ByteArray)
+    (argOffsets : @& Array USize)
+    : IO Unit
+
 /-! ## L2 cache persistence (Ampere+ / Ada / Hopper, CC ≥ 8.0) -/
 
 /-- Set the persisting-L2 limit on the current context.  The value is
