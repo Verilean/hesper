@@ -1,60 +1,64 @@
 ---
-title: "05 — hesper Circuit DSL 拡張計画"
+title: "05 — hesper Circuit DSL extension plan"
 date: 2026-04-16
 ---
 
-# hesper Circuit DSL 拡張計画
+# hesper Circuit DSL extension plan
 
-llama.cpp CUDA fusion 調査で判明した gap を Circuit DSL で埋めるための
-具体的な変更計画。
+Concrete changes to close the gap identified in the llama.cpp analysis.
 
-## 前提: 既存 DSL アーキテクチャ
+> **Note** (2026-04-16): some of these items have since been implemented;
+> the unification of write-side primitives is recorded in
+> [`08-scatter-impl-notes.md`](08-scatter-impl-notes.md). The plan
+> below is the original action list.
+
+## Existing DSL architecture
 
 ```
-[IR 層]   Prim → Op → TensorRef → Circuit state
-[Pass 層] fusePointwise / fuseReduceEpilogue / fuseMatmulEpilogue
-[Lowering] Prim → ShaderM → PTX JIT → cuLaunchKernel
+[IR]      Prim → Op → TensorRef → Circuit state
+[Passes]  fusePointwise / fuseReduceEpilogue / fuseMatmulEpilogue
+[Lower]   Prim → ShaderM → PTX JIT → cuLaunchKernel
 ```
 
-### 既存 Prim 一覧 (IR.lean:163–213)
+### Existing Prim catalogue (IR.lean:163–213)
 
-| Prim | 概要 | 行番号 |
+| Prim | Purpose | Line |
 |---|---|---|
 | `pointwise` | N-input → 1-output element-wise | `IR.lean:163` |
 | `matmulQ4K` | Q4_K mat-vec | `IR.lean:172` |
-| `matmulQ4KWithEpilogue` | Q4_K mat-vec + pointwise tail | `IR.lean:176` |
+| `matmulQ4KWithEpilogue` | Q4_K mat-vec with pointwise tail | `IR.lean:176` |
 | `reduceLastAxis` | sum / sumOfSquares | `IR.lean:191` |
 | `reduceLastAxisWithEpilogue` | reduce + pointwise tail | `IR.lean:211` |
 
-### 既存 Fusion Pass 一覧 (Passes.lean)
+### Existing fusion passes (Passes.lean)
 
-| Pass | 概要 | 行番号 |
+| Pass | Purpose | Line |
 |---|---|---|
-| `fusePointwise` | pointwise チェーン圧縮 | `Passes.lean:278` |
-| `fuseReduceEpilogue` | reduce → pointwise 融合 | `Passes.lean:451` |
-| `fuseMatmulEpilogue` | matmulQ4K → pointwise 融合 | `Passes.lean:575` |
-| `mergeSameDispatch` | 同一 dispatch 統合 | `Passes.lean:53` |
+| `fusePointwise` | Compress pointwise chains | `Passes.lean:278` |
+| `fuseReduceEpilogue` | Fuse reduce → pointwise | `Passes.lean:451` |
+| `fuseMatmulEpilogue` | Fuse matmulQ4K → pointwise | `Passes.lean:575` |
+| `mergeSameDispatch` | Merge identical dispatches | `Passes.lean:53` |
 
 ---
 
-## 変更 1: `Prim.matmulQ4KGateGLU` (新規 Prim)
+## Change 1: `Prim.matmulQ4KGateGLU` (new Prim)
 
-### 動機
+### Motivation
 
-llama.cpp Pattern B/C: `MUL_MAT + [ADD +] MUL_MAT + [ADD +] GLU` → 1 kernel。
-Gemma 4 FFN の gate+up 構造がこのパターンに合致。現状 hesper は
-`fusedQ4KMLinearDP4AGeluSliceKernel` として手書きだが、IR 化されていないため
-Circuit DSL の fusion pass から到達不可能。
+Pattern B/C from llama.cpp: `MUL_MAT + [ADD +] MUL_MAT + [ADD +] GLU` →
+1 kernel. Gemma 4's FFN gate+up pair matches this exactly. Today
+hesper has `fusedQ4KMLinearDP4AGeluSliceKernel` hand-coded but never
+exposed at the IR level, so Circuit DSL fusion passes can't reach it.
 
-### 設計
+### Design
 
 ```lean
--- Hesper/Circuit/IR.lean に追加
+-- Hesper/Circuit/IR.lean
 inductive GLUOp where
-  | silu     -- result *= silu(gate)
-  | gelu     -- result *= gelu(gate)
-  | reglu    -- result *= gate
-  | swigluOai -- swiglu-openai variant
+  | silu      -- result *= silu(gate)
+  | gelu      -- result *= gelu(gate)
+  | reglu     -- result *= gate
+  | swigluOai -- swiglu OpenAI variant
 
 inductive Prim where
   ...
@@ -69,42 +73,43 @@ inductive Prim where
 
 ### Lowering
 
-[`Lowering.lean`](../../../Hesper/Circuit/Lowering.lean) に追加:
+In [`Lowering.lean`](../../../Hesper/Circuit/Lowering.lean), emit the
+existing `fusedQ4KMLinearDP4AGeluSliceKernel` shape with two parallel
+accumulators — same pattern as `mmvq.cu:494–497`:
 
 ```
 Prim.matmulQ4KGateGLU main gate xBias gateBias gluOp
-  → 既存 fusedQ4KMLinearDP4AGeluSliceKernel と同構造の PTX kernel を emit
-  → inner loop: main dot-product + gate dot-product を並列計算
-     (mmvq.cu:494-497 と同パターン)
-  → epilogue: bias add → gluOp 適用 → f32 output
+  → emit a PTX kernel that computes `main · x` and `gate · x` in the
+    same inner loop, applies optional biases on lane 0 after warp
+    reduction, applies gluOp, and writes the f32 product.
 ```
 
-### 推定削減
+### Estimated savings
 
-- FFN gate+up fusion: **−42/tok** (gate+up が 1 kernel に)
-- 加えて、geluMul pointwise を吸収: **追加 −42/tok**
-- **合計 −84/tok** (975 → 891)
+- FFN gate+up: **−42/tok** (gate+up fold to one kernel)
+- Plus the geluMul pointwise gets absorbed: **another −42/tok**
+- **Total −84/tok** (975 → 891)
 
-### 実装場所
+### Edits
 
-| ファイル | 変更内容 |
+| File | Change |
 |---|---|
-| `Hesper/Circuit/IR.lean` | `GLUOp` enum + `Prim.matmulQ4KGateGLU` 追加 |
-| `Hesper/Circuit/Lowering.lean` | `lowerMatmulQ4KGateGLU` lowering 関数 |
-| `Hesper/Layers/Linear.lean` | 既存 `fusedQ4KMLinearDP4AGeluSliceKernel` を template 化 |
-| `Hesper/Models/Gemma4.lean` | FFN の wGate/wUp を CircuitM 経由で emit |
-| `Tests/Circuit/FuseGateGLUTest.lean` | IR fusion テスト (新規) |
+| `Hesper/Circuit/IR.lean` | Add `GLUOp` enum + `Prim.matmulQ4KGateGLU` |
+| `Hesper/Circuit/Lowering.lean` | New `lowerMatmulQ4KGateGLU` |
+| `Hesper/Layers/Linear.lean` | Templatise the existing fused kernel |
+| `Hesper/Models/Gemma4.lean` | FFN's wGate/wUp emit through CircuitM |
+| `Tests/Circuit/FuseGateGLUTest.lean` | New IR fusion test |
 
 ---
 
-## 変更 2: `fuseGateMatmulEpilogue` pass (新規 Pass)
+## Change 2: `fuseGateMatmulEpilogue` pass (new pass)
 
-### 動機
+### Motivation
 
-IR を走査して Pattern B/C を自動検出 → `matmulQ4KGateGLU` に置換。
-`fuseMatmulEpilogue` (Passes.lean:575) と同系統の AST walker。
+Walk the IR for Pattern B/C and rewrite into `matmulQ4KGateGLU`. Same
+shape as `fuseMatmulEpilogue` (Passes.lean:575).
 
-### 検出パターン
+### Pattern detected
 
 ```
 op_i:    matmulQ4K(x, wUp)         → up     (single consumer)
@@ -113,142 +118,145 @@ op_k:    pointwise(up, gate, body)  → out
   body = mul (input 0) (silu (input 1))   -- or gelu / reglu
 ```
 
-条件:
-- `op_i` と `op_j` が **同一入力 x** を消費
-- `up` と `gate` が **単一 consumer** (`op_k`)
-- `up`, `gate` がどちらも `protectedIds` に含まれない
+Conditions:
+- `op_i` and `op_j` consume the **same input `x`**
+- `up` and `gate` are each **single-consumer** of `op_k`
+- Neither `up` nor `gate` is in `protectedIds`
 
-### 置換結果
+### Rewrite
 
 ```
 op_new: matmulQ4KGateGLU(x, wUp, wGate, none, none, .silu) → out
 ```
 
-### 実装場所
+### Edits
 
-| ファイル | 変更内容 |
+| File | Change |
 |---|---|
 | `Hesper/Circuit/Passes.lean` | `fuseGateMatmulEpilogue` / `fuseGateMatmulEpilogueStep` |
-| `Tests/Circuit/FuseGateGLUTest.lean` | パターンマッチテスト |
+| `Tests/Circuit/FuseGateGLUTest.lean` | Pattern-match unit test |
 
 ---
 
-## 変更 3: `reduceWithEpilogue` の ADD 拡張
+## Change 3: extend `reduceWithEpilogue` to absorb ADD
 
-### 動機
+### Motivation
 
-llama.cpp Pattern D: `RMS_NORM + MUL + ADD` → 1 kernel。
-現在の `fuseReduceEpilogue` は `reduce → pointwise(mul)` まで。
-`ADD` を追加するには epilogue の `ScalarExp` body を 3-input に拡張。
+Pattern D from llama.cpp: `RMS_NORM + MUL + ADD` → 1 kernel.
+Today `fuseReduceEpilogue` covers `reduce → pointwise(mul)`.
+Adding ADD just means accepting a 3-input `ScalarExp` body.
 
-### 設計
+### Design
 
-変更箇所は `fuseReduceEpilogueStep` (Passes.lean:376) の**パターンマッチ拡張**のみ:
+Change `fuseReduceEpilogueStep` (Passes.lean:376) **only** in pattern
+matching:
 
 ```
-現在: reduce → pointwise(2-input mul)  → reduceWithEpilogue(mul body)
-拡張: reduce → pointwise(2-input mul) → pointwise(2-input add)
-      → reduceWithEpilogue(mul+add body, 3 inputs)
+Now:    reduce → pointwise(2-input mul)  → reduceWithEpilogue(mul body)
+Want:   reduce → pointwise(2-input mul) → pointwise(2-input add)
+        → reduceWithEpilogue(mul+add body, 3 inputs)
 ```
 
-### 推定削減
+### Estimated savings
 
-- attnNorm / ffnNorm で MUL+ADD がチェーン化されている箇所: **−42/tok**
+- attnNorm / ffnNorm sites where MUL+ADD is chained: **−42/tok**
 
-### 実装場所
+### Edits
 
-| ファイル | 変更内容 |
+| File | Change |
 |---|---|
-| `Hesper/Circuit/Passes.lean` | `fuseReduceEpilogueStep` のパターン拡張 |
-| `Hesper/Circuit/Lowering.lean` | 3-input reduce-with-epilogue kernel emit |
+| `Hesper/Circuit/Passes.lean` | Pattern extension in `fuseReduceEpilogueStep` |
+| `Hesper/Circuit/Lowering.lean` | 3-input reduce-with-epilogue kernel |
 
 ---
 
-## 変更 4: 連続 ADD の n-ary fusion
+## Change 4: n-ary ADD fusion
 
-### 動機
+### Motivation
 
-llama.cpp Pattern F: `ADD → ADD → ... → ADD` (max 8) → 1 kernel。
-hesper の residual 加算チェーンがこれに該当。
+Pattern F: `ADD → ADD → ... → ADD` (max 8) → 1 kernel. hesper's
+residual-add chain matches.
 
-### 設計
+### Design
 
-`fusePointwise` (Passes.lean:278) を拡張して、連続する binary ADD を n-ary
-pointwise に圧縮:
+Extend `fusePointwise` (Passes.lean:278) to compress chained binary ADDs
+into an n-ary pointwise:
 
 ```
 add(add(add(a, b), c), d) → pointwise(a, b, c, d, body=input0+input1+input2+input3)
 ```
 
-現在の `fusePointwise` は 2-input → 1-output の chain fusion のみ。
-n-input `ScalarExp` は IR.lean の `input : Nat → ScalarExp` で既に表現可能。
+Today `fusePointwise` only fuses 2-input → 1-output chains.
+n-input `ScalarExp` is already representable via `input : Nat → ScalarExp`.
 
-### 推定削減
+### Estimated savings
 
-- residual add chain: **−30/tok**
+- residual-add chains: **−30/tok**
 
-### 実装場所
+### Edits
 
-| ファイル | 変更内容 |
+| File | Change |
 |---|---|
-| `Hesper/Circuit/Passes.lean` | `fusePointwiseStep` の多段 ADD chain 検出 |
+| `Hesper/Circuit/Passes.lean` | Multi-stage ADD-chain detection in `fusePointwiseStep` |
 
 ---
 
-## 変更 5: Single-consumer safety check 明文化
+## Change 5: explicit single-consumer safety check
 
-### 動機
+### Motivation
 
-llama.cpp `ggml_can_fuse_ext` は「中間テンソルが exactly 1 consumer」を必ず
-チェック (ggml-impl.h:680–682)。hesper の fusion pass は `protectedIds` で
-外部参照を保護しているが、**2 つの non-protected consumer が同じ中間テンソルを
-消費** する場合に安全性が保証されているか未検証。
+llama.cpp's `ggml_can_fuse_ext` always checks "intermediate tensor has
+exactly 1 consumer" (`ggml-impl.h:680–682`). hesper's fusion passes
+protect externally-visible tensors via `protectedIds`, but **two
+non-protected consumers of the same intermediate** may not be guarded
+explicitly.
 
-### 設計
+### Design
 
-各 fusion pass の冒頭で「中間テンソルが protectedIds 外かつ
-consumer 数 == 1」を明示的に検証する guard を追加。
+Add a `countConsumers` guard at the start of each fusion pass requiring
+"intermediate id is not in protectedIds AND consumer count == 1".
 
-### 実装場所
+### Edits
 
-| ファイル | 変更内容 |
+| File | Change |
 |---|---|
-| `Hesper/Circuit/Passes.lean` | `countConsumers` ヘルパー + guard |
+| `Hesper/Circuit/Passes.lean` | `countConsumers` helper + guards |
 
 ---
 
-## 優先順位
+## Priority order
 
-| 順位 | 変更 | 削減 | 難易度 | 依存 |
+| Priority | Change | Saves | Difficulty | Depends on |
 |---:|---|---:|---|---|
-| 1 | **matmulQ4KGateGLU** + **fuseGateMatmulEpilogue** | −84 | 中 (3–5日) | なし |
-| 2 | reduceWithEpilogue ADD 拡張 | −42 | 小 (1日) | なし |
-| 3 | 連続 ADD n-ary fusion | −30 | 小 (1日) | なし |
-| 4 | single-consumer guard | 0 (正しさ) | 小 (0.5日) | なし |
-| 5 | PLE 経路 Circuit 化 | −150 | 大 (1–2週) | 1–4 |
+| 1 | **`matmulQ4KGateGLU`** + **`fuseGateMatmulEpilogue`** | −84 | Medium (3–5 days) | none |
+| 2 | `reduceWithEpilogue` ADD extension | −42 | Small (1 day) | none |
+| 3 | n-ary ADD fusion | −30 | Small (1 day) | none |
+| 4 | single-consumer guard | 0 (correctness) | Small (0.5 day) | none |
+| 5 | PLE path → Circuit | −150 | Large (1–2 weeks) | 1–4 |
 
-**Step 1 が最大 ROI**。Step 2–4 は並行可能。Step 5 は Step 1–4 完了後。
+**Step 1 has the highest single-commit ROI.** Steps 2–4 are independent
+and parallelisable. Step 5 builds on 1–4.
 
 ---
 
-## 長期ロードマップ: kernels/tok 見込み
+## Long-term roadmap: kernels-per-token outlook
 
 ```
-          975 ←── 現状
+          975 ←── starting point
     Step 1: −84  (matmulQ4KGateGLU)
     Step 2: −42  (reduce+MUL+ADD)
     Step 3: −30  (n-ary ADD)
     ────────────
           819
-    Step 5: −150 (PLE Circuit化)
-    Step 6: −84  (residual-add epilogue)
+    Step 5: −150 (PLE → Circuit)
+    Step 6: −84  (residual-add as matmul epilogue)
     ────────────
           585
     ────────────
-    理論下限: ~400/tok (per-layer persistent kernel なし)
-    llama.cpp CUDA: 187/tok (CUDA Graphs + multi-op-per-kernel)
+    Theoretical floor: ~400/tok (without per-layer persistent kernel)
+    llama.cpp CUDA:   187/tok (CUDA Graphs + multi-op-per-kernel)
 ```
 
-187/tok に到達するには **per-layer persistent kernel** (1 token = 1 kernel/layer)
-が必要。これは llama.cpp が CUDA Graphs で間接的に達成しているものの、
-個別 kernel 設計でも可能（将来検討）。
+Reaching 187/tok requires **per-layer persistent kernels** (one kernel
+per layer per token). llama.cpp gets there indirectly via CUDA Graphs;
+the same can be achieved with custom kernel design (deferred).

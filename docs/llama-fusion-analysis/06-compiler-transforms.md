@@ -1,211 +1,185 @@
 ---
-title: "06 — コンパイラ変換として見た fusion: reduce の壁と汎用化戦略"
+title: "06 — Fusion as compiler transforms: the reduce wall and how to generalise"
 date: 2026-04-16
 ---
 
-# コンパイラ変換として見た fusion
+# Fusion as compiler transforms
 
-## 1. reduce が fusion の壁になる理由
+## 1. Why reduce is a fusion wall
 
-現在の Circuit DSL の fusion pass 構造：
+Today's Circuit DSL fusion passes:
 
-| Pass | producer Prim | consumer Prim | 結果 |
+| Pass | Producer Prim | Consumer Prim | Result |
 |---|---|---|---|
-| `fusePointwise` | `pointwise` | `pointwise` | `pointwise` (body inlined) |
+| `fusePointwise` | `pointwise` | `pointwise` | inlined `pointwise` |
 | `fuseReduceEpilogue` | `reduceLastAxis` | `pointwise` chain | `reduceLastAxisWithEpilogue` |
 | `fuseMatmulEpilogue` | `matmulQ4K` | `pointwise` | `matmulQ4KWithEpilogue` |
 
-**全 pass が「producer と consumer が特定の Prim 種族ペア」でないとスキップする。**
+**Every pass requires producer/consumer to be a specific Prim pair.**
 
-reduce（sum）が間に入ると：
-- `fusePointwise`: producer/consumer とも `pointwise` 必須 → `reduceLastAxis` はスキップ
-- `fuseMatmulEpilogue`: consumer が `pointwise` 必須 → matmul→reduce→pointwise のうち
-  matmul の直後が reduce なので融合不可
-- `fuseReduceEpilogue`: producer が `reduceLastAxis` 必須 → pointwise→reduce は不可
+When a reduce sits between two ops:
+- `fusePointwise`: needs producer **and** consumer to be `pointwise`
+  (`Passes.lean:154,175`); a `reduceLastAxis` breaks the chain.
+- `fuseMatmulEpilogue`: consumer must be `pointwise` (`Passes.lean:485+`);
+  matmul → reduce → pointwise can't be fused because the reduce sits
+  immediately after the matmul.
+- `fuseReduceEpilogue`: producer must be `reduceLastAxis`
+  (`Passes.lean:383`), so pointwise → reduce or reduce → reduce don't fuse.
 
-→ **reduce は fusion chain を切断する壁として機能**
+Net: **reduce acts as a wall in the fusion DAG.**
 
-## 2. reduce をまたぐ代数的変換
+## 2. Algebraic transforms across reduce
 
-数学的に可換な変換は自動化可能：
+Mathematically valid moves we'd like a compiler to do automatically:
 
 ```
-a × Σ x_i = Σ (a × x_i)     -- scalar を reduce の中に吸収
-(Σ x_i) + b = Σ x_i + b     -- bias は reduce の外
-f(Σ x_i)  where f is pointwise -- reduce の後に pointwise 適用
+a × Σ x_i = Σ (a × x_i)            -- pull a scalar inside the reduce
+(Σ x_i) + b = Σ x_i + b             -- pull a bias outside the reduce
+f(Σ x_i)  where f is pointwise      -- apply pointwise after the reduce
 ```
 
-3番目は **`fuseReduceEpilogue` が既にやっていること**。
-1番目（reduce の前に pointwise を吸収）は未実装。
+The third case is what `fuseReduceEpilogue` already does.
+The first case (push pointwise into the reduce) is **not implemented**.
 
-## 3. llama.cpp 8 パターンのコンパイラ変換分類
+## 3. Classifying llama.cpp's eight patterns as compiler transforms
 
-| # | パターン | コンパイラ変換名 | 概要 |
+| # | Pattern | Compiler-transform name | Notes |
 |---|---|---|---|
-| A | matmul + bias | **epilogue absorption** | reduce 後の pointwise を吸収 |
-| B/C | matmul×2 + GLU | **parallel reduce fusion** | 同入力の 2 reduce を 1 kernel に |
-| D | RMSNorm + mul + add | **reduce-epilogue chain extension** | epilogue chain を延長 |
-| E | RoPE + view + set_rows | **output destination fusion** | 書き込み先をリダイレクト |
-| F | add×N | **n-ary pointwise collapse** | 多段 pointwise を 1 op に圧縮 |
-| H | silu + mul | **pointwise fusion** | 既存 `fusePointwise` |
+| A | matmul + bias | **epilogue absorption** | absorb pointwise after reduce |
+| B/C | matmul×2 + GLU | **parallel reduce fusion** | merge two reduces sharing input |
+| D | RMSNorm + mul + add | **reduce-epilogue chain extension** | extend the epilogue chain |
+| E | RoPE + view + set_rows | **output destination fusion** | redirect the write |
+| F | add×N | **n-ary pointwise collapse** | collapse multi-stage pointwise |
+| H | silu + mul | **pointwise fusion** | existing `fusePointwise` |
 
-**B/C と E のみが新しい変換**。他は既存 pass の拡張。
+**B/C and E are the only patterns that need genuinely new transforms.**
+The rest are extensions of existing passes.
 
-## 4. Parallel Reduce Fusion (B/C パターン)
+## 4. Parallel reduce fusion (Patterns B/C)
 
-### パターン
+### Pattern
 
 ```
 r1 = reduce(x, weights1)    -- matmul = weighted sum = reduce
-r2 = reduce(x, weights2)    -- 同じ x を消費
+r2 = reduce(x, weights2)    -- same input
 out = pointwise(r1, r2)     -- silu(r2) * r1 (GLU)
 ```
 
-2 つの Σ が同じ j を走査するので、1 ループで同時に累積可能。
+The two Σ traverse the same `j`, so we can accumulate both in one loop.
 
-### IR 設計: `parallelMatmulWithEpilogue`
+### IR design: `parallelMatmulWithEpilogue`
 
 ```lean
 | parallelMatmulWithEpilogue
-    (layers : Array (LinearLayer BufT CacheT))  -- N 個の weight
+    (layers : Array (LinearLayer BufT CacheT))  -- N weight tensors
     (epiBody : ScalarExp)
-    -- body で input 0 = layers[0] の結果
-    --       input 1 = layers[1] の結果
-    --       input N.. = 追加の side inputs
+    -- body: input 0 = layers[0] output, input 1 = layers[1] output, ...
+    --       input N.. = additional side inputs
 ```
 
-- N=1, body=identity → 現在の `matmulQ4K`
-- N=1, body=add(input 0)(input 1) → 現在の `matmulQ4KWithEpilogue` (bias)
-- **N=2, body=mul(input 0)(silu(input 1))** → llama.cpp Pattern B/C
+- N=1, body=identity → equivalent to `matmulQ4K`
+- N=1, body=add(input 0)(input 1) → equivalent to `matmulQ4KWithEpilogue` (bias)
+- **N=2, body=mul(input 0)(silu(input 1))** → llama.cpp B/C
 
 ### Lowering
 
-inner loop に N 本の accumulator を並列配置（`mmvq.cu:494–497` と同パターン）：
+Place N parallel accumulators in the inner loop (same shape as
+`mmvq.cu:494–497`):
 
 ```cuda
 tmp[j][i]      += vec_dot_q(vx_main, &y[...], ...);  // main
 tmp_gate[j][i] += vec_dot_q(vx_gate, &y[...], ...);  // gate (same y)
 ```
 
-### Fusion Pass 拡張
+### Pass extension
 
-`fuseMatmulEpilogue` を「同一入力を消費する N 個の matmul + 合流 pointwise」パターンに拡張。
+Extend `fuseMatmulEpilogue` to detect "N matmuls sharing an input,
+joined at a pointwise consumer".
 
-### 対応ソース
+### Source links
 
-- llama.cpp 実装: [`mmvq.cu:494–497`](../../../llama.cpp/ggml/src/ggml-cuda/mmvq.cu)
-  (gate matmul の inner loop 並列計算)
+- llama.cpp impl: [`mmvq.cu:494–497`](../../../llama.cpp/ggml/src/ggml-cuda/mmvq.cu)
 - llama.cpp graph fusion: [`ggml-cuda.cu:3810–3886`](../../../llama.cpp/ggml/src/ggml-cuda/ggml-cuda.cu)
-  (Pattern B: 5 ops → 1 kernel)
-- hesper 現行: [`Hesper/Circuit/IR.lean:176`](../../../Hesper/Circuit/IR.lean)
-  (`matmulQ4KWithEpilogue` — N=1 のみ)
-- hesper fusion pass: [`Hesper/Circuit/Passes.lean:485–580`](../../../Hesper/Circuit/Passes.lean)
-  (`fuseMatmulEpilogue` — 1 matmul + 1 pointwise のみ)
+- hesper today: [`Hesper/Circuit/IR.lean:176`](../../../Hesper/Circuit/IR.lean)
+  (`matmulQ4KWithEpilogue` — N=1)
+- hesper pass: [`Hesper/Circuit/Passes.lean:485–580`](../../../Hesper/Circuit/Passes.lean)
+  (`fuseMatmulEpilogue` — 1 matmul + 1 pointwise)
 
-## 5. Output Destination Fusion (E パターン)
+## 5. Output destination fusion (Pattern E)
 
-### パターン
+### Pattern
 
 ```
-1. result = compute(inputs)            -- RoPE, matmul, pointwise 等
+1. result = compute(inputs)            -- RoPE / matmul / pointwise
 2. view(result)                        -- zero-cost shape reinterpret
-3. set_rows(cache, view_out, pos)      -- 既存バッファの特定位置に書き込み
+3. set_rows(cache, view_out, pos)      -- write at a position in an existing buffer
 ```
 
-VIEW は zero-cost（メモリコピーなし）。実質：
+VIEW is zero-cost. Effectively:
 
 ```
-compute(inputs) → cache[pos] に直接書き込み
+compute(inputs) → write directly at cache[pos]
 ```
 
-### 現行 DSL で表現できない理由
+### Why old DSL couldn't express it
 
-1. **alias の概念がない**: `TensorRef` は `(id, shape, dtype, scope)` で id が
-   unique identity。同じバッファを別 shape で見る view は「新 id = 新バッファ = コピー」
+1. **No alias concept.** `TensorRef` was `(id, shape, dtype, scope)`
+   with id as unique identity. Viewing a buffer at a different shape
+   meant "new id = new buffer = copy".
+2. **Outputs were always fresh allocations.** `emitOp` (IR.lean:289–294)
+   called `allocTensor`, so "write at slot pos of existing buffer" was
+   inexpressible.
+3. **No way for a fusion pass to redirect the output.**
 
-2. **output は常に fresh allocation**: `emitOp` (IR.lean:289–294) が `allocTensor`
-   で新バッファを作る。「既存バッファの pos 番目に書く」は表現不能。
+### Resolution (commit b515e13)
 
-3. **fusion pass が output 先をリダイレクトする仕組みがない**
-
-### IR 設計案
+`Prim.scatter` with explicit `addrExpr : ScalarExp` covers this directly.
+See [`08-scatter-impl-notes.md`](08-scatter-impl-notes.md). For the
+record, the original design proposal:
 
 ```lean
--- TensorRef に alias 情報を追加
+-- Add alias info to TensorRef
 structure TensorRef where
   id     : Nat
   shape  : Shape
   dtype  : DType
   scope  : Scope
-  base   : Option Nat := none   -- 元バッファの id (alias の場合)
-  offset : Nat := 0             -- 元バッファ内のオフセット
+  base   : Option Nat := none   -- source buffer id (when this is an alias)
+  offset : Nat := 0             -- element offset within source
 
--- 新 Prim
+-- New Prims
 inductive Prim where
   ...
-  | view (newShape : Shape)             -- zero-cost reshape / alias 作成
-  | writeSlice (dstOffset : Nat)        -- output を dst[offset..] に書く
+  | view (newShape : Shape)             -- zero-cost reshape / alias
+  | writeSlice (dstOffset : Nat)        -- write to dst[offset..]
 ```
 
-### Fusion Pass: `fuseWriteDestination`
-
-```
-Rule: fuse-write-destination
-
-Match:
-  op_a: any_compute(inputs) → r       (single consumer = op_b)
-  op_b: writeSlice(cache, r, offset)  (r を cache[offset] に書く)
-
-Rewrite:
-  op_a の output address を cache[offset] に差し替え
-  op_b を削除
-```
-
-**任意の compute op に適用可能** — RoPE 固有ではない：
-
-```
-matmul(x, w)    → result → writeSlice(cache, result, pos)   -- wO → residual 直接書き
-pointwise(a, b) → result → writeSlice(buf, result, offset)  -- PLE scale 直接書き
-```
-
-GCC の **store sinking / destination propagation** に相当する汎用最適化。
-
-### 必要な変更
-
-| 変更 | ファイル | 難易度 |
-|---|---|---|
-| `TensorRef` に `base`/`offset` 追加 | [`IR.lean:55`](../../../Hesper/Circuit/IR.lean) | 小 |
-| `Prim.view` 追加 | [`IR.lean:151+`](../../../Hesper/Circuit/IR.lean) | 小 |
-| `Prim.writeSlice` 追加 | [`IR.lean:238+`](../../../Hesper/Circuit/IR.lean) | 小 |
-| `fuseWriteDestination` pass | [`Passes.lean`](../../../Hesper/Circuit/Passes.lean) (新規) | 中 |
-| Lowering: output address を offset 付きで emit | [`Lowering.lean`](../../../Hesper/Circuit/Lowering.lean) | 中 |
-| `CircuitM.writeSlice` builder sugar | [`IR.lean:263+`](../../../Hesper/Circuit/IR.lean) | 小 |
-
-### 対応ソース
+The actual implementation went further and unified all writes under one
+`Prim.scatter`, eliminating the need for a separate `view` and the
+alias fields on `TensorRef`. The source links stay valid:
 
 - llama.cpp graph fusion: [`ggml-cuda.cu:3762–3769`](../../../llama.cpp/ggml/src/ggml-cuda/ggml-cuda.cu)
-  (ROPE + VIEW + SET_ROWS → 1 kernel)
 - llama.cpp predicate: [`ggml-cuda.cu:3357–3365`](../../../llama.cpp/ggml/src/ggml-cuda/ggml-cuda.cu)
-  (`ggml_cuda_can_fuse` for rope_set_rows_ops)
-- hesper 現行 hand-coded: [`Hesper/Models/Gemma4.lean`](../../../Hesper/Models/Gemma4.lean)
-  (fused RoPE-K+KVwrite kernel — hand-composed, 非 Circuit)
+- hesper hand-coded: [`Hesper/Models/Gemma4.lean`](../../../Hesper/Models/Gemma4.lean)
+  (fused RoPE-K + KVwrite)
 
-## 6. 全パターンの DSL 対応まとめ
+## 6. Pattern × DSL coverage
 
-| # | パターン | コンパイラ変換 | 必要な DSL 改変 | 削減 |
+| # | Pattern | Compiler transform | DSL change needed | Saves |
 |---|---|---|---|---:|
-| A | matmul+bias | epilogue absorption | なし (既存) | — |
-| B/C | matmul×2+GLU | parallel reduce fusion | `layers: Array` 汎化 | −84/tok |
-| D | RMSNorm+mul+add | reduce-epilogue chain | pass 拡張のみ | −42/tok |
-| **E** | **RoPE+view+set_rows** | **output destination fusion** | **view + writeSlice Prim + pass** | **−42/tok** |
-| F | add×N | n-ary pointwise | pass 拡張のみ | −30/tok |
-| H | silu+mul | pointwise fusion | なし (既存) | — |
+| A | matmul+bias | epilogue absorption | none (existing) | — |
+| B/C | matmul×2+GLU | parallel reduce fusion | `layers : Array` generalisation | −84/tok |
+| D | RMSNorm+mul+add | reduce-epilogue chain | pass extension | −42/tok |
+| **E** | **RoPE+view+set_rows** | **output destination fusion** | **`Prim.scatter` (DONE)** | **−42/tok** |
+| F | add×N | n-ary pointwise | pass extension | −30/tok |
+| H | silu+mul | pointwise fusion | none (existing) | — |
 
-## 7. 実装優先順位
+## 7. Implementation order (recommended)
 
-1. **E (output destination fusion)** — DSL の表現力向上が最大。view/writeSlice は
-   B/C にも将来使える汎用基盤。他のモデルにも再利用可能。
-2. **B/C (parallel reduce fusion)** — TPS 効果が最大 (−84/tok)。E で view が入った後なら
-   fusion chain が繋がりやすい。
-3. **D (reduce-epilogue chain)** — pass 拡張のみ。
-4. **F (n-ary pointwise)** — pass 拡張のみ。
+1. **E (output destination fusion)** — biggest leap in DSL expressiveness.
+   `view` / `writeSlice` (or now `scatter`) become the foundation that
+   B/C also rest on. Reusable across models.
+2. **B/C (parallel reduce fusion)** — biggest TPS win (−84/tok). Easier
+   once `view` is in place.
+3. **D (reduce-epilogue chain)** — pass extension only.
+4. **F (n-ary pointwise)** — pass extension only.

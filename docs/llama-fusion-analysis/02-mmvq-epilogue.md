@@ -1,54 +1,53 @@
 ---
-title: "02 — mmvq.cu: Quantized Mat-Vec + Epilogue Template"
+title: "02 — mmvq.cu: quantised mat-vec + epilogue template"
 date: 2026-04-16
-source: llama.cpp/ggml/src/ggml-cuda/mmvq.cu (1,150行)
+source: llama.cpp/ggml/src/ggml-cuda/mmvq.cu (1,150 lines)
 ---
 
-# mmvq.cu: Quantized Mat-Vec + Epilogue
+# mmvq.cu: quantised mat-vec + epilogue
 
-`mul_mat_vec_q` は llama.cpp の **decode 時メイン matmul kernel**。
-1 トークン推論 (`ncols_dst=1`) 時のみ epilogue fusion が有効。
+`mul_mat_vec_q` is llama.cpp's main matmul kernel during decode. Epilogue
+fusion is enabled only when `ncols_dst = 1` (single-token decode).
 
-## 1. テンプレートシグネチャ
+## 1. Template signature
 
-**mmvq.cu:389–390**
+**`mmvq.cu:389–390`**
 
 ```cuda
 template <ggml_type type, int ncols_dst, bool has_fusion, bool small_k = false>
 __launch_bounds__(calc_nwarps(type, ncols_dst, ...) * warp_size, 1)
 static __global__ void mul_mat_vec_q(
-    const void * __restrict__ vx,        // quantized weights (Q4_K/Q6_K等)
-    const void * __restrict__ vy,        // Q8_1 pre-quantized input
+    const void * __restrict__ vx,        // quantised weights (Q4_K/Q6_K etc.)
+    const void * __restrict__ vy,        // Q8_1 pre-quantised input
     const int32_t * __restrict__ ids,    // MoE routing (optional)
     const ggml_cuda_mm_fusion_args_device fusion,  // epilogue payload
     float * __restrict__ dst,            // output (f32)
     ...)
 ```
 
-| パラメータ | 型 | 意味 |
+| Parameter | Type | Meaning |
 |---|---|---|
-| `type` | `ggml_type` | Q4_0, Q4_K, Q6_K, IQ2_XXS 等 20+ |
-| `ncols_dst` | `int` | 出力バッチ幅 1–8 (compile-time) |
-| `has_fusion` | `bool` | true: epilogue code 有効化 |
-| `small_k` | `bool` | K 次元が小さい場合の最適化 |
+| `type` | `ggml_type` | Q4_0, Q4_K, Q6_K, IQ2_XXS etc. (20+ variants) |
+| `ncols_dst` | `int` | Output batch width 1–8 (compile-time) |
+| `has_fusion` | `bool` | True ⇒ epilogue code is enabled |
+| `small_k` | `bool` | Optimisation flag for small K dimension |
 
-## 2. Fusion 構造体
+## 2. The fusion struct
 
-**`ggml_cuda_mm_fusion_args_device`** (common.cuh, mmvq.cu:1047)
+**`ggml_cuda_mm_fusion_args_device`** (declared in `common.cuh`, used at `mmvq.cu:1047`)
 
 ```c
 struct ggml_cuda_mm_fusion_args_device {
     const void * x_bias      = nullptr;  // up-path bias (f32 vector)
-    const void * gate         = nullptr;  // gate weight (同じ quant type)
+    const void * gate         = nullptr;  // gate weight (same quant type)
     const void * gate_bias    = nullptr;  // gate-path bias (f32 vector)
     ggml_glu_op  glu_op;                 // SWIGLU / GEGLU / REGLU / SWIGLU_OAI
 };
 ```
 
-Host 側で `ggml_tensor*` → `void*` (device pointer) に変換:
+Host-side conversion of `ggml_tensor*` → device pointer (`mmvq.cu:1047–1070`):
 
 ```c
-// mmvq.cu:1047-1070
 ggml_cuda_mm_fusion_args_device fusion_local{};
 if (fusion) {
     if (fusion->x_bias)    fusion_local.x_bias    = fusion->x_bias->data;
@@ -58,9 +57,9 @@ if (fusion) {
 }
 ```
 
-## 3. Epilogue 実装
+## 3. Epilogue implementation
 
-### 条件フラグ展開 (mmvq.cu:435–443)
+### Conditional flag setup (`mmvq.cu:435–443`)
 
 ```cuda
 if constexpr (has_fusion) {
@@ -70,11 +69,12 @@ if constexpr (has_fusion) {
 }
 ```
 
-`constexpr` → dead code elimination で fusion 無しビルドは epilogue が完全除去。
+`if constexpr` means the dead-code branches vanish at compile time when
+`has_fusion = false`.
 
-### Gate matmul の並列計算 (mmvq.cu:494–497)
+### Parallel gate matmul (`mmvq.cu:494–497`)
 
-**Inner loop 内で main matmul と gate matmul を同時計算**:
+The main and gate matmuls are computed **in the same inner loop**:
 
 ```cuda
 // main path
@@ -91,12 +91,13 @@ if constexpr (has_fusion) {
 }
 ```
 
-**重要**: gate matmul は **同じ Q8_1 input** (`y`) を共有。重み (`vgate`) だけ異なる。
+Both paths share the same Q8_1 input `y`; only the weight pointer
+(`vx` vs `vgate`) differs.
 
-### Warp reduction → epilogue (mmvq.cu:533–582)
+### Warp reduction → epilogue (`mmvq.cu:533–582`)
 
 ```cuda
-// reduction 後、threadIdx.x == 0 のスレッドのみ:
+// After warp reduction, only thread 0 of each warp:
 float result = /* reduced sum */;
 
 // Step 1: bias
@@ -126,11 +127,11 @@ switch (active_glu) {
         break;
 }
 
-// Step 4: f32 書き込み
+// Step 4: f32 store
 dst[j*stride_col_dst + threadIdx.x] = result;               // mmvq.cu:582
 ```
 
-### 活性化関数 (unary.cuh)
+### Activation primitives (in `unary.cuh`)
 
 ```cuda
 // SiLU: x * σ(x)
@@ -138,21 +139,21 @@ __device__ float ggml_cuda_op_silu_single(float x) {
     return x / (1.0f + expf(-x));
 }
 
-// GELU (tanh 近似)
+// GELU (tanh approximation)
 __device__ float ggml_cuda_op_gelu_single(float x) {
     return 0.5f * x * (1.0f + tanhf(0.7978845f * x * (1.0f + 0.044715f * x * x)));
 }
 ```
 
-## 4. Dispatch ロジック (3 段階)
+## 4. Three-stage dispatcher
 
-### Level 1: `mul_mat_vec_q_switch_type` (mmvq.cu:880–1019)
+### Level 1: `mul_mat_vec_q_switch_type` (`mmvq.cu:880–1019`)
 
-`type_x` (Q4_0, Q4_K, Q6_K 等) を switch → Level 2 呼出。
+Switch on `type_x` (Q4_0, Q4_K, Q6_K, …) and call Level 2.
 
-### Level 2: `mul_mat_vec_q_switch_ncols_dst` (mmvq.cu:717–879)
+### Level 2: `mul_mat_vec_q_switch_ncols_dst` (`mmvq.cu:717–879`)
 
-`ncols_dst` (1–8) を switch。fusion チェック:
+Switch on `ncols_dst` (1–8). Fusion check:
 
 ```c
 // mmvq.cu:738
@@ -168,7 +169,7 @@ if (ncols_dst == 1 && has_fusion) {
 }
 ```
 
-### Level 3: `mul_mat_vec_q_switch_fusion` (mmvq.cu:667–693)
+### Level 3: `mul_mat_vec_q_switch_fusion` (`mmvq.cu:667–693`)
 
 ```c
 if constexpr (has_fusion) {
@@ -178,35 +179,39 @@ if constexpr (has_fusion) {
 }
 ```
 
-## 5. 入力形式
+## 5. Input format
 
-- **src0 (weights)**: 量子化済み (`type_x` = Q4_K 等)
-- **src1 (input)**: **f32 → Q8_1 に事前量子化** (mmvq.cu:1083–1090)
+- **src0 (weights)**: pre-quantised (`type_x` = Q4_K etc.)
+- **src1 (input)**: f32 → **Q8_1 by a separate quantize kernel** (`mmvq.cu:1083–1090`)
   ```c
   quantize_row_q8_1_cuda(src1_d, ..., src1_q8_1.get(), ...);
   ```
-- Q8_1 quantize は **別 kernel** — matmul には含まれない
+- The Q8_1 quantize is a **distinct dispatch**, not part of the matmul kernel.
 
-## 6. 出力形式
+## 6. Output format
 
-- **常に f32** (mmvq.cu:582)
-- post-quantize 無し — 後続 kernel に委託
+- **Always f32** (`mmvq.cu:582`).
+- No post-quantise; downstream kernels do their own quantisation if needed.
 
-## 7. 制約
+## 7. Constraints
 
-| 制約 | 詳細 |
+| Constraint | Detail |
 |---|---|
-| fusion は ncols_dst == 1 のみ | バッチ/prefill は fusion 無効 |
-| gate weight は main weight と同じ quant type | 異なる型は不可 |
-| 活性化は 1 種のみ同時適用 | SiLU + GELU 等の chain は不可 |
-| bias は up-path のみ (x_bias) | down-proj の bias は別パターン |
+| Fusion only for `ncols_dst == 1` | Batch / prefill paths skip fusion entirely |
+| Gate weight must match main quant type | Mixed types are not supported |
+| One activation at a time | Cannot chain SiLU + GELU etc. |
+| Bias is up-path only (`x_bias`) | down-proj bias uses a different pattern |
 
-## 8. hesper への含意
+## 8. Implications for hesper
 
-1. **gate matmul を inner loop 内で並列計算** する設計 → `ScalarExp` (pointwise-only)
-   では表現不能 → **新 Prim `matmulQ4KGateGLU` が必要**
-2. **同じ Q8_1 input を共有** → hesper の gate+up fused kernel
-   (`fusedQ4KMLinearDP4AGeluSliceKernel`) は既に同パターン。
-   内部構造を gate-matmul + epilogue に分解すれば IR 化可能
-3. **`constexpr` による dead code elimination** → hesper は PTX JIT なので
-   同等の特殊化はコスト 0 で可能（ShaderM → PTX lowering で分岐を静的に解決）
+1. **Gate matmul is computed inside the main kernel's inner loop.**
+   `ScalarExp` (pointwise-only) cannot represent that — gate matmul has
+   its own reduction. **A new `Prim.matmulQ4KGateGLU` is required.**
+
+2. **Gate and main share the same Q8_1 input.** hesper's existing
+   `fusedQ4KMLinearDP4AGeluSliceKernel` follows the same pattern; the
+   internal structure can be lifted into IR with the right Prim.
+
+3. **`if constexpr` dead-code elimination.** hesper compiles to PTX via
+   JIT, so the same specialisation has zero cost — the lowering can
+   resolve branches statically based on the `Prim` arguments.

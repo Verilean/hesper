@@ -1,25 +1,26 @@
 ---
-title: "01 — ggml-cuda.cu Graph-Level Fusion Logic"
+title: "01 — ggml-cuda.cu graph-level fusion"
 date: 2026-04-16
-source: llama.cpp/ggml/src/ggml-cuda/ggml-cuda.cu (5,316行)
+source: llama.cpp/ggml/src/ggml-cuda/ggml-cuda.cu (5,316 lines)
 ---
 
-# ggml-cuda.cu Graph-Level Fusion Logic
+# ggml-cuda.cu graph-level fusion
 
-## 1. Fusion Entry Point
+## 1. Entry point
 
-**`ggml_cuda_graph_evaluate_and_capture()`** (`ggml-cuda.cu:3540`)
+**`ggml_cuda_graph_evaluate_and_capture()`** at `ggml-cuda.cu:3540`.
 
-ggml cgraph の全ノードを `for (int i = 0; i < cgraph->n_nodes; i++)` で走査
-(`ggml-cuda.cu:3638`)。各ノードで以下の fusion パターンを**順次チェック**し、
-最初にマッチしたパターンで dispatch → `i` を融合分だけスキップ。
+It walks every node of the ggml cgraph with `for (int i = 0; i < cgraph->n_nodes; i++)`
+(`ggml-cuda.cu:3638`). At each node it tries the fusion patterns
+**in order**; the first one that matches dispatches a fused kernel and
+advances `i` past the absorbed ops.
 
-disable ゲート (`ggml-cuda.cu:3687`):
+Kill switch at `ggml-cuda.cu:3687`:
 ```c
 static bool disable_fusion = (getenv("GGML_CUDA_DISABLE_FUSION") != nullptr);
 ```
 
-## 2. Fusability Predicate
+## 2. Fusability predicate
 
 ### Core: `ggml_can_fuse_ext()` (`ggml-impl.h:663–690`)
 
@@ -31,29 +32,30 @@ static inline bool ggml_can_fuse_ext(
     int num_ops)
 {
     for (int i = 0; i < num_ops; ++i) {
-        // 1. ノードが graph 内に存在
+        // 1. Node exists in graph
         if (node_idxs[i] >= cgraph->n_nodes) return false;
 
         struct ggml_tensor * node = cgraph->nodes[node_idxs[i]];
 
-        // 2. op type がパターンと一致
+        // 2. Op type matches expected pattern
         if (node->op != ops[i]) return false;
 
-        // 3. COMPUTE flag (dead code 除外)
+        // 3. COMPUTE flag set (skip dead code)
         if ((node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) return false;
 
-        // 4. 中間テンソルは single-consumer (最後の op は複数 consumer 可)
+        // 4. Intermediate tensor must have exactly one consumer
+        //    (final op may have multiple consumers)
         if (i < num_ops - 1 &&
             !ggml_node_has_n_uses(cgraph, node_idxs[i], 1))
             return false;
 
-        // 5. data dependency (sequential chain)
+        // 5. Data dependency: sequential ops must chain
         if (i > 0) {
             struct ggml_tensor * prev = cgraph->nodes[node_idxs[i - 1]];
             if (node->src[0] != prev && node->src[1] != prev)
                 return false;
 
-            // 6. 同一 shape
+            // 6. Same-shape requirement
             if (!ggml_are_same_shape(node, prev))
                 return false;
         }
@@ -62,29 +64,30 @@ static inline bool ggml_can_fuse_ext(
 }
 ```
 
-### Memory overlap check (`ggml-cuda.cu:3477–3538`)
+### Memory-overlap check (`ggml-cuda.cu:3477–3538`)
 
 ```c
 static bool ggml_cuda_check_fusion_memory_ranges(
     ggml_cgraph * cgraph, ...) {
-    // nrows > 1 の場合: output が中間入力を上書きしないか検証
-    // nrows == 1 は vectorized write で race-free → always safe
+    // For nrows > 1, the output must not overwrite an intermediate input
+    // before it is read.  nrows == 1 is always safe (vectorised writes
+    // don't race reads within a wavefront).
 }
 ```
 
-### hesper Circuit DSL との対応
+### Correspondence with hesper Circuit DSL
 
-| llama.cpp の predicate | hesper の実装 |
+| llama.cpp predicate | hesper equivalent |
 |---|---|
-| single-consumer | `protectedIds` で「最終出力と外部入力のみ保護」→ 暗黙的に single-consumer |
-| shape 一致 | `fusePointwise` で `op.outShape == consumer.inShapes[slot]` チェック |
-| memory overlap | 未実装（IR は SSA なので in-place hazard は lowering 側で対処） |
+| single-consumer | `protectedIds` marks externals + final outputs; anything else is implicitly at-most-single-consumer for fusion |
+| same-shape | `fusePointwise` checks `op.outShape == consumer.inShapes[slot]` |
+| memory overlap | not yet implemented (IR is SSA; in-place hazards handled in lowering) |
 
-## 3. 全 Fusion パターン詳細
+## 3. Pattern catalogue
 
 ### Pattern A: `MUL_MAT + ADD` (bias epilogue)
 
-**ggml-cuda.cu:3933–3987**
+**`ggml-cuda.cu:3933–3987`**
 
 ```c
 if (!ggml_can_fuse(cgraph, i, { op, bias_op })) continue;
@@ -99,14 +102,15 @@ if (ggml_cuda_should_fuse_mul_mat_vec_f(mm_node)) {
 }
 ```
 
-**hesper 対応**: `Prim.matmulQ4KWithEpilogue` + `fuseMatmulEpilogue` pass
-(`Passes.lean:485–580`)。bias を `ScalarExp.add (input 0) (input 1)` で表現可能。
+**hesper**: covered by `Prim.matmulQ4KWithEpilogue` + `fuseMatmulEpilogue`
+(`Passes.lean:485–580`). Bias is expressed as
+`ScalarExp.add (input 0) (input 1)`.
 
 ---
 
 ### Pattern B: `MUL_MAT + ADD + MUL_MAT + ADD + GLU` (FFN gate+up fused)
 
-**ggml-cuda.cu:3810–3886** — 最大 ROI パターン
+**`ggml-cuda.cu:3810–3886`** — highest-ROI pattern.
 
 ```c
 if (ggml_cuda_can_fuse(cgraph, i,
@@ -122,8 +126,9 @@ if (ggml_cuda_can_fuse(cgraph, i,
 }
 ```
 
-Gate matmul は**メインの matmul inner loop の中で並列計算**される
+The gate matmul is computed **inside the main matmul's inner loop**
 (`mmvq.cu:494–497`):
+
 ```c
 if (use_gate) {
     tmp_gate[j][i] += vec_dot_q_cuda(
@@ -132,16 +137,16 @@ if (use_gate) {
 }
 ```
 
-**hesper 対応**: `ScalarExp` は pointwise のみ → **gate matmul は reduce を含む**
-ため `matmulQ4KWithEpilogue` の body では表現不能。**新 Prim が必要**。
-
-→ 提案: `Prim.matmulQ4KGateGLU` ([05-hesper-dsl-plan.md](05-hesper-dsl-plan.md) 参照)
+**hesper**: `ScalarExp` is pointwise-only; the gate matmul requires a
+reduction, so the current `matmulQ4KWithEpilogue` body can't express it.
+A **new Prim is required** — see [`05-hesper-dsl-plan.md`](05-hesper-dsl-plan.md)
+for `Prim.matmulQ4KGateGLU`.
 
 ---
 
-### Pattern C: `MUL_MAT + MUL_MAT + GLU` (no bias variant)
+### Pattern C: `MUL_MAT + MUL_MAT + GLU` (no-bias variant)
 
-**ggml-cuda.cu:3887–3922** — Pattern B の bias 無しバージョン。
+**`ggml-cuda.cu:3887–3922`** — same as B without the ADD steps.
 
 ```c
 else if (ggml_cuda_can_fuse(cgraph, i, { op, op, GGML_OP_GLU }, {})) {
@@ -149,13 +154,13 @@ else if (ggml_cuda_can_fuse(cgraph, i, { op, op, GGML_OP_GLU }, {})) {
 }
 ```
 
-**hesper 対応**: Pattern B の `xBias = none, gateBias = none` で包含。
+**hesper**: covered by the same new Prim, with `xBias = none, gateBias = none`.
 
 ---
 
 ### Pattern D: `RMS_NORM + MUL (+ ADD)`
 
-**ggml-cuda.cu:3994–4004**
+**`ggml-cuda.cu:3994–4004`**
 
 ```c
 if (ggml_cuda_can_fuse(cgraph, i,
@@ -173,15 +178,15 @@ if (ggml_cuda_can_fuse(cgraph, i,
 }
 ```
 
-**hesper 対応**: Step 6 `fuseReduceEpilogue` (`Passes.lean:376–451`) で
-`reduceLastAxis → pointwise(mul)` 融合済み。`+ ADD` 拡張は `ScalarExp` body を
-2-input → 3-input にするだけ。
+**hesper**: Step 6's `fuseReduceEpilogue` (`Passes.lean:376–451`)
+already fuses `reduceLastAxis → pointwise(mul)`. Adding `+ ADD` only
+requires the body to become a 3-input `ScalarExp`.
 
 ---
 
 ### Pattern E: `ROPE + VIEW + SET_ROWS`
 
-**ggml-cuda.cu:3762–3769**
+**`ggml-cuda.cu:3762–3769`**
 
 ```c
 if (ggml_cuda_can_fuse(cgraph, i,
@@ -191,14 +196,16 @@ if (ggml_cuda_can_fuse(cgraph, i,
 }
 ```
 
-**hesper 対応**: `Gemma4.lean` に hand-coded の fused RoPE-K+KVwrite kernel で
-対応済み。将来的に `Prim.ropeWithKVWrite` として IR 化すれば汎用性向上。
+**hesper**: previously handled by hand-coded fused RoPE-K+KVwrite kernel
+in `Gemma4.lean`. As of commit `b515e13` this is **also expressible via
+`Prim.scatter`** with a `.indexed` gather and dynamic `addrExpr` — see
+[`08-scatter-impl-notes.md`](08-scatter-impl-notes.md).
 
 ---
 
-### Pattern F: 連続 `ADD` (max 8)
+### Pattern F: Chained `ADD` (up to 8)
 
-**ggml-cuda.cu:3771–3802**
+**`ggml-cuda.cu:3771–3802`**
 
 ```c
 for (; n_fuse <= 6; ++n_fuse) {
@@ -213,16 +220,17 @@ if (n_fuse > 1) {
 }
 ```
 
-**hesper 対応**: `fusePointwise` が 2-input zip → N-input zip に拡張可能。
-現在は binary → binary の連鎖でしか対応していない。
+**hesper**: `fusePointwise` can be extended from binary-chain to n-ary.
+Currently the pass collapses pairs of binary adds; it doesn't group them
+into a single n-input `Prim.scatter`.
 
 ---
 
-### Pattern G: `SSM_CONV + SILU` — Gemma4 非対象
+### Pattern G: `SSM_CONV + SILU` — not applicable to Gemma 4.
 
 ### Pattern H: `UNARY(SILU/SIGMOID) + MUL`
 
-**ggml-cuda.cu:4012–4018**
+**`ggml-cuda.cu:4012–4018`**
 
 ```c
 if (ggml_cuda_can_fuse(cgraph, i,
@@ -233,35 +241,39 @@ if (ggml_cuda_can_fuse(cgraph, i,
 }
 ```
 
-**hesper 対応**: `fusePointwise` で `ScalarExp.mul (ScalarExp.silu (input 0)) (input 1)`
-として自動融合可能。
+**hesper**: `fusePointwise` already handles it: the composed body
+`ScalarExp.mul (ScalarExp.silu (input 0)) (input 1)` is a single
+Map scatter after fusion.
 
 ---
 
-### Pattern I: TopK-MOE — Gemma4 非対象
+### Pattern I: TopK-MOE — not applicable to Gemma 4.
 
-## 4. CUDA Graph Capture
+## 4. CUDA Graph capture
 
-**Entry**: `ggml_backend_cuda_graph_compute()` (`ggml-cuda.cu:4105–4162`)
+**Entry**: `ggml_backend_cuda_graph_compute()` at `ggml-cuda.cu:4105–4162`.
 
 ```
-1. graph_key = hash(cgraph) で前回 capture と比較
-2. 初回: 直接実行 (warmup), capture しない
-3. 2回目: properties 安定 → cudaStreamBeginCapture
-4. fusion dispatch loop 実行 → 全 kernel が graph に record
+1. Compute graph_key = hash(cgraph) and look up in cache
+2. First call: execute directly (warmup, no capture)
+3. Second call: properties stable → cudaStreamBeginCapture
+4. Run the fusion dispatch loop — each kernel gets recorded into the graph
 5. cudaStreamEndCapture → cudaGraphInstantiate
-6. 以後: cudaGraphLaunch で 1-call dispatch
+6. Subsequent tokens: cudaGraphLaunch dispatches the whole graph in one call
 ```
 
-**Gating**: CC < 80 (pre-Ampere) は disable (`ggml-cuda.cu:4089`)。
+**Gate**: compute capability < 80 (pre-Ampere) disables Graphs
+(`ggml-cuda.cu:4089`).
 
-**hesper への影響**: Investigation C で gap histogram を測定済み。
-per-token 4.6 ms の end-of-token sync が dominant → **CUDA Graphs の実効利得
-< +1 TPS**。見送り。
+**Impact on hesper**: Investigation C measured the gap histogram and
+found the ~10 ms/tok GPU-idle time sits in a single ~4.6 ms
+`cuCtxSynchronize` per token (end-of-token logits readback — unavoidable
+for autoregressive decode). Realistic CUDA Graphs gain is **< +1 TPS**,
+so we skip it.
 
-## 5. 環境変数
+## 5. Environment variables
 
-| 変数 | 用途 | 場所 |
+| Variable | Purpose | Source |
 |---|---|---|
-| `GGML_CUDA_DISABLE_FUSION` | 全 fusion 無効化 | `ggml-cuda.cu:3687` |
-| `GGML_CUDA_GRAPH_OPT` | graph 最適化有効化 | `ggml-cuda.cu:4201` |
+| `GGML_CUDA_DISABLE_FUSION` | Disable all fusion patterns | `ggml-cuda.cu:3687` |
+| `GGML_CUDA_GRAPH_OPT` | Enable graph-level optimisations | `ggml-cuda.cu:4201` |

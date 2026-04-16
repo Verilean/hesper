@@ -1,16 +1,16 @@
 ---
-title: "03 — mmvf.cu + vecdotq.cuh: f16 Mat-Vec と Q4_K/Q6_K dp4a 内積"
+title: "03 — mmvf.cu + vecdotq.cuh: f16 mat-vec and Q4_K/Q6_K dp4a"
 date: 2026-04-16
 source:
-  - llama.cpp/ggml/src/ggml-cuda/mmvf.cu (862行)
-  - llama.cpp/ggml/src/ggml-cuda/vecdotq.cuh (1,269行)
+  - llama.cpp/ggml/src/ggml-cuda/mmvf.cu (862 lines)
+  - llama.cpp/ggml/src/ggml-cuda/vecdotq.cuh (1,269 lines)
 ---
 
 # mmvf.cu + vecdotq.cuh
 
-## Part A: mmvf.cu — f16/f32 Matrix-Vector Multiply
+## Part A: mmvf.cu — f16/f32 matrix-vector multiply
 
-### テンプレートシグネチャ (mmvf.cu:7–13)
+### Template signature (`mmvf.cu:7–13`)
 
 ```cuda
 template <typename T, typename type_acc, int ncols_dst, int block_size,
@@ -22,10 +22,10 @@ static __global__ void mul_mat_vec_f(
     float * __restrict__ dst, ...)
 ```
 
-- **mmvq.cu と同じ `fusion_args_device` を消費** → 同じ epilogue (bias/gate/GLU)
-- `has_fusion` は `ncols_dst == 1` のみ有効 (mmvf.cu:386, 396)
+- **Same `fusion_args_device` as `mmvq.cu`** ⇒ same epilogue (bias / gate / GLU)
+- `has_fusion` only fires when `ncols_dst == 1` (`mmvf.cu:386, 396`)
 
-### 共有メモリ (mmvf.cu:95–100)
+### Shared memory (`mmvf.cu:95–100`)
 
 ```cuda
 extern __shared__ char data_mmv[];
@@ -36,9 +36,10 @@ if constexpr (has_fusion) {
 }
 ```
 
-warp-reduction buffer のみ。gate 用に追加バッファ。
+Just a warp-reduction buffer, plus a second one for the gate path when
+fusion is on.
 
-### Block size 自動選択 (mmvf.cu:426–497)
+### Block-size autotuning (`mmvf.cu:426–497`)
 
 ```cuda
 int64_t block_size_best = warp_size;  // 32
@@ -48,21 +49,22 @@ for (block_size = 2*warp_size; block_size <= 256; block_size += warp_size) {
 }
 ```
 
-サポート: 32, 64, 96, 128, 160, 192, 224, 256。
-ncols (K 次元) に対してスレッドあたり反復回数を最小化。
+Supported: 32, 64, 96, 128, 160, 192, 224, 256. Picked to minimise the
+per-thread iteration count over the K dimension.
 
-### hesper との関係
+### Relationship to hesper
 
-hesper の F16 kernel (`perLayerInputPre`) は block-coop 型。
-llama.cpp mmvf は per-thread ループで register accumulate → ILP 重視。
+hesper's F16 kernel (`perLayerInputPre`) is block-cooperative.
+llama.cpp's `mmvf` uses per-thread loops with register accumulation —
+ILP-focused.
 
 ---
 
-## Part B: vecdotq.cuh — Q4_K / Q6_K 内積カーネル
+## Part B: vecdotq.cuh — Q4_K / Q6_K inner products
 
-**hesper の per-kernel 速度差の鍵はここにある。**
+**This is where hesper's per-kernel speed gap originates.**
 
-### Q4_K: `vec_dot_q4_K_q8_1_impl_vmmq` (vecdotq.cuh:502–524)
+### Q4_K: `vec_dot_q4_K_q8_1_impl_vmmq` (`vecdotq.cuh:502–524`)
 
 ```cuda
 static __device__ __forceinline__ float vec_dot_q4_K_q8_1_impl_vmmq(
@@ -81,11 +83,11 @@ static __device__ __forceinline__ float vec_dot_q4_K_q8_1_impl_vmmq(
         const int v0i = (v[0] >> (4*i)) & 0x0F0F0F0F;
         const int v1i = (v[1] >> (4*i)) & 0x0F0F0F0F;
 
-        // ★ DP4A chaining: 2回の dp4a を直列に繋げ ILP を稼ぐ
+        // ★ DP4A chaining: two sequential dp4a calls keep the ALU pipeline busy
         const int dot1 = ggml_cuda_dp4a(v1i, u[2*i+1],
                          ggml_cuda_dp4a(v0i, u[2*i+0], 0));
 
-        // ★ 0x01010101 mask: 4要素の合計を 1回の DP4A で計算
+        // ★ 0x01010101 mask: sums all 4 elements with one DP4A
         const int dot2 = ggml_cuda_dp4a(0x01010101, u[2*i+1],
                          ggml_cuda_dp4a(0x01010101, u[2*i+0], 0));
 
@@ -93,14 +95,14 @@ static __device__ __forceinline__ float vec_dot_q4_K_q8_1_impl_vmmq(
         sumf_m += d8[i] * (dot2 * m[i]);
     }
 
-    const float2 dm4f = __half22float2(dm4);  // ★ 遅延 f16→f32 変換
+    const float2 dm4f = __half22float2(dm4);  // ★ deferred f16 → f32
     return dm4f.x*sumf_d - dm4f.y*sumf_m;
 }
 ```
 
-**DP4A 使用: 2×2 = 4回/iteration × 2 iteration = 8 DP4A/block-pair**
+**4 DP4A per iteration × 2 iterations = 8 DP4A per block-pair.**
 
-### Q4_K ラッパー (vecdotq.cuh:816–860)
+### Q4_K wrapper (`vecdotq.cuh:816–860`)
 
 ```cuda
 static __device__ __forceinline__ float vec_dot_q4_K_q8_1(
@@ -114,7 +116,7 @@ static __device__ __forceinline__ float vec_dot_q4_K_q8_1(
     int u[2*QR4_K];   // u[4]
     float d8[QR4_K];
 
-    // スケール展開: 条件分岐 + bitwise
+    // Scale unpacking: branchy bitwise
     const uint16_t * scales = (const uint16_t *)bq4_K->scales;
     uint16_t aux[2];
     const int j = bq8_offset/2;
@@ -128,7 +130,7 @@ static __device__ __forceinline__ float vec_dot_q4_K_q8_1(
                | ((scales[j-0] & 0xc0c0) >> 2);
     }
 
-    // q4 data: int キャスト読み (→ ld.global.nc を期待)
+    // q4 data: int-cast loads (expects ld.global.nc)
     const int * q4 = (const int *)(bq4_K->qs + ...);
     v[0] = q4[0];
     v[1] = q4[4];
@@ -145,7 +147,7 @@ static __device__ __forceinline__ float vec_dot_q4_K_q8_1(
 }
 ```
 
-### Q6_K: `vec_dot_q6_K_q8_1_impl_mmvq` (vecdotq.cuh:621–641)
+### Q6_K: `vec_dot_q6_K_q8_1_impl_mmvq` (`vecdotq.cuh:621–641`)
 
 ```cuda
 static __device__ __forceinline__ float vec_dot_q6_K_q8_1_impl_mmvq(
@@ -162,8 +164,8 @@ static __device__ __forceinline__ float vec_dot_q6_K_q8_1_impl_mmvq(
         const int vil = (vl >> (4*i)) & 0x0F0F0F0F;
         const int vih = ((vh >> (4*i)) << 4) & 0x30303030;
 
-        // ★ __vsubss4: SIMD 4-element signed saturation subtract
-        // 1命令で 4値同時に -32 オフセット
+        // ★ __vsubss4: SIMD 4-element signed-saturation subtract,
+        //   one instruction subtracts -32 from four bytes at once.
         const int vi = __vsubss4((vil | vih), 0x20202020);
 
         sumf += d8[i] * (ggml_cuda_dp4a(vi, u[i], 0) * sc);
@@ -173,21 +175,21 @@ static __device__ __forceinline__ float vec_dot_q6_K_q8_1_impl_mmvq(
 }
 ```
 
-**DP4A 使用: 1回/iteration × 3 iteration = 3 DP4A/block-pair**
+**1 DP4A per iteration × 3 iterations = 3 DP4A per block-pair.**
 
-### Q6_K ラッパー (vecdotq.cuh:908–932)
+### Q6_K wrapper (`vecdotq.cuh:908–932`)
 
 ```cuda
-// 高 2 ビット展開
+// High 2 bits
 const int vh = get_int_b2(bq6_K->qh, ...) >> vh_shift;
 
-// 低 4 ビット
+// Low 4 bits
 const int vl = get_int_b2(bq6_K->ql, iqs);
 ```
 
-## 3. Warp Reduction (共通)
+## 3. Warp reduction (shared)
 
-`mmvf.cu:303–334` / `mmvq.cu` 内:
+`mmvf.cu:303–334` and inside `mmvq.cu`:
 
 ```cuda
 sumf[j] = warp_reduce_sum<warp_size>(sumf[j]);
@@ -202,7 +204,8 @@ if (block_size > warp_size) {
 }
 ```
 
-`warp_reduce_sum` (common.cuh):
+`warp_reduce_sum` (in `common.cuh`):
+
 ```cuda
 template <int warp_size>
 __device__ float warp_reduce_sum(float v) {
@@ -212,50 +215,54 @@ __device__ float warp_reduce_sum(float v) {
 }
 ```
 
-## 4. メモリアクセスパターン
+## 4. Memory access patterns
 
-| 項目 | 実装 | 効果 |
+| Item | Implementation | Effect |
 |---|---|---|
-| Weight reads | `(const int *)bq4_K->qs` — int cast | ld.global.nc (const-cache) |
-| Q8_1 input | `(const int *)bq8i->qs` | 同上 |
-| Scale | レジスタ上の bitwise unpack | ALU のみ、memory miss 回避 |
-| dm (delta-min) | `__half22float2(bq4_K->dm)` | 1 命令 f16→f32 |
+| Weight reads | `(const int *)bq4_K->qs` — int-cast | ld.global.nc (const cache) |
+| Q8_1 input | `(const int *)bq8i->qs` | same |
+| Scale | bitwise unpack on registers | ALU only, no memory misses |
+| dm (delta-min) | `__half22float2(bq4_K->dm)` | one f16→f32 instruction |
 
-**Software pipelining / double-buffering**: **使用なし** (vecdotq.cuh 内)。
-MMQ kernel (`mmq.cuh`) では別途 pipeline 使用あり。
+**Software pipelining / double buffering**: not used in `vecdotq.cuh`.
+The MMQ kernel (`mmq.cuh`) has its own pipelining — out of scope here.
 
-## 5. ncu 計測比較
+## 5. ncu comparison
 
 ### hesper wO (Q4_K 2-row) vs llama.cpp Q4_K
 
-| Metric | hesper | llama.cpp | 差 |
+| Metric | hesper | llama.cpp | Delta |
 |---|---:|---:|---|
 | Duration | 95 µs | 7–36 µs | 3–14× |
-| Regs/thread | 36 | **66** | llama.cpp は ILP 重視 |
-| Occupancy | 61% | 43–54% | hesper のほうが高い → warp-parallel 戦略 |
-| DRAM BW util | 31% | 42–83% | llama.cpp は memory BW を活用 |
-| Waves/SM | 0.89 | — | hesper は tail-wave 問題 |
-| L1 Hit | 94% | 87–89% | hesper は L2 cache 恩恵 |
+| Regs/thread | 36 | **66** | llama.cpp: ILP-focused |
+| Occupancy | 61% | 43–54% | hesper higher (warp-parallel) |
+| DRAM BW util | 31% | 42–83% | llama.cpp leverages BW better |
+| Waves/SM | 0.89 | — | hesper has tail-wave problem |
+| L1 hit | 94% | 87–89% | hesper is L2-resident |
 
-**根本的な差**: llama.cpp は**高レジスタ × 低 occupancy × ILP 最大化**戦略。
-hesper は **低レジスタ × 高 occupancy × warp 並列** 戦略。
-小 matrix (2560×2560 wO) では llama.cpp 戦略が勝つ。
+**Root difference.** llama.cpp pursues **high register count × low
+occupancy × maximised ILP**; hesper pursues **low register count × high
+occupancy × warp parallelism**. For small matrices (the 2560×2560 wO),
+llama.cpp's strategy wins.
 
-## 6. hesper カーネルが「おそらく足りないもの」5 点
+## 6. Five things hesper kernels probably miss
 
-1. **DP4A chaining**: `dp4a(a,b, dp4a(c,d, 0))` — hesper の PTX emitter がこの
-   パターンを生成しているか要確認 (`Hesper/Backend/CUDA/ShaderM.lean` の dp4a lowering)
+1. **DP4A chaining**: `dp4a(a,b, dp4a(c,d, 0))`. Need to confirm
+   hesper's PTX emitter generates this pattern (check
+   `Hesper/Backend/CUDA/ShaderM.lean`'s dp4a lowering).
 
-2. **`0x01010101` SIMD row-sum**: Q4_K の min-bias 項を 1 DP4A で sum。
-   hesper は `for (j in 0..3) minBias += u8[j]` のような展開かもしれない
+2. **`0x01010101` SIMD row-sum**: one DP4A computes the sum-of-four
+   used in Q4_K's `min*bias` term. hesper may be expanding it as
+   `for (j in 0..3) minBias += u8[j]`.
 
-3. **`__vsubss4` (Q6_K -32 offset)**: SIMD 1 命令で 4 値に対して saturating subtract。
-   hesper の ShaderM に VALU の `vsub` が expose されているか要確認
+3. **`__vsubss4` (Q6_K -32 offset)**: one SIMD instruction subtracts -32
+   from four bytes simultaneously. Need to check whether `vsub` is
+   exposed in hesper's ShaderM.
 
-4. **Half2 遅延変換 (`__half22float2`)**: scale を half のまま保持して最後に f32 化。
-   hesper は early conversion で register を浪費している可能性あり
+4. **Deferred `__half22float2`**: keep the scale as half until the very
+   end. hesper may convert eagerly and waste registers.
 
-5. **Const-cache hint (`__ldg`/`ld.global.nc`)**: weight reads を const-cache に
-   載せる。hesper は Step 55 (`BufferHint.readOnly`) で一部対応済みだが、
-   Q4_K 内積の per-block weight reads に適用されているか要確認
-   → [`Hesper/Layers/Linear.lean`](../../../Hesper/Layers/Linear.lean) の dp4a kernel 参照
+5. **Const-cache hint (`__ldg` / `ld.global.nc`)**: weight reads should
+   go through the const cache. hesper has Step 55 (`BufferHint.readOnly`)
+   for this — verify it's applied to per-block weight reads in Q4_K
+   inner products. See [`Hesper/Layers/Linear.lean`](../../../Hesper/Layers/Linear.lean).
