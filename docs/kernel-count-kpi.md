@@ -209,3 +209,38 @@ Change reverted.  Next candidate: eliminate Q8_1 pre-quantize
 (llama.cpp Vulkan's approach) — save the 45 Q8_1 quantize dispatches
 per token AND the Q8_1-round-trip latency, at the cost of rewriting
 the matmul kernels to consume f32 directly (longer but more generic).
+
+## Investigation C (2026-04-16): CUDA Graphs — NOT pursued
+
+Hypothesis: wall 20.4 ms/tok − kernel-exec 16.2 ms/tok = 4.2 ms/tok
+CPU+launch overhead that CUDA Graphs (single cuGraphLaunch per
+token) could amortize to near zero.
+
+Before implementing, ran nsys kernel-gap histogram on the current
+profile (/tmp/step10.sqlite):
+
+Gap distribution across 30 decode tokens (total gap time: 300 ms):
+  <   1 µs : 30,445 gaps, 15.1 ms    (normal launch latency)
+  1-10 µs :     13 gaps,  0.2 ms
+  10-50 µs:     37 gaps,  0.8 ms
+  50-100 µs:     1 gap,  0.1 ms
+  0.1-1 ms:     35 gaps, 14.1 ms
+  **1-10 ms:    31 gaps, 143.0 ms**  ← one ~4.6 ms gap per token
+  10-100 ms:   31 gaps, ???
+  100ms+  :     2 gaps, 126.7 ms     (startup / first-kernel PTX JIT)
+
+Key finding: the 10 ms/tok "GPU idle" is almost entirely **31 gaps of
+~4.6 ms each — one per token**.  That's the `cuMemcpyDtoH +
+cuCtxSynchronize` before argmax sampling, waiting for logits.
+
+Within each token, inter-kernel gaps are sub-µs (15 ms spread over
+30,445 gaps = 0.5 µs mean).  CUDA Graphs would compress the
+sub-µs gaps but cannot eliminate the end-of-token sync — it's
+fundamental to autoregressive decoding (next token depends on
+current token's logits).
+
+**Realistic CUDA Graphs gain: < +1 TPS.**  Not worth the 2-4 hour
+implementation cost vs alternatives.
+
+Next attempts focus on reducing `kernel-exec` time (16.2 ms/tok)
+directly — that's the real floor for hesper at current architecture.
