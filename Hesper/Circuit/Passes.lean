@@ -210,6 +210,9 @@ partial def ScalarExp.usedInputs : ScalarExp → Array Nat
   | .const _      => #[]
   | .laneIdx      => #[]
   | .indexed i a  => #[i] ++ a.usedInputs
+  | .warpSum a        => a.usedInputs
+  | .warpBroadcast a  => a.usedInputs
+  | .warpShuffleXor a _ => a.usedInputs
   | .add a b      => a.usedInputs ++ b.usedInputs
   | .sub a b      => a.usedInputs ++ b.usedInputs
   | .mul a b      => a.usedInputs ++ b.usedInputs
@@ -235,6 +238,9 @@ private partial def renumberInputs (remap : Array Nat) : ScalarExp → ScalarExp
   | .const v      => .const v
   | .laneIdx      => .laneIdx
   | .indexed i a  => .indexed (remap[i]!) (renumberInputs remap a)
+  | .warpSum a        => .warpSum (renumberInputs remap a)
+  | .warpBroadcast a  => .warpBroadcast (renumberInputs remap a)
+  | .warpShuffleXor a m => .warpShuffleXor (renumberInputs remap a) m
   | .add a b      => .add (renumberInputs remap a) (renumberInputs remap b)
   | .sub a b      => .sub (renumberInputs remap a) (renumberInputs remap b)
   | .mul a b      => .mul (renumberInputs remap a) (renumberInputs remap b)
