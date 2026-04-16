@@ -418,6 +418,48 @@ def lowerScatter
     ShaderM.writeBuffer (ty := .scalar .f32) outputName addrU32 value
   ) (pure ())
 
+/-- Multi-output scatter: shared dispatch grid + shared input slots,
+    but writes to N independent destination buffers.  `outputNames[k]`
+    is the binding for destination k; `dstNumels[k]` its element count;
+    `bodies[k] = (valueExpr_k, addrExpr_k)` its compute. -/
+def lowerScatterMulti
+    (inputNames : Array String) (inputBroadcast : Array Bool)
+    (outputNames : Array String) (dstNumels : Array Nat)
+    (numel : Nat) (bodies : Array (ScalarExp × ScalarExp))
+    : ShaderM Unit := do
+  for i in [0:inputNames.size] do
+    let name := inputNames[i]!
+    let bc := inputBroadcast[i]?.getD false
+    let len := if bc then 1 else numel
+    let _ ← ShaderM.declareInputBuffer name (.array (.scalar .f32) len)
+  for i in [0:outputNames.size] do
+    let name := outputNames[i]!
+    let dstN := dstNumels[i]?.getD 0
+    let _ ← ShaderM.declareOutputBuffer name (.array (.scalar .f32) dstN)
+  let gid ← ShaderM.globalId
+  let idx := Exp.vec3X gid
+  ShaderM.if_ (Exp.lt idx (Exp.litU32 numel)) (do
+    let mut slots : Array (Exp (.scalar .f32)) := #[]
+    let mut decls : Array InputDecl := #[]
+    for i in [0:inputNames.size] do
+      let name := inputNames[i]!
+      let bc := inputBroadcast[i]?.getD false
+      let len := if bc then 1 else numel
+      let readIdx := if bc then Exp.litU32 0 else idx
+      let v ← ShaderM.readBuffer (ty := .scalar .f32) (n := len) name readIdx
+      let vName ← ShaderM.var (.scalar .f32) v
+      slots := slots.push (Exp.var vName)
+      decls := decls.push { name := name, len := len }
+    let idxF32 := Exp.toF32 idx
+    for k in [0 : bodies.size] do
+      let (valueExpr, addrExpr) := bodies[k]!
+      let value ← lowerScalarExp slots idxF32 decls valueExpr
+      let addrF32 ← lowerScalarExp slots idxF32 decls addrExpr
+      let addrU32 := Exp.toU32 addrF32
+      let outName := outputNames[k]!
+      ShaderM.writeBuffer (ty := .scalar .f32) outName addrU32 value
+  ) (pure ())
+
 /-- A mapping from TensorRef id to the concrete device buffer.
     Represented as a simple association list; linear lookup is fine
     for MVP circuit sizes (<100 tensors per compile). -/
@@ -442,6 +484,37 @@ def runScatterOp [GPUBackend β]
   let mut namedBufs : List (String × GPUBackend.Buf β) := [(outputName, outputBuf)]
   let n := inputBufs.size
   for i in [0:n] do
+    match inputBufs[i]? with
+    | some buf => namedBufs := (s!"in{i}", buf) :: namedBufs
+    | none     => pure ()
+  let config : ExecConfig := ExecConfig.dispatch1D numel
+  GPUBackend.executeWithConfigCached ctx shader namedBufs config cacheKey cacheRef
+
+/-- Dispatch a `Prim.scatterMulti` op.  Same shape as `runScatterOp`
+    but with N output buffers.  `dstNumels[k]` and `bodies[k] =
+    (valueExpr, addrExpr)` describe destination k. -/
+def runScatterMultiOp [GPUBackend β]
+    (ctx : β) (numel : Nat)
+    (inShapes : Array Shape)
+    (bodies : Array (ScalarExp × ScalarExp))
+    (dstNumels : Array Nat)
+    (inputBufs : Array (GPUBackend.Buf β))
+    (outputBufs : Array (GPUBackend.Buf β))
+    (cacheKey : UInt64) (cacheRef : IO.Ref (Option (GPUBackend.CachedDispatch β)))
+    : IO Unit := do
+  let inputNames : Array String :=
+    Array.ofFn (fun (i : Fin inputBufs.size) => s!"in{i.val}")
+  let outputNames : Array String :=
+    Array.ofFn (fun (i : Fin outputBufs.size) => s!"out{i.val}")
+  let inputBroadcast : Array Bool := inShapes.map (fun s => s == #[1])
+  let shader : ShaderM Unit :=
+    lowerScatterMulti inputNames inputBroadcast outputNames dstNumels numel bodies
+  let mut namedBufs : List (String × GPUBackend.Buf β) := []
+  for i in [0:outputBufs.size] do
+    match outputBufs[i]? with
+    | some buf => namedBufs := (s!"out{i}", buf) :: namedBufs
+    | none     => pure ()
+  for i in [0:inputBufs.size] do
     match inputBufs[i]? with
     | some buf => namedBufs := (s!"in{i}", buf) :: namedBufs
     | none     => pure ()
@@ -506,6 +579,27 @@ def compile [GPUBackend β]
         let cacheRef ← IO.mkRef (α := Option (GPUBackend.CachedDispatch β)) none
         runScatterOp ctx outShape.numel dstShape.numel inShapes valueExpr addrExpr inBufs outBuf 0 cacheRef
       | none => throw (IO.userError s!"Circuit.compile: missing scatter output {outTr.id}")
+    | Prim.scatterMulti outShape inShapes outputs =>
+      -- op.inputs layout: [data inputs..., dst_0, dst_1, ...]
+      let nOuts := op.outputs.size
+      let nIn := op.inputs.size - nOuts
+      let mut inBufs : Array (GPUBackend.Buf β) := #[]
+      for k in [0:nIn] do
+        let tr := op.inputs[k]!
+        match lookup tr.id with
+        | some b => inBufs := inBufs.push b
+        | none => throw (IO.userError s!"Circuit.compile: missing scatterMulti input {tr.id}")
+      let mut outBufs : Array (GPUBackend.Buf β) := #[]
+      for k in [0:nOuts] do
+        let tr := op.outputs[k]!
+        match lookup tr.id with
+        | some b => outBufs := outBufs.push b
+        | none => throw (IO.userError s!"Circuit.compile: missing scatterMulti output {tr.id}")
+      let bodies : Array (ScalarExp × ScalarExp) :=
+        outputs.map (fun (_, v, a) => (v, a))
+      let dstNumels : Array Nat := outputs.map (fun (s, _, _) => s.numel)
+      let cacheRef ← IO.mkRef (α := Option (GPUBackend.CachedDispatch β)) none
+      runScatterMultiOp ctx outShape.numel inShapes bodies dstNumels inBufs outBufs 0 cacheRef
     | Prim.reduceLastAxis rop inShape =>
       let inTr  := op.inputs[0]!
       let outTr := op.outputs[0]!
@@ -644,6 +738,33 @@ def compileOnce [GPUBackend β]
             | some outBuf =>
               runScatterOp _ctx numel dstNumel inShapes valueExpr addrExpr inBufs outBuf cacheKey cacheRef
             | none => throw (IO.userError s!"CompiledCircuit: missing scatter output id={outId}")
+        }
+    | Prim.scatterMulti outShape inShapes outputs =>
+      let numel := outShape.numel
+      let nOuts := op.outputs.size
+      let nIn := op.inputs.size - nOuts
+      let inIds : Array Nat := (op.inputs.extract 0 nIn).map (·.id)
+      let outIds : Array Nat := op.outputs.map (·.id)
+      let bodies : Array (ScalarExp × ScalarExp) :=
+        outputs.map (fun (_, v, a) => (v, a))
+      let dstNumels : Array Nat := outputs.map (fun (s, _, _) => s.numel)
+      let cacheRef : IO.Ref (Option (GPUBackend.CachedDispatch β)) ← IO.mkRef none
+      let cacheKey : UInt64 :=
+        hash ("circuit-scatter-multi", numel, reprStr inShapes.toList,
+              reprStr (outputs.map (fun (s, v, a) => (s.numel, reprStr v, reprStr a))).toList)
+      closures := closures.push
+        { run := fun lookup => do
+            let mut inBufs : Array (GPUBackend.Buf β) := #[]
+            for id in inIds do
+              match lookup id with
+              | some b => inBufs := inBufs.push b
+              | none   => throw (IO.userError s!"CompiledCircuit: missing scatterMulti input id={id}")
+            let mut outBufs : Array (GPUBackend.Buf β) := #[]
+            for id in outIds do
+              match lookup id with
+              | some b => outBufs := outBufs.push b
+              | none   => throw (IO.userError s!"CompiledCircuit: missing scatterMulti output id={id}")
+            runScatterMultiOp _ctx numel inShapes bodies dstNumels inBufs outBufs cacheKey cacheRef
         }
     | Prim.reduceLastAxis rop inShape =>
       let D := inShape.numel

@@ -751,6 +751,33 @@ def compileWithPasses [GPUBackend β]
               runScatterOp ctx numel dstNumel inShapes valueExpr addrExpr inBufs outBuf cacheKey cacheRef
             | none => throw (IO.userError s!"compileWithPasses: missing scatter output id={outId}")
         }
+    | PrimExt.base (Prim.scatterMulti outShape inShapes outputs) =>
+      let numel := outShape.numel
+      let nOuts := op.outputs.size
+      let nIn := op.inputs.size - nOuts
+      let inIds : Array Nat := (op.inputs.extract 0 nIn).map (·.id)
+      let outIds : Array Nat := op.outputs.map (·.id)
+      let bodies : Array (ScalarExp × ScalarExp) :=
+        outputs.map (fun (_, v, a) => (v, a))
+      let dstNumels : Array Nat := outputs.map (fun (s, _, _) => s.numel)
+      let cacheRef : IO.Ref (Option (GPUBackend.CachedDispatch β)) ← IO.mkRef none
+      let cacheKey : UInt64 :=
+        hash ("circuit-scatter-multi", numel, reprStr inShapes.toList,
+              reprStr (outputs.map (fun (s, v, a) => (s.numel, reprStr v, reprStr a))).toList)
+      closures := closures.push
+        { run := fun lookup => do
+            let mut inBufs : Array (GPUBackend.Buf β) := #[]
+            for id in inIds do
+              match lookup id with
+              | some b => inBufs := inBufs.push b
+              | none   => throw (IO.userError s!"compileWithPasses: missing scatterMulti input id={id}")
+            let mut outBufs : Array (GPUBackend.Buf β) := #[]
+            for id in outIds do
+              match lookup id with
+              | some b => outBufs := outBufs.push b
+              | none   => throw (IO.userError s!"compileWithPasses: missing scatterMulti output id={id}")
+            runScatterMultiOp ctx numel inShapes bodies dstNumels inBufs outBufs cacheKey cacheRef
+        }
     | PrimExt.base (Prim.reduceLastAxis rop inShape) =>
       let D := inShape.numel
       let inId  := op.inputs[0]!.id
