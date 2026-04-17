@@ -3345,6 +3345,21 @@ def forwardBatchDP4A [GPUBackend β] (ctx : β)
     GPUBackend.freeBuffer ctx inColBuf
     GPUBackend.freeBuffer ctx outColBuf
 
+/-- Batched Q4_K matmul from pre-quantized Q8_1 input (skip quantize step).
+    Used when the caller has already produced Q8_1 via fusedRMSNormQ8_1Kernel
+    to guarantee numerical parity with the fused decode path.
+    `q8Buf` layout: `[nQ8Blocks * 9 * seqLen]` u32, column-major. -/
+def forwardBatchDP4A_fromQ8 [GPUBackend β] (ctx : β)
+    (layer : LinearLayer (GPUBackend.Buf β) (GPUBackend.CachedDispatch β))
+    (q8Buf outputBuf : GPUBackend.Buf β)
+    (seqLen : Nat) : IO Unit := do
+  if layer.quantFormat != .Q4_K then
+    throw (IO.userError s!"forwardBatchDP4A_fromQ8: only Q4_K, got {repr layer.quantFormat}")
+  GPUBackend.executeWithConfig ctx
+    (q4kMatmulBatchKernel layer.config seqLen)
+    [("weights", layer.weightBuf), ("input_q8", q8Buf), ("output", outputBuf)]
+    { numWorkgroups := (layer.config.outDim, seqLen, 1), workgroupSize := { x := 32, y := 1, z := 1 } }
+
 /-- Execute the linear layer: output = input @ weights^T
 
     Fast path: after the first call, the prepared dispatch is cached in
