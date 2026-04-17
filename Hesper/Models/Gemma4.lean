@@ -2310,7 +2310,7 @@ def forwardPrefillBatch [GPUBackend β] (ctx : β)
       let rowOffBytes := Hesper.WebGPU.BufferOps.uint32ToBytes rowOffset.toUInt32
       GPUBackend.writeBufferOffset ctx state.plRawRowBuf 0 rowOffBytes
       let scaleFactor : Float := Float.sqrt embdPL.toFloat
-      ce s!"q6kDequantScale_pf_{i}"
+      ce "q6kDequantScale_pf"
         (Hesper.Quantization.Q6_K.q6kTableRowDequantScaleKernel totalPL scaleFactor
           cfg.vocabSize)
         [("table", embdTableGPU), ("params", state.plRawRowBuf), ("output", state.plModelProj)]
@@ -2592,9 +2592,8 @@ def forwardPrefillBatch [GPUBackend β] (ctx : β)
           let embdPL := cfg.embdPerLayer
           let nLayers := cfg.numHiddenLayers
           let totalPL := embdPL * nLayers
-          let rowOffset := tokenId * model.perLayerEmbdRowBytes
-          let rowOffBytes := Hesper.WebGPU.BufferOps.uint32ToBytes rowOffset.toUInt32
-          GPUBackend.writeBufferOffset ctx state.plRawRowBuf 0 rowOffBytes
+          let tokenIdBytes := Hesper.WebGPU.BufferOps.uint32ToBytes tokenId.toUInt32
+          GPUBackend.writeBufferOffset ctx state.plRawRowBuf 0 tokenIdBytes
           let scaleFactor : Float := Float.sqrt embdPL.toFloat
           GPUBackend.execute ctx
             (Hesper.Quantization.Q6_K.q6kTableRowDequantScaleKernel totalPL scaleFactor
