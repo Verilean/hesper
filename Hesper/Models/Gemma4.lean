@@ -2312,7 +2312,10 @@ def forwardPrefillBatch [GPUBackend β] (ctx : β)
   let mut currentBuf := batchBuf2
   let mut nextBuf := batchBuf1
 
-  for block in model.blocks do
+  let nBlocksToRun := match ← IO.getEnv "HESPER_PREFILL_LAYERS" with
+    | some s => s.toNat!
+    | none => model.blocks.size
+  for block in model.blocks.extract 0 nBlocksToRun do
     let li := block.layerIdx
     let headDim := cfg.headDim li
     let numHeads := cfg.numAttentionHeads
@@ -3110,15 +3113,9 @@ def generate [GPUBackend β] (ctx : β) (model : Gemma4Model (GPUBackend.Buf β)
   -- Phase 1: Prefill (process prompt tokens)
   IO.println s!"[Prefill] Processing {promptTokens.size} prompt tokens..."
   let prefillStart ← IO.monoNanosNow
-  let useBatchPrefill := promptTokens.size > 1
-    && (match ← IO.getEnv "HESPER_BATCH_PREFILL" with | some "0" => false | some "1" => true | _ => false)
-  if useBatchPrefill then
-    IO.println s!"[Prefill] Batched path (seqLen={promptTokens.size})"
-    forwardPrefillBatch ctx model promptTokens state (kcr := some kcr)
-  else
-    for i in [0:promptTokens.size] do
-      if i >= model.config.maxSeqLen then break
-      forwardSingleToken ctx model promptTokens[i]! i state (kcr := some kcr)
+  for i in [0:promptTokens.size] do
+    if i >= model.config.maxSeqLen then break
+    forwardSingleToken ctx model promptTokens[i]! i state (kcr := some kcr)
   let prefillEnd ← IO.monoNanosNow
   let prefillMs := (prefillEnd - prefillStart).toFloat / 1_000_000.0
   IO.println s!"[Prefill] Done in {prefillMs} ms"
