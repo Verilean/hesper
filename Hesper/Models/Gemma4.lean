@@ -2148,31 +2148,38 @@ private def copyU32Kernel (srcSize : Nat) (srcIdx : Nat) (dstSize : Nat) (dstIdx
   let v ← ShaderM.readBuffer (ty := .scalar .u32) (n := srcSize) "src" (Exp.litU32 srcIdx)
   ShaderM.writeBuffer (ty := .scalar .u32) "dst" (Exp.litU32 dstIdx) v
 
-/-- Copy column `colIdx` from a column-major batch buffer into a contiguous
-    single-row buffer.  `batch[colIdx * dim + i] → out[i]` for i in [0, dim). -/
-private def columnExtractKernel (dim : Nat) (seqLen : Nat) (colIdx : Nat) : ShaderM Unit := do
+/-- Copy column from a column-major batch buffer into a contiguous single-row
+    buffer.  Column index is read at runtime from `params[0]` (u32).
+    `batch[params[0] * dim + i] → out[i]` for i in [0, dim).
+    One kernel JIT'd per (dim, seqLen) pair; colIdx changes via params only. -/
+private def columnExtractKernel (dim : Nat) (seqLen : Nat) : ShaderM Unit := do
   let gid ← ShaderM.globalId
   let i := Exp.vec3X gid
   let totalBatch := dim * seqLen
-  let _batch ← ShaderM.declareInputBuffer "batch" (.array (.scalar .f32) totalBatch)
-  let _out   ← ShaderM.declareOutputBuffer "out" (.array (.scalar .f32) dim)
+  let _batch  ← ShaderM.declareInputBuffer "batch" (.array (.scalar .f32) totalBatch)
+  let _params ← ShaderM.declareInputBuffer "params" (.array (.scalar .u32) 1)
+  let _out    ← ShaderM.declareOutputBuffer "out" (.array (.scalar .f32) dim)
   ShaderM.if_ (Exp.lt i (Exp.litU32 dim)) (do
-    let srcIdx := Exp.add (Exp.litU32 (colIdx * dim)) i
+    let colIdx ← ShaderM.readBuffer (ty := .scalar .u32) (n := 1) "params" (Exp.litU32 0)
+    let srcIdx := Exp.add (Exp.mul colIdx (Exp.litU32 dim)) i
     let v ← ShaderM.readBuffer (ty := .scalar .f32) (n := totalBatch) "batch" srcIdx
     ShaderM.writeBuffer (ty := .scalar .f32) "out" i v
   ) (pure ())
 
-/-- Copy a contiguous single-row buffer into column `colIdx` of a column-major
-    batch buffer.  `src[i] → batch[colIdx * dim + i]` for i in [0, dim). -/
-private def columnInsertKernel (dim : Nat) (seqLen : Nat) (colIdx : Nat) : ShaderM Unit := do
+/-- Copy a contiguous single-row buffer into a column of a column-major batch
+    buffer.  Column index is read at runtime from `params[0]` (u32).
+    `src[i] → batch[params[0] * dim + i]` for i in [0, dim). -/
+private def columnInsertKernel (dim : Nat) (seqLen : Nat) : ShaderM Unit := do
   let gid ← ShaderM.globalId
   let i := Exp.vec3X gid
   let totalBatch := dim * seqLen
-  let _src   ← ShaderM.declareInputBuffer "src" (.array (.scalar .f32) dim)
-  let _batch ← ShaderM.declareOutputBuffer "batch" (.array (.scalar .f32) totalBatch)
+  let _src    ← ShaderM.declareInputBuffer "src" (.array (.scalar .f32) dim)
+  let _params ← ShaderM.declareInputBuffer "params" (.array (.scalar .u32) 1)
+  let _batch  ← ShaderM.declareOutputBuffer "batch" (.array (.scalar .f32) totalBatch)
   ShaderM.if_ (Exp.lt i (Exp.litU32 dim)) (do
+    let colIdx ← ShaderM.readBuffer (ty := .scalar .u32) (n := 1) "params" (Exp.litU32 0)
     let v ← ShaderM.readBuffer (ty := .scalar .f32) (n := dim) "src" i
-    let dstIdx := Exp.add (Exp.litU32 (colIdx * dim)) i
+    let dstIdx := Exp.add (Exp.mul colIdx (Exp.litU32 dim)) i
     ShaderM.writeBuffer (ty := .scalar .f32) "batch" dstIdx v
   ) (pure ())
 
@@ -2267,16 +2274,18 @@ def forwardPrefillBatch [GPUBackend β] (ctx : β)
       { numWorkgroups := (1, 1, 1), workgroupSize := { x := 1, y := 1, z := 1 } }
     match model.embdFormat with
     | .Q6_K =>
-      ce s!"q6kEmbLookup_{i}"
+      ce "q6kEmbLookup"
         (Hesper.Quantization.Q6_K.q6kEmbeddingLookupKernel model.config.vocabSize dim)
         [("token_ids", state.tokenBuf), ("embedding_table", model.embedding.embeddingTable), ("output", state.buf1)]
         (.dispatch1D dim)
     | _ =>
       Embedding.forward ctx model.embedding state.tokenBuf state.buf1 1 1
     -- Copy state.buf1 → batchBuf1 column i
+    let colIdxBytes := Hesper.WebGPU.BufferOps.uint32ToBytes i.toUInt32
+    GPUBackend.writeBufferOffset ctx state.plRawRowBuf 0 colIdxBytes
     GPUBackend.execute ctx
-      (columnInsertKernel dim seqLen i)
-      [("src", state.buf1), ("batch", batchBuf1)]
+      (columnInsertKernel dim seqLen)
+      [("src", state.buf1), ("params", state.plRawRowBuf), ("batch", batchBuf1)]
       (.dispatch1D dim)
 
   -- ── Step 1b: Scale embeddings by sqrt(hiddenSize) — batch-wide ──────
@@ -2316,9 +2325,11 @@ def forwardPrefillBatch [GPUBackend β] (ctx : β)
         [("table", embdTableGPU), ("params", state.plRawRowBuf), ("output", state.plModelProj)]
         (.dispatch1D totalPL)
       -- Extract column i from batchBuf2 (scaled embedding) into state.buf1
+      let colIdxBytes := Hesper.WebGPU.BufferOps.uint32ToBytes i.toUInt32
+      GPUBackend.writeBufferOffset ctx state.plRawRowBuf 0 colIdxBytes
       GPUBackend.execute ctx
-        (columnExtractKernel dim seqLen i)
-        [("batch", batchBuf2), ("out", state.buf1)]
+        (columnExtractKernel dim seqLen)
+        [("batch", batchBuf2), ("params", state.plRawRowBuf), ("out", state.buf1)]
         (.dispatch1D dim)
       -- F16 matmul: buf1 × modelProj → plTokenSelected
       let projConfig : Hesper.WGSL.MatMul.Config := {
@@ -2328,15 +2339,15 @@ def forwardPrefillBatch [GPUBackend β] (ctx : β)
         Hesper.WGSL.MatMul.executeMatMulTransposeF16BlockCoop ctx state.buf1 modelProj state.plTokenSelected projConfig
       else
         Hesper.WGSL.MatMul.executeMatMulTransposeF16 ctx state.buf1 modelProj state.plTokenSelected projConfig
-      ce s!"pleScalePL_pf_{i}"
+      ce "pleScalePL_pf"
         (PerLayerEmbedding.scaleKernel totalPL (1.0 / Float.sqrt dim.toFloat))
         [("input", state.plTokenSelected), ("output", state.plInputAll)]
         (.dispatch1D totalPL)
-      ce s!"chunkedRMSNorm_pf_{i}"
+      ce "chunkedRMSNorm_pf"
         (chunkedRMSNormKernel embdPL nLayers model.config.rmsNormEps)
         [("input", state.plInputAll), ("weight", projNorm.scale), ("output", state.plTokenSelected)]
         { numWorkgroups := (nLayers, 1, 1), workgroupSize := { x := min embdPL 256, y := 1, z := 1 } : Hesper.ExecConfig }
-      ce s!"scaledAdd_pf_{i}"
+      ce "scaledAdd_pf"
         (scaledAddKernel totalPL (1.0 / Float.sqrt 2.0))
         [("a", state.plTokenSelected), ("b", state.plModelProj), ("output", state.plInputAll)]
         (.dispatch1D totalPL)
@@ -2388,24 +2399,26 @@ def forwardPrefillBatch [GPUBackend β] (ctx : β)
       let pos := i
 
       -- Extract Q column i → state.qBuf
+      let colIdxBytes := Hesper.WebGPU.BufferOps.uint32ToBytes i.toUInt32
+      GPUBackend.writeBufferOffset ctx state.plRawRowBuf 0 colIdxBytes
       GPUBackend.execute ctx
-        (columnExtractKernel qDim seqLen i)
-        [("batch", batchQBuf), ("out", state.qBuf)]
+        (columnExtractKernel qDim seqLen)
+        [("batch", batchQBuf), ("params", state.plRawRowBuf), ("out", state.qBuf)]
         (.dispatch1D qDim)
       -- Extract K, V columns (if this layer has its own KV)
       if cfg.hasKV li then
         GPUBackend.execute ctx
-          (columnExtractKernel kvDim seqLen i)
-          [("batch", batchKBuf), ("out", state.kBuf)]
+          (columnExtractKernel kvDim seqLen)
+          [("batch", batchKBuf), ("params", state.plRawRowBuf), ("out", state.kBuf)]
           (.dispatch1D kvDim)
         GPUBackend.execute ctx
-          (columnExtractKernel kvDim seqLen i)
-          [("batch", batchVBuf), ("out", state.vBuf)]
+          (columnExtractKernel kvDim seqLen)
+          [("batch", batchVBuf), ("params", state.plRawRowBuf), ("out", state.vBuf)]
           (.dispatch1D kvDim)
 
       -- Per-head QKV norms (single token)
       if cfg.hasKV li then
-        ce (if isFull then s!"qkvNormFull_pf_{i}" else s!"qkvNormSWA_pf_{i}")
+        ce (if isFull then "qkvNormFull_pf" else "qkvNormSWA_pf")
           (fusedPerHeadQKVNormKernel numHeads numKVHeads headDim cfg.rmsNormEps)
           [("q_in", state.qBuf), ("q_scale", block.attention.qNormWeight), ("q_out", state.qBuf2),
            ("k_in", state.kBuf), ("k_scale", block.attention.kNormWeight), ("k_out", state.kBuf2),
@@ -2413,7 +2426,7 @@ def forwardPrefillBatch [GPUBackend β] (ctx : β)
           { numWorkgroups := (numHeads, 3, 1),
             workgroupSize := { x := wgSize, y := 1, z := 1 } : Hesper.ExecConfig }
       else
-        ce (if isFull then s!"qNormFull_pf_{i}" else s!"qNormSWA_pf_{i}")
+        ce (if isFull then "qNormFull_pf" else "qNormSWA_pf")
           (perHeadRMSNormKernel numHeads headDim cfg.rmsNormEps)
           [("input", state.qBuf), ("weight", block.attention.qNormWeight), ("output", state.qBuf2)]
           { numWorkgroups := (numHeads, 1, 1),
@@ -2427,13 +2440,13 @@ def forwardPrefillBatch [GPUBackend β] (ctx : β)
         { numWorkgroups := (1, 1, 1), workgroupSize := { x := 1, y := 1, z := 1 } }
       match block.ropeFreqFactors with
       | some freqFactors =>
-        ce s!"ropeFreqQ_pf_{headDim}_{i}"
+        ce s!"ropeFreqQ_pf_{headDim}"
           (ropeWithFreqFactorsKernel headDim numHeads cfg.ropeTheta)
           [("input", state.qBuf2), ("output", state.qBuf), ("params", state.paramsBuf), ("freq_factors", freqFactors)]
           (.dispatch1D (numHeads * headDim / 2))
       | none =>
         let ropeConfig : RoPE.Config := { dim := numHeads * headDim, maxSeqLen := cfg.maxSeqLen, base := cfg.ropeTheta }
-        ce s!"ropeDynQ_pf_{headDim}_{i}"
+        ce s!"ropeDynQ_pf_{headDim}"
           (RoPE.ropeKernelDynamic ropeConfig 1 1 numHeads headDim)
           [("input", state.qBuf2), ("output", state.qBuf), ("params", state.paramsBuf)]
           (.dispatch1D (numHeads * headDim / 2))
@@ -2447,7 +2460,7 @@ def forwardPrefillBatch [GPUBackend β] (ctx : β)
           -- RoPE-K + KV cache write
           match block.ropeFreqFactors with
           | some freqFactors =>
-            ce s!"ropeKKvW_pf_{headDim}_{numKVHeads}_{i}"
+            ce s!"ropeKKvW_pf_{headDim}_{numKVHeads}"
               (Attention.fusedRopeKAndCacheWriteKernel numKVHeads cfg.maxSeqLen headDim kvDim cfg.ropeTheta)
               [("new_k", state.kBuf2), ("new_v", state.vBuf2),
                ("k_cache", kvCache.kBuf), ("v_cache", kvCache.vBuf),
@@ -2456,11 +2469,11 @@ def forwardPrefillBatch [GPUBackend β] (ctx : β)
           | none =>
             -- Separate RoPE-K then KV write
             let ropeConfig : RoPE.Config := { dim := kvDim, maxSeqLen := cfg.maxSeqLen, base := cfg.ropeTheta }
-            ce s!"ropeDynK_pf_{headDim}_{numKVHeads}_{i}"
+            ce s!"ropeDynK_pf_{headDim}_{numKVHeads}"
               (RoPE.ropeKernelDynamic ropeConfig 1 1 numKVHeads headDim)
               [("input", state.kBuf2), ("output", state.kBuf), ("params", state.paramsBuf)]
               (.dispatch1D (numKVHeads * headDim / 2))
-            ce s!"kvWrite_pf_{headDim}_{numKVHeads}_{i}"
+            ce s!"kvWrite_pf_{headDim}_{numKVHeads}"
               (Attention.fusedCacheWriteKVKernel numKVHeads cfg.maxSeqLen headDim kvDim)
               [("new_k", state.kBuf), ("new_v", state.vBuf2),
                ("k_cache", kvCache.kBuf), ("v_cache", kvCache.vBuf),
@@ -2480,16 +2493,18 @@ def forwardPrefillBatch [GPUBackend β] (ctx : β)
             numHeads numKVHeads cfg.maxSeqLen headDim cacheLen scale
             (partialBuf := some state.flashPartialBuf)
         else
-          ce s!"flashAttnP_pf_{headDim}_{numKVHeads}_{i}"
+          ce s!"flashAttnP_pf_{headDim}_{numKVHeads}"
             (FlashAttention.flashAttentionDynamicParamsKernel numHeads numKVHeads cfg.maxSeqLen headDim scale)
             [("q", state.qBuf), ("k_cache", kvCache.kBuf), ("v_cache", kvCache.vBuf),
              ("output", state.attnOutBuf), ("params", state.paramsBuf)]
             ({ numWorkgroups := (numHeads, 1, 1) : Hesper.ExecConfig })
 
         -- Insert attnOut into batch buffer for later O-projection
+        let colIdxBytes := Hesper.WebGPU.BufferOps.uint32ToBytes i.toUInt32
+        GPUBackend.writeBufferOffset ctx state.plRawRowBuf 0 colIdxBytes
         GPUBackend.execute ctx
-          (columnInsertKernel qDim seqLen i)
-          [("src", state.attnOutBuf), ("batch", batchAttnOutBuf)]
+          (columnInsertKernel qDim seqLen)
+          [("src", state.attnOutBuf), ("params", state.plRawRowBuf), ("batch", batchAttnOutBuf)]
           (.dispatch1D qDim)
 
     GPUBackend.endBatch ctx  -- flush all per-token attention dispatches
@@ -2502,14 +2517,16 @@ def forwardPrefillBatch [GPUBackend β] (ctx : β)
     -- forwardNormThenAdd is hardcoded to 1 row, so we loop per token.
     for i in [0:seqLen] do
       -- Extract oProj column i → state.normedBuf
+      let colIdxBytes := Hesper.WebGPU.BufferOps.uint32ToBytes i.toUInt32
+      GPUBackend.writeBufferOffset ctx state.plRawRowBuf 0 colIdxBytes
       GPUBackend.execute ctx
-        (columnExtractKernel dim seqLen i)
-        [("batch", batchOProjBuf), ("out", state.normedBuf)]
+        (columnExtractKernel dim seqLen)
+        [("batch", batchOProjBuf), ("params", state.plRawRowBuf), ("out", state.normedBuf)]
         (.dispatch1D dim)
       -- Extract current (input) column i → state.buf1
       GPUBackend.execute ctx
-        (columnExtractKernel dim seqLen i)
-        [("batch", currentBuf), ("out", state.buf1)]
+        (columnExtractKernel dim seqLen)
+        [("batch", currentBuf), ("params", state.plRawRowBuf), ("out", state.buf1)]
         (.dispatch1D dim)
       -- Fused post-attn norm + residual add
       let ref ← IO.mkRef none
@@ -2517,8 +2534,8 @@ def forwardPrefillBatch [GPUBackend β] (ctx : β)
         state.normedBuf state.buf1 state.attnResidualBuf ref
       -- Insert result into batchAttnResidBuf column i
       GPUBackend.execute ctx
-        (columnInsertKernel dim seqLen i)
-        [("src", state.attnResidualBuf), ("batch", batchAttnResidBuf)]
+        (columnInsertKernel dim seqLen)
+        [("src", state.attnResidualBuf), ("params", state.plRawRowBuf), ("batch", batchAttnResidBuf)]
         (.dispatch1D dim)
 
     -- ── 2f: FFN ──────────────────────────────────────────────────────
@@ -2549,20 +2566,22 @@ def forwardPrefillBatch [GPUBackend β] (ctx : β)
     -- ── 2g: Post-FFN norm + residual (per-token) ─────────────────────
     -- `output[i] = RMSNorm(ffnOut[i]) * scale + attnResid[i]`
     for i in [0:seqLen] do
+      let colIdxBytes := Hesper.WebGPU.BufferOps.uint32ToBytes i.toUInt32
+      GPUBackend.writeBufferOffset ctx state.plRawRowBuf 0 colIdxBytes
       GPUBackend.execute ctx
-        (columnExtractKernel dim seqLen i)
-        [("batch", batchFFNOutBuf), ("out", state.ffnOutBuf)]
+        (columnExtractKernel dim seqLen)
+        [("batch", batchFFNOutBuf), ("params", state.plRawRowBuf), ("out", state.ffnOutBuf)]
         (.dispatch1D dim)
       GPUBackend.execute ctx
-        (columnExtractKernel dim seqLen i)
-        [("batch", batchAttnResidBuf), ("out", state.attnResidualBuf)]
+        (columnExtractKernel dim seqLen)
+        [("batch", batchAttnResidBuf), ("params", state.plRawRowBuf), ("out", state.attnResidualBuf)]
         (.dispatch1D dim)
       let ref ← IO.mkRef none
       RMSNorm.forwardNormThenAdd ctx block.postFFNNorm
         state.ffnOutBuf state.attnResidualBuf state.buf2 ref
       GPUBackend.execute ctx
-        (columnInsertKernel dim seqLen i)
-        [("src", state.buf2), ("batch", nextBuf)]
+        (columnInsertKernel dim seqLen)
+        [("src", state.buf2), ("params", state.plRawRowBuf), ("batch", nextBuf)]
         (.dispatch1D dim)
 
     -- ── 2h: Per-layer embedding + layer output scale (per-token) ──────
@@ -2579,9 +2598,11 @@ def forwardPrefillBatch [GPUBackend β] (ctx : β)
       -- Per-layer embedding for each token position
       for i in [0:seqLen] do
         -- Extract this token's output column → state.buf2
+        let colIdxBytes := Hesper.WebGPU.BufferOps.uint32ToBytes i.toUInt32
+        GPUBackend.writeBufferOffset ctx state.plRawRowBuf 0 colIdxBytes
         GPUBackend.execute ctx
-          (columnExtractKernel dim seqLen i)
-          [("batch", nextBuf), ("out", state.buf2)]
+          (columnExtractKernel dim seqLen)
+          [("batch", nextBuf), ("params", state.plRawRowBuf), ("out", state.buf2)]
           (.dispatch1D dim)
         -- Compute per-layer input for token i (if not already in state.plInputAll
         -- from Step 1b).  Step 1b precomputed for ALL tokens but stored the last.
@@ -2634,9 +2655,11 @@ def forwardPrefillBatch [GPUBackend β] (ctx : β)
           { numWorkgroups := (1, 1, 1), workgroupSize := { x := 256, y := 1, z := 1 }
             extensions := ["subgroups"] : Hesper.ExecConfig }
         -- Insert modified output back into batch buffer
+        let colIdxBytes := Hesper.WebGPU.BufferOps.uint32ToBytes i.toUInt32
+        GPUBackend.writeBufferOffset ctx state.plRawRowBuf 0 colIdxBytes
         GPUBackend.execute ctx
-          (columnInsertKernel dim seqLen i)
-          [("src", state.buf2), ("batch", nextBuf)]
+          (columnInsertKernel dim seqLen)
+          [("src", state.buf2), ("params", state.plRawRowBuf), ("batch", nextBuf)]
           (.dispatch1D dim)
     | none => pure ()
 
@@ -2644,9 +2667,11 @@ def forwardPrefillBatch [GPUBackend β] (ctx : β)
     match block.outScale with
     | some scale =>
       for i in [0:seqLen] do
+        let colIdxBytes := Hesper.WebGPU.BufferOps.uint32ToBytes i.toUInt32
+        GPUBackend.writeBufferOffset ctx state.plRawRowBuf 0 colIdxBytes
         GPUBackend.execute ctx
-          (columnExtractKernel dim seqLen i)
-          [("batch", nextBuf), ("out", state.buf2)]
+          (columnExtractKernel dim seqLen)
+          [("batch", nextBuf), ("params", state.plRawRowBuf), ("out", state.buf2)]
           (.dispatch1D dim)
         -- output[j] = buf2[j] * scale[0] via Circuit DSL runCachedFused
         let key := hash ("batchPrefillOutScale", dim, li, i)
@@ -2665,8 +2690,8 @@ def forwardPrefillBatch [GPUBackend β] (ctx : β)
             pure ())
           [(0, state.buf2), (1, scale), (5, state.buf2)]
         GPUBackend.execute ctx
-          (columnInsertKernel dim seqLen i)
-          [("src", state.buf2), ("batch", nextBuf)]
+          (columnInsertKernel dim seqLen)
+          [("src", state.buf2), ("params", state.plRawRowBuf), ("batch", nextBuf)]
           (.dispatch1D dim)
     | none => pure ()
 
@@ -2682,9 +2707,11 @@ def forwardPrefillBatch [GPUBackend β] (ctx : β)
   -- ── Step 3: Extract last token → final norm → lm head ─────────────
   -- Copy last column of currentBuf → state.buf2 (single-token)
   let lastCol := seqLen - 1
+  let colIdxBytes := Hesper.WebGPU.BufferOps.uint32ToBytes lastCol.toUInt32
+  GPUBackend.writeBufferOffset ctx state.plRawRowBuf 0 colIdxBytes
   GPUBackend.execute ctx
-    (columnExtractKernel dim seqLen lastCol)
-    [("batch", currentBuf), ("out", state.buf2)]
+    (columnExtractKernel dim seqLen)
+    [("batch", currentBuf), ("params", state.plRawRowBuf), ("out", state.buf2)]
     (.dispatch1D dim)
 
   -- Final RMSNorm (single token)
@@ -3054,7 +3081,7 @@ def forwardSingleToken [GPUBackend β] (ctx : β)
               model.config.hiddenSize model.config.vocabSize 256 gridX
         let wgSize := if useSubgroups then 32 else 256
         let lmBufs : List (String × GPUBackend.Buf β) :=
-          [("weights", model.outputWeight), ("input", nextBuf), ("output", state.logitsBuf)]
+          [("weights", model.outputWeight), ("input", state.buf1), ("output", state.logitsBuf)]
         ce "lmHead"
           shader
           lmBufs
