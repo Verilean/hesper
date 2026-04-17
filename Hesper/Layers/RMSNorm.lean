@@ -435,26 +435,31 @@ This stays within Hesper's hand-written-kernel inventory but is wired
 through the IR as `Prim.rmsNormQ8_1Quantize`, so callers see it as a
 proper compiler op.  The Stage 3 follow-up will replace the body
 with auto-generated reduce + double-reduce-epilogue lowering. -/
-def fusedRMSNormQ8_1Kernel (config : Config) (workgroupSize : Nat := 256) : ShaderM Unit := do
+def fusedRMSNormQ8_1Kernel (config : Config) (numRows : Nat := 1) (workgroupSize : Nat := 256) : ShaderM Unit := do
+  let wid ← ShaderM.workgroupId
   let lid ← ShaderM.localId
+  let rowIdx := Exp.vec3X wid
   let localIdx := Exp.vec3X lid
   let D := config.dim
   let nBlocks := D / 32
-  let outU32Size := nBlocks * 9
+  let totalInputSize := D * numRows
+  let outU32Size := nBlocks * 9 * numRows
 
   ShaderM.sharedNamed "scratch_norm" (.array (.scalar .f32) workgroupSize)
-  -- One byte slot per lane; reused across the 10 strided quantize passes.
   ShaderM.sharedNamed "shared_q" (.array (.scalar .u32) workgroupSize)
 
-  let _input  ← ShaderM.declareReadOnlyBuffer "input"  (.array (.scalar .f32) D)
+  let _input  ← ShaderM.declareReadOnlyBuffer "input"  (.array (.scalar .f32) totalInputSize)
   let _scale  ← ShaderM.declareReadOnlyBuffer "scale"  (.array (.scalar .f32) D)
   let _output ← ShaderM.declareOutputBuffer "output" (.array (.scalar .u32) outU32Size)
+
+  let inputRowBase := Exp.mul rowIdx (Exp.litU32 D)
+  let outputRowBase := Exp.mul rowIdx (Exp.litU32 (nBlocks * 9))
 
   -- ── Phase 1: cooperative RMSNorm reduction over the input ──
   ShaderM.varNamed "accum" (.scalar .f32) (Exp.litF32 0.0)
   let accumE : Exp (.scalar .f32) := Exp.var "accum"
   ShaderM.loop localIdx (Exp.litU32 D) (Exp.litU32 workgroupSize) fun loopIdx => do
-    let v ← ShaderM.readBuffer (ty := .scalar .f32) (n := D) "input" loopIdx
+    let v ← ShaderM.readBuffer (ty := .scalar .f32) (n := totalInputSize) "input" (Exp.add inputRowBase loopIdx)
     ShaderM.assign "accum" (Exp.add accumE (Exp.mul v v))
   ShaderM.writeWorkgroup (ty := .scalar .f32) "scratch_norm" localIdx accumE
   ShaderM.barrier
@@ -485,7 +490,7 @@ def fusedRMSNormQ8_1Kernel (config : Config) (workgroupSize : Nat := 256) : Shad
   while p < numPasses do
     let elemIdx := Exp.add (Exp.litU32 (p * workgroupSize)) localIdx
     let blockIdx := Exp.add (Exp.litU32 (p * (workgroupSize / 32))) warpId
-    let x  ← ShaderM.readBuffer (ty := .scalar .f32) (n := D) "input" elemIdx
+    let x  ← ShaderM.readBuffer (ty := .scalar .f32) (n := totalInputSize) "input" (Exp.add inputRowBase elemIdx)
     let s  ← ShaderM.readBuffer (ty := .scalar .f32) (n := D) "scale" elemIdx
     let xN := Exp.mul (Exp.mul x invRms) s
     -- Materialise the normalised value before reductions branch on it.
@@ -509,7 +514,7 @@ def fusedRMSNormQ8_1Kernel (config : Config) (workgroupSize : Nat := 256) : Shad
     -- Write the d|s header (s=0; downstream Q4_K dp4a kernel ignores s
     -- — see fusedQ4KMLinearDP4AKernel which reconstructs sums per
     -- block from the int8 quants).  Lane 0 of each warp owns its block.
-    let hdrOff := Exp.mul blockIdx (Exp.litU32 9)
+    let hdrOff := Exp.add outputRowBase (Exp.mul blockIdx (Exp.litU32 9))
     ShaderM.if_ (Exp.eq laneInW (Exp.litU32 0)) (do
       let dBits : Exp (.scalar .u32) := Exp.bitcast d
       ShaderM.writeBuffer (ty := .scalar .u32) "output" hdrOff dBits

@@ -2323,20 +2323,24 @@ def forwardPrefillBatch [GPUBackend β] (ctx : β)
     let kvDim := numKVHeads * headDim
     let qDim := numHeads * headDim
 
-    -- ── 2a: Attention norm (batch RMSNorm) ────────────────────────────
-    -- We call executeWithConfig directly instead of RMSNorm.forward to
-    -- avoid polluting layer.prepared (which is keyed to numRows=1 for
-    -- subsequent single-token decode).
+    -- ── 2a: Fused RMSNorm + Q8_1 quantize (batch) ──────────────────────
+    -- Same fused kernel as forwardBlock's decode path, extended to numRows=seqLen.
+    -- This guarantees numerical parity: the RMSNorm output is directly quantized
+    -- to Q8_1 without an f32 intermediate buffer round-trip.
+    let nQ8Blocks := dim / 32
+    let batchQ8Bytes : USize := (nQ8Blocks * 9 * seqLen * 4).toUSize
+    let batchQ8Buf ← GPUBackend.allocBuffer ctx batchQ8Bytes
     GPUBackend.executeWithConfig ctx
-      (RMSNorm.rmsNormFusedKernel block.attnNorm.config seqLen 256)
-      [("input", currentBuf), ("scale", block.attnNorm.scale), ("output", batchNormedBuf)]
+      (RMSNorm.fusedRMSNormQ8_1Kernel block.attnNorm.config seqLen 256)
+      [("input", currentBuf), ("scale", block.attnNorm.scale), ("output", batchQ8Buf)]
       { workgroupSize := { x := 256 }, numWorkgroups := (seqLen, 1, 1) }
 
-    -- ── 2b: Q/K/V projections (batch matmul) ─────────────────────────
-    Linear.forwardBatchDP4A ctx block.attention.wQ batchNormedBuf batchQBuf seqLen
+    -- ── 2b: Q/K/V projections (batch matmul from Q8_1) ───────────────
+    -- Skip the separate Q8_1 quantize step — use fused output directly.
+    Linear.forwardBatchDP4A_fromQ8 ctx block.attention.wQ batchQ8Buf batchQBuf seqLen
     if cfg.hasKV li then
-      Linear.forwardBatchDP4A ctx block.attention.wK batchNormedBuf batchKBuf seqLen
-      Linear.forwardBatchDP4A ctx block.attention.wV batchNormedBuf batchVBuf seqLen
+      Linear.forwardBatchDP4A_fromQ8 ctx block.attention.wK batchQ8Buf batchKBuf seqLen
+      Linear.forwardBatchDP4A_fromQ8 ctx block.attention.wV batchQ8Buf batchVBuf seqLen
 
     -- ── 2c: Per-token attention loop ──────────────────────────────────
     -- For each token: extract Q/K/V columns → per-head norms → RoPE →
@@ -2477,15 +2481,17 @@ def forwardPrefillBatch [GPUBackend β] (ctx : β)
     -- ── 2f: FFN ──────────────────────────────────────────────────────
     -- Skip MoE — use dense FFN path only.
 
-    -- FFN norm (batch RMSNorm) — direct dispatch to avoid polluting layer.prepared
+    -- FFN norm: fused RMSNorm + Q8_1 (batch, same kernel as decode path)
+    let ffnQ8Bytes : USize := (nQ8Blocks * 9 * seqLen * 4).toUSize
+    let ffnBatchQ8Buf ← GPUBackend.allocBuffer ctx ffnQ8Bytes
     GPUBackend.executeWithConfig ctx
-      (RMSNorm.rmsNormFusedKernel block.ffnNorm.config seqLen 256)
-      [("input", batchAttnResidBuf), ("scale", block.ffnNorm.scale), ("output", batchNormedBuf)]
+      (RMSNorm.fusedRMSNormQ8_1Kernel block.ffnNorm.config seqLen 256)
+      [("input", batchAttnResidBuf), ("scale", block.ffnNorm.scale), ("output", ffnBatchQ8Buf)]
       { workgroupSize := { x := 256 }, numWorkgroups := (seqLen, 1, 1) }
 
-    -- Gate + Up projections (batch matmul)
-    Linear.forwardBatchDP4A ctx block.ffn.gate batchNormedBuf batchGateBuf seqLen
-    Linear.forwardBatchDP4A ctx block.ffn.up batchNormedBuf batchUpBuf seqLen
+    -- Gate + Up projections (batch matmul from Q8_1)
+    Linear.forwardBatchDP4A_fromQ8 ctx block.ffn.gate ffnBatchQ8Buf batchGateBuf seqLen
+    Linear.forwardBatchDP4A_fromQ8 ctx block.ffn.up ffnBatchQ8Buf batchUpBuf seqLen
 
     -- GELU * up (batch pointwise — dispatch with totalElements = interSize * seqLen)
     let totalInter := interSize * seqLen
@@ -2620,6 +2626,10 @@ def forwardPrefillBatch [GPUBackend β] (ctx : β)
           [("src", state.buf2), ("batch", nextBuf)]
           (.dispatch1D dim)
     | none => pure ()
+
+    -- Free per-layer batch Q8_1 buffers
+    GPUBackend.freeBuffer ctx batchQ8Buf
+    GPUBackend.freeBuffer ctx ffnBatchQ8Buf
 
     -- Swap ping-pong buffers
     let oldCur := currentBuf
