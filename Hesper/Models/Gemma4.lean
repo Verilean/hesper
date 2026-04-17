@@ -2445,12 +2445,14 @@ def forwardPrefillBatch [GPUBackend β] (ctx : β)
         Linear.forwardBatchDP4A_fromQ8 ctx block.attention.wV batchQ8Buf batchVBuf seqLen
       GPUBackend.freeBuffer ctx batchQ8Buf
     else
-      -- Q6_K fallback: RMSNorm into batchBuf1 as scratch, then batch matmul in f32.
-      RMSNorm.forward ctx block.attnNorm currentBuf batchBuf1 seqLen
-      Linear.forwardBatchDP4A ctx block.attention.wQ batchBuf1 batchQBuf seqLen
+      -- Q6_K fallback: RMSNorm into batchNormedBuf as scratch (CANNOT use
+      -- batchBuf1 since it may alias currentBuf during ping-pong).  Then
+      -- batch matmul in f32.
+      RMSNorm.forward ctx block.attnNorm currentBuf batchNormedBuf seqLen
+      Linear.forwardBatchDP4A ctx block.attention.wQ batchNormedBuf batchQBuf seqLen
       if cfg.hasKV li then
-        Linear.forwardBatchDP4A ctx block.attention.wK batchBuf1 batchKBuf seqLen
-        Linear.forwardBatchDP4A ctx block.attention.wV batchBuf1 batchVBuf seqLen
+        Linear.forwardBatchDP4A ctx block.attention.wK batchNormedBuf batchKBuf seqLen
+        Linear.forwardBatchDP4A ctx block.attention.wV batchNormedBuf batchVBuf seqLen
 
     -- ── 2c: Per-token attention loop ──────────────────────────────────
     let wgSize := min headDim 256
@@ -2598,6 +2600,15 @@ def forwardPrefillBatch [GPUBackend β] (ctx : β)
         [("src", state.attnResidualBuf), ("params", colIdxBuf), ("batch", batchAttnResidBuf)]
         (.dispatch1D dim)
 
+    -- Diagnostic: dump currentBuf col 0 at L1 after attention inner loop / after O proj
+    if li = 1 then
+      GPUBackend.writeBufferOffset ctx colIdxBuf 0 (Hesper.WebGPU.BufferOps.uint32ToBytes 0)
+      GPUBackend.execute ctx
+        (columnExtractKernel dim seqLen)
+        [("batch", currentBuf), ("params", colIdxBuf), ("out", state.buf1)]
+        (.dispatch1D dim)
+      dumpBuf ctx state.buf1 (dim * 4).toUSize s!"batch_t0_currBufL1afterAttnOProj"
+
     -- Dump post-attn residual for each token (batch diagnostic) — only L0/L1 for brevity
     if li ≤ 2 then for i in [0:seqLen] do
       let idxBytes := Hesper.WebGPU.BufferOps.uint32ToBytes i.toUInt32
@@ -2627,9 +2638,10 @@ def forwardPrefillBatch [GPUBackend β] (ctx : β)
       Linear.forwardBatchDP4A_fromQ8 ctx block.ffn.up ffnBatchQ8Buf batchUpBuf seqLen
       GPUBackend.freeBuffer ctx ffnBatchQ8Buf
     else
-      RMSNorm.forward ctx block.ffnNorm batchAttnResidBuf batchBuf1 seqLen
-      Linear.forwardBatchDP4A ctx block.ffn.gate batchBuf1 batchGateBuf seqLen
-      Linear.forwardBatchDP4A ctx block.ffn.up batchBuf1 batchUpBuf seqLen
+      -- FFN Q6_K fallback: normedBuf can't be batchBuf1 (ping-pong alias).
+      RMSNorm.forward ctx block.ffnNorm batchAttnResidBuf batchNormedBuf seqLen
+      Linear.forwardBatchDP4A ctx block.ffn.gate batchNormedBuf batchGateBuf seqLen
+      Linear.forwardBatchDP4A ctx block.ffn.up batchNormedBuf batchUpBuf seqLen
 
     -- GELU * up (batch pointwise — dispatch with totalElements = interSize * seqLen)
     let totalInter := interSize * seqLen
