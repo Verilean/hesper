@@ -762,7 +762,6 @@ def q6kSingleRowDequantScaleKernel (dim : Nat) (scale : Float) : ShaderM Unit :=
   let idx := Exp.vec3X gid
 
   let blocksPerRow := dim / 256
-  -- One row only; totalU32 covers just `blocksPerRow` blocks.
   let totalU32 := (blocksPerRow * blockSizeBytes + 3) / 4
 
   let _row ← ShaderM.declareReadOnlyBuffer "row" (.array (.scalar .u32) totalU32)
@@ -770,6 +769,35 @@ def q6kSingleRowDequantScaleKernel (dim : Nat) (scale : Float) : ShaderM Unit :=
 
   ShaderM.if_ (Exp.lt idx (Exp.litU32 dim)) (do
     let val ← dequantQ6KElement dim "row" totalU32 (Exp.litU32 0) idx
+    ShaderM.writeBuffer (ty := .scalar .f32) "output" idx (Exp.mul val (Exp.litF32 scale))
+  ) (pure ())
+
+/-- Dequant + scale a row from a full Q6_K table on GPU.  The row offset is
+    read at runtime from `params[0]` (u32, byte offset into the table buffer).
+    This avoids per-token CPU→GPU transfer and per-token JIT recompilation.
+    The kernel is compiled once (dim, scale are compile-time); only the params
+    buffer changes between tokens.  Buffer `"table"` is the full vocab-sized
+    Q6_K table; declared size is minimal (the CUDA backend ignores it for
+    global loads).  `rowU32Capacity` should be a small overestimate (e.g.
+    2 × rowU32Size) to keep PTX compact. -/
+def q6kTableRowDequantScaleKernel (dim : Nat) (scale : Float)
+    (rowU32Capacity : Nat) : ShaderM Unit := do
+  let gid ← ShaderM.globalId
+  let idx := Exp.vec3X gid
+
+  let blocksPerRow := dim / 256
+  let rowU32Size := (blocksPerRow * blockSizeBytes + 3) / 4
+
+  let _table ← ShaderM.declareReadOnlyBuffer "table" (.array (.scalar .u32) rowU32Capacity)
+  let _params ← ShaderM.declareReadOnlyBuffer "params" (.array (.scalar .u32) 1)
+  let _output ← ShaderM.declareOutputBuffer "output" (.array (.scalar .f32) dim)
+
+  -- Read runtime row offset from params[0]
+  let rowByteOffset ← ShaderM.readBuffer (ty := .scalar .u32) (n := 1) "params" (Exp.litU32 0)
+  let rowU32Offset := Exp.div rowByteOffset (Exp.litU32 4)
+
+  ShaderM.if_ (Exp.lt idx (Exp.litU32 dim)) (do
+    let val ← dequantQ6KElement dim "table" rowU32Capacity rowU32Offset idx
     ShaderM.writeBuffer (ty := .scalar .f32) "output" idx (Exp.mul val (Exp.litF32 scale))
   ) (pure ())
 
