@@ -966,7 +966,7 @@ structure Gemma4Model (BufT CacheT : Type) where
   blocks : Array (Gemma4Block BufT CacheT)
   finalNorm : RMSNorm.RMSNorm BufT CacheT
   outputWeight : BufT
-  perLayerEmbdTableCPU : Option ByteArray
+  perLayerEmbdTableGPU : Option BufT
   perLayerEmbdRowBytes : Nat
   perLayerModelProj : Option BufT
   perLayerProjNorm : Option (RMSNorm.RMSNorm BufT CacheT)
@@ -1224,17 +1224,19 @@ def Gemma4Model.fromGGUFData [GPUBackend β] (ctx : β) (ggufData : ByteArray)
       pure embedding.embeddingTable
 
   -- Step 7: Load per-layer embeddings (optional)
-  -- per_layer_token_embd kept on CPU (table > WebGPU 256 MB binding limit; we
-  -- dequant just the input token's row at inference time)
-  let (perLayerEmbdTableCPU, perLayerEmbdRowBytes, perLayerModelProj, perLayerProjNorm) ←
+  -- per_layer_token_embd: full table uploaded to GPU (like llama.cpp).
+  -- No per-token CPU→GPU transfer needed.
+  let (perLayerEmbdTableGPU, perLayerEmbdRowBytes, perLayerModelProj, perLayerProjNorm) ←
     if cfg.hasPerLayerEmbeddings then do
       IO.println "[Gemma4] Loading per-layer embeddings..."
       let blocksPerRow := (cfg.embdPerLayer * cfg.numHiddenLayers) / 256
       let rowBytes := blocksPerRow * 210  -- Q6_K block size
       let tableData ← match Hesper.GGUF.Loader.getTensorData gguf "per_layer_token_embd.weight" with
         | .ok (_, data) =>
-          IO.println s!"  per_layer_token_embd: {data.size} bytes (kept on CPU, row size {rowBytes} bytes)"
-          pure (some data)
+          IO.println s!"  per_layer_token_embd: {data.size} bytes → GPU ({data.size / 1024 / 1024} MB)"
+          let buf ← GPUBackend.allocBuffer ctx data.size.toUSize
+          GPUBackend.writeBuffer ctx buf data
+          pure (some buf)
         | .error _ => pure none
       let proj ← match Hesper.GGUF.Loader.getTensorData gguf "per_layer_model_proj.weight" with
         | .ok (_, data) => pure (some (← uploadBuffer ctx data))
@@ -1286,7 +1288,7 @@ def Gemma4Model.fromGGUFData [GPUBackend β] (ctx : β) (ggufData : ByteArray)
     blocks
     finalNorm
     outputWeight
-    perLayerEmbdTableCPU
+    perLayerEmbdTableGPU
     perLayerEmbdRowBytes
     perLayerModelProj
     perLayerProjNorm
@@ -2295,8 +2297,8 @@ def forwardPrefillBatch [GPUBackend β] (ctx : β)
   -- token's result in state.plInputAll (since that's what the per-token
   -- attention loops need — each block reads from state.plInputAll at the
   -- token's turn).  TODO: properly batch per-layer input.
-  match model.perLayerEmbdTableCPU, model.perLayerModelProj, model.perLayerProjNorm with
-  | some embdTableCPU, some modelProj, some projNorm =>
+  match model.perLayerEmbdTableGPU, model.perLayerModelProj, model.perLayerProjNorm with
+  | some embdTableGPU, some modelProj, some projNorm =>
     let embdPL := model.config.embdPerLayer
     let nLayers := model.config.numHiddenLayers
     let totalPL := embdPL * nLayers
@@ -2304,12 +2306,14 @@ def forwardPrefillBatch [GPUBackend β] (ctx : β)
     for i in [0:seqLen] do
       let tokenId := promptTokens[i]!
       let rowOffset := tokenId * model.perLayerEmbdRowBytes
-      let rowBytes := embdTableCPU.extract rowOffset (rowOffset + model.perLayerEmbdRowBytes)
-      GPUBackend.writeBufferOffset ctx state.plRawRowBuf 0 rowBytes
+      -- Write row byte offset to plRawRowBuf (reused as params buf for GPU table lookup)
+      let rowOffBytes := Hesper.WebGPU.BufferOps.uint32ToBytes rowOffset.toUInt32
+      GPUBackend.writeBufferOffset ctx state.plRawRowBuf 0 rowOffBytes
       let scaleFactor : Float := Float.sqrt embdPL.toFloat
       ce s!"q6kDequantScale_pf_{i}"
-        (Hesper.Quantization.Q6_K.q6kSingleRowDequantScaleKernel totalPL scaleFactor)
-        [("row", state.plRawRowBuf), ("output", state.plModelProj)]
+        (Hesper.Quantization.Q6_K.q6kTableRowDequantScaleKernel totalPL scaleFactor
+          ((totalPL / 256 * 210 + 3) / 4 * 2))
+        [("table", embdTableGPU), ("params", state.plRawRowBuf), ("output", state.plModelProj)]
         (.dispatch1D totalPL)
       -- Extract column i from batchBuf2 (scaled embedding) into state.buf1
       GPUBackend.execute ctx
@@ -2583,18 +2587,19 @@ def forwardPrefillBatch [GPUBackend β] (ctx : β)
         -- from Step 1b).  Step 1b precomputed for ALL tokens but stored the last.
         -- For simplicity, we recompute for each token here (correct but slower).
         let tokenId := promptTokens[i]!
-        match model.perLayerEmbdTableCPU, model.perLayerModelProj, model.perLayerProjNorm with
-        | some embdTableCPU, some modelProj, some projNorm =>
+        match model.perLayerEmbdTableGPU, model.perLayerModelProj, model.perLayerProjNorm with
+        | some embdTableGPU, some modelProj, some projNorm =>
           let embdPL := cfg.embdPerLayer
           let nLayers := cfg.numHiddenLayers
           let totalPL := embdPL * nLayers
           let rowOffset := tokenId * model.perLayerEmbdRowBytes
-          let rowBytes := embdTableCPU.extract rowOffset (rowOffset + model.perLayerEmbdRowBytes)
-          GPUBackend.writeBufferOffset ctx state.plRawRowBuf 0 rowBytes
+          let rowOffBytes := Hesper.WebGPU.BufferOps.uint32ToBytes rowOffset.toUInt32
+          GPUBackend.writeBufferOffset ctx state.plRawRowBuf 0 rowOffBytes
           let scaleFactor : Float := Float.sqrt embdPL.toFloat
           GPUBackend.execute ctx
-            (Hesper.Quantization.Q6_K.q6kSingleRowDequantScaleKernel totalPL scaleFactor)
-            [("row", state.plRawRowBuf), ("output", state.plModelProj)]
+            (Hesper.Quantization.Q6_K.q6kTableRowDequantScaleKernel totalPL scaleFactor
+              ((totalPL / 256 * 210 + 3) / 4 * 2))
+            [("table", embdTableGPU), ("params", state.plRawRowBuf), ("output", state.plModelProj)]
             (.dispatch1D totalPL)
           let projConfig : Hesper.WGSL.MatMul.Config := { M := 1, N := totalPL, K := dim }
           if projConfig.K % 64 == 0 then
@@ -2812,28 +2817,23 @@ def forwardSingleToken [GPUBackend β] (ctx : β)
   -- with the current Dawn limits, so we dequant just the input token's row on
   -- CPU and upload (~43 KB).
   Hesper.WGSL.Execute.withSection "perLayerInputPre" do
-    match model.perLayerEmbdTableCPU, model.perLayerModelProj, model.perLayerProjNorm with
-    | some embdTableCPU, some modelProj, some projNorm =>
+    match model.perLayerEmbdTableGPU, model.perLayerModelProj, model.perLayerProjNorm with
+    | some embdTableGPU, some modelProj, some projNorm =>
       let embdPL := model.config.embdPerLayer
       let nLayers := model.config.numHiddenLayers
       let totalPL := embdPL * nLayers
 
-      -- 1) Dequant the `tokenId` row of the Q6_K per-layer embedding
-      --    table on the GPU. The table is too big to keep on the GPU
-      --    (> single-buffer limit), so we slice the 33 KB of raw Q6_K
-      --    bytes for this row out of the CPU ByteArray, upload it to a
-      --    small scratch buffer, and run `q6kSingleRowDequantScaleKernel`
-      --    to dequant + scale(sqrt(embdPL)) into plModelProj in one
-      --    pass. This replaces a 10 ms/token CPU dequant+upload loop.
-      Hesper.WGSL.Execute.withSection "plPre.rowUpload" do
-        let rowOffset := tokenId * model.perLayerEmbdRowBytes
-        let rowBytes := embdTableCPU.extract rowOffset (rowOffset + model.perLayerEmbdRowBytes)
-        GPUBackend.writeBufferOffset ctx state.plRawRowBuf 0 rowBytes
+      -- 1) Dequant the `tokenId` row from GPU-resident Q6_K table.
+      --    Full table on GPU — no CPU→GPU transfer per token.
       Hesper.WGSL.Execute.withSection "plPre.gpuDequant" do
+        let rowOffset := tokenId * model.perLayerEmbdRowBytes
+        let rowOffBytes := Hesper.WebGPU.BufferOps.uint32ToBytes rowOffset.toUInt32
+        GPUBackend.writeBufferOffset ctx state.plRawRowBuf 0 rowOffBytes
         let scaleFactor : Float := Float.sqrt embdPL.toFloat
         ce "q6kDequantScale"
-          (Hesper.Quantization.Q6_K.q6kSingleRowDequantScaleKernel totalPL scaleFactor)
-          [("row", state.plRawRowBuf), ("output", state.plModelProj)]
+          (Hesper.Quantization.Q6_K.q6kTableRowDequantScaleKernel totalPL scaleFactor
+            ((totalPL / 256 * 210 + 3) / 4 * 2))
+          [("table", embdTableGPU), ("params", state.plRawRowBuf), ("output", state.plModelProj)]
           (.dispatch1D totalPL)
 
       -- 2) per_layer_model_proj @ buf2 → plTokenSelected
