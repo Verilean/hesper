@@ -2135,6 +2135,428 @@ def forwardBlock [GPUBackend β] (ctx : β)
         [(0, outputBuf), (1, scale), (3, outputBuf)]
   | none => pure ()
 
+/-! ## Column-major helper kernels for batched prefill -/
+
+/-- Copy column `colIdx` from a column-major batch buffer into a contiguous
+    single-row buffer.  `batch[colIdx * dim + i] → out[i]` for i in [0, dim). -/
+private def columnExtractKernel (dim : Nat) (seqLen : Nat) (colIdx : Nat) : ShaderM Unit := do
+  let gid ← ShaderM.globalId
+  let i := Exp.vec3X gid
+  let totalBatch := dim * seqLen
+  let _batch ← ShaderM.declareInputBuffer "batch" (.array (.scalar .f32) totalBatch)
+  let _out   ← ShaderM.declareOutputBuffer "out" (.array (.scalar .f32) dim)
+  ShaderM.if_ (Exp.lt i (Exp.litU32 dim)) (do
+    let srcIdx := Exp.add (Exp.litU32 (colIdx * dim)) i
+    let v ← ShaderM.readBuffer (ty := .scalar .f32) (n := totalBatch) "batch" srcIdx
+    ShaderM.writeBuffer (ty := .scalar .f32) "out" i v
+  ) (pure ())
+
+/-- Copy a contiguous single-row buffer into column `colIdx` of a column-major
+    batch buffer.  `src[i] → batch[colIdx * dim + i]` for i in [0, dim). -/
+private def columnInsertKernel (dim : Nat) (seqLen : Nat) (colIdx : Nat) : ShaderM Unit := do
+  let gid ← ShaderM.globalId
+  let i := Exp.vec3X gid
+  let totalBatch := dim * seqLen
+  let _src   ← ShaderM.declareInputBuffer "src" (.array (.scalar .f32) dim)
+  let _batch ← ShaderM.declareOutputBuffer "batch" (.array (.scalar .f32) totalBatch)
+  ShaderM.if_ (Exp.lt i (Exp.litU32 dim)) (do
+    let v ← ShaderM.readBuffer (ty := .scalar .f32) (n := dim) "src" i
+    let dstIdx := Exp.add (Exp.litU32 (colIdx * dim)) i
+    ShaderM.writeBuffer (ty := .scalar .f32) "batch" dstIdx v
+  ) (pure ())
+
+/-! ## Batched Prefill -/
+
+/-- Process all prompt tokens through the model in batch.
+    Uses `forwardBatchDP4A` for Q4_K matmuls and `RMSNorm.forward` with
+    `numRows` for batch RMSNorm.  Attention remains per-token (extract
+    column, run single-token attention, write KV cache).
+
+    Populates the KV caches for all prompt positions and leaves the last
+    token's logits in `state.logitsBuf` so that decode can continue from
+    position `promptTokens.size`. -/
+def forwardPrefillBatch [GPUBackend β] (ctx : β)
+    (model : Gemma4Model (GPUBackend.Buf β) (GPUBackend.CachedDispatch β))
+    (promptTokens : Array Nat)
+    (state : InferenceState (GPUBackend.Buf β) (GPUBackend.CachedDispatch β))
+    (kcr : Option (KernelCacheRefs (GPUBackend.CachedDispatch β)) := none) : IO Unit := do
+  let seqLen := promptTokens.size
+  if seqLen == 0 then return
+  -- NOTE: for seqLen == 1, callers should use `forwardSingleToken` directly.
+  -- This function always takes the batch path (forwardBatchDP4A handles
+  -- the seqLen=1 case internally by falling through to single-token dp4a).
+
+  let cfg := model.config
+  let dim := cfg.hiddenSize
+  let interSize := cfg.intermediateSize
+  let mkBuf := fun (n : Nat) => GPUBackend.allocBuffer ctx (n * 4).toUSize
+
+  -- Cached execute helper (same pattern as forwardBlock / forwardSingleToken).
+  let ce := fun (name : String) (shader : ShaderM Unit)
+      (namedBufs : List (String × GPUBackend.Buf β)) (config : Hesper.ExecConfig) => do
+    match kcr with
+    | some k =>
+      let key := hash ("gemma4_prefill_ce", name, config.numWorkgroups,
+                        config.workgroupSize.x, config.workgroupSize.y, config.workgroupSize.z)
+      let ref ← k.getRef key
+      GPUBackend.executeWithConfigCached ctx shader namedBufs config key ref
+    | none => GPUBackend.execute ctx shader namedBufs config
+
+  -- ── Allocate prefill-sized batch buffers (column-major) ──────────────
+  let batchBuf1 ← mkBuf (dim * seqLen)       -- ping-pong A
+  let batchBuf2 ← mkBuf (dim * seqLen)       -- ping-pong B
+  let batchNormedBuf ← mkBuf (dim * seqLen)  -- after attnNorm / ffnNorm
+  let maxHeadDim := max cfg.headDimFull cfg.headDimSWA
+  let maxQDim := cfg.numAttentionHeads * maxHeadDim
+  let maxKVDim := (max cfg.numKeyValueHeadsFull cfg.numKeyValueHeadsSWA) * maxHeadDim
+  let batchQBuf ← mkBuf (maxQDim * seqLen)
+  let batchKBuf ← mkBuf (maxKVDim * seqLen)
+  let batchVBuf ← mkBuf (maxKVDim * seqLen)
+  let batchAttnOutBuf ← mkBuf (maxQDim * seqLen)
+  let batchOProjBuf ← mkBuf (dim * seqLen)
+  let batchAttnResidBuf ← mkBuf (dim * seqLen)
+  let batchGateBuf ← mkBuf (interSize * seqLen)
+  let batchUpBuf ← mkBuf (interSize * seqLen)
+  let batchGeluBuf ← mkBuf (interSize * seqLen)
+  let batchFFNOutBuf ← mkBuf (dim * seqLen)
+
+  GPUBackend.beginBatch ctx
+
+  -- ── Step 1: Embedding lookup — per token into batch buffer ──────────
+  -- Embed each token into state.buf1, then copy into the batch buffer
+  -- at column position `i`.
+  for i in [0:seqLen] do
+    let tokenId := promptTokens[i]!
+    let tokenBytes := Hesper.WebGPU.BufferOps.uint32ToBytes tokenId.toUInt32
+    GPUBackend.writeBufferOffset ctx state.tokenBuf 0 tokenBytes
+    match model.embdFormat with
+    | .Q6_K =>
+      ce s!"q6kEmbLookup_{i}"
+        (Hesper.Quantization.Q6_K.q6kEmbeddingLookupKernel model.config.vocabSize dim)
+        [("token_ids", state.tokenBuf), ("embedding_table", model.embedding.embeddingTable), ("output", state.buf1)]
+        (.dispatch1D dim)
+    | _ =>
+      Embedding.forward ctx model.embedding state.tokenBuf state.buf1 1 1
+    -- Copy state.buf1 → batchBuf1 column i
+    GPUBackend.execute ctx
+      (columnInsertKernel dim seqLen i)
+      [("src", state.buf1), ("batch", batchBuf1)]
+      (.dispatch1D dim)
+
+  -- ── Step 1b: Scale embeddings by sqrt(hiddenSize) — batch-wide ──────
+  -- embeddingScaleKernel takes a `size` param — we pass dim * seqLen so
+  -- it covers all columns in one dispatch.
+  let totalHidden := dim * seqLen
+  ce "embedScaleBatch"
+    (embeddingScaleKernel totalHidden dim)
+    [("input", batchBuf1), ("output", batchBuf2)]
+    (.dispatch1D totalHidden)
+
+  -- NOTE: skip per-layer input precomputation for prefill (set to none).
+
+  -- ── Step 2: Process transformer blocks ──────────────────────────────
+  let mut currentBuf := batchBuf2
+  let mut nextBuf := batchBuf1
+
+  for block in model.blocks do
+    let li := block.layerIdx
+    let headDim := cfg.headDim li
+    let numHeads := cfg.numAttentionHeads
+    let numKVHeads := cfg.numKVHeads li
+    let kvDim := numKVHeads * headDim
+    let qDim := numHeads * headDim
+
+    -- ── 2a: Attention norm (batch RMSNorm) ────────────────────────────
+    -- We call executeWithConfig directly instead of RMSNorm.forward to
+    -- avoid polluting layer.prepared (which is keyed to numRows=1 for
+    -- subsequent single-token decode).
+    GPUBackend.executeWithConfig ctx
+      (RMSNorm.rmsNormFusedKernel block.attnNorm.config seqLen 256)
+      [("input", currentBuf), ("scale", block.attnNorm.scale), ("output", batchNormedBuf)]
+      { workgroupSize := { x := 256 }, numWorkgroups := (seqLen, 1, 1) }
+
+    -- ── 2b: Q/K/V projections (batch matmul) ─────────────────────────
+    Linear.forwardBatchDP4A ctx block.attention.wQ batchNormedBuf batchQBuf seqLen
+    if cfg.hasKV li then
+      Linear.forwardBatchDP4A ctx block.attention.wK batchNormedBuf batchKBuf seqLen
+      Linear.forwardBatchDP4A ctx block.attention.wV batchNormedBuf batchVBuf seqLen
+
+    -- ── 2c: Per-token attention loop ──────────────────────────────────
+    -- For each token: extract Q/K/V columns → per-head norms → RoPE →
+    -- KV cache write → flash attention → write attnOut column back.
+    let wgSize := min headDim 256
+    let isFull := cfg.isFullAttention li
+    let kvLi := cfg.kvCacheLayer li
+
+    for i in [0:seqLen] do
+      let pos := i
+
+      -- Extract Q column i → state.qBuf
+      GPUBackend.execute ctx
+        (columnExtractKernel qDim seqLen i)
+        [("batch", batchQBuf), ("out", state.qBuf)]
+        (.dispatch1D qDim)
+      -- Extract K, V columns (if this layer has its own KV)
+      if cfg.hasKV li then
+        GPUBackend.execute ctx
+          (columnExtractKernel kvDim seqLen i)
+          [("batch", batchKBuf), ("out", state.kBuf)]
+          (.dispatch1D kvDim)
+        GPUBackend.execute ctx
+          (columnExtractKernel kvDim seqLen i)
+          [("batch", batchVBuf), ("out", state.vBuf)]
+          (.dispatch1D kvDim)
+
+      -- Per-head QKV norms (single token)
+      if cfg.hasKV li then
+        ce (if isFull then s!"qkvNormFull_pf_{i}" else s!"qkvNormSWA_pf_{i}")
+          (fusedPerHeadQKVNormKernel numHeads numKVHeads headDim cfg.rmsNormEps)
+          [("q_in", state.qBuf), ("q_scale", block.attention.qNormWeight), ("q_out", state.qBuf2),
+           ("k_in", state.kBuf), ("k_scale", block.attention.kNormWeight), ("k_out", state.kBuf2),
+           ("v_in", state.vBuf),                                              ("v_out", state.vBuf2)]
+          { numWorkgroups := (numHeads, 3, 1),
+            workgroupSize := { x := wgSize, y := 1, z := 1 } : Hesper.ExecConfig }
+      else
+        ce (if isFull then s!"qNormFull_pf_{i}" else s!"qNormSWA_pf_{i}")
+          (perHeadRMSNormKernel numHeads headDim cfg.rmsNormEps)
+          [("input", state.qBuf), ("weight", block.attention.qNormWeight), ("output", state.qBuf2)]
+          { numWorkgroups := (numHeads, 1, 1),
+            workgroupSize := { x := wgSize, y := 1, z := 1 } : Hesper.ExecConfig }
+
+      -- RoPE on Q: qBuf2 → qBuf
+      let posBytes := Hesper.WebGPU.BufferOps.uint32ToBytes pos.toUInt32
+      GPUBackend.writeBufferOffset ctx state.paramsBuf 0 posBytes
+      match block.ropeFreqFactors with
+      | some freqFactors =>
+        ce s!"ropeFreqQ_pf_{headDim}_{i}"
+          (ropeWithFreqFactorsKernel headDim numHeads cfg.ropeTheta)
+          [("input", state.qBuf2), ("output", state.qBuf), ("params", state.paramsBuf), ("freq_factors", freqFactors)]
+          (.dispatch1D (numHeads * headDim / 2))
+      | none =>
+        let ropeConfig : RoPE.Config := { dim := numHeads * headDim, maxSeqLen := cfg.maxSeqLen, base := cfg.ropeTheta }
+        ce s!"ropeDynQ_pf_{headDim}_{i}"
+          (RoPE.ropeKernelDynamic ropeConfig 1 1 numHeads headDim)
+          [("input", state.qBuf2), ("output", state.qBuf), ("params", state.paramsBuf)]
+          (.dispatch1D (numHeads * headDim / 2))
+
+      -- RoPE on K + KV cache write + flash attention
+      if h : kvLi < state.kvCaches.size then
+        let kvCache := state.kvCaches[kvLi]
+        let cacheLen := pos + 1
+
+        if cfg.hasKV li then
+          -- RoPE-K + KV cache write
+          match block.ropeFreqFactors with
+          | some freqFactors =>
+            ce s!"ropeKKvW_pf_{headDim}_{numKVHeads}_{i}"
+              (Attention.fusedRopeKAndCacheWriteKernel numKVHeads cfg.maxSeqLen headDim kvDim cfg.ropeTheta)
+              [("new_k", state.kBuf2), ("new_v", state.vBuf2),
+               ("k_cache", kvCache.kBuf), ("v_cache", kvCache.vBuf),
+               ("params", state.paramsBuf), ("freq_factors", freqFactors)]
+              (.dispatch1D kvDim)
+          | none =>
+            -- Separate RoPE-K then KV write
+            let ropeConfig : RoPE.Config := { dim := kvDim, maxSeqLen := cfg.maxSeqLen, base := cfg.ropeTheta }
+            ce s!"ropeDynK_pf_{headDim}_{numKVHeads}_{i}"
+              (RoPE.ropeKernelDynamic ropeConfig 1 1 numKVHeads headDim)
+              [("input", state.kBuf2), ("output", state.kBuf), ("params", state.paramsBuf)]
+              (.dispatch1D (numKVHeads * headDim / 2))
+            ce s!"kvWrite_pf_{headDim}_{numKVHeads}_{i}"
+              (Attention.fusedCacheWriteKVKernel numKVHeads cfg.maxSeqLen headDim kvDim)
+              [("new_k", state.kBuf), ("new_v", state.vBuf2),
+               ("k_cache", kvCache.kBuf), ("v_cache", kvCache.vBuf),
+               ("params", state.paramsBuf)]
+              (.dispatch1D kvDim)
+
+        -- Flash attention
+        let scale : Float := 1.0
+        let cacheLenBytes := Hesper.WebGPU.BufferOps.uint32ToBytes cacheLen.toUInt32
+        GPUBackend.writeBufferOffset ctx state.paramsBuf 4 cacheLenBytes
+        if cacheLen > 32 then
+          FlashAttention.executeFlashAttentionTiled ctx
+            state.qBuf kvCache.kBuf kvCache.vBuf state.attnOutBuf
+            numHeads numKVHeads cfg.maxSeqLen headDim cacheLen scale
+            (partialBuf := some state.flashPartialBuf)
+        else
+          ce s!"flashAttnP_pf_{headDim}_{numKVHeads}_{i}"
+            (FlashAttention.flashAttentionDynamicParamsKernel numHeads numKVHeads cfg.maxSeqLen headDim scale)
+            [("q", state.qBuf), ("k_cache", kvCache.kBuf), ("v_cache", kvCache.vBuf),
+             ("output", state.attnOutBuf), ("params", state.paramsBuf)]
+            ({ numWorkgroups := (numHeads, 1, 1) : Hesper.ExecConfig })
+
+        -- Insert attnOut into batch buffer for later O-projection
+        GPUBackend.execute ctx
+          (columnInsertKernel qDim seqLen i)
+          [("src", state.attnOutBuf), ("batch", batchAttnOutBuf)]
+          (.dispatch1D qDim)
+
+    -- ── 2d: O projection (batch matmul) ──────────────────────────────
+    Linear.forwardBatchDP4A ctx block.attention.wO batchAttnOutBuf batchOProjBuf seqLen
+
+    -- ── 2e: Post-attention norm + residual (per-token) ───────────────
+    -- `attnResid[i] = RMSNorm(oProj[i]) * scale + current[i]`
+    -- forwardNormThenAdd is hardcoded to 1 row, so we loop per token.
+    for i in [0:seqLen] do
+      -- Extract oProj column i → state.normedBuf
+      GPUBackend.execute ctx
+        (columnExtractKernel dim seqLen i)
+        [("batch", batchOProjBuf), ("out", state.normedBuf)]
+        (.dispatch1D dim)
+      -- Extract current (input) column i → state.buf1
+      GPUBackend.execute ctx
+        (columnExtractKernel dim seqLen i)
+        [("batch", currentBuf), ("out", state.buf1)]
+        (.dispatch1D dim)
+      -- Fused post-attn norm + residual add
+      let ref ← IO.mkRef none
+      RMSNorm.forwardNormThenAdd ctx block.postAttnNorm
+        state.normedBuf state.buf1 state.attnResidualBuf ref
+      -- Insert result into batchAttnResidBuf column i
+      GPUBackend.execute ctx
+        (columnInsertKernel dim seqLen i)
+        [("src", state.attnResidualBuf), ("batch", batchAttnResidBuf)]
+        (.dispatch1D dim)
+
+    -- ── 2f: FFN ──────────────────────────────────────────────────────
+    -- Skip MoE — use dense FFN path only.
+
+    -- FFN norm (batch RMSNorm) — direct dispatch to avoid polluting layer.prepared
+    GPUBackend.executeWithConfig ctx
+      (RMSNorm.rmsNormFusedKernel block.ffnNorm.config seqLen 256)
+      [("input", batchAttnResidBuf), ("scale", block.ffnNorm.scale), ("output", batchNormedBuf)]
+      { workgroupSize := { x := 256 }, numWorkgroups := (seqLen, 1, 1) }
+
+    -- Gate + Up projections (batch matmul)
+    Linear.forwardBatchDP4A ctx block.ffn.gate batchNormedBuf batchGateBuf seqLen
+    Linear.forwardBatchDP4A ctx block.ffn.up batchNormedBuf batchUpBuf seqLen
+
+    -- GELU * up (batch pointwise — dispatch with totalElements = interSize * seqLen)
+    let totalInter := interSize * seqLen
+    ce s!"geluMulBatch_{li}"
+      (geluMulKernel totalInter)
+      [("gate", batchGateBuf), ("up", batchUpBuf), ("output", batchGeluBuf)]
+      (.dispatch1D totalInter)
+
+    -- Down projection (batch matmul)
+    Linear.forwardBatchDP4A ctx block.ffn.down batchGeluBuf batchFFNOutBuf seqLen
+
+    -- ── 2g: Post-FFN norm + residual (per-token) ─────────────────────
+    -- `output[i] = RMSNorm(ffnOut[i]) * scale + attnResid[i]`
+    for i in [0:seqLen] do
+      GPUBackend.execute ctx
+        (columnExtractKernel dim seqLen i)
+        [("batch", batchFFNOutBuf), ("out", state.ffnOutBuf)]
+        (.dispatch1D dim)
+      GPUBackend.execute ctx
+        (columnExtractKernel dim seqLen i)
+        [("batch", batchAttnResidBuf), ("out", state.attnResidualBuf)]
+        (.dispatch1D dim)
+      let ref ← IO.mkRef none
+      RMSNorm.forwardNormThenAdd ctx block.postFFNNorm
+        state.ffnOutBuf state.attnResidualBuf state.buf2 ref
+      GPUBackend.execute ctx
+        (columnInsertKernel dim seqLen i)
+        [("src", state.buf2), ("batch", nextBuf)]
+        (.dispatch1D dim)
+
+    -- Skip per-layer embeddings and layer output scale for prefill.
+
+    -- Swap ping-pong buffers
+    let oldCur := currentBuf
+    currentBuf := nextBuf
+    nextBuf := oldCur
+
+  -- ── Step 3: Extract last token → final norm → lm head ─────────────
+  -- Copy last column of currentBuf → state.buf2 (single-token)
+  let lastCol := seqLen - 1
+  GPUBackend.execute ctx
+    (columnExtractKernel dim seqLen lastCol)
+    [("batch", currentBuf), ("out", state.buf2)]
+    (.dispatch1D dim)
+
+  -- Final RMSNorm (single token)
+  RMSNorm.forward ctx model.finalNorm state.buf2 state.buf1
+
+  -- LM head matmul — reuse the last token through forwardSingleToken's
+  -- lm-head logic. We have the normed hidden state in state.buf1 (= nextBuf
+  -- equivalent for single token). Copy to the right buffer position and
+  -- run the lm-head from forwardSingleToken.
+  -- For simplicity, run the Q6_K dp4a path directly if available,
+  -- otherwise fall back to the generic LinearLayer.forward.
+  match model.embdFormat with
+  | .Q6_K =>
+    let useSubgroups ← GPUBackend.hasSubgroupSupport ctx
+    let dp4aOn ← do
+      let a ← Hesper.Layers.Linear.dp4aEnabled.get
+      let b ← Hesper.Layers.Linear.dp4aQ6KEnabled.get
+      pure (a && b)
+    let gridX : Nat := 4096
+    let gridY : Nat := (cfg.vocabSize + gridX - 1) / gridX
+    if dp4aOn && useSubgroups && cfg.hiddenSize % 32 == 0 then
+      let nQ8Blocks := cfg.hiddenSize / 32
+      let q8BufBytes : USize := (nQ8Blocks * 9 * 4).toUSize
+      let q8Buf ← match ← state.lmHeadQ8Buf.get with
+        | some b => pure b
+        | none =>
+          let b ← GPUBackend.allocBuffer ctx q8BufBytes
+          state.lmHeadQ8Buf.set (some b)
+          pure b
+      GPUBackend.executeWithConfigCached ctx
+        (Hesper.Layers.Linear.quantizeQ8_1Kernel cfg.hiddenSize)
+        [("input", state.buf1), ("output", q8Buf)]
+        { numWorkgroups := (nQ8Blocks, 1, 1), workgroupSize := { x := 32, y := 1, z := 1 }
+          extensions := ["subgroups"] : Hesper.ExecConfig }
+        (hash ("q8_1-quantize-lmhead", cfg.hiddenSize))
+        state.lmHeadQuantizePrepared
+      let quadCount := (cfg.vocabSize + 3) / 4
+      let gridX4 : Nat := 4096
+      let gridY4 : Nat := (quadCount + gridX4 - 1) / gridX4
+      GPUBackend.executeWithConfigCached ctx
+        (Hesper.Layers.Linear.fusedQ6KLinearDP4A4RowKernel
+          cfg.hiddenSize cfg.vocabSize gridX4)
+        [("weights", model.outputWeight), ("input_q8", q8Buf), ("output", state.logitsBuf)]
+        { numWorkgroups := (gridX4, gridY4, 1), workgroupSize := { x := 128, y := 1, z := 1 }
+          extensions := ["subgroups"] : Hesper.ExecConfig }
+        (hash ("q6k-dp4a-lmhead-4row", cfg.hiddenSize, cfg.vocabSize))
+        state.lmHeadDP4APrepared
+    else
+      -- Fallback: f32 Q6_K kernel
+      let shaderF32 := if useSubgroups then
+          Hesper.Quantization.Q6_K.fusedQ6KLinearBlockCoopKernel
+            cfg.hiddenSize cfg.vocabSize gridX
+        else
+          Hesper.Quantization.Q6_K.fusedQ6KLinearKernel
+            cfg.hiddenSize cfg.vocabSize 256 gridX
+      let wgSize := if useSubgroups then 32 else 256
+      GPUBackend.execute ctx shaderF32
+        [("weights", model.outputWeight), ("input", state.buf1), ("output", state.logitsBuf)]
+        { numWorkgroups := (gridX, gridY, 1), workgroupSize := { x := wgSize, y := 1, z := 1 }
+          extensions := if useSubgroups then ["subgroups"] else []
+          : Hesper.ExecConfig }
+  | _ =>
+    -- Non-Q6_K fallback: F32 matmul transpose
+    let lmHeadConfig : Hesper.WGSL.MatMul.Config := {
+      M := 1, N := cfg.vocabSize, K := cfg.hiddenSize
+    }
+    Hesper.WGSL.MatMul.executeMatMulTranspose ctx state.buf1 model.outputWeight state.logitsBuf lmHeadConfig
+
+  GPUBackend.endBatch ctx
+
+  -- ── Free prefill batch buffers ─────────────────────────────────────
+  GPUBackend.freeBuffer ctx batchBuf1
+  GPUBackend.freeBuffer ctx batchBuf2
+  GPUBackend.freeBuffer ctx batchNormedBuf
+  GPUBackend.freeBuffer ctx batchQBuf
+  GPUBackend.freeBuffer ctx batchKBuf
+  GPUBackend.freeBuffer ctx batchVBuf
+  GPUBackend.freeBuffer ctx batchAttnOutBuf
+  GPUBackend.freeBuffer ctx batchOProjBuf
+  GPUBackend.freeBuffer ctx batchAttnResidBuf
+  GPUBackend.freeBuffer ctx batchGateBuf
+  GPUBackend.freeBuffer ctx batchUpBuf
+  GPUBackend.freeBuffer ctx batchGeluBuf
+  GPUBackend.freeBuffer ctx batchFFNOutBuf
+
 /-- Run full single-token forward pass through the model.
     Returns logits in state.logitsBuf. -/
 def forwardSingleToken [GPUBackend β] (ctx : β)
@@ -2531,9 +2953,15 @@ def generate [GPUBackend β] (ctx : β) (model : Gemma4Model (GPUBackend.Buf β)
   -- Phase 1: Prefill (process prompt tokens)
   IO.println s!"[Prefill] Processing {promptTokens.size} prompt tokens..."
   let prefillStart ← IO.monoNanosNow
-  for i in [0:promptTokens.size] do
-    if i >= model.config.maxSeqLen then break
-    forwardSingleToken ctx model promptTokens[i]! i state (kcr := some kcr)
+  let useBatchPrefill := promptTokens.size > 1
+    && (match ← IO.getEnv "HESPER_BATCH_PREFILL" with | some "0" => false | _ => true)
+  if useBatchPrefill then
+    IO.println s!"[Prefill] Batched path (seqLen={promptTokens.size})"
+    forwardPrefillBatch ctx model promptTokens state (kcr := some kcr)
+  else
+    for i in [0:promptTokens.size] do
+      if i >= model.config.maxSeqLen then break
+      forwardSingleToken ctx model promptTokens[i]! i state (kcr := some kcr)
   let prefillEnd ← IO.monoNanosNow
   let prefillMs := (prefillEnd - prefillStart).toFloat / 1_000_000.0
   IO.println s!"[Prefill] Done in {prefillMs} ms"
