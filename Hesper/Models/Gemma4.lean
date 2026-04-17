@@ -2595,7 +2595,7 @@ def forwardPrefillBatch [GPUBackend β] (ctx : β)
           let tokenIdBytes := Hesper.WebGPU.BufferOps.uint32ToBytes tokenId.toUInt32
           GPUBackend.writeBufferOffset ctx state.plRawRowBuf 0 tokenIdBytes
           let scaleFactor : Float := Float.sqrt embdPL.toFloat
-          GPUBackend.execute ctx
+          ce "q6kDequantScale_ple"
             (Hesper.Quantization.Q6_K.q6kTableRowDequantScaleKernel totalPL scaleFactor
               cfg.vocabSize)
             [("table", embdTableGPU), ("params", state.plRawRowBuf), ("output", state.plModelProj)]
