@@ -783,9 +783,14 @@ def q6kTableRowDequantScaleKernel (dim : Nat) (scale : Float)
   let idx := Exp.vec3X gid
 
   let blocksPerRow := dim / 256
-  let totalU32 := (vocabSize * blocksPerRow * blockSizeBytes + 3) / 4
+  let rowU32Size := (blocksPerRow * blockSizeBytes + 3) / 4
+  -- Declare a small buffer (2 rows) — CUDA ignores declared sizes for
+  -- global memory.  The actual GPU buffer is vocabSize rows; the
+  -- runtime tokenId selects the correct row offset.  Keeping the declared
+  -- size small prevents PTX array-size explosion in the ShaderM printer.
+  let declaredU32 := rowU32Size * 2
 
-  let _table ← ShaderM.declareReadOnlyBuffer "table" (.array (.scalar .u32) totalU32)
+  let _table ← ShaderM.declareReadOnlyBuffer "table" (.array (.scalar .u32) declaredU32)
   let _params ← ShaderM.declareReadOnlyBuffer "params" (.array (.scalar .u32) 1)
   let _output ← ShaderM.declareOutputBuffer "output" (.array (.scalar .f32) dim)
 
@@ -793,7 +798,7 @@ def q6kTableRowDequantScaleKernel (dim : Nat) (scale : Float)
   let tokenId ← ShaderM.readBuffer (ty := .scalar .u32) (n := 1) "params" (Exp.litU32 0)
 
   ShaderM.if_ (Exp.lt idx (Exp.litU32 dim)) (do
-    let val ← dequantQ6KElement dim "table" totalU32 tokenId idx
+    let val ← dequantQ6KElement dim "table" declaredU32 tokenId idx
     ShaderM.writeBuffer (ty := .scalar .f32) "output" idx (Exp.mul val (Exp.litF32 scale))
   ) (pure ())
 
