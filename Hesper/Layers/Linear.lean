@@ -3288,27 +3288,62 @@ def forwardBatchDP4A [GPUBackend β] (ctx : β)
     (layer : LinearLayer (GPUBackend.Buf β) (GPUBackend.CachedDispatch β))
     (inputBuf outputBuf : GPUBackend.Buf β)
     (seqLen : Nat) : IO Unit := do
-  if layer.quantFormat != .Q4_K then
-    throw (IO.userError s!"forwardBatchDP4A: only Q4_K supported, got {repr layer.quantFormat}")
   if seqLen <= 1 then
     forwardDP4A ctx layer inputBuf outputBuf
     return
 
-  let nQ8Blocks := layer.config.inDim / 32
-  let q8BufBytes : USize := (nQ8Blocks * 9 * seqLen * 4).toUSize
-  let q8Buf ← GPUBackend.allocBuffer ctx q8BufBytes
+  if layer.quantFormat == .Q4_K then
+    -- Q4_K batch path: 2 dispatches (batch quantize + batch matmul)
+    let nQ8Blocks := layer.config.inDim / 32
+    let q8BufBytes : USize := (nQ8Blocks * 9 * seqLen * 4).toUSize
+    let q8Buf ← GPUBackend.allocBuffer ctx q8BufBytes
 
-  GPUBackend.executeWithConfig ctx
-    (quantizeQ8_1BatchKernel layer.config.inDim seqLen)
-    [("input", inputBuf), ("output", q8Buf)]
-    { numWorkgroups := (nQ8Blocks, seqLen, 1), workgroupSize := { x := 32, y := 1, z := 1 } }
+    GPUBackend.executeWithConfig ctx
+      (quantizeQ8_1BatchKernel layer.config.inDim seqLen)
+      [("input", inputBuf), ("output", q8Buf)]
+      { numWorkgroups := (nQ8Blocks, seqLen, 1), workgroupSize := { x := 32, y := 1, z := 1 } }
 
-  GPUBackend.executeWithConfig ctx
-    (q4kMatmulBatchKernel layer.config seqLen)
-    [("weights", layer.weightBuf), ("input_q8", q8Buf), ("output", outputBuf)]
-    { numWorkgroups := (layer.config.outDim, seqLen, 1), workgroupSize := { x := 32, y := 1, z := 1 } }
+    GPUBackend.executeWithConfig ctx
+      (q4kMatmulBatchKernel layer.config seqLen)
+      [("weights", layer.weightBuf), ("input_q8", q8Buf), ("output", outputBuf)]
+      { numWorkgroups := (layer.config.outDim, seqLen, 1), workgroupSize := { x := 32, y := 1, z := 1 } }
 
-  GPUBackend.freeBuffer ctx q8Buf
+    GPUBackend.freeBuffer ctx q8Buf
+  else
+    -- Q6_K (or other formats): per-column loop with GPU-side column
+    -- extract/insert.  Uses a lightweight copy kernel to avoid D2H round-trips.
+    let inDim := layer.config.inDim
+    let outDim := layer.config.outDim
+    let inColBuf ← GPUBackend.allocBuffer ctx (inDim * 4).toUSize
+    let outColBuf ← GPUBackend.allocBuffer ctx (outDim * 4).toUSize
+    for col in [0:seqLen] do
+      -- GPU-side column extract: inColBuf[i] = inputBuf[col * inDim + i]
+      GPUBackend.executeWithConfig ctx
+        (do let _src ← ShaderM.declareReadOnlyBuffer "src" (.array (.scalar .f32) (inDim * seqLen))
+            let _dst ← ShaderM.declareOutputBuffer "dst" (.array (.scalar .f32) inDim)
+            let lid ← ShaderM.localId; let wid ← ShaderM.workgroupId
+            let i := Exp.add (Exp.mul (Exp.vec3X wid) (Exp.litU32 256)) (Exp.vec3X lid)
+            ShaderM.if_ (Exp.lt i (Exp.litU32 inDim)) (do
+              let srcIdx := Exp.add (Exp.litU32 (col * inDim)) i
+              let v ← ShaderM.readBuffer (ty := .scalar .f32) (n := inDim * seqLen) "src" srcIdx
+              ShaderM.writeBuffer (ty := .scalar .f32) "dst" i v) (pure ()))
+        [("src", inputBuf), ("dst", inColBuf)]
+        (.dispatch1D inDim 256)
+      forwardDP4A ctx layer inColBuf outColBuf
+      -- GPU-side column insert: outputBuf[col * outDim + i] = outColBuf[i]
+      GPUBackend.executeWithConfig ctx
+        (do let _src ← ShaderM.declareReadOnlyBuffer "src" (.array (.scalar .f32) outDim)
+            let _dst ← ShaderM.declareOutputBuffer "dst" (.array (.scalar .f32) (outDim * seqLen))
+            let lid ← ShaderM.localId; let wid ← ShaderM.workgroupId
+            let i := Exp.add (Exp.mul (Exp.vec3X wid) (Exp.litU32 256)) (Exp.vec3X lid)
+            ShaderM.if_ (Exp.lt i (Exp.litU32 outDim)) (do
+              let v ← ShaderM.readBuffer (ty := .scalar .f32) (n := outDim) "src" i
+              let dstIdx := Exp.add (Exp.litU32 (col * outDim)) i
+              ShaderM.writeBuffer (ty := .scalar .f32) "dst" dstIdx v) (pure ()))
+        [("src", outColBuf), ("dst", outputBuf)]
+        (.dispatch1D outDim 256)
+    GPUBackend.freeBuffer ctx inColBuf
+    GPUBackend.freeBuffer ctx outColBuf
 
 /-- Execute the linear layer: output = input @ weights^T
 
