@@ -2220,7 +2220,11 @@ def forwardPrefillBatch [GPUBackend β] (ctx : β)
   let batchGeluBuf ← mkBuf (interSize * seqLen)
   let batchFFNOutBuf ← mkBuf (dim * seqLen)
 
-  GPUBackend.beginBatch ctx
+  -- NOTE: no beginBatch here — each dispatch fires immediately.
+  -- Batching would defer all launches until endBatch, but the per-token
+  -- attention loop reads batch matmul outputs mid-stream, requiring
+  -- them to be complete.  Individual kernel launches on the default
+  -- stream are serialized by CUDA, so this is correct.
 
   -- ── Step 1: Embedding lookup — per token into batch buffer ──────────
   -- Embed each token into state.buf1, then copy into the batch buffer
@@ -2252,7 +2256,57 @@ def forwardPrefillBatch [GPUBackend β] (ctx : β)
     [("input", batchBuf1), ("output", batchBuf2)]
     (.dispatch1D totalHidden)
 
-  -- NOTE: skip per-layer input precomputation for prefill (set to none).
+  -- Step 1b: Per-layer input precomputation (per-token, same as forwardSingleToken).
+  -- This is required for Gemma 4 E4B which uses per_layer_token_embd.
+  -- We compute it once for each token and store in state.plInputAll.
+  -- Each token's per-layer input depends on its token ID, so we must
+  -- loop.  The result is used inside forwardBlock for each layer.
+  -- For the batch path, we precompute for ALL tokens and store the last
+  -- token's result in state.plInputAll (since that's what the per-token
+  -- attention loops need — each block reads from state.plInputAll at the
+  -- token's turn).  TODO: properly batch per-layer input.
+  match model.perLayerEmbdTableCPU, model.perLayerModelProj, model.perLayerProjNorm with
+  | some embdTableCPU, some modelProj, some projNorm =>
+    let embdPL := model.config.embdPerLayer
+    let nLayers := model.config.numHiddenLayers
+    let totalPL := embdPL * nLayers
+    -- For each token, compute per-layer input (writes state.plInputAll)
+    for i in [0:seqLen] do
+      let tokenId := promptTokens[i]!
+      let rowOffset := tokenId * model.perLayerEmbdRowBytes
+      let rowBytes := embdTableCPU.extract rowOffset (rowOffset + model.perLayerEmbdRowBytes)
+      GPUBackend.writeBufferOffset ctx state.plRawRowBuf 0 rowBytes
+      let scaleFactor : Float := Float.sqrt embdPL.toFloat
+      ce s!"q6kDequantScale_pf_{i}"
+        (Hesper.Quantization.Q6_K.q6kSingleRowDequantScaleKernel totalPL scaleFactor)
+        [("row", state.plRawRowBuf), ("output", state.plModelProj)]
+        (.dispatch1D totalPL)
+      -- Extract column i from batchBuf2 (scaled embedding) into state.buf1
+      GPUBackend.execute ctx
+        (columnExtractKernel dim seqLen i)
+        [("batch", batchBuf2), ("out", state.buf1)]
+        (.dispatch1D dim)
+      -- F16 matmul: buf1 × modelProj → plTokenSelected
+      let projConfig : Hesper.WGSL.MatMul.Config := {
+        M := 1, N := totalPL, K := dim
+      }
+      if projConfig.K % 64 == 0 then
+        Hesper.WGSL.MatMul.executeMatMulTransposeF16BlockCoop ctx state.buf1 modelProj state.plTokenSelected projConfig
+      else
+        Hesper.WGSL.MatMul.executeMatMulTransposeF16 ctx state.buf1 modelProj state.plTokenSelected projConfig
+      ce s!"pleScalePL_pf_{i}"
+        (PerLayerEmbedding.scaleKernel totalPL (1.0 / Float.sqrt dim.toFloat))
+        [("input", state.plTokenSelected), ("output", state.plInputAll)]
+        (.dispatch1D totalPL)
+      ce s!"chunkedRMSNorm_pf_{i}"
+        (chunkedRMSNormKernel embdPL nLayers model.config.rmsNormEps)
+        [("input", state.plInputAll), ("weight", projNorm.scale), ("output", state.plTokenSelected)]
+        { numWorkgroups := (nLayers, 1, 1), workgroupSize := { x := min embdPL 256, y := 1, z := 1 } : Hesper.ExecConfig }
+      ce s!"scaledAdd_pf_{i}"
+        (scaledAddKernel totalPL (1.0 / Float.sqrt 2.0))
+        [("a", state.plTokenSelected), ("b", state.plModelProj), ("output", state.plInputAll)]
+        (.dispatch1D totalPL)
+  | _, _, _ => pure ()
 
   -- ── Step 2: Process transformer blocks ──────────────────────────────
   let mut currentBuf := batchBuf2
@@ -2954,7 +3008,7 @@ def generate [GPUBackend β] (ctx : β) (model : Gemma4Model (GPUBackend.Buf β)
   IO.println s!"[Prefill] Processing {promptTokens.size} prompt tokens..."
   let prefillStart ← IO.monoNanosNow
   let useBatchPrefill := promptTokens.size > 1
-    && (match ← IO.getEnv "HESPER_BATCH_PREFILL" with | some "0" => false | _ => true)
+    && (match ← IO.getEnv "HESPER_BATCH_PREFILL" with | some "0" => false | some "1" => true | _ => false)
   if useBatchPrefill then
     IO.println s!"[Prefill] Batched path (seqLen={promptTokens.size})"
     forwardPrefillBatch ctx model promptTokens state (kcr := some kcr)
