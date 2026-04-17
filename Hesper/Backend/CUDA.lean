@@ -59,6 +59,10 @@ structure PendingLaunch where
 
 initialize cudaBatchQueue : IO.Ref (Option (Array PendingLaunch)) ← IO.mkRef none
 
+/-- Diagnostic: true when a CUDA batch queue is currently open. -/
+def Backend.isCudaBatching : IO Bool := do
+  return (← cudaBatchQueue.get).isSome
+
 private def cudaExecuteImpl (computation : ShaderM Unit) (namedBuffers : List (String × CUDABuffer))
     (funcName : String) (workgroupSize : Hesper.WGSL.WorkgroupSize)
     (numWorkgroups : Nat × Nat × Nat) : IO CUfunction := do
