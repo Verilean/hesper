@@ -1,5 +1,6 @@
 import Hesper.Backend
 import Hesper.Backend.WebGPU
+import Hesper.Backend.CUDA
 import Hesper.Circuit.IR
 import Hesper.Circuit.Lowering
 import Hesper.Circuit.Passes
@@ -1470,6 +1471,24 @@ def createInferenceState [GPUBackend β] (ctx : β) (cfg : Config) : IO (Inferen
     lmHeadDP4APrepared := ← GPUBackend.newCacheRef (β := β)
   }
 
+/-- Dump a buffer to a file when HESPER_DUMP_DIR env is set.
+    Caller passes the byte count; suffix identifies the checkpoint.
+    Flushes any pending CUDA batch queue first so the buffer reflects all
+    queued launches.  If there was an active batch, reopens it afterwards. -/
+def dumpBuf [GPUBackend β] (ctx : β) (buf : GPUBackend.Buf β) (bytes : USize) (suffix : String) : IO Unit := do
+  match ← IO.getEnv "HESPER_DUMP_DIR" with
+  | none => pure ()
+  | some dir =>
+    -- Probe CUDA batch state: if currently batching, queue sync returns
+    -- some; we flush + reopen only in that case.  Safe regardless of backend
+    -- because endBatch on `none` is a no-op.
+    let wasBatching ← Hesper.Backend.isCudaBatching
+    GPUBackend.endBatch ctx
+    let data ← GPUBackend.readBuffer ctx buf bytes
+    IO.FS.writeBinFile s!"{dir}/{suffix}.bin" data
+    if wasBatching then
+      GPUBackend.beginBatch ctx
+
 /-! ## Single-Token Forward Pass -/
 
 /-- Run single-token forward pass through one transformer block.
@@ -1839,6 +1858,7 @@ def forwardBlock [GPUBackend β] (ctx : β)
       | none => IO.mkRef none
     RMSNorm.forwardNormThenAdd ctx block.postAttnNorm
       state.normedBuf inputBuf state.attnResidualBuf ref
+  dumpBuf ctx state.attnResidualBuf (cfg.hiddenSize * 4).toUSize s!"single_p{pos}_postAttn_L{li}"
 
   -- Step 7: FFN (dense or MoE)
   if block.isMoE then do
@@ -2024,6 +2044,7 @@ def forwardBlock [GPUBackend β] (ctx : β)
         | none => IO.mkRef none
       RMSNorm.forwardNormThenAdd ctx block.postFFNNorm
         state.ffnOutBuf state.attnResidualBuf outputBuf refFFN2
+  dumpBuf ctx outputBuf (cfg.hiddenSize * 4).toUSize s!"single_p{pos}_postFFN_L{li}"
 
   -- Step 8: Per-layer embedding (optional, from gemma4-iswa.cpp:192-213)
   -- pe_in = cur (= outputBuf at this point)
@@ -2107,6 +2128,7 @@ def forwardBlock [GPUBackend β] (ctx : β)
             extensions := ["subgroups"]
             : Hesper.ExecConfig }
     | _, _ => pure ()
+  dumpBuf ctx outputBuf (cfg.hiddenSize * 4).toUSize s!"single_p{pos}_postPLE_L{li}"
 
   -- Step 9: Layer output scale (optional).  Was two dispatches:
   --   layerScale: normedBuf2[i] = outputBuf[i] * scale[0]  (broadcast)
@@ -2115,7 +2137,8 @@ def forwardBlock [GPUBackend β] (ctx : β)
   -- chain into a single dispatch whose body is `(outputBuf[i] * scale[0]) * 1`.
   -- The normedBuf2 round-trip is gone; outputBuf is consumed + written
   -- in one kernel (safe because every lane's read precedes its write).
-  match block.outScale with
+  let skipOutScaleSingle := (← IO.getEnv "HESPER_SKIP_OUTSCALE").isSome
+  match if skipOutScaleSingle then none else block.outScale with
   | some scale =>
     Hesper.WGSL.Execute.withSection "layerOutScale" do
       let key := hash ("circuitLayerOutScale-cuda", cfg.hiddenSize, li)
@@ -2239,6 +2262,8 @@ def forwardPrefillBatch [GPUBackend β] (ctx : β)
   let batchUpBuf ← mkBuf (interSize * seqLen)
   let batchGeluBuf ← mkBuf (interSize * seqLen)
   let batchFFNOutBuf ← mkBuf (dim * seqLen)
+  -- Scaled embedding cache: PLE input uses the embedding (not per-layer output)
+  let batchScaledEmbdBuf ← mkBuf (dim * seqLen)
   let colIdxBuf ← GPUBackend.allocBuffer ctx (4 : USize)
 
   -- NOTE: no beginBatch here — each dispatch fires immediately.
@@ -2301,6 +2326,24 @@ def forwardPrefillBatch [GPUBackend β] (ctx : β)
     [("input", batchBuf1), ("output", batchBuf2)]
     (.dispatch1D totalHidden)
 
+  -- Cache the scaled embedding (pre-layer state) for PLE usage inside the block loop.
+  -- Single-token path precomputes plInputAll ONCE from the scaled embedding and reuses
+  -- across layers; batch path recomputes per token per layer, and MUST use the scaled
+  -- embedding (not the current layer output) as the PLE matmul input.
+  do
+    let totalScaled := dim * seqLen
+    let shader : ShaderM Unit := do
+      let gid ← ShaderM.globalId
+      let i := Exp.vec3X gid
+      let _src ← ShaderM.declareInputBuffer "src" (.array (.scalar .f32) totalScaled)
+      let _dst ← ShaderM.declareOutputBuffer "dst" (.array (.scalar .f32) totalScaled)
+      ShaderM.if_ (Exp.lt i (Exp.litU32 totalScaled)) (do
+        let v ← ShaderM.readBuffer (ty := .scalar .f32) (n := totalScaled) "src" i
+        ShaderM.writeBuffer (ty := .scalar .f32) "dst" i v) (pure ())
+    ce "batchScaledEmbdCopy" shader
+      [("src", batchBuf2), ("dst", batchScaledEmbdBuf)]
+      (.dispatch1D totalScaled)
+
   -- Step 1b: Per-layer input precomputation (per-token, same as forwardSingleToken).
   -- This is required for Gemma 4 E4B which uses per_layer_token_embd.
   -- We compute it once for each token and store in state.plInputAll.
@@ -2318,10 +2361,9 @@ def forwardPrefillBatch [GPUBackend β] (ctx : β)
     -- For each token, compute per-layer input (writes state.plInputAll)
     for i in [0:seqLen] do
       let tokenId := promptTokens[i]!
-      let rowOffset := tokenId * model.perLayerEmbdRowBytes
-      -- Write row byte offset to plRawRowBuf (reused as params buf for GPU table lookup)
-      let rowOffBytes := Hesper.WebGPU.BufferOps.uint32ToBytes rowOffset.toUInt32
-      GPUBackend.writeBufferOffset ctx state.plRawRowBuf 0 rowOffBytes
+      -- Write token ID (row index) to plRawRowBuf — kernel expects row index, not byte offset
+      let tokenIdBytes := Hesper.WebGPU.BufferOps.uint32ToBytes tokenId.toUInt32
+      GPUBackend.writeBufferOffset ctx state.plRawRowBuf 0 tokenIdBytes
       let scaleFactor : Float := Float.sqrt embdPL.toFloat
       ce "q6kDequantScale_pf"
         (Hesper.Quantization.Q6_K.q6kTableRowDequantScaleKernel totalPL scaleFactor
@@ -2361,6 +2403,16 @@ def forwardPrefillBatch [GPUBackend β] (ctx : β)
   let mut currentBuf := batchBuf2
   let mut nextBuf := batchBuf1
 
+  -- Dump post-PLE state for each token (extract each column to state.buf1 and dump)
+  for i in [0:seqLen] do
+    let idxBytes := Hesper.WebGPU.BufferOps.uint32ToBytes i.toUInt32
+    GPUBackend.writeBufferOffset ctx colIdxBuf 0 idxBytes
+    GPUBackend.execute ctx
+      (columnExtractKernel dim seqLen)
+      [("batch", currentBuf), ("params", colIdxBuf), ("out", state.buf1)]
+      (.dispatch1D dim)
+    dumpBuf ctx state.buf1 (dim * 4).toUSize s!"batch_t{i}_postPLE"
+
   let nBlocksToRun := match ← IO.getEnv "HESPER_PREFILL_LAYERS" with
     | some s => s.toNat!
     | none => model.blocks.size
@@ -2372,24 +2424,33 @@ def forwardPrefillBatch [GPUBackend β] (ctx : β)
     let kvDim := numKVHeads * headDim
     let qDim := numHeads * headDim
 
-    -- ── 2a: Fused RMSNorm + Q8_1 quantize (batch) ──────────────────────
-    -- Same fused kernel as forwardBlock's decode path, extended to numRows=seqLen.
-    -- This guarantees numerical parity: the RMSNorm output is directly quantized
-    -- to Q8_1 without an f32 intermediate buffer round-trip.
+    -- ── 2a: RMSNorm + Q/K/V projections (batch) ────────────────────────
+    -- Fast path (all Q4_K): fused RMSNorm+Q8_1 quantize → Q8_1 batch matmul.
+    -- Fallback (any Q6_K in Q/K/V): standalone RMSNorm → f32 batch matmul.
     let nQ8Blocks := dim / 32
-    let batchQ8Bytes : USize := (nQ8Blocks * 9 * seqLen * 4).toUSize
-    let batchQ8Buf ← GPUBackend.allocBuffer ctx batchQ8Bytes
-    GPUBackend.executeWithConfig ctx
-      (RMSNorm.fusedRMSNormQ8_1Kernel block.attnNorm.config seqLen 256)
-      [("input", currentBuf), ("scale", block.attnNorm.scale), ("output", batchQ8Buf)]
-      { workgroupSize := { x := 256 }, numWorkgroups := (seqLen, 1, 1) }
-
-    -- ── 2b: Q/K/V projections (batch matmul from Q8_1) ───────────────
-    -- Skip the separate Q8_1 quantize step — use fused output directly.
-    Linear.forwardBatchDP4A_fromQ8 ctx block.attention.wQ batchQ8Buf batchQBuf seqLen
-    if cfg.hasKV li then
-      Linear.forwardBatchDP4A_fromQ8 ctx block.attention.wK batchQ8Buf batchKBuf seqLen
-      Linear.forwardBatchDP4A_fromQ8 ctx block.attention.wV batchQ8Buf batchVBuf seqLen
+    let allQ4K := block.attention.wQ.quantFormat == .Q4_K
+                && (!cfg.hasKV li ||
+                    (block.attention.wK.quantFormat == .Q4_K
+                     && block.attention.wV.quantFormat == .Q4_K))
+    if allQ4K then
+      let batchQ8Bytes : USize := (nQ8Blocks * 9 * seqLen * 4).toUSize
+      let batchQ8Buf ← GPUBackend.allocBuffer ctx batchQ8Bytes
+      GPUBackend.executeWithConfig ctx
+        (RMSNorm.fusedRMSNormQ8_1Kernel block.attnNorm.config seqLen 256)
+        [("input", currentBuf), ("scale", block.attnNorm.scale), ("output", batchQ8Buf)]
+        { workgroupSize := { x := 256 }, numWorkgroups := (seqLen, 1, 1) }
+      Linear.forwardBatchDP4A_fromQ8 ctx block.attention.wQ batchQ8Buf batchQBuf seqLen
+      if cfg.hasKV li then
+        Linear.forwardBatchDP4A_fromQ8 ctx block.attention.wK batchQ8Buf batchKBuf seqLen
+        Linear.forwardBatchDP4A_fromQ8 ctx block.attention.wV batchQ8Buf batchVBuf seqLen
+      GPUBackend.freeBuffer ctx batchQ8Buf
+    else
+      -- Q6_K fallback: RMSNorm into batchBuf1 as scratch, then batch matmul in f32.
+      RMSNorm.forward ctx block.attnNorm currentBuf batchBuf1 seqLen
+      Linear.forwardBatchDP4A ctx block.attention.wQ batchBuf1 batchQBuf seqLen
+      if cfg.hasKV li then
+        Linear.forwardBatchDP4A ctx block.attention.wK batchBuf1 batchKBuf seqLen
+        Linear.forwardBatchDP4A ctx block.attention.wV batchBuf1 batchVBuf seqLen
 
     -- ── 2c: Per-token attention loop ──────────────────────────────────
     let wgSize := min headDim 256
@@ -2537,20 +2598,38 @@ def forwardPrefillBatch [GPUBackend β] (ctx : β)
         [("src", state.attnResidualBuf), ("params", colIdxBuf), ("batch", batchAttnResidBuf)]
         (.dispatch1D dim)
 
+    -- Dump post-attn residual for each token (batch diagnostic) — only L0/L1 for brevity
+    if li ≤ 2 then for i in [0:seqLen] do
+      let idxBytes := Hesper.WebGPU.BufferOps.uint32ToBytes i.toUInt32
+      GPUBackend.writeBufferOffset ctx colIdxBuf 0 idxBytes
+      GPUBackend.execute ctx
+        (columnExtractKernel dim seqLen)
+        [("batch", batchAttnResidBuf), ("params", colIdxBuf), ("out", state.buf1)]
+        (.dispatch1D dim)
+      dumpBuf ctx state.buf1 (dim * 4).toUSize s!"batch_t{i}_postAttn_L{li}"
+
     -- ── 2f: FFN ──────────────────────────────────────────────────────
     -- Skip MoE — use dense FFN path only.
 
-    -- FFN norm: fused RMSNorm + Q8_1 (batch, same kernel as decode path)
-    let ffnQ8Bytes : USize := (nQ8Blocks * 9 * seqLen * 4).toUSize
-    let ffnBatchQ8Buf ← GPUBackend.allocBuffer ctx ffnQ8Bytes
-    GPUBackend.executeWithConfig ctx
-      (RMSNorm.fusedRMSNormQ8_1Kernel block.ffnNorm.config seqLen 256)
-      [("input", batchAttnResidBuf), ("scale", block.ffnNorm.scale), ("output", ffnBatchQ8Buf)]
-      { workgroupSize := { x := 256 }, numWorkgroups := (seqLen, 1, 1) }
-
-    -- Gate + Up projections (batch matmul from Q8_1)
-    Linear.forwardBatchDP4A_fromQ8 ctx block.ffn.gate ffnBatchQ8Buf batchGateBuf seqLen
-    Linear.forwardBatchDP4A_fromQ8 ctx block.ffn.up ffnBatchQ8Buf batchUpBuf seqLen
+    -- FFN norm + Gate/Up projections (batch)
+    -- Fast path (both Q4_K): fused RMSNorm+Q8_1 quantize → Q8_1 batch matmul.
+    -- Fallback: standalone RMSNorm → f32 batch matmul.
+    let ffnAllQ4K := block.ffn.gate.quantFormat == .Q4_K
+                  && block.ffn.up.quantFormat == .Q4_K
+    if ffnAllQ4K then
+      let ffnQ8Bytes : USize := (nQ8Blocks * 9 * seqLen * 4).toUSize
+      let ffnBatchQ8Buf ← GPUBackend.allocBuffer ctx ffnQ8Bytes
+      GPUBackend.executeWithConfig ctx
+        (RMSNorm.fusedRMSNormQ8_1Kernel block.ffnNorm.config seqLen 256)
+        [("input", batchAttnResidBuf), ("scale", block.ffnNorm.scale), ("output", ffnBatchQ8Buf)]
+        { workgroupSize := { x := 256 }, numWorkgroups := (seqLen, 1, 1) }
+      Linear.forwardBatchDP4A_fromQ8 ctx block.ffn.gate ffnBatchQ8Buf batchGateBuf seqLen
+      Linear.forwardBatchDP4A_fromQ8 ctx block.ffn.up ffnBatchQ8Buf batchUpBuf seqLen
+      GPUBackend.freeBuffer ctx ffnBatchQ8Buf
+    else
+      RMSNorm.forward ctx block.ffnNorm batchAttnResidBuf batchBuf1 seqLen
+      Linear.forwardBatchDP4A ctx block.ffn.gate batchBuf1 batchGateBuf seqLen
+      Linear.forwardBatchDP4A ctx block.ffn.up batchBuf1 batchUpBuf seqLen
 
     -- GELU * up (batch pointwise — dispatch with totalElements = interSize * seqLen)
     let totalInter := interSize * seqLen
@@ -2583,29 +2662,35 @@ def forwardPrefillBatch [GPUBackend β] (ctx : β)
         [("src", state.buf2), ("params", colIdxBuf), ("batch", nextBuf)]
         (.dispatch1D dim)
 
+    -- Dump post-FFN (pre-PLE) state
+    for i in [0:seqLen] do
+      let idxBytes := Hesper.WebGPU.BufferOps.uint32ToBytes i.toUInt32
+      GPUBackend.writeBufferOffset ctx colIdxBuf 0 idxBytes
+      GPUBackend.execute ctx
+        (columnExtractKernel dim seqLen)
+        [("batch", nextBuf), ("params", colIdxBuf), ("out", state.buf1)]
+        (.dispatch1D dim)
+      dumpBuf ctx state.buf1 (dim * 4).toUSize s!"batch_t{i}_postFFN_L{li}"
+
     -- ── 2h: Per-layer embedding + layer output scale (per-token) ──────
     -- Gemma 4 E4B uses per_layer_token_embd: each layer's output gets an
     -- additive embedding that depends on both the layer index and the
     -- token's per-layer input (precomputed in Step 1b).  We also apply
     -- the layer output scale (a single scalar multiply per layer).
     let blockIdx := li
-    let plEmbd := if blockIdx < model.perLayerBlocks.size then
+    let skipPLE := (← IO.getEnv "HESPER_SKIP_PLE").isSome
+    let plEmbd := if blockIdx < model.perLayerBlocks.size && !skipPLE then
       model.perLayerBlocks[blockIdx]!
     else none
     match plEmbd with
     | some ple =>
       -- Per-layer embedding for each token position
       for i in [0:seqLen] do
-        -- Extract this token's output column → state.buf2
         let colIdxBytes := Hesper.WebGPU.BufferOps.uint32ToBytes i.toUInt32
-        GPUBackend.writeBufferOffset ctx colIdxBuf 0 colIdxBytes
-        GPUBackend.execute ctx
-          (columnExtractKernel dim seqLen)
-          [("batch", nextBuf), ("params", colIdxBuf), ("out", state.buf2)]
-          (.dispatch1D dim)
-        -- Compute per-layer input for token i (if not already in state.plInputAll
-        -- from Step 1b).  Step 1b precomputed for ALL tokens but stored the last.
-        -- For simplicity, we recompute for each token here (correct but slower).
+        -- Compute per-layer input for token i.
+        -- CRITICAL: plInputAll must be derived from the SCALED EMBEDDING (not the
+        -- current layer output), matching Step 1b of forwardSingleToken.  The
+        -- scaled embedding was cached in `batchScaledEmbdBuf` before the block loop.
         let tokenId := promptTokens[i]!
         match model.perLayerEmbdTableGPU, model.perLayerModelProj, model.perLayerProjNorm with
         | some embdTableGPU, some modelProj, some projNorm =>
@@ -2620,11 +2705,17 @@ def forwardPrefillBatch [GPUBackend β] (ctx : β)
               cfg.vocabSize)
             [("table", embdTableGPU), ("params", state.plRawRowBuf), ("output", state.plModelProj)]
             (.dispatch1D totalPL)
+          -- Extract scaled embedding column for token i → state.buf1 (PLE matmul input)
+          GPUBackend.writeBufferOffset ctx colIdxBuf 0 colIdxBytes
+          GPUBackend.execute ctx
+            (columnExtractKernel dim seqLen)
+            [("batch", batchScaledEmbdBuf), ("params", colIdxBuf), ("out", state.buf1)]
+            (.dispatch1D dim)
           let projConfig : Hesper.WGSL.MatMul.Config := { M := 1, N := totalPL, K := dim }
           if projConfig.K % 64 == 0 then
-            Hesper.WGSL.MatMul.executeMatMulTransposeF16BlockCoop ctx state.buf2 modelProj state.plTokenSelected projConfig
+            Hesper.WGSL.MatMul.executeMatMulTransposeF16BlockCoop ctx state.buf1 modelProj state.plTokenSelected projConfig
           else
-            Hesper.WGSL.MatMul.executeMatMulTransposeF16 ctx state.buf2 modelProj state.plTokenSelected projConfig
+            Hesper.WGSL.MatMul.executeMatMulTransposeF16 ctx state.buf1 modelProj state.plTokenSelected projConfig
           GPUBackend.execute ctx
             (PerLayerEmbedding.scaleKernel totalPL (1.0 / Float.sqrt dim.toFloat))
             [("input", state.plTokenSelected), ("output", state.plInputAll)]
@@ -2638,6 +2729,12 @@ def forwardPrefillBatch [GPUBackend β] (ctx : β)
             [("a", state.plTokenSelected), ("b", state.plModelProj), ("output", state.plInputAll)]
             (.dispatch1D totalPL)
         | _, _, _ => pure ()
+        -- Extract this token's output column → state.buf2 (input to PLE inpGate)
+        GPUBackend.writeBufferOffset ctx colIdxBuf 0 colIdxBytes
+        GPUBackend.execute ctx
+          (columnExtractKernel dim seqLen)
+          [("batch", nextBuf), ("params", colIdxBuf), ("out", state.buf2)]
+          (.dispatch1D dim)
         -- Now run the actual per-layer embedding ops on state.buf2
         -- (inpGate matmul → gelu*gate*slice → proj → postNorm+add)
         let plOffset := li * cfg.embdPerLayer
@@ -2661,8 +2758,19 @@ def forwardPrefillBatch [GPUBackend β] (ctx : β)
           (.dispatch1D dim)
     | none => pure ()
 
+    -- Dump post-PLE (pre-outScale) state
+    for i in [0:seqLen] do
+      let idxBytes := Hesper.WebGPU.BufferOps.uint32ToBytes i.toUInt32
+      GPUBackend.writeBufferOffset ctx colIdxBuf 0 idxBytes
+      GPUBackend.execute ctx
+        (columnExtractKernel dim seqLen)
+        [("batch", nextBuf), ("params", colIdxBuf), ("out", state.buf1)]
+        (.dispatch1D dim)
+      dumpBuf ctx state.buf1 (dim * 4).toUSize s!"batch_t{i}_postPLE_L{li}"
+
     -- Layer output scale (per-token) — uses Circuit DSL scalar broadcast multiply
-    match block.outScale with
+    let skipOutScale := (← IO.getEnv "HESPER_SKIP_OUTSCALE").isSome
+    match if skipOutScale then none else block.outScale with
     | some scale =>
       for i in [0:seqLen] do
         let colIdxBytes := Hesper.WebGPU.BufferOps.uint32ToBytes i.toUInt32
@@ -2686,21 +2794,37 @@ def forwardPrefillBatch [GPUBackend β] (ctx : β)
             let _out   ← Hesper.Circuit.CircuitM.map scaled
                            (.mul (.input 0) (.const 1.0))
             pure ())
-          [(0, state.buf2), (1, scale), (5, state.buf2)]
+          -- ids: 0=x (state.buf2), 1=s (scale), 3=final map output written back.
+          [(0, state.buf2), (1, scale), (3, state.buf2)]
         GPUBackend.execute ctx
           (columnInsertKernel dim seqLen)
           [("src", state.buf2), ("params", colIdxBuf), ("batch", nextBuf)]
           (.dispatch1D dim)
     | none => pure ()
 
-    -- Free per-layer batch Q8_1 buffers
-    GPUBackend.freeBuffer ctx batchQ8Buf
-    GPUBackend.freeBuffer ctx ffnBatchQ8Buf
+    -- Per-layer batch Q8_1 buffers are freed inside their respective
+    -- Q4_K fast-path branches above.
 
     -- Swap ping-pong buffers
     let oldCur := currentBuf
     currentBuf := nextBuf
     nextBuf := oldCur
+
+    -- Dump post-layer state for each token
+    for i in [0:seqLen] do
+      let idxBytes := Hesper.WebGPU.BufferOps.uint32ToBytes i.toUInt32
+      GPUBackend.writeBufferOffset ctx colIdxBuf 0 idxBytes
+      GPUBackend.execute ctx
+        (columnExtractKernel dim seqLen)
+        [("batch", currentBuf), ("params", colIdxBuf), ("out", state.buf1)]
+        (.dispatch1D dim)
+      dumpBuf ctx state.buf1 (dim * 4).toUSize s!"batch_t{i}_afterL{li}"
+      -- Also dump previous-buffer (before outScale if it ran) to localize
+      GPUBackend.execute ctx
+        (columnExtractKernel dim seqLen)
+        [("batch", batchAttnResidBuf), ("params", colIdxBuf), ("out", state.buf1)]
+        (.dispatch1D dim)
+      dumpBuf ctx state.buf1 (dim * 4).toUSize s!"batch_t{i}_attnResidL{li}"
 
   -- ── Step 3: Extract last token → final norm → lm head ─────────────
   -- Copy last column of currentBuf → state.buf2 (single-token)
@@ -2849,7 +2973,6 @@ def forwardSingleToken [GPUBackend β] (ctx : β)
       -- 1) Dequant the `tokenId` row from GPU-resident Q6_K table.
       --    Full table on GPU — no CPU→GPU transfer per token.
       Hesper.WGSL.Execute.withSection "plPre.gpuDequant" do
-        let rowOffset := tokenId * model.perLayerEmbdRowBytes
         let tokenIdBytes := Hesper.WebGPU.BufferOps.uint32ToBytes tokenId.toUInt32
         GPUBackend.writeBufferOffset ctx state.plRawRowBuf 0 tokenIdBytes
         let scaleFactor : Float := Float.sqrt embdPL.toFloat
@@ -2902,16 +3025,20 @@ def forwardSingleToken [GPUBackend β] (ctx : β)
   let mut currentBuf := state.buf2
   let mut nextBuf := state.buf1
 
+  dumpBuf ctx currentBuf (model.config.hiddenSize * 4).toUSize s!"single_p{pos}_postPLE"
+
   let mut blockIdx := 0
+  let skipPLE ← do pure (← IO.getEnv "HESPER_SKIP_PLE").isSome
   let plInputBuf := if model.config.hasPerLayerEmbeddings then some state.plInputAll else none
   for block in model.blocks do
-    let plEmbd := if blockIdx < model.perLayerBlocks.size then
+    let plEmbd := if blockIdx < model.perLayerBlocks.size && !skipPLE then
       model.perLayerBlocks[blockIdx]!
     else none
     forwardBlock ctx block model.config currentBuf nextBuf state pos (kcr := kcr) (perLayerEmbd := plEmbd) (perLayerInput := plInputBuf)
     let oldCb := currentBuf
     currentBuf := nextBuf
     nextBuf := oldCb
+    dumpBuf ctx currentBuf (model.config.hiddenSize * 4).toUSize s!"single_p{pos}_afterL{blockIdx}"
     blockIdx := blockIdx + 1
 
   -- Step 3: Final norm — Circuit DSL path.  The hand-written
