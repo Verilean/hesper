@@ -2137,6 +2137,15 @@ def forwardBlock [GPUBackend β] (ctx : β)
 
 /-! ## Column-major helper kernels for batched prefill -/
 
+/-- GPU-side parameter set: copy src[srcIdx] to dst[dstIdx].
+    Used to replace host→device writeBufferOffset in the per-token attention
+    loop, enabling the entire loop to run without host sync. -/
+private def copyU32Kernel (srcSize : Nat) (srcIdx : Nat) (dstSize : Nat) (dstIdx : Nat) : ShaderM Unit := do
+  let _src ← ShaderM.declareInputBuffer "src" (.array (.scalar .u32) srcSize)
+  let _dst ← ShaderM.declareOutputBuffer "dst" (.array (.scalar .u32) dstSize)
+  let v ← ShaderM.readBuffer (ty := .scalar .u32) (n := srcSize) "src" (Exp.litU32 srcIdx)
+  ShaderM.writeBuffer (ty := .scalar .u32) "dst" (Exp.litU32 dstIdx) v
+
 /-- Copy column `colIdx` from a column-major batch buffer into a contiguous
     single-row buffer.  `batch[colIdx * dim + i] → out[i]` for i in [0, dim). -/
 private def columnExtractKernel (dim : Nat) (seqLen : Nat) (colIdx : Nat) : ShaderM Unit := do
@@ -2226,13 +2235,34 @@ def forwardPrefillBatch [GPUBackend β] (ctx : β)
   -- them to be complete.  Individual kernel launches on the default
   -- stream are serialized by CUDA, so this is correct.
 
-  -- ── Step 1: Embedding lookup — per token into batch buffer ──────────
-  -- Embed each token into state.buf1, then copy into the batch buffer
-  -- at column position `i`.
+  -- ── Pre-upload: token IDs and positions to GPU ──────────────────────
+  -- Upload all token IDs and position indices to GPU buffers BEFORE any
+  -- kernel dispatch.  This eliminates per-token host→device transfers
+  -- inside the per-token attention loop, enabling batch dispatch.
+  let tokenIdsBuf ← GPUBackend.allocBuffer ctx (seqLen * 4).toUSize
+  let posBuf ← GPUBackend.allocBuffer ctx (seqLen * 4).toUSize
+  let mut tokBytes : ByteArray := ByteArray.empty
+  let mut posBytes : ByteArray := ByteArray.empty
   for i in [0:seqLen] do
     let tokenId := promptTokens[i]!
-    let tokenBytes := Hesper.WebGPU.BufferOps.uint32ToBytes tokenId.toUInt32
-    GPUBackend.writeBufferOffset ctx state.tokenBuf 0 tokenBytes
+    tokBytes := tokBytes ++ Hesper.WebGPU.BufferOps.uint32ToBytes tokenId.toUInt32
+    posBytes := posBytes ++ Hesper.WebGPU.BufferOps.uint32ToBytes i.toUInt32
+  -- cacheLenBuf[i] = i + 1 (number of KV cache entries after writing token i)
+  let cacheLenBuf ← GPUBackend.allocBuffer ctx (seqLen * 4).toUSize
+  let mut clBytes : ByteArray := ByteArray.empty
+  for i in [0:seqLen] do
+    clBytes := clBytes ++ Hesper.WebGPU.BufferOps.uint32ToBytes (i + 1).toUInt32
+  GPUBackend.writeBuffer ctx tokenIdsBuf tokBytes
+  GPUBackend.writeBuffer ctx posBuf posBytes
+  GPUBackend.writeBuffer ctx cacheLenBuf clBytes
+
+  -- ── Step 1: Embedding lookup — per token into batch buffer ──────────
+  for i in [0:seqLen] do
+    -- GPU-side: copy tokenIdsBuf[i] → state.tokenBuf[0]
+    GPUBackend.execute ctx
+      (copyU32Kernel seqLen i 1 0)
+      [("src", tokenIdsBuf), ("dst", state.tokenBuf)]
+      { numWorkgroups := (1, 1, 1), workgroupSize := { x := 1, y := 1, z := 1 } }
     match model.embdFormat with
     | .Q6_K =>
       ce s!"q6kEmbLookup_{i}"
@@ -2343,8 +2373,9 @@ def forwardPrefillBatch [GPUBackend β] (ctx : β)
       Linear.forwardBatchDP4A_fromQ8 ctx block.attention.wV batchQ8Buf batchVBuf seqLen
 
     -- ── 2c: Per-token attention loop ──────────────────────────────────
-    -- For each token: extract Q/K/V columns → per-head norms → RoPE →
-    -- KV cache write → flash attention → write attnOut column back.
+    -- All host→device transfers have been replaced with GPU-side copyU32Kernel,
+    -- so this entire loop can be batch-dispatched (no host sync needed).
+    GPUBackend.beginBatch ctx
     let wgSize := min headDim 256
     let isFull := cfg.isFullAttention li
     let kvLi := cfg.kvCacheLayer li
@@ -2385,8 +2416,11 @@ def forwardPrefillBatch [GPUBackend β] (ctx : β)
             workgroupSize := { x := wgSize, y := 1, z := 1 } : Hesper.ExecConfig }
 
       -- RoPE on Q: qBuf2 → qBuf
-      let posBytes := Hesper.WebGPU.BufferOps.uint32ToBytes pos.toUInt32
-      GPUBackend.writeBufferOffset ctx state.paramsBuf 0 posBytes
+      -- GPU-side: posBuf[i] → paramsBuf[0]
+      GPUBackend.execute ctx
+        (copyU32Kernel seqLen i 2 0)
+        [("src", posBuf), ("dst", state.paramsBuf)]
+        { numWorkgroups := (1, 1, 1), workgroupSize := { x := 1, y := 1, z := 1 } }
       match block.ropeFreqFactors with
       | some freqFactors =>
         ce s!"ropeFreqQ_pf_{headDim}_{i}"
@@ -2431,8 +2465,11 @@ def forwardPrefillBatch [GPUBackend β] (ctx : β)
 
         -- Flash attention
         let scale : Float := 1.0
-        let cacheLenBytes := Hesper.WebGPU.BufferOps.uint32ToBytes cacheLen.toUInt32
-        GPUBackend.writeBufferOffset ctx state.paramsBuf 4 cacheLenBytes
+        -- GPU-side: cacheLenBuf[i] → paramsBuf[1] (offset 4 bytes = u32 index 1)
+        GPUBackend.execute ctx
+          (copyU32Kernel seqLen i 2 1)
+          [("src", cacheLenBuf), ("dst", state.paramsBuf)]
+          { numWorkgroups := (1, 1, 1), workgroupSize := { x := 1, y := 1, z := 1 } }
         if cacheLen > 32 then
           FlashAttention.executeFlashAttentionTiled ctx
             state.qBuf kvCache.kBuf kvCache.vBuf state.attnOutBuf
@@ -2450,6 +2487,8 @@ def forwardPrefillBatch [GPUBackend β] (ctx : β)
           (columnInsertKernel qDim seqLen i)
           [("src", state.attnOutBuf), ("batch", batchAttnOutBuf)]
           (.dispatch1D qDim)
+
+    GPUBackend.endBatch ctx  -- flush all per-token attention dispatches
 
     -- ── 2d: O projection (batch matmul) ──────────────────────────────
     Linear.forwardBatchDP4A ctx block.attention.wO batchAttnOutBuf batchOProjBuf seqLen
@@ -3123,9 +3162,15 @@ def generate [GPUBackend β] (ctx : β) (model : Gemma4Model (GPUBackend.Buf β)
   -- Phase 1: Prefill (process prompt tokens)
   IO.println s!"[Prefill] Processing {promptTokens.size} prompt tokens..."
   let prefillStart ← IO.monoNanosNow
-  for i in [0:promptTokens.size] do
-    if i >= model.config.maxSeqLen then break
-    forwardSingleToken ctx model promptTokens[i]! i state (kcr := some kcr)
+  let useBatch := promptTokens.size > 1
+    && (match ← IO.getEnv "HESPER_BATCH_PREFILL" with | some "0" => false | _ => true)
+  if useBatch then
+    IO.println s!"[Prefill] Batched path (seqLen={promptTokens.size})"
+    forwardPrefillBatch ctx model promptTokens state (kcr := some kcr)
+  else
+    for i in [0:promptTokens.size] do
+      if i >= model.config.maxSeqLen then break
+      forwardSingleToken ctx model promptTokens[i]! i state (kcr := some kcr)
   let prefillEnd ← IO.monoNanosNow
   let prefillMs := (prefillEnd - prefillStart).toFloat / 1_000_000.0
   IO.println s!"[Prefill] Done in {prefillMs} ms"
