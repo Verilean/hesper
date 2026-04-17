@@ -2513,7 +2513,110 @@ def forwardPrefillBatch [GPUBackend β] (ctx : β)
         [("src", state.buf2), ("batch", nextBuf)]
         (.dispatch1D dim)
 
-    -- Skip per-layer embeddings and layer output scale for prefill.
+    -- ── 2h: Per-layer embedding + layer output scale (per-token) ──────
+    -- Gemma 4 E4B uses per_layer_token_embd: each layer's output gets an
+    -- additive embedding that depends on both the layer index and the
+    -- token's per-layer input (precomputed in Step 1b).  We also apply
+    -- the layer output scale (a single scalar multiply per layer).
+    let blockIdx := li
+    let plEmbd := if blockIdx < model.perLayerBlocks.size then
+      model.perLayerBlocks[blockIdx]!
+    else none
+    match plEmbd with
+    | some ple =>
+      -- Per-layer embedding for each token position
+      for i in [0:seqLen] do
+        -- Extract this token's output column → state.buf2
+        GPUBackend.execute ctx
+          (columnExtractKernel dim seqLen i)
+          [("batch", nextBuf), ("out", state.buf2)]
+          (.dispatch1D dim)
+        -- Compute per-layer input for token i (if not already in state.plInputAll
+        -- from Step 1b).  Step 1b precomputed for ALL tokens but stored the last.
+        -- For simplicity, we recompute for each token here (correct but slower).
+        let tokenId := promptTokens[i]!
+        match model.perLayerEmbdTableCPU, model.perLayerModelProj, model.perLayerProjNorm with
+        | some embdTableCPU, some modelProj, some projNorm =>
+          let embdPL := cfg.embdPerLayer
+          let nLayers := cfg.numHiddenLayers
+          let totalPL := embdPL * nLayers
+          let rowOffset := tokenId * model.perLayerEmbdRowBytes
+          let rowBytes := embdTableCPU.extract rowOffset (rowOffset + model.perLayerEmbdRowBytes)
+          GPUBackend.writeBufferOffset ctx state.plRawRowBuf 0 rowBytes
+          let scaleFactor : Float := Float.sqrt embdPL.toFloat
+          GPUBackend.execute ctx
+            (Hesper.Quantization.Q6_K.q6kSingleRowDequantScaleKernel totalPL scaleFactor)
+            [("row", state.plRawRowBuf), ("output", state.plModelProj)]
+            (.dispatch1D totalPL)
+          let projConfig : Hesper.WGSL.MatMul.Config := { M := 1, N := totalPL, K := dim }
+          if projConfig.K % 64 == 0 then
+            Hesper.WGSL.MatMul.executeMatMulTransposeF16BlockCoop ctx state.buf2 modelProj state.plTokenSelected projConfig
+          else
+            Hesper.WGSL.MatMul.executeMatMulTransposeF16 ctx state.buf2 modelProj state.plTokenSelected projConfig
+          GPUBackend.execute ctx
+            (PerLayerEmbedding.scaleKernel totalPL (1.0 / Float.sqrt dim.toFloat))
+            [("input", state.plTokenSelected), ("output", state.plInputAll)]
+            (.dispatch1D totalPL)
+          GPUBackend.execute ctx
+            (chunkedRMSNormKernel embdPL nLayers cfg.rmsNormEps)
+            [("input", state.plInputAll), ("weight", projNorm.scale), ("output", state.plTokenSelected)]
+            { numWorkgroups := (nLayers, 1, 1), workgroupSize := { x := min embdPL 256, y := 1, z := 1 } : Hesper.ExecConfig }
+          GPUBackend.execute ctx
+            (scaledAddKernel totalPL (1.0 / Float.sqrt 2.0))
+            [("a", state.plTokenSelected), ("b", state.plModelProj), ("output", state.plInputAll)]
+            (.dispatch1D totalPL)
+        | _, _, _ => pure ()
+        -- Now run the actual per-layer embedding ops on state.buf2
+        -- (inpGate matmul → gelu*gate*slice → proj → postNorm+add)
+        let plOffset := li * cfg.embdPerLayer
+        let plTotalSize := cfg.embdPerLayer * cfg.numHiddenLayers
+        Linear.LinearLayer.forward ctx ple.inpGate state.buf2 state.plGateBuf
+        GPUBackend.execute ctx
+          (PerLayerEmbedding.geluGateMulSliceKernel cfg.embdPerLayer plTotalSize plOffset)
+          [("gate", state.plGateBuf), ("per_layer_input", state.plInputAll), ("output", state.moeRouterOutBuf)]
+          (.dispatch1D cfg.embdPerLayer)
+        Linear.LinearLayer.forward ctx ple.proj state.moeRouterOutBuf state.plProjBuf
+        GPUBackend.execute ctx
+          (fusedPerLayerPostKernel cfg.hiddenSize cfg.rmsNormEps)
+          [("proj", state.plProjBuf), ("weight", ple.postNorm.scale), ("residual", state.buf2)]
+          { numWorkgroups := (1, 1, 1), workgroupSize := { x := 256, y := 1, z := 1 }
+            extensions := ["subgroups"] : Hesper.ExecConfig }
+        -- Insert modified output back into batch buffer
+        GPUBackend.execute ctx
+          (columnInsertKernel dim seqLen i)
+          [("src", state.buf2), ("batch", nextBuf)]
+          (.dispatch1D dim)
+    | none => pure ()
+
+    -- Layer output scale (per-token) — uses Circuit DSL scalar broadcast multiply
+    match block.outScale with
+    | some scale =>
+      for i in [0:seqLen] do
+        GPUBackend.execute ctx
+          (columnExtractKernel dim seqLen i)
+          [("batch", nextBuf), ("out", state.buf2)]
+          (.dispatch1D dim)
+        -- output[j] = buf2[j] * scale[0] via Circuit DSL runCachedFused
+        let key := hash ("batchPrefillOutScale", dim, li, i)
+        let ccRef ← Hesper.Circuit.getGlobalCircuitRef (β := β) key
+        Hesper.Circuit.runCachedFused ctx ccRef
+          (do
+            let x ← Hesper.Circuit.CircuitM.registerExternal
+                      (BufT := GPUBackend.Buf β) (CacheT := GPUBackend.CachedDispatch β)
+                      state.buf2 #[dim] .f32 .Global
+            let s ← Hesper.Circuit.CircuitM.registerExternal
+                      (BufT := GPUBackend.Buf β) (CacheT := GPUBackend.CachedDispatch β)
+                      scale #[1] .f32 .Global
+            let scaled ← Hesper.Circuit.CircuitM.scaleByBroadcast x s
+            let _out   ← Hesper.Circuit.CircuitM.map scaled
+                           (.mul (.input 0) (.const 1.0))
+            pure ())
+          [(0, state.buf2), (1, scale), (5, state.buf2)]
+        GPUBackend.execute ctx
+          (columnInsertKernel dim seqLen i)
+          [("src", state.buf2), ("batch", nextBuf)]
+          (.dispatch1D dim)
+    | none => pure ()
 
     -- Swap ping-pong buffers
     let oldCur := currentBuf
