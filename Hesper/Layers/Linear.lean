@@ -1722,9 +1722,20 @@ def fusedQ4KMGateUpDP4A4RowKernel (config : Config) : ShaderM Unit := do
   let bq8Off := Exp.mul pairIdx (Exp.litU32 2)
 
   let halvedTrip := (blocksPerRow + 1) / 2
-  ShaderM.loop (Exp.litU32 0) (Exp.litU32 halvedTrip) (Exp.litU32 1) fun iter => do
-    let blockIdx := Exp.add (Exp.mul iter (Exp.litU32 2)) blockOff
-    let blockInRange := Exp.lt blockIdx (Exp.litU32 blocksPerRow)
+  -- Unroll the outer loop at Lean codegen time.  halvedTrip is a
+  -- compile-time constant (5 for Gemma 4's inDim=2560); emitting the
+  -- iterations linearly lets the PTX compiler schedule loads across
+  -- the whole body, hide ~4 rounds of global-memory latency, and
+  -- fold the OOB guard entirely when blocksPerRow is even.
+  for iterNat in [0 : halvedTrip] do
+    let iterU32 := Exp.litU32 iterNat
+    let blockIdx := Exp.add (Exp.mul iterU32 (Exp.litU32 2)) blockOff
+    let blockInRange :=
+      if 2 * iterNat + 1 < blocksPerRow then
+        -- Both halves are always in range for this iteration.
+        Exp.litBool true
+      else
+        Exp.lt blockIdx (Exp.litU32 blocksPerRow)
     -- Clamp OOB reads to block 0 so they hit valid memory; their
     -- contribution is gated below via `blockInRange`.
     let safeBlockIdx := Exp.select blockInRange blockIdx (Exp.litU32 0)
@@ -2023,8 +2034,12 @@ def fusedQ4KMLinearDP4A4WarpKernel (config : Config) : ShaderM Unit := do
 
   let inBounds := Exp.lt outIdx (Exp.litU32 config.outDim)
 
-  -- Lane decomposition within a warp — unchanged from 1-row kernel.
+  -- Lane decomposition within a warp.  Top-half lanes (laneId>>4 == 1) pick
+  -- up a second block per outer iteration via the shared warp stride, so
+  -- the warp covers 2 blocks per iteration with 0% duplicated work and no
+  -- subgroupAdd correction.
   let laneLow := Exp.bitAnd laneId (Exp.litU32 15)
+  let blockOff := Exp.shiftRight laneId (Exp.litU32 4)  -- 0 (bottom half) or 1 (top half)
   let pairIdxInRow := Exp.div laneLow (Exp.litU32 4)
   let elemOff := Exp.sub laneLow (Exp.mul pairIdxInRow (Exp.litU32 4))
   let bq8Off := Exp.mul pairIdxInRow (Exp.litU32 2)
@@ -2034,8 +2049,24 @@ def fusedQ4KMLinearDP4A4WarpKernel (config : Config) : ShaderM Unit := do
   ShaderM.varNamed "acc" (.scalar .f32) (Exp.litF32 0.0)
   let acc : Exp (.scalar .f32) := Exp.var "acc"
 
-  -- Warp-strided loop: warp w handles blocks [w, w+4, w+8, ...].
-  ShaderM.loop warpId (Exp.litU32 blocksPerRow) (Exp.litU32 4) fun blockIdx => do
+  -- Super-warp stride: the 4 warps collectively cover blocks in groups of 8
+  -- (each warp advances by 8 per outer iteration and each warp handles 2
+  -- blocks per iteration via its halves).  Warp w's bottom half handles
+  -- blockIdx = w*2 + iter*8; top half handles blockIdx = w*2 + 1 + iter*8.
+  -- For blocksPerRow=10 this gives warp 0:{0,1,8,9}, warp 1:{2,3}, warp
+  -- 2:{4,5}, warp 3:{6,7} — covers all 10 blocks with no overlap, compared
+  -- to the previous stride-4 scheme where each warp wasted 50% on
+  -- duplicated lanes 0..15 ↔ 16..31 work.
+  let warpBase := Exp.mul warpId (Exp.litU32 2)
+  let iterCount := (blocksPerRow + 7) / 8
+  ShaderM.loop (Exp.litU32 0) (Exp.litU32 iterCount) (Exp.litU32 1) fun iter => do
+    let blockIdx := Exp.add warpBase (Exp.add (Exp.mul iter (Exp.litU32 8)) blockOff)
+    let blockInRange := Exp.lt blockIdx (Exp.litU32 blocksPerRow)
+    let safeBlockIdx := Exp.select blockInRange blockIdx (Exp.litU32 0)
+    let _unused := safeBlockIdx
+    -- Use safeBlockIdx for memory reads (never OOB) and gate the
+    -- contribution on blockInRange.
+    let blockIdx := safeBlockIdx
     let blockU32Base := Exp.add rowBaseU32 (Exp.mul blockIdx (Exp.litU32 36))
 
     let dmU32 ← ShaderM.readBuffer (ty := .scalar .u32) (n := totalWeightU32) "weights" blockU32Base
@@ -2110,12 +2141,16 @@ def fusedQ4KMLinearDP4A4WarpKernel (config : Config) : ShaderM Unit := do
     let blockSumfD := Exp.add sumfD_0 sumfD_1
     let blockSumfM := Exp.add sumfM_0 sumfM_1
     let blockContrib := Exp.sub (Exp.mul dF blockSumfD) (Exp.mul dminF blockSumfM)
-    ShaderM.assign "acc" (Exp.add acc blockContrib)
+    -- Gate OOB iterations (only possible when a warp's super-stride slot
+    -- reaches past blocksPerRow).
+    let gatedContrib := Exp.select blockInRange blockContrib (Exp.litF32 0.0)
+    ShaderM.assign "acc" (Exp.add acc gatedContrib)
 
-  -- Intra-warp reduce: 32 lanes → lane 0 of each warp holds the warp total.
-  -- ×0.5 because lanes 0..15 and 16..31 duplicate work (same as 1-row/2-row).
-  ShaderM.varNamed "warpTotal" (.scalar .f32)
-    (Exp.mul (Exp.subgroupAdd acc) (Exp.litF32 0.5))
+  -- Intra-warp reduce: top-half and bottom-half lanes cover distinct
+  -- blocks, so the full subgroup sum is the exact partial — no ×0.5
+  -- correction needed (see the paired duplicate-work fix in the 4-row
+  -- and fused-KV kernels, commits 097cca7 + 8db8588).
+  ShaderM.varNamed "warpTotal" (.scalar .f32) (Exp.subgroupAdd acc)
   let warpTotal : Exp (.scalar .f32) := Exp.var "warpTotal"
 
   -- Lane 0 of warps 1..3 writes to smem; warp 0 keeps its value in register.
