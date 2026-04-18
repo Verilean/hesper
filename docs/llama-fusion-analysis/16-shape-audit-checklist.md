@@ -25,6 +25,47 @@ kernels block unifying `forwardSingleToken` with `forwardPrefillBatch`.
 Remaining structural item (2) is the biggest single lever — ≈ −3780
 additional dispatches — but also the riskiest. 
 
+## Current state (2026-04-19, post-`1f85284`)
+
+**Measured on Gemma 4 E4B Q4_K_M, RTX 4070 Ti, `"Hello world how are
+you"` (seqLen=9):**
+
+| Metric | Original | Current | Change |
+|---|---|---|---|
+| Prefill wall | 290 ms | **213 ms** | −27 % |
+| Decode TPS (single-token path) | 85 | **85** | unchanged |
+| Multi-token correctness | `"are are…"` | `"stst{}}<tool_call|>…"` | still wrong (different wrong) |
+
+**Live architecture ground truth (via new `HESPER_LAYER_PROFILE=1` probe,
+commit `848c14f`):**
+
+```
+Gemma 4 E4B: 42 layers = 7 full-attn + 35 SWA + 18 shared-KV
+             ropeFreq_layers = 7
+```
+
+Only **17 %** of layers (the 7 full-attention ones) currently enter the
+batched attention fast path.  The other **83 %** — all 35 SWA layers and
+all 18 shared-KV layers — still go through the per-token fallback at
+Gemma4.lean:2936-3046.  That is why items 1 and 3 only brought prefill
+from 290 ms to 213 ms: they optimized the things that happen *around*
+the fallback, not the fallback itself.  The fallback is item 2.
+
+**Correctness diagnostic** (see doc 17 for details):
+
+- With `HESPER_SKIP_PLE=1`, both pre- and post-item-3 versions produce
+  bit-identical garbage output — the pre-existing `"are are…"` bug is
+  NOT in the code we've already refactored.  It lives in the
+  interaction between the PLE path and the per-token attention
+  fallback.  Item 2 is likely to move the needle on correctness as
+  well as dispatch count.
+- Naive attempt at item 2 (feed `freq_factors=1.0` to SWA layers so
+  they share the existing batched kernel) was reverted: regressed both
+  perf (250 → 4 222 ms prefill) and correctness (output shifted but
+  did not recover).  Revised plan in doc 17 requires a bit-parity
+  test harness first.
+
+
 Legend:
 - **A** — already N-aware: accepts seqLen as a runtime/grid dim and
   produces correct output for N>1 without being called in a loop.
