@@ -1305,6 +1305,8 @@ private def loadLinear [GPUBackend β] (ctx : β) (gguf : Hesper.GGUF.GGUFFile)
   let dp4aQ8Buf ← IO.mkRef none
   let dp4aQuantizePrepared ← GPUBackend.newCacheRef (β := β)
   let dp4aMatmulPrepared ← GPUBackend.newCacheRef (β := β)
+  let dp4aBatchQuantizePrepared ← GPUBackend.newCacheRef (β := β)
+  let dp4aBatchMatmulPrepared ← GPUBackend.newCacheRef (β := β)
   return {
     config := { inDim, outDim }
     weightBuf
@@ -1316,6 +1318,8 @@ private def loadLinear [GPUBackend β] (ctx : β) (gguf : Hesper.GGUF.GGUFFile)
     dp4aQ8Buf
     dp4aQuantizePrepared
     dp4aMatmulPrepared
+    dp4aBatchQuantizePrepared
+    dp4aBatchMatmulPrepared
   }
 
 /-- Load Gemma 4 model from GGUF file -/
@@ -2661,6 +2665,12 @@ def forwardPrefillBatch [GPUBackend β] (ctx : β)
   let batchScaledEmbdBuf ← mkBuf (dim * seqLen)
   let colIdxBuf ← GPUBackend.allocBuffer ctx (4 : USize)
 
+  -- Debug dumps (per-token column extracts + disk writes) are extremely
+  -- expensive: 5 loops × 9 tokens × 42 blocks ≈ 1540 wasted dispatches
+  -- per prefill when `HESPER_DUMP_DIR` is unset.  Skip the extract+dump
+  -- chain entirely in the common case.
+  let dumpEnabled := (← IO.getEnv "HESPER_DUMP_DIR").isSome
+
   -- NOTE: no beginBatch here — each dispatch fires immediately.
   -- Batching would defer all launches until endBatch, but the per-token
   -- attention loop reads batch matmul outputs mid-stream, requiring
@@ -2818,7 +2828,7 @@ def forwardPrefillBatch [GPUBackend β] (ctx : β)
   let mut nextBuf := batchBuf1
 
   -- Dump post-PLE state for each token (extract each column to state.buf1 and dump)
-  for i in [0:seqLen] do
+  if dumpEnabled then for i in [0:seqLen] do
     let idxBytes := Hesper.WebGPU.BufferOps.uint32ToBytes i.toUInt32
     GPUBackend.writeBufferOffset ctx colIdxBuf 0 idxBytes
     GPUBackend.execute ctx
@@ -3065,7 +3075,7 @@ def forwardPrefillBatch [GPUBackend β] (ctx : β)
         (.dispatch1D dim)
 
     -- Diagnostic: dump currentBuf col 0 at L1 after attention inner loop / after O proj
-    if li = 1 then
+    if dumpEnabled && li = 1 then
       GPUBackend.writeBufferOffset ctx colIdxBuf 0 (Hesper.WebGPU.BufferOps.uint32ToBytes 0)
       GPUBackend.execute ctx
         (columnExtractKernel dim seqLen)
@@ -3074,7 +3084,7 @@ def forwardPrefillBatch [GPUBackend β] (ctx : β)
       dumpBuf ctx state.buf1 (dim * 4).toUSize s!"batch_t0_currBufL1afterAttnOProj"
 
     -- Dump post-attn residual for each token (batch diagnostic) — only L0/L1 for brevity
-    if li ≤ 2 then for i in [0:seqLen] do
+    if dumpEnabled && li ≤ 2 then for i in [0:seqLen] do
       let idxBytes := Hesper.WebGPU.BufferOps.uint32ToBytes i.toUInt32
       GPUBackend.writeBufferOffset ctx colIdxBuf 0 idxBytes
       GPUBackend.execute ctx
@@ -3139,7 +3149,7 @@ def forwardPrefillBatch [GPUBackend β] (ctx : β)
         (.dispatch1D dim)
 
     -- Dump post-FFN (pre-PLE) state
-    for i in [0:seqLen] do
+    if dumpEnabled then for i in [0:seqLen] do
       let idxBytes := Hesper.WebGPU.BufferOps.uint32ToBytes i.toUInt32
       GPUBackend.writeBufferOffset ctx colIdxBuf 0 idxBytes
       GPUBackend.execute ctx
@@ -3221,7 +3231,7 @@ def forwardPrefillBatch [GPUBackend β] (ctx : β)
     | none => pure ()
 
     -- Dump post-PLE (pre-outScale) state
-    for i in [0:seqLen] do
+    if dumpEnabled then for i in [0:seqLen] do
       let idxBytes := Hesper.WebGPU.BufferOps.uint32ToBytes i.toUInt32
       GPUBackend.writeBufferOffset ctx colIdxBuf 0 idxBytes
       GPUBackend.execute ctx
@@ -3273,7 +3283,7 @@ def forwardPrefillBatch [GPUBackend β] (ctx : β)
     nextBuf := oldCur
 
     -- Dump post-layer state for each token
-    for i in [0:seqLen] do
+    if dumpEnabled then for i in [0:seqLen] do
       let idxBytes := Hesper.WebGPU.BufferOps.uint32ToBytes i.toUInt32
       GPUBackend.writeBufferOffset ctx colIdxBuf 0 idxBytes
       GPUBackend.execute ctx
