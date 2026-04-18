@@ -2663,6 +2663,10 @@ def forwardPrefillBatch [GPUBackend β] (ctx : β)
   let batchFFNOutBuf ← mkBuf (dim * seqLen)
   -- Scaled embedding cache: PLE input uses the embedding (not per-layer output)
   let batchScaledEmbdBuf ← mkBuf (dim * seqLen)
+  -- PLE batched scratch: inpGate output, gelu*gate*slice output, proj output.
+  let plGateBatchBuf ← mkBuf (cfg.embdPerLayer * seqLen)
+  let plMoeOutBatchBuf ← mkBuf (cfg.embdPerLayer * seqLen)
+  let plProjBatchBuf ← mkBuf (dim * seqLen)
   let colIdxBuf ← GPUBackend.allocBuffer ctx (4 : USize)
 
   -- Debug dumps (per-token column extracts + disk writes) are extremely
@@ -2840,6 +2844,15 @@ def forwardPrefillBatch [GPUBackend β] (ctx : β)
   let nBlocksToRun := match ← IO.getEnv "HESPER_PREFILL_LAYERS" with
     | some s => s.toNat!
     | none => model.blocks.size
+  -- Architecture diagnostic: set HESPER_LAYER_PROFILE=1 to print layer mix.
+  if (← IO.getEnv "HESPER_LAYER_PROFILE").isSome then
+    let mut full := 0
+    let mut swa := 0
+    let mut shared := 0
+    for b in model.blocks do
+      if cfg.isFullAttention b.layerIdx then full := full + 1 else swa := swa + 1
+      if !cfg.hasKV b.layerIdx then shared := shared + 1
+    IO.println s!"[LayerProfile] total={model.blocks.size} full={full} swa={swa} kvShared={shared} ropeFreq_layers={(model.blocks.filter (fun b => b.ropeFreqFactors.isSome)).size}"
   for block in model.blocks.extract 0 nBlocksToRun do
     let li := block.layerIdx
     let headDim := cfg.headDim li
@@ -3145,64 +3158,30 @@ def forwardPrefillBatch [GPUBackend β] (ctx : β)
     else none
     match plEmbd with
     | some ple =>
-      -- Per-layer embedding for each token position.  plInputAll for
-      -- each prompt token was precomputed once before the block loop
-      -- (see `batchPLInputAllOpt` above) — here we just extract the
-      -- relevant column from the batched scratch into `state.plInputAll`,
-      -- saving 42× redundant PLE recompute per layer.
-      for i in [0:seqLen] do
-        let colIdxBytes := Hesper.WebGPU.BufferOps.uint32ToBytes i.toUInt32
-        match batchPLInputAllOpt with
-        | some batchPL =>
-          let embdPL := cfg.embdPerLayer
-          let nLayers := cfg.numHiddenLayers
-          let totalPL := embdPL * nLayers
-          GPUBackend.writeBufferOffset ctx colIdxBuf 0 colIdxBytes
-          -- Copy column i of batchPLInputAll (contiguous at offset
-          -- i*totalPL) into the single-token state.plInputAll buffer.
-          let extractShader : ShaderM Unit := do
-            let gid ← ShaderM.globalId
-            let k := Exp.vec3X gid
-            let _src ← ShaderM.declareInputBuffer "src" (.array (.scalar .f32) (seqLen * totalPL))
-            let _params ← ShaderM.declareInputBuffer "params" (.array (.scalar .u32) 1)
-            let _dst ← ShaderM.declareOutputBuffer "dst" (.array (.scalar .f32) totalPL)
-            ShaderM.if_ (Exp.lt k (Exp.litU32 totalPL)) (do
-              let colId ← ShaderM.readBuffer (ty := .scalar .u32) (n := 1) "params" (Exp.litU32 0)
-              let srcOff := Exp.add (Exp.mul colId (Exp.litU32 totalPL)) k
-              let v ← ShaderM.readBuffer (ty := .scalar .f32) (n := seqLen * totalPL) "src" srcOff
-              ShaderM.writeBuffer (ty := .scalar .f32) "dst" k v) (pure ())
-          ce "plInputAllExtract"
-            extractShader
-            [("src", batchPL), ("params", colIdxBuf), ("dst", state.plInputAll)]
-            (.dispatch1D totalPL)
-        | none => pure ()
-        -- Extract this token's output column → state.buf2 (input to PLE inpGate)
-        GPUBackend.writeBufferOffset ctx colIdxBuf 0 colIdxBytes
-        GPUBackend.execute ctx
-          (columnExtractKernel dim seqLen)
-          [("batch", nextBuf), ("params", colIdxBuf), ("out", state.buf2)]
-          (.dispatch1D dim)
-        -- Now run the actual per-layer embedding ops on state.buf2
-        -- (inpGate matmul → gelu*gate*slice → proj → postNorm+add)
+      -- Per-layer embedding path — fully batched across seqLen.  Replaces
+      -- the old per-token loop (9 × 42 × 6 = 2268 dispatches) with 4
+      -- dispatches per layer (matmul + gelu*gate*slice + matmul + norm+add).
+      match batchPLInputAllOpt with
+      | some batchPL =>
         let plOffset := li * cfg.embdPerLayer
         let plTotalSize := cfg.embdPerLayer * cfg.numHiddenLayers
-        Linear.LinearLayer.forward ctx ple.inpGate state.buf2 state.plGateBuf
-        GPUBackend.execute ctx
-          (PerLayerEmbedding.geluGateMulSliceKernel cfg.embdPerLayer plTotalSize plOffset)
-          [("gate", state.plGateBuf), ("per_layer_input", state.plInputAll), ("output", state.moeRouterOutBuf)]
-          (.dispatch1D cfg.embdPerLayer)
-        Linear.LinearLayer.forward ctx ple.proj state.moeRouterOutBuf state.plProjBuf
-        GPUBackend.execute ctx
-          (fusedPerLayerPostKernel cfg.hiddenSize cfg.rmsNormEps)
-          [("proj", state.plProjBuf), ("weight", ple.postNorm.scale), ("residual", state.buf2)]
-          { numWorkgroups := (1, 1, 1), workgroupSize := { x := 256, y := 1, z := 1 }
-            extensions := ["subgroups"] : Hesper.ExecConfig }
-        -- Insert modified output back into batch buffer
-        GPUBackend.writeBufferOffset ctx colIdxBuf 0 colIdxBytes
-        GPUBackend.execute ctx
-          (columnInsertKernel dim seqLen)
-          [("src", state.buf2), ("params", colIdxBuf), ("batch", nextBuf)]
-          (.dispatch1D dim)
+        -- 1) inpGate matmul: nextBuf [dim, seqLen] → plGateBatchBuf [embdPerLayer, seqLen]
+        Linear.forwardBatchDP4A ctx ple.inpGate nextBuf plGateBatchBuf seqLen
+        -- 2) GELU(gate) * per_layer_input[li_slice] — batched across seqLen
+        ce s!"pleGeluGateMulSliceBatch"
+          (PerLayerEmbedding.geluGateMulSliceBatchKernel cfg.embdPerLayer plTotalSize plOffset seqLen)
+          [("gate", plGateBatchBuf), ("per_layer_input", batchPL), ("output", plMoeOutBatchBuf)]
+          (.dispatch1D (cfg.embdPerLayer * seqLen))
+        -- 3) proj matmul: plMoeOutBatchBuf [embdPerLayer, seqLen] → plProjBatchBuf [dim, seqLen]
+        Linear.forwardBatchDP4A ctx ple.proj plMoeOutBatchBuf plProjBatchBuf seqLen
+        -- 4) Fused post-norm + residual add: nextBuf[i,d] = RMSNorm(plProj[i,:])[d] * scale[d] + nextBuf[i,d]
+        let plePostKey := hash ("plePostNormAddBatch", cfg.hiddenSize, seqLen)
+        let plePostRef ← match kcr with
+          | some k => k.getRef plePostKey
+          | none => IO.mkRef none
+        RMSNorm.forwardNormThenAddBatch ctx ple.postNorm
+          plProjBatchBuf nextBuf nextBuf seqLen plePostRef
+      | none => pure ()
     | none => pure ()
 
     -- Dump post-PLE (pre-outScale) state
@@ -3367,6 +3346,9 @@ def forwardPrefillBatch [GPUBackend β] (ctx : β)
   GPUBackend.freeBuffer ctx batchGeluBuf
   GPUBackend.freeBuffer ctx batchFFNOutBuf
   GPUBackend.freeBuffer ctx colIdxBuf
+  GPUBackend.freeBuffer ctx plGateBatchBuf
+  GPUBackend.freeBuffer ctx plMoeOutBatchBuf
+  GPUBackend.freeBuffer ctx plProjBatchBuf
   match batchPLInputAllOpt with
   | some b => GPUBackend.freeBuffer ctx b
   | none => pure ()

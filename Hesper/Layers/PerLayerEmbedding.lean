@@ -126,6 +126,44 @@ def geluGateMulSliceKernel (size plTotalSize plOffset : Nat) : ShaderM Unit := d
     ShaderM.writeBuffer (ty := .scalar .f32) "output" idx (Exp.mul gelu plVal)
   ) (pure ())
 
+/-- Batched version of `geluGateMulSliceKernel`: processes all `seqLen`
+    columns in one dispatch.
+
+    Input layout:
+      gate                [size * seqLen]  — col-major, col i at offset i*size
+      per_layer_input     [seqLen * plTotalSize] — token-major, token i at
+                                                    offset i*plTotalSize
+    Output layout:
+      output              [size * seqLen]  — col-major (same as gate)
+
+    Grid: dispatch1D(size * seqLen); thread `tix` handles element `(i, d)`
+    where `i = tix / size`, `d = tix % size`. -/
+def geluGateMulSliceBatchKernel (size plTotalSize plOffset seqLen : Nat) : ShaderM Unit := do
+  let gid ← ShaderM.globalId
+  let idx := Exp.vec3X gid
+  let total := size * seqLen
+
+  let _gate ← ShaderM.declareInputBuffer "gate" (.array (.scalar .f32) total)
+  let _perLayerInput ← ShaderM.declareInputBuffer "per_layer_input" (.array (.scalar .f32) (seqLen * plTotalSize))
+  let _output ← ShaderM.declareOutputBuffer "output" (.array (.scalar .f32) total)
+
+  ShaderM.if_ (Exp.lt idx (Exp.litU32 total)) (do
+    let col := Exp.div idx (Exp.litU32 size)
+    let d := Exp.sub idx (Exp.mul col (Exp.litU32 size))
+    let gateVal ← ShaderM.readBuffer (ty := .scalar .f32) (n := total) "gate" idx
+    -- per_layer_input offset: col*plTotalSize + plOffset + d
+    let plIdx := Exp.add (Exp.mul col (Exp.litU32 plTotalSize))
+                         (Exp.add (Exp.litU32 plOffset) d)
+    let plVal ← ShaderM.readBuffer (ty := .scalar .f32) (n := seqLen * plTotalSize) "per_layer_input" plIdx
+
+    -- GELU approximation (matches geluGateMulSliceKernel)
+    let sqrt2OverPi := Exp.litF32 0.7978845608028654
+    let x3 := Exp.mul (Exp.mul gateVal gateVal) gateVal
+    let inner := Exp.mul sqrt2OverPi (Exp.add gateVal (Exp.mul (Exp.litF32 0.044715) x3))
+    let gelu := Exp.mul (Exp.mul (Exp.litF32 0.5) gateVal) (Exp.add (Exp.litF32 1.0) (Exp.tanh inner))
+    ShaderM.writeBuffer (ty := .scalar .f32) "output" idx (Exp.mul gelu plVal)
+  ) (pure ())
+
 /-! ## Per-Layer Input Pre-Processing Kernels -/
 
 /-- Scale kernel: y = x * scaleFactor
