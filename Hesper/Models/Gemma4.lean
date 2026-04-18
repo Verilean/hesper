@@ -360,6 +360,134 @@ def ropeWithFreqFactorsKernel (headDim numHeads : Nat) (ropeBase : Float) : Shad
     ShaderM.writeBuffer (ty := .scalar .f32) "output" idx1 x1_new
   ) (pure ())
 
+/-- Batched RoPE-Q with frequency factors: rotates Q for all `seqLen` query
+    tokens.  Q layout: [seqLen, numHeads, headDim] column-major
+    (`q[col * (numHeads * headDim) + h * headDim + d]`).
+
+    `params[0]` = startPos.  Token at column `col` uses pos = startPos + col.
+    Grid: dispatch1D(numHeads * dimPairs * seqLen). -/
+def ropeWithFreqFactorsBatchKernel (headDim numHeads seqLen : Nat) (ropeBase : Float) : ShaderM Unit := do
+  let gid ← ShaderM.globalId
+  let idx := Exp.vec3X gid
+
+  let dimPairs := headDim / 2
+  let perTokenElems := numHeads * dimPairs
+  let totalElements := perTokenElems * seqLen
+
+  let qDim := numHeads * headDim
+  let _input  ← ShaderM.declareInputBuffer "input"  (.array (.scalar .f32) (qDim * seqLen))
+  let _output ← ShaderM.declareOutputBuffer "output" (.array (.scalar .f32) (qDim * seqLen))
+  let _params ← ShaderM.declareInputBuffer "params" (.array (.scalar .u32) 1)
+  let _freqFactors ← ShaderM.declareInputBuffer "freq_factors" (.array (.scalar .f32) dimPairs)
+
+  ShaderM.if_ (Exp.lt idx (Exp.litU32 totalElements)) (do
+    let col := Exp.div idx (Exp.litU32 perTokenElems)
+    let withinTok := Exp.sub idx (Exp.mul col (Exp.litU32 perTokenElems))
+    let dimPair := Exp.mod withinTok (Exp.litU32 dimPairs)
+    let head    := Exp.div withinTok (Exp.litU32 dimPairs)
+
+    let startPos ← ShaderM.readBuffer (ty := .scalar .u32) (n := 1) "params" (Exp.litU32 0)
+    let pos := Exp.add startPos col
+    let posF32 := Exp.toF32 pos
+
+    let freqFactor ← ShaderM.readBuffer (ty := .scalar .f32) (n := dimPairs) "freq_factors" dimPair
+
+    let dimPairF32 := Exp.toF32 dimPair
+    let exponent := Exp.div (Exp.mul (Exp.litF32 2.0) dimPairF32) (Exp.litF32 headDim.toFloat)
+    let freqInv := Exp.pow (Exp.litF32 ropeBase) (Exp.neg exponent)
+    let theta := Exp.div (Exp.mul posF32 freqInv) freqFactor
+    let cosTheta := Exp.cos theta
+    let sinTheta := Exp.sin theta
+
+    let halfDim := headDim / 2
+    let colBase    := Exp.mul col (Exp.litU32 qDim)
+    let headOffset := Exp.mul head (Exp.litU32 headDim)
+    let idx0 := Exp.add (Exp.add colBase headOffset) dimPair
+    let idx1 := Exp.add (Exp.add colBase headOffset) (Exp.add dimPair (Exp.litU32 halfDim))
+
+    let x0 ← ShaderM.readBuffer (ty := .scalar .f32) (n := qDim * seqLen) "input" idx0
+    let x1 ← ShaderM.readBuffer (ty := .scalar .f32) (n := qDim * seqLen) "input" idx1
+
+    let x0_new := Exp.sub (Exp.mul x0 cosTheta) (Exp.mul x1 sinTheta)
+    let x1_new := Exp.add (Exp.mul x0 sinTheta) (Exp.mul x1 cosTheta)
+
+    ShaderM.writeBuffer (ty := .scalar .f32) "output" idx0 x0_new
+    ShaderM.writeBuffer (ty := .scalar .f32) "output" idx1 x1_new
+  ) (pure ())
+
+/-- Batched RoPE-K + KV cache write: for all `seqLen` tokens, rotate the K row,
+    write rotated K and unmodified V into the KV cache at slot `startPos + col`.
+
+    K/V input layout: [seqLen, numKVHeads, headDim] column-major
+    (`new_k[col * kvDim + kvH * headDim + d]`, kvDim = numKVHeads * headDim).
+    KV cache layout: [numKVHeads, maxSeqLen, headDim] (same as single-token).
+
+    `params[0]` = startPos.  Token at column `col` writes K/V to cache slot
+    `startPos + col`.  Grid: dispatch1D(numKVHeads * dimPairs * seqLen).  Each
+    thread processes one (col, kvHead, dimPair) — emits both rotated K
+    components AND the corresponding V at idx0/idx1. -/
+def fusedRopeKAndCacheWriteBatchKernel (numKVHeads maxSeqLen headDim seqLen : Nat)
+    (ropeBase : Float) : ShaderM Unit := do
+  let gid ← ShaderM.globalId
+  let idx := Exp.vec3X gid
+
+  let dimPairs := headDim / 2
+  let perTokenElems := numKVHeads * dimPairs
+  let totalElements := perTokenElems * seqLen
+  let kvDim := numKVHeads * headDim
+
+  let _newK   ← ShaderM.declareInputBuffer "new_k" (.array (.scalar .f32) (kvDim * seqLen))
+  let _newV   ← ShaderM.declareInputBuffer "new_v" (.array (.scalar .f32) (kvDim * seqLen))
+  let _kCache ← ShaderM.declareOutputBuffer "k_cache" (.array (.scalar .f32) (numKVHeads * maxSeqLen * headDim))
+  let _vCache ← ShaderM.declareOutputBuffer "v_cache" (.array (.scalar .f32) (numKVHeads * maxSeqLen * headDim))
+  let _params ← ShaderM.declareInputBuffer "params" (.array (.scalar .u32) 1)
+  let _freqFactors ← ShaderM.declareInputBuffer "freq_factors" (.array (.scalar .f32) dimPairs)
+
+  ShaderM.if_ (Exp.lt idx (Exp.litU32 totalElements)) (do
+    let col := Exp.div idx (Exp.litU32 perTokenElems)
+    let withinTok := Exp.sub idx (Exp.mul col (Exp.litU32 perTokenElems))
+    let dimPair := Exp.mod withinTok (Exp.litU32 dimPairs)
+    let kvHead  := Exp.div withinTok (Exp.litU32 dimPairs)
+
+    let startPos ← ShaderM.readBuffer (ty := .scalar .u32) (n := 1) "params" (Exp.litU32 0)
+    let pos := Exp.add startPos col
+    let posF32 := Exp.toF32 pos
+
+    let freqFactor ← ShaderM.readBuffer (ty := .scalar .f32) (n := dimPairs) "freq_factors" dimPair
+
+    let dimPairF32 := Exp.toF32 dimPair
+    let exponent := Exp.div (Exp.mul (Exp.litF32 2.0) dimPairF32) (Exp.litF32 headDim.toFloat)
+    let freqInv := Exp.pow (Exp.litF32 ropeBase) (Exp.neg exponent)
+    let theta := Exp.div (Exp.mul posF32 freqInv) freqFactor
+    let cosTheta := Exp.cos theta
+    let sinTheta := Exp.sin theta
+
+    let halfDim := headDim / 2
+    let colBase  := Exp.mul col (Exp.litU32 kvDim)
+    let kvHeadOffset := Exp.mul kvHead (Exp.litU32 headDim)
+    let inIdx0 := Exp.add (Exp.add colBase kvHeadOffset) dimPair
+    let inIdx1 := Exp.add (Exp.add colBase kvHeadOffset) (Exp.add dimPair (Exp.litU32 halfDim))
+
+    let k0 ← ShaderM.readBuffer (ty := .scalar .f32) (n := kvDim * seqLen) "new_k" inIdx0
+    let k1 ← ShaderM.readBuffer (ty := .scalar .f32) (n := kvDim * seqLen) "new_k" inIdx1
+    let v0 ← ShaderM.readBuffer (ty := .scalar .f32) (n := kvDim * seqLen) "new_v" inIdx0
+    let v1 ← ShaderM.readBuffer (ty := .scalar .f32) (n := kvDim * seqLen) "new_v" inIdx1
+
+    let k0_new := Exp.sub (Exp.mul k0 cosTheta) (Exp.mul k1 sinTheta)
+    let k1_new := Exp.add (Exp.mul k0 sinTheta) (Exp.mul k1 cosTheta)
+
+    -- KV cache slot for this token = startPos + col
+    let cacheBase := Exp.add (Exp.mul (Exp.mul kvHead (Exp.litU32 maxSeqLen)) (Exp.litU32 headDim))
+                              (Exp.mul pos (Exp.litU32 headDim))
+    let cIdx0 := Exp.add cacheBase dimPair
+    let cIdx1 := Exp.add cacheBase (Exp.add dimPair (Exp.litU32 halfDim))
+
+    ShaderM.writeBuffer (ty := .scalar .f32) "k_cache" cIdx0 k0_new
+    ShaderM.writeBuffer (ty := .scalar .f32) "k_cache" cIdx1 k1_new
+    ShaderM.writeBuffer (ty := .scalar .f32) "v_cache" cIdx0 v0
+    ShaderM.writeBuffer (ty := .scalar .f32) "v_cache" cIdx1 v1
+  ) (pure ())
+
 /-! ## Per-Head RMSNorm Kernel -/
 
 /-- Per-head RMSNorm: normalize each head independently.
@@ -580,6 +708,105 @@ def fusedPerHeadQKVNormKernel
           let v ← ShaderM.readBuffer (ty := .scalar .f32) (n := kvTotal) "v_in" elemIdx
           ShaderM.writeBuffer (ty := .scalar .f32) "v_out" elemIdx (Exp.mul v rmsRef))
       )
+  )
+
+/-- Batched fused per-head Q/K/V RMSNorm.  Same algorithm as
+    `fusedPerHeadQKVNormKernel` but processes `seqLen` query tokens in a
+    single dispatch.
+
+    Q/K/V column-major batch layout:
+    - q[col * (numHeads * headDim) + h * headDim + d]
+    - k[col * (numKVHeads * headDim) + kh * headDim + d]
+    - v[col * (numKVHeads * headDim) + kh * headDim + d]
+
+    Grid: (numHeads * seqLen, 3, 1) — wgid.x packs (col * numHeads + head),
+    wgid.y = which variant (0=Q, 1=K, 2=V).  Per-WG decomposes:
+        col  = wgid.x / numHeads
+        head = wgid.x % numHeads
+    (vec3Z is not exposed in Hesper.WGSL.Exp; pack into x instead.) -/
+def fusedPerHeadQKVNormBatchKernel
+    (numHeads numKVHeads headDim seqLen : Nat) (eps : Float) : ShaderM Unit := do
+  let wid ← ShaderM.workgroupId
+  let lid ← ShaderM.localId
+  let packed  := Exp.vec3X wid
+  let yIdx    := Exp.vec3Y wid
+  let colIdx  := Exp.div packed (Exp.litU32 numHeads)
+  let headIdx := Exp.sub packed (Exp.mul colIdx (Exp.litU32 numHeads))
+  let tid     := Exp.vec3X lid
+  let qTotal  := numHeads * headDim
+  let kvTotal := numKVHeads * headDim
+  let _qIn    ← ShaderM.declareInputBuffer  "q_in"    (.array (.scalar .f32) (qTotal * seqLen))
+  let _qScale ← ShaderM.declareInputBuffer  "q_scale" (.array (.scalar .f32) headDim)
+  let _qOut   ← ShaderM.declareOutputBuffer "q_out"   (.array (.scalar .f32) (qTotal * seqLen))
+  let _kIn    ← ShaderM.declareInputBuffer  "k_in"    (.array (.scalar .f32) (kvTotal * seqLen))
+  let _kScale ← ShaderM.declareInputBuffer  "k_scale" (.array (.scalar .f32) headDim)
+  let _kOut   ← ShaderM.declareOutputBuffer "k_out"   (.array (.scalar .f32) (kvTotal * seqLen))
+  let _vIn    ← ShaderM.declareInputBuffer  "v_in"    (.array (.scalar .f32) (kvTotal * seqLen))
+  let _vOut   ← ShaderM.declareOutputBuffer "v_out"   (.array (.scalar .f32) (kvTotal * seqLen))
+  let wgSize := if headDim < 256 then headDim else 256
+  ShaderM.sharedNamed "shared_sum" (.array (.scalar .f32) wgSize)
+  let invalidKV : Exp (.scalar .bool) :=
+    Exp.and (Exp.ne yIdx (Exp.litU32 0))
+            (Exp.ge headIdx (Exp.litU32 numKVHeads))
+  ShaderM.if_ invalidKV (pure ()) (do
+    let qColBase  := Exp.add (Exp.mul colIdx (Exp.litU32 qTotal))
+                              (Exp.mul headIdx (Exp.litU32 headDim))
+    let kvColBase := Exp.add (Exp.mul colIdx (Exp.litU32 kvTotal))
+                              (Exp.mul headIdx (Exp.litU32 headDim))
+    ShaderM.varNamed "local_sum" (.scalar .f32) (Exp.litF32 0.0)
+    let localSum : Exp (.scalar .f32) := Exp.var "local_sum"
+    ShaderM.loop tid (Exp.litU32 headDim) (Exp.litU32 wgSize) fun i => do
+      ShaderM.if_ (Exp.eq yIdx (Exp.litU32 0)) (do
+        let v ← ShaderM.readBuffer (ty := .scalar .f32) (n := qTotal * seqLen) "q_in"
+                  (Exp.add qColBase i)
+        ShaderM.assign "local_sum" (Exp.add localSum (Exp.mul v v))
+      ) (do
+        ShaderM.if_ (Exp.eq yIdx (Exp.litU32 1)) (do
+          let v ← ShaderM.readBuffer (ty := .scalar .f32) (n := kvTotal * seqLen) "k_in"
+                    (Exp.add kvColBase i)
+          ShaderM.assign "local_sum" (Exp.add localSum (Exp.mul v v))
+        ) (do
+          let v ← ShaderM.readBuffer (ty := .scalar .f32) (n := kvTotal * seqLen) "v_in"
+                    (Exp.add kvColBase i)
+          ShaderM.assign "local_sum" (Exp.add localSum (Exp.mul v v)))
+      )
+    ShaderM.writeWorkgroup (ty := .scalar .f32) "shared_sum" tid localSum
+    ShaderM.barrier
+    let mut stride := wgSize / 2
+    while stride > 0 do
+      ShaderM.if_ (Exp.lt tid (Exp.litU32 stride)) (do
+        let a ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := wgSize) "shared_sum" tid
+        let b ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := wgSize) "shared_sum"
+                  (Exp.add tid (Exp.litU32 stride))
+        ShaderM.writeWorkgroup (ty := .scalar .f32) "shared_sum" tid (Exp.add a b)
+      ) (pure ())
+      ShaderM.barrier
+      stride := stride / 2
+    let sumSq ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := wgSize) "shared_sum" (Exp.litU32 0)
+    let rms := Exp.inverseSqrt
+                 (Exp.add (Exp.div sumSq (Exp.litF32 headDim.toFloat))
+                          (Exp.litF32 eps))
+    let rmsName ← ShaderM.var (.scalar .f32) rms
+    let rmsRef : Exp (.scalar .f32) := Exp.var rmsName
+    ShaderM.loop tid (Exp.litU32 headDim) (Exp.litU32 wgSize) fun i => do
+      ShaderM.if_ (Exp.eq yIdx (Exp.litU32 0)) (do
+        let v ← ShaderM.readBuffer (ty := .scalar .f32) (n := qTotal * seqLen) "q_in"
+                  (Exp.add qColBase i)
+        let w ← ShaderM.readBuffer (ty := .scalar .f32) (n := headDim) "q_scale" i
+        ShaderM.writeBuffer (ty := .scalar .f32) "q_out" (Exp.add qColBase i)
+          (Exp.mul (Exp.mul v rmsRef) w)
+      ) (do
+        ShaderM.if_ (Exp.eq yIdx (Exp.litU32 1)) (do
+          let v ← ShaderM.readBuffer (ty := .scalar .f32) (n := kvTotal * seqLen) "k_in"
+                    (Exp.add kvColBase i)
+          let w ← ShaderM.readBuffer (ty := .scalar .f32) (n := headDim) "k_scale" i
+          ShaderM.writeBuffer (ty := .scalar .f32) "k_out" (Exp.add kvColBase i)
+            (Exp.mul (Exp.mul v rmsRef) w)
+        ) (do
+          let v ← ShaderM.readBuffer (ty := .scalar .f32) (n := kvTotal * seqLen) "v_in"
+                    (Exp.add kvColBase i)
+          ShaderM.writeBuffer (ty := .scalar .f32) "v_out" (Exp.add kvColBase i)
+            (Exp.mul v rmsRef)))
   )
 
 /-- Legacy: bare RMSNorm over a single vector of size `dim`. Kept for backward
@@ -2454,11 +2681,61 @@ def forwardPrefillBatch [GPUBackend β] (ctx : β)
         Linear.forwardBatchDP4A ctx block.attention.wK batchNormedBuf batchKBuf seqLen
         Linear.forwardBatchDP4A ctx block.attention.wV batchNormedBuf batchVBuf seqLen
 
-    -- ── 2c: Per-token attention loop ──────────────────────────────────
+    -- ── 2c: Attention (batched when possible, per-token fallback) ─────
     let wgSize := min headDim 256
     let isFull := cfg.isFullAttention li
     let kvLi := cfg.kvCacheLayer li
+    -- Batched path requires:
+    --   * cfg.hasKV li (this layer has its own KV cache)
+    --   * block.ropeFreqFactors = some (full-attention layers only)
+    --   * a valid KV cache slot
+    let mut handledByBatched := false
+    if hKV : kvLi < state.kvCaches.size then
+      match (if cfg.hasKV li then block.ropeFreqFactors else none) with
+      | some freqFactors =>
+        handledByBatched := true
+        let kvCache := state.kvCaches[kvLi]
 
+        -- startPos = 0 (prefill from scratch — KV cache is empty for this
+        -- layer before this batch).  Write to paramsBuf[0]; the kernel
+        -- treats wgid.y/z as the per-token offset.
+        GPUBackend.writeBufferOffset ctx state.paramsBuf 0
+          (Hesper.WebGPU.BufferOps.uint32ToBytes 0)
+
+        -- Batched fused QKV norm: grid (numHeads*seqLen, 3, 1).
+        ce (if isFull then "qkvNormFullBatch" else "qkvNormSWABatch")
+          (fusedPerHeadQKVNormBatchKernel numHeads numKVHeads headDim seqLen cfg.rmsNormEps)
+          [("q_in", batchQBuf), ("q_scale", block.attention.qNormWeight), ("q_out", batchQBuf),
+           ("k_in", batchKBuf), ("k_scale", block.attention.kNormWeight), ("k_out", batchKBuf),
+           ("v_in", batchVBuf),                                            ("v_out", batchVBuf)]
+          { numWorkgroups := (numHeads * seqLen, 3, 1),
+            workgroupSize := { x := wgSize, y := 1, z := 1 } : Hesper.ExecConfig }
+
+        -- Batched RoPE-Q (in place).
+        ce s!"ropeFreqQBatch_{headDim}"
+          (ropeWithFreqFactorsBatchKernel headDim numHeads seqLen cfg.ropeTheta)
+          [("input", batchQBuf), ("output", batchQBuf),
+           ("params", state.paramsBuf), ("freq_factors", freqFactors)]
+          (.dispatch1D (numHeads * headDim / 2 * seqLen))
+
+        -- Batched RoPE-K + KV cache write.
+        ce s!"ropeKKvWBatch_{headDim}_{numKVHeads}"
+          (fusedRopeKAndCacheWriteBatchKernel numKVHeads cfg.maxSeqLen headDim seqLen cfg.ropeTheta)
+          [("new_k", batchKBuf), ("new_v", batchVBuf),
+           ("k_cache", kvCache.kBuf), ("v_cache", kvCache.vBuf),
+           ("params", state.paramsBuf), ("freq_factors", freqFactors)]
+          (.dispatch1D (numKVHeads * headDim / 2 * seqLen))
+
+        -- Batched flash-attention.  Grid (numHeads, seqLen, 1).
+        let scale : Float := 1.0
+        ce s!"flashAttnBatch_{headDim}_{numKVHeads}"
+          (FlashAttention.flashAttentionBatchKernel numHeads numKVHeads cfg.maxSeqLen headDim seqLen scale)
+          [("q", batchQBuf), ("k_cache", kvCache.kBuf), ("v_cache", kvCache.vBuf),
+           ("output", batchAttnOutBuf), ("params", state.paramsBuf)]
+          ({ numWorkgroups := (numHeads, seqLen, 1) : Hesper.ExecConfig })
+      | none => pure ()
+
+    if !handledByBatched then
     for i in [0:seqLen] do
       let pos := i
 
