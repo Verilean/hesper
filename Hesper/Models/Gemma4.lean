@@ -3654,18 +3654,17 @@ def generate [GPUBackend β] (ctx : β) (model : Gemma4Model (GPUBackend.Buf β)
     if newPos < model.config.maxSeqLen then
       match graphExecOpt with
       | some (exec, stream) =>
-        -- Replay path: buffers already carry tokenId / pos written by
-        -- forwardSingleToken's input-upload step outside the graph.
-        -- We still need to stage those writes BEFORE the launch.  The
-        -- simplest way is to fall back to forwardSingleToken (with the
-        -- capture stream set to `none`) which does the writeBuffer
-        -- calls, and then instead of running kernels ourselves, launch
-        -- the graph.  But forwardSingleToken also runs the kernels, so
-        -- we need a "setup-only" mode.
+        -- Graph replay is NOT YET wired.  The captured graph's memcpy
+        -- nodes hold pointers into the ByteArrays used during capture;
+        -- those are Lean-managed and may be freed before replay.  A
+        -- correct implementation needs a pinned-memory staging area
+        -- owned by hesper state (tokenBuf, paramsBuf, ...) — then
+        -- writeBufferOffset on the capture stream captures a memcpy
+        -- from that persistent host buffer, and replay re-reads it.
         --
-        -- For the MVP, just skip replay and fall through to the normal
-        -- forwardSingleToken.  The graph is instantiated but unused;
-        -- this measures overhead of FFI alone.
+        -- For now, just run forwardSingleToken normally and ignore the
+        -- graph.  The capture overhead on token 1 is kept so we can
+        -- measure "capture + instantiate" cost (currently ~0).
         let _ := exec
         let _ := stream
         forwardSingleToken ctx model nextToken newPos state (kcr := some kcr)
