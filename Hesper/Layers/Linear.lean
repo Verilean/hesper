@@ -1703,14 +1703,24 @@ def fusedQ4KMGateUpDP4A4RowKernel (config : Config) : ShaderM Unit := do
 
   let rowBaseU32 := Exp.mul outIdx (Exp.litU32 (blocksPerRow * 36))
 
-  -- Lane decomposition uses laneId (not tid) — same as 1-row kernel.
+  -- Lane decomposition uses laneId (not tid).  Top-half lanes (16..31) pick
+  -- up the next block so that a 32-lane warp handles two blocks per outer
+  -- iteration — halves outer trip count and eliminates the duplicate-work
+  -- ×0.5 correction present in earlier versions of this kernel.
   let laneLow := Exp.bitAnd laneId (Exp.litU32 15)
+  let blockOff := Exp.shiftRight laneId (Exp.litU32 4)  -- 0 or 1
   let pairIdx := Exp.div laneLow (Exp.litU32 4)
   let elemOff := Exp.sub laneLow (Exp.mul pairIdx (Exp.litU32 4))
   let bq8Off := Exp.mul pairIdx (Exp.litU32 2)
 
-  ShaderM.loop (Exp.litU32 0) (Exp.litU32 blocksPerRow) (Exp.litU32 1) fun blockIdx => do
-    let blockU32Base := Exp.add rowBaseU32 (Exp.mul blockIdx (Exp.litU32 36))
+  let halvedTrip := (blocksPerRow + 1) / 2
+  ShaderM.loop (Exp.litU32 0) (Exp.litU32 halvedTrip) (Exp.litU32 1) fun iter => do
+    let blockIdx := Exp.add (Exp.mul iter (Exp.litU32 2)) blockOff
+    let blockInRange := Exp.lt blockIdx (Exp.litU32 blocksPerRow)
+    -- Clamp OOB reads to block 0 so they hit valid memory; their
+    -- contribution is gated below via `blockInRange`.
+    let safeBlockIdx := Exp.select blockInRange blockIdx (Exp.litU32 0)
+    let blockU32Base := Exp.add rowBaseU32 (Exp.mul safeBlockIdx (Exp.litU32 36))
 
     let processWeight (which : String) (acc : Exp (.scalar .f32))
         (u0 u1 u2 u3 : Exp (.scalar .u32)) (d8A d8B : Exp (.scalar .f32))
@@ -1775,10 +1785,12 @@ def fusedQ4KMGateUpDP4A4RowKernel (config : Config) : ShaderM Unit := do
       let blockSumfD := Exp.add sumfD_0 sumfD_1
       let blockSumfM := Exp.add sumfM_0 sumfM_1
       let blockContrib := Exp.sub (Exp.mul dF blockSumfD) (Exp.mul dminF blockSumfM)
-      pure (Exp.add acc blockContrib)
+      -- Gate OOB iterations (only possible when blocksPerRow is odd).
+      let gatedContrib := Exp.select blockInRange blockContrib (Exp.litF32 0.0)
+      pure (Exp.add acc gatedContrib)
 
     -- Q8_1 input from smem (shared across 4 warps in this WG).
-    let q8Sub0Base := Exp.add (Exp.mul blockIdx (Exp.litU32 (8 * 9))) (Exp.mul bq8Off (Exp.litU32 9))
+    let q8Sub0Base := Exp.add (Exp.mul safeBlockIdx (Exp.litU32 (8 * 9))) (Exp.mul bq8Off (Exp.litU32 9))
     let q8Sub1Base := Exp.add q8Sub0Base (Exp.litU32 9)
     let u0 ← ShaderM.readWorkgroup (ty := .scalar .u32) (n := q8InputU32Size) "s_input_q8" (Exp.add q8Sub0Base (Exp.add (Exp.litU32 1) elemOff))
     let u1 ← ShaderM.readWorkgroup (ty := .scalar .u32) (n := q8InputU32Size) "s_input_q8" (Exp.add q8Sub0Base (Exp.add (Exp.litU32 5) elemOff))
@@ -1794,11 +1806,11 @@ def fusedQ4KMGateUpDP4A4RowKernel (config : Config) : ShaderM Unit := do
     let newAccU ← processWeight "weights_up" accU u0 u1 u2 u3 d8A d8B
     ShaderM.assign "accU" newAccU
 
-  -- Per-warp subgroup reductions (duplicate-work correction ×0.5).
-  ShaderM.varNamed "totalG" (.scalar .f32)
-    (Exp.mul (Exp.subgroupAdd accG) (Exp.litF32 0.5))
-  ShaderM.varNamed "totalU" (.scalar .f32)
-    (Exp.mul (Exp.subgroupAdd accU) (Exp.litF32 0.5))
+  -- Per-warp subgroup reductions.  Each of lanes 0..15 and 16..31 contributes
+  -- distinct blocks, so the full subgroup sum is the exact row dot product
+  -- — no duplicate-work correction needed.
+  ShaderM.varNamed "totalG" (.scalar .f32) (Exp.subgroupAdd accG)
+  ShaderM.varNamed "totalU" (.scalar .f32) (Exp.subgroupAdd accU)
   let totalG : Exp (.scalar .f32) := Exp.var "totalG"
   let totalU : Exp (.scalar .f32) := Exp.var "totalU"
 
