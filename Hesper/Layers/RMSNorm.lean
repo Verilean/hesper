@@ -251,6 +251,60 @@ def rmsNormThenAddKernel (config : Config) (workgroupSize : Nat := 256) : Shader
     let y := Exp.add (Exp.mul (Exp.div v rms) s) r
     ShaderM.writeBuffer (ty := .scalar .f32) "output" i y
 
+/-- Batched version of `rmsNormThenAddKernel`: processes `seqLen` rows in
+    a single dispatch.  Each workgroup handles one row `i` of the
+    `[dim, seqLen]` column-major batch buffer (element `(d, i)` lives at
+    `buf[i*dim + d]`, matching `columnExtractKernel` / `columnInsertKernel`).
+
+    `outputBatch[i, d] = RMSNorm(layerOutBatch[i, :])[d] * scale[d] + residualBatch[i, d]`
+
+    Replaces the per-token `(extract, forwardNormThenAdd, insert)` chain
+    in `forwardPrefillBatch` for post-attention and post-FFN residual+norm.
+    Dispatch: `(seqLen, 1, 1)` workgroups × `workgroupSize` threads. -/
+def rmsNormThenAddBatchKernel (config : Config) (seqLen : Nat)
+    (workgroupSize : Nat := 256) : ShaderM Unit := do
+  let wid ← ShaderM.workgroupId
+  let lid ← ShaderM.localId
+  let rowIdx := Exp.vec3X wid
+  let localIdx := Exp.vec3X lid
+  let totalElements := config.dim * seqLen
+  ShaderM.sharedNamed "shared_sum" (.array (.scalar .f32) workgroupSize)
+  let _layerOut ← ShaderM.declareInputBuffer "layer_out" (.array (.scalar .f32) totalElements)
+  let _residual ← ShaderM.declareInputBuffer "residual" (.array (.scalar .f32) totalElements)
+  let _scale    ← ShaderM.declareInputBuffer "scale" (.array (.scalar .f32) config.dim)
+  let _output   ← ShaderM.declareOutputBuffer "output" (.array (.scalar .f32) totalElements)
+  let rowBase := Exp.mul rowIdx (Exp.litU32 config.dim)
+
+  -- Pass 1: sum of squares of layer_out row.
+  ShaderM.varNamed "partial_sum" (.scalar .f32) (Exp.litF32 0.0)
+  let partialSum : Exp (.scalar .f32) := Exp.var "partial_sum"
+  ShaderM.loop localIdx (Exp.litU32 config.dim) (Exp.litU32 workgroupSize) fun i => do
+    let v ← ShaderM.readBuffer (ty := .scalar .f32) (n := totalElements) "layer_out" (Exp.add rowBase i)
+    ShaderM.assign "partial_sum" (Exp.add partialSum (Exp.mul v v))
+  ShaderM.writeWorkgroup (ty := .scalar .f32) "shared_sum" localIdx partialSum
+  ShaderM.barrier
+  let mut stride := workgroupSize / 2
+  while stride > 0 do
+    ShaderM.if_ (Exp.lt localIdx (Exp.litU32 stride)) (do
+      let a ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := workgroupSize) "shared_sum" localIdx
+      let b ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := workgroupSize) "shared_sum" (Exp.add localIdx (Exp.litU32 stride))
+      ShaderM.writeWorkgroup (ty := .scalar .f32) "shared_sum" localIdx (Exp.add a b)
+    ) (pure ())
+    ShaderM.barrier
+    stride := stride / 2
+  let totalSum ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := workgroupSize) "shared_sum" (Exp.litU32 0)
+  let mean := Exp.div totalSum (Exp.litF32 config.dim.toFloat)
+  let rms := Exp.sqrt (Exp.add mean (Exp.litF32 config.eps))
+
+  -- Pass 2: normalise × scale + residual, write back to same row of output batch.
+  ShaderM.loop localIdx (Exp.litU32 config.dim) (Exp.litU32 workgroupSize) fun i => do
+    let bi := Exp.add rowBase i
+    let v ← ShaderM.readBuffer (ty := .scalar .f32) (n := totalElements) "layer_out" bi
+    let s ← ShaderM.readBuffer (ty := .scalar .f32) (n := config.dim) "scale" i
+    let r ← ShaderM.readBuffer (ty := .scalar .f32) (n := totalElements) "residual" bi
+    let y := Exp.add (Exp.mul (Exp.div v rms) s) r
+    ShaderM.writeBuffer (ty := .scalar .f32) "output" bi y
+
 /-! ## Fused residual-add + RMSNorm -/
 
 /-- Compute `residualOut = a + b` and `output = RMSNorm(residualOut) * scale`
@@ -605,6 +659,24 @@ def forwardNormThenAdd [GPUBackend β] (ctx : β)
     [("layer_out", layerOutBuf), ("residual", residualBuf), ("scale", layer.scale),
      ("output", outputBuf)]
     { workgroupSize := { x := workgroupSize }, numWorkgroups := (1, 1, 1) }
+    cacheKey preparedRef
+
+/-- Batched post-norm+residual: processes all `seqLen` rows in one
+    dispatch.  The input/output buffers are `[dim, seqLen]` column-major
+    (same stride as `columnExtractKernel`), so this eliminates the
+    per-token `extract → forwardNormThenAdd → insert` chain. -/
+@[inline]
+def forwardNormThenAddBatch [GPUBackend β] (ctx : β)
+    (layer : RMSNorm (GPUBackend.Buf β) (GPUBackend.CachedDispatch β))
+    (layerOutBuf residualBuf outputBuf : GPUBackend.Buf β) (seqLen : Nat)
+    (preparedRef : IO.Ref (Option (GPUBackend.CachedDispatch β)))
+    (workgroupSize : Nat := 256) : IO Unit := do
+  let shader := rmsNormThenAddBatchKernel layer.config seqLen workgroupSize
+  let cacheKey : UInt64 := hash ("rms-then-add-batch", layer.config.dim, seqLen, workgroupSize)
+  GPUBackend.executeWithConfigCached ctx shader
+    [("layer_out", layerOutBuf), ("residual", residualBuf), ("scale", layer.scale),
+     ("output", outputBuf)]
+    { workgroupSize := { x := workgroupSize }, numWorkgroups := (seqLen, 1, 1) }
     cacheKey preparedRef
 
 /-- Fused residual-add + RMSNorm forward.  Computes
