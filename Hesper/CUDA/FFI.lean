@@ -150,4 +150,73 @@ opaque cuSetL2AccessWindow (ptr : USize) (size : USize) : IO Unit
 @[extern "lean_hesper_cuda_reset_l2_persisting_cache"]
 opaque cuResetL2PersistingCache : IO Unit
 
+/-! ## CUDA Graphs
+
+Capture a sequence of kernel launches once, then replay the whole graph
+per decode token with a single driver call.  llama.cpp uses this to
+amortise the ~1.2 µs/dispatch host overhead that dominates our ~10
+ms/tok host budget.  See docs/llama-fusion-analysis/12-complete-cuda-flow.md
+§5 for the llama.cpp reference flow.
+
+Opaque handles are `size_t` on the C side; we marshall as `USize`. -/
+
+/-- `cudaStream_t` handle (null stream ≡ 0). -/
+def CUstream : Type := USize
+/-- `cudaGraph_t` handle (capture product). -/
+def CUgraph : Type := USize
+/-- `cudaGraphExec_t` handle (instantiated graph ready to launch). -/
+def CUgraphExec : Type := USize
+
+/-- Create a dedicated non-blocking stream on which subsequent launches
+    can be captured.  Call once at context init. -/
+@[extern "lean_hesper_cuda_stream_create"]
+opaque cuStreamCreate : IO CUstream
+
+@[extern "lean_hesper_cuda_stream_destroy"]
+opaque cuStreamDestroy (stream : CUstream) : IO Unit
+
+/-- Begin graph capture on `stream`.  All `cuLaunchKernelOnStream`
+    launches between this call and `cuStreamEndCapture` are recorded
+    into the produced `cudaGraph_t`. -/
+@[extern "lean_hesper_cuda_stream_begin_capture"]
+opaque cuStreamBeginCapture (stream : CUstream) : IO Unit
+
+/-- End capture and return the captured graph. -/
+@[extern "lean_hesper_cuda_stream_end_capture"]
+opaque cuStreamEndCapture (stream : CUstream) : IO CUgraph
+
+/-- Turn a captured graph into an executable that the driver can replay
+    with one launch.  Must be called before the first `cuGraphLaunch`. -/
+@[extern "lean_hesper_cuda_graph_instantiate"]
+opaque cuGraphInstantiate (graph : CUgraph) : IO CUgraphExec
+
+@[extern "lean_hesper_cuda_graph_exec_destroy"]
+opaque cuGraphExecDestroy (exec : CUgraphExec) : IO Unit
+
+@[extern "lean_hesper_cuda_graph_destroy"]
+opaque cuGraphDestroy (graph : CUgraph) : IO Unit
+
+/-- Replay a previously-instantiated graph on `stream`.  Returns when
+    the kernels have been submitted (they still run asynchronously). -/
+@[extern "lean_hesper_cuda_graph_launch"]
+opaque cuGraphLaunch (exec : CUgraphExec) (stream : CUstream) : IO Unit
+
+/-- Launch a kernel onto a specific stream — needed so we can capture
+    the launches into a graph (the default `cuLaunchKernel` goes to the
+    null stream, which is not captureable). -/
+@[extern "lean_hesper_cuda_launch_kernel_on_stream"]
+opaque cuLaunchKernelOnStream
+    (func : CUfunction)
+    (gridX gridY gridZ : UInt32)
+    (blockX blockY blockZ : UInt32)
+    (sharedMem : UInt32)
+    (stream : CUstream)
+    (args : @& Array USize)
+    : IO Unit
+
+/-- Synchronise a stream.  Required after `cuGraphLaunch` when the
+    caller wants to read back results. -/
+@[extern "lean_hesper_cuda_stream_synchronize"]
+opaque cuStreamSynchronize (stream : CUstream) : IO Unit
+
 end Hesper.CUDA

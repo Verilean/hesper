@@ -348,3 +348,85 @@ extern "C" lean_obj_res lean_hesper_read_file_fast(b_lean_obj_arg path_str) {
     
     return lean_io_result_mk_ok(arr);
 }
+
+// ============================================================================
+// CUDA Graphs — amortise per-dispatch launch overhead across decode tokens.
+// ============================================================================
+
+extern "C" lean_obj_res lean_hesper_cuda_stream_create() {
+    CUstream s;
+    CUDA_CHECK(cuStreamCreate(&s, CU_STREAM_NON_BLOCKING), "cuStreamCreate");
+    return lean_io_result_mk_ok(lean_box_usize((size_t)s));
+}
+
+extern "C" lean_obj_res lean_hesper_cuda_stream_destroy(size_t stream_val) {
+    CUDA_CHECK(cuStreamDestroy((CUstream)stream_val), "cuStreamDestroy");
+    return lean_io_result_mk_ok(lean_box(0));
+}
+
+extern "C" lean_obj_res lean_hesper_cuda_stream_begin_capture(size_t stream_val) {
+    CUDA_CHECK(cuStreamBeginCapture((CUstream)stream_val, CU_STREAM_CAPTURE_MODE_RELAXED),
+               "cuStreamBeginCapture");
+    return lean_io_result_mk_ok(lean_box(0));
+}
+
+extern "C" lean_obj_res lean_hesper_cuda_stream_end_capture(size_t stream_val) {
+    CUgraph graph;
+    CUDA_CHECK(cuStreamEndCapture((CUstream)stream_val, &graph),
+               "cuStreamEndCapture");
+    return lean_io_result_mk_ok(lean_box_usize((size_t)graph));
+}
+
+extern "C" lean_obj_res lean_hesper_cuda_graph_instantiate(size_t graph_val) {
+    CUgraphExec exec;
+    // cuGraphInstantiate signature takes (exec*, graph, flags) on recent
+    // CUDA; older drivers need the 4-arg form.  Use the 2-arg helper
+    // that's stable across 11.x / 12.x.
+    CUDA_CHECK(cuGraphInstantiate(&exec, (CUgraph)graph_val, 0),
+               "cuGraphInstantiate");
+    return lean_io_result_mk_ok(lean_box_usize((size_t)exec));
+}
+
+extern "C" lean_obj_res lean_hesper_cuda_graph_exec_destroy(size_t exec_val) {
+    CUDA_CHECK(cuGraphExecDestroy((CUgraphExec)exec_val), "cuGraphExecDestroy");
+    return lean_io_result_mk_ok(lean_box(0));
+}
+
+extern "C" lean_obj_res lean_hesper_cuda_graph_destroy(size_t graph_val) {
+    CUDA_CHECK(cuGraphDestroy((CUgraph)graph_val), "cuGraphDestroy");
+    return lean_io_result_mk_ok(lean_box(0));
+}
+
+extern "C" lean_obj_res lean_hesper_cuda_graph_launch(size_t exec_val,
+                                                      size_t stream_val) {
+    CUDA_CHECK(cuGraphLaunch((CUgraphExec)exec_val, (CUstream)stream_val),
+               "cuGraphLaunch");
+    return lean_io_result_mk_ok(lean_box(0));
+}
+
+extern "C" lean_obj_res lean_hesper_cuda_stream_synchronize(size_t stream_val) {
+    CUDA_CHECK(cuStreamSynchronize((CUstream)stream_val), "cuStreamSynchronize");
+    return lean_io_result_mk_ok(lean_box(0));
+}
+
+extern "C" lean_obj_res lean_hesper_cuda_launch_kernel_on_stream(
+    size_t func_val,
+    uint32_t gx, uint32_t gy, uint32_t gz,
+    uint32_t bx, uint32_t by, uint32_t bz,
+    uint32_t smem,
+    size_t stream_val,
+    b_lean_obj_arg arg_ptrs
+) {
+    size_t n = lean_array_size(arg_ptrs);
+    CUdeviceptr* ptrs = (CUdeviceptr*)malloc(n * sizeof(CUdeviceptr));
+    void** args = (void**)malloc(n * sizeof(void*));
+    for (size_t i = 0; i < n; i++) {
+        ptrs[i] = (CUdeviceptr)lean_unbox_usize(lean_array_get_core(arg_ptrs, i));
+        args[i] = &ptrs[i];
+    }
+    CUDA_CHECK(cuLaunchKernel((CUfunction)func_val,
+        gx, gy, gz, bx, by, bz,
+        smem, (CUstream)stream_val, args, nullptr), "cuLaunchKernelOnStream");
+    free(ptrs); free(args);
+    return lean_io_result_mk_ok(lean_box(0));
+}
