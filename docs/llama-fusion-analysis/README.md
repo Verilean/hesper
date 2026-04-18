@@ -30,6 +30,7 @@ move to compress kernel count toward **llama.cpp CUDA's 187 kernels/tok**.
 | [`14-nsys-fresh-comparison.md`](14-nsys-fresh-comparison.md) | nsys hesper vs llama.cpp (post-Q4K-fixes) | nsys captures |
 | [`15-llama-single-path.md`](15-llama-single-path.md) | **Architecture plan**: adopt llama.cpp's single-forward shape-polymorphic path | `llama-context.cpp`, `gemma4-iswa.cpp` |
 | [`16-shape-audit-checklist.md`](16-shape-audit-checklist.md) | **Phase 1 shape audit**: every forward kernel classified A/B/C; reduces rewrite to 3 items | `Hesper/Models/Gemma4.lean`, `Hesper/Layers/*.lean` |
+| [`17-phase2-item2-findings.md`](17-phase2-item2-findings.md) | Phase 2 item 2 first attempt: why the naive SWA→batched-path change regressed; revised plan requires bit-parity harness + separate batched SWA kernels | — |
 
 ## Measurement artefacts
 
