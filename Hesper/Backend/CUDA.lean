@@ -63,6 +63,28 @@ initialize cudaBatchQueue : IO.Ref (Option (Array PendingLaunch)) ← IO.mkRef n
 def Backend.isCudaBatching : IO Bool := do
   return (← cudaBatchQueue.get).isSome
 
+/-! ## CUDA Graph capture stream
+
+When `cudaCaptureStream` is `some s` (and no batch queue is open),
+kernel launches go to `s` via `cuLaunchKernelOnStream` instead of the
+default stream via `cuLaunchKernel`.  That makes them capturable into a
+CUDA Graph.  When the ref is `none`, behaviour is unchanged.
+
+Host→device copies also need to land on the capture stream — hence
+`cuMemcpyHtoDMaybeOnStream` below.  All other FFI (cuMemcpyDtoH,
+cuMemset) stays on the default stream because they sync + reading
+happens only OUTSIDE capture scope. -/
+initialize cudaCaptureStream : IO.Ref (Option Hesper.CUDA.CUstream) ← IO.mkRef none
+
+/-- Helper: route a kernel launch through the capture stream when active.
+    Mirrors `cuLaunchKernel` signature. -/
+private def launchKernelMaybeStream
+    (func : CUfunction) (gx gy gz bx byDim bz : UInt32) (smem : UInt32)
+    (args : Array USize) : IO Unit := do
+  match ← cudaCaptureStream.get with
+  | some s => Hesper.CUDA.cuLaunchKernelOnStream func gx gy gz bx byDim bz smem s args
+  | none   => cuLaunchKernel func gx gy gz bx byDim bz smem args
+
 private def cudaExecuteImpl (computation : ShaderM Unit) (namedBuffers : List (String × CUDABuffer))
     (funcName : String) (workgroupSize : Hesper.WGSL.WorkgroupSize)
     (numWorkgroups : Nat × Nat × Nat) : IO CUfunction := do
@@ -93,7 +115,7 @@ private def cudaLaunchWithBuffers (func : CUfunction) (namedBuffers : List (Stri
     | some (_, buf) => return acc.push buf.ptr
     | none => throw (IO.userError s!"CUDA execute: missing buffer '{name}'")
   let (gx, gy, gz) := numWorkgroups
-  cuLaunchKernel func
+  launchKernelMaybeStream func
     gx.toUInt32 gy.toUInt32 gz.toUInt32
     workgroupSize.x.toUInt32 workgroupSize.y.toUInt32 workgroupSize.z.toUInt32
     0 args
@@ -137,7 +159,7 @@ instance : GPUBackend CUDAContext where
     -- If batching, queue the launch; otherwise fire immediately
     match ← cudaBatchQueue.get with
     | some queue => cudaBatchQueue.set (some (queue.push pending))
-    | none => cuLaunchKernel func gx.toUInt32 gy.toUInt32 gz.toUInt32
+    | none => launchKernelMaybeStream func gx.toUInt32 gy.toUInt32 gz.toUInt32
                 config.workgroupSize.x.toUInt32 config.workgroupSize.y.toUInt32
                 config.workgroupSize.z.toUInt32 0 args
   executeWithConfigCached _ctx computation namedBuffers config cacheKey cacheRef := do
@@ -179,7 +201,7 @@ instance : GPUBackend CUDAContext where
     }
     match ← cudaBatchQueue.get with
     | some queue => cudaBatchQueue.set (some (queue.push pending))
-    | none => cuLaunchKernel func gx.toUInt32 gy.toUInt32 gz.toUInt32
+    | none => launchKernelMaybeStream func gx.toUInt32 gy.toUInt32 gz.toUInt32
                 config.workgroupSize.x.toUInt32 config.workgroupSize.y.toUInt32
                 config.workgroupSize.z.toUInt32 0 args
   replayCached _ctx cached dims := do
@@ -190,7 +212,7 @@ instance : GPUBackend CUDAContext where
     }
     match ← cudaBatchQueue.get with
     | some queue => cudaBatchQueue.set (some (queue.push pending))
-    | none => cuLaunchKernel cached.func gx.toUInt32 gy.toUInt32 gz.toUInt32
+    | none => launchKernelMaybeStream cached.func gx.toUInt32 gy.toUInt32 gz.toUInt32
                 cached.blockX cached.blockY cached.blockZ 0 cached.args
   allocBuffer _ctx size := createCUDABuffer size
   freeBuffer _ctx buf := freeCUDABuffer buf
@@ -223,7 +245,7 @@ instance : GPUBackend CUDAContext where
     }
     match ← cudaBatchQueue.get with
     | some queue => cudaBatchQueue.set (some (queue.push pending))
-    | none => cuLaunchKernel kernel.func gx.toUInt32 gy.toUInt32 gz.toUInt32
+    | none => launchKernelMaybeStream kernel.func gx.toUInt32 gy.toUInt32 gz.toUInt32
                 kernel.blockX kernel.blockY kernel.blockZ 0 args
   beginBatch _ctx := do
     cudaBatchQueue.set (some #[])
@@ -231,7 +253,7 @@ instance : GPUBackend CUDAContext where
     match ← cudaBatchQueue.get with
     | some queue =>
       for p in queue do
-        cuLaunchKernel p.func p.gridX p.gridY p.gridZ p.blockX p.blockY p.blockZ 0 p.args
+        launchKernelMaybeStream p.func p.gridX p.gridY p.gridZ p.blockX p.blockY p.blockZ 0 p.args
       cudaBatchQueue.set none
     | none => pure ()
   hasSubgroupSupport _ctx := pure true   -- CUDA warp shuffle
