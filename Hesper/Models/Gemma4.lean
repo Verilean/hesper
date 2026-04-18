@@ -3194,15 +3194,14 @@ def forwardPrefillBatch [GPUBackend β] (ctx : β)
     [("batch", currentBuf), ("params", colIdxBuf), ("out", state.buf2)]
     (.dispatch1D dim)
 
-  -- Final RMSNorm (single token)
-  RMSNorm.forward ctx model.finalNorm state.buf2 state.buf1
-
-  -- LM head matmul — reuse the last token through forwardSingleToken's
-  -- lm-head logic. We have the normed hidden state in state.buf1 (= nextBuf
-  -- equivalent for single token). Copy to the right buffer position and
-  -- run the lm-head from forwardSingleToken.
-  -- For simplicity, run the Q6_K dp4a path directly if available,
-  -- otherwise fall back to the generic LinearLayer.forward.
+  -- LM head.
+  --
+  -- For the Q6_K dp4a path, fuse the final RMSNorm directly into the Q8_1
+  -- quantize step — identical pattern to `forwardFusedNormGateUp`.  Saves
+  -- one dispatch per token (the standalone RMSNorm) and one ~2560-float
+  -- VRAM round-trip (the f32 normed hidden state).  For the fallback
+  -- paths (f32 matmul etc.) still run the standalone RMSNorm because
+  -- they don't consume Q8_1.
   match model.embdFormat with
   | .Q6_K =>
     let useSubgroups ← GPUBackend.hasSubgroupSupport ctx
@@ -3221,12 +3220,13 @@ def forwardPrefillBatch [GPUBackend β] (ctx : β)
           let b ← GPUBackend.allocBuffer ctx q8BufBytes
           state.lmHeadQ8Buf.set (some b)
           pure b
+      -- Fused finalNorm + Q8_1 quantize (one dispatch, no f32 normed buf).
       GPUBackend.executeWithConfigCached ctx
-        (Hesper.Layers.Linear.quantizeQ8_1Kernel cfg.hiddenSize)
-        [("input", state.buf1), ("output", q8Buf)]
-        { numWorkgroups := (nQ8Blocks, 1, 1), workgroupSize := { x := 32, y := 1, z := 1 }
+        (Hesper.Layers.RMSNorm.fusedRMSNormQ8_1Kernel model.finalNorm.config)
+        [("input", state.buf2), ("scale", model.finalNorm.scale), ("output", q8Buf)]
+        { numWorkgroups := (1, 1, 1), workgroupSize := { x := 256, y := 1, z := 1 }
           extensions := ["subgroups"] : Hesper.ExecConfig }
-        (hash ("q8_1-quantize-lmhead", cfg.hiddenSize))
+        (hash ("fused-rmsnorm-q8_1-lmhead", cfg.hiddenSize))
         state.lmHeadQuantizePrepared
       let quadCount := (cfg.vocabSize + 3) / 4
       let gridX4 : Nat := 4096
@@ -3240,7 +3240,9 @@ def forwardPrefillBatch [GPUBackend β] (ctx : β)
         (hash ("q6k-dp4a-lmhead-4row", cfg.hiddenSize, cfg.vocabSize))
         state.lmHeadDP4APrepared
     else
-      -- Fallback: f32 Q6_K kernel
+      -- Fallback: f32 Q6_K kernel.  Needs standalone RMSNorm since the
+      -- f32 matmul can't consume Q8_1.
+      RMSNorm.forward ctx model.finalNorm state.buf2 state.buf1
       let shaderF32 := if useSubgroups then
           Hesper.Quantization.Q6_K.fusedQ6KLinearBlockCoopKernel
             cfg.hiddenSize cfg.vocabSize gridX
@@ -3254,7 +3256,8 @@ def forwardPrefillBatch [GPUBackend β] (ctx : β)
           extensions := if useSubgroups then ["subgroups"] else []
           : Hesper.ExecConfig }
   | _ =>
-    -- Non-Q6_K fallback: F32 matmul transpose
+    -- Non-Q6_K fallback: F32 matmul transpose.  Needs standalone RMSNorm.
+    RMSNorm.forward ctx model.finalNorm state.buf2 state.buf1
     let lmHeadConfig : Hesper.WGSL.MatMul.Config := {
       M := 1, N := cfg.vocabSize, K := cfg.hiddenSize
     }
@@ -3399,28 +3402,35 @@ def forwardSingleToken [GPUBackend β] (ctx : β)
     dumpBuf ctx currentBuf (model.config.hiddenSize * 4).toUSize s!"single_p{pos}_afterL{blockIdx}"
     blockIdx := blockIdx + 1
 
-  -- Step 3: Final norm — Circuit DSL path.  The hand-written
-  -- RMSNorm.forward emits one fused dispatch; CircuitM.rmsNorm builds
-  -- the same shape (reduce + 3 pointwise) and the fuseReduceEpilogue
-  -- pass collapses it to one dispatch via β-reduction over ScalarExp.
-  -- Equivalent kernels/tok, but the kernel is now generated from the
-  -- IR rather than being a hand-maintained ShaderM.
-  Hesper.WGSL.Execute.withSection "finalNorm" do
-    let key := hash ("circuitFinalNorm-cuda", model.finalNorm.config.dim)
-    let ccRef ← Hesper.Circuit.getGlobalCircuitRef (β := β) key
-    Hesper.Circuit.runCachedFused ctx ccRef
-      (do
-        let xT ← Hesper.Circuit.CircuitM.registerExternal
-          (BufT := GPUBackend.Buf β) (CacheT := GPUBackend.CachedDispatch β)
-          currentBuf #[model.finalNorm.config.dim] .f32 .Global
-        let sT ← Hesper.Circuit.CircuitM.registerExternal
-          (BufT := GPUBackend.Buf β) (CacheT := GPUBackend.CachedDispatch β)
-          model.finalNorm.scale #[model.finalNorm.config.dim] .f32 .Global
-        let _y ← Hesper.Circuit.CircuitM.rmsNorm xT sT model.finalNorm.config.eps
-        pure ())
-      -- Tensor ids: 0 = currentBuf (external), 1 = scale (external),
-      -- 2..5 are intermediates fused away, final epilogue output id is the last.
-      [(0, currentBuf), (1, model.finalNorm.scale), (5, nextBuf)]
+  -- Step 3: Final norm.  When the Q6_K dp4a lm_head path is available
+  -- (Gemma 4's default for embdFormat=Q6_K with dp4a enabled), we defer
+  -- emission until lm_head so we can fuse finalNorm + Q8_1 quantize
+  -- into one kernel (`fusedRMSNormQ8_1Kernel`).  Otherwise emit the
+  -- standalone Circuit-DSL norm so the f32 matmul fallback has a
+  -- valid `nextBuf` to read.
+  let useFusedNormLmHead ← do
+    match model.embdFormat with
+    | .Q6_K =>
+      let useSubgroups ← GPUBackend.hasSubgroupSupport ctx
+      let a ← Hesper.Layers.Linear.dp4aEnabled.get
+      let b ← Hesper.Layers.Linear.dp4aQ6KEnabled.get
+      pure (a && b && useSubgroups && model.config.hiddenSize % 32 == 0)
+    | _ => pure false
+  if !useFusedNormLmHead then
+    Hesper.WGSL.Execute.withSection "finalNorm" do
+      let key := hash ("circuitFinalNorm-cuda", model.finalNorm.config.dim)
+      let ccRef ← Hesper.Circuit.getGlobalCircuitRef (β := β) key
+      Hesper.Circuit.runCachedFused ctx ccRef
+        (do
+          let xT ← Hesper.Circuit.CircuitM.registerExternal
+            (BufT := GPUBackend.Buf β) (CacheT := GPUBackend.CachedDispatch β)
+            currentBuf #[model.finalNorm.config.dim] .f32 .Global
+          let sT ← Hesper.Circuit.CircuitM.registerExternal
+            (BufT := GPUBackend.Buf β) (CacheT := GPUBackend.CachedDispatch β)
+            model.finalNorm.scale #[model.finalNorm.config.dim] .f32 .Global
+          let _y ← Hesper.Circuit.CircuitM.rmsNorm xT sT model.finalNorm.config.eps
+          pure ())
+        [(0, currentBuf), (1, model.finalNorm.scale), (5, nextBuf)]
 
   -- Step 4: LM head matmul (1 × hiddenSize @ hiddenSize × vocabSize)
   Hesper.WGSL.Execute.withSection "lmHead" do
@@ -3472,7 +3482,11 @@ def forwardSingleToken [GPUBackend β] (ctx : β)
 
       let _ := debugMode
       if dp4aOn && useSubgroups && model.config.hiddenSize % 32 == 0 then
-        -- dp4a path: quantize input to Q8_1, then Q6_K × Q8_1 matmul.
+        -- dp4a path: fused finalNorm+Q8_1 quantize, then Q6_K × Q8_1 matmul.
+        -- The fused kernel consumes the pre-norm hidden state directly
+        -- from `currentBuf`, so we deliberately skipped the standalone
+        -- finalNorm above (see `useFusedNormLmHead`).  Saves 1 dispatch
+        -- and the f32 normed round-trip through `nextBuf`.
         let nQ8Blocks := model.config.hiddenSize / 32
         let q8BufBytes : USize := (nQ8Blocks * 9 * 4).toUSize
         let q8Buf ← match ← state.lmHeadQ8Buf.get with
@@ -3481,13 +3495,13 @@ def forwardSingleToken [GPUBackend β] (ctx : β)
             let b ← GPUBackend.allocBuffer ctx q8BufBytes
             state.lmHeadQ8Buf.set (some b)
             pure b
-        -- Quantize
+        -- Fused finalNorm + Q8_1 quantize.
         GPUBackend.executeWithConfigCached ctx
-          (Hesper.Layers.Linear.quantizeQ8_1Kernel model.config.hiddenSize)
-          [("input", nextBuf), ("output", q8Buf)]
-          { numWorkgroups := (nQ8Blocks, 1, 1), workgroupSize := { x := 32, y := 1, z := 1 }
+          (Hesper.Layers.RMSNorm.fusedRMSNormQ8_1Kernel model.finalNorm.config)
+          [("input", currentBuf), ("scale", model.finalNorm.scale), ("output", q8Buf)]
+          { numWorkgroups := (1, 1, 1), workgroupSize := { x := 256, y := 1, z := 1 }
             extensions := ["subgroups"] : Hesper.ExecConfig }
-          (hash ("q8_1-quantize-lmhead", model.config.hiddenSize))
+          (hash ("fused-rmsnorm-q8_1-lmhead", model.config.hiddenSize))
           state.lmHeadQuantizePrepared
         -- Q6_K dp4a matmul (2D grid for vocabSize > 65535).
         -- Default is the 4-warp cooperative variant (smem input reuse across
