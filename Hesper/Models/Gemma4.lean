@@ -3050,31 +3050,15 @@ def forwardPrefillBatch [GPUBackend β] (ctx : β)
     -- ── 2d: O projection (batch matmul) ──────────────────────────────
     Linear.forwardBatchDP4A ctx block.attention.wO batchAttnOutBuf batchOProjBuf seqLen
 
-    -- ── 2e: Post-attention norm + residual (per-token) ───────────────
-    -- `attnResid[i] = RMSNorm(oProj[i]) * scale + current[i]`
-    -- forwardNormThenAdd is hardcoded to 1 row, so we loop per token.
-    for i in [0:seqLen] do
-      -- Extract oProj column i → state.normedBuf
-      let colIdxBytes := Hesper.WebGPU.BufferOps.uint32ToBytes i.toUInt32
-      GPUBackend.writeBufferOffset ctx colIdxBuf 0 colIdxBytes
-      GPUBackend.execute ctx
-        (columnExtractKernel dim seqLen)
-        [("batch", batchOProjBuf), ("params", colIdxBuf), ("out", state.normedBuf)]
-        (.dispatch1D dim)
-      -- Extract current (input) column i → state.buf1
-      GPUBackend.execute ctx
-        (columnExtractKernel dim seqLen)
-        [("batch", currentBuf), ("params", colIdxBuf), ("out", state.buf1)]
-        (.dispatch1D dim)
-      -- Fused post-attn norm + residual add
-      let ref ← IO.mkRef none
-      RMSNorm.forwardNormThenAdd ctx block.postAttnNorm
-        state.normedBuf state.buf1 state.attnResidualBuf ref
-      -- Insert result into batchAttnResidBuf column i
-      GPUBackend.execute ctx
-        (columnInsertKernel dim seqLen)
-        [("src", state.attnResidualBuf), ("params", colIdxBuf), ("batch", batchAttnResidBuf)]
-        (.dispatch1D dim)
+    -- ── 2e: Post-attention norm + residual (batched) ─────────────────
+    -- `batchAttnResid[i,d] = RMSNorm(oProj[i,:])[d] * scale[d] + currentBuf[i,d]`
+    -- One dispatch over seqLen rows (was: 3 dispatches × seqLen).
+    let postAttnKey := hash ("postAttnNormAddBatch", cfg.hiddenSize, seqLen)
+    let postAttnRef ← match kcr with
+      | some k => k.getRef postAttnKey
+      | none => IO.mkRef none
+    RMSNorm.forwardNormThenAddBatch ctx block.postAttnNorm
+      batchOProjBuf currentBuf batchAttnResidBuf seqLen postAttnRef
 
     -- Diagnostic: dump currentBuf col 0 at L1 after attention inner loop / after O proj
     if dumpEnabled && li = 1 then
@@ -3129,26 +3113,15 @@ def forwardPrefillBatch [GPUBackend β] (ctx : β)
     -- Down projection (batch matmul)
     Linear.forwardBatchDP4A ctx block.ffn.down batchGeluBuf batchFFNOutBuf seqLen
 
-    -- ── 2g: Post-FFN norm + residual (per-token) ─────────────────────
-    -- `output[i] = RMSNorm(ffnOut[i]) * scale + attnResid[i]`
-    for i in [0:seqLen] do
-      let colIdxBytes := Hesper.WebGPU.BufferOps.uint32ToBytes i.toUInt32
-      GPUBackend.writeBufferOffset ctx colIdxBuf 0 colIdxBytes
-      GPUBackend.execute ctx
-        (columnExtractKernel dim seqLen)
-        [("batch", batchFFNOutBuf), ("params", colIdxBuf), ("out", state.ffnOutBuf)]
-        (.dispatch1D dim)
-      GPUBackend.execute ctx
-        (columnExtractKernel dim seqLen)
-        [("batch", batchAttnResidBuf), ("params", colIdxBuf), ("out", state.attnResidualBuf)]
-        (.dispatch1D dim)
-      let ref ← IO.mkRef none
-      RMSNorm.forwardNormThenAdd ctx block.postFFNNorm
-        state.ffnOutBuf state.attnResidualBuf state.buf2 ref
-      GPUBackend.execute ctx
-        (columnInsertKernel dim seqLen)
-        [("src", state.buf2), ("params", colIdxBuf), ("batch", nextBuf)]
-        (.dispatch1D dim)
+    -- ── 2g: Post-FFN norm + residual (batched) ───────────────────────
+    -- `nextBuf[i,d] = RMSNorm(ffnOut[i,:])[d] * scale[d] + attnResid[i,d]`
+    -- One dispatch over seqLen rows (was: 3 dispatches × seqLen).
+    let postFFNKey := hash ("postFFNNormAddBatch", cfg.hiddenSize, seqLen)
+    let postFFNRef ← match kcr with
+      | some k => k.getRef postFFNKey
+      | none => IO.mkRef none
+    RMSNorm.forwardNormThenAddBatch ctx block.postFFNNorm
+      batchFFNOutBuf batchAttnResidBuf nextBuf seqLen postFFNRef
 
     -- Dump post-FFN (pre-PLE) state
     if dumpEnabled then for i in [0:seqLen] do
