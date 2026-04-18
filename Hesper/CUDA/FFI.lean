@@ -219,4 +219,50 @@ opaque cuLaunchKernelOnStream
 @[extern "lean_hesper_cuda_stream_synchronize"]
 opaque cuStreamSynchronize (stream : CUstream) : IO Unit
 
+/-- Host→device memcpy on an explicit stream.  Needed so writes
+    issued DURING stream capture get recorded as memcpy nodes in the
+    resulting graph (rather than forcing a sync).  The driver captures
+    the (src-host-ptr, dst-device-ptr, size) triple; on each replay
+    the memcpy re-reads `src` from host memory, so subsequent tokens'
+    values flow through without re-capturing. -/
+@[extern "lean_hesper_cuda_memcpy_htod_async"]
+opaque cuMemcpyHtoDAsync (dst : CUdeviceptr) (src : @& ByteArray)
+    (offset : USize) (size : USize) (stream : CUstream) : IO Unit
+
+/-! ## Pinned host memory (staging buffers for CUDA Graphs)
+
+`ByteArray` is Lean-GC'd and its address is not stable across
+`writeBufferOffset` calls.  CUDA Graph capture records the *pointer*,
+so replay against a freed ByteArray tombstones with
+`CUDA_ERROR_ILLEGAL_ADDRESS`.  The correct source for capturable
+writes is **page-locked (pinned) host memory** allocated via
+`cuMemHostAlloc` and held for the whole session.  llama.cpp uses the
+same trick for its per-token scalar uploads. -/
+
+/-- Allocate `size` bytes of pinned host memory.  Returns the host
+    virtual-address as a `USize`.  The memory survives until
+    `cuMemFreeHost` is called (or the process exits). -/
+@[extern "lean_hesper_cuda_mem_alloc_host"]
+opaque cuMemAllocHost (size : USize) : IO USize
+
+@[extern "lean_hesper_cuda_mem_free_host"]
+opaque cuMemFreeHost (hostPtr : USize) : IO Unit
+
+/-- Write a small scalar (≤ 8 bytes) into a pinned host buffer.  The
+    data is plain Lean bytes; the C++ side memcpys them into the
+    pinned region.  No GPU involvement.  Use before every graph
+    launch to update a captured memcpy node's source. -/
+@[extern "lean_hesper_cuda_write_pinned"]
+opaque cuWritePinned (hostPtr : USize) (offset : USize)
+    (src : @& ByteArray) (size : USize) : IO Unit
+
+/-- Host→device memcpy where the source is a pinned host pointer
+    (stable across the session).  Safe to use inside stream capture;
+    the graph records the host pointer, and every replay reads the
+    current contents. -/
+@[extern "lean_hesper_cuda_memcpy_htod_from_pinned"]
+opaque cuMemcpyHtoDFromPinned
+    (dst : CUdeviceptr) (hostPtr : USize) (offset : USize)
+    (size : USize) (stream : CUstream) : IO Unit
+
 end Hesper.CUDA

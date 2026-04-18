@@ -216,9 +216,20 @@ instance : GPUBackend CUDAContext where
                 cached.blockX cached.blockY cached.blockZ 0 cached.args
   allocBuffer _ctx size := createCUDABuffer size
   freeBuffer _ctx buf := freeCUDABuffer buf
-  writeBuffer _ctx buf data := writeCUDABuffer buf data
-  writeBufferOffset _ctx buf offset data :=
-    cuMemcpyHtoD buf.ptr data offset data.size.toUSize
+  writeBuffer _ctx buf data := do
+    -- Route through the capture stream when active so writes become
+    -- graph nodes.  Outside capture, use the sync default-stream path.
+    match ← cudaCaptureStream.get with
+    | some s =>
+      Hesper.CUDA.cuMemcpyHtoDAsync buf.ptr data 0 data.size.toUSize s
+    | none =>
+      writeCUDABuffer buf data
+  writeBufferOffset _ctx buf offset data := do
+    match ← cudaCaptureStream.get with
+    | some s =>
+      Hesper.CUDA.cuMemcpyHtoDAsync buf.ptr data offset data.size.toUSize s
+    | none =>
+      cuMemcpyHtoD buf.ptr data offset data.size.toUSize
   readBuffer _ctx buf size := readCUDABuffer buf size
   buildKernel _ctx computation config := do
     let ptx := generatePTX config.funcName config.workgroupSize computation

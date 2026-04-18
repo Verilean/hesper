@@ -430,3 +430,57 @@ extern "C" lean_obj_res lean_hesper_cuda_launch_kernel_on_stream(
     free(ptrs); free(args);
     return lean_io_result_mk_ok(lean_box(0));
 }
+
+extern "C" lean_obj_res lean_hesper_cuda_memcpy_htod_async(
+    size_t dst_ptr,
+    b_lean_obj_arg src_bytes,
+    size_t offset,
+    size_t size,
+    size_t stream_val
+) {
+    const uint8_t* src = lean_sarray_cptr(src_bytes);
+    CUDA_CHECK(cuMemcpyHtoDAsync((CUdeviceptr)(dst_ptr + offset), src, size, (CUstream)stream_val),
+               "cuMemcpyHtoDAsync");
+    return lean_io_result_mk_ok(lean_box(0));
+}
+
+// ============================================================================
+// Pinned host memory for CUDA Graph-capture-safe writes
+// ============================================================================
+
+extern "C" lean_obj_res lean_hesper_cuda_mem_alloc_host(size_t size) {
+    void* ptr = nullptr;
+    CUDA_CHECK(cuMemHostAlloc(&ptr, size, CU_MEMHOSTALLOC_PORTABLE),
+               "cuMemHostAlloc");
+    return lean_io_result_mk_ok(lean_box_usize((size_t)ptr));
+}
+
+extern "C" lean_obj_res lean_hesper_cuda_mem_free_host(size_t host_ptr) {
+    CUDA_CHECK(cuMemFreeHost((void*)host_ptr), "cuMemFreeHost");
+    return lean_io_result_mk_ok(lean_box(0));
+}
+
+extern "C" lean_obj_res lean_hesper_cuda_write_pinned(
+    size_t host_ptr,
+    size_t offset,
+    b_lean_obj_arg src_bytes,
+    size_t size
+) {
+    const uint8_t* src = lean_sarray_cptr(src_bytes);
+    memcpy((uint8_t*)host_ptr + offset, src, size);
+    return lean_io_result_mk_ok(lean_box(0));
+}
+
+extern "C" lean_obj_res lean_hesper_cuda_memcpy_htod_from_pinned(
+    size_t dst_ptr,
+    size_t host_ptr,
+    size_t offset,
+    size_t size,
+    size_t stream_val
+) {
+    CUDA_CHECK(cuMemcpyHtoDAsync((CUdeviceptr)dst_ptr,
+                                 (const void*)(host_ptr + offset),
+                                 size, (CUstream)stream_val),
+               "cuMemcpyHtoDFromPinned");
+    return lean_io_result_mk_ok(lean_box(0));
+}
