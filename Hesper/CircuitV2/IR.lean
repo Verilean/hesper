@@ -1,3 +1,4 @@
+import Hesper.Circuit.IR
 /-!
 # Circuit DSL v2 — IR and type system (Phase B proposal)
 
@@ -209,11 +210,13 @@ inductive Prim : Type where
       (srcId   : Nat)
       (dstId   : Nat)
       (offset  : Nat)
-  /-- Pointwise op.  Body is a `Hesper.Circuit.ScalarExp` (v1).  The
+  /-- Pointwise op.  Body is a `Hesper.Circuit.ScalarExp` (v1) — we
+      reuse v1's ScalarExp verbatim since the lane-local algebra (add,
+      mul, exp, tanh, rsqrt, warpSum, etc.) is already complete.  The
       returned tensor lives in the same scope as the inputs. -/
   | pointwise
       (inputs  : Array Nat)    -- input CircuitTensor ids
-      (body    : Nat)          -- opaque handle to a ScalarExp (populated by builder)
+      (body    : Hesper.Circuit.ScalarExp)
       (outShape : Shape)
       (outDt    : DType)
       (outScope : Scope)

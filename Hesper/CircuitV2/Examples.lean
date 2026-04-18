@@ -1,4 +1,5 @@
 import Hesper.CircuitV2.IR
+import Hesper.CircuitV2.Lowering
 
 /-!
 # Circuit DSL v2 — Phase B reference examples
@@ -59,5 +60,34 @@ def loadStoreRoundTrip (dim : Nat)
   let s ← CircuitM.loadToSram src
   let tok ← CircuitM.storeTo s dst 0 tok
   return tok
+
+/-! ## Lowering round-trip: pointwise → ShaderM
+
+Emit a single pointwise op (`y[i] = x[i] * 2 + 1`) through the v2
+builder and lower it to a `LoweredPrim`.  A compile-time sanity check
+that the pipeline wiring is correct. -/
+
+open Hesper.Circuit (ScalarExp)
+
+/-- Build a single pointwise op that doubles its input and adds one. -/
+def doubleAddOne (inId outId : Nat) (n : Nat) : CircuitM Unit := do
+  let body : ScalarExp :=
+    .add (.mul (.input 0) (.const 2.0)) (.const 1.0)
+  CircuitM.emit (Prim.pointwise #[inId] body [n] .f32 .VRAM)
+  -- consume outId so it's not flagged unused
+  let _ := outId
+  pure ()
+
+/-- End-to-end: build, lower, inspect.  This definition is used only to
+    check that `lowerAll` produces exactly one `LoweredPrim` with the
+    expected dispatch shape.  The returned plan is not executed. -/
+def pointwiseRoundTrip : Array LoweredPrim :=
+  let initSt : BuilderState := { nextId := 0, nextTick := 0, ops := #[] }
+  let (_, st) := (doubleAddOne 0 1 128).run initSt
+  let env : ShapeEnv := #[(0, [128]), (1, [128])]
+  lowerAll st env
+
+#eval pointwiseRoundTrip.size   -- expect: 1
+#eval (pointwiseRoundTrip[0]!).name   -- expect: "v2_pointwise_n128"
 
 end Hesper.CircuitV2.Examples
