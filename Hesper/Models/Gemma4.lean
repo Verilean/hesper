@@ -924,6 +924,78 @@ def chunkedRMSNormKernel (chunkDim numChunks : Nat) (eps : Float) (workgroupSize
     let result := Exp.mul (Exp.mul val rms) w
     ShaderM.writeBuffer (ty := .scalar .f32) "output" (Exp.add chunkBase i) result
 
+/-- Fused (pre-scale + chunked RMSNorm + weight + residual-add + post-scale)
+    kernel — single dispatch over `chunkDim × numChunks` elements.
+
+    Equivalent to the sequence:
+      scaled[i]  = input[i] * preScale
+      normed[i]  = rmsNorm(scaled, chunk)[i] * weight[i % chunkDim]
+      output[i]  = (normed[i] + residual[i]) * addScale
+
+    Replaces (pleScalePL + chunkedRMSNorm + scaledAdd) — three dispatches
+    over `totalPL = embdPL × numHiddenLayers` elements — with one.
+
+    Math: rmsNorm(x * C) = (x * C) / sqrt(mean((x*C)²) + ε)
+                       = (x * C) / sqrt(C² * mean(x²) + ε)
+    so the kernel computes `meanSq = mean(input²)` then
+    `invRms = 1 / sqrt(C² * meanSq + ε)` and applies
+    `normed[i] = input[i] * C * invRms * weight[i % chunk]`.
+    Exact equivalent to running the 3 kernels in sequence (no
+    approximation in the ε term). -/
+def chunkedRMSNormAddScaledKernel (chunkDim numChunks : Nat)
+    (eps preScale addScale : Float)
+    (workgroupSize : Nat := 256) : ShaderM Unit := do
+  let wid ← ShaderM.workgroupId
+  let lid ← ShaderM.localId
+  let chunkIdx := Exp.vec3X wid
+  let tid := Exp.vec3X lid
+
+  let totalElements := chunkDim * numChunks
+  let _input ← ShaderM.declareInputBuffer "input" (.array (.scalar .f32) totalElements)
+  let _weight ← ShaderM.declareInputBuffer "weight" (.array (.scalar .f32) chunkDim)
+  let _residual ← ShaderM.declareInputBuffer "residual" (.array (.scalar .f32) totalElements)
+  let _output ← ShaderM.declareOutputBuffer "output" (.array (.scalar .f32) totalElements)
+
+  ShaderM.sharedNamed "shared_sum" (.array (.scalar .f32) workgroupSize)
+
+  let chunkBase := Exp.mul chunkIdx (Exp.litU32 chunkDim)
+
+  ShaderM.varNamed "local_sum" (.scalar .f32) (Exp.litF32 0.0)
+  let localSum : Exp (.scalar .f32) := Exp.var "local_sum"
+
+  ShaderM.loop tid (Exp.litU32 chunkDim) (Exp.litU32 workgroupSize) fun i => do
+    let val ← ShaderM.readBuffer (ty := .scalar .f32) (n := totalElements) "input" (Exp.add chunkBase i)
+    ShaderM.assign "local_sum" (Exp.add localSum (Exp.mul val val))
+
+  ShaderM.writeWorkgroup (ty := .scalar .f32) "shared_sum" tid localSum
+  ShaderM.barrier
+
+  let mut stride := workgroupSize / 2
+  while stride > 0 do
+    ShaderM.if_ (Exp.lt tid (Exp.litU32 stride)) (do
+      let a ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := workgroupSize) "shared_sum" tid
+      let b ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := workgroupSize) "shared_sum" (Exp.add tid (Exp.litU32 stride))
+      ShaderM.writeWorkgroup (ty := .scalar .f32) "shared_sum" tid (Exp.add a b)
+    ) (pure ())
+    ShaderM.barrier
+    stride := stride / 2
+
+  let sumSq ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := workgroupSize) "shared_sum" (Exp.litU32 0)
+  -- meanSq(input * preScale) = preScale² * meanSq(input).
+  let preScaleSq : Float := preScale * preScale
+  let scaledMeanSq := Exp.mul (Exp.litF32 preScaleSq)
+                               (Exp.div sumSq (Exp.litF32 chunkDim.toFloat))
+  let rms := Exp.inverseSqrt (Exp.add scaledMeanSq (Exp.litF32 eps))
+
+  ShaderM.loop tid (Exp.litU32 chunkDim) (Exp.litU32 workgroupSize) fun i => do
+    let val ← ShaderM.readBuffer (ty := .scalar .f32) (n := totalElements) "input" (Exp.add chunkBase i)
+    let w ← ShaderM.readBuffer (ty := .scalar .f32) (n := chunkDim) "weight" i
+    let r ← ShaderM.readBuffer (ty := .scalar .f32) (n := totalElements) "residual" (Exp.add chunkBase i)
+    let scaled := Exp.mul val (Exp.litF32 preScale)
+    let normed := Exp.mul (Exp.mul scaled rms) w
+    let result := Exp.mul (Exp.add normed r) (Exp.litF32 addScale)
+    ShaderM.writeBuffer (ty := .scalar .f32) "output" (Exp.add chunkBase i) result
+
 /-! ## CPU Q6_K Row Dequant -/
 
 /-- Dequantize a single Q6_K row to F32 ByteArray on CPU.
@@ -3380,23 +3452,20 @@ def forwardSingleToken [GPUBackend β] (ctx : β)
         else
           Hesper.WGSL.MatMul.executeMatMulTransposeF16 ctx state.buf2 modelProj state.plTokenSelected projConfig
 
-      Hesper.WGSL.Execute.withSection "plPre.scale" do
-        ce "pleScalePL"
-          (PerLayerEmbedding.scaleKernel totalPL (1.0 / Float.sqrt model.config.hiddenSize.toFloat))
-          [("input", state.plTokenSelected), ("output", state.plInputAll)]
-          (.dispatch1D totalPL)
-
-      Hesper.WGSL.Execute.withSection "plPre.chunkedNorm" do
-        ce "chunkedRMSNorm"
-          (chunkedRMSNormKernel embdPL nLayers model.config.rmsNormEps)
-          [("input", state.plInputAll), ("weight", projNorm.scale), ("output", state.plTokenSelected)]
+      -- Fused (scale + chunked RMSNorm + scaledAdd) — one dispatch over
+      -- totalPL elements.  The kernel reads `plTokenSelected` (f16Matmul
+      -- output, un-scaled), absorbs the (1/√hidden) pre-norm scale via
+      -- `scaleSq` in the variance computation, applies the norm + weight,
+      -- then adds `plModelProj` scaled by 1/√2.  Replaces three separate
+      -- dispatches (pleScalePL, chunkedRMSNorm, scaledAdd) with one.
+      Hesper.WGSL.Execute.withSection "plPre.fusedNormAdd" do
+        let preScale : Float := 1.0 / Float.sqrt model.config.hiddenSize.toFloat
+        let addScale : Float := 1.0 / Float.sqrt 2.0
+        ce "plFusedNormAdd"
+          (chunkedRMSNormAddScaledKernel embdPL nLayers model.config.rmsNormEps preScale addScale)
+          [("input", state.plTokenSelected), ("weight", projNorm.scale),
+           ("residual", state.plModelProj), ("output", state.plInputAll)]
           { numWorkgroups := (nLayers, 1, 1), workgroupSize := { x := min embdPL 256, y := 1, z := 1 } : Hesper.ExecConfig }
-
-      Hesper.WGSL.Execute.withSection "plPre.scaledAdd" do
-        ce "scaledAdd"
-          (scaledAddKernel totalPL (1.0 / Float.sqrt 2.0))
-          [("a", state.plTokenSelected), ("b", state.plModelProj), ("output", state.plInputAll)]
-          (.dispatch1D totalPL)
     | _, _, _ => pure ()
 
   -- Step 2: Process all transformer blocks (starting from buf2 as current).
