@@ -696,6 +696,10 @@ lean_exe «llamacpp-abi-test» where
   root := `Tests.LlamaCppPTX.ABITest
   moreLinkArgs := stdLinkArgs ++ #["./.lake/build/native/libhesper_cuda.a", "-lcuda"]
 
+lean_exe «hesper-vs-llamacpp-q4k» where
+  root := `Tests.LlamaCppPTX.HesperVsLlamacppQ4K
+  moreLinkArgs := stdLinkArgs ++ #["./.lake/build/native/libhesper_cuda.a", "-lcuda"]
+
 lean_exe «rope-k-scatter-gpu-test» where
   root := `Tests.Circuit.RopeKScatterGPUTest
   moreLinkArgs := stdLinkArgs ++ #["./.lake/build/native/libhesper_cuda.a", "-lcuda"]
