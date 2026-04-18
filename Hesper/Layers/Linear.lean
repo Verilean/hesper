@@ -1091,13 +1091,20 @@ def q4kMatmulBatchKernel (config : Config) (seqLen : Nat) : ShaderM Unit := do
   let rowBaseU32 := Exp.mul outIdx (Exp.litU32 (blocksPerRow * 36))
   let q8ColBase := Exp.mul colIdx (Exp.litU32 (q8BlocksPerRow * 9))
 
+  -- Top-half lanes (tid>>4 == 1) pick up the next block per iteration —
+  -- halves trip count and removes the `*0.5` duplicate-work correction.
   let laneLow := Exp.bitAnd tid (Exp.litU32 15)
+  let blockOff := Exp.shiftRight tid (Exp.litU32 4)  -- 0 or 1
   let pairIdx := Exp.div laneLow (Exp.litU32 4)
   let elemOff := Exp.sub laneLow (Exp.mul pairIdx (Exp.litU32 4))
   let bq8Off := Exp.mul pairIdx (Exp.litU32 2)
 
-  ShaderM.loop (Exp.litU32 0) (Exp.litU32 blocksPerRow) (Exp.litU32 1) fun blockIdx => do
-    let blockU32Base := Exp.add rowBaseU32 (Exp.mul blockIdx (Exp.litU32 36))
+  let halvedTrip := (blocksPerRow + 1) / 2
+  ShaderM.loop (Exp.litU32 0) (Exp.litU32 halvedTrip) (Exp.litU32 1) fun iter => do
+    let blockIdx := Exp.add (Exp.mul iter (Exp.litU32 2)) blockOff
+    let blockInRange := Exp.lt blockIdx (Exp.litU32 blocksPerRow)
+    let safeBlockIdx := Exp.select blockInRange blockIdx (Exp.litU32 0)
+    let blockU32Base := Exp.add rowBaseU32 (Exp.mul safeBlockIdx (Exp.litU32 36))
     let dmU32 ← ShaderM.readBuffer (ty := .scalar .u32) (n := totalWeightU32) "weights" blockU32Base
     let dF := fp16ToF32 (Exp.bitAnd dmU32 (Exp.litU32 0xFFFF))
     let dminF := fp16ToF32 (Exp.shiftRight dmU32 (Exp.litU32 16))
@@ -1136,7 +1143,7 @@ def q4kMatmulBatchKernel (config : Config) (seqLen : Nat) : ShaderM Unit := do
     let v1 ← ShaderM.readBuffer (ty := .scalar .u32) (n := totalWeightU32) "weights" (Exp.add q4BaseIdx (Exp.litU32 4))
 
     -- Q8_1 reads: offset by colIdx into the batched Q8_1 buffer
-    let q8Sub0Base := Exp.add q8ColBase (Exp.add (Exp.mul blockIdx (Exp.litU32 (8 * 9))) (Exp.mul bq8Off (Exp.litU32 9)))
+    let q8Sub0Base := Exp.add q8ColBase (Exp.add (Exp.mul safeBlockIdx (Exp.litU32 (8 * 9))) (Exp.mul bq8Off (Exp.litU32 9)))
     let q8Sub1Base := Exp.add q8Sub0Base (Exp.litU32 9)
     let u0 ← ShaderM.readBuffer (ty := .scalar .u32) (n := q8InputU32Size) "input_q8" (Exp.add q8Sub0Base (Exp.add (Exp.litU32 1) elemOff))
     let u1 ← ShaderM.readBuffer (ty := .scalar .u32) (n := q8InputU32Size) "input_q8" (Exp.add q8Sub0Base (Exp.add (Exp.litU32 5) elemOff))
@@ -1170,10 +1177,12 @@ def q4kMatmulBatchKernel (config : Config) (seqLen : Nat) : ShaderM Unit := do
     let blockSumfD := Exp.add sumfD_0 sumfD_1
     let blockSumfM := Exp.add sumfM_0 sumfM_1
     let blockContrib := Exp.sub (Exp.mul dF blockSumfD) (Exp.mul dminF blockSumfM)
-    ShaderM.assign "acc" (Exp.add acc blockContrib)
+    let gatedContrib := Exp.select blockInRange blockContrib (Exp.litF32 0.0)
+    ShaderM.assign "acc" (Exp.add acc gatedContrib)
 
-  ShaderM.varNamed "total" (.scalar .f32)
-    (Exp.mul (Exp.subgroupAdd acc) (Exp.litF32 0.5))
+  -- Lanes 0..15 and 16..31 now cover distinct blocks, so the full
+  -- subgroup sum is the exact row dot — no `*0.5` correction.
+  ShaderM.varNamed "total" (.scalar .f32) (Exp.subgroupAdd acc)
   let total : Exp (.scalar .f32) := Exp.var "total"
 
   -- Column-major output: output[col * outDim + row]
