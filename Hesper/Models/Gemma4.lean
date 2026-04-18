@@ -2110,19 +2110,46 @@ def forwardBlock [GPUBackend β] (ctx : β)
     let cacheLenBytes := Hesper.WebGPU.BufferOps.uint32ToBytes cacheLen.toUInt32
     writeScalarViaStaging ctx state.paramsBuf 4 state.stagingParamsPtr 4 cacheLenBytes
     Hesper.WGSL.Execute.withSection "flashAttn" do
-      -- Use params-buffer kernel for ALL attention types (cacheable — PTX is fixed).
-      -- SWA masking is unnecessary: cacheLen already ≤ windowSize for SWA layers.
+      -- Two kernels:
+      --   cacheLen > 32: tiled split-K (phase1 + phase2) — parallel
+      --     accumulation across KV dimension wins for long caches.
+      --   cacheLen ≤ 32: subgroup params kernel (HESPER_FA_SUBGROUP=1)
+      --     or the 256-thread tree-reduce `Dynamic` kernel (default).
+      --     The subgroup kernel uses 32 threads with a single
+      --     `subgroupAdd` per position — no shared memory, no
+      --     barriers — and reads cacheLen from `params` so the PTX is
+      --     cacheable (works correctly under CUDA Graph capture +
+      --     replay past the initial ≤32 capture boundary).
+      --
+      -- Measured on Gemma 4 E4B Q4_K_M + RTX 4070 Ti: both ≤32 kernels
+      -- land within noise for typical 100-tok decode.  Keeping the
+      -- older default to avoid touching the long-context path; opt-in
+      -- via env for benchmarking / future tuning.
+      --
+      -- SWA masking isn't needed: cacheLen is already clamped to
+      -- ≤ windowSize for SWA layers upstream.
       if cacheLen > 32 then
         FlashAttention.executeFlashAttentionTiled ctx
           state.qBuf kvCache.kBuf kvCache.vBuf state.attnOutBuf
           numHeads numKVHeads cfg.maxSeqLen headDim cacheLen scale
           (partialBuf := some state.flashPartialBuf)
       else
-        ce s!"flashAttnP_{headDim}_{numKVHeads}"
-          (FlashAttention.flashAttentionDynamicParamsKernel numHeads numKVHeads cfg.maxSeqLen headDim scale)
-          [("q", state.qBuf), ("k_cache", kvCache.kBuf), ("v_cache", kvCache.vBuf),
-           ("output", state.attnOutBuf), ("params", state.paramsBuf)]
-          ({ numWorkgroups := (numHeads, 1, 1) : Hesper.ExecConfig })
+        let useSubgroupFA := (match ← IO.getEnv "HESPER_FA_SUBGROUP" with
+                             | some "1" => true
+                             | _        => false)
+        if useSubgroupFA then
+          ce s!"flashAttnS_{headDim}_{numKVHeads}"
+            (FlashAttention.flashAttentionSubgroupParamsKernel numHeads numKVHeads cfg.maxSeqLen headDim scale)
+            [("q", state.qBuf), ("k_cache", kvCache.kBuf), ("v_cache", kvCache.vBuf),
+             ("output", state.attnOutBuf), ("params", state.paramsBuf)]
+            ({ numWorkgroups := (numHeads, 1, 1), workgroupSize := { x := 32, y := 1, z := 1 }
+               extensions := ["subgroups"] : Hesper.ExecConfig })
+        else
+          ce s!"flashAttnP_{headDim}_{numKVHeads}"
+            (FlashAttention.flashAttentionDynamicParamsKernel numHeads numKVHeads cfg.maxSeqLen headDim scale)
+            [("q", state.qBuf), ("k_cache", kvCache.kBuf), ("v_cache", kvCache.vBuf),
+             ("output", state.attnOutBuf), ("params", state.paramsBuf)]
+            ({ numWorkgroups := (numHeads, 1, 1) : Hesper.ExecConfig })
 
     -- Output projection: attnOut [numHeads * headDim] → normedBuf [hiddenSize]
     -- Circuit-DSL: single matmulQ4K op via runCached (build once, replay).

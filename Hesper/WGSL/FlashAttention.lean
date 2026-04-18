@@ -558,6 +558,103 @@ def flashAttentionSubgroupKernel (numHeads numKVHeads maxSeqLen headDim cacheLen
     let oReg : Exp (.scalar .f32) := Exp.var s!"o{slice}"
     ShaderM.writeBuffer (ty := .scalar .f32) "output" outIdx oReg
 
+/-- Params-buffer variant of `flashAttentionSubgroupKernel`: reads
+    `cacheLen` from a 2-u32 params buffer (position 1 = cacheLen, matching
+    the layout used by `flashAttentionDynamicParamsKernel`).  This keeps
+    the PTX shape-stable across decode positions — exactly what CUDA
+    Graph capture needs to replay correctly past the initial
+    cacheLen-at-capture boundary.
+
+    All other properties are identical to `flashAttentionSubgroupKernel`:
+    32-thread workgroup, per-lane headDim slicing, single `subgroupAdd`
+    per position, online softmax in registers, no shared memory, no
+    barriers. -/
+def flashAttentionSubgroupParamsKernel (numHeads numKVHeads maxSeqLen headDim : Nat)
+    (scale : Float) : ShaderM Unit := do
+  let wgid ← ShaderM.workgroupId
+  let lid ← ShaderM.localId
+  let head := Exp.vec3X wgid
+  let tid := Exp.vec3X lid
+
+  let headsPerKV := numHeads / numKVHeads
+  let kvHead := Exp.div head (Exp.litU32 headsPerKV)
+  let dimsPerLane := headDim / 32
+
+  let _q ← ShaderM.declareInputBuffer "q" (.array (.scalar .f32) (numHeads * headDim))
+  let _kCache ← ShaderM.declareInputBuffer "k_cache" (.array (.scalar .f32) (numKVHeads * maxSeqLen * headDim))
+  let _vCache ← ShaderM.declareInputBuffer "v_cache" (.array (.scalar .f32) (numKVHeads * maxSeqLen * headDim))
+  let _output ← ShaderM.declareOutputBuffer "output" (.array (.scalar .f32) (numHeads * headDim))
+  let _params ← ShaderM.declareStorageBuffer "params" (.array (.scalar .u32) 2) .read
+
+  let qHeadBase := Exp.mul head (Exp.litU32 headDim)
+  let kvHeadBase := Exp.mul (Exp.mul kvHead (Exp.litU32 maxSeqLen)) (Exp.litU32 headDim)
+
+  for slice in [0:dimsPerLane] do
+    let sliceOff := Exp.add tid (Exp.litU32 (slice * 32))
+    let v ← ShaderM.readBuffer (ty := .scalar .f32) (n := numHeads * headDim) "q"
+              (Exp.add qHeadBase sliceOff)
+    ShaderM.varNamed s!"q{slice}" (.scalar .f32) v
+
+  for slice in [0:dimsPerLane] do
+    ShaderM.varNamed s!"o{slice}" (.scalar .f32) (Exp.litF32 0.0)
+
+  ShaderM.varNamed "max_score" (.scalar .f32) (Exp.litF32 (-1.0e30))
+  ShaderM.varNamed "sum_exp" (.scalar .f32) (Exp.litF32 0.0)
+  let maxScore : Exp (.scalar .f32) := Exp.var "max_score"
+  let sumExp : Exp (.scalar .f32) := Exp.var "sum_exp"
+
+  -- Read cacheLen from params[1].
+  let cacheLen ← ShaderM.readBuffer (ty := .scalar .u32) (n := 2) "params" (Exp.litU32 1)
+
+  ShaderM.loop (Exp.litU32 0) cacheLen (Exp.litU32 1) fun s => do
+    let posBase := Exp.add kvHeadBase (Exp.mul s (Exp.litU32 headDim))
+
+    ShaderM.varNamed "partialDot" (.scalar .f32) (Exp.litF32 0.0)
+    let partialDot : Exp (.scalar .f32) := Exp.var "partialDot"
+    for slice in [0:dimsPerLane] do
+      let sliceOff := Exp.add tid (Exp.litU32 (slice * 32))
+      let kVal ← ShaderM.readBuffer (ty := .scalar .f32)
+                  (n := numKVHeads * maxSeqLen * headDim) "k_cache"
+                  (Exp.add posBase sliceOff)
+      let qReg : Exp (.scalar .f32) := Exp.var s!"q{slice}"
+      ShaderM.assign "partialDot" (Exp.add partialDot (Exp.mul qReg kVal))
+
+    ShaderM.varNamed "dot" (.scalar .f32) (Exp.subgroupAdd partialDot)
+    let dot : Exp (.scalar .f32) := Exp.var "dot"
+    ShaderM.varNamed "score" (.scalar .f32) (Exp.mul (Exp.litF32 scale) dot)
+    let score : Exp (.scalar .f32) := Exp.var "score"
+
+    ShaderM.varNamed "newMax" (.scalar .f32) (Exp.max maxScore score)
+    let newMax : Exp (.scalar .f32) := Exp.var "newMax"
+    ShaderM.varNamed "expOld" (.scalar .f32) (Exp.exp (Exp.sub maxScore newMax))
+    let expOld : Exp (.scalar .f32) := Exp.var "expOld"
+    ShaderM.varNamed "expNew" (.scalar .f32) (Exp.exp (Exp.sub score newMax))
+    let expNew : Exp (.scalar .f32) := Exp.var "expNew"
+    ShaderM.varNamed "newSum" (.scalar .f32) (Exp.add (Exp.mul sumExp expOld) expNew)
+    let newSum : Exp (.scalar .f32) := Exp.var "newSum"
+    ShaderM.varNamed "rescaleFactor" (.scalar .f32) (Exp.div (Exp.mul sumExp expOld) newSum)
+    let rescaleFactor : Exp (.scalar .f32) := Exp.var "rescaleFactor"
+    ShaderM.varNamed "contribFactor" (.scalar .f32) (Exp.div expNew newSum)
+    let contribFactor : Exp (.scalar .f32) := Exp.var "contribFactor"
+
+    for slice in [0:dimsPerLane] do
+      let sliceOff := Exp.add tid (Exp.litU32 (slice * 32))
+      let vVal ← ShaderM.readBuffer (ty := .scalar .f32)
+                  (n := numKVHeads * maxSeqLen * headDim) "v_cache"
+                  (Exp.add posBase sliceOff)
+      let oReg : Exp (.scalar .f32) := Exp.var s!"o{slice}"
+      ShaderM.assign s!"o{slice}"
+        (Exp.add (Exp.mul oReg rescaleFactor) (Exp.mul vVal contribFactor))
+
+    ShaderM.assign "max_score" newMax
+    ShaderM.assign "sum_exp" newSum
+
+  for slice in [0:dimsPerLane] do
+    let sliceOff := Exp.add tid (Exp.litU32 (slice * 32))
+    let outIdx := Exp.add qHeadBase sliceOff
+    let oReg : Exp (.scalar .f32) := Exp.var s!"o{slice}"
+    ShaderM.writeBuffer (ty := .scalar .f32) "output" outIdx oReg
+
 /-! ## SWA variant: subgroup flash attention with sliding window -/
 
 /-- SWA (Sliding Window Attention) variant of `flashAttentionSubgroupKernel`.
