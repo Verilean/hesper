@@ -2675,6 +2675,20 @@ def forwardPrefillBatch [GPUBackend β] (ctx : β)
   -- chain entirely in the common case.
   let dumpEnabled := (← IO.getEnv "HESPER_DUMP_DIR").isSome
 
+  -- Attention-path bit-parity harness (Phase 2 item 2 step 1):
+  --   HESPER_ATTN_DUMP=<tag>       → dump batchAttnOutBuf after attention,
+  --                                   file name `attn_L{li}_<tag>.bin`.
+  --   HESPER_FORCE_FALLBACK=1      → force the per-token loop even on
+  --                                   layers that would normally take the
+  --                                   batched fast path.  Combined with
+  --                                   HESPER_ATTN_DUMP=fallback, lets us
+  --                                   dump the fallback output for a
+  --                                   full-attn layer, then re-run without
+  --                                   the flag + HESPER_ATTN_DUMP=batched
+  --                                   and diff the two.
+  let attnDumpTag ← IO.getEnv "HESPER_ATTN_DUMP"
+  let forceFallback := (← IO.getEnv "HESPER_FORCE_FALLBACK").isSome
+
   -- NOTE: no beginBatch here — each dispatch fires immediately.
   -- Batching would defer all launches until endBatch, but the per-token
   -- attention loop reads batch matmul outputs mid-stream, requiring
@@ -2901,7 +2915,7 @@ def forwardPrefillBatch [GPUBackend β] (ctx : β)
     --   * a valid KV cache slot
     let mut handledByBatched := false
     if hKV : kvLi < state.kvCaches.size then
-      match (if cfg.hasKV li then block.ropeFreqFactors else none) with
+      match (if cfg.hasKV li && !forceFallback then block.ropeFreqFactors else none) with
       | some freqFactors =>
         handledByBatched := true
         let kvCache := state.kvCaches[kvLi]
@@ -3059,6 +3073,19 @@ def forwardPrefillBatch [GPUBackend β] (ctx : β)
           (columnInsertKernel qDim seqLen)
           [("src", state.attnOutBuf), ("params", colIdxBuf), ("batch", batchAttnOutBuf)]
           (.dispatch1D qDim)
+    else pure ()
+
+    -- Bit-parity harness: dump `batchAttnOutBuf` right after attention.
+    -- Use per-layer filenames so full/SWA/shared-KV can be inspected
+    -- independently.  Dumps go under `$HESPER_ATTN_DUMP_DIR` (default: /tmp).
+    match attnDumpTag with
+    | some tag =>
+      let dir := (← IO.getEnv "HESPER_ATTN_DUMP_DIR").getD "/tmp"
+      GPUBackend.endBatch ctx
+      let bytes := (qDim * seqLen * 4).toUSize
+      let data ← GPUBackend.readBuffer ctx batchAttnOutBuf bytes
+      IO.FS.writeBinFile s!"{dir}/attn_L{li}_{tag}.bin" data
+    | none => pure ()
 
     -- ── 2d: O projection (batch matmul) ──────────────────────────────
     Linear.forwardBatchDP4A ctx block.attention.wO batchAttnOutBuf batchOProjBuf seqLen
