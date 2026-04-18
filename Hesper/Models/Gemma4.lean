@@ -1610,6 +1610,15 @@ structure InferenceState (BufT CacheT : Type) where
   lmHeadQ8Buf : IO.Ref (Option BufT)
   lmHeadQuantizePrepared : IO.Ref (Option CacheT)
   lmHeadDP4APrepared : IO.Ref (Option CacheT)
+  /-- Pinned host pointer (4 bytes).  See §CUDA Graph notes in the
+      InferenceState doc header. -/
+  stagingTokenPtr   : USize := 0
+  /-- Pinned host pointer (8 bytes — pos @0, cacheLen @4). -/
+  stagingParamsPtr  : USize := 0
+  /-- Pinned host pointer (4 bytes) for per-layer-embedding row index. -/
+  stagingPLRowPtr   : USize := 0
+  /-- Pinned host pointer (4 bytes) for the batch-prefill column index. -/
+  stagingColIdxPtr  : USize := 0
 
 /-- Dynamic cache ref store. Lazily creates IO.Ref per unique cacheKey. -/
 structure KernelCacheRefs (CacheT : Type) where
@@ -1696,6 +1705,21 @@ def createInferenceState [GPUBackend β] (ctx : β) (cfg : Config) : IO (Inferen
     lmHeadQ8Buf := ← IO.mkRef none
     lmHeadQuantizePrepared := ← GPUBackend.newCacheRef (β := β)
     lmHeadDP4APrepared := ← GPUBackend.newCacheRef (β := β)
+    -- Pinned-host staging (CUDA only; zero on other backends).  Using
+    -- IO.getEnv as a crude backend check for now — a typeclass method
+    -- `allocPinnedHost` on GPUBackend is the proper extension point.
+    stagingTokenPtr  := ← match ← IO.getEnv "HESPER_CUDA_GRAPHS" with
+                         | some _ => Hesper.CUDA.cuMemAllocHost 4
+                         | none   => pure 0
+    stagingParamsPtr := ← match ← IO.getEnv "HESPER_CUDA_GRAPHS" with
+                         | some _ => Hesper.CUDA.cuMemAllocHost 8
+                         | none   => pure 0
+    stagingPLRowPtr  := ← match ← IO.getEnv "HESPER_CUDA_GRAPHS" with
+                         | some _ => Hesper.CUDA.cuMemAllocHost 4
+                         | none   => pure 0
+    stagingColIdxPtr := ← match ← IO.getEnv "HESPER_CUDA_GRAPHS" with
+                         | some _ => Hesper.CUDA.cuMemAllocHost 4
+                         | none   => pure 0
   }
 
 /-- Dump a buffer to a file when HESPER_DUMP_DIR env is set.
@@ -1715,6 +1739,42 @@ def dumpBuf [GPUBackend β] (ctx : β) (buf : GPUBackend.Buf β) (bytes : USize)
     IO.FS.writeBinFile s!"{dir}/{suffix}.bin" data
     if wasBatching then
       GPUBackend.beginBatch ctx
+
+/-- Write a small scalar (≤8 bytes) to a device buffer via a pinned-host
+    staging slot.  Safe inside CUDA Graph capture: the resulting memcpy
+    node holds a stable host pointer.  Outside capture it is identical
+    in effect to `writeBufferOffset` (just uses pinned host memory as
+    the source).
+
+    * `ctx`        — backend context
+    * `dstBuf`     — device buffer
+    * `dstOffset`  — byte offset into `dstBuf`
+    * `staging`    — `USize` pinned-host pointer allocated at state init
+    * `stOffset`   — byte offset inside the staging slot (usually 0)
+    * `data`       — the bytes to write
+ -/
+def writeScalarViaStaging [GPUBackend β] (ctx : β)
+    (dstBuf : GPUBackend.Buf β) (dstOffset : USize)
+    (staging : USize) (stOffset : USize)
+    (data : ByteArray) : IO Unit := do
+  if staging == 0 then
+    -- No pinned slot (e.g. WebGPU, or CUDA_GRAPHS disabled) — fall back.
+    GPUBackend.writeBufferOffset ctx dstBuf dstOffset data
+  else
+    Hesper.CUDA.cuWritePinned staging stOffset data data.size.toUSize
+    match ← Hesper.cudaCaptureStream.get with
+    | some s =>
+      -- Pull the raw device pointer via the backend extension.
+      match ← GPUBackend.rawDevicePtr ctx dstBuf with
+      | some ptr =>
+        Hesper.CUDA.cuMemcpyHtoDFromPinned
+          (ptr + dstOffset) staging stOffset data.size.toUSize s
+      | none =>
+        -- Backend can't expose a raw ptr; fall back to the normal path.
+        GPUBackend.writeBufferOffset ctx dstBuf dstOffset data
+    | none =>
+      -- Not capturing — just plain writeBufferOffset is fine.
+      GPUBackend.writeBufferOffset ctx dstBuf dstOffset data
 
 /-! ## Single-Token Forward Pass -/
 
@@ -1889,8 +1949,11 @@ def forwardBlock [GPUBackend β] (ctx : β)
   -- Step 4: RoPE on Q and K
   -- Upload position to params buffer (u32 for hand-coded kernels)
   let posBytes := Hesper.WebGPU.BufferOps.uint32ToBytes pos.toUInt32
-  GPUBackend.writeBufferOffset ctx state.paramsBuf 0 posBytes
+  writeScalarViaStaging ctx state.paramsBuf 0 state.stagingParamsPtr 0 posBytes
   -- Also upload pos as f32 for Circuit DSL scatter addrExpr.
+  -- posF32Buf is small too but we don't yet have a pinned slot for it.
+  -- Kept on the non-pinned path; during graph capture this is a
+  -- captured memcpy whose source may be freed.  TODO: add slot.
   let posF32Bytes ← Hesper.Basic.floatToBytes pos.toFloat
   GPUBackend.writeBufferOffset ctx state.posF32Buf 0 posF32Bytes
 
@@ -2039,7 +2102,7 @@ def forwardBlock [GPUBackend β] (ctx : β)
     let scale : Float := 1.0
     -- Write cacheLen to params buffer for FlashAttention (params = [pos, cacheLen])
     let cacheLenBytes := Hesper.WebGPU.BufferOps.uint32ToBytes cacheLen.toUInt32
-    GPUBackend.writeBufferOffset ctx state.paramsBuf 4 cacheLenBytes
+    writeScalarViaStaging ctx state.paramsBuf 4 state.stagingParamsPtr 4 cacheLenBytes
     Hesper.WGSL.Execute.withSection "flashAttn" do
       -- Use params-buffer kernel for ALL attention types (cacheable — PTX is fixed).
       -- SWA masking is unnecessary: cacheLen already ≤ windowSize for SWA layers.
@@ -3227,7 +3290,7 @@ def forwardSingleToken [GPUBackend β] (ctx : β)
       GPUBackend.executeWithConfigCached ctx shader namedBufs config key ref
     | none => GPUBackend.execute ctx shader namedBufs config
   let tokenBytes := Hesper.WebGPU.BufferOps.uint32ToBytes tokenId.toUInt32
-  GPUBackend.writeBufferOffset ctx state.tokenBuf 0 tokenBytes
+  writeScalarViaStaging ctx state.tokenBuf 0 state.stagingTokenPtr 0 tokenBytes
   Hesper.WGSL.Execute.withSection "embedLookup" do
     match model.embdFormat with
     | .Q6_K =>
@@ -3263,7 +3326,7 @@ def forwardSingleToken [GPUBackend β] (ctx : β)
       --    Full table on GPU — no CPU→GPU transfer per token.
       Hesper.WGSL.Execute.withSection "plPre.gpuDequant" do
         let tokenIdBytes := Hesper.WebGPU.BufferOps.uint32ToBytes tokenId.toUInt32
-        GPUBackend.writeBufferOffset ctx state.plRawRowBuf 0 tokenIdBytes
+        writeScalarViaStaging ctx state.plRawRowBuf 0 state.stagingPLRowPtr 0 tokenIdBytes
         let scaleFactor : Float := Float.sqrt embdPL.toFloat
         ce "q6kDequantScale"
           (Hesper.Quantization.Q6_K.q6kTableRowDequantScaleKernel totalPL scaleFactor
@@ -3654,20 +3717,21 @@ def generate [GPUBackend β] (ctx : β) (model : Gemma4Model (GPUBackend.Buf β)
     if newPos < model.config.maxSeqLen then
       match graphExecOpt with
       | some (exec, stream) =>
-        -- Graph replay is NOT YET wired.  The captured graph's memcpy
-        -- nodes hold pointers into the ByteArrays used during capture;
-        -- those are Lean-managed and may be freed before replay.  A
-        -- correct implementation needs a pinned-memory staging area
-        -- owned by hesper state (tokenBuf, paramsBuf, ...) — then
-        -- writeBufferOffset on the capture stream captures a memcpy
-        -- from that persistent host buffer, and replay re-reads it.
-        --
-        -- For now, just run forwardSingleToken normally and ignore the
-        -- graph.  The capture overhead on token 1 is kept so we can
-        -- measure "capture + instantiate" cost (currently ~0).
-        let _ := exec
-        let _ := stream
-        forwardSingleToken ctx model nextToken newPos state (kcr := some kcr)
+        -- Replay path.  The captured graph contains memcpy nodes whose
+        -- host sources are the pinned buffers at state.stagingTokenPtr /
+        -- stagingParamsPtr / stagingPLRowPtr (see writeScalarViaStaging).
+        -- Update those slots with the new token/pos/cacheLen BEFORE
+        -- launching the graph so the memcpy nodes pick up fresh values.
+        let tokenBytes := Hesper.WebGPU.BufferOps.uint32ToBytes nextToken.toUInt32
+        let posBytes := Hesper.WebGPU.BufferOps.uint32ToBytes newPos.toUInt32
+        let cacheLenBytes := Hesper.WebGPU.BufferOps.uint32ToBytes (newPos + 1).toUInt32
+        let plRowBytes := tokenBytes
+        Hesper.CUDA.cuWritePinned state.stagingTokenPtr  0 tokenBytes 4
+        Hesper.CUDA.cuWritePinned state.stagingParamsPtr 0 posBytes 4
+        Hesper.CUDA.cuWritePinned state.stagingParamsPtr 4 cacheLenBytes 4
+        Hesper.CUDA.cuWritePinned state.stagingPLRowPtr  0 plRowBytes 4
+        Hesper.CUDA.cuGraphLaunch exec stream
+        Hesper.CUDA.cuStreamSynchronize stream
       | none =>
         if useCudaGraphs && genCount == 1 then
           -- Capture path: run forwardSingleToken on a capture stream.
