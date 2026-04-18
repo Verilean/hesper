@@ -1,7 +1,7 @@
 ---
 title: "16 — Phase 1 shape audit: hesper forward kernels classified A/B/C"
 date: 2026-04-19
-status: architecture-plan
+status: architecture-plan (in progress)
 ---
 
 # Phase 1 shape audit
@@ -9,6 +9,21 @@ status: architecture-plan
 Classification of every GPU kernel dispatched on hesper's Gemma 4
 forward path, per the plan in doc 15.  Goal: identify exactly which
 kernels block unifying `forwardSingleToken` with `forwardPrefillBatch`.
+
+## Progress tracker
+
+| Phase 2 item | Status | Commit | Measured impact |
+|---|---|---|---|
+| **1. Batched RMSNorm+residual** (post-attn + post-FFN) | ✅ done | `848c14f` | −2268 dispatches, prefill 290 → 250 ms |
+| **2. Unify attention via batched fast path** | 🟥 blocked | (reverted) | First attempt (freq_factors=1.0 fake) regressed both perf and correctness.  Needs bit-parity harness + genuine batched-RoPE-no-freq kernels.  See doc 17. |
+| **3. Batched PLE inner loop** | ✅ done | `1f85284` | −2150 dispatches, prefill 247 → 213 ms |
+| 4. Drop `columnExtract` / `columnInsert` around batched paths | ⏳ partial | in items 1 & 3 | Deleted from post-attn/post-FFN + PLE.  Still present in per-token attn fallback (item 2). |
+| 5. Pass pos/cacheLen arrays directly (skip `copyU32Kernel`) | ⏳ pending | — | Blocked on item 2 (only per-token loop needs this). |
+| 6. Fuse layer output scale into preceding matmul | ⏳ pending | — | Independent; easy once items 1-3 stabilize. |
+
+**Net so far**: −4418 dispatches/prefill, wall time 290 → 213 ms (−27 %).
+Remaining structural item (2) is the biggest single lever — ≈ −3780
+additional dispatches — but also the riskiest. 
 
 Legend:
 - **A** — already N-aware: accepts seqLen as a runtime/grid dim and
@@ -81,7 +96,7 @@ The `for i in [0:seqLen]` loop at Gemma4.lean:3056 does extract → norm → ins
 | Kernel | Called at | Shape now | Buffer | Class | Batch variant? | Notes |
 |---|---|---|---|---|---|---|
 | `columnExtractKernel` (oProj, current) | 3060, 3065 | `dispatch1D(dim)` | col extract | **B** | — | Delete if batched norm reads `[dim*seqLen]` directly. |
-| `RMSNorm.forwardNormThenAdd` | 3071 | hardcoded 1 WG = 1 row | `[dim]` | **C** | **none** | **Highest priority new kernel**: batched `RMSNorm+residual` taking `[dim, seqLen]`, 1 WG per row.  This unblocks both the post-attn and post-FFN loops. |
+| ~~`RMSNorm.forwardNormThenAdd`~~ → `forwardNormThenAddBatch` | 3071 | `(seqLen, 1, 1)×256` | `[dim*seqLen]` batch | ✅ **A** | `848c14f` | **Done** (Phase 2 item 1).  Batched kernel `rmsNormThenAddBatchKernel` takes `[dim, seqLen]` col-major, 1 WG per row.  Deleted extract/insert wrappers. |
 | `columnInsertKernel` (result) | 3074 | `dispatch1D(dim)` | single-col | **B** | — | Same — delete if the batched norm writes to `[dim*seqLen]` directly. |
 
 ## FFN
@@ -101,24 +116,29 @@ same batched `RMSNorm+residual` kernel.
 | Kernel | Called at | Shape now | Buffer | Class | Batch variant? | Notes |
 |---|---|---|---|---|---|---|
 | `columnExtractKernel` (ffnOut, attnResid) | 3142, 3149 | `dispatch1D(dim)` | col extract | **B** | — | Delete once batched norm ships. |
-| `RMSNorm.forwardNormThenAdd` | 3154 | 1 WG = 1 row | `[dim]` | **C** | **none** | Same kernel as post-attn. |
+| ~~`RMSNorm.forwardNormThenAdd`~~ → `forwardNormThenAddBatch` | 3154 | `(seqLen, 1, 1)×256` | `[dim*seqLen]` batch | ✅ **A** | `848c14f` | **Done** (Phase 2 item 1).  Shared kernel with post-attn.  Both extract/insert wrappers deleted. |
 | `columnInsertKernel` (nextBuf) | 3157 | `dispatch1D(dim)` | single-col | **B** | — | |
 
 ## Per-layer embedding (PLE) — per-token loop
 
 The loop at Gemma4.lean:3188 runs `for i in [0:seqLen]` and dispatches
-several single-token kernels per token.  Of everything, this is the
-second-biggest structural C after the RMSNorm+residual.
+several single-token kernels per token.  Of everything, this was the
+second-biggest structural C after the RMSNorm+residual.  **✅ Resolved
+by Phase 2 item 3 (commit `1f85284`).**  The entire `for i in
+[0:seqLen]` loop was replaced with 4 batched dispatches: `inpGate`
+matmul (batched) → `geluGateMulSliceBatchKernel` → `proj` matmul
+(batched) → `forwardNormThenAddBatch`.  All the column-extract /
+column-insert wrappers in this section are gone.
 
-| Kernel | Called at | Shape now | Buffer | Class | Batch variant? | Notes |
-|---|---|---|---|---|---|---|
-| `plInputAllExtract` (column of `batchPLInputAll`) | 3195 | `dispatch1D(totalPL)` | `[seqLen*totalPL]` → `[totalPL]` | **B** | — | Add y-dim = seqLen; eliminate. |
-| `columnExtractKernel` (nextBuf) | 3201 | `dispatch1D(dim)` | col extract | **B** | — | |
-| `LinearLayer.forward` (per_layer_inp_gate) | ~3216 | single-token matmul `[dim] → [embdPerLayer]` | single-token | **C** | — | Use `forwardBatchDP4A` on `[dim*seqLen]` input — already exists. Just rewire. |
-| `geluGateMulSliceKernel` | ~3218 | `dispatch1D(embdPerLayer)` | `[embdPerLayer*nLayers]` slice+mul | **B** | — | Pointwise; add y=seqLen. |
-| `LinearLayer.forward` (per_layer_proj) | similar | single-token | single-token | **C** | — | Same: rewire to batched matmul. |
-| `fusedPerLayerPostKernel` (norm+residual inside PLE) | ~3223 | `(1,1,1)×wgSize` | `[hiddenSize]` single-token | **C** | **none** | Subgroup-fused; hard-coded 1 WG = 1 token.  Either add y=seqLen (1 WG per row) or reuse the new batched RMSNorm+residual kernel with a different epilogue. |
-| `columnInsertKernel` (back into nextBuf) | ~3222 | `dispatch1D(dim)` | col | **B** | — | |
+| Kernel (old) | Replacement | Class | Notes |
+|---|---|---|---|
+| ~~`plInputAllExtract`~~ | folded into `geluGateMulSliceBatchKernel` (reads `per_layer_input[col*plTotalSize + plOffset + d]` directly) | ✅ **A** | Deleted. |
+| ~~`columnExtractKernel` (nextBuf)~~ | none — batched matmul reads `nextBuf [dim, seqLen]` directly | ✅ **A** | Deleted. |
+| ~~`LinearLayer.forward` (inp_gate)~~ | `forwardBatchDP4A(ple.inpGate, nextBuf, plGateBatchBuf, seqLen)` | ✅ **A** | `1f85284` |
+| ~~`geluGateMulSliceKernel`~~ | new `geluGateMulSliceBatchKernel` (1D dispatch over `embdPerLayer*seqLen`) | ✅ **A** | `1f85284` |
+| ~~`LinearLayer.forward` (proj)~~ | `forwardBatchDP4A(ple.proj, plMoeOutBatchBuf, plProjBatchBuf, seqLen)` | ✅ **A** | `1f85284` |
+| ~~`fusedPerLayerPostKernel`~~ | `forwardNormThenAddBatch(ple.postNorm, plProj, nextBuf, nextBuf, seqLen)` | ✅ **A** | Shares the Phase 2 item 1 kernel. |
+| ~~`columnInsertKernel` (back into nextBuf)~~ | none — `forwardNormThenAddBatch` writes directly to `nextBuf [dim, seqLen]` | ✅ **A** | Deleted. |
 
 ## Layer output scale (per-token loop)
 
@@ -134,57 +154,67 @@ second-biggest structural C after the RMSNorm+residual.
 
 ## Summary — what actually needs writing
 
-The audit reduces to **three** real refactor items.  Everything else is
-either already batched (A) or a trivial grid-extension (B) that falls
-out of the refactor.
+The audit reduced to **three** real refactor items.  Status after
+commits `848c14f` (item 1), `1f85284` (item 3), and doc 17 (item 2
+revised plan):
 
-1. **Batched `RMSNorm + residual-add` kernel** — shape `[dim, seqLen]`,
-   1 WG per row.  Unblocks both post-attn (Gemma4.lean:3056) and
-   post-FFN (3134) hot loops.  Estimate: ~100 LoC ShaderM + wiring.
-   Deletes ~2268 dispatches/prefill.
+1. ✅ **Batched `RMSNorm + residual-add` kernel** — shape `[dim, seqLen]`,
+   1 WG per row.  Unblocked both post-attn (Gemma4.lean:3056) and
+   post-FFN (3134) hot loops.  **Commit `848c14f`.  −2268 dispatches,
+   prefill 290 → 250 ms.**
 
-2. **Unify the two attention paths** — route every layer through the
-   existing batched attention fast path (batch QKV-norm + batched RoPE
-   + batched RoPE-K+cache-write + `flashAttentionBatchKernel`).  The
-   single-token SWA / no-freq_factors branches need batch variants OR
-   the SWA mask has to be folded into the batched path.  Estimate:
-   mostly plumbing, 1 new batched-RoPE variant if SWA really needs a
-   separate kernel.  Deletes ~3780 dispatches/prefill.
+2. 🟥 **Unify the two attention paths** — first attempt (feed
+   `freq_factors=1.0` to SWA layers to share the existing batched
+   kernel) regressed both perf (250 → 4,222 ms prefill) and
+   correctness (`"are are"` → `"ATP"`), and was reverted.  Root cause
+   analysis in doc 17: the SWA batched path does NOT have bit-parity
+   with the SWA single-token fallback.  Revised plan: build a
+   bit-parity test harness first, then write genuine batched-RoPE-
+   no-freq and batched-Q-only kernels (not fake
+   `freq_factors=1.0`), THEN delete the fallback.  Expected savings
+   still −3780 dispatches.  **Still pending — biggest remaining lever.**
 
-3. **Batch the PLE inner loop** — `per_layer_inp_gate` and
-   `per_layer_proj` are already batch-capable through
-   `forwardBatchDP4A`; the PLE-post kernel (`fusedPerLayerPostKernel`)
-   is the only true C in this section.  Either add y=seqLen to it or
-   route through the new batched RMSNorm+residual.  Deletes ~378
-   dispatches/prefill.
+3. ✅ **Batch the PLE inner loop** — `per_layer_inp_gate` and
+   `per_layer_proj` rewired to `forwardBatchDP4A`; new
+   `geluGateMulSliceBatchKernel`; the PLE-post step reuses the kernel
+   from item 1.  **Commit `1f85284`.  −2150 dispatches, prefill 247
+   → 213 ms.**
 
 Plus housekeeping (all B → delete-and-simplify):
 
-4. Drop all `columnExtractKernel` / `columnInsertKernel` calls that
+4. ⏳ Drop all `columnExtractKernel` / `columnInsertKernel` calls that
    exist only to bridge batched buffers into single-token kernels.
-   Once (1)–(3) are done, nothing consumes the single-token views.
+   **Partially done** — removed around post-attn/post-FFN norm (item 1)
+   and PLE (item 3).  Still present in the per-token attention
+   fallback; deleted when item 2 lands.
 
-5. `copyU32Kernel` dispatches for pos/cacheLen — pass arrays directly
+5. ⏳ `copyU32Kernel` dispatches for pos/cacheLen — pass arrays directly
    to the batched RoPE/FA kernels (they already index `inp_pos[y]`).
+   Blocked on item 2 (only per-token loop uses them).
 
-6. Layer output scale — fuse into the preceding matmul epilogue via
-   the existing `Circuit.fuseMatmulEpilogue` pass.
+6. ⏳ Layer output scale — fuse into the preceding matmul epilogue via
+   the existing `Circuit.fuseMatmulEpilogue` pass.  Independent of
+   item 2; easy follow-up.
 
 ## Projected dispatch counts after Phase 2
 
 For `seqLen = 9, nLayers = 42`:
 
-| Component | Today | After rewrite | Source |
-|---|---:|---:|---|
-| Embedding | 9 (+ scale) | 1 | B→A |
-| Attention inner loop (fallback) | ~90/layer → 3780 | 3/layer → 126 | Phase 2 item 2 |
-| Post-attn RMSNorm+residual | 27/layer → 1134 | 1/layer → 42 | Phase 2 item 1 |
-| FFN | ~5/layer → 210 | ~5/layer → 210 | already A |
-| Post-FFN RMSNorm+residual | 27/layer → 1134 | 1/layer → 42 | Phase 2 item 1 |
-| PLE inner loop | ~8·9/layer → 3024 | ~5/layer → 210 | Phase 2 item 3 |
-| Output scale | 3/layer → 126 | 0 (fused) | housekeeping 6 |
-| Final norm + lm_head | ~5 | ~5 | unchanged |
-| **Total (prefill)** | **≈ 9420** | **≈ 640** | 15× fewer |
+| Component | Original | Current (`1f85284`) | After item 2 | Source |
+|---|---:|---:|---:|---|
+| Embedding | 9 (+ scale) | 9 | 1 | B→A (housekeeping) |
+| Attention inner loop (fallback) | ~90/layer → 3780 | 3780 | 3/layer → 126 | item 2 |
+| Post-attn RMSNorm+residual | 27/layer → 1134 | **42** | 42 | ✅ item 1 |
+| FFN | ~5/layer → 210 | 210 | 210 | already A |
+| Post-FFN RMSNorm+residual | 27/layer → 1134 | **42** | 42 | ✅ item 1 |
+| PLE inner loop | ~8·9/layer → 3024 | **~210** | ~210 | ✅ item 3 |
+| Output scale | 3/layer → 126 | 126 | 0 (fused) | housekeeping 6 |
+| Final norm + lm_head | ~5 | 5 | 5 | unchanged |
+| **Total (prefill)** | **≈ 9420** | **≈ 4425** | **≈ 640** | items 1+3 done; item 2 pending |
+
+**Progress: 53 % of dispatch reduction achieved** (9420 → 4425 so far;
+target 640).  The remaining 3785 dispatches are almost entirely the
+per-token attention fallback loop — i.e. exactly item 2.
 
 llama.cpp hits ~20 dispatches/layer → 840 for the same shape.  Our
 post-rewrite projection of ~640 is comparable (hesper has fewer ops
@@ -193,8 +223,31 @@ per-layer because of the PLE-precompute hoist already done, and no
 
 ## Next step — Phase 2
 
-Start with item 1 (batched RMSNorm+residual) — it's the smallest new
-kernel, unlocks the biggest single-dispatch drop (1134 each for
-post-attn/post-FFN = 2268 total), and is a useful test of whether the
-refactor moves the multi-token correctness needle before we tackle the
-thornier attention-path unification.
+~~Start with item 1 (batched RMSNorm+residual)...~~  ✅ Done.
+~~Follow up with item 3 (batched PLE)...~~  ✅ Done.
+
+**Item 2 (attention path unification) is the remaining work.**  Per
+doc 17, the naive "feed `freq_factors=1.0`" trick failed — SWA and
+shared-KV layers have subtly different math than the existing batched
+full-attention path.  Next actions:
+
+1. **Build a bit-parity test harness**: dump `batchAttnOutBuf` for one
+   SWA layer via the current per-token fallback, then via the
+   (proposed) batched path, and numerical-diff.  Without this we
+   cannot tell whether the unified path is numerically correct, let
+   alone whether it matches llama.cpp.
+2. Write batched-RoPE-no-freq and (if needed) Q-only batched QKV-norm
+   kernels — NOT the `freq_factors=1.0` hack, actual math mirrors
+   of `RoPE.ropeKernelDynamic` and `perHeadRMSNormKernel`.
+3. Separately audit whether `executeFlashAttentionTiled` can take
+   `nQueries > 1` today, or needs extension.
+4. Only after bit-parity is established on all three layer types
+   (full, SWA, shared-KV), replace the fallback block.
+
+Estimated effort: one working session.  Expected gain: −3780
+dispatches, and (if the hidden "are are" bug lives in the fallback as
+doc 17 conjectures) restoration of multi-token correctness.
+
+Also unblocked once item 2 lands: housekeeping items 4 (column
+extract/insert deletion in the attention path) and 5
+(`copyU32Kernel` deletion).
