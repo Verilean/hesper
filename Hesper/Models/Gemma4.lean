@@ -2972,7 +2972,9 @@ def forwardPrefillBatch [GPUBackend β] (ctx : β)
 
       -- RoPE on Q: qBuf2 → qBuf
       -- GPU-side: posBuf[i] → paramsBuf[0]
-      GPUBackend.writeBufferOffset ctx colIdxBuf 0 colIdxBytes  -- i already written above
+      -- NOTE: colIdxBuf already holds `i` from the Q/K/V extract above
+      -- (extracts always run first this iteration, so skip the redundant
+      -- 4-byte HtoD write here — 1 HtoD/token/layer × 42 × 9 = 378 saved).
       GPUBackend.execute ctx
         (copyU32Kernel seqLen 2 0)
         [("src", posBuf), ("params", colIdxBuf), ("dst", state.paramsBuf)]
@@ -3038,8 +3040,8 @@ def forwardPrefillBatch [GPUBackend β] (ctx : β)
              ("output", state.attnOutBuf), ("params", state.paramsBuf)]
             ({ numWorkgroups := (numHeads, 1, 1) : Hesper.ExecConfig })
 
-        -- Insert attnOut into batch buffer for later O-projection
-        GPUBackend.writeBufferOffset ctx colIdxBuf 0 colIdxBytes
+        -- Insert attnOut into batch buffer for later O-projection.
+        -- colIdxBuf still holds `i` from the extracts — skip redundant write.
         GPUBackend.execute ctx
           (columnInsertKernel qDim seqLen)
           [("src", state.attnOutBuf), ("params", colIdxBuf), ("batch", batchAttnOutBuf)]
