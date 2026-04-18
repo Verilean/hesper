@@ -270,25 +270,114 @@ per-layer because of the PLE-precompute hoist already done, and no
 **Item 2 (attention path unification) is the remaining work.**  Per
 doc 17, the naive "feed `freq_factors=1.0`" trick failed — SWA and
 shared-KV layers have subtly different math than the existing batched
-full-attention path.  Next actions:
+full-attention path.
 
-1. **Build a bit-parity test harness**: dump `batchAttnOutBuf` for one
-   SWA layer via the current per-token fallback, then via the
-   (proposed) batched path, and numerical-diff.  Without this we
-   cannot tell whether the unified path is numerically correct, let
-   alone whether it matches llama.cpp.
-2. Write batched-RoPE-no-freq and (if needed) Q-only batched QKV-norm
-   kernels — NOT the `freq_factors=1.0` hack, actual math mirrors
-   of `RoPE.ropeKernelDynamic` and `perHeadRMSNormKernel`.
-3. Separately audit whether `executeFlashAttentionTiled` can take
-   `nQueries > 1` today, or needs extension.
-4. Only after bit-parity is established on all three layer types
-   (full, SWA, shared-KV), replace the fallback block.
+### Concrete re-start plan (Phase 2 item 2)
 
-Estimated effort: one working session.  Expected gain: −3780
-dispatches, and (if the hidden "are are" bug lives in the fallback as
-doc 17 conjectures) restoration of multi-token correctness.
+Open these on next session:
 
-Also unblocked once item 2 lands: housekeeping items 4 (column
-extract/insert deletion in the attention path) and 5
-(`copyU32Kernel` deletion).
+- `Hesper/Models/Gemma4.lean:2880-3048` — entire attention block; batched
+  fast path at 2891-2932, per-token fallback at 2935-3048.
+- `docs/llama-fusion-analysis/17-phase2-item2-findings.md` — revised plan
+  and the three correctness hypotheses from the last attempt.
+- `docs/llama-fusion-analysis/15-llama-single-path.md` — the llama.cpp
+  reference behaviour the unified path must match.
+
+**Step 1 — Bit-parity harness** (smallest standalone deliverable).
+
+Add an env-gated dump to `forwardPrefillBatch`:
+- `HESPER_ATTN_DUMP=fallback` → before the per-token loop writes
+  `columnInsertKernel` output at 3046, copy `state.attnOutBuf` to a
+  host file named `attn_L{li}_t{i}_fallback.bin`.
+- `HESPER_ATTN_DUMP=batched` → same dump point in the batched branch
+  (after `flashAttentionBatchKernel` at 2929), column-extract each
+  token's slice of `batchAttnOutBuf` into a scratch buf, dump with the
+  same filename shape.
+- Diff script (5 lines of Python or a small Lean test): `numpy.allclose`
+  on every `attn_L{li}_t{i}_*.bin` pair for `li ∈ full-attn layers` —
+  these should already match bit-identically (same kernels, same data).
+  If they don't, our diff infrastructure itself is wrong and item 2's
+  main work is blocked.
+
+**Step 2 — Batched-RoPE-no-freq kernel** (once harness works for full-
+attn).
+
+In `Hesper/Models/Gemma4.lean`:
+- Add `ropeBatchKernel (headDim numHeads seqLen : Nat) (ropeBase :
+  Float)` — structural mirror of `ropeWithFreqFactorsBatchKernel` at
+  line 369 but drop the `/ freqFactor` division.  Math should match
+  `RoPE.ropeKernelDynamic` (single-token, full-layer variant).
+- Add `ropeKAndCacheWriteBatchKernel_noFreq` — mirror of
+  `fusedRopeKAndCacheWriteBatchKernel` at line 429, drop freq factor
+  division.  Math matches `Attention.fusedCacheWriteKVKernel` chained
+  after `RoPE.ropeKernelDynamic`.
+- Wire SWA layers (`hasKV=true, ropeFreqFactors=none`) into the batched
+  branch using these new kernels.  Gate behind `HESPER_UNIFY_ATTN=swa`
+  env var so the fallback path is still the default until the harness
+  greenlights it.
+- Run the Step 1 harness with `HESPER_UNIFY_ATTN=swa` + one SWA layer.
+  Expect bit-identical output.
+
+**Step 3 — Flash-attention `nQueries > 1` audit** (open question from
+doc 15).
+
+Read `Hesper/WGSL/FlashAttention.lean` — does
+`executeFlashAttentionTiled` (called at line 3032 for cacheLen > 32)
+already handle a Q with shape `[head_dim, n_heads, n_tokens]` as in
+llama.cpp's MMA-F16 prefill tile?  If yes, reuse as-is.  If no, the
+batched `flashAttentionBatchKernel` at 2929 already dispatches grid
+`(nHeads, seqLen, 1)` — audit whether it hits the same cacheLen > 32
+branch correctly.  For `seqLen=9` prefill, `cacheLen` hits 9 max, so
+the ≤32 branch covers it.
+
+**Step 4 — Shared-KV layers**.
+
+`hasKV=false` layers compute only Q, then FA against an earlier
+layer's KV cache.  In the batched path:
+- Skip K/V batch matmul and QKV-batch norm (use Q-only).  Need a
+  `perHeadRMSNormBatchKernel` (mirror of `perHeadRMSNormKernel` at line
+  502) — grid `(numHeads, seqLen, 1)`, one WG per (head, token).
+- Dispatch batched RoPE-Q (already exists).
+- Dispatch `flashAttentionBatchKernel` with `kvCache=state.kvCaches[kvLi]`
+  where `kvLi = cfg.kvCacheLayer li` points at the earlier full-KV
+  layer.
+- Gate behind `HESPER_UNIFY_ATTN=swa,shared` (cumulative flag).
+
+**Step 5 — Flip the default, delete the fallback**.
+
+Once all three layer types (full / SWA / shared-KV) pass bit-parity
+AND multi-token end-to-end produces sane output for `"Hello world how
+are you"`, remove:
+- The `if !handledByBatched then for i in [0:seqLen] do …` block at
+  Gemma4.lean:2935-3048.
+- All `columnExtractKernel` / `columnInsertKernel` calls that only
+  existed to bridge batch buffers into that fallback.
+- The two `copyU32Kernel` calls for `posBuf[i]` / `cacheLenBuf[i]` →
+  `paramsBuf` at 2978-2981 and 3027-3030; the batched kernels already
+  index `inp_pos[y]` directly.
+
+### Success criteria
+
+- `lake exe gemma4-cuda data/gemma-4-e4b-it-Q4_K_M.gguf "Hello world
+  how are you" 30` produces a sensible continuation (any non-degenerate
+  English), not `"are are…"` or `"stst{}}…"`.
+- Prefill wall ≤ 100 ms (llama.cpp-parity target from doc 12).
+- Decode TPS ≥ 85 (no regression on the decode path).
+- `HESPER_LAYER_PROFILE=1` still reports 42 layers but the batched
+  path now handles all 42, not just 7.
+
+### Estimated effort
+
+One working session — faster than the first attempt because the
+harness from Step 1 tells us immediately which layer type broke.
+Expected gain on success: −3780 dispatches/prefill; likely
+restoration of multi-token correctness.
+
+### Also unblocked once item 2 lands
+
+- Housekeeping 4 (column extract/insert deletion in the attention path).
+- Housekeeping 5 (`copyU32Kernel` deletion).
+- PLE numerics investigation: the `"are are…"` vs `"stst{}}…"` divergence
+  after item 3 will collapse into a single consistent output once the
+  attention path is stable, making any residual PLE bug easier to
+  isolate.
