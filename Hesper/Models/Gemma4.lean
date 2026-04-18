@@ -2739,24 +2739,26 @@ def forwardPrefillBatch [GPUBackend β] (ctx : β)
       [("src", batchBuf2), ("dst", batchScaledEmbdBuf)]
       (.dispatch1D totalScaled)
 
-  -- Step 1b: Per-layer input precomputation (per-token, same as forwardSingleToken).
-  -- This is required for Gemma 4 E4B which uses per_layer_token_embd.
-  -- We compute it once for each token and store in state.plInputAll.
-  -- Each token's per-layer input depends on its token ID, so we must
-  -- loop.  The result is used inside forwardBlock for each layer.
-  -- For the batch path, we precompute for ALL tokens and store the last
-  -- token's result in state.plInputAll (since that's what the per-token
-  -- attention loops need — each block reads from state.plInputAll at the
-  -- token's turn).  TODO: properly batch per-layer input.
+  -- Step 1b: Per-layer input precomputation (BATCHED across all prompt
+  -- tokens).  Gemma 4 E4B's per_layer_token_embd needs a plInputAll
+  -- vector per token; the value depends only on tokenId (via the
+  -- scaled embedding) and NOT on the layer index, so it's safe to
+  -- compute once per token before the block loop and reuse for all
+  -- 42 layers.  Previously this loop ran per-token-per-layer inside
+  -- the block loop (42× redundant recompute).  Now the result is
+  -- stored in a `batchPLInputAll : [seqLen × totalPL]` scratch
+  -- buffer, and `forwardBlock` reads column `i` from it per token.
+  let mut batchPLInputAllOpt : Option (GPUBackend.Buf β) := none
   match model.perLayerEmbdTableGPU, model.perLayerModelProj, model.perLayerProjNorm with
   | some embdTableGPU, some modelProj, some projNorm =>
     let embdPL := model.config.embdPerLayer
     let nLayers := model.config.numHiddenLayers
     let totalPL := embdPL * nLayers
-    -- For each token, compute per-layer input (writes state.plInputAll)
+    -- Allocate the batched scratch: one totalPL-vector per prompt token.
+    let batchPLInputAll ← GPUBackend.allocBuffer ctx (seqLen * totalPL * 4).toUSize
+    batchPLInputAllOpt := some batchPLInputAll
     for i in [0:seqLen] do
       let tokenId := promptTokens[i]!
-      -- Write token ID (row index) to plRawRowBuf — kernel expects row index, not byte offset
       let tokenIdBytes := Hesper.WebGPU.BufferOps.uint32ToBytes tokenId.toUInt32
       GPUBackend.writeBufferOffset ctx state.plRawRowBuf 0 tokenIdBytes
       let scaleFactor : Float := Float.sqrt embdPL.toFloat
@@ -2765,14 +2767,12 @@ def forwardPrefillBatch [GPUBackend β] (ctx : β)
           cfg.vocabSize)
         [("table", embdTableGPU), ("params", state.plRawRowBuf), ("output", state.plModelProj)]
         (.dispatch1D totalPL)
-      -- Extract column i from batchBuf2 (scaled embedding) into state.buf1
       let colIdxBytes := Hesper.WebGPU.BufferOps.uint32ToBytes i.toUInt32
       GPUBackend.writeBufferOffset ctx colIdxBuf 0 colIdxBytes
       GPUBackend.execute ctx
         (columnExtractKernel dim seqLen)
         [("batch", batchBuf2), ("params", colIdxBuf), ("out", state.buf1)]
         (.dispatch1D dim)
-      -- F16 matmul: buf1 × modelProj → plTokenSelected
       let projConfig : Hesper.WGSL.MatMul.Config := {
         M := 1, N := totalPL, K := dim
       }
@@ -2791,6 +2791,25 @@ def forwardPrefillBatch [GPUBackend β] (ctx : β)
       ce "scaledAdd_pf"
         (scaledAddKernel totalPL (1.0 / Float.sqrt 2.0))
         [("a", state.plTokenSelected), ("b", state.plModelProj), ("output", state.plInputAll)]
+        (.dispatch1D totalPL)
+      -- Copy the per-token plInputAll into column `i` of the batched
+      -- buffer via a params-indexed kernel so the PTX cache key does
+      -- NOT embed `i` (otherwise every iteration is a JIT miss).
+      let colIdxBytes2 := Hesper.WebGPU.BufferOps.uint32ToBytes i.toUInt32
+      GPUBackend.writeBufferOffset ctx colIdxBuf 0 colIdxBytes2
+      let copyShader : ShaderM Unit := do
+        let gid ← ShaderM.globalId
+        let k := Exp.vec3X gid
+        let _src ← ShaderM.declareInputBuffer "src" (.array (.scalar .f32) totalPL)
+        let _params ← ShaderM.declareInputBuffer "params" (.array (.scalar .u32) 1)
+        let _dst ← ShaderM.declareOutputBuffer "dst" (.array (.scalar .f32) (seqLen * totalPL))
+        ShaderM.if_ (Exp.lt k (Exp.litU32 totalPL)) (do
+          let colId ← ShaderM.readBuffer (ty := .scalar .u32) (n := 1) "params" (Exp.litU32 0)
+          let v ← ShaderM.readBuffer (ty := .scalar .f32) (n := totalPL) "src" k
+          let dstIdx := Exp.add (Exp.mul colId (Exp.litU32 totalPL)) k
+          ShaderM.writeBuffer (ty := .scalar .f32) "dst" dstIdx v) (pure ())
+      ce "batchPLInputAllCopy" copyShader
+        [("src", state.plInputAll), ("params", colIdxBuf), ("dst", batchPLInputAll)]
         (.dispatch1D totalPL)
   | _, _, _ => pure ()
 
@@ -3141,51 +3160,37 @@ def forwardPrefillBatch [GPUBackend β] (ctx : β)
     else none
     match plEmbd with
     | some ple =>
-      -- Per-layer embedding for each token position
+      -- Per-layer embedding for each token position.  plInputAll for
+      -- each prompt token was precomputed once before the block loop
+      -- (see `batchPLInputAllOpt` above) — here we just extract the
+      -- relevant column from the batched scratch into `state.plInputAll`,
+      -- saving 42× redundant PLE recompute per layer.
       for i in [0:seqLen] do
         let colIdxBytes := Hesper.WebGPU.BufferOps.uint32ToBytes i.toUInt32
-        -- Compute per-layer input for token i.
-        -- CRITICAL: plInputAll must be derived from the SCALED EMBEDDING (not the
-        -- current layer output), matching Step 1b of forwardSingleToken.  The
-        -- scaled embedding was cached in `batchScaledEmbdBuf` before the block loop.
-        let tokenId := promptTokens[i]!
-        match model.perLayerEmbdTableGPU, model.perLayerModelProj, model.perLayerProjNorm with
-        | some embdTableGPU, some modelProj, some projNorm =>
+        match batchPLInputAllOpt with
+        | some batchPL =>
           let embdPL := cfg.embdPerLayer
           let nLayers := cfg.numHiddenLayers
           let totalPL := embdPL * nLayers
-          let tokenIdBytes := Hesper.WebGPU.BufferOps.uint32ToBytes tokenId.toUInt32
-          GPUBackend.writeBufferOffset ctx state.plRawRowBuf 0 tokenIdBytes
-          let scaleFactor : Float := Float.sqrt embdPL.toFloat
-          ce "q6kDequantScale_ple"
-            (Hesper.Quantization.Q6_K.q6kTableRowDequantScaleKernel totalPL scaleFactor
-              cfg.vocabSize)
-            [("table", embdTableGPU), ("params", state.plRawRowBuf), ("output", state.plModelProj)]
-            (.dispatch1D totalPL)
-          -- Extract scaled embedding column for token i → state.buf1 (PLE matmul input)
           GPUBackend.writeBufferOffset ctx colIdxBuf 0 colIdxBytes
-          GPUBackend.execute ctx
-            (columnExtractKernel dim seqLen)
-            [("batch", batchScaledEmbdBuf), ("params", colIdxBuf), ("out", state.buf1)]
-            (.dispatch1D dim)
-          let projConfig : Hesper.WGSL.MatMul.Config := { M := 1, N := totalPL, K := dim }
-          if projConfig.K % 64 == 0 then
-            Hesper.WGSL.MatMul.executeMatMulTransposeF16BlockCoop ctx state.buf1 modelProj state.plTokenSelected projConfig
-          else
-            Hesper.WGSL.MatMul.executeMatMulTransposeF16 ctx state.buf1 modelProj state.plTokenSelected projConfig
-          GPUBackend.execute ctx
-            (PerLayerEmbedding.scaleKernel totalPL (1.0 / Float.sqrt dim.toFloat))
-            [("input", state.plTokenSelected), ("output", state.plInputAll)]
+          -- Copy column i of batchPLInputAll (contiguous at offset
+          -- i*totalPL) into the single-token state.plInputAll buffer.
+          let extractShader : ShaderM Unit := do
+            let gid ← ShaderM.globalId
+            let k := Exp.vec3X gid
+            let _src ← ShaderM.declareInputBuffer "src" (.array (.scalar .f32) (seqLen * totalPL))
+            let _params ← ShaderM.declareInputBuffer "params" (.array (.scalar .u32) 1)
+            let _dst ← ShaderM.declareOutputBuffer "dst" (.array (.scalar .f32) totalPL)
+            ShaderM.if_ (Exp.lt k (Exp.litU32 totalPL)) (do
+              let colId ← ShaderM.readBuffer (ty := .scalar .u32) (n := 1) "params" (Exp.litU32 0)
+              let srcOff := Exp.add (Exp.mul colId (Exp.litU32 totalPL)) k
+              let v ← ShaderM.readBuffer (ty := .scalar .f32) (n := seqLen * totalPL) "src" srcOff
+              ShaderM.writeBuffer (ty := .scalar .f32) "dst" k v) (pure ())
+          ce "plInputAllExtract"
+            extractShader
+            [("src", batchPL), ("params", colIdxBuf), ("dst", state.plInputAll)]
             (.dispatch1D totalPL)
-          GPUBackend.execute ctx
-            (chunkedRMSNormKernel embdPL nLayers cfg.rmsNormEps)
-            [("input", state.plInputAll), ("weight", projNorm.scale), ("output", state.plTokenSelected)]
-            { numWorkgroups := (nLayers, 1, 1), workgroupSize := { x := min embdPL 256, y := 1, z := 1 } : Hesper.ExecConfig }
-          GPUBackend.execute ctx
-            (scaledAddKernel totalPL (1.0 / Float.sqrt 2.0))
-            [("a", state.plTokenSelected), ("b", state.plModelProj), ("output", state.plInputAll)]
-            (.dispatch1D totalPL)
-        | _, _, _ => pure ()
+        | none => pure ()
         -- Extract this token's output column → state.buf2 (input to PLE inpGate)
         GPUBackend.writeBufferOffset ctx colIdxBuf 0 colIdxBytes
         GPUBackend.execute ctx
@@ -3377,6 +3382,9 @@ def forwardPrefillBatch [GPUBackend β] (ctx : β)
   GPUBackend.freeBuffer ctx batchGeluBuf
   GPUBackend.freeBuffer ctx batchFFNOutBuf
   GPUBackend.freeBuffer ctx colIdxBuf
+  match batchPLInputAllOpt with
+  | some b => GPUBackend.freeBuffer ctx b
+  | none => pure ()
 
 /-- Run full single-token forward pass through the model.
     Returns logits in state.logitsBuf. -/
