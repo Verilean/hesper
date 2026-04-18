@@ -1619,6 +1619,10 @@ structure InferenceState (BufT CacheT : Type) where
   stagingPLRowPtr   : USize := 0
   /-- Pinned host pointer (4 bytes) for the batch-prefill column index. -/
   stagingColIdxPtr  : USize := 0
+  /-- Pinned host pointer (4 bytes) for state.posF32Buf (pos as f32 —
+      needed by the Circuit DSL scatter addrExpr that writes to the
+      KV cache inside fusedRopeKAndCacheWrite). -/
+  stagingPosF32Ptr  : USize := 0
 
 /-- Dynamic cache ref store. Lazily creates IO.Ref per unique cacheKey. -/
 structure KernelCacheRefs (CacheT : Type) where
@@ -1718,6 +1722,9 @@ def createInferenceState [GPUBackend β] (ctx : β) (cfg : Config) : IO (Inferen
                          | some _ => Hesper.CUDA.cuMemAllocHost 4
                          | none   => pure 0
     stagingColIdxPtr := ← match ← IO.getEnv "HESPER_CUDA_GRAPHS" with
+                         | some _ => Hesper.CUDA.cuMemAllocHost 4
+                         | none   => pure 0
+    stagingPosF32Ptr := ← match ← IO.getEnv "HESPER_CUDA_GRAPHS" with
                          | some _ => Hesper.CUDA.cuMemAllocHost 4
                          | none   => pure 0
   }
@@ -1950,12 +1957,11 @@ def forwardBlock [GPUBackend β] (ctx : β)
   -- Upload position to params buffer (u32 for hand-coded kernels)
   let posBytes := Hesper.WebGPU.BufferOps.uint32ToBytes pos.toUInt32
   writeScalarViaStaging ctx state.paramsBuf 0 state.stagingParamsPtr 0 posBytes
-  -- Also upload pos as f32 for Circuit DSL scatter addrExpr.
-  -- posF32Buf is small too but we don't yet have a pinned slot for it.
-  -- Kept on the non-pinned path; during graph capture this is a
-  -- captured memcpy whose source may be freed.  TODO: add slot.
+  -- Also upload pos as f32 for Circuit DSL scatter addrExpr.  Routed
+  -- through a pinned host slot so CUDA Graph replay picks up the
+  -- current pos (not a stale captured value).
   let posF32Bytes ← Hesper.Basic.floatToBytes pos.toFloat
-  GPUBackend.writeBufferOffset ctx state.posF32Buf 0 posF32Bytes
+  writeScalarViaStaging ctx state.posF32Buf 0 state.stagingPosF32Ptr 0 posF32Bytes
 
   Hesper.WGSL.Execute.withSection "rope" do
     -- RoPE on Q: qBuf2 → qBuf
@@ -3726,10 +3732,12 @@ def generate [GPUBackend β] (ctx : β) (model : Gemma4Model (GPUBackend.Buf β)
         let posBytes := Hesper.WebGPU.BufferOps.uint32ToBytes newPos.toUInt32
         let cacheLenBytes := Hesper.WebGPU.BufferOps.uint32ToBytes (newPos + 1).toUInt32
         let plRowBytes := tokenBytes
+        let posF32Bytes ← Hesper.Basic.floatToBytes newPos.toFloat
         Hesper.CUDA.cuWritePinned state.stagingTokenPtr  0 tokenBytes 4
         Hesper.CUDA.cuWritePinned state.stagingParamsPtr 0 posBytes 4
         Hesper.CUDA.cuWritePinned state.stagingParamsPtr 4 cacheLenBytes 4
         Hesper.CUDA.cuWritePinned state.stagingPLRowPtr  0 plRowBytes 4
+        Hesper.CUDA.cuWritePinned state.stagingPosF32Ptr 0 posF32Bytes 4
         Hesper.CUDA.cuGraphLaunch exec stream
         Hesper.CUDA.cuStreamSynchronize stream
       | none =>
