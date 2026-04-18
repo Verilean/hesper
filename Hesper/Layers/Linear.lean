@@ -3214,6 +3214,14 @@ structure LinearLayer (BufT : Type) (CacheT : Type := Unit) where
   -- Prepared dispatches for (quantize, matmul) of the dp4a pipeline.
   dp4aQuantizePrepared : IO.Ref (Option CacheT)
   dp4aMatmulPrepared : IO.Ref (Option CacheT)
+  -- Separate prepared refs for the BATCHED (prefill) path.  The batch
+  -- kernel takes seqLen as a compile-time parameter, so sharing the
+  -- decode refs above would clobber the decode dispatch when prefill
+  -- runs.  Without caching these, every one of the 42 layers'
+  -- prefill-time Q4_K matmuls invokes `cuModuleLoadDataEx` (~350 µs)
+  -- → ~50 ms of pure JIT overhead per prefill.
+  dp4aBatchQuantizePrepared : IO.Ref (Option CacheT)
+  dp4aBatchMatmulPrepared : IO.Ref (Option CacheT)
 
 /-- Q8_1 quantize input + Q4_K/Q6_K dp4a matmul (2 dispatches).
     Uses lazily-allocated per-layer Q8_1 scratch buffer and cache refs.
@@ -3356,15 +3364,19 @@ def forwardBatchDP4A [GPUBackend β] (ctx : β)
     let q8BufBytes : USize := (nQ8Blocks * 9 * seqLen * 4).toUSize
     let q8Buf ← GPUBackend.allocBuffer ctx q8BufBytes
 
-    GPUBackend.executeWithConfig ctx
+    GPUBackend.executeWithConfigCached ctx
       (quantizeQ8_1BatchKernel layer.config.inDim seqLen)
       [("input", inputBuf), ("output", q8Buf)]
       { numWorkgroups := (nQ8Blocks, seqLen, 1), workgroupSize := { x := 32, y := 1, z := 1 } }
+      (hash ("q8_1-quantize-batch", layer.config.inDim, seqLen))
+      layer.dp4aBatchQuantizePrepared
 
-    GPUBackend.executeWithConfig ctx
+    GPUBackend.executeWithConfigCached ctx
       (q4kMatmulBatchKernel layer.config seqLen)
       [("weights", layer.weightBuf), ("input_q8", q8Buf), ("output", outputBuf)]
       { numWorkgroups := (layer.config.outDim, seqLen, 1), workgroupSize := { x := 32, y := 1, z := 1 } }
+      (hash ("q4k-batch-matmul", layer.config.inDim, layer.config.outDim, seqLen))
+      layer.dp4aBatchMatmulPrepared
 
     GPUBackend.freeBuffer ctx q8Buf
   else

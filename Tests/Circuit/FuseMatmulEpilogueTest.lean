@@ -30,10 +30,13 @@ def mkMockLayer (inDim outDim : Nat) : IO (LinearLayer Buf Cache) := do
   let dp4aQ8Buf ← IO.mkRef (α := Option Buf) none
   let dp4aQuantizePrepared ← IO.mkRef (α := Option Cache) none
   let dp4aMatmulPrepared ← IO.mkRef (α := Option Cache) none
+  let dp4aBatchQuantizePrepared ← IO.mkRef (α := Option Cache) none
+  let dp4aBatchMatmulPrepared ← IO.mkRef (α := Option Cache) none
   return {
     config := cfg, weightBuf := (), quantFormat := .Q4_K, prepared,
     splitKBuf, splitKPartialPrepared, splitKReducePrepared,
-    dp4aQ8Buf, dp4aQuantizePrepared, dp4aMatmulPrepared }
+    dp4aQ8Buf, dp4aQuantizePrepared, dp4aMatmulPrepared,
+    dp4aBatchQuantizePrepared, dp4aBatchMatmulPrepared }
 
 def run : IO Unit := do
   -- Build a circuit: y = matmulQ4K(x, layer); z = (y + bias) * 2.0
