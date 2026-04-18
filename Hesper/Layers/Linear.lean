@@ -1995,26 +1995,23 @@ def fusedQ4KMLinearDP4A2RowKernel (config : Config) : ShaderM Unit := do
 /-- Q4_K × Q8_1 dp4a matmul, **4-warp cooperative 1-row-per-WG** — the
     pattern llama.cpp's `mul_mat_vec_q<Q4_K, ncols_dst=1>` uses on sm_89.
 
-    Rationale: `2RowKernel` (64 threads/WG, 2 rows/WG) launches outDim/2
-    WGs — for ffn_down (outDim=2560) that's 1280 WGs ≈ 1.4 waves on the
-    RTX 4070 Ti (60 SMs × 1536 resident threads ≈ 92K).  The memory-latency-
-    bound ffn_down kernel stalls on global loads without enough concurrent
-    warps to hide them (TODO-P1).
+    Thread layout mirrors llama.cpp's mul_mat_vec_q (mmvq.cu:389+, see
+    docs/llama-fusion-analysis/02-mmvq-epilogue.md):
 
-    4-warp-1-row instead launches `outDim` WGs × 128 threads = 327K threads
-    total, **4× more parallelism offered** → the scheduler can swap warps
-    during weight-load stalls.  The 4 warps within one WG share the row's
-    `blocksPerRow` blocks: warp_id 0..3 takes blocks `[warp_id*B/4, (warp_id+1)*B/4)`.
-    Each warp computes its partial sum (full 32-lane dp4a as in the 1-row
-    kernel), then warp 0 reduces the 4 partials via smem + barrier.
+      tid = warpId*32 + laneId        (0..127)
+      kbxStart = tid / (qi/vdr) = tid / 16   (0..7)
+      iqs      = vdr * (tid % 16)    = 2 * (tid & 15)  (0,2,4,...,30)
 
-    Matches llama.cpp decode path exactly (small_k=false, rpb=1, nwarps=4).
+    Each of the 16 threads sharing `kbxStart` covers one `iqs` slot of
+    that block; together they compute all 16 (bq8Off, elemOff) pairs of
+    the block exactly once.  The outer loop strides by
+    `blocks_per_iter = vdr * nwarps * warp_size / qi = 2*4*32/32 = 8`.
 
-    Dispatch: `(outDim, 1, 1)` workgroups × **128 threads**.
-    Requires `blocksPerRow % 4 == 0` for clean work split (Gemma 4 E4B
-    inDim ∈ {2560, 10240} → blocksPerRow ∈ {10, 40}; 10 is NOT divisible
-    by 4, so the 2560-input kernels will have some warps doing more).
-    Handled by striding: `for kbx = warp_id; kbx < bpr; kbx += 4`. -/
+    Dispatch: `(outDim, 1, 1)` workgroups × **128 threads**.  Works for
+    any `blocksPerRow`: for blocksPerRow=10 (Gemma 4 inDim=2560),
+    threads 0..31 (warp 0) handle blocks {0,1,8,9}, warps 1–3 handle
+    blocks {2..7} — every block is covered exactly once, no duplicated
+    work, no `*0.5` correction. -/
 def fusedQ4KMLinearDP4A4WarpKernel (config : Config) : ShaderM Unit := do
   let wid ← ShaderM.workgroupId
   let lid ← ShaderM.localId
@@ -2033,48 +2030,38 @@ def fusedQ4KMLinearDP4A4WarpKernel (config : Config) : ShaderM Unit := do
   let _output ← ShaderM.declareOutputBuffer "output" (.array (.scalar .f32) config.outDim)
 
   -- smem for cross-warp partial sums only (4 floats = 16 B).
-  -- NOTE: no smem staging of Q8_1 input — global read directly.
-  -- This keeps smem usage minimal and maximizes occupancy (the key
-  -- difference vs the 2-row/4-row variants that staged Q8_1 in smem
-  -- at the cost of 11 KB smem → 67% occupancy).
   ShaderM.sharedNamed "s_partial" (.array (.scalar .f32) 4)
 
   let inBounds := Exp.lt outIdx (Exp.litU32 config.outDim)
 
-  -- Lane decomposition within a warp.  Top-half lanes (laneId>>4 == 1) pick
-  -- up a second block per outer iteration via the shared warp stride, so
-  -- the warp covers 2 blocks per iteration with 0% duplicated work and no
-  -- subgroupAdd correction.
-  let laneLow := Exp.bitAnd laneId (Exp.litU32 15)
-  let blockOff := Exp.shiftRight laneId (Exp.litU32 4)  -- 0 (bottom half) or 1 (top half)
-  let pairIdxInRow := Exp.div laneLow (Exp.litU32 4)
-  let elemOff := Exp.sub laneLow (Exp.mul pairIdxInRow (Exp.litU32 4))
-  let bq8Off := Exp.mul pairIdxInRow (Exp.litU32 2)
+  -- llama.cpp mul_mat_vec_q<Q4_K, 1, nwarps=4> thread layout (sm_89 decode):
+  --   qk=256, qi=32, vdr=2, warp_size=32, nwarps=4, total threads=128.
+  --   blocks_per_iter = vdr * nwarps * warp_size / qi = 2*4*32/32 = 8
+  --   kbx = tid / (qi/vdr) = tid / 16  → starting block index (0..7)
+  --   kqs = vdr * (tid % (qi/vdr)) = 2 * (tid & 15)  → iqs in 0..30
+  -- Each of the 16 threads sharing a kbxStart uniquely indexes (bq8Off, elemOff)
+  -- via (tid & 15), so together they cover all 16 sub-slots of one block.
+  -- No duplicated work — every thread contributes distinct products.
+  let kbxStart := Exp.shiftRight tid (Exp.litU32 4)  -- 0..7
+  let laneLow := Exp.bitAnd tid (Exp.litU32 15)
+  let pairIdxInRow := Exp.shiftRight laneLow (Exp.litU32 2)  -- 0..3
+  let elemOff := Exp.bitAnd laneLow (Exp.litU32 3)           -- 0..3
+  let bq8Off := Exp.shiftLeft pairIdxInRow (Exp.litU32 1)    -- 0,2,4,6
 
   let rowBaseU32 := Exp.mul outIdx (Exp.litU32 (blocksPerRow * 36))
 
   ShaderM.varNamed "acc" (.scalar .f32) (Exp.litF32 0.0)
   let acc : Exp (.scalar .f32) := Exp.var "acc"
 
-  -- Super-warp stride: the 4 warps collectively cover blocks in groups of 8
-  -- (each warp advances by 8 per outer iteration and each warp handles 2
-  -- blocks per iteration via its halves).  Warp w's bottom half handles
-  -- blockIdx = w*2 + iter*8; top half handles blockIdx = w*2 + 1 + iter*8.
-  -- For blocksPerRow=10 this gives warp 0:{0,1,8,9}, warp 1:{2,3}, warp
-  -- 2:{4,5}, warp 3:{6,7} — covers all 10 blocks with no overlap, compared
-  -- to the previous stride-4 scheme where each warp wasted 50% on
-  -- duplicated lanes 0..15 ↔ 16..31 work.
-  let warpBase := Exp.mul warpId (Exp.litU32 2)
-  let iterCount := (blocksPerRow + 7) / 8
-  ShaderM.loop (Exp.litU32 0) (Exp.litU32 iterCount) (Exp.litU32 1) fun iter => do
-    let blockIdx := Exp.add warpBase (Exp.add (Exp.mul iter (Exp.litU32 8)) blockOff)
+  -- Outer loop: `for kbx = kbxStart; kbx < blocksPerRow; kbx += 8`.
+  -- Encoded as a bounded iter loop to keep ShaderM happy.  max iter count
+  -- is ⌈blocksPerRow / 8⌉ + 1 (kbxStart can be up to 7; 7 + 8k < bpr).
+  let maxIter := (blocksPerRow + 7) / 8
+  ShaderM.loop (Exp.litU32 0) (Exp.litU32 maxIter) (Exp.litU32 1) fun iter => do
+    let blockIdx := Exp.add kbxStart (Exp.mul iter (Exp.litU32 8))
     let blockInRange := Exp.lt blockIdx (Exp.litU32 blocksPerRow)
     let safeBlockIdx := Exp.select blockInRange blockIdx (Exp.litU32 0)
-    let _unused := safeBlockIdx
-    -- Use safeBlockIdx for memory reads (never OOB) and gate the
-    -- contribution on blockInRange.
-    let blockIdx := safeBlockIdx
-    let blockU32Base := Exp.add rowBaseU32 (Exp.mul blockIdx (Exp.litU32 36))
+    let blockU32Base := Exp.add rowBaseU32 (Exp.mul safeBlockIdx (Exp.litU32 36))
 
     let dmU32 ← ShaderM.readBuffer (ty := .scalar .u32) (n := totalWeightU32) "weights" blockU32Base
     let dF := fp16ToF32 (Exp.bitAnd dmU32 (Exp.litU32 0xFFFF))
@@ -2114,7 +2101,7 @@ def fusedQ4KMLinearDP4A4WarpKernel (config : Config) : ShaderM Unit := do
     let v1 ← ShaderM.readBuffer (ty := .scalar .u32) (n := totalWeightU32) "weights" (Exp.add q4BaseIdx (Exp.litU32 4))
 
     -- Q8_1 reads from global memory (no smem staging — maximizes occupancy).
-    let q8Sub0Base := Exp.add (Exp.mul blockIdx (Exp.litU32 (8 * 9))) (Exp.mul bq8Off (Exp.litU32 9))
+    let q8Sub0Base := Exp.add (Exp.mul safeBlockIdx (Exp.litU32 (8 * 9))) (Exp.mul bq8Off (Exp.litU32 9))
     let q8Sub1Base := Exp.add q8Sub0Base (Exp.litU32 9)
     let u0 ← ShaderM.readBuffer (ty := .scalar .u32) (n := q8InputU32Size) "input_q8" (Exp.add q8Sub0Base (Exp.add (Exp.litU32 1) elemOff))
     let u1 ← ShaderM.readBuffer (ty := .scalar .u32) (n := q8InputU32Size) "input_q8" (Exp.add q8Sub0Base (Exp.add (Exp.litU32 5) elemOff))
@@ -2148,15 +2135,15 @@ def fusedQ4KMLinearDP4A4WarpKernel (config : Config) : ShaderM Unit := do
     let blockSumfD := Exp.add sumfD_0 sumfD_1
     let blockSumfM := Exp.add sumfM_0 sumfM_1
     let blockContrib := Exp.sub (Exp.mul dF blockSumfD) (Exp.mul dminF blockSumfM)
-    -- Gate OOB iterations (only possible when a warp's super-stride slot
-    -- reaches past blocksPerRow).
+    -- Gate OOB iterations (threads with kbxStart past blocksPerRow, or
+    -- kbxStart + 8*iter past blocksPerRow).
     let gatedContrib := Exp.select blockInRange blockContrib (Exp.litF32 0.0)
     ShaderM.assign "acc" (Exp.add acc gatedContrib)
 
-  -- Intra-warp reduce: top-half and bottom-half lanes cover distinct
-  -- blocks, so the full subgroup sum is the exact partial — no ×0.5
-  -- correction needed (see the paired duplicate-work fix in the 4-row
-  -- and fused-KV kernels, commits 097cca7 + 8db8588).
+  -- Intra-warp reduce: all 32 lanes contribute distinct products (matches
+  -- llama.cpp's mul_mat_vec_q where each thread handles a unique
+  -- (kbx, iqs) sub-block slot).  The full subgroup sum is the warp's
+  -- partial — no `*0.5` correction.
   ShaderM.varNamed "warpTotal" (.scalar .f32) (Exp.subgroupAdd acc)
   let warpTotal : Exp (.scalar .f32) := Exp.var "warpTotal"
 
