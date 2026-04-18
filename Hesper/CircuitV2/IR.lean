@@ -319,6 +319,42 @@ def storeTo {srcScope : Scope} {shape dstShape : Shape} {dt : DType}
   let t ← tick
   return ⟨t⟩
 
+/-! ### Pure compute helpers
+
+Thin builder-side constructors so end-user DSL code doesn't have to
+emit raw `Prim`s.  Each helper returns the handle to the produced
+tensor (typed by scope/shape/dtype). -/
+
+/-- Pointwise map over one input.  The body is a `ScalarExp` evaluated
+    at each lane with `input 0` bound to `src[lane]`. -/
+def map {s : Scope} {shape : Shape} {dt : DType}
+    (src : CircuitTensor s shape dt) (body : Hesper.Circuit.ScalarExp)
+    : CircuitM (CircuitTensor s shape dt) := do
+  let dst ← newTensor s shape dt
+  emit (Prim.pointwise #[src.id] body shape dt s)
+  return dst
+
+/-- Elementwise `zip2` over two same-shape inputs.  Both tensors must
+    share shape and scope; in the body, `input 0` is `a[lane]` and
+    `input 1` is `b[lane]`. -/
+def zip2 {s : Scope} {shape : Shape} {dt : DType}
+    (a b : CircuitTensor s shape dt) (body : Hesper.Circuit.ScalarExp)
+    : CircuitM (CircuitTensor s shape dt) := do
+  let dst ← newTensor s shape dt
+  emit (Prim.pointwise #[a.id, b.id] body shape dt s)
+  return dst
+
+/-- Reduce along the last (and only, for 1-D) axis of `src`.  For
+    multi-dim tensors the reduction flattens — a Phase C2 change will
+    carry an explicit axis if we ever need partial reductions. -/
+def reduce {s : Scope} {shape : Shape} {dt : DType}
+    (src : CircuitTensor s shape dt) (op : ReduceOp)
+    (outScope : Scope := s)
+    : CircuitM (CircuitTensor outScope [1] dt) := do
+  let dst ← newTensor outScope [1] dt
+  emit (Prim.reduce src.id op dt outScope)
+  return dst
+
 /-! ### Scatter -/
 
 /-- Scatter write with a **statically** proved index.  `h : i < outerDim`

@@ -124,25 +124,121 @@ def lowerPointwise
   { name := s!"v2_pointwise_n{numElems}"
     shader, numWg, wgSize, binds }
 
-/-- Top-level lowerer for a finished `BuilderState`.  For C1-a we only
-    handle `Prim.pointwise`; unsupported prims are skipped with a
-    warning comment so incremental bring-up is possible. -/
+/-! ## Phase C1-b — `Prim.reduce` → ShaderM
+
+v2 supports three reductions (sum, max, sumOfSquares); v1 only has
+the first and third.  We emit the reduction directly in v2 rather than
+call v1's helper, because:
+
+  * the combine-op differs (add vs max) but the kernel skeleton is
+    identical (strided local accumulation → tree reduction → lane-0
+    writes `out[0]`);
+  * v2 will eventually want output-scope awareness (`.SRAM` output =
+    leave the result in shared memory for an epilogue), which v1's
+    helper doesn't model.
+
+For Phase C1-b the output scope is treated as VRAM — the kernel writes
+one scalar to `out[0]`.  A subsequent pass will promote VRAM→SRAM when
+a downstream op in the same block can consume the shared scalar.
+-/
+
+/-- Identity element for a reduction op, in the f32 lane-local algebra. -/
+def ReduceOp.identity : ReduceOp → Exp (.scalar .f32)
+  | .sum          => Exp.litF32 0.0
+  | .max          => Exp.litF32 (-1.0e30)
+  | .sumOfSquares => Exp.litF32 0.0
+
+/-- Per-lane-per-iteration contribution before the running combine. -/
+def ReduceOp.contrib (op : ReduceOp) (v : Exp (.scalar .f32))
+    : Exp (.scalar .f32) :=
+  match op with
+  | .sum          => v
+  | .max          => v
+  | .sumOfSquares => Exp.mul v v
+
+/-- Associative combine for the running accumulator. -/
+def ReduceOp.combine (op : ReduceOp)
+    (a b : Exp (.scalar .f32)) : Exp (.scalar .f32) :=
+  match op with
+  | .sum          => Exp.add a b
+  | .max          => Exp.max a b
+  | .sumOfSquares => Exp.add a b
+
+/-- Lower `Prim.reduce` to a single-WG ShaderM.  Same structure as
+    v1's `lowerReduceLastAxis` but parameterised over the combine op
+    so `.max` works.
+
+    Dispatch: `numWg = (1, 1, 1)`, `wgSize = min 256 D`. -/
+def lowerReduce
+    (inShape : Shape) (inId : Nat) (op : ReduceOp) (outId : Nat)
+    : LoweredPrim :=
+  let D := Shape.numel inShape
+  let wgSize := min 256 (max D 1)
+  let inName  := "in0"
+  let outName := "out"
+  let shader : ShaderM Unit := do
+    ShaderM.sharedNamed "scratch" (.array (.scalar .f32) wgSize)
+    let _ ← ShaderM.declareInputBuffer  inName  (.array (.scalar .f32) D)
+    let _ ← ShaderM.declareOutputBuffer outName (.array (.scalar .f32) 1)
+    let lid ← ShaderM.localId
+    let localIdx := Exp.vec3X lid
+    ShaderM.varNamed "accum" (.scalar .f32) (ReduceOp.identity op)
+    let accumE : Exp (.scalar .f32) := Exp.var "accum"
+    -- Strided accumulation.
+    ShaderM.loop localIdx (Exp.litU32 D) (Exp.litU32 wgSize) fun loopIdx => do
+      let v ← ShaderM.readBuffer (ty := .scalar .f32) (n := D) inName loopIdx
+      ShaderM.assign "accum" (ReduceOp.combine op accumE (ReduceOp.contrib op v))
+    ShaderM.writeWorkgroup (ty := .scalar .f32) "scratch" localIdx accumE
+    ShaderM.barrier
+    -- Classic power-of-two tree reduction.
+    let mut stride := wgSize / 2
+    while stride > 0 do
+      ShaderM.if_ (Exp.lt localIdx (Exp.litU32 stride)) (do
+        let a ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := wgSize) "scratch" localIdx
+        let b ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := wgSize) "scratch"
+                  (Exp.add localIdx (Exp.litU32 stride))
+        ShaderM.writeWorkgroup (ty := .scalar .f32) "scratch" localIdx
+          (ReduceOp.combine op a b)
+      ) (pure ())
+      ShaderM.barrier
+      stride := stride / 2
+    -- Lane 0 writes the total.
+    ShaderM.if_ (Exp.eq localIdx (Exp.litU32 0)) (do
+      let total ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := wgSize) "scratch" (Exp.litU32 0)
+      ShaderM.writeBuffer (ty := .scalar .f32) outName (Exp.litU32 0) total
+    ) (pure ())
+  let opTag := match op with
+    | .sum => "sum" | .max => "max" | .sumOfSquares => "sumSq"
+  { name   := s!"v2_reduce_{opTag}_D{D}"
+    shader
+    numWg  := (1, 1, 1)
+    wgSize
+    binds  := #[(inName, inId), (outName, outId)] }
+
+/-- Top-level lowerer for a finished `BuilderState`.  Handles `pointwise`
+    (Phase C1-a) and `reduce` (Phase C1-b); unsupported prims are
+    no-ops — incremental bring-up. -/
 def lowerAll (st : BuilderState) (idToShape : ShapeEnv)
     : Array LoweredPrim := Id.run do
   let mut out : Array LoweredPrim := #[]
+  let mut currentOutId : Nat := idToShape.maxId
   for op in st.ops do
     match op with
     | .pointwise inputs body outShape _outDt _outScope =>
       let inShapes : Array Shape :=
         inputs.map (fun id => (idToShape.find? id).getD [])
-      -- Output id is the next fresh id the builder allocated — in v2
-      -- it's the emitter's responsibility to pair an op with the id it
-      -- produces.  For C1-a we take it from the end of the tensor map.
-      -- (A real implementation would pass the map through the builder.)
-      let outId := idToShape.maxId
-      out := out.push (lowerPointwise inShapes inputs body outShape outId)
+      -- Each emitted Prim produces a fresh tensor id in the builder;
+      -- we increment our own counter to stay in sync, since we don't
+      -- yet thread that back through BuilderState.  A proper
+      -- implementation would have Prim carry its output id explicitly.
+      currentOutId := currentOutId + 1
+      out := out.push (lowerPointwise inShapes inputs body outShape currentOutId)
+    | .reduce inputId op _outDt _outScope =>
+      let inShape := (idToShape.find? inputId).getD []
+      currentOutId := currentOutId + 1
+      out := out.push (lowerReduce inShape inputId op currentOutId)
     | _ =>
-      -- TODO Phase C1-b/c: lower reduce / scatter / load / store / block
+      -- TODO Phase C1-c: lower scatter / load / store / block
       pure ()
   return out
 
