@@ -26,6 +26,9 @@ move to compress kernel count toward **llama.cpp CUDA's 187 kernels/tok**.
 | [`06-compiler-transforms.md`](06-compiler-transforms.md) | Fusion viewed as compiler passes; the "reduce wall" | — |
 | [`07-scatter-design.md`](07-scatter-design.md) | Dynamic-offset / scatter design discussion (**implemented**) | `Hesper/Circuit/IR.lean` |
 | [`08-scatter-impl-notes.md`](08-scatter-impl-notes.md) | **Scatter unification: impl + verification** | commit `b515e13` |
+| [`12-complete-cuda-flow.md`](12-complete-cuda-flow.md) | **Complete CUDA flow** for Gemma 4 E4B | `fattn*`, `mmvq`, `mmq`, `rope`, `norm` |
+| [`14-nsys-fresh-comparison.md`](14-nsys-fresh-comparison.md) | nsys hesper vs llama.cpp (post-Q4K-fixes) | nsys captures |
+| [`15-llama-single-path.md`](15-llama-single-path.md) | **Architecture plan**: adopt llama.cpp's single-forward shape-polymorphic path | `llama-context.cpp`, `gemma4-iswa.cpp` |
 
 ## Measurement artefacts
 
