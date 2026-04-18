@@ -1546,13 +1546,21 @@ def fusedQ4KMKVDP4AKernel (config : Config) : ShaderM Unit := do
 
   let rowBaseU32 := Exp.mul outIdx (Exp.litU32 (blocksPerRow * 36))
 
+  -- Top-half lanes pick up the next block so a 32-lane warp covers 2
+  -- blocks per outer iteration — halves the trip count and eliminates
+  -- the duplicate-work correction.
   let laneLow := Exp.bitAnd tid (Exp.litU32 15)
+  let blockOff := Exp.shiftRight tid (Exp.litU32 4)
   let pairIdx := Exp.div laneLow (Exp.litU32 4)
   let elemOff := Exp.sub laneLow (Exp.mul pairIdx (Exp.litU32 4))
   let bq8Off := Exp.mul pairIdx (Exp.litU32 2)
 
-  ShaderM.loop (Exp.litU32 0) (Exp.litU32 blocksPerRow) (Exp.litU32 1) fun blockIdx => do
-    let blockU32Base := Exp.add rowBaseU32 (Exp.mul blockIdx (Exp.litU32 36))
+  let halvedTrip := (blocksPerRow + 1) / 2
+  ShaderM.loop (Exp.litU32 0) (Exp.litU32 halvedTrip) (Exp.litU32 1) fun iter => do
+    let blockIdx := Exp.add (Exp.mul iter (Exp.litU32 2)) blockOff
+    let blockInRange := Exp.lt blockIdx (Exp.litU32 blocksPerRow)
+    let safeBlockIdx := Exp.select blockInRange blockIdx (Exp.litU32 0)
+    let blockU32Base := Exp.add rowBaseU32 (Exp.mul safeBlockIdx (Exp.litU32 36))
 
     let processWeight (which : String) (acc : Exp (.scalar .f32))
         (u0 u1 u2 u3 : Exp (.scalar .u32)) (d8A d8B : Exp (.scalar .f32))
@@ -1617,10 +1625,11 @@ def fusedQ4KMKVDP4AKernel (config : Config) : ShaderM Unit := do
       let blockSumfD := Exp.add sumfD_0 sumfD_1
       let blockSumfM := Exp.add sumfM_0 sumfM_1
       let blockContrib := Exp.sub (Exp.mul dF blockSumfD) (Exp.mul dminF blockSumfM)
-      pure (Exp.add acc blockContrib)
+      let gatedContrib := Exp.select blockInRange blockContrib (Exp.litF32 0.0)
+      pure (Exp.add acc gatedContrib)
 
     -- Q8_1 input shared between K and V.
-    let q8Sub0Base := Exp.add (Exp.mul blockIdx (Exp.litU32 (8 * 9))) (Exp.mul bq8Off (Exp.litU32 9))
+    let q8Sub0Base := Exp.add (Exp.mul safeBlockIdx (Exp.litU32 (8 * 9))) (Exp.mul bq8Off (Exp.litU32 9))
     let q8Sub1Base := Exp.add q8Sub0Base (Exp.litU32 9)
     let u0 ← ShaderM.readBuffer (ty := .scalar .u32) (n := q8InputU32Size) "input_q8" (Exp.add q8Sub0Base (Exp.add (Exp.litU32 1) elemOff))
     let u1 ← ShaderM.readBuffer (ty := .scalar .u32) (n := q8InputU32Size) "input_q8" (Exp.add q8Sub0Base (Exp.add (Exp.litU32 5) elemOff))
@@ -1636,11 +1645,10 @@ def fusedQ4KMKVDP4AKernel (config : Config) : ShaderM Unit := do
     let newAccV ← processWeight "weights_v" accV u0 u1 u2 u3 d8A d8B
     ShaderM.assign "accV" newAccV
 
-  -- Subgroup reduction for each accumulator (×0.5 duplicate-work correction).
-  ShaderM.varNamed "totalK" (.scalar .f32)
-    (Exp.mul (Exp.subgroupAdd accK) (Exp.litF32 0.5))
-  ShaderM.varNamed "totalV" (.scalar .f32)
-    (Exp.mul (Exp.subgroupAdd accV) (Exp.litF32 0.5))
+  -- Subgroup reduction — lanes 0..15 and 16..31 now cover distinct blocks
+  -- so the full warp sum is the exact row dot; no ×0.5 correction needed.
+  ShaderM.varNamed "totalK" (.scalar .f32) (Exp.subgroupAdd accK)
+  ShaderM.varNamed "totalV" (.scalar .f32) (Exp.subgroupAdd accV)
   let totalK : Exp (.scalar .f32) := Exp.var "totalK"
   let totalV : Exp (.scalar .f32) := Exp.var "totalV"
 
