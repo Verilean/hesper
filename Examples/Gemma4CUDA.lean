@@ -112,7 +112,18 @@ unsafe def main (args : List String) : IO Unit := do
     | .error e => throw (IO.userError s!"GGUF parse error: {e}")
   let tokenizer ← Hesper.Tokenizer.SentencePiece.fromGGUF gguf
 
-  let promptTokens := Hesper.Tokenizer.SentencePiece.encode tokenizer prompt
+  -- HESPER_CHAT=1: wrap the user prompt in the Gemma 4 E4B chat template
+  -- (`<turn|>\n<|turn>user\n...<turn|>\n<|turn>model\n`) so the model
+  -- answers as an assistant instead of continuing as raw completion.
+  -- Verified 2026-04-20: with chat wrap, "The capital of France is" →
+  -- "The capital of France is **Paris**." (matching llama-cli --jinja).
+  let useChat := (← IO.getEnv "HESPER_CHAT").isSome
+  let finalPrompt := if useChat then
+    Hesper.Tokenizer.SentencePiece.renderGemma4Chat prompt
+  else
+    prompt
+  if useChat then IO.println "[Config] HESPER_CHAT=1: prompt wrapped in Gemma 4 chat template"
+  let promptTokens := Hesper.Tokenizer.SentencePiece.encode tokenizer finalPrompt
   IO.println s!"[Tokenize] Prompt: {promptTokens.size} tokens"
   IO.println s!"[Tokenize] IDs: {promptTokens.toList}"
 
