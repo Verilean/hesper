@@ -253,12 +253,18 @@ def createVocabFromGGUF (gguf : GGUFFile) : IO Vocab := do
   IO.println s!"  EOS token: {eosToken}"
   IO.println s!"  UNK token: {unkToken}"
 
-  -- Detect BPE vs SentencePiece space encoding
-  let usesBPE := tokens.any (fun t => t.piece.startsWith "Ġ")
+  -- Detect BPE vs SentencePiece space encoding by COUNTING which marker
+  -- appears more.  A vocab that has some Ġ byte-fallback tokens but many
+  -- more ▁-prefixed "word" tokens is SentencePiece (e.g. Gemma 4); the
+  -- old `.any startsWith "Ġ"` heuristic misfired for Gemma 4 and produced
+  -- 9 tokens instead of 5 for "Hello world how are you".
+  let bpeCount : Nat := tokens.foldl (init := 0) fun (n : Nat) t => if t.piece.startsWith "Ġ" then n + 1 else n
+  let spCount  : Nat := tokens.foldl (init := 0) fun (n : Nat) t => if t.piece.startsWith "▁" then n + 1 else n
+  let usesBPE := bpeCount > spCount
   if usesBPE then
-    IO.println "  Space encoding: BPE (Ġ)"
+    IO.println s!"  Space encoding: BPE (Ġ count={bpeCount} > ▁ count={spCount})"
   else
-    IO.println "  Space encoding: SentencePiece (▁)"
+    IO.println s!"  Space encoding: SentencePiece (▁ count={spCount} ≥ Ġ count={bpeCount})"
 
   return {
     tokens := tokens
@@ -273,16 +279,22 @@ def createVocabFromGGUF (gguf : GGUFFile) : IO Vocab := do
 
 /-! ## Tokenization (Encoding) -/
 
-/-- Normalize text: add space marker, handle special cases -/
+/-- Normalize text: add space marker, handle special cases.
+
+    Gemma 4 is SentencePiece but — unlike vanilla Llama — does NOT
+    prepend a leading ▁ to prompts.  llama.cpp tokenizes "Hello world"
+    as ["Hello", "▁world"] (5 tokens total for "Hello world how are
+    you", ids [9259, 1902, 1217, 659, 611]).  Matching that behaviour
+    is prerequisite for every tensor-level golden-value comparison
+    against llama.cpp. -/
 def normalizeText (vocab : Vocab) (text : String) : String :=
   if vocab.usesBPE then
-    -- BPE tokenizers (e.g. Gemma 4) do NOT prepend a leading space:
-    -- llama.cpp tokenize "Hello" → [9259] where 9259 = "Hello" (no Ġ).
-    -- Only interior spaces become Ġ.
+    -- BPE tokenizers: interior spaces become Ġ, no leading marker.
     text.replace " " "Ġ"
   else
-    -- SentencePiece prepends a leading ▁ even if the text doesn't start with a space.
-    let text := if text.startsWith " " then text else " " ++ text
+    -- SentencePiece (Gemma 4): replace interior spaces with ▁.
+    -- Do NOT prepend a leading ▁ — that is what vanilla Llama wants,
+    -- but Gemma 4 expects the first word to NOT have a space marker.
     text.replace " " "▁"
 
 /-- Find longest matching token piece starting at position -/
