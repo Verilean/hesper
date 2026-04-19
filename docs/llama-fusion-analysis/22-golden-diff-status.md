@@ -303,3 +303,57 @@ bit-exactly.  The 10.36% rel diff from llama.cpp's `ffn_norm-1` is
 the "error floor" — any correct RMSNorm on hesper's input would
 produce this much diff, because ffn_norm weights span
 `[-9.5, 184]` and amplify directionally.  **RMSNorm is exonerated.**
+
+## 2026-04-19 update 6 — BUG FOUND: stale PTX cache in batched PLE kernel
+
+Root cause of the L3→L4 jump (and the entire "aga" garbage output):
+
+`ce s!"pleGeluGateMulSliceBatch"` in the batched prefill PLE path
+used a static cache key that did not include `plOffset`.  But the
+shader builder `geluGateMulSliceBatchKernel(..., plOffset, ...)`
+bakes `plOffset` as a LITERAL u32 in the compiled shader.
+
+So the first layer to trigger this kernel (L0, plOffset=0)
+populated the cache.  Every subsequent layer (L1-L41) reused that
+stale shader, **reading `per_layer_input[col * plTotalSize + 0 + d]`
+(L0's slice) regardless of the actual layer**.
+
+Evidence: f64 reference `GELU(hesper_gate) * slice_L4` had
+correlation -0.05 with hesper's `ple_moe_out-4` output, and
+magnitude ratio of 0.07× (not ~1×).  Upstream matmuls
+(`ple.inpGate`, `ple.proj`) were both correct to ~1.2% (Q4_K
+quant noise).  RMSNorm was correct bit-exactly.  The only
+remaining kernel was the fused GELU-gate-mul-slice step, which
+back-to-back diff pinpointed.
+
+Fix: `ce s!"pleGeluGateMulSliceBatch_off{plOffset}"` — include
+plOffset in the cache key so each layer's distinct shader gets
+its own cache entry.
+
+Result: prefill produces real English prefixes again.  Prompt
+"Hello world how are you" no longer produces "aga" — decode
+actually generates "Hello world how are you" (still loops the
+prompt, which is a separate issue in decode or sampling, but
+the transformer math is now healthy).
+
+Per-layer l_out rel diff after fix (prefill last token):
+
+```
+L 0: 4.44% → 4.44%  (unchanged — L0 was already correct)
+L 1: 4.28% → 2.16%  (L1 no longer uses stale L0 kernel)
+L 4: 54.47% → 5.56%  ← the big one
+L20: 102.92% → 20.41%
+L40: 73.74% → 6.45%
+```
+
+Remaining issues:
+1. Decode path loops the prompt regardless of content (e.g.
+   "Hello" → "HelloHelloHello...").  Suggests another bug in
+   single-token forward (PLE? KV cache handoff?) or in sampling.
+2. Mid-stack bump at L15-L21 still shows rel diffs up to 33%
+   before recovering — worth investigating but much less severe
+   than the L4 catastrophe.
+
+**Lesson**: any kernel that bakes a per-call parameter as a shader
+literal MUST include that parameter in its cache key.  We should
+audit the other `ce s!"..."` calls for this pattern.
