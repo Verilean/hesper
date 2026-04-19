@@ -549,6 +549,64 @@ def perHeadRMSNormKernel (numHeads headDim : Nat) (eps : Float) : ShaderM Unit :
     let normed := Exp.mul (Exp.mul val rms) w
     ShaderM.writeBuffer (ty := .scalar .f32) "output" (Exp.add headBase i) normed
 
+/-- Batched per-head RMSNorm: same math as `perHeadRMSNormKernel`, but
+    processes all `seqLen` tokens in one dispatch.
+
+    Input layout: `[numHeads * headDim, seqLen]` column-major.
+    Output layout: same.  Each workgroup handles one (head, token)
+    pair: `wid.x = head`, `wid.y = token`.  In-place is safe (each
+    thread reads and writes its own element). -/
+def perHeadRMSNormBatchKernel (numHeads headDim seqLen : Nat) (eps : Float) : ShaderM Unit := do
+  let wid ← ShaderM.workgroupId
+  let lid ← ShaderM.localId
+  let headIdx := Exp.vec3X wid
+  let tokIdx  := Exp.vec3Y wid
+  let tid := Exp.vec3X lid
+
+  let qDim := numHeads * headDim
+  let totalElements := qDim * seqLen
+
+  let _input ← ShaderM.declareInputBuffer "input" (.array (.scalar .f32) totalElements)
+  let _weight ← ShaderM.declareInputBuffer "weight" (.array (.scalar .f32) headDim)
+  let _output ← ShaderM.declareOutputBuffer "output" (.array (.scalar .f32) totalElements)
+
+  let wgSize := if headDim < 256 then headDim else 256
+  ShaderM.sharedNamed "shared_sum" (.array (.scalar .f32) wgSize)
+
+  -- Offset into the batch buffer for this (token, head): col-major
+  -- column stride = qDim; within the column, head starts at head*headDim.
+  let colBase := Exp.mul tokIdx (Exp.litU32 qDim)
+  let headBase := Exp.add colBase (Exp.mul headIdx (Exp.litU32 headDim))
+
+  ShaderM.varNamed "local_sum" (.scalar .f32) (Exp.litF32 0.0)
+  let localSum : Exp (.scalar .f32) := Exp.var "local_sum"
+
+  ShaderM.loop tid (Exp.litU32 headDim) (Exp.litU32 wgSize) fun i => do
+    let val ← ShaderM.readBuffer (ty := .scalar .f32) (n := totalElements) "input" (Exp.add headBase i)
+    ShaderM.assign "local_sum" (Exp.add localSum (Exp.mul val val))
+
+  ShaderM.writeWorkgroup (ty := .scalar .f32) "shared_sum" tid localSum
+  ShaderM.barrier
+
+  let mut stride := wgSize / 2
+  while stride > 0 do
+    ShaderM.if_ (Exp.lt tid (Exp.litU32 stride)) (do
+      let a ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := wgSize) "shared_sum" tid
+      let b ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := wgSize) "shared_sum" (Exp.add tid (Exp.litU32 stride))
+      ShaderM.writeWorkgroup (ty := .scalar .f32) "shared_sum" tid (Exp.add a b)
+    ) (pure ())
+    ShaderM.barrier
+    stride := stride / 2
+
+  let sumSq ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := wgSize) "shared_sum" (Exp.litU32 0)
+  let rms := Exp.inverseSqrt (Exp.add (Exp.div sumSq (Exp.litF32 headDim.toFloat)) (Exp.litF32 eps))
+
+  ShaderM.loop tid (Exp.litU32 headDim) (Exp.litU32 wgSize) fun i => do
+    let val ← ShaderM.readBuffer (ty := .scalar .f32) (n := totalElements) "input" (Exp.add headBase i)
+    let w ← ShaderM.readBuffer (ty := .scalar .f32) (n := headDim) "weight" i
+    let normed := Exp.mul (Exp.mul val rms) w
+    ShaderM.writeBuffer (ty := .scalar .f32) "output" (Exp.add headBase i) normed
+
 /-! ## Bare RMSNorm Kernels (no learned weights) -/
 
 /-- Per-head bare RMSNorm: normalize each head independently (no learned weights).
@@ -2953,14 +3011,15 @@ def forwardPrefillBatch [GPUBackend β] (ctx : β)
       -- RoPE-Q/K kernels with a 1.0-filled freq_factors (gated by
       -- HESPER_UNIFY_ATTN=swa).  This only works now that the in-place
       -- RWW bug in ropeWithFreqFactorsBatchKernel is fixed (commit c92e377).
+      -- Shared-KV layers (cfg.hasKV li = false) only need a Q-only path.
       let effectiveFreqFactors :=
-        if cfg.hasKV li && !forceFallback then
+        if !forceFallback then
           match block.ropeFreqFactors with
           | some ff => some ff
           | none => if unifyAttnSwa then some onesBuf else none
         else none
-      match effectiveFreqFactors with
-      | some freqFactors =>
+      match effectiveFreqFactors, cfg.hasKV li with
+      | some freqFactors, true =>
         handledByBatched := true
         let kvCache := state.kvCaches[kvLi]
 
@@ -3015,7 +3074,40 @@ def forwardPrefillBatch [GPUBackend β] (ctx : β)
            ("output", batchAttnOutBuf), ("params", state.paramsBuf)]
           ({ numWorkgroups := (numHeads, seqLen, 1) : Hesper.ExecConfig })
         dumpStage s!"attnOut_L{li}" batchAttnOutBuf (qDim * seqLen) stageActive
-      | none => pure ()
+      | some freqFactors, false =>
+        -- Shared-KV batched path: only Q is computed this layer; K/V
+        -- come from an earlier layer's cache at kvLi = cfg.kvCacheLayer li.
+        -- Flow: Q-only batched norm → batched RoPE-Q → batched FA.
+        handledByBatched := true
+        let kvCache := state.kvCaches[kvLi]
+        GPUBackend.writeBufferOffset ctx state.paramsBuf 0
+          (Hesper.WebGPU.BufferOps.uint32ToBytes 0)
+        -- Q-only norm, grid (numHeads, seqLen, 1).
+        ce s!"qNormBatch_{headDim}"
+          (perHeadRMSNormBatchKernel numHeads headDim seqLen cfg.rmsNormEps)
+          [("input", batchQBuf), ("weight", block.attention.qNormWeight),
+           ("output", batchQBuf)]
+          { numWorkgroups := (numHeads, seqLen, 1),
+            workgroupSize := { x := wgSize, y := 1, z := 1 } : Hesper.ExecConfig }
+        let stageActive := stageDumpLayer.any (· = li)
+        dumpStage s!"Qnormed_L{li}" batchQBuf (qDim * seqLen) stageActive
+        -- Batched RoPE-Q → batchQRopedBuf (out-of-place; see commit c92e377).
+        ce s!"ropeFreqQBatchOut_{headDim}"
+          (ropeWithFreqFactorsBatchKernel headDim numHeads seqLen cfg.ropeTheta)
+          [("input", batchQBuf), ("output", batchQRopedBuf),
+           ("params", state.paramsBuf), ("freq_factors", freqFactors)]
+          (.dispatch1D (numHeads * headDim / 2 * seqLen))
+        dumpStage s!"Qroped_L{li}" batchQRopedBuf (qDim * seqLen) stageActive
+        -- No K/V writes — cache was populated by the layer at kvLi.
+        -- Batched FA.
+        let scale : Float := 1.0
+        ce s!"flashAttnBatch_{headDim}_{numKVHeads}"
+          (FlashAttention.flashAttentionBatchKernel numHeads numKVHeads cfg.maxSeqLen headDim seqLen scale)
+          [("q", batchQRopedBuf), ("k_cache", kvCache.kBuf), ("v_cache", kvCache.vBuf),
+           ("output", batchAttnOutBuf), ("params", state.paramsBuf)]
+          ({ numWorkgroups := (numHeads, seqLen, 1) : Hesper.ExecConfig })
+        dumpStage s!"attnOut_L{li}" batchAttnOutBuf (qDim * seqLen) stageActive
+      | none, _ => pure ()
 
     if !handledByBatched then
     for i in [0:seqLen] do
