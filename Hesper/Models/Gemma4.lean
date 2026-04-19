@@ -2692,12 +2692,16 @@ def forwardPrefillBatch [GPUBackend β] (ctx : β)
     (model : Gemma4Model (GPUBackend.Buf β) (GPUBackend.CachedDispatch β))
     (promptTokens : Array Nat)
     (state : InferenceState (GPUBackend.Buf β) (GPUBackend.CachedDispatch β))
-    (kcr : Option (KernelCacheRefs (GPUBackend.CachedDispatch β)) := none) : IO Unit := do
+    (kcr : Option (KernelCacheRefs (GPUBackend.CachedDispatch β)) := none)
+    (startPos : Nat := 0) : IO Unit := do
   let seqLen := promptTokens.size
   if seqLen == 0 then return
-  -- NOTE: for seqLen == 1, callers should use `forwardSingleToken` directly.
-  -- This function always takes the batch path (forwardBatchDP4A handles
-  -- the seqLen=1 case internally by falling through to single-token dp4a).
+  -- `startPos` > 0 enables using this function for continuation / decode:
+  -- the N tokens in `promptTokens` are written to KV cache slots
+  -- `[startPos, startPos+1, ..., startPos+N-1]` and their rotary positions
+  -- are `startPos + i`.  For decode use `promptTokens := #[nextToken]`
+  -- and `startPos := pos` (N=1 case matches llama.cpp's shape-polymorphic
+  -- llama_decode behaviour).
 
   let cfg := model.config
   let dim := cfg.hiddenSize
@@ -2807,12 +2811,13 @@ def forwardPrefillBatch [GPUBackend β] (ctx : β)
   for i in [0:seqLen] do
     let tokenId := promptTokens[i]!
     tokBytes := tokBytes ++ Hesper.WebGPU.BufferOps.uint32ToBytes tokenId.toUInt32
-    posBytes := posBytes ++ Hesper.WebGPU.BufferOps.uint32ToBytes i.toUInt32
-  -- cacheLenBuf[i] = i + 1 (number of KV cache entries after writing token i)
+    -- Absolute rotary position of this token.
+    posBytes := posBytes ++ Hesper.WebGPU.BufferOps.uint32ToBytes (startPos + i).toUInt32
+  -- cacheLenBuf[i] = startPos + i + 1 (number of KV entries after this token's write)
   let cacheLenBuf ← GPUBackend.allocBuffer ctx (seqLen * 4).toUSize
   let mut clBytes : ByteArray := ByteArray.empty
   for i in [0:seqLen] do
-    clBytes := clBytes ++ Hesper.WebGPU.BufferOps.uint32ToBytes (i + 1).toUInt32
+    clBytes := clBytes ++ Hesper.WebGPU.BufferOps.uint32ToBytes (startPos + i + 1).toUInt32
   GPUBackend.writeBuffer ctx tokenIdsBuf tokBytes
   GPUBackend.writeBuffer ctx posBuf posBytes
   GPUBackend.writeBuffer ctx cacheLenBuf clBytes
@@ -3062,11 +3067,10 @@ def forwardPrefillBatch [GPUBackend β] (ctx : β)
         handledByBatched := true
         let kvCache := state.kvCaches[kvLi]
 
-        -- startPos = 0 (prefill from scratch — KV cache is empty for this
-        -- layer before this batch).  Write to paramsBuf[0]; the kernel
-        -- treats wgid.y/z as the per-token offset.
+        -- Write startPos to paramsBuf[0]; the kernel treats wgid.y/z as
+        -- the per-token offset (absolute position = startPos + col).
         GPUBackend.writeBufferOffset ctx state.paramsBuf 0
-          (Hesper.WebGPU.BufferOps.uint32ToBytes 0)
+          (Hesper.WebGPU.BufferOps.uint32ToBytes startPos.toUInt32)
 
         -- Batched fused QKV norm: grid (numHeads*seqLen, 3, 1).
         ce (if isFull then "qkvNormFullBatch" else "qkvNormSWABatch")
@@ -4143,12 +4147,22 @@ def generate [GPUBackend β] (ctx : β) (model : Gemma4Model (GPUBackend.Buf β)
         Hesper.CUDA.cuGraphLaunch exec stream
         Hesper.CUDA.cuStreamSynchronize stream
       | none =>
+        -- HESPER_UNIFIED_DECODE=1: route decode through forwardPrefillBatch
+        -- with N=1, startPos=newPos.  This is Phase 3 of the llama.cpp
+        -- single-path architecture migration (docs/15-llama-single-path.md).
+        -- When correct and fast enough, it replaces the separate
+        -- forwardSingleToken path entirely.
+        let unifiedDecode := (← IO.getEnv "HESPER_UNIFIED_DECODE").isSome
         if useCudaGraphs && genCount == 1 then
-          -- Capture path: run forwardSingleToken on a capture stream.
+          -- Capture path: run decode forward on a capture stream.
           let stream ← Hesper.CUDA.cuStreamCreate
           Hesper.cudaCaptureStream.set (some stream)
           Hesper.CUDA.cuStreamBeginCapture stream
-          forwardSingleToken ctx model nextToken newPos state (kcr := some kcr)
+          if unifiedDecode then
+            forwardPrefillBatch ctx model #[nextToken] state
+              (kcr := some kcr) (startPos := newPos)
+          else
+            forwardSingleToken ctx model nextToken newPos state (kcr := some kcr)
           let graph ← Hesper.CUDA.cuStreamEndCapture stream
           Hesper.cudaCaptureStream.set none
           let exec ← Hesper.CUDA.cuGraphInstantiate graph
@@ -4157,7 +4171,11 @@ def generate [GPUBackend β] (ctx : β) (model : Gemma4Model (GPUBackend.Buf β)
           graphExecOpt := some (exec, stream)
           IO.println s!"[Graph] captured decode graph; subsequent tokens will replay"
         else
-          forwardSingleToken ctx model nextToken newPos state (kcr := some kcr)
+          if unifiedDecode then
+            forwardPrefillBatch ctx model #[nextToken] state
+              (kcr := some kcr) (startPos := newPos)
+          else
+            forwardSingleToken ctx model nextToken newPos state (kcr := some kcr)
 
   -- Clean up graph resources.
   match graphExecOpt with
