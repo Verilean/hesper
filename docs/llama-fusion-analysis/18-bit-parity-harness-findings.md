@@ -118,6 +118,40 @@ likely):
    coincide for `seqLen=1` but might diverge in how they interpret
    Q/K/V buffer strides for `seqLen>1`.
 
+## Follow-up: per-stage + per-token narrowing (commit 6d06b4f)
+
+Added per-stage dumps (`HESPER_ATTN_STAGE_LAYER=<li>`) at the 4
+intermediate points for the target layer:
+
+- **Qnormed / Knormed / Vnormed** (after fused QKV-norm).
+- **Qroped** (after RoPE-Q).
+- **Kcache / Vcache** (after RoPE-K + cache-write).
+- **attnOut** (after FA, before column-insert).
+
+Per-token diff of `attn_L5`:
+
+```
+token 0:  BIT-IDENTICAL
+token 1:  max=2.889e-02
+token 2:  max=8.172e-01
+token 3:  max=1.056e+00   ← peak
+tokens 4-8: max=0.24 .. 0.57
+```
+
+**Token 0 matches exactly**.  All kernels agree on the first token's
+data end-to-end (QKVnorm → RoPE-Q → RoPE-K+cache-write slot 0 → FA at
+cacheLen=1 → attnOut).
+
+Tokens 1+ diverge.  This narrows the bug to one of:
+
+- The batched `fusedRopeKAndCacheWriteBatchKernel` writes tokens 1..8
+  to the cache with a different layout than the single-token kernel
+  (most likely a subtle offset bug).
+- The batched `flashAttentionBatchKernel` reads Q for tokens 1..8
+  at a wrong offset (e.g. layout-assumes row-major instead of col-major).
+- Both kernels are right individually but differ on which element of
+  `batchQBuf` is token `col`.
+
 ## Revised next step
 
 Before writing any new kernels (original Step 2), **we have to fix the
