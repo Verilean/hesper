@@ -84,7 +84,8 @@ structure Config where
   headDimSWA : Nat             -- 128 (head_dim)
   slidingWindowSize : Nat      -- 512
   rmsNormEps : Float           -- 1e-6
-  ropeTheta : Float            -- 1000000.0
+  ropeTheta : Float            -- Full-attn freq_base: 1000000.0
+  ropeThetaSWA : Float         -- SWA freq_base: 10000.0  (gemma4.rope.freq_base_swa)
   partialRotaryFactorSWA : Float -- e.g. 0.5
   layerTypes : Array LayerType -- per-layer: full or SWA
   logitSoftcapScale : Float    -- 30.0
@@ -120,6 +121,15 @@ def Config.isFullAttention (c : Config) (layerIdx : Nat) : Bool :=
   if layerIdx < c.layerTypes.size then
     c.layerTypes[layerIdx]! == .full
   else false
+
+/-- RoPE freq_base for a given layer.  Gemma 4 uses a different rope
+    base for SWA layers (10000) vs full-attn layers (1000000).  Per
+    `llama.cpp/src/models/gemma4-iswa.cpp:37`:
+      freq_base_l = model.get_rope_freq_base(cparams, il)
+    which resolves to `freq_base_swa` for SWA layers and `freq_base`
+    for full-attn layers.  -/
+def Config.ropeBase (c : Config) (layerIdx : Nat) : Float :=
+  if c.isFullAttention layerIdx then c.ropeTheta else c.ropeThetaSWA
 
 /-- Check if a layer has its own KV cache (not shared) -/
 def Config.hasKV (c : Config) (layerIdx : Nat) : Bool :=
@@ -1221,6 +1231,7 @@ def Config.fromGGUF (gguf : Hesper.GGUF.GGUFFile) : Except String Config := do
 
   let rmsNormEps := findF32DefaultEither "gemma4.attention.layer_norm_rms_epsilon" "llama.attention.layer_norm_rms_epsilon" 1e-6
   let ropeTheta := findF32DefaultEither "gemma4.rope.freq_base" "llama.rope.freq_base" 1000000.0
+  let ropeThetaSWA := findF32DefaultEither "gemma4.rope.freq_base_swa" "llama.rope.freq_base_swa" 10000.0
 
   return {
     vocabSize
@@ -1235,6 +1246,7 @@ def Config.fromGGUF (gguf : Hesper.GGUF.GGUFFile) : Except String Config := do
     slidingWindowSize := (findU32Either "gemma4.attention.sliding_window" "llama.attention.sliding_window").toOption.getD 512
     rmsNormEps
     ropeTheta
+    ropeThetaSWA
     partialRotaryFactorSWA := 0.5  -- TODO: read from metadata
     layerTypes
     logitSoftcapScale := findF32DefaultEither "gemma4.final_logit_softcapping" "llama.logit_softcapping" 30.0
@@ -2102,11 +2114,11 @@ def forwardBlock [GPUBackend β] (ctx : β)
     match block.ropeFreqFactors with
     | some freqFactors =>
       ce s!"ropeFreqQ_{headDim}"
-        (ropeWithFreqFactorsKernel headDim numHeads cfg.ropeTheta)
+        (ropeWithFreqFactorsKernel headDim numHeads (cfg.ropeBase li))
         [("input", state.qBuf2), ("output", state.qBuf), ("params", state.paramsBuf), ("freq_factors", freqFactors)]
         (.dispatch1D (numHeads * headDim / 2))
     | none =>
-      let ropeConfig : RoPE.Config := { dim := numHeads * headDim, maxSeqLen := cfg.maxSeqLen, base := cfg.ropeTheta }
+      let ropeConfig : RoPE.Config := { dim := numHeads * headDim, maxSeqLen := cfg.maxSeqLen, base := cfg.ropeBase li }
       ce s!"ropeDynQ_{headDim}"
         (RoPE.ropeKernelDynamic ropeConfig 1 1 numHeads headDim)
         [("input", state.qBuf2), ("output", state.qBuf), ("params", state.paramsBuf)]
@@ -2116,7 +2128,7 @@ def forwardBlock [GPUBackend β] (ctx : β)
     -- and we have a KV cache).  When freq factors aren't present we fall back to
     -- the legacy two-kernel path.
     if cfg.hasKV li && block.ropeFreqFactors.isNone then
-      let ropeConfig : RoPE.Config := { dim := numKVHeads * headDim, maxSeqLen := cfg.maxSeqLen, base := cfg.ropeTheta }
+      let ropeConfig : RoPE.Config := { dim := numKVHeads * headDim, maxSeqLen := cfg.maxSeqLen, base := cfg.ropeBase li }
       ce s!"ropeDynK_{headDim}_{numKVHeads}"
         (RoPE.ropeKernelDynamic ropeConfig 1 1 numKVHeads headDim)
         [("input", state.kBuf2), ("output", state.kBuf), ("params", state.paramsBuf)]
@@ -2143,7 +2155,7 @@ def forwardBlock [GPUBackend β] (ctx : β)
         | some freqFactors, false =>
           -- Default path: single fused hand-coded RoPE-K + KV-write kernel.
           ce s!"ropeKAndKvWrite_{headDim}_{numKVHeads}"
-            (Attention.fusedRopeKAndCacheWriteKernel numKVHeads cfg.maxSeqLen headDim kvDim cfg.ropeTheta)
+            (Attention.fusedRopeKAndCacheWriteKernel numKVHeads cfg.maxSeqLen headDim kvDim (cfg.ropeBase li))
             [("new_k", state.kBuf2), ("new_v", state.vBuf2),
              ("k_cache", kvCache.kBuf), ("v_cache", kvCache.vBuf),
              ("params", state.paramsBuf), ("freq_factors", freqFactors)]
@@ -2207,7 +2219,7 @@ def forwardBlock [GPUBackend β] (ctx : β)
               let freqFac  : Hesper.Circuit.ScalarExp := .indexed 1 dimPair
               let exponent : Hesper.Circuit.ScalarExp :=
                 .const 2.0 * dimPair / .const headDim.toFloat
-              let freqInv  : Hesper.Circuit.ScalarExp := .pow (.const cfg.ropeTheta) (.neg exponent)
+              let freqInv  : Hesper.Circuit.ScalarExp := .pow (.const (cfg.ropeBase li)) (.neg exponent)
               let theta    : Hesper.Circuit.ScalarExp := posSE * freqInv / freqFac
               let cosT     : Hesper.Circuit.ScalarExp := .cos theta
               let sinT     : Hesper.Circuit.ScalarExp := .sin theta
@@ -3071,7 +3083,7 @@ def forwardPrefillBatch [GPUBackend β] (ctx : β)
         -- Batched RoPE-Q (NOT in place — write to a dedicated scratch to
         -- avoid any read-modify-write hazard on the shared Q buffer).
         ce s!"ropeFreqQBatchOut_{headDim}"
-          (ropeWithFreqFactorsBatchKernel headDim numHeads seqLen cfg.ropeTheta)
+          (ropeWithFreqFactorsBatchKernel headDim numHeads seqLen (cfg.ropeBase li))
           [("input", batchQBuf), ("output", batchQRopedBuf),
            ("params", state.paramsBuf), ("freq_factors", freqFactors)]
           (.dispatch1D (numHeads * headDim / 2 * seqLen))
@@ -3081,7 +3093,7 @@ def forwardPrefillBatch [GPUBackend β] (ctx : β)
 
         -- Batched RoPE-K + KV cache write.
         ce s!"ropeKKvWBatch_{headDim}_{numKVHeads}"
-          (fusedRopeKAndCacheWriteBatchKernel numKVHeads cfg.maxSeqLen headDim seqLen cfg.ropeTheta)
+          (fusedRopeKAndCacheWriteBatchKernel numKVHeads cfg.maxSeqLen headDim seqLen (cfg.ropeBase li))
           [("new_k", batchKBuf), ("new_v", batchVBuf),
            ("k_cache", kvCache.kBuf), ("v_cache", kvCache.vBuf),
            ("params", state.paramsBuf), ("freq_factors", freqFactors)]
@@ -3123,7 +3135,7 @@ def forwardPrefillBatch [GPUBackend β] (ctx : β)
         dumpStage s!"Qnormed_L{li}" batchQBuf (qDim * seqLen) stageActive
         -- Batched RoPE-Q → batchQRopedBuf (out-of-place; see commit c92e377).
         ce s!"ropeFreqQBatchOut_{headDim}"
-          (ropeWithFreqFactorsBatchKernel headDim numHeads seqLen cfg.ropeTheta)
+          (ropeWithFreqFactorsBatchKernel headDim numHeads seqLen (cfg.ropeBase li))
           [("input", batchQBuf), ("output", batchQRopedBuf),
            ("params", state.paramsBuf), ("freq_factors", freqFactors)]
           (.dispatch1D (numHeads * headDim / 2 * seqLen))
@@ -3202,11 +3214,11 @@ def forwardPrefillBatch [GPUBackend β] (ctx : β)
       match block.ropeFreqFactors with
       | some freqFactors =>
         ce s!"ropeFreqQ_pf_{headDim}"
-          (ropeWithFreqFactorsKernel headDim numHeads cfg.ropeTheta)
+          (ropeWithFreqFactorsKernel headDim numHeads (cfg.ropeBase li))
           [("input", state.qBuf2), ("output", state.qBuf), ("params", state.paramsBuf), ("freq_factors", freqFactors)]
           (.dispatch1D (numHeads * headDim / 2))
       | none =>
-        let ropeConfig : RoPE.Config := { dim := numHeads * headDim, maxSeqLen := cfg.maxSeqLen, base := cfg.ropeTheta }
+        let ropeConfig : RoPE.Config := { dim := numHeads * headDim, maxSeqLen := cfg.maxSeqLen, base := cfg.ropeBase li }
         ce s!"ropeDynQ_pf_{headDim}"
           (RoPE.ropeKernelDynamic ropeConfig 1 1 numHeads headDim)
           [("input", state.qBuf2), ("output", state.qBuf), ("params", state.paramsBuf)]
@@ -3223,14 +3235,14 @@ def forwardPrefillBatch [GPUBackend β] (ctx : β)
           match block.ropeFreqFactors with
           | some freqFactors =>
             ce s!"ropeKKvW_pf_{headDim}_{numKVHeads}"
-              (Attention.fusedRopeKAndCacheWriteKernel numKVHeads cfg.maxSeqLen headDim kvDim cfg.ropeTheta)
+              (Attention.fusedRopeKAndCacheWriteKernel numKVHeads cfg.maxSeqLen headDim kvDim (cfg.ropeBase li))
               [("new_k", state.kBuf2), ("new_v", state.vBuf2),
                ("k_cache", kvCache.kBuf), ("v_cache", kvCache.vBuf),
                ("params", state.paramsBuf), ("freq_factors", freqFactors)]
               (.dispatch1D kvDim)
           | none =>
             -- Separate RoPE-K then KV write
-            let ropeConfig : RoPE.Config := { dim := kvDim, maxSeqLen := cfg.maxSeqLen, base := cfg.ropeTheta }
+            let ropeConfig : RoPE.Config := { dim := kvDim, maxSeqLen := cfg.maxSeqLen, base := cfg.ropeBase li }
             ce s!"ropeDynK_pf_{headDim}_{numKVHeads}"
               (RoPE.ropeKernelDynamic ropeConfig 1 1 numKVHeads headDim)
               [("input", state.kBuf2), ("output", state.kBuf), ("params", state.paramsBuf)]
