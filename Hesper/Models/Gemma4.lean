@@ -2929,6 +2929,8 @@ def forwardPrefillBatch [GPUBackend β] (ctx : β)
       ce "batchPLInputAllCopy" copyShader
         [("src", state.plInputAll), ("params", colIdxBuf), ("dst", batchPLInputAll)]
         (.dispatch1D totalPL)
+    -- After all tokens populated: dump the whole tensor for golden comparison
+    dumpGolden s!"inp_per_layer" batchPLInputAll (seqLen * totalPL)
   | _, _, _ => pure ()
 
   -- ── Step 2: Process transformer blocks ──────────────────────────────
@@ -3413,15 +3415,24 @@ def forwardPrefillBatch [GPUBackend β] (ctx : β)
       | some batchPL =>
         let plOffset := li * cfg.embdPerLayer
         let plTotalSize := cfg.embdPerLayer * cfg.numHiddenLayers
+        -- Golden dump: `pe_in-<li>` = input to PLE (post-FFN-norm+residual).
+        -- Matches llama.cpp's `pe_in-<li>` at gemma4-iswa.cpp:195.
+        dumpGolden s!"pe_in-{li}" nextBuf (dim * seqLen)
         -- 1) inpGate matmul: nextBuf [dim, seqLen] → plGateBatchBuf [embdPerLayer, seqLen]
         Linear.forwardBatchDP4A ctx ple.inpGate nextBuf plGateBatchBuf seqLen
+        dumpGolden s!"ple_gate-{li}" plGateBatchBuf (cfg.embdPerLayer * seqLen)
         -- 2) GELU(gate) * per_layer_input[li_slice] — batched across seqLen
-        ce s!"pleGeluGateMulSliceBatch"
+        -- Cache key MUST include plOffset; it's baked into the shader as a
+        -- literal, and reusing a stale cached kernel would apply the wrong
+        -- layer's slice offset (this was a real bug — see commit log).
+        ce s!"pleGeluGateMulSliceBatch_off{plOffset}"
           (PerLayerEmbedding.geluGateMulSliceBatchKernel cfg.embdPerLayer plTotalSize plOffset seqLen)
           [("gate", plGateBatchBuf), ("per_layer_input", batchPL), ("output", plMoeOutBatchBuf)]
           (.dispatch1D (cfg.embdPerLayer * seqLen))
+        dumpGolden s!"ple_moe_out-{li}" plMoeOutBatchBuf (cfg.embdPerLayer * seqLen)
         -- 3) proj matmul: plMoeOutBatchBuf [embdPerLayer, seqLen] → plProjBatchBuf [dim, seqLen]
         Linear.forwardBatchDP4A ctx ple.proj plMoeOutBatchBuf plProjBatchBuf seqLen
+        dumpGolden s!"ple_proj-{li}" plProjBatchBuf (dim * seqLen)
         -- 4) Fused post-norm + residual add: nextBuf[i,d] = RMSNorm(plProj[i,:])[d] * scale[d] + nextBuf[i,d]
         let plePostKey := hash ("plePostNormAddBatch", cfg.hiddenSize, seqLen)
         let plePostRef ← match kcr with
@@ -3445,6 +3456,13 @@ def forwardPrefillBatch [GPUBackend β] (ctx : β)
     -- Golden dump: post-PLE / pre-outScale.  Matches llama.cpp's
     -- `per_layer_embd_out-<li>` at gemma4-iswa.cpp:209.
     dumpGolden s!"per_layer_embd_out-{li}" nextBuf (dim * seqLen)
+
+    -- Golden dump: pre-outScale state (post-PLE including pe_in residual).
+    -- llama.cpp's `out_scaled-<li>` fires at this point but isn't currently
+    -- emitted by llama-eval-callback (same tensor gets renamed to "l_out"
+    -- by the next `cb` call).  So we dump a hesper-only probe as
+    -- `pre_out_scaled-<li>`.
+    dumpGolden s!"pre_out_scaled-{li}" nextBuf (dim * seqLen)
 
     -- Layer output scale (per-token) — uses Circuit DSL scalar broadcast multiply
     let skipOutScale := (← IO.getEnv "HESPER_SKIP_OUTSCALE").isSome
