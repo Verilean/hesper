@@ -2875,6 +2875,24 @@ def forwardPrefillBatch [GPUBackend β] (ctx : β)
   let nBlocksToRun := match ← IO.getEnv "HESPER_PREFILL_LAYERS" with
     | some s => s.toNat!
     | none => model.blocks.size
+  -- Phase 2 item 2 Step 3 scaffolding: allocate a `[headDim/2]` ones buffer
+  -- that SWA layers (with `ropeFreqFactors = none`) can use as their
+  -- freq_factors input.  Feeding 1.0 makes the batched RoPE kernel
+  -- mathematically equivalent to the single-token `ropeKernelDynamic`
+  -- (which has no freq-factor division), letting SWA layers share the
+  -- same batched fast path as full-attn layers.  Gated behind
+  -- `HESPER_UNIFY_ATTN=swa` until bit-parity is verified.
+  let unifyAttnSwa := (← IO.getEnv "HESPER_UNIFY_ATTN").any (· = "swa")
+  let headDim0 := cfg.headDim 0
+  let dimPairs := headDim0 / 2
+  let onesBuf ← GPUBackend.allocBuffer ctx (dimPairs * 4).toUSize
+  (do
+    let oneBytes ← Hesper.WebGPU.BufferOps.floatToBytes 1.0
+    let mut onesBytes : ByteArray := ByteArray.empty
+    for _ in [0:dimPairs] do
+      onesBytes := onesBytes ++ oneBytes
+    GPUBackend.writeBuffer ctx onesBuf onesBytes)
+
   -- Architecture diagnostic: set HESPER_LAYER_PROFILE=1 to print layer mix.
   if (← IO.getEnv "HESPER_LAYER_PROFILE").isSome then
     let mut full := 0
@@ -2932,7 +2950,17 @@ def forwardPrefillBatch [GPUBackend β] (ctx : β)
     --   * a valid KV cache slot
     let mut handledByBatched := false
     if hKV : kvLi < state.kvCaches.size then
-      match (if cfg.hasKV li && !forceFallback then block.ropeFreqFactors else none) with
+      -- SWA layers have ropeFreqFactors = none but can share the batched
+      -- RoPE-Q/K kernels with a 1.0-filled freq_factors (gated by
+      -- HESPER_UNIFY_ATTN=swa).  This only works now that the in-place
+      -- RWW bug in ropeWithFreqFactorsBatchKernel is fixed (commit c92e377).
+      let effectiveFreqFactors :=
+        if cfg.hasKV li && !forceFallback then
+          match block.ropeFreqFactors with
+          | some ff => some ff
+          | none => if unifyAttnSwa then some onesBuf else none
+        else none
+      match effectiveFreqFactors with
       | some freqFactors =>
         handledByBatched := true
         let kvCache := state.kvCaches[kvLi]
@@ -3409,6 +3437,7 @@ def forwardPrefillBatch [GPUBackend β] (ctx : β)
   GPUBackend.freeBuffer ctx batchNormedBuf
   GPUBackend.freeBuffer ctx batchQBuf
   GPUBackend.freeBuffer ctx batchQRopedBuf
+  GPUBackend.freeBuffer ctx onesBuf
   GPUBackend.freeBuffer ctx batchKBuf
   GPUBackend.freeBuffer ctx batchVBuf
   GPUBackend.freeBuffer ctx batchAttnOutBuf
