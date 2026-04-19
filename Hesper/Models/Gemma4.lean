@@ -4166,7 +4166,7 @@ def generate [GPUBackend β] (ctx : β) (model : Gemma4Model (GPUBackend.Buf β)
           Hesper.CUDA.cuStreamBeginCapture stream
           if unifiedDecode then
             forwardPrefillBatch ctx model #[nextToken] state
-              (kcr := some kcr) (startPos := newPos)
+              (kcr := none) (startPos := newPos)
           else
             forwardSingleToken ctx model nextToken newPos state (kcr := some kcr)
           let graph ← Hesper.CUDA.cuStreamEndCapture stream
@@ -4178,10 +4178,25 @@ def generate [GPUBackend β] (ctx : β) (model : Gemma4Model (GPUBackend.Buf β)
           IO.println s!"[Graph] captured decode graph; subsequent tokens will replay"
         else
           if unifiedDecode then
+            -- Debug: pass kcr := none to rule out key-collision cache bugs.
             forwardPrefillBatch ctx model #[nextToken] state
-              (kcr := some kcr) (startPos := newPos)
+              (kcr := none) (startPos := newPos)
+            -- Debug for state-dirtying: run it TWICE in a row with same args
+            -- and see if 2nd call produces same logits.  If HESPER_DOUBLE_CALL=1.
+            if (← IO.getEnv "HESPER_DOUBLE_CALL").isSome then
+              let firstArg ← GPUBackend.readBuffer ctx state.logitsBuf (16 : USize)
+              forwardPrefillBatch ctx model #[nextToken] state
+                (kcr := none) (startPos := newPos)
+              let secondArg ← GPUBackend.readBuffer ctx state.logitsBuf (16 : USize)
+              IO.println s!"[doubleCall] genCount={genCount} first={firstArg.toList.take 16} second={secondArg.toList.take 16}"
+            if (← IO.getEnv "HESPER_DUMP_LOGITS_UNIFIED").isSome then
+              let bytes ← GPUBackend.readBuffer ctx state.logitsBuf (model.config.vocabSize * 4).toUSize
+              IO.FS.writeBinFile s!"/tmp/hesper_unified_logits_step{genCount}.bin" bytes
           else
             forwardSingleToken ctx model nextToken newPos state (kcr := some kcr)
+            if (← IO.getEnv "HESPER_DUMP_LOGITS_SINGLE").isSome then
+              let bytes ← GPUBackend.readBuffer ctx state.logitsBuf (model.config.vocabSize * 4).toUSize
+              IO.FS.writeBinFile s!"/tmp/hesper_single_logits_step{genCount}.bin" bytes
 
   -- Clean up graph resources.
   match graphExecOpt with
