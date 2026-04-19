@@ -3619,6 +3619,9 @@ def forwardPrefillBatch [GPUBackend β] (ctx : β)
           extensions := ["subgroups"] : Hesper.ExecConfig }
         (hash ("q6k-dp4a-lmhead-4row", cfg.hiddenSize, cfg.vocabSize))
         state.lmHeadDP4APrepared
+      -- Golden dump: hesper's prefill logits (pre-softcap).  Matches
+      -- llama.cpp's `result_output` top-5 token IDs (including argmax).
+      dumpGolden "prefill_logits_raw" state.logitsBuf cfg.vocabSize
     else
       -- Fallback: f32 Q6_K kernel.  Needs standalone RMSNorm since the
       -- f32 matmul can't consume Q8_1.
