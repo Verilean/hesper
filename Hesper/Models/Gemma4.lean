@@ -2747,6 +2747,7 @@ def forwardPrefillBatch [GPUBackend β] (ctx : β)
   --                                   and diff the two.
   let attnDumpTag ← IO.getEnv "HESPER_ATTN_DUMP"
   let forceFallback := (← IO.getEnv "HESPER_FORCE_FALLBACK").isSome
+  let kvDumpDir ← IO.getEnv "HESPER_KVCACHE_DUMP_DIR"
   let stageDumpLayer : Option Nat := (← IO.getEnv "HESPER_ATTN_STAGE_LAYER").bind String.toNat?
   -- Helper: dump `nFloats` f32 elements from `buf` starting at offset 0
   -- to `$HESPER_ATTN_DUMP_DIR/<name>_<tag>.bin` (where <tag> = attnDumpTag).
@@ -3442,6 +3443,24 @@ def forwardPrefillBatch [GPUBackend β] (ctx : β)
         [("batch", batchAttnResidBuf), ("params", colIdxBuf), ("out", state.buf1)]
         (.dispatch1D dim)
       dumpBuf ctx state.buf1 (dim * 4).toUSize s!"batch_t{i}_attnResidL{li}"
+
+  -- Phase 3 diagnostic: dump all KV caches after prefill (one file per
+  -- layer) for comparison against llama.cpp ground truth.  Enabled by
+  -- setting HESPER_KVCACHE_DUMP_DIR=<path>.
+  match kvDumpDir with
+  | some dir =>
+    GPUBackend.endBatch ctx
+    for li in [0:state.kvCaches.size] do
+      if h : li < state.kvCaches.size then
+        let kvc := state.kvCaches[li]
+        let headDim := cfg.headDim li
+        let numKVHeads := cfg.numKVHeads li
+        let bytes := (numKVHeads * cfg.maxSeqLen * headDim * 4).toUSize
+        let kData ← GPUBackend.readBuffer ctx kvc.kBuf bytes
+        let vData ← GPUBackend.readBuffer ctx kvc.vBuf bytes
+        IO.FS.writeBinFile s!"{dir}/k_L{li}.bin" kData
+        IO.FS.writeBinFile s!"{dir}/v_L{li}.bin" vData
+  | none => pure ()
 
   -- ── Step 3: Extract last token → final norm → lm head ─────────────
   -- Copy last column of currentBuf → state.buf2 (single-token)
