@@ -2113,13 +2113,14 @@ def forwardBlock [GPUBackend β] (ctx : β)
     -- RoPE on Q: qBuf2 → qBuf
     match block.ropeFreqFactors with
     | some freqFactors =>
-      ce s!"ropeFreqQ_{headDim}"
+      ce s!"ropeFreqQ_{headDim}_base{cfg.ropeBase li}"
         (ropeWithFreqFactorsKernel headDim numHeads (cfg.ropeBase li))
         [("input", state.qBuf2), ("output", state.qBuf), ("params", state.paramsBuf), ("freq_factors", freqFactors)]
         (.dispatch1D (numHeads * headDim / 2))
     | none =>
       let ropeConfig : RoPE.Config := { dim := numHeads * headDim, maxSeqLen := cfg.maxSeqLen, base := cfg.ropeBase li }
-      ce s!"ropeDynQ_{headDim}"
+      -- NB: `base` is baked into the shader as a literal — must be in cache key.
+      ce s!"ropeDynQ_{headDim}_base{cfg.ropeBase li}"
         (RoPE.ropeKernelDynamic ropeConfig 1 1 numHeads headDim)
         [("input", state.qBuf2), ("output", state.qBuf), ("params", state.paramsBuf)]
         (.dispatch1D (numHeads * headDim / 2))
@@ -2129,7 +2130,7 @@ def forwardBlock [GPUBackend β] (ctx : β)
     -- the legacy two-kernel path.
     if cfg.hasKV li && block.ropeFreqFactors.isNone then
       let ropeConfig : RoPE.Config := { dim := numKVHeads * headDim, maxSeqLen := cfg.maxSeqLen, base := cfg.ropeBase li }
-      ce s!"ropeDynK_{headDim}_{numKVHeads}"
+      ce s!"ropeDynK_{headDim}_{numKVHeads}_base{cfg.ropeBase li}"
         (RoPE.ropeKernelDynamic ropeConfig 1 1 numKVHeads headDim)
         [("input", state.kBuf2), ("output", state.kBuf), ("params", state.paramsBuf)]
         (.dispatch1D (numKVHeads * headDim / 2))
@@ -2154,7 +2155,7 @@ def forwardBlock [GPUBackend β] (ctx : β)
         match block.ropeFreqFactors, useScatter with
         | some freqFactors, false =>
           -- Default path: single fused hand-coded RoPE-K + KV-write kernel.
-          ce s!"ropeKAndKvWrite_{headDim}_{numKVHeads}"
+          ce s!"ropeKAndKvWrite_{headDim}_{numKVHeads}_base{cfg.ropeBase li}"
             (Attention.fusedRopeKAndCacheWriteKernel numKVHeads cfg.maxSeqLen headDim kvDim (cfg.ropeBase li))
             [("new_k", state.kBuf2), ("new_v", state.vBuf2),
              ("k_cache", kvCache.kBuf), ("v_cache", kvCache.vBuf),
@@ -3082,7 +3083,7 @@ def forwardPrefillBatch [GPUBackend β] (ctx : β)
 
         -- Batched RoPE-Q (NOT in place — write to a dedicated scratch to
         -- avoid any read-modify-write hazard on the shared Q buffer).
-        ce s!"ropeFreqQBatchOut_{headDim}"
+        ce s!"ropeFreqQBatchOut_{headDim}_base{cfg.ropeBase li}"
           (ropeWithFreqFactorsBatchKernel headDim numHeads seqLen (cfg.ropeBase li))
           [("input", batchQBuf), ("output", batchQRopedBuf),
            ("params", state.paramsBuf), ("freq_factors", freqFactors)]
@@ -3092,7 +3093,7 @@ def forwardPrefillBatch [GPUBackend β] (ctx : β)
         dumpGolden s!"Qcur_pos-{li}" batchQRopedBuf (qDim * seqLen)
 
         -- Batched RoPE-K + KV cache write.
-        ce s!"ropeKKvWBatch_{headDim}_{numKVHeads}"
+        ce s!"ropeKKvWBatch_{headDim}_{numKVHeads}_base{cfg.ropeBase li}"
           (fusedRopeKAndCacheWriteBatchKernel numKVHeads cfg.maxSeqLen headDim seqLen (cfg.ropeBase li))
           [("new_k", batchKBuf), ("new_v", batchVBuf),
            ("k_cache", kvCache.kBuf), ("v_cache", kvCache.vBuf),
@@ -3134,7 +3135,7 @@ def forwardPrefillBatch [GPUBackend β] (ctx : β)
         let stageActive := stageDumpLayer.any (· = li)
         dumpStage s!"Qnormed_L{li}" batchQBuf (qDim * seqLen) stageActive
         -- Batched RoPE-Q → batchQRopedBuf (out-of-place; see commit c92e377).
-        ce s!"ropeFreqQBatchOut_{headDim}"
+        ce s!"ropeFreqQBatchOut_{headDim}_base{cfg.ropeBase li}"
           (ropeWithFreqFactorsBatchKernel headDim numHeads seqLen (cfg.ropeBase li))
           [("input", batchQBuf), ("output", batchQRopedBuf),
            ("params", state.paramsBuf), ("freq_factors", freqFactors)]
@@ -3219,7 +3220,7 @@ def forwardPrefillBatch [GPUBackend β] (ctx : β)
           (.dispatch1D (numHeads * headDim / 2))
       | none =>
         let ropeConfig : RoPE.Config := { dim := numHeads * headDim, maxSeqLen := cfg.maxSeqLen, base := cfg.ropeBase li }
-        ce s!"ropeDynQ_pf_{headDim}"
+        ce s!"ropeDynQ_pf_{headDim}_base{cfg.ropeBase li}"
           (RoPE.ropeKernelDynamic ropeConfig 1 1 numHeads headDim)
           [("input", state.qBuf2), ("output", state.qBuf), ("params", state.paramsBuf)]
           (.dispatch1D (numHeads * headDim / 2))
@@ -3243,7 +3244,7 @@ def forwardPrefillBatch [GPUBackend β] (ctx : β)
           | none =>
             -- Separate RoPE-K then KV write
             let ropeConfig : RoPE.Config := { dim := kvDim, maxSeqLen := cfg.maxSeqLen, base := cfg.ropeBase li }
-            ce s!"ropeDynK_pf_{headDim}_{numKVHeads}"
+            ce s!"ropeDynK_pf_{headDim}_{numKVHeads}_base{cfg.ropeBase li}"
               (RoPE.ropeKernelDynamic ropeConfig 1 1 numKVHeads headDim)
               [("input", state.kBuf2), ("output", state.kBuf), ("params", state.paramsBuf)]
               (.dispatch1D (numKVHeads * headDim / 2))
