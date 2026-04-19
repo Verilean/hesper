@@ -196,7 +196,31 @@ bit-parity test, but the test was insufficient: two paths agreeing
 with each other does not imply either is correct.  The golden test
 above is the correctness oracle we should have started with.
 
-## 2026-04-19 addendum — per-kernel unit tests required, not just E2E
+## 2026-04-19 addendum — correctness by construction
+
+After 2 weeks of gemma4 work and a PLE cache bug that took 6 hours to
+localise with E2E tests, the pattern is clear: **"start light, fix
+later" is a trap**.  Every time we batched, fused, or refactored a
+kernel without a per-kernel correctness oracle, a subtle bug
+(off-by-one layer offset, RWW hazard, missing +1 in Gemma convention,
+wrong residual semantics) silently entered the tree and was only
+caught days later by coherence-of-English inspection.
+
+Going forward: **correctness by construction**.  No kernel change
+lands — not one line — until (a) a reference implementation exists
+that matches llama.cpp's dump at rel < 1e-5, and (b) an LSpec unit
+test against that reference exists and fails on the proposed
+implementation for the right reason.  Then the implementation
+lands, test goes green, and only then we measure TPS.
+
+Also insufficient until now: **reference-architecture fidelity
+check**.  We didn't verify, e.g., that Gemma 4 uses raw weights
+(not `1 + w`) in its norm by reading the llama.cpp source until
+a bug forced us to.  Always grep `llama.cpp/src/models/gemma4-iswa.cpp`
+and `llama.cpp/src/llama-graph.cpp` for the exact formula and
+ordering the kernel implements.
+
+### Rule: no kernel change without a passing unit test
 
 The E2E golden harness caught the catastrophic failure ("aga"
 output), but it was too coarse to localise anything.  Hours were
@@ -206,14 +230,14 @@ PTX cache bug was found.  And even after the fix, l_out still has
 output produces English prefixes.  Same architecture means same
 math means same output to f32 numerical floor (≤ 1e-5 rel).
 
-### Rule: no kernel change without a passing unit test
-
 Every kernel that hesper's forward chain uses in prefill or decode
 must have a LSpec unit test that:
 
 1. **Inputs**: GGUF weights + a llama.cpp-dumped f32 input tensor.
 2. **Output**: run *exactly that kernel* (not a chain), read back.
-3. **Compare**: the matching llama.cpp-dumped f32 output tensor.
+3. **Compare**: the matching llama.cpp-dumped f32 output tensor
+   — or, when llama.cpp doesn't dump the intermediate, a Python
+   f64 reference (see "Two-layer oracle" below).
 4. **Threshold**: rel diff < `1e-5` (f32 numerical floor), NOT
    "Q4_K quant noise" etc.  If the kernel is itself a quantized
    matmul, the reference must also be that quantized matmul on the
@@ -224,6 +248,62 @@ Do this per-unit — rushing to batched prefill, then measuring
 end-to-end rel diff of 50%+, then trying to localise, is what cost
 the ~6 hours.  Batch/fuse/unify rewrites are big changes and
 demand per-kernel unit tests first.
+
+### Two-layer oracle: Python f64 ref → LSpec GPU test
+
+Not every kernel output is dumped by llama.cpp's eval-callback.
+For example, the PLE intermediate `ple_moe_out` (post-GELU gate ×
+per-layer-input slice) is not a llama.cpp-named tensor — llama.cpp
+computes it inside `build_ffn` and immediately consumes it.  In
+these cases we need our own reference.
+
+**Layer 1 — Python f64 oracle**: for each kernel, write a numpy
+(f64) reference in `Tests/golden-unit/python_refs/` that:
+
+- Loads the llama.cpp-dumped input (or, for intermediates, the
+  llama.cpp-dumped output of the preceding kernel).
+- Reconstructs the kernel's math exactly as stated in
+  `llama.cpp/src/models/gemma4-iswa.cpp` and
+  `llama.cpp/src/llama-graph.cpp`.  Cite the line numbers in a
+  comment.
+- **Sanity step**: when llama.cpp does dump the matching output,
+  assert the numpy f64 ref matches it at rel < 1e-6.  This
+  validates the formula is correct (see
+  `test_rmsnorm_attn_l0.py` for the template).
+- Writes the reference output to `tmp_<name>_f64ref.bin` for the
+  Lean test to consume.
+
+**Layer 2 — LSpec GPU test**: in `Tests/golden-unit/<Kernel>.lean`,
+invoke the hesper kernel on the same inputs, read back, and
+compare against the f64 ref (or directly against the llama.cpp
+dump if available).  Threshold rel < 1e-5 for f32 kernels; rel
+< 1e-4 for Q4_K matmuls where the reference is also Q4_K.
+
+### Reference-architecture fidelity checklist
+
+Before writing a new kernel (or batching/fusing an existing one),
+open the llama.cpp source for the model family and confirm:
+
+- [ ] **Exact formula**: RMSNorm `y = x/rms * w` vs `y = x/rms * (1+w)`?
+      Check `llama.cpp/src/llama-graph.cpp::build_norm` and the
+      model's `convert_hf_to_gguf.py::norm_shift`.
+- [ ] **Operator order**: residual before or after norm?  Scale
+      before or after activation?
+- [ ] **Per-layer overrides**: head_dim, num_kv_heads, sliding-
+      window flag — does the model change these per-layer?  Gemma 4
+      does (key_length vs key_length_swa).
+- [ ] **Quantization format**: Q4_K vs Q6_K vs f16 — which format
+      does the reference use for *this* tensor?  Must match.
+- [ ] **Scale factors**: any `ggml_scale` in the graph?  Their
+      constants must match (e.g. `1/sqrt(n_embd)`,
+      `1/sqrt(head_dim)`, embedding scale, attention logit cap).
+- [ ] **Optional tensors**: is the tensor `TENSOR_NOT_REQUIRED` in
+      llama-model.cpp?  If so, branch on its existence, not assume
+      it's always present.
+
+Write the checklist answer in a comment above the Lean kernel
+call site.  When the kernel gets batched/fused later, the comment
+is the reference to re-check against.
 
 ### Writing a unit test (LSpec + CUDA)
 
