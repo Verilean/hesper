@@ -4076,7 +4076,10 @@ def generate [GPUBackend β] (ctx : β) (model : Gemma4Model (GPUBackend.Buf β)
   -- Phase 1: Prefill (process prompt tokens)
   IO.println s!"[Prefill] Processing {promptTokens.size} prompt tokens..."
   let prefillStart ← IO.monoNanosNow
-  let useBatch := promptTokens.size > 1
+  -- HESPER_BATCH_PREFILL_FORCE=1 uses the batched path even for N=1
+  -- prompts (test vehicle for Phase 3 unified decode).
+  let forceBatch := (← IO.getEnv "HESPER_BATCH_PREFILL_FORCE").isSome
+  let useBatch := (promptTokens.size > 1 || forceBatch)
     && (match ← IO.getEnv "HESPER_BATCH_PREFILL" with | some "0" => false | _ => true)
   if useBatch then
     IO.println s!"[Prefill] Batched path (seqLen={promptTokens.size})"
@@ -4112,6 +4115,9 @@ def generate [GPUBackend β] (ctx : β) (model : Gemma4Model (GPUBackend.Buf β)
 
     -- Sample: GPU-side greedy argmax (download 4 bytes instead of 1 MB)
     let nextToken ← gpuArgmax ctx state.logitsBuf state.argmaxBuf model.config.vocabSize
+
+    if (← IO.getEnv "HESPER_DECODE_TRACE").isSome then
+      IO.println s!"[decode] genCount={genCount} tokens.size(before push)={tokens.size} nextToken={nextToken}"
 
     tokens := tokens.push nextToken
     genCount := genCount + 1
