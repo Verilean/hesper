@@ -834,6 +834,10 @@ lean_exe «gemma4-cuda» where
   root := `Examples.Gemma4CUDA
   moreLinkArgs := stdLinkArgs ++ #["./.lake/build/native/libhesper_cuda.a", "-lcuda"]
 
+lean_exe «gemma4-unit-tests» where
+  root := `Tests.GoldenUnit.Main
+  moreLinkArgs := stdLinkArgs ++ #["./.lake/build/native/libhesper_cuda.a", "-lcuda"]
+
 lean_exe «cuda-graph-smoke» where
   root := `Examples.CUDAGraphSmoke
   moreLinkArgs := stdLinkArgs ++ #["./.lake/build/native/libhesper_cuda.a", "-lcuda"]
