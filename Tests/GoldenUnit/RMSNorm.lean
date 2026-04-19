@@ -42,28 +42,42 @@ unsafe def runRMSNormSingleToken
   let outBytes ← GPUBackend.readBuffer ctx outBuf (dim * 4).toUSize
   pure (byteArrayToF32Array outBytes dim)
 
-unsafe def testAttnNormL0 : IO TestSeq := do
+/-- Parameterised test: run RMSNorm at a given layer using llama.cpp's
+    INPUT tensor from that layer and compare against llama.cpp's
+    attn_norm output at the same layer.
+
+    Input sources by layer:
+    - L0: `inp_scaled` (the prompt-level input to L0)
+    - Lₙ (n > 0): `l_out-(n-1)` (previous layer's output, 1-token)
+-/
+unsafe def testAttnNormAtLayer (ctx : CUDAContext) (li : Nat) (inputName : String)
+    (threshold : Float) : IO TestSeq := do
   let dim := gemma4HiddenDim
   let eps := gemma4RmsEps
-  -- Inputs: last token of inp_scaled, attn_norm weight from GGUF.
-  let inpFull ← loadFloat32Bin s!"{goldenDir}/inp_scaled.bin"
+  let inpFull ← loadFloat32Bin s!"{goldenDir}/{inputName}.bin"
   let inputBytes := lastTokenBytes inpFull dim
   let gguf ← loadGGUF
-  let weightBytes ← extractF32 gguf "blk.0.attn_norm.weight"
-  -- Expected: last token of attn_norm-0.
-  let expFull ← loadFloat32Bin s!"{goldenDir}/attn_norm-0.bin"
+  let weightBytes ← extractF32 gguf s!"blk.{li}.attn_norm.weight"
+  let expFull ← loadFloat32Bin s!"{goldenDir}/attn_norm-{li}.bin"
   let expected := byteArrayToF32Array (lastTokenBytes expFull dim) dim
-  -- Run hesper kernel.
-  let ctx ← CUDAContext.init
   let actual ← runRMSNormSingleToken ctx weightBytes inputBytes dim eps
   let rel := relDiff actual expected
-  IO.println s!"[RMSNorm L0 attn_norm] rel = {rel}"
-  pure (test s!"hesper RMSNorm.forward matches llama.cpp attn_norm-0 (rel={rel} < 1e-5)" (rel < 1e-5))
+  IO.println s!"[RMSNorm L{li} attn_norm (input={inputName})] rel = {rel}"
+  pure (test s!"hesper RMSNorm.forward matches llama.cpp attn_norm-{li} (rel={rel} < {threshold})" (rel < threshold))
 
 unsafe def allTests : IO (List (String × List TestSeq)) := do
-  let t1 ← testAttnNormL0
+  let ctx ← CUDAContext.init
+  -- L0: attn_norm(inp_scaled).  Input is f32 exact (no prior accumulated
+  -- error), so expect f32 numerical floor.
+  let t0 ← testAttnNormAtLayer ctx 0 "inp_scaled" 1e-5
+  -- L17: attn_norm(l_out-16).  Input is llama.cpp's l_out-16 (f32),
+  -- weight is blk.17.attn_norm.weight.  Same kernel as L0 — if rel
+  -- diverges from L0, the RMSNorm kernel has some layer-dependent
+  -- bug (which it shouldn't; the kernel is layer-agnostic).
+  let t17 ← testAttnNormAtLayer ctx 17 "l_out-16" 1e-5
   pure [
-    ("RMSNorm(attn_norm) L0 last token", [t1])
+    ("RMSNorm(attn_norm) L0 last token", [t0]),
+    ("RMSNorm(attn_norm) L17 last token", [t17])
   ]
 
 end Hesper.Tests.GoldenUnit.RMSNorm
