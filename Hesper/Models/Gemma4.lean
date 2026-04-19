@@ -3011,6 +3011,15 @@ def forwardPrefillBatch [GPUBackend β] (ctx : β)
       if cfg.hasKV li then
         Linear.forwardBatchDP4A ctx block.attention.wK batchNormedBuf batchKBuf seqLen
         Linear.forwardBatchDP4A ctx block.attention.wV batchNormedBuf batchVBuf seqLen
+    -- Golden dumps (outside the Q4K/Q6K branch so every layer gets one).
+    -- Note: for the Q4K path, attn_norm output is quantized Q8_1 — we dump
+    -- the RMSNorm-then-matmul output (Qcur/Kcur/Vcur), not attn_norm.
+    -- For the Q6K path we dump batchNormedBuf which IS attn_norm.
+    if !allQ4K then dumpGolden s!"attn_norm-{li}" batchNormedBuf (dim * seqLen)
+    dumpGolden s!"Qcur-{li}" batchQBuf (qDim * seqLen)
+    if cfg.hasKV li then
+      dumpGolden s!"Kcur-{li}" batchKBuf (kvDim * seqLen)
+      dumpGolden s!"Vcur-{li}" batchVBuf (kvDim * seqLen)
 
     -- ── 2c: Attention (batched when possible, per-token fallback) ─────
     let wgSize := min headDim 256
@@ -3278,6 +3287,9 @@ def forwardPrefillBatch [GPUBackend β] (ctx : β)
       | none => IO.mkRef none
     RMSNorm.forwardNormThenAddBatch ctx block.postAttnNorm
       batchOProjBuf currentBuf batchAttnResidBuf seqLen postAttnRef
+    -- Golden dump: `attn_out-<li>` (matches llama.cpp's post-attn-residual
+    -- tensor — `ggml_add(cur, inpL)` at gemma4-iswa.cpp:112).
+    dumpGolden s!"attn_out-{li}" batchAttnResidBuf (dim * seqLen)
 
     -- Diagnostic: dump currentBuf col 0 at L1 after attention inner loop / after O proj
     if dumpEnabled && li = 1 then
@@ -3341,6 +3353,9 @@ def forwardPrefillBatch [GPUBackend β] (ctx : β)
       | none => IO.mkRef none
     RMSNorm.forwardNormThenAddBatch ctx block.postFFNNorm
       batchFFNOutBuf batchAttnResidBuf nextBuf seqLen postFFNRef
+    -- Golden dump: post-FFN residual add; matches llama.cpp's `ffn_post_norm-<li>`
+    -- named tensor (cur = ggml_add(cur, attn_out) at gemma4-iswa.cpp:190).
+    dumpGolden s!"ffn_post_norm-{li}" nextBuf (dim * seqLen)
 
     -- Dump post-FFN (pre-PLE) state
     if dumpEnabled then for i in [0:seqLen] do
