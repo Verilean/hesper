@@ -96,6 +96,69 @@ a *second* time with the same InferenceState and an incremented
 - trips a PTX cache key reuse between different call sites that
   happen to hash the same way.
 
+## 2026-04-20 yet narrower: state.buf2 is correct, lm_head chain is suspect
+
+Added `dumpGolden "prefill_buf2_lastcol_seqLen{N}"` right after the
+column-extract in forwardPrefillBatch so we can see the input to the
+final norm + lm_head.  Ran both paths on "What is 2+2?":
+
+  Single  prefill end    buf2 (seqLen=18): L2 = 54.0526
+  Unified prefill end    buf2 (seqLen=18): L2 = 54.0526  (diff = 0!)
+  Unified decode step 1  buf2 (seqLen=1):  L2 = 49.2858  (reasonable)
+
+So `state.buf2` after column-extract is CORRECT in both paths.  The
+halving happens between buf2 and the final logits.
+
+Chain between buf2 and logits:
+  1. fusedRMSNormQ8_1Kernel (finalNorm+Q8_1 quantize): state.buf2 → q8Buf
+  2. fusedQ6KLinearDP4A4RowKernel (lm_head): q8Buf → logitsBuf
+
+Single path runs these exact same two kernels (line 3891+ of Gemma4.lean
+forwardSingleToken uses them).  So why would unified decode's run of
+the same two kernels produce half-magnitude logits?
+
+Suspect: CachedDispatch prefill run's instance has stale bindings of
+args somehow interacting with the Q8_1 scratch buffer.  Specifically,
+`state.lmHeadQ8Buf` is *lazily* allocated on first call (line 3601).
+If prefill populates it with seqLen=18-worth of data, then decode step
+1 reads that same buffer expecting the single-row version...
+
+BUT: fusedRMSNormQ8_1Kernel writes the full q8Buf on every call (it
+always runs numRows=1).  Stale reads should not happen.
+
+Another unusual finding: HESPER_SKIP_PLE=1 on both paths produces
+gibberish 5-token outputs (expected since PLE is required), but
+unified decode DOESN'T emit early EOS.  i.e. **The early-EOS at decode
+step 1 is SPECIFIC to the PLE chain being active**.
+
+Chain of suspicion for PLE + unified decode:
+  - Prefill's PLE precompute writes `batchPLInputAll[i*totalPL..]` for
+    each of seqLen=18 prompt tokens.
+  - Decode step 1's PLE precompute writes for seqLen=1 token only.
+  - But each `forwardPrefillBatch` call allocates a FRESH
+    `batchPLInputAll` of its own size, so no cross-pollination.
+
+I'm running out of time/context for this session.  This is the
+narrowest the bug has gotten:
+
+  **Bug lives in fusedRMSNormQ8_1 → Q6_K lm_head chain when invoked
+  from a second `forwardPrefillBatch` call, AND the bug is
+  PLE-dependent (disappears with HESPER_SKIP_PLE=1 in the sense that
+  decode no longer emits early EOS).**
+
+Next session minimal steps (prioritized):
+  1. Add a HESPER_DUMP_Q8_UNIFIED env hook: dump the q8Buf written by
+     fusedRMSNormQ8_1 in unified path, compare against single path.
+     If q8Buf diverges despite buf2 being equal, the fused kernel is
+     misbehaving on re-entry.
+  2. Bypass the fused kernel by setting HESPER_DP4A_Q6K=0 (forces the
+     fallback path that uses a standalone RMSNorm then f32 matmul).
+     If unified becomes correct under that flag, the bug is in
+     fusedRMSNormQ8_1 (reuse/caching).
+  3. Inspect cudaAutoCache — is the PTX for fusedRMSNormQ8_1 at
+     numRows=1 getting reused across calls with different state.buf2
+     pointers?  (Logically shouldn't matter.)
+
 ## 2026-04-20 even narrower: bug lives AFTER `l_out-41`
 
 Dumped `l_out-<li>` (every layer block output) under both paths with
