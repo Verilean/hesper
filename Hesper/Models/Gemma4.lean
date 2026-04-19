@@ -3316,8 +3316,10 @@ def forwardPrefillBatch [GPUBackend β] (ctx : β)
     -- FFN norm + Gate/Up projections (batch)
     -- Fast path (both Q4_K): fused RMSNorm+Q8_1 quantize → Q8_1 batch matmul.
     -- Fallback: standalone RMSNorm → f32 batch matmul.
+    let ffnFastDisabled := (← IO.getEnv "HESPER_FFN_FASTPATH_DISABLE").isSome
     let ffnAllQ4K := block.ffn.gate.quantFormat == .Q4_K
                   && block.ffn.up.quantFormat == .Q4_K
+                  && !ffnFastDisabled
     if ffnAllQ4K then
       let ffnQ8Bytes : USize := (nQ8Blocks * 9 * seqLen * 4).toUSize
       let ffnBatchQ8Buf ← GPUBackend.allocBuffer ctx ffnQ8Bytes
@@ -3331,8 +3333,17 @@ def forwardPrefillBatch [GPUBackend β] (ctx : β)
     else
       -- FFN Q6_K fallback: normedBuf can't be batchBuf1 (ping-pong alias).
       RMSNorm.forward ctx block.ffnNorm batchAttnResidBuf batchNormedBuf seqLen
+      -- Golden dump: ffn_norm output (post-RMSNorm, pre-gate/up).
+      -- Only visible in the fallback branch; fast path bakes it into Q8_1.
+      dumpGolden s!"ffn_norm-{li}" batchNormedBuf (dim * seqLen)
       Linear.forwardBatchDP4A ctx block.ffn.gate batchNormedBuf batchGateBuf seqLen
       Linear.forwardBatchDP4A ctx block.ffn.up batchNormedBuf batchUpBuf seqLen
+
+    -- Golden dumps: pre-GELU gate/up outputs.  Matches llama.cpp's
+    -- `ffn_gate-<li>` / `ffn_up-<li>` at gemma4-iswa.cpp (build_ffn
+    -- internal; both are [interSize, seqLen] f32 tensors).
+    dumpGolden s!"ffn_gate-{li}" batchGateBuf (interSize * seqLen)
+    dumpGolden s!"ffn_up-{li}" batchUpBuf (interSize * seqLen)
 
     -- GELU * up (batch pointwise — dispatch with totalElements = interSize * seqLen)
     let totalInter := interSize * seqLen
@@ -3340,6 +3351,10 @@ def forwardPrefillBatch [GPUBackend β] (ctx : β)
       (geluMulKernel totalInter)
       [("gate", batchGateBuf), ("up", batchUpBuf), ("output", batchGeluBuf)]
       (.dispatch1D totalInter)
+
+    -- Golden dump: GELU(gate) * up (pre-down-proj).  Matches llama.cpp's
+    -- `ffn_geglu-<li>` tensor.
+    dumpGolden s!"ffn_geglu-{li}" batchGeluBuf (interSize * seqLen)
 
     -- Down projection (batch matmul)
     Linear.forwardBatchDP4A ctx block.ffn.down batchGeluBuf batchFFNOutBuf seqLen

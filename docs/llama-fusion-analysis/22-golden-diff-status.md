@@ -92,3 +92,91 @@ one that first hits >5% rel vs llama.cpp is the bug.
   "L4 post-attention subpath".
 - Correctness: multi-token output still garbage ("aga"), but now
   we have a principled path to fix it.
+
+## 2026-04-19 update — extended to ffn_out/per_layer_embd_out/out_scaled
+
+After adding intermediate dumps (`ffn_out-<li>`, `per_layer_embd_out-<li>`,
+`out_scaled-<li>`) and widening llama.cpp's whitelist to include
+L1–L4, the per-layer picture became clearer:
+
+```
+layer |  attn_out |   ffn_out |     l_out
+------+-----------+-----------+----------
+    0 |    3.46%  |    3.60%  |    3.77%
+    1 |    1.85%  |    9.35%  |    4.66%  ← L1 FFN: 1.85 → 9.35 (5×)
+    2 |    5.98%  |   42.29%  |   13.06%
+    3 |   12.69%  |   38.60%  |   17.32%
+    4 |   18.36%  |   50.57%  |   50.33%
+    5 |   54.69%  |  544.93%  |   58.06%
+```
+
+**The FFN at every layer amplifies the error.**  attn_out-1 is clean
+(1.85%) but ffn_out-1 is 5× worse (9.35%).  This is not quant noise;
+it's a real correctness bug in hesper's FFN path (ffnNorm → gate/up
+→ GELU × up → down-proj).
+
+Note on intermediate naming: `ffn_post_norm-<li>` and
+`per_layer_embd_out-<li>` show huge rel diffs (150–2500%) even when
+the surrounding `l_out` matches at 3.77%.  Reason: hesper fuses
+`RMSNorm + residual add` into one kernel, so hesper dumps the
+post-residual tensor, while llama.cpp dumps the pre-residual
+(norm-only) tensor at those names.  **Ignore these two columns** —
+the `l_out` and `ffn_out` boundaries are semantically matched and
+those are the load-bearing numbers.
+
+## Next step (revised)
+
+Isolate which FFN sub-kernel amplifies the error:
+
+1. Dump `ffn_norm-<li>` output (pre-gate/up).  Compare vs llama.cpp
+   `ffn_norm-<li>` (already in llama.cpp dumps).
+2. Dump `ffn_gate-<li>`, `ffn_up-<li>` (pre-GELU).
+3. If `ffn_gate` or `ffn_up` already diverges: bug in Q4_K dp4a
+   matmul for gate/up shape (2560→10240).  If they're fine, bug
+   is in GELU×up or down-proj.
+
+## 2026-04-19 update — ffn_norm is the amplifier
+
+Added `HESPER_FFN_FASTPATH_DISABLE=1` flag (forces the standalone
+RMSNorm → f32 matmul fallback path, same as non-Q4_K-both layers).
+With the fast path disabled, hesper now dumps `ffn_norm-<li>` (output
+of standalone `RMSNorm.forward`, matching llama.cpp's `cb(cur,
+"ffn_norm", il)` which fires AFTER the weight multiply in `build_norm`).
+
+```
+L | attn_out | ffn_norm | ffn_gate | ffn_up | ffn_geglu | ffn_out
+--+----------+----------+----------+--------+-----------+--------
+0 |   3.46%  |   3.91%  |   3.06%  |  3.66% |    4.09%  |  3.60%
+1 |   1.85%  |   7.64%  |   4.40%  |  6.34% |   10.12%  |  9.37%
+2 |   5.98%  |  38.43%  |  23.70%  | 31.71% |   44.82%  | 42.31%
+```
+
+At L1: `attn_out` is 1.85% (quant-noise OK), but `ffn_norm`
+**amplifies to 7.64% — a 4× increase**.  RMSNorm is a pure f32 op
+with tiny eps; it should NOT amplify error.
+
+Tested hypotheses:
+
+- **Gemma3 "+1 to weight" convention**: rejected — Gemma4 overrides
+  `norm_shift()` to return 0.0 in `convert_hf_to_gguf.py:7443-7445`,
+  so Gemma4 RMSNorm is plain `y = x * invRms * weight`, which
+  matches hesper.
+- **Disabling fused RMSNorm+Q8_1 fast path**: rejected — numbers are
+  nearly identical with/without `HESPER_FFN_FASTPATH_DISABLE=1`,
+  proving the fusion is not the bug.
+
+The RMSNorm output formula is the same on both sides:
+  `y[d] = x[d] * rsqrt(sum(x²)/D + eps) * weight[d]`
+
+So either:
+- hesper's weight buffer differs from llama.cpp's by a
+  layer-dependent amount (unlikely — it's the same GGUF file), or
+- hesper's `sum(x²)` reduction has a precision bug (f32 summation
+  order?) that amplifies when the input has small-magnitude
+  components dominated by cancellation.
+
+Status: **ffn_norm = amplifier confirmed**.  Next: compare raw
+ffn_norm weights from GGUF to llama.cpp's (sanity check), then dump
+the pre-weight-multiply `norm-<li>` tensor from hesper and compare
+to llama.cpp's `norm-<li>` to localise the bug to either the
+reduction or the weight multiply.
