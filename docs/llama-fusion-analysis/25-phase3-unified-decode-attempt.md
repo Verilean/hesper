@@ -96,7 +96,57 @@ a *second* time with the same InferenceState and an incremented
 - trips a PTX cache key reuse between different call sites that
   happen to hash the same way.
 
-## 2026-04-20 yet narrower: state.buf2 is correct, lm_head chain is suspect
+## 2026-04-20 FINAL: bypass fused kernel doesn't fix — bug is upstream
+
+Test: HESPER_DP4A_Q6K=0 forces the f32 fallback path
+(standalone RMSNorm.forward + f32 matmul, bypassing fusedRMSNormQ8_1
+and fusedQ6KLinearDP4A4RowKernel):
+
+  Single  (DP4A_Q6K=0):  "The value of 2+2 is 4."   ✓ correct
+  Unified (DP4A_Q6K=0):  "The<turn|>"                ✗ broken
+
+So bypassing the fused norm+Q8_1 kernel DOES NOT fix the bug.  This
+means the root cause is NOT in fusedRMSNormQ8_1.  It must be in buf2
+itself (whose content we cannot directly validate without adding a
+dump in the single-token path), or in how buf2 is being populated.
+
+Also verified: state.buf2 at PREFILL END is bit-identical between
+paths (byte-diff = 0).  So the two paths don't diverge at prefill.
+
+What this means: the divergence happens inside the *second* call to
+forwardPrefillBatch (= decode step 1 of unified path).  That call:
+  1. Re-allocates batchBuf1/2 from scratch (uninitialised memory!)
+  2. Writes embedding of token 818 ("The") to batchBuf1
+  3. Scales to batchBuf2
+  4. Runs the 42-block loop
+  5. Extracts last column to state.buf2
+  6. Runs final norm + lm_head
+
+Layer-by-layer L2 on decode step 1 vs prefill ratios were all
+near 1.0 (doc above), suggesting the block loop itself runs.  But
+since single-token decode step 1 is NOT dumped via golden pipeline,
+we can't directly diff layer outputs of the two paths to find where
+they start to differ.
+
+**Next session minimal steps (REVISED, prioritized)**:
+  1. Add golden dumps to forwardSingleToken (e.g. put `dumpGolden` at
+     each block output mirroring the forwardPrefillBatch hooks).
+     Requires editing forwardBlock to accept a "decode dump prefix" or
+     similar.  Once both paths can write comparable golden files, diff
+     every layer to find the first divergence.
+  2. Alternatively: instrument forwardSingleToken to write
+     `state.buf2` content to disk after its column-equivalent step,
+     so we can at least verify whether single and unified produce
+     the same buf2 at decode step 1.
+  3. Inspect batchBuf1/batchBuf2 allocation: maybe they are NOT being
+     zeroed between calls and some kernel reads past seqLen=1
+     columns thinking they're valid.
+
+The bug is still NOT in fusedRMSNormQ8_1, and NOT simply PLE (since
+HESPER_SKIP_PLE=1 on unified doesn't crash but produces gibberish,
+same as single with PLE off).
+
+
 
 Added `dumpGolden "prefill_buf2_lastcol_seqLen{N}"` right after the
 column-extract in forwardPrefillBatch so we can see the input to the
