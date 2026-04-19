@@ -114,6 +114,7 @@ unsafe def main (args : List String) : IO Unit := do
 
   let promptTokens := Hesper.Tokenizer.SentencePiece.encode tokenizer prompt
   IO.println s!"[Tokenize] Prompt: {promptTokens.size} tokens"
+  IO.println s!"[Tokenize] IDs: {promptTokens.toList}"
 
   -- Generate
   IO.println "[Generate] Starting CUDA inference..."
