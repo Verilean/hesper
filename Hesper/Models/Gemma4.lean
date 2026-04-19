@@ -2688,6 +2688,22 @@ def forwardPrefillBatch [GPUBackend β] (ctx : β)
   --                                   and diff the two.
   let attnDumpTag ← IO.getEnv "HESPER_ATTN_DUMP"
   let forceFallback := (← IO.getEnv "HESPER_FORCE_FALLBACK").isSome
+  let stageDumpLayer : Option Nat := (← IO.getEnv "HESPER_ATTN_STAGE_LAYER").bind String.toNat?
+  -- Helper: dump `nFloats` f32 elements from `buf` starting at offset 0
+  -- to `$HESPER_ATTN_DUMP_DIR/<name>_<tag>.bin` (where <tag> = attnDumpTag).
+  -- Active only when both HESPER_ATTN_DUMP and HESPER_ATTN_STAGE_LAYER are
+  -- set, and the caller passes `liActive=true`.  Used to localise the
+  -- per-stage divergence between batched and fallback attention paths.
+  let dumpStage : String → GPUBackend.Buf β → Nat → Bool → IO Unit :=
+    fun name buf nFloats liActive => do
+      match attnDumpTag with
+      | some tag =>
+        if liActive then
+          let dir := (← IO.getEnv "HESPER_ATTN_DUMP_DIR").getD "/tmp"
+          GPUBackend.endBatch ctx
+          let data ← GPUBackend.readBuffer ctx buf (nFloats * 4).toUSize
+          IO.FS.writeBinFile s!"{dir}/{name}_{tag}.bin" data
+      | none => pure ()
 
   -- NOTE: no beginBatch here — each dispatch fires immediately.
   -- Batching would defer all launches until endBatch, but the per-token
@@ -2934,6 +2950,10 @@ def forwardPrefillBatch [GPUBackend β] (ctx : β)
            ("v_in", batchVBuf),                                            ("v_out", batchVBuf)]
           { numWorkgroups := (numHeads * seqLen, 3, 1),
             workgroupSize := { x := wgSize, y := 1, z := 1 } : Hesper.ExecConfig }
+        let stageActive := stageDumpLayer.any (· = li)
+        dumpStage s!"Qnormed_L{li}" batchQBuf (qDim * seqLen) stageActive
+        dumpStage s!"Knormed_L{li}" batchKBuf (kvDim * seqLen) stageActive
+        dumpStage s!"Vnormed_L{li}" batchVBuf (kvDim * seqLen) stageActive
 
         -- Batched RoPE-Q (in place).
         ce s!"ropeFreqQBatch_{headDim}"
@@ -2941,6 +2961,7 @@ def forwardPrefillBatch [GPUBackend β] (ctx : β)
           [("input", batchQBuf), ("output", batchQBuf),
            ("params", state.paramsBuf), ("freq_factors", freqFactors)]
           (.dispatch1D (numHeads * headDim / 2 * seqLen))
+        dumpStage s!"Qroped_L{li}" batchQBuf (qDim * seqLen) stageActive
 
         -- Batched RoPE-K + KV cache write.
         ce s!"ropeKKvWBatch_{headDim}_{numKVHeads}"
@@ -2949,6 +2970,13 @@ def forwardPrefillBatch [GPUBackend β] (ctx : β)
            ("k_cache", kvCache.kBuf), ("v_cache", kvCache.vBuf),
            ("params", state.paramsBuf), ("freq_factors", freqFactors)]
           (.dispatch1D (numKVHeads * headDim / 2 * seqLen))
+        -- K cache layout is [numKVHeads, maxSeqLen, headDim]; slot 0 for
+        -- every KV head means byte range [kvH * maxSeqLen * headDim + 0,
+        -- ... + headDim) — not contiguous.  For a simple sanity dump,
+        -- snapshot the whole cache slab (numKVHeads * maxSeqLen * headDim)
+        -- and let the diff tool pick out the right slices.
+        dumpStage s!"Kcache_L{li}" kvCache.kBuf (numKVHeads * cfg.maxSeqLen * headDim) stageActive
+        dumpStage s!"Vcache_L{li}" kvCache.vBuf (numKVHeads * cfg.maxSeqLen * headDim) stageActive
 
         -- Batched flash-attention.  Grid (numHeads, seqLen, 1).
         let scale : Float := 1.0
@@ -2957,6 +2985,7 @@ def forwardPrefillBatch [GPUBackend β] (ctx : β)
           [("q", batchQBuf), ("k_cache", kvCache.kBuf), ("v_cache", kvCache.vBuf),
            ("output", batchAttnOutBuf), ("params", state.paramsBuf)]
           ({ numWorkgroups := (numHeads, seqLen, 1) : Hesper.ExecConfig })
+        dumpStage s!"attnOut_L{li}" batchAttnOutBuf (qDim * seqLen) stageActive
       | none => pure ()
 
     if !handledByBatched then
@@ -2996,6 +3025,16 @@ def forwardPrefillBatch [GPUBackend β] (ctx : β)
           [("input", state.qBuf), ("weight", block.attention.qNormWeight), ("output", state.qBuf2)]
           { numWorkgroups := (numHeads, 1, 1),
             workgroupSize := { x := wgSize, y := 1, z := 1 } : Hesper.ExecConfig }
+      -- Per-stage dumps: only fire for the target layer, at the LAST iter
+      -- (i = seqLen - 1) so Kcache/Vcache reflect all tokens written.
+      -- Qnormed/Vnormed/Qroped are single-token scratch buffers; dumping
+      -- at the last iter captures token (seqLen-1)'s values, letting us
+      -- compare against the batched path's last-column slice.
+      let stageActive := stageDumpLayer.any (· = li) && i = seqLen - 1
+      dumpStage s!"Qnormed_L{li}" state.qBuf2 qDim stageActive
+      if cfg.hasKV li then
+        dumpStage s!"Knormed_L{li}" state.kBuf2 kvDim stageActive
+        dumpStage s!"Vnormed_L{li}" state.vBuf2 kvDim stageActive
 
       -- RoPE on Q: qBuf2 → qBuf
       -- GPU-side: posBuf[i] → paramsBuf[0]
@@ -3018,6 +3057,7 @@ def forwardPrefillBatch [GPUBackend β] (ctx : β)
           (RoPE.ropeKernelDynamic ropeConfig 1 1 numHeads headDim)
           [("input", state.qBuf2), ("output", state.qBuf), ("params", state.paramsBuf)]
           (.dispatch1D (numHeads * headDim / 2))
+      dumpStage s!"Qroped_L{li}" state.qBuf qDim stageActive
 
       -- RoPE on K + KV cache write + flash attention
       if h : kvLi < state.kvCaches.size then
@@ -3047,6 +3087,9 @@ def forwardPrefillBatch [GPUBackend β] (ctx : β)
                ("k_cache", kvCache.kBuf), ("v_cache", kvCache.vBuf),
                ("params", state.paramsBuf)]
               (.dispatch1D kvDim)
+        if cfg.hasKV li then
+          dumpStage s!"Kcache_L{li}" kvCache.kBuf (numKVHeads * cfg.maxSeqLen * headDim) stageActive
+          dumpStage s!"Vcache_L{li}" kvCache.vBuf (numKVHeads * cfg.maxSeqLen * headDim) stageActive
 
         -- Flash attention
         let scale : Float := 1.0
@@ -3066,6 +3109,7 @@ def forwardPrefillBatch [GPUBackend β] (ctx : β)
             [("q", state.qBuf), ("k_cache", kvCache.kBuf), ("v_cache", kvCache.vBuf),
              ("output", state.attnOutBuf), ("params", state.paramsBuf)]
             ({ numWorkgroups := (numHeads, 1, 1) : Hesper.ExecConfig })
+        dumpStage s!"attnOut_L{li}" state.attnOutBuf qDim stageActive
 
         -- Insert attnOut into batch buffer for later O-projection.
         -- colIdxBuf still holds `i` from the extracts — skip redundant write.
