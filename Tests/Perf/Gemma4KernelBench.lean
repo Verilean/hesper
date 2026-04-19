@@ -1,6 +1,7 @@
 import Hesper.Backend.CUDA
 import Hesper.CUDA.FFI
 import Hesper.Layers.Linear
+import Hesper.Models.Gemma4
 import Tests.GoldenUnit.Common
 
 /-!
@@ -126,5 +127,29 @@ unsafe def main : IO Unit := do
   -- LM head (Q6_K, largest single kernel in decode)
   IO.println "\n-- LM head --"
   benchLinear ctx gguf "lm_head"      "token_embd.weight"         2560 262144 (iters := 200)
+
+  -- Fused gate+up — the actual decode path for FFN.
+  IO.println "\n-- Fused gate+up (the real decode path for FFN) --"
+  withLinearLayer ctx gguf "blk.0.ffn_gate.weight" 2560 10240 fun gateL => do
+    withLinearLayer ctx gguf "blk.0.ffn_up.weight" 2560 10240 fun upL => do
+      withTempBuf ctx (2560 * 4) fun inBuf => do
+        withTempBuf ctx (10240 * 4) fun outBuf => do
+          let preparedRef ← GPUBackend.newCacheRef (β := CUDAContext)
+          Linear.dp4aEnabled.set true
+          -- Warmup.
+          for _ in [0:20] do
+            Linear.forwardFusedGateUp ctx gateL upL inBuf outBuf preparedRef
+          let _ ← GPUBackend.readBuffer ctx outBuf (4 : USize)
+          let iters := 500
+          let t0 ← IO.monoNanosNow
+          for _ in [0:iters] do
+            Linear.forwardFusedGateUp ctx gateL upL inBuf outBuf preparedRef
+          let _ ← GPUBackend.readBuffer ctx outBuf (4 : USize)
+          let t1 ← IO.monoNanosNow
+          let us : Float := (t1 - t0).toFloat / (iters.toFloat * 1000.0)
+          -- Each call reads gate + up weight buffers (2 × Q4_K 2560×10240).
+          let wBytes : Float := 2.0 * (2560 * 10240).toFloat * 0.578125
+          let gbs : Float := wBytes / (us * 1e-6) / 1e9
+          IO.println s!"  forwardFusedGateUp L0 [2560→2×10240]: {us} μs/call, {gbs} GB/s (both weights)"
 
   IO.println "\n[Done]"
