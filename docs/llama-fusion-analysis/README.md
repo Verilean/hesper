@@ -29,13 +29,13 @@ move to compress kernel count toward **llama.cpp CUDA's 187 kernels/tok**.
 | [`12-complete-cuda-flow.md`](12-complete-cuda-flow.md) | **Complete CUDA flow** for Gemma 4 E4B | `fattn*`, `mmvq`, `mmq`, `rope`, `norm` |
 | [`14-nsys-fresh-comparison.md`](14-nsys-fresh-comparison.md) | nsys hesper vs llama.cpp (post-Q4K-fixes) | nsys captures |
 | [`15-llama-single-path.md`](15-llama-single-path.md) | **Architecture plan**: adopt llama.cpp's single-forward shape-polymorphic path | `llama-context.cpp`, `gemma4-iswa.cpp` |
-| [`16-shape-audit-checklist.md`](16-shape-audit-checklist.md) | **Phase 1 shape audit**: every forward kernel classified A/B/C; reduces rewrite to 3 items | `Hesper/Models/Gemma4.lean`, `Hesper/Layers/*.lean` |
+| [`16-shape-audit-checklist.md`](16-shape-audit-checklist.md) | Phase 1 shape audit (A/B/C).  **All 3 items done**; housekeeping 4-6 deferred.  Active checklist moved to doc 21. | `Hesper/Models/Gemma4.lean`, `Hesper/Layers/*.lean` |
 | [`17-phase2-item2-findings.md`](17-phase2-item2-findings.md) | Phase 2 item 2 first attempt: why the naive SWA→batched-path change regressed; revised plan requires bit-parity harness + separate batched SWA kernels | — |
 | [`18-bit-parity-harness-findings.md`](18-bit-parity-harness-findings.md) | Bit-parity harness built; pre-existing batched-path RoPE-Q bug found and fixed (in-place RWW → out-of-place); all 42 layers BIT-IDENTICAL | `Hesper/Models/Gemma4.lean` |
 | [`19-phase3-correctness-plan.md`](19-phase3-correctness-plan.md) | Phase 3 plan: locate the remaining "ucucuc." bug (not in attention).  KV-cache-vs-llama.cpp diff + PLE stage dumps. | — |
 | [`20-phase3-root-finding.md`](20-phase3-root-finding.md) | **Root finding**: the bug is NOT multi-token — hesper's whole 42-layer transformer is a near-identity.  Every single-token prompt produces itself repeated. | — |
-| [`21-development-flow.md`](21-development-flow.md) | **Development flow**: llama.cpp-first, golden-value-driven.  Lessons from the 6-hour "fast at being wrong" detour. | `llama.cpp/common/debug.cpp:161` HESPER PATCH |
-| [`22-golden-diff-status.md`](22-golden-diff-status.md) | **Golden-diff status**: narrowed bug from whole stack to L4 post-attention subpath. attn_out-4 matches at 2.9%; l_out-4 diverges at 13%. | `Hesper/Models/Gemma4.lean` dumps |
+| [`21-development-flow.md`](21-development-flow.md) | **Development flow + active checklist**: llama.cpp-first, golden-value-driven, **per-kernel unit tests BEFORE batch/fuse refactors**.  Includes the open per-kernel unit-test table. | `llama.cpp/common/debug.cpp:161` HESPER PATCH |
+| [`22-golden-diff-status.md`](22-golden-diff-status.md) | **Golden-diff trail** that led to the PLE cache-key bug fix (commit `c3de2f7`).  Output went from "aga" garbage to English. | `Hesper/Models/Gemma4.lean` dumps |
 
 ## Measurement artefacts
 
