@@ -3344,6 +3344,10 @@ def forwardPrefillBatch [GPUBackend β] (ctx : β)
     -- Down projection (batch matmul)
     Linear.forwardBatchDP4A ctx block.ffn.down batchGeluBuf batchFFNOutBuf seqLen
 
+    -- Golden dump: FFN down-proj output (pre post-FFN-norm+residual).
+    -- Matches llama.cpp's `ffn_out-<li>` at gemma4-iswa.cpp:182.
+    dumpGolden s!"ffn_out-{li}" batchFFNOutBuf (dim * seqLen)
+
     -- ── 2g: Post-FFN norm + residual (batched) ───────────────────────
     -- `nextBuf[i,d] = RMSNorm(ffnOut[i,:])[d] * scale[d] + attnResid[i,d]`
     -- One dispatch over seqLen rows (was: 3 dispatches × seqLen).
@@ -3415,6 +3419,10 @@ def forwardPrefillBatch [GPUBackend β] (ctx : β)
         (.dispatch1D dim)
       dumpBuf ctx state.buf1 (dim * 4).toUSize s!"batch_t{i}_postPLE_L{li}"
 
+    -- Golden dump: post-PLE / pre-outScale.  Matches llama.cpp's
+    -- `per_layer_embd_out-<li>` at gemma4-iswa.cpp:209.
+    dumpGolden s!"per_layer_embd_out-{li}" nextBuf (dim * seqLen)
+
     -- Layer output scale (per-token) — uses Circuit DSL scalar broadcast multiply
     let skipOutScale := (← IO.getEnv "HESPER_SKIP_OUTSCALE").isSome
     match if skipOutScale then none else block.outScale with
@@ -3451,6 +3459,10 @@ def forwardPrefillBatch [GPUBackend β] (ctx : β)
 
     -- Per-layer batch Q8_1 buffers are freed inside their respective
     -- Q4_K fast-path branches above.
+
+    -- Golden dump: post-outScale.  Matches llama.cpp's `out_scaled-<li>`
+    -- at gemma4-iswa.cpp:218.
+    dumpGolden s!"out_scaled-{li}" nextBuf (dim * seqLen)
 
     -- Swap ping-pong buffers
     let oldCur := currentBuf
