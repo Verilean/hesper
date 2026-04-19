@@ -195,3 +195,110 @@ The attention unification work in Phase 2 was correct under its own
 bit-parity test, but the test was insufficient: two paths agreeing
 with each other does not imply either is correct.  The golden test
 above is the correctness oracle we should have started with.
+
+## 2026-04-19 addendum — per-kernel unit tests required, not just E2E
+
+The E2E golden harness caught the catastrophic failure ("aga"
+output), but it was too coarse to localise anything.  Hours were
+spent bisecting a 42-layer stack before the `pleGeluGateMulSliceBatch`
+PTX cache bug was found.  And even after the fix, l_out still has
+~5-30% rel diff per layer — which is **not OK** just because the
+output produces English prefixes.  Same architecture means same
+math means same output to f32 numerical floor (≤ 1e-5 rel).
+
+### Rule: no kernel change without a passing unit test
+
+Every kernel that hesper's forward chain uses in prefill or decode
+must have a LSpec unit test that:
+
+1. **Inputs**: GGUF weights + a llama.cpp-dumped f32 input tensor.
+2. **Output**: run *exactly that kernel* (not a chain), read back.
+3. **Compare**: the matching llama.cpp-dumped f32 output tensor.
+4. **Threshold**: rel diff < `1e-5` (f32 numerical floor), NOT
+   "Q4_K quant noise" etc.  If the kernel is itself a quantized
+   matmul, the reference must also be that quantized matmul on the
+   same weights — so the answer is still `~0` rel diff.
+5. **All tests must pass before any TPS measurement.**
+
+Do this per-unit — rushing to batched prefill, then measuring
+end-to-end rel diff of 50%+, then trying to localise, is what cost
+the ~6 hours.  Batch/fuse/unify rewrites are big changes and
+demand per-kernel unit tests first.
+
+### Writing a unit test (LSpec + CUDA)
+
+Template (new tests go in `Tests/golden-unit/`):
+
+```
+import LSpec
+import Hesper.CUDA.FFI
+import Hesper.GGUF.Parser
+import Hesper.Layers.RMSNorm
+-- ... whatever the kernel under test needs
+
+unsafe def main : IO UInt32 := do
+  let ctx ← Hesper.CUDA.CUDAContext.init
+  let input  ← Hesper.GGUF.Loader.loadRawFloat32 "/tmp/llama_dump/inp_scaled.bin" dim
+  let weight ← extractFromGGUF "blk.0.attn_norm.weight"
+  let expected ← Hesper.GGUF.Loader.loadRawFloat32 "/tmp/llama_dump/attn_norm-0.bin" dim
+  let actual ← runOnGPU ctx (RMSNorm.forward weight) input
+  let rel := relDiff actual expected
+  LSpec.check "RMSNorm(attn_norm) L0 last-token" (rel < 1e-5)
+  -- ...
+```
+
+Each kernel gets one exe in `lakefile.lean`:
+`lean_exe unit-rmsnorm-l0 where root := ...`
+
+### Kernels that currently need unit tests (prefill-batched path)
+
+Order: same as gemma4-iswa.cpp control flow.  Input = llama.cpp
+f32 dump; output compared to llama.cpp f32 dump at the matching
+name.  For quantized matmuls, compare against llama.cpp's same-
+quantized matmul output (which is what llama.cpp dumps).
+
+| Stage | Hesper kernel | golden input | golden output | threshold |
+|---|---|---|---|---|
+| 1 | `Embedding.forward` + `embeddingScaleKernel` | token ids | `inp_scaled` | 0 (bit-exact) |
+| 2 | `RMSNorm.forward` (attn_norm) | `inp_scaled` | `attn_norm-0` | 1e-5 |
+| 3 | `Linear.forwardBatchDP4A` (wQ) | `attn_norm-0` | `Qcur-0` | 1e-4 |
+| 4 | `Linear.forwardBatchDP4A` (wK) | `attn_norm-0` | `Kcur-0` | 1e-4 |
+| 5 | `Linear.forwardBatchDP4A` (wV) | `attn_norm-0` | `Vcur-0` | 1e-4 |
+| 6 | `perHeadRMSNormBatchKernel` (q_norm) | `Qcur-0` | `Qcur_normed-0` | 1e-5 |
+| 7 | (same for k_norm, v_norm) | ... | ... | 1e-5 |
+| 8 | `ropeWithFreqFactorsBatchKernel` (Q) | `Qcur_normed-0` | `Qcur_pos-0` | 1e-5 |
+| 9 | `fusedRopeKAndCacheWriteBatchKernel` (K) | `Kcur_normed-0` | `Kcur_pos-0` | 1e-5 |
+| 10 | `flashAttentionBatchKernel` | Q_pos, K cache, V cache | `__fattn__-0` | 1e-4 |
+| 11 | `Linear.forwardBatchDP4A` (wO) + residual | `__fattn__-0` | `attn_out-0` | 1e-4 |
+| 12 | `rmsNormThenAddBatchKernel` (post-attn) | — | — | — (NOT used this block; fused into attn_norm path) |
+| 13 | `fusedRMSNormQ8_1Kernel` (ffn_norm) | `attn_out-0` | `ffn_norm-0` (via reverse dequant) | 1e-5 |
+| 14 | Linear gate (Q4_K) | `ffn_norm-0` | `ffn_gate-0` | 1e-4 |
+| 15 | Linear up (Q4_K) | `ffn_norm-0` | `ffn_up-0` | 1e-4 |
+| 16 | `geluMulKernel` | gate, up | `ffn_geglu-0` | 1e-5 |
+| 17 | Linear down (Q4_K) | `ffn_geglu-0` | `ffn_out-0` | 1e-4 |
+| 18 | `forwardNormThenAddBatch` (post-FFN) | ffn_out, attn_out | `ffn_post_norm-0` | 1e-5 |
+| 19 | PLE `Linear.inpGate` (Q4_K) | `ffn_post_norm-0` | `ple_gate-0` | 1e-4 |
+| 20 | `geluGateMulSliceBatchKernel` | ple_gate, inp_per_layer slice | `ple_moe_out-0` | 1e-5 |
+| 21 | PLE `Linear.proj` (Q4_K) | ple_moe_out | `ple_proj-0` | 1e-4 |
+| 22 | PLE `forwardNormThenAddBatch` | ple_proj, pe_in | `per_layer_embd_out + pe_in` | 1e-5 |
+| 23 | `out_scale` mul | (pe_in + PLE) | `l_out-0` | 1e-5 |
+
+Unit tests not yet written for any of these.  Write one at a time,
+keep each <150 lines, land it passing, then move to the next.
+
+### Why unit tests matter for big refactors
+
+Small patches (e.g. renaming a variable) don't need a new unit
+test.  But anything that rewires dispatch — batching, fusion,
+cache-key changes — is a **big change** that can silently
+introduce PTX-cache/layout/indexing bugs that E2E tests can't
+easily localise.  For these, write the unit test FIRST, watch it
+fail on the naive port, fix until green, then measure TPS.
+
+The PLE cache-key bug (commit c3de2f7) is the concrete example:
+it had been in the tree for days, invisible to E2E ("aga" output
+looked like any other garbage), and took a full session of
+layer-by-layer golden diffs to pin down.  A unit test around
+`geluGateMulSliceBatchKernel` with L0 AND L4 inputs (same code,
+different plOffset) would have caught it the moment the batched
+PLE was introduced.

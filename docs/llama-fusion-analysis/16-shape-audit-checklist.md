@@ -1,8 +1,21 @@
 ---
 title: "16 — Phase 1 shape audit: hesper forward kernels classified A/B/C"
 date: 2026-04-19
-status: architecture-plan (in progress)
+status: COMPLETE (Phase 2 items 1/2/3 all done); housekeeping items
+        4/5/6 deferred — see doc 21 for the active correctness checklist
 ---
+
+> **STATUS (2026-04-19)**: Phase 2 items 1–3 are all done and landed on
+> `main`.  The remaining housekeeping items (4/5/6) are low-priority
+> clean-ups that don't affect correctness.
+>
+> **The active development checklist is now in
+> `21-development-flow.md` under "Kernels that currently need unit
+> tests".**  That table tracks the per-kernel unit tests we need to
+> add before resuming TPS measurement, which is the current blocker.
+>
+> This document is kept for historical record of the Phase 2
+> refactor and the A/B/C classification that motivated it.
 
 # Phase 1 shape audit
 
