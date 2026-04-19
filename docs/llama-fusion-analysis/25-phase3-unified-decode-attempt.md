@@ -96,7 +96,44 @@ a *second* time with the same InferenceState and an incremented
 - trips a PTX cache key reuse between different call sites that
   happen to hash the same way.
 
-## 2026-04-20 continued: bug reproduced in minimal setting
+## 2026-04-20 further narrowing: magnitude ≈ 1/2 of correct
+
+Added logit dumps at step 1 under both paths and compared:
+
+  unified step1 top-1:  <turn|>   logit = 21.62   (wrong argmax)
+  single  step1 top-1:  ▁value    logit = 26.04   (correct)
+
+  unified logits L2 norm: 2534.59
+  single  logits L2 norm: 4710.03
+
+**Unified produces logits ≈ half the magnitude of the single path.**
+This is not noise — the distribution is structurally different, with
+<turn|> ranked 1st in unified but below position 10 in single (where
+▁value is 1st).
+
+Implication: something is scaling the final hidden state by 0.5, or
+missing a residual add.  Each block in Gemma 4 has two residual adds
+(post-attention, post-FFN).  If one residual is missing across all
+42 layers, the accumulated output would lose ~half its magnitude.
+
+Also ruled out earlier:
+- `forwardPrefillBatch` IS deterministic — calling it twice with same
+  args yields bit-identical logits (`HESPER_DOUBLE_CALL=1` test).
+  So no state-dirtying by the function itself.
+- `kcr := none` doesn't fix the bug — the PTX cache is not the cause.
+
+**Root cause is almost certainly a missing residual add or wrong
+scale in forwardPrefillBatch's block loop, activated specifically when
+startPos > 0.**  Maybe the PLE precompute path skips the residual,
+or the attnResidualBuf / postAttnNorm ordering differs.
+
+Next minimal test (for next session):
+1. dumpGolden after attn-residual, after ffn-residual, and after
+   post-PLE residual in forwardPrefillBatch, under HESPER_UNIFIED_DECODE.
+2. Compare against same points in forwardSingleToken.
+3. First divergence identifies the missing scale/residual.
+
+## 2026-04-20 initial narrowing
 
 With `HESPER_BATCH_PREFILL_FORCE=1 HESPER_UNIFIED_DECODE=1` for a
 single-char prompt ("H") — wrapped by HESPER_CHAT into 11 tokens —
