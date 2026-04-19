@@ -2748,6 +2748,18 @@ def forwardPrefillBatch [GPUBackend β] (ctx : β)
   let attnDumpTag ← IO.getEnv "HESPER_ATTN_DUMP"
   let forceFallback := (← IO.getEnv "HESPER_FORCE_FALLBACK").isSome
   let kvDumpDir ← IO.getEnv "HESPER_KVCACHE_DUMP_DIR"
+  -- Golden-value harness: dump named intermediate tensors with the SAME
+  -- names as llama.cpp's eval-callback dump (`llama.cpp/common/debug.cpp`),
+  -- so a simple filename-keyed diff localises the first divergence.
+  let goldenDumpDir ← IO.getEnv "HESPER_GOLDEN_DUMP_DIR"
+  let dumpGolden : String → GPUBackend.Buf β → Nat → IO Unit :=
+    fun name buf nFloats => do
+      match goldenDumpDir with
+      | some dir =>
+        GPUBackend.endBatch ctx
+        let data ← GPUBackend.readBuffer ctx buf (nFloats * 4).toUSize
+        IO.FS.writeBinFile s!"{dir}/{name}.bin" data
+      | none => pure ()
   let stageDumpLayer : Option Nat := (← IO.getEnv "HESPER_ATTN_STAGE_LAYER").bind String.toNat?
   -- Helper: dump `nFloats` f32 elements from `buf` starting at offset 0
   -- to `$HESPER_ATTN_DUMP_DIR/<name>_<tag>.bin` (where <tag> = attnDumpTag).
@@ -2824,6 +2836,8 @@ def forwardPrefillBatch [GPUBackend β] (ctx : β)
     (embeddingScaleKernel totalHidden dim)
     [("input", batchBuf1), ("output", batchBuf2)]
     (.dispatch1D totalHidden)
+  -- Golden dump: matches llama.cpp's `inp_scaled` tensor.
+  dumpGolden "inp_scaled" batchBuf2 totalHidden
 
   -- Cache the scaled embedding (pre-layer state) for PLE usage inside the block loop.
   -- Single-token path precomputes plInputAll ONCE from the scaled embedding and reuses
@@ -3427,6 +3441,9 @@ def forwardPrefillBatch [GPUBackend β] (ctx : β)
     let oldCur := currentBuf
     currentBuf := nextBuf
     nextBuf := oldCur
+
+    -- Golden dump: layer output — matches llama.cpp's `l_out-<li>` tensor.
+    dumpGolden s!"l_out-{li}" currentBuf (dim * seqLen)
 
     -- Dump post-layer state for each token
     if dumpEnabled then for i in [0:seqLen] do
