@@ -15,7 +15,9 @@ kernels block unifying `forwardSingleToken` with `forwardPrefillBatch`.
 | Phase 2 item | Status | Commit | Measured impact |
 |---|---|---|---|
 | **1. Batched RMSNorm+residual** (post-attn + post-FFN) | ✅ done | `848c14f` | −2268 dispatches, prefill 290 → 250 ms |
-| **2. Unify attention via batched fast path** | 🟥 blocked | (reverted) | First attempt (freq_factors=1.0 fake) regressed both perf and correctness.  Needs bit-parity harness + genuine batched-RoPE-no-freq kernels.  See doc 17. |
+| **2a. Bit-parity harness + RoPE-Q in-place RWW fix** | ✅ done | `4678951`, `c92e377` | Fixed the batched-vs-fallback Qroped divergence (was in-place RWW bug in `ropeWithFreqFactorsBatchKernel`); all 42 layers now BIT-IDENTICAL. |
+| **2b. Unify SWA layers via 1.0-freq_factors** | ✅ done | `caa5c7d`, `04a5ef2` | After 2a unblocked, SWA layers now take the batched fast path by default.  Prefill 236 → 220 ms (−7%). 24/42 layers batched (was 4/42).  |
+| **2c. Unify shared-KV layers** | ⏳ pending | — | 18/42 layers still on fallback.  Need Q-only batched norm kernel + FA against earlier-layer KV cache. |
 | **3. Batched PLE inner loop** | ✅ done | `1f85284` | −2150 dispatches, prefill 247 → 213 ms |
 | 4. Drop `columnExtract` / `columnInsert` around batched paths | ⏳ partial | in items 1 & 3 | Deleted from post-attn/post-FFN + PLE.  Still present in per-token attn fallback (item 2). |
 | 5. Pass pos/cacheLen arrays directly (skip `copyU32Kernel`) | ⏳ pending | — | Blocked on item 2 (only per-token loop needs this). |
