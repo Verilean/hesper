@@ -59,6 +59,43 @@ that put `<turn|>` on top**.
    entries are valid for N=1.  If any kernel in that tail reads past
    index 0 it would consume uninitialised memory.
 
+## Additional diagnostic data (2026-04-20 second pass)
+
+Added a `HESPER_DECODE_TRACE=1` IO.println that prints
+`(genCount, tokens.size before push, nextToken)` and
+`HESPER_BATCH_PREFILL_FORCE=1` that allows using
+`forwardPrefillBatch` for N=1 prompts.
+
+Findings:
+
+1. **forwardPrefillBatch is correct for N=1 with startPos=0**.
+   Running `"H"` (1 prompt token) with and without
+   `HESPER_BATCH_PREFILL_FORCE=1` produces the exact same output
+   (`"PHHPH"`).  So the batched path at seqLen=1, startPos=0 reaches
+   a bit-identical endpoint as the single-token path.
+
+2. **First decode step (N=1, startPos=promptLen) is also correct**.
+   Under `HESPER_UNIFIED_DECODE=1` for prompt "What is 2+2?" (18
+   tokens after chat-wrap):
+
+      genCount=0 nextToken=818    'The'  ← correct, matches non-unified
+
+3. **Second decode step is where it breaks**.
+
+      non-unified  step1: 1550 ' value'   ← correct
+      unified      step1:  106 '<turn|>'  ← wrong (early EOS)
+
+So the bug manifests specifically when `forwardPrefillBatch` is called
+a *second* time with the same InferenceState and an incremented
+`startPos`.  Something in the first call's tail either:
+- leaves shared `state.xxx` buffers in a state that the batched path
+  assumes is fresh (e.g. `state.paramsBuf`, `state.plModelProj`,
+  `state.buf1`/`buf2`), OR
+- releases a batch-scratch buffer that the second call still reads,
+  OR
+- trips a PTX cache key reuse between different call sites that
+  happen to hash the same way.
+
 ## Recommendation for next iteration
 
 - **Move batch-buffer allocation to state**: add
