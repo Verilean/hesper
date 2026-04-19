@@ -2875,14 +2875,13 @@ def forwardPrefillBatch [GPUBackend β] (ctx : β)
   let nBlocksToRun := match ← IO.getEnv "HESPER_PREFILL_LAYERS" with
     | some s => s.toNat!
     | none => model.blocks.size
-  -- Phase 2 item 2 Step 3 scaffolding: allocate a `[headDim/2]` ones buffer
-  -- that SWA layers (with `ropeFreqFactors = none`) can use as their
-  -- freq_factors input.  Feeding 1.0 makes the batched RoPE kernel
-  -- mathematically equivalent to the single-token `ropeKernelDynamic`
-  -- (which has no freq-factor division), letting SWA layers share the
-  -- same batched fast path as full-attn layers.  Gated behind
-  -- `HESPER_UNIFY_ATTN=swa` until bit-parity is verified.
-  let unifyAttnSwa := (← IO.getEnv "HESPER_UNIFY_ATTN").any (· = "swa")
+  -- Phase 2 item 2 Step 3: route SWA layers through the batched RoPE
+  -- path by feeding a constant-1.0 freq_factors buffer — equivalent to
+  -- the single-token `ropeKernelDynamic` (no freq-factor division).
+  -- Verified bit-identical vs the per-token fallback for all 42 layers
+  -- on Gemma 4 E4B Q4_K_M (commits c92e377 + caa5c7d).  Can be disabled
+  -- with HESPER_UNIFY_ATTN=off for A/B testing.
+  let unifyAttnSwa := (← IO.getEnv "HESPER_UNIFY_ATTN").all (· ≠ "off")
   let headDim0 := cfg.headDim 0
   let dimPairs := headDim0 / 2
   let onesBuf ← GPUBackend.allocBuffer ctx (dimPairs * 4).toUSize
