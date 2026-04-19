@@ -33,6 +33,8 @@ move to compress kernel count toward **llama.cpp CUDA's 187 kernels/tok**.
 | [`17-phase2-item2-findings.md`](17-phase2-item2-findings.md) | Phase 2 item 2 first attempt: why the naive SWA→batched-path change regressed; revised plan requires bit-parity harness + separate batched SWA kernels | — |
 | [`18-bit-parity-harness-findings.md`](18-bit-parity-harness-findings.md) | Bit-parity harness built; pre-existing batched-path RoPE-Q bug found and fixed (in-place RWW → out-of-place); all 42 layers BIT-IDENTICAL | `Hesper/Models/Gemma4.lean` |
 | [`19-phase3-correctness-plan.md`](19-phase3-correctness-plan.md) | Phase 3 plan: locate the remaining "ucucuc." bug (not in attention).  KV-cache-vs-llama.cpp diff + PLE stage dumps. | — |
+| [`20-phase3-root-finding.md`](20-phase3-root-finding.md) | **Root finding**: the bug is NOT multi-token — hesper's whole 42-layer transformer is a near-identity.  Every single-token prompt produces itself repeated. | — |
+| [`21-development-flow.md`](21-development-flow.md) | **Development flow**: llama.cpp-first, golden-value-driven.  Lessons from the 6-hour "fast at being wrong" detour. | `llama.cpp/common/debug.cpp:161` HESPER PATCH |
 
 ## Measurement artefacts
 
