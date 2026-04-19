@@ -7,17 +7,18 @@ import Hesper.Layers.Linear
 /-!
 # Common helpers for Gemma4 golden-unit tests
 
-All kernel unit tests share these helpers:
-- Load f32 binary dumps (produced by llama.cpp's eval-callback).
-- Extract weight tensors from the GGUF file.
-- Compute relative L2 diff between actual and expected f32 buffers.
+Design notes (memory-conscious):
+- The GGUF file (2.7 GB) and CUDAContext are loaded **once** in
+  `Main.lean` and passed to every test as arguments.  Tests must
+  not re-load them.
+- Every GPU buffer allocated inside a test must be released via
+  `GPUBackend.freeBuffer` before returning.  We provide
+  `withTempBuf` / `withTempLinearLayer` helpers that free on exit.
 
 Conventions:
 - Inputs in `/tmp/llama_dump/<name>.bin` (populated by
   `llama-eval-callback -p "Hello world how are you"`).
-- Tests compare against the **last token's slice** (position 4 in
-  our 5-token prompt) because llama.cpp's `inp_out_ids` optimization
-  prunes intermediate positions from most dumps.
+- Tests compare against the **last token's slice** of each dump.
 -/
 
 namespace Hesper.Tests.GoldenUnit.Common
@@ -84,7 +85,7 @@ def relDiff (a b : Array Float) : Float := Id.run do
   let den := denSq.sqrt
   if den < 1e-30 then num else num / den
 
-/-- Parse GGUF once and return the file structure. -/
+/-- Parse GGUF once (call in Main). -/
 def loadGGUF : IO Hesper.GGUF.GGUFFile := do
   let bytes ← Hesper.CUDA.readFileFast ggufPath
   match Hesper.GGUF.Parser.parseGGUF bytes with
@@ -95,7 +96,7 @@ def loadGGUF : IO Hesper.GGUF.GGUFFile := do
 def extractF32 (gguf : Hesper.GGUF.GGUFFile) (name : String) : IO ByteArray :=
   Hesper.GGUF.Loader.extractFloat32Tensor gguf name
 
-/-- Upload a ByteArray to a new GPU buffer. -/
+/-- Upload a ByteArray to a new GPU buffer.  Caller MUST free. -/
 def uploadBuffer [GPUBackend β] (ctx : β) (data : ByteArray) : IO (GPUBackend.Buf β) := do
   let bufSize := if data.size == 0 then 4 else data.size
   let buf ← GPUBackend.allocBuffer ctx bufSize.toUSize
@@ -103,8 +104,26 @@ def uploadBuffer [GPUBackend β] (ctx : β) (data : ByteArray) : IO (GPUBackend.
     GPUBackend.writeBuffer ctx buf data
   return buf
 
-/-- Load a quantized linear layer from a GGUF tensor.  Mirrors
-    `Hesper.Models.Gemma4.loadLinear` (private there). -/
+/-- Run `action` with a fresh GPU buffer of `sizeBytes`, free on exit. -/
+def withTempBuf [GPUBackend β] (ctx : β) (sizeBytes : Nat)
+    (action : GPUBackend.Buf β → IO α) : IO α := do
+  let buf ← GPUBackend.allocBuffer ctx sizeBytes.toUSize
+  try
+    action buf
+  finally
+    GPUBackend.freeBuffer ctx buf
+
+/-- Run `action` with a fresh GPU buffer initialised from `data`, free on exit. -/
+def withTempBufFromBytes [GPUBackend β] (ctx : β) (data : ByteArray)
+    (action : GPUBackend.Buf β → IO α) : IO α := do
+  let buf ← uploadBuffer ctx data
+  try
+    action buf
+  finally
+    GPUBackend.freeBuffer ctx buf
+
+/-- Load a quantized linear layer from a GGUF tensor.  Caller MUST free
+    the returned layer's `weightBuf` via `freeLinearLayer`. -/
 def loadLinear [GPUBackend β] (ctx : β) (gguf : Hesper.GGUF.GGUFFile)
     (name : String) (inDim outDim : Nat)
     : IO (Hesper.Layers.Linear.LinearLayer (GPUBackend.Buf β) (GPUBackend.CachedDispatch β)) := do
@@ -141,5 +160,29 @@ def loadLinear [GPUBackend β] (ctx : β) (gguf : Hesper.GGUF.GGUFFile)
     dp4aBatchQuantizePrepared
     dp4aBatchMatmulPrepared
   }
+
+/-- Free all GPU buffers held by a LinearLayer (weightBuf + lazily-
+    allocated splitK / dp4a Q8 scratch). -/
+def freeLinearLayer [GPUBackend β] (ctx : β)
+    (layer : Hesper.Layers.Linear.LinearLayer (GPUBackend.Buf β) (GPUBackend.CachedDispatch β))
+    : IO Unit := do
+  GPUBackend.freeBuffer ctx layer.weightBuf
+  match ← layer.splitKBuf.get with
+  | some b => GPUBackend.freeBuffer ctx b
+  | none => pure ()
+  match ← layer.dp4aQ8Buf.get with
+  | some b => GPUBackend.freeBuffer ctx b
+  | none => pure ()
+
+/-- Run `action` with a freshly loaded LinearLayer, free on exit. -/
+def withLinearLayer [GPUBackend β] (ctx : β) (gguf : Hesper.GGUF.GGUFFile)
+    (name : String) (inDim outDim : Nat)
+    (action : Hesper.Layers.Linear.LinearLayer (GPUBackend.Buf β) (GPUBackend.CachedDispatch β) → IO α)
+    : IO α := do
+  let layer ← loadLinear ctx gguf name inDim outDim
+  try
+    action layer
+  finally
+    freeLinearLayer ctx layer
 
 end Hesper.Tests.GoldenUnit.Common
