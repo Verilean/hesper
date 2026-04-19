@@ -1,5 +1,6 @@
 import LSpec
 import Tests.GoldenUnit.RMSNorm
+import Tests.GoldenUnit.Linear
 
 /-!
 # Gemma4 unit-test runner
@@ -10,4 +11,5 @@ unit test.  Add new test modules here.
 
 unsafe def main : IO UInt32 := do
   let g1 ← Hesper.Tests.GoldenUnit.RMSNorm.allTests
-  LSpec.lspecIO (.ofList g1) ([] : List String)
+  let g2 ← Hesper.Tests.GoldenUnit.Linear.allTests
+  LSpec.lspecIO (.ofList (g1 ++ g2)) ([] : List String)
