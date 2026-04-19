@@ -96,6 +96,69 @@ a *second* time with the same InferenceState and an incremented
 - trips a PTX cache key reuse between different call sites that
   happen to hash the same way.
 
+## 2026-04-20 continued: bug reproduced in minimal setting
+
+With `HESPER_BATCH_PREFILL_FORCE=1 HESPER_UNIFIED_DECODE=1` for a
+single-char prompt ("H") — wrapped by HESPER_CHAT into 11 tokens —
+both prefill and decode use `forwardPrefillBatch`.  Result:
+
+  [decode] genCount=0 nextToken=236777  'I'      ← first call, correct
+  [decode] genCount=1 nextToken=106    '<turn|>' ← second call, wrong
+  [Result] Decoded: I<turn|>
+
+So the bug is:
+
+  **The second call to `forwardPrefillBatch` on the same
+  InferenceState produces wrong logits, independent of whether the
+  first call was for N=11 or N=1.**
+
+This is NOT specific to startPos vs 0 — it triggers as soon as
+forwardPrefillBatch runs twice in a row on shared state.
+
+## Root-cause candidates (ranked by likelihood)
+
+(a) **Some `state.xxx` buffer is written in a way that's only correct
+    on first call**.  The most likely suspects (shared between prefill
+    tail and decode input preparation):
+    - `state.plModelProj`, `state.plInputAll`, `state.plTokenSelected`
+      — re-used per-token inside the batched PLE precompute loop
+    - `state.buf1`, `state.buf2` — used by the last-token extract +
+      final norm + lm_head tail
+    - `state.tokenBuf` — used by both embedding lookup paths
+    - `state.paramsBuf` — both paths write offset 0; single-token also
+      writes offset 4 (cacheLen) that batched path doesn't clear.
+
+(b) **Cached dispatch buffer-pointer pinning**: the CUDA backend's
+    `executeWithConfigCached` resolves `args` fresh on every call
+    (line 191 in `Hesper/Backend/CUDA.lean`), so buffer pointers
+    changing between calls should be fine.  Confirmed NOT the cause.
+
+(c) **Two caches colliding**: `kcr.getRef key` is a single shared map
+    with `hash("gemma4_prefill_ce", name, config…)` as key.  If
+    another call site (e.g. forwardBlock inside the ce) creates a
+    different ref using the same key, cached refs could be wired to
+    the wrong compiled dispatch.  Worth grepping for collisions.
+
+(d) **KV cache corruption**: first call's RoPE-K+KV-write targets
+    slot `startPos`.  If the write went to the wrong slot (e.g.
+    scattered across multiple slots), the second call reads garbage
+    from slot 18 via attention.  BUT: we verified KV cache write was
+    correct in the unit tests, and the first call's *output* is
+    correct.  If the KV write were wrong, the first call's lm_head
+    logit would be wrong too.  Probably not the cause.
+
+## Minimal next debug step
+
+Dump `state.paramsBuf`, `state.buf1`, `state.buf2` at the *start* of
+the second call and compare against their values at the *start* of
+the first call.  The first difference localises the corruption.
+
+Better still: compare the **intermediate tensors** (attn_out-0,
+ffn_out-0, ..., result_norm) between call 1 and call 2.  Since the
+input to call 2 is structurally the same as call 1 (one token, just
+at different startPos), seeing which layer first diverges from its
+expected value would pinpoint the corruption.
+
 ## Recommendation for next iteration
 
 - **Move batch-buffer allocation to state**: add
