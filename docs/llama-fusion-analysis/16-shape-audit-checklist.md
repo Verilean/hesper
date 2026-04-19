@@ -17,15 +17,18 @@ kernels block unifying `forwardSingleToken` with `forwardPrefillBatch`.
 | **1. Batched RMSNorm+residual** (post-attn + post-FFN) | ✅ done | `848c14f` | −2268 dispatches, prefill 290 → 250 ms |
 | **2a. Bit-parity harness + RoPE-Q in-place RWW fix** | ✅ done | `4678951`, `c92e377` | Fixed the batched-vs-fallback Qroped divergence (was in-place RWW bug in `ropeWithFreqFactorsBatchKernel`); all 42 layers now BIT-IDENTICAL. |
 | **2b. Unify SWA layers via 1.0-freq_factors** | ✅ done | `caa5c7d`, `04a5ef2` | After 2a unblocked, SWA layers now take the batched fast path by default.  Prefill 236 → 220 ms (−7%). 24/42 layers batched (was 4/42).  |
-| **2c. Unify shared-KV layers** | ⏳ pending | — | 18/42 layers still on fallback.  Need Q-only batched norm kernel + FA against earlier-layer KV cache. |
+| **2c. Unify shared-KV layers** | ✅ done | `4e70a71` | Added `perHeadRMSNormBatchKernel` + shared-KV match arm.  All 42 layers now batched; fallback is dead code.  Prefill 220 → 216 ms. |
 | **3. Batched PLE inner loop** | ✅ done | `1f85284` | −2150 dispatches, prefill 247 → 213 ms |
 | 4. Drop `columnExtract` / `columnInsert` around batched paths | ⏳ partial | in items 1 & 3 | Deleted from post-attn/post-FFN + PLE.  Still present in per-token attn fallback (item 2). |
 | 5. Pass pos/cacheLen arrays directly (skip `copyU32Kernel`) | ⏳ pending | — | Blocked on item 2 (only per-token loop needs this). |
 | 6. Fuse layer output scale into preceding matmul | ⏳ pending | — | Independent; easy once items 1-3 stabilize. |
 
-**Net so far**: −4418 dispatches/prefill, wall time 290 → 213 ms (−27 %).
-Remaining structural item (2) is the biggest single lever — ≈ −3780
-additional dispatches — but also the riskiest. 
+**Net so far**: −4418 dispatches/prefill, wall time 290 → 216 ms (−26 %).
+All 42 layers now take the batched attention path (was 4/42).  Direct
+A/B: default 216 ms vs `HESPER_FORCE_FALLBACK=1` 233 ms → 7% faster
+on seqLen=9, scales with seqLen on longer prompts.  Multi-token
+correctness still broken ("ucucuc.") — a different root cause than
+the attention math (see doc 18 § "Correctness diagnostic"). 
 
 ## Current state (2026-04-19, post-`1f85284`)
 
