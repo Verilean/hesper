@@ -227,28 +227,71 @@ demand per-kernel unit tests first.
 
 ### Writing a unit test (LSpec + CUDA)
 
-Template (new tests go in `Tests/golden-unit/`):
+**Single-exe policy**: *all* unit tests are bundled into one LSpec
+exe `gemma4-unit-tests` to avoid per-kernel lakefile entries.
+Tests are organised as LSpec groups:
 
 ```
-import LSpec
-import Hesper.CUDA.FFI
-import Hesper.GGUF.Parser
-import Hesper.Layers.RMSNorm
--- ... whatever the kernel under test needs
+Tests/golden-unit/
+  Common.lean        — helpers: loadF32Bin, relDiff, GGUF weight extract
+  RMSNorm.lean       — attn_norm, ffn_norm, post_attn_norm, post_ffn_norm
+  Linear.lean        — wQ/wK/wV/wO, ffn gate/up/down (Q4_K)
+  Attention.lean     — perHeadRMSNorm (q/k/v), RoPE, FlashAttention
+  PLE.lean           — inpGate, geluGateMulSlice, proj
+  All.lean           — aggregator: List (String × List TestSeq)
+  Main.lean          — `lake exe gemma4-unit-tests` entry
+```
 
-unsafe def main : IO UInt32 := do
-  let ctx ← Hesper.CUDA.CUDAContext.init
-  let input  ← Hesper.GGUF.Loader.loadRawFloat32 "/tmp/llama_dump/inp_scaled.bin" dim
-  let weight ← extractFromGGUF "blk.0.attn_norm.weight"
-  let expected ← Hesper.GGUF.Loader.loadRawFloat32 "/tmp/llama_dump/attn_norm-0.bin" dim
-  let actual ← runOnGPU ctx (RMSNorm.forward weight) input
+Each test module exports `allTests : IO (List (String × List TestSeq))`
+following the pattern of `Tests/BufferTests.lean`.  `Main.lean`
+concatenates them and runs `LSpec.lspecIO`.
+
+**Temporary files**: any scratch artefacts that a test creates must
+be prefixed `tmp_` (e.g. `/tmp/hesper_unit_tmp_rmsnorm.bin`) so they
+are obviously disposable.  The per-run llama.cpp golden dumps under
+`/tmp/llama_dump/` are *inputs* — tests read them but don't
+recreate them.
+
+Test template (per-kernel, inside one of the modules above):
+
+```
+def testRMSNormAttnL0 : IO TestSeq := do
+  let ctx ← CUDAContext.init
+  let input  ← loadF32Bin "/tmp/llama_dump/inp_scaled.bin" (dim := 2560) (lastToken := true)
+  let weight ← extractF32FromGGUF "data/gemma-4-e4b-it-Q4_K_M.gguf"
+                  "blk.0.attn_norm.weight"
+  let expected ← loadF32Bin "/tmp/llama_dump/attn_norm-0.bin" (dim := 2560)
+                  (lastToken := true)
+  let actual ← runRMSNormOnGPU ctx weight input
   let rel := relDiff actual expected
-  LSpec.check "RMSNorm(attn_norm) L0 last-token" (rel < 1e-5)
-  -- ...
+  pure $ test s!"RMSNorm(attn_norm) L0 last-token, rel={rel}" (rel < 1e-5)
 ```
 
-Each kernel gets one exe in `lakefile.lean`:
-`lean_exe unit-rmsnorm-l0 where root := ...`
+`allTests` per module:
+
+```
+def allTests : IO (List (String × List TestSeq)) := do
+  let t1 ← testRMSNormAttnL0
+  let t2 ← testRMSNormFfnL0
+  ...
+  pure [ ("RMSNorm attn L0", [t1]), ("RMSNorm ffn L0", [t2]), ... ]
+```
+
+`Main.lean`:
+
+```
+def main : IO UInt32 := do
+  let g1 ← RMSNorm.allTests
+  let g2 ← Linear.allTests
+  let g3 ← Attention.allTests
+  let g4 ← PLE.allTests
+  LSpec.lspecIO (.ofList (g1 ++ g2 ++ g3 ++ g4)) ([] : List String)
+```
+
+**Prerequisite**: `/tmp/llama_dump/` must be populated by
+`scripts/run_golden_dump.sh` (or manually via
+`llama-eval-callback -p "Hello world how are you" -n 1`).  The test
+fails with a clear error if any dump is missing.
 
 ### Kernels that currently need unit tests (prefill-batched path)
 
