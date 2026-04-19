@@ -3577,6 +3577,10 @@ def forwardPrefillBatch [GPUBackend β] (ctx : β)
     (columnExtractKernel dim seqLen)
     [("batch", currentBuf), ("params", colIdxBuf), ("out", state.buf2)]
     (.dispatch1D dim)
+  -- Debug: dump state.buf2 (the extracted last-column hidden state that
+  -- feeds finalNorm + lm_head).  Compare against single-token path
+  -- which writes to state.buf2 via its own column-extract for prefill.
+  dumpGolden s!"prefill_buf2_lastcol_seqLen{seqLen}" state.buf2 dim
 
   -- LM head.
   --
