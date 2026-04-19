@@ -3080,6 +3080,10 @@ def forwardPrefillBatch [GPUBackend β] (ctx : β)
         dumpStage s!"Qnormed_L{li}" batchQBuf (qDim * seqLen) stageActive
         dumpStage s!"Knormed_L{li}" batchKBuf (kvDim * seqLen) stageActive
         dumpStage s!"Vnormed_L{li}" batchVBuf (kvDim * seqLen) stageActive
+        -- DEBUG: golden-dump pre-RoPE Q/K/V (matches llama.cpp's Qcur_normed / Kcur_normed / Vcur_normed)
+        dumpGolden s!"Qcur_normed-{li}" batchQBuf (qDim * seqLen)
+        dumpGolden s!"Kcur_normed-{li}" batchKBuf (kvDim * seqLen)
+        dumpGolden s!"Vcur_normed-{li}" batchVBuf (kvDim * seqLen)
 
         -- Batched RoPE-Q (NOT in place — write to a dedicated scratch to
         -- avoid any read-modify-write hazard on the shared Q buffer).
