@@ -247,3 +247,59 @@ Focus on the L3→L4 discontinuity.  Hypotheses to check:
 Collect evidence by dumping `Qcur_pos`, `Kcur_pos` (post-RoPE) and
 `__fattn__` (attention output pre-Oproj) at L3 and L4, then diff.
 Use whichever amplifies first as the next lead.
+
+## 2026-04-19 update 4 — full attention-chain trace
+
+Added `Qcur_pos-<li>` and `__fattn__-<li>` dumps at the batched
+attention code path.  With correct last-token slicing (using the
+actual per-tensor dims: qDim = numHeads × headDim(li), kvDim =
+numKVHeads × headDim(li)):
+
+```
+L | Qcur  | Kcur  | Vcur  | Qcur_pos | __fattn__ | attn_out | l_out
+0 | 0.94% | 0.71% | 1.28% |  22.87%  |   8.70%   |   3.56%  |  4.44%
+1 | 3.26% | 2.78% | 5.00% |  23.99%  |  13.40%   |   2.29%  |  4.28%
+2 |17.85% |12.47% |24.13% |  28.06%  |  31.42%   |   5.09%  | 10.50%
+3 |20.45% |11.66% |29.45% |  28.83%  |  29.11%   |   9.92%  | 14.17%
+4 |20.66% |14.66% |47.70% |  28.43%  |  50.58%   |  14.92%  | 54.47%
+5 |89.98% |70.18% |88.56% |  93.57%  |  77.89%   |  59.17%  | 61.67%
+```
+
+Key observations:
+
+- **Qcur_pos and __fattn__ rel diffs are suspicious (22%+ at L0)
+  but likely spurious layout mismatches.**  llama.cpp's
+  `Qcur_pos` is in `[headDim, seqLen, numHeads]` (post-permute)
+  while hesper's `batchQRopedBuf` is `[seqLen, numHeads, headDim]`.
+  Same bytes, different interpretation → diff is meaningless.
+  Same for `__fattn__` (post-FA is permuted in llama.cpp).
+- **Load-bearing numbers**: `Qcur`, `Kcur`, `Vcur` (pre-norm,
+  pre-permute) and `attn_out` (post-Oproj, back to [dim, tokens]).
+  These have matching layouts.
+- **Q4_K quant noise grows cleanly L0→L3**: Qcur 0.9% → 20%
+  (expected 0.5–1.5% per matmul × accumulation).
+- **L4 Vcur jumps 29.45% → 47.70%** while Qcur/Kcur do not.  That
+  asymmetry is suspicious.
+- **L4→L5 head-dim change**: Gemma 4 uses headDim=256 for SWA
+  layers (L0-L4) and headDim=512 for full-attn layers (L5+).
+  Hesper's code handles this correctly (Config.headDim branches
+  on layer type, file sizes match: L0 qDim=2048, L5 qDim=4096).
+
+- **L3→L4 FFN amplification is the real bug**: attn_out-3 is
+  9.92% → l_out-3 14.17% (1.4× amp, normal), but attn_out-4 is
+  14.92% → l_out-4 54.47% (**3.6× amp**, abnormal).  The per-layer
+  FFN kernels are identical between L3 and L4 — only the layer
+  weights differ.  Either L4's FFN weights have extreme
+  distribution (rare) or the PLE (per-layer embedding) at L4
+  introduces the jump.
+
+Sanity restored: `inp_scaled` matches 0.0000% bit-exact.
+
+## 2026-04-19 update 5 — f64 reference: RMSNorm is not a bug
+
+With proper last-token slicing, f64 reference RMSNorm on hesper's
+`attn_out-1` produces output matching hesper's `ffn_norm-1`
+bit-exactly.  The 10.36% rel diff from llama.cpp's `ffn_norm-1` is
+the "error floor" — any correct RMSNorm on hesper's input would
+produce this much diff, because ffn_norm weights span
+`[-9.5, 184]` and amplify directionally.  **RMSNorm is exonerated.**
