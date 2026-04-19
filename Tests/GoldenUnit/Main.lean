@@ -8,6 +8,7 @@ import Tests.GoldenUnit.Attention
 import Tests.GoldenUnit.RoPE
 import Tests.GoldenUnit.KVCacheWrite
 import Tests.GoldenUnit.FlashAttention
+import Tests.GoldenUnit.Oproj
 
 /-!
 # Gemma4 unit-test runner
@@ -32,4 +33,5 @@ unsafe def main : IO UInt32 := do
   let g4 ← Hesper.Tests.GoldenUnit.RoPE.allTests ctx gguf
   let g5 ← Hesper.Tests.GoldenUnit.KVCacheWrite.allTests ctx gguf
   let g6 ← Hesper.Tests.GoldenUnit.FlashAttention.allTests ctx gguf
-  LSpec.lspecIO (.ofList (g1 ++ g2 ++ g3 ++ g4 ++ g5 ++ g6)) ([] : List String)
+  let g7 ← Hesper.Tests.GoldenUnit.Oproj.allTests ctx gguf
+  LSpec.lspecIO (.ofList (g1 ++ g2 ++ g3 ++ g4 ++ g5 ++ g6 ++ g7)) ([] : List String)
