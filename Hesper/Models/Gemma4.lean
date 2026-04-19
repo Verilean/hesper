@@ -2652,6 +2652,7 @@ def forwardPrefillBatch [GPUBackend β] (ctx : β)
   let maxQDim := cfg.numAttentionHeads * maxHeadDim
   let maxKVDim := (max cfg.numKeyValueHeadsFull cfg.numKeyValueHeadsSWA) * maxHeadDim
   let batchQBuf ← mkBuf (maxQDim * seqLen)
+  let batchQRopedBuf ← mkBuf (maxQDim * seqLen)
   let batchKBuf ← mkBuf (maxKVDim * seqLen)
   let batchVBuf ← mkBuf (maxKVDim * seqLen)
   let batchAttnOutBuf ← mkBuf (maxQDim * seqLen)
@@ -2955,13 +2956,14 @@ def forwardPrefillBatch [GPUBackend β] (ctx : β)
         dumpStage s!"Knormed_L{li}" batchKBuf (kvDim * seqLen) stageActive
         dumpStage s!"Vnormed_L{li}" batchVBuf (kvDim * seqLen) stageActive
 
-        -- Batched RoPE-Q (in place).
-        ce s!"ropeFreqQBatch_{headDim}"
+        -- Batched RoPE-Q (NOT in place — write to a dedicated scratch to
+        -- avoid any read-modify-write hazard on the shared Q buffer).
+        ce s!"ropeFreqQBatchOut_{headDim}"
           (ropeWithFreqFactorsBatchKernel headDim numHeads seqLen cfg.ropeTheta)
-          [("input", batchQBuf), ("output", batchQBuf),
+          [("input", batchQBuf), ("output", batchQRopedBuf),
            ("params", state.paramsBuf), ("freq_factors", freqFactors)]
           (.dispatch1D (numHeads * headDim / 2 * seqLen))
-        dumpStage s!"Qroped_L{li}" batchQBuf (qDim * seqLen) stageActive
+        dumpStage s!"Qroped_L{li}" batchQRopedBuf (qDim * seqLen) stageActive
 
         -- Batched RoPE-K + KV cache write.
         ce s!"ropeKKvWBatch_{headDim}_{numKVHeads}"
@@ -2982,7 +2984,7 @@ def forwardPrefillBatch [GPUBackend β] (ctx : β)
         let scale : Float := 1.0
         ce s!"flashAttnBatch_{headDim}_{numKVHeads}"
           (FlashAttention.flashAttentionBatchKernel numHeads numKVHeads cfg.maxSeqLen headDim seqLen scale)
-          [("q", batchQBuf), ("k_cache", kvCache.kBuf), ("v_cache", kvCache.vBuf),
+          [("q", batchQRopedBuf), ("k_cache", kvCache.kBuf), ("v_cache", kvCache.vBuf),
            ("output", batchAttnOutBuf), ("params", state.paramsBuf)]
           ({ numWorkgroups := (numHeads, seqLen, 1) : Hesper.ExecConfig })
         dumpStage s!"attnOut_L{li}" batchAttnOutBuf (qDim * seqLen) stageActive
@@ -3406,6 +3408,7 @@ def forwardPrefillBatch [GPUBackend β] (ctx : β)
   GPUBackend.freeBuffer ctx batchBuf2
   GPUBackend.freeBuffer ctx batchNormedBuf
   GPUBackend.freeBuffer ctx batchQBuf
+  GPUBackend.freeBuffer ctx batchQRopedBuf
   GPUBackend.freeBuffer ctx batchKBuf
   GPUBackend.freeBuffer ctx batchVBuf
   GPUBackend.freeBuffer ctx batchAttnOutBuf
