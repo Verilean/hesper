@@ -3025,12 +3025,11 @@ def forwardPrefillBatch [GPUBackend β] (ctx : β)
           [("input", state.qBuf), ("weight", block.attention.qNormWeight), ("output", state.qBuf2)]
           { numWorkgroups := (numHeads, 1, 1),
             workgroupSize := { x := wgSize, y := 1, z := 1 } : Hesper.ExecConfig }
-      -- Per-stage dumps: only fire for the target layer, at the LAST iter
-      -- (i = seqLen - 1) so Kcache/Vcache reflect all tokens written.
-      -- Qnormed/Vnormed/Qroped are single-token scratch buffers; dumping
-      -- at the last iter captures token (seqLen-1)'s values, letting us
-      -- compare against the batched path's last-column slice.
-      let stageActive := stageDumpLayer.any (· = li) && i = seqLen - 1
+      -- Per-stage dumps: fire once at a chosen iter (default = last).
+      -- HESPER_ATTN_STAGE_TOKEN picks which token i to dump (0..seqLen-1).
+      let targetTok := (← IO.getEnv "HESPER_ATTN_STAGE_TOKEN").bind String.toNat?
+        |>.getD (seqLen - 1)
+      let stageActive := stageDumpLayer.any (· = li) && i = targetTok
       dumpStage s!"Qnormed_L{li}" state.qBuf2 qDim stageActive
       if cfg.hasKV li then
         dumpStage s!"Knormed_L{li}" state.kBuf2 kvDim stageActive
