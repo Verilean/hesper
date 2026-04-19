@@ -460,4 +460,28 @@ def testRoundtrip (tokenizer : Tokenizer) (text : String) : IO Unit := do
   else
     IO.println "✗ Roundtrip mismatch"
 
+/-- Minimal Gemma 4 E4B chat template renderer.
+
+    Gemma 4 uses different chat tokens from Gemma 3:
+      `<|turn>` = token 105  (turn prefix)
+      `<turn|>` = token 106  (turn suffix)
+      `<|think|>` = token 98 (thinking)
+
+    Template (simplified from the Jinja in the GGUF — the full template
+    covers tools, images, audio, video, tool_responses which we don't
+    need here):
+
+      [<|think|>]                    ← if enableThinking
+      <turn|>\n                      ← system turn closer (always present
+                                       per the template's "prev_message"
+                                       logic when no explicit system msg)
+      <|turn>user\n<USER><turn|>\n   ← user turn
+      <|turn>model\n                 ← generation prompt
+
+    This matches the `add_generation_prompt=true` output of the GGUF's
+    Jinja template for a single user message. -/
+def renderGemma4Chat (userMsg : String) (enableThinking : Bool := false) : String :=
+  let thinkPrefix := if enableThinking then "<|think|>" else ""
+  s!"{thinkPrefix}<turn|>\n<|turn>user\n{userMsg}<turn|>\n<|turn>model\n"
+
 end Hesper.Tokenizer.SentencePiece
