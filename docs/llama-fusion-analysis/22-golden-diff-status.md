@@ -180,3 +180,70 @@ ffn_norm weights from GGUF to llama.cpp's (sanity check), then dump
 the pre-weight-multiply `norm-<li>` tensor from hesper and compare
 to llama.cpp's `norm-<li>` to localise the bug to either the
 reduction or the weight multiply.
+
+## 2026-04-19 update 3 — correct last-token slicing + RMSNorm exonerated
+
+**Methodology bug fixed.**  hesper dumps 5 tokens × 2560 floats
+per tensor; llama.cpp uses `inp_out_ids` to prune intermediate
+positions, so most tensors dump only the last token (2560 floats).
+Previous comparisons silently returned `None` on size mismatch and
+used wrong slices when they didn't, producing misleading numbers.
+
+Correct diff: always compare the last 2560 floats on both sides
+(the last-token slice, position 4 in a 5-token prompt).
+
+**Sanity: `inp_scaled` now matches at 0.0000% (bit-exact)** — the
+embedding + sqrt-scale is correct.
+
+**RMSNorm is mathematically correct.**  Reference f64 RMSNorm on
+hesper's `attn_out-1` input produces output that matches hesper's
+`ffn_norm-1` at **0.0000%**.  The 10.36% output diff vs llama.cpp
+is an unavoidable consequence of the 2.29% input diff combined
+with the highly skewed ffn_norm weight distribution (range
+`[-9.5, 184]`, median 6.78 — some dims amplify by 184×).
+
+Per-stage last-token rel diffs (HESPER_DP4A=1, 5-token prompt):
+
+```
+L0: Qcur 0.85%, Kcur 0.68%, Vcur 1.27%, attn_out 3.56%,
+    ffn_norm 5.03%, ffn_gate 4.09%, ffn_up 4.87%,
+    ffn_out 4.93%, l_out 4.44%
+L1: Qcur 3.20%, attn_out 2.29%, ffn_norm 10.36%, l_out 4.28%
+L2: attn_out 5.10%, l_out 10.50%
+L3: attn_out 9.93%, l_out 14.18%
+L4: attn_out 14.94%, l_out 54.38%  ← jump
+L5: attn_out 59.10%, l_out 61.61%  ← stabilises
+L20: attn_out 120%, l_out 110%
+L40: attn_out 74%, l_out 74%
+```
+
+**Interpretation**:
+
+1. Q4_K matmul noise is ~0.5–1.5% per projection (Q/K/V at L0).
+2. Attention + Oproj doubles the accumulated error (to ~3–4%).
+3. RMSNorm doesn't introduce error, but amplifies the input error
+   via the high-weight-variance multiply (well-behaved math).
+4. Residual adds dilute error — that's why `l_out` is smaller
+   than `ffn_out` at each layer.
+5. **L3→L4 has a 4× jump (14% → 54%)** that doesn't fit the
+   gradual Q4_K noise model.  This is the one genuine anomaly.
+   It does NOT correspond to a known Gemma 4 architecture
+   boundary (full-attn→SWA is at L7; shared-KV starts at L24).
+
+## Next step (revised again)
+
+Focus on the L3→L4 discontinuity.  Hypotheses to check:
+
+- **FlashAttention split-K threshold**: some per-head code path
+  engages only beyond a certain prompt length or head-dim × seqLen,
+  and L4 happens to be where SWA window starts needing it.
+- **Q4_K matmul kernel selection**: `Linear.forwardBatchDP4A`
+  dispatches different kernels based on `outDim` or shape; maybe
+  L4 hits a different kernel variant with a bug.
+- **Per-layer RoPE freq_factors**: L4 is near where RoPE period
+  crosses the sliding-window boundary; any off-by-one indexing
+  error in hesper's batched RoPE-Q/K would surface here.
+
+Collect evidence by dumping `Qcur_pos`, `Kcur_pos` (post-RoPE) and
+`__fattn__` (attention output pre-Oproj) at L3 and L4, then diff.
+Use whichever amplifies first as the next lead.
