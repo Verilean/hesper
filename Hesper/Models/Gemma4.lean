@@ -3074,6 +3074,8 @@ def forwardPrefillBatch [GPUBackend β] (ctx : β)
            ("params", state.paramsBuf), ("freq_factors", freqFactors)]
           (.dispatch1D (numHeads * headDim / 2 * seqLen))
         dumpStage s!"Qroped_L{li}" batchQRopedBuf (qDim * seqLen) stageActive
+        -- Golden dump: post-RoPE Q (matches llama.cpp's `Qcur_pos-<li>`).
+        dumpGolden s!"Qcur_pos-{li}" batchQRopedBuf (qDim * seqLen)
 
         -- Batched RoPE-K + KV cache write.
         ce s!"ropeKKvWBatch_{headDim}_{numKVHeads}"
@@ -3098,6 +3100,8 @@ def forwardPrefillBatch [GPUBackend β] (ctx : β)
            ("output", batchAttnOutBuf), ("params", state.paramsBuf)]
           ({ numWorkgroups := (numHeads, seqLen, 1) : Hesper.ExecConfig })
         dumpStage s!"attnOut_L{li}" batchAttnOutBuf (qDim * seqLen) stageActive
+        -- Golden dump: FlashAttention output pre-Oproj (llama.cpp's `__fattn__-<li>`).
+        dumpGolden s!"__fattn__-{li}" batchAttnOutBuf (qDim * seqLen)
       | some freqFactors, false =>
         -- Shared-KV batched path: only Q is computed this layer; K/V
         -- come from an earlier layer's cache at kvLi = cfg.kvCacheLayer li.
@@ -3122,6 +3126,8 @@ def forwardPrefillBatch [GPUBackend β] (ctx : β)
            ("params", state.paramsBuf), ("freq_factors", freqFactors)]
           (.dispatch1D (numHeads * headDim / 2 * seqLen))
         dumpStage s!"Qroped_L{li}" batchQRopedBuf (qDim * seqLen) stageActive
+        -- Golden dump: post-RoPE Q (matches llama.cpp's `Qcur_pos-<li>`).
+        dumpGolden s!"Qcur_pos-{li}" batchQRopedBuf (qDim * seqLen)
         -- No K/V writes — cache was populated by the layer at kvLi.
         -- Batched FA.
         let scale : Float := 1.0
@@ -3131,6 +3137,8 @@ def forwardPrefillBatch [GPUBackend β] (ctx : β)
            ("output", batchAttnOutBuf), ("params", state.paramsBuf)]
           ({ numWorkgroups := (numHeads, seqLen, 1) : Hesper.ExecConfig })
         dumpStage s!"attnOut_L{li}" batchAttnOutBuf (qDim * seqLen) stageActive
+        -- Golden dump: FlashAttention output pre-Oproj (llama.cpp's `__fattn__-<li>`).
+        dumpGolden s!"__fattn__-{li}" batchAttnOutBuf (qDim * seqLen)
       | none, _ => pure ()
 
     if !handledByBatched then
