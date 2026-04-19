@@ -2,6 +2,7 @@ import Hesper.CUDA.FFI
 import Hesper.Backend.CUDA
 import Hesper.GGUF.Parser
 import Hesper.GGUF.Loader
+import Hesper.Layers.Linear
 
 /-!
 # Common helpers for Gemma4 golden-unit tests
@@ -93,5 +94,52 @@ def loadGGUF : IO Hesper.GGUF.GGUFFile := do
 /-- Extract a named float32 tensor from a parsed GGUF. -/
 def extractF32 (gguf : Hesper.GGUF.GGUFFile) (name : String) : IO ByteArray :=
   Hesper.GGUF.Loader.extractFloat32Tensor gguf name
+
+/-- Upload a ByteArray to a new GPU buffer. -/
+def uploadBuffer [GPUBackend β] (ctx : β) (data : ByteArray) : IO (GPUBackend.Buf β) := do
+  let bufSize := if data.size == 0 then 4 else data.size
+  let buf ← GPUBackend.allocBuffer ctx bufSize.toUSize
+  if data.size > 0 then
+    GPUBackend.writeBuffer ctx buf data
+  return buf
+
+/-- Load a quantized linear layer from a GGUF tensor.  Mirrors
+    `Hesper.Models.Gemma4.loadLinear` (private there). -/
+def loadLinear [GPUBackend β] (ctx : β) (gguf : Hesper.GGUF.GGUFFile)
+    (name : String) (inDim outDim : Nat)
+    : IO (Hesper.Layers.Linear.LinearLayer (GPUBackend.Buf β) (GPUBackend.CachedDispatch β)) := do
+  let tensorInfo ← match Hesper.GGUF.Loader.findTensor gguf name with
+    | .ok ti => pure ti
+    | .error e => throw (IO.userError e)
+  let quantFormat : Hesper.Layers.Linear.QuantFormat := match tensorInfo.ggmlType with
+    | .Q6_K => .Q6_K
+    | _ => .Q4_K
+  let (_, data) ← match Hesper.GGUF.Loader.getTensorData gguf name with
+    | .ok r => pure r
+    | .error e => throw (IO.userError e)
+  let weightBuf ← uploadBuffer ctx data
+  let prepared ← GPUBackend.newCacheRef (β := β)
+  let splitKBuf ← IO.mkRef none
+  let splitKPartialPrepared ← GPUBackend.newCacheRef (β := β)
+  let splitKReducePrepared ← GPUBackend.newCacheRef (β := β)
+  let dp4aQ8Buf ← IO.mkRef none
+  let dp4aQuantizePrepared ← GPUBackend.newCacheRef (β := β)
+  let dp4aMatmulPrepared ← GPUBackend.newCacheRef (β := β)
+  let dp4aBatchQuantizePrepared ← GPUBackend.newCacheRef (β := β)
+  let dp4aBatchMatmulPrepared ← GPUBackend.newCacheRef (β := β)
+  return {
+    config := { inDim, outDim }
+    weightBuf
+    quantFormat
+    prepared
+    splitKBuf
+    splitKPartialPrepared
+    splitKReducePrepared
+    dp4aQ8Buf
+    dp4aQuantizePrepared
+    dp4aMatmulPrepared
+    dp4aBatchQuantizePrepared
+    dp4aBatchMatmulPrepared
+  }
 
 end Hesper.Tests.GoldenUnit.Common
