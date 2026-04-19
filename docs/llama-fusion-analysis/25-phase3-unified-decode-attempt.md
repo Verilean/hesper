@@ -96,6 +96,61 @@ a *second* time with the same InferenceState and an incremented
 - trips a PTX cache key reuse between different call sites that
   happen to hash the same way.
 
+## 2026-04-20 even narrower: bug lives AFTER `l_out-41`
+
+Dumped `l_out-<li>` (every layer block output) under both paths with
+`HESPER_GOLDEN_DUMP_DIR`.  Compared per-layer L2 magnitudes between
+single-path (prefill last column, i.e. token 17 = "?") and unified
+(decode step 1 col 0, i.e. token 18 = "The"):
+
+  layer   single L2   unified L2   ratio
+      0     48.12       55.16      1.15
+      5    106.33      122.63      1.15
+     17     95.38       83.81      0.88
+     30    129.07      129.01      1.00
+     40    104.45       96.24      0.92
+     41     54.05       49.29      0.91
+
+All layer outputs are within ~10% of each other (NOT halved).
+
+BUT final logits:
+  Prefill (single)  logits L2 = 4710
+  Decode  (unified) logits L2 = 2534
+  Ratio = 0.54  (≈ half)
+
+**So the magnitude halving happens AFTER `l_out-41`, i.e. inside the
+final norm + lm_head + softcap chain.**
+
+Path is identical between the two in principle:
+  1. columnExtract(currentBuf, col=seqLen-1) → state.buf2
+  2. fusedRMSNormQ8_1Kernel (finalNorm + Q8_1 quant)
+  3. fusedQ6KLinearDP4A4RowKernel (Q6_K lm_head)
+  4. (single path only) logitSoftcapKernel
+
+Note: the single-path dump includes the softcap step (it runs in
+forwardSingleToken via generate()'s post-hook dump), but `forwardPrefillBatch`
+does NOT apply softcap.  With tanh-based softcap and values up to ~21,
+softcap COMPRESSES magnitudes (y = 30*tanh(x/30), for |x|=21 this is
+≈20.1, only 5% smaller).  Softcap would make `single` logits smaller
+not larger.  Yet `single` is larger — meaning the single path produces
+larger logits upstream and softcap then slightly compresses them.
+
+So the real suspect is **fusedRMSNormQ8_1 → Q6_K matmul between single
+and unified**.  The PTX kernel is the same, but the input (state.buf2)
+might be different.
+
+Most likely concrete bugs to audit next:
+  1. columnExtract on seqLen=1: when forwardPrefillBatch runs with
+     seqLen=1, the PTX baked with `totalBatch = dim * 1` MUST be
+     generated — not cached from the prefill run (seqLen=18).  If the
+     cudaAutoCache collides based on PTX hash, and the PTX text differs
+     only by a numeric literal, we'd get a stale kernel.  TO CHECK.
+  2. PTX generated for seqLen=1 might have a different implicit assumption
+     (e.g. only 1 col, so no need to multiply by colIdx) that's wrong.
+  3. state.buf2 after extraction: is it actually the last-column's data,
+     or half-filled with prev-call data?  A GPU-side memcpy of state.buf2
+     right after columnExtract would answer this.
+
 ## 2026-04-20 further narrowing: magnitude ≈ 1/2 of correct
 
 Added logit dumps at step 1 under both paths and compared:
