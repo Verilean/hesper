@@ -1,15 +1,29 @@
 import LSpec
+import Hesper.Backend.CUDA
+import Hesper.CUDA.FFI
+import Tests.GoldenUnit.Common
 import Tests.GoldenUnit.RMSNorm
 import Tests.GoldenUnit.Linear
+import Tests.GoldenUnit.Attention
 
 /-!
 # Gemma4 unit-test runner
 
-Single LSpec exe `gemma4-unit-tests` that bundles every kernel
-unit test.  Add new test modules here.
+Single LSpec exe `gemma4-unit-tests`.  Memory policy:
+- Initialise CUDAContext ONCE (here).
+- Parse GGUF ONCE (here); pass the struct to each test module.
+- Each test module's helpers must free every GPU buffer they alloc.
 -/
 
+open Hesper
+open Hesper.Tests.GoldenUnit.Common
+
 unsafe def main : IO UInt32 := do
-  let g1 ← Hesper.Tests.GoldenUnit.RMSNorm.allTests
-  let g2 ← Hesper.Tests.GoldenUnit.Linear.allTests
-  LSpec.lspecIO (.ofList (g1 ++ g2)) ([] : List String)
+  IO.println "[Init] CUDA + GGUF..."
+  let ctx ← CUDAContext.init
+  let gguf ← loadGGUF
+  IO.println "[Init] done.  Running tests..."
+  let g1 ← Hesper.Tests.GoldenUnit.RMSNorm.allTests ctx gguf
+  let g2 ← Hesper.Tests.GoldenUnit.Linear.allTests ctx gguf
+  let g3 ← Hesper.Tests.GoldenUnit.Attention.allTests ctx gguf
+  LSpec.lspecIO (.ofList (g1 ++ g2 ++ g3)) ([] : List String)
