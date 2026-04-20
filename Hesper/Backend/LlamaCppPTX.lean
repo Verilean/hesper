@@ -193,12 +193,22 @@ private def packMatmulArgs (weightBuf : CUdeviceptr) (q8Buf : CUdeviceptr)
   -- 5: uint32_t ncols_x = inDim
   offsets := offsets.push bytes.size.toUSize
   bytes := pushU32 bytes inDim.toUInt32
-  -- 6: uint3 nchannels_y = (0, 0, 1)
+  -- 6: uint3 nchannels_y — llama.cpp's `init_fastdiv_values(d)` packs
+  -- (mp, L, divisor) in (x, y, z).  For d=1: L=0, mp = ((1<<32)*0/1)+1 = 1,
+  -- so the correct fastdiv triple is (1, 0, 1), NOT (0, 0, 1).  Passing
+  -- (0, 0, 1) made `fastdiv(n, triple) = (n + __umulhi(n, 0)) >> 0 = n`
+  -- which WRAPS for channel_dst > 0 in any non-trivial launch config,
+  -- but since we always launch with channel_dst=0, fastdiv returned 0
+  -- and channel_y was computed as `fastmodulo(0, (0,0,1)) = 0 - 0*1 = 0`,
+  -- which is fine; however ANY kernel path that later multiplies by
+  -- `nchannels_y.z` (the divisor field) saw value 1 correctly, but
+  -- intermediate `fastdiv` temporaries in PTX can still diverge when
+  -- mp=0.  Using the real (1, 0, 1) is safer and matches llama.cpp.
   bytes := alignTo bytes 4
   offsets := offsets.push bytes.size.toUSize
-  bytes := pushU32 bytes 0
-  bytes := pushU32 bytes 0
-  bytes := pushU32 bytes 1
+  bytes := pushU32 bytes 1  -- mp for divisor=1
+  bytes := pushU32 bytes 0  -- L
+  bytes := pushU32 bytes 1  -- divisor
   -- 7-9: uint32_t stride_row_x, stride_col_y, stride_col_dst
   offsets := offsets.push bytes.size.toUSize
   bytes := pushU32 bytes blocksPerRowX.toUInt32
@@ -206,20 +216,20 @@ private def packMatmulArgs (weightBuf : CUdeviceptr) (q8Buf : CUdeviceptr)
   bytes := pushU32 bytes (inDim / 32).toUInt32
   offsets := offsets.push bytes.size.toUSize
   bytes := pushU32 bytes outDim.toUInt32
-  -- 10: uint3 channel_ratio = (0, 0, 1)
+  -- 10: uint3 channel_ratio — same fastdiv(1) triple (1, 0, 1).
   bytes := alignTo bytes 4
   offsets := offsets.push bytes.size.toUSize
-  bytes := pushU32 bytes 0
+  bytes := pushU32 bytes 1
   bytes := pushU32 bytes 0
   bytes := pushU32 bytes 1
   -- 11-13: stride_channel_{x,y,dst} = 0
   for _ in [0:3] do
     offsets := offsets.push bytes.size.toUSize
     bytes := pushU32 bytes 0
-  -- 14: uint3 sample_ratio = (0, 0, 1)
+  -- 14: uint3 sample_ratio — same fastdiv(1) triple (1, 0, 1).
   bytes := alignTo bytes 4
   offsets := offsets.push bytes.size.toUSize
-  bytes := pushU32 bytes 0
+  bytes := pushU32 bytes 1
   bytes := pushU32 bytes 0
   bytes := pushU32 bytes 1
   -- 15-17: stride_sample_{x,y,dst} = 0

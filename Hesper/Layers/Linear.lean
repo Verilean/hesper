@@ -1165,8 +1165,14 @@ def q4kMatmulBatchKernel (config : Config) (seqLen : Nat) : ShaderM Unit := do
     -- Q8_1 header is now half2(d, sum) packed in a u32.  Extract `d` via
     -- the low f16 (sum lives in the high f16 — currently unused by hesper's
     -- matmul, but matches llama.cpp layout).
-    let d8A : Exp (.scalar .f32) := Exp.vecX (Exp.unpack2x16float q8Hdr0)
-    let d8B : Exp (.scalar .f32) := Exp.vecX (Exp.unpack2x16float q8Hdr1)
+    -- Hoist the f16→f32 conversion: each d8A/d8B is referenced 2-4× below.
+    -- Without a ShaderM.var binding, CSE still has to re-emit the
+    -- `mov.b32 {lo,hi}, r; cvt.f32.f16` pair for every reference.  The
+    -- explicit bind + `Exp.var` forces a single register reuse.
+    let d8AName ← ShaderM.var (.scalar .f32) (Exp.vecX (Exp.unpack2x16float q8Hdr0))
+    let d8BName ← ShaderM.var (.scalar .f32) (Exp.vecX (Exp.unpack2x16float q8Hdr1))
+    let d8A : Exp (.scalar .f32) := Exp.var d8AName
+    let d8B : Exp (.scalar .f32) := Exp.var d8BName
 
     let v0i0 := Exp.bitAnd v0 (Exp.litU32 0x0F0F0F0F)
     let v1i0 := Exp.bitAnd v1 (Exp.litU32 0x0F0F0F0F)
@@ -1336,8 +1342,14 @@ def emitQ4KMLinearDP4ABody (config : Config)
     -- Q8_1 header is now half2(d, sum) packed in a u32.  Extract `d` via
     -- the low f16 (sum lives in the high f16 — currently unused by hesper's
     -- matmul, but matches llama.cpp layout).
-    let d8A : Exp (.scalar .f32) := Exp.vecX (Exp.unpack2x16float q8Hdr0)
-    let d8B : Exp (.scalar .f32) := Exp.vecX (Exp.unpack2x16float q8Hdr1)
+    -- Hoist the f16→f32 conversion: each d8A/d8B is referenced 2-4× below.
+    -- Without a ShaderM.var binding, CSE still has to re-emit the
+    -- `mov.b32 {lo,hi}, r; cvt.f32.f16` pair for every reference.  The
+    -- explicit bind + `Exp.var` forces a single register reuse.
+    let d8AName ← ShaderM.var (.scalar .f32) (Exp.vecX (Exp.unpack2x16float q8Hdr0))
+    let d8BName ← ShaderM.var (.scalar .f32) (Exp.vecX (Exp.unpack2x16float q8Hdr1))
+    let d8A : Exp (.scalar .f32) := Exp.var d8AName
+    let d8B : Exp (.scalar .f32) := Exp.var d8BName
 
     -- llama.cpp loop: QR4_K=2 iterations. i=0 uses v[0]>>0 & 0x0F..., u[0]+u[1], d8[0], sc[0], m[0]
     --                                       i=1 uses v[0]>>4 & 0x0F..., u[2]+u[3], d8[1], sc[1], m[1]
@@ -1509,8 +1521,14 @@ def fusedQ4KMGateUpDP4AKernel (config : Config) : ShaderM Unit := do
     -- Q8_1 header is now half2(d, sum) packed in a u32.  Extract `d` via
     -- the low f16 (sum lives in the high f16 — currently unused by hesper's
     -- matmul, but matches llama.cpp layout).
-    let d8A : Exp (.scalar .f32) := Exp.vecX (Exp.unpack2x16float q8Hdr0)
-    let d8B : Exp (.scalar .f32) := Exp.vecX (Exp.unpack2x16float q8Hdr1)
+    -- Hoist the f16→f32 conversion: each d8A/d8B is referenced 2-4× below.
+    -- Without a ShaderM.var binding, CSE still has to re-emit the
+    -- `mov.b32 {lo,hi}, r; cvt.f32.f16` pair for every reference.  The
+    -- explicit bind + `Exp.var` forces a single register reuse.
+    let d8AName ← ShaderM.var (.scalar .f32) (Exp.vecX (Exp.unpack2x16float q8Hdr0))
+    let d8BName ← ShaderM.var (.scalar .f32) (Exp.vecX (Exp.unpack2x16float q8Hdr1))
+    let d8A : Exp (.scalar .f32) := Exp.var d8AName
+    let d8B : Exp (.scalar .f32) := Exp.var d8BName
 
     let newAccG ← processWeight "weights_gate" accG u0 u1 u2 u3 d8A d8B
     ShaderM.assign "accG" newAccG
@@ -1669,8 +1687,14 @@ def fusedQ4KMKVDP4AKernel (config : Config) : ShaderM Unit := do
     -- Q8_1 header is now half2(d, sum) packed in a u32.  Extract `d` via
     -- the low f16 (sum lives in the high f16 — currently unused by hesper's
     -- matmul, but matches llama.cpp layout).
-    let d8A : Exp (.scalar .f32) := Exp.vecX (Exp.unpack2x16float q8Hdr0)
-    let d8B : Exp (.scalar .f32) := Exp.vecX (Exp.unpack2x16float q8Hdr1)
+    -- Hoist the f16→f32 conversion: each d8A/d8B is referenced 2-4× below.
+    -- Without a ShaderM.var binding, CSE still has to re-emit the
+    -- `mov.b32 {lo,hi}, r; cvt.f32.f16` pair for every reference.  The
+    -- explicit bind + `Exp.var` forces a single register reuse.
+    let d8AName ← ShaderM.var (.scalar .f32) (Exp.vecX (Exp.unpack2x16float q8Hdr0))
+    let d8BName ← ShaderM.var (.scalar .f32) (Exp.vecX (Exp.unpack2x16float q8Hdr1))
+    let d8A : Exp (.scalar .f32) := Exp.var d8AName
+    let d8B : Exp (.scalar .f32) := Exp.var d8BName
 
     let newAccK ← processWeight "weights_k" accK u0 u1 u2 u3 d8A d8B
     ShaderM.assign "accK" newAccK
@@ -1852,8 +1876,14 @@ def fusedQ4KMGateUpDP4A4RowKernel (config : Config) : ShaderM Unit := do
     -- Q8_1 header is now half2(d, sum) packed in a u32.  Extract `d` via
     -- the low f16 (sum lives in the high f16 — currently unused by hesper's
     -- matmul, but matches llama.cpp layout).
-    let d8A : Exp (.scalar .f32) := Exp.vecX (Exp.unpack2x16float q8Hdr0)
-    let d8B : Exp (.scalar .f32) := Exp.vecX (Exp.unpack2x16float q8Hdr1)
+    -- Hoist the f16→f32 conversion: each d8A/d8B is referenced 2-4× below.
+    -- Without a ShaderM.var binding, CSE still has to re-emit the
+    -- `mov.b32 {lo,hi}, r; cvt.f32.f16` pair for every reference.  The
+    -- explicit bind + `Exp.var` forces a single register reuse.
+    let d8AName ← ShaderM.var (.scalar .f32) (Exp.vecX (Exp.unpack2x16float q8Hdr0))
+    let d8BName ← ShaderM.var (.scalar .f32) (Exp.vecX (Exp.unpack2x16float q8Hdr1))
+    let d8A : Exp (.scalar .f32) := Exp.var d8AName
+    let d8B : Exp (.scalar .f32) := Exp.var d8BName
 
     let newAccG ← processWeight "weights_gate" accG u0 u1 u2 u3 d8A d8B
     ShaderM.assign "accG" newAccG
@@ -1988,8 +2018,14 @@ def fusedQ4KMLinearDP4A2RowKernel (config : Config) : ShaderM Unit := do
     -- Q8_1 header is now half2(d, sum) packed in a u32.  Extract `d` via
     -- the low f16 (sum lives in the high f16 — currently unused by hesper's
     -- matmul, but matches llama.cpp layout).
-    let d8A : Exp (.scalar .f32) := Exp.vecX (Exp.unpack2x16float q8Hdr0)
-    let d8B : Exp (.scalar .f32) := Exp.vecX (Exp.unpack2x16float q8Hdr1)
+    -- Hoist the f16→f32 conversion: each d8A/d8B is referenced 2-4× below.
+    -- Without a ShaderM.var binding, CSE still has to re-emit the
+    -- `mov.b32 {lo,hi}, r; cvt.f32.f16` pair for every reference.  The
+    -- explicit bind + `Exp.var` forces a single register reuse.
+    let d8AName ← ShaderM.var (.scalar .f32) (Exp.vecX (Exp.unpack2x16float q8Hdr0))
+    let d8BName ← ShaderM.var (.scalar .f32) (Exp.vecX (Exp.unpack2x16float q8Hdr1))
+    let d8A : Exp (.scalar .f32) := Exp.var d8AName
+    let d8B : Exp (.scalar .f32) := Exp.var d8BName
 
     -- i=0: vl & 0x0F
     let v0i0 := Exp.bitAnd v0 (Exp.litU32 0x0F0F0F0F)
@@ -2150,8 +2186,14 @@ def fusedQ4KMLinearDP4A4WarpKernel (config : Config) : ShaderM Unit := do
     -- Q8_1 header is now half2(d, sum) packed in a u32.  Extract `d` via
     -- the low f16 (sum lives in the high f16 — currently unused by hesper's
     -- matmul, but matches llama.cpp layout).
-    let d8A : Exp (.scalar .f32) := Exp.vecX (Exp.unpack2x16float q8Hdr0)
-    let d8B : Exp (.scalar .f32) := Exp.vecX (Exp.unpack2x16float q8Hdr1)
+    -- Hoist the f16→f32 conversion: each d8A/d8B is referenced 2-4× below.
+    -- Without a ShaderM.var binding, CSE still has to re-emit the
+    -- `mov.b32 {lo,hi}, r; cvt.f32.f16` pair for every reference.  The
+    -- explicit bind + `Exp.var` forces a single register reuse.
+    let d8AName ← ShaderM.var (.scalar .f32) (Exp.vecX (Exp.unpack2x16float q8Hdr0))
+    let d8BName ← ShaderM.var (.scalar .f32) (Exp.vecX (Exp.unpack2x16float q8Hdr1))
+    let d8A : Exp (.scalar .f32) := Exp.var d8AName
+    let d8B : Exp (.scalar .f32) := Exp.var d8BName
 
     let v0i0 := Exp.bitAnd v0 (Exp.litU32 0x0F0F0F0F)
     let v1i0 := Exp.bitAnd v1 (Exp.litU32 0x0F0F0F0F)
@@ -2404,8 +2446,14 @@ def fusedQ6KLinearDP4AKernel (inDim outDim : Nat) (gridX : Nat := 0) : ShaderM U
     -- Q8_1 header is now half2(d, sum) packed in a u32.  Extract `d` via
     -- the low f16 (sum lives in the high f16 — currently unused by hesper's
     -- matmul, but matches llama.cpp layout).
-    let d8A : Exp (.scalar .f32) := Exp.vecX (Exp.unpack2x16float q8Hdr0)
-    let d8B : Exp (.scalar .f32) := Exp.vecX (Exp.unpack2x16float q8Hdr1)
+    -- Hoist the f16→f32 conversion: each d8A/d8B is referenced 2-4× below.
+    -- Without a ShaderM.var binding, CSE still has to re-emit the
+    -- `mov.b32 {lo,hi}, r; cvt.f32.f16` pair for every reference.  The
+    -- explicit bind + `Exp.var` forces a single register reuse.
+    let d8AName ← ShaderM.var (.scalar .f32) (Exp.vecX (Exp.unpack2x16float q8Hdr0))
+    let d8BName ← ShaderM.var (.scalar .f32) (Exp.vecX (Exp.unpack2x16float q8Hdr1))
+    let d8A : Exp (.scalar .f32) := Exp.var d8AName
+    let d8B : Exp (.scalar .f32) := Exp.var d8BName
 
     -- QR6_K=2 iterations. dot × sc done in i32; single FFMA d8 × f32(dot*sc).
     let vil_0 := Exp.bitAnd vl (Exp.litU32 0x0F0F0F0F)
@@ -2569,8 +2617,14 @@ def fusedQ6KLinearDP4A2RowKernel (inDim outDim : Nat) (gridX : Nat := 0) : Shade
     -- Q8_1 header is now half2(d, sum) packed in a u32.  Extract `d` via
     -- the low f16 (sum lives in the high f16 — currently unused by hesper's
     -- matmul, but matches llama.cpp layout).
-    let d8A : Exp (.scalar .f32) := Exp.vecX (Exp.unpack2x16float q8Hdr0)
-    let d8B : Exp (.scalar .f32) := Exp.vecX (Exp.unpack2x16float q8Hdr1)
+    -- Hoist the f16→f32 conversion: each d8A/d8B is referenced 2-4× below.
+    -- Without a ShaderM.var binding, CSE still has to re-emit the
+    -- `mov.b32 {lo,hi}, r; cvt.f32.f16` pair for every reference.  The
+    -- explicit bind + `Exp.var` forces a single register reuse.
+    let d8AName ← ShaderM.var (.scalar .f32) (Exp.vecX (Exp.unpack2x16float q8Hdr0))
+    let d8BName ← ShaderM.var (.scalar .f32) (Exp.vecX (Exp.unpack2x16float q8Hdr1))
+    let d8A : Exp (.scalar .f32) := Exp.var d8AName
+    let d8B : Exp (.scalar .f32) := Exp.var d8BName
 
     let vil_0 := Exp.bitAnd vl (Exp.litU32 0x0F0F0F0F)
     let vih_0 := Exp.bitAnd (Exp.shiftLeft vh (Exp.litU32 4)) (Exp.litU32 0x30303030)
@@ -2732,8 +2786,14 @@ def fusedQ6KLinearDP4A4RowKernel (inDim outDim : Nat) (gridX : Nat := 0) : Shade
     -- Q8_1 header is now half2(d, sum) packed in a u32.  Extract `d` via
     -- the low f16 (sum lives in the high f16 — currently unused by hesper's
     -- matmul, but matches llama.cpp layout).
-    let d8A : Exp (.scalar .f32) := Exp.vecX (Exp.unpack2x16float q8Hdr0)
-    let d8B : Exp (.scalar .f32) := Exp.vecX (Exp.unpack2x16float q8Hdr1)
+    -- Hoist the f16→f32 conversion: each d8A/d8B is referenced 2-4× below.
+    -- Without a ShaderM.var binding, CSE still has to re-emit the
+    -- `mov.b32 {lo,hi}, r; cvt.f32.f16` pair for every reference.  The
+    -- explicit bind + `Exp.var` forces a single register reuse.
+    let d8AName ← ShaderM.var (.scalar .f32) (Exp.vecX (Exp.unpack2x16float q8Hdr0))
+    let d8BName ← ShaderM.var (.scalar .f32) (Exp.vecX (Exp.unpack2x16float q8Hdr1))
+    let d8A : Exp (.scalar .f32) := Exp.var d8AName
+    let d8B : Exp (.scalar .f32) := Exp.var d8BName
 
     let vil_0 := Exp.bitAnd vl (Exp.litU32 0x0F0F0F0F)
     let vih_0 := Exp.bitAnd (Exp.shiftLeft vh (Exp.litU32 4)) (Exp.litU32 0x30303030)
