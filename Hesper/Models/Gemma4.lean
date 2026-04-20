@@ -4288,8 +4288,15 @@ def generate [GPUBackend β] (ctx : β) (model : Gemma4Model (GPUBackend.Buf β)
   for _ in [0:maxTokens] do
     if tokens.size >= model.config.maxSeqLen then break
 
-    -- Sample: GPU-side greedy argmax (download 4 bytes instead of 1 MB)
-    let nextToken ← gpuArgmax ctx state.logitsBuf state.argmaxBuf model.config.vocabSize
+    -- Sample: GPU-side greedy argmax (download 4 bytes instead of 1 MB).
+    -- When a captured decode graph exists, argmax has already run as part
+    -- of the graph (see capture block below); just read its result.
+    let nextToken ← match graphExecOpt with
+      | some _ =>
+        let bytes ← GPUBackend.readBuffer ctx state.argmaxBuf (4 : USize)
+        pure (Hesper.Basic.bytesToUInt32 bytes 0).toNat
+      | none =>
+        gpuArgmax ctx state.logitsBuf state.argmaxBuf model.config.vocabSize
 
     if (← IO.getEnv "HESPER_DECODE_TRACE").isSome then
       IO.println s!"[decode] genCount={genCount} tokens.size(before push)={tokens.size} nextToken={nextToken}"
@@ -4364,6 +4371,12 @@ def generate [GPUBackend β] (ctx : β) (model : Gemma4Model (GPUBackend.Buf β)
               (kcr := some unifiedKcr) (startPos := newPos)
           else
             forwardSingleToken ctx model nextToken newPos state (kcr := some kcr)
+          -- Fold argmax into the captured graph as well — saves one
+          -- cuLaunchKernel per token on replay.  Result lands in
+          -- `state.argmaxBuf`; the host reads 4 bytes after each replay.
+          GPUBackend.execute ctx (argmaxKernel model.config.vocabSize)
+            [("logits", state.logitsBuf), ("result", state.argmaxBuf)]
+            { workgroupSize := { x := 256 }, numWorkgroups := (1, 1, 1) }
           let graph ← Hesper.CUDA.cuStreamEndCapture stream
           Hesper.cudaCaptureStream.set none
           let exec ← Hesper.CUDA.cuGraphInstantiate graph
