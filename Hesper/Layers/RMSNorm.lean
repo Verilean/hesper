@@ -629,14 +629,17 @@ def forward [GPUBackend β] (ctx : β)
             (inputBuf outputBuf : GPUBackend.Buf β) (numRows : Nat := 1) (workgroupSize : Nat := 256)
             (preAllocRmsBuf : Option (GPUBackend.Buf β) := none)
             (refOverride : Option (IO.Ref (Option (GPUBackend.CachedDispatch β))) := none) : IO Unit := do
-  -- Pick cache ref: caller may pass a throwaway ref to bypass `layer.prepared`
-  -- when the input/output buffers are transient (e.g., per-call batch buffers
-  -- in forwardPrefillBatch).  Using `layer.prepared` in that setting lets the
-  -- fast-path replay launch with stale buffer pointers from a prior call.
-  let refToUse := refOverride.getD layer.prepared
-  -- Fast path: replay cached dispatch (only valid for numRows=1 + the shared
-  -- layer.prepared ref; overridden refs may be None and fall through).
-  if numRows == 1 && refOverride.isNone then
+  -- `layer.prepared` is only semantically valid for the exact shape used to
+  -- populate it.  Using it across different `numRows` produces launches with
+  -- args captured at the wrong shape — benign outside CUDA Graph capture (the
+  -- args happen to still point at valid GPU memory) but fatal inside capture.
+  --
+  -- Rule: only use `layer.prepared` when numRows=1.  For numRows>1 always use
+  -- a throwaway ref.  Caller may additionally pass `refOverride` to force a
+  -- throwaway ref even at numRows=1 (when the buffers themselves are transient,
+  -- e.g. per-call batch buffers in `forwardPrefillBatch`).
+  let useSharedPrepared := numRows == 1 && refOverride.isNone
+  if useSharedPrepared then
     if let some p ← layer.prepared.get then
       preparedHitsRef.modify (· + 1)
       GPUBackend.replayCached ctx p (numRows, 1, 1)
@@ -646,6 +649,12 @@ def forward [GPUBackend β] (ctx : β)
   logVerbose s!"[RMSNorm] Executing forward pass ({numRows} rows × {layer.config.dim} dim)..."
   let shader := rmsNormFusedKernel layer.config numRows workgroupSize
   let cacheKey : UInt64 := hash ("rms", layer.config.dim, numRows, workgroupSize)
+  -- Pick target ref: shared layer.prepared only when shape matches (numRows=1
+  -- and no override); otherwise throwaway.
+  let refToUse ← if useSharedPrepared then pure layer.prepared
+                 else match refOverride with
+                      | some r => pure r
+                      | none   => IO.mkRef none
   GPUBackend.executeWithConfigCached ctx shader
     [("input", inputBuf), ("scale", layer.scale), ("output", outputBuf)]
     { workgroupSize := { x := workgroupSize }, numWorkgroups := (numRows, 1, 1) }
