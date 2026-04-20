@@ -672,3 +672,59 @@ Closing this needs either:
    kernels so ceiling is tight)
 
 Session stops here.  Next major moves tracked as #47, #119, #127.
+
+---
+
+## Update (later): call-range bisection on hybrid-PTX garbage
+
+Added `HESPER_LLAMACPP_CALL_FROM` / `HESPER_LLAMACPP_CALL_UNTIL` to
+the LlamaCppPTX override.  These gate the override by a monotonic
+call counter so individual matmul invocations can be enabled/disabled
+for bisection.
+
+Running "The capital of France is" with progressively larger override
+call windows:
+
+| UNTIL | 8-tok output | interpretation |
+|------:|:-------------|:---|
+|    0  | "The capital of France is **Paris**." | baseline, no override |
+|    1  | "The capital of France is **Paris**." | 1 override call is safe |
+|    5  | "...**Paris**..."                     | 5 calls still safe |
+|   20  | "The capital of France is"             | 20 calls safe-ish |
+|  100  | "The capital of:"                     | partial corruption |
+|  150  | "The capital of"                      | partial |
+|  200  | "The capital on inil"                  | broken |
+|  250  | "ThePARENTindex..."                    | broken |
+|  300+ | "The好奇好奇好奇..."                   | full garbage |
+
+Gemma 4 E4B has ~210 matmul calls per decode token (21 full-attn × 6
++ 21 shared-KV × 4).  Breakage happens around call 150–250, i.e.
+part-way into the first decode forward pass.
+
+This rules out "single bad call" and confirms **cumulative** error
+build-up.  The Q8_1 quantize + Q4_K matmul kernels are bit-identical
+to hesper's (proven by 2048-row isolated test with max |diff|=2e-6),
+so the error has to come from something in the override's **launch
+context**, not the compute.
+
+Candidates narrowed down:
+1. `cuLaunchKernelRaw` bypasses hesper's `launchKernelMaybeStream`
+   that routes through the CUDA Graphs capture stream when active.
+   But: bug also happens WITHOUT `HESPER_CUDA_GRAPHS=1`, so this
+   isn't the primary issue.
+2. Global `getQ8Scratch(inDim)` is one u32 scratch per distinct
+   inDim, shared across 42 layers' worth of wQ/wK/wV calls.  Default
+   stream should serialize, but maybe a missing `cuStreamSynchronize`
+   between layers lets a downstream layer read stale scratch?
+3. Override `forwardDP4A` returns after its own launch without
+   updating the hesper layer's `dp4aMatmulPrepared` cache ref —
+   subsequent calls that *don't* go through override (via
+   CALL_UNTIL) end up with a stale cached dispatch.
+4. `kv cache write` (not override-covered) reads K from `state.kBuf`
+   which was just written by override's matmul.  If override writes
+   don't finish before the downstream KV-write kernel fires, cache
+   corruption.
+
+#3 and #4 are the most plausible.  Next session: add an explicit
+`cuStreamSynchronize` right after the override's matmul and see if
+the garbage clears.
