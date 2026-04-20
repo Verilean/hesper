@@ -57,8 +57,9 @@ unsafe def main (args : List String) : IO Unit := do
   let bytesPerRow := blocksPerRow * 144
   IO.println s!"[Load] inDim={inDim} outDim={outDim} blocksPerRow={blocksPerRow} bytesPerRow={bytesPerRow}"
 
-  -- Construct a tiny test: take outDim'=4 rows (=4×blocksPerRow×144 bytes).
-  let testOutDim : Nat := 4
+  -- Full-row comparison: take ALL rows (2048 for wQ).  Helps surface
+  -- integration-scale bugs that the original 4-row test missed.
+  let testOutDim : Nat := outDim
   let testBytes := testOutDim * bytesPerRow
   let mut wSlice : ByteArray := ByteArray.empty
   for i in [0:testBytes] do
@@ -69,9 +70,13 @@ unsafe def main (args : List String) : IO Unit := do
   let wBuf ← createCUDABuffer testBytes.toUSize
   writeCUDABuffer wBuf wSlice
 
-  -- Deterministic f32 input (same as ABITest test 1).
+  -- Deterministic f32 input.  Use a RMSNorm-like distribution
+  -- (post-norm values can reach ~±10 in real Gemma 4, not the [-1,1]
+  -- of the original test).  Specifically: alternating signs, magnitude
+  -- pattern that tests the Q8_1 amax reduction across all ranges.
   let xArr : Array Float := Array.ofFn (n := inDim) fun i =>
-    (i.val.toFloat - (inDim/2).toFloat) / (inDim/2).toFloat
+    let s : Float := if i.val % 2 == 0 then 1.0 else -1.0
+    s * (1.0 + (i.val.toFloat / inDim.toFloat) * 5.0)
   let xBytes ← Hesper.WebGPU.BufferOps.floatArrayToBytes xArr
   let xBuf ← createCUDABuffer (4 * inDim).toUSize
   writeCUDABuffer xBuf xBytes
@@ -88,8 +93,8 @@ unsafe def main (args : List String) : IO Unit := do
   launchMulMatVecQ4K k wBuf.ptr q8Buf.ptr outLlama.ptr inDim testOutDim
   let outLlamaBytes ← readCUDABuffer outLlama (testOutDim * 4).toUSize
 
-  IO.println "[llama.cpp PTX output]"
-  for i in [0:testOutDim] do
+  IO.println "[llama.cpp PTX output, first 4 rows]"
+  for i in [0:(min 4 testOutDim)] do
     let v ← Hesper.Basic.bytesToFloat32 outLlamaBytes (i * 4)
     IO.println s!"  row[{i}] = {v}"
 
@@ -112,8 +117,8 @@ unsafe def main (args : List String) : IO Unit := do
 
   let outHesperBytes ← readCUDABuffer outHesper (testOutDim * 4).toUSize
 
-  IO.println "[hesper dp4a output (hesper Q8_1 + hesper matmul)]"
-  for i in [0:testOutDim] do
+  IO.println "[hesper dp4a output, first 4 rows]"
+  for i in [0:(min 4 testOutDim)] do
     let v ← Hesper.Basic.bytesToFloat32 outHesperBytes (i * 4)
     IO.println s!"  row[{i}] = {v}"
 
@@ -126,11 +131,37 @@ unsafe def main (args : List String) : IO Unit := do
   IO.println s!"  llama.cpp: {b0L}"
   IO.println s!"  hesper:    {b0H}"
 
-  -- Diff llama-vs-hesper (full self-consistent runs).
-  IO.println "[self-consistent llama vs self-consistent hesper]"
+  -- Diff llama-vs-hesper (full self-consistent runs).  Find max |diff|
+  -- and the first row whose |diff| exceeds 1e-2 so we can see whether
+  -- the bug is uniformly spread across rows or localised past some
+  -- boundary.
+  IO.println "[self-consistent llama vs self-consistent hesper — summary]"
+  let mut maxDiff : Float := 0.0
+  let mut maxDiffRow : Nat := 0
+  let mut firstDivRow : Int := -1
   for i in [0:testOutDim] do
     let v1 ← Hesper.Basic.bytesToFloat32 outLlamaBytes (i * 4)
     let v2 ← Hesper.Basic.bytesToFloat32 outHesperBytes (i * 4)
-    let d := (v1 - v2)
+    let d := v1 - v2
     let dAbs := if d < 0 then -d else d
-    IO.println s!"  row[{i}]: llama={v1} hesper={v2} |diff|={dAbs}"
+    if dAbs > maxDiff then
+      maxDiff := dAbs
+      maxDiffRow := i
+    if firstDivRow < 0 && dAbs > 0.01 then
+      firstDivRow := i.toInt64.toInt
+  IO.println s!"  max |diff| = {maxDiff} at row {maxDiffRow}"
+  IO.println s!"  first row with |diff| > 0.01 = {firstDivRow}"
+  -- Print first-4 and spot-check rows near firstDivRow if any.
+  IO.println "[row-by-row around any divergence]"
+  let spotRows : Array Nat :=
+    if firstDivRow ≥ 0 then
+      let r := firstDivRow.toNat
+      #[r, r+1, r+2, r+3]
+    else #[0, 1, 2, 3]
+  for i in spotRows do
+    if i < testOutDim then
+      let v1 ← Hesper.Basic.bytesToFloat32 outLlamaBytes (i * 4)
+      let v2 ← Hesper.Basic.bytesToFloat32 outHesperBytes (i * 4)
+      let d := v1 - v2
+      let dAbs := if d < 0 then -d else d
+      IO.println s!"  row[{i}]: llama={v1} hesper={v2} |diff|={dAbs}"
