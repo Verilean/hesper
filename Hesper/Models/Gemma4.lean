@@ -2084,7 +2084,18 @@ def forwardBlock [GPUBackend β] (ctx : β)
       circuitRMSNorm "attnNorm" block.attnNorm inputBuf state.normedBuf
     Hesper.WGSL.Execute.withSection "qkvProj" do
       if cfg.hasKV li then
-        if useFusedQKV then
+        if disableFusion then
+          -- HESPER_FUSION_DISABLE=1: route every matmul through plain
+          -- `LinearLayer.forward` so the llama.cpp-PTX override actually
+          -- fires for all of Q, K, V (not just the ones Circuit DSL
+          -- happens to emit unfused).  Critical for hybrid correctness
+          -- bisection: the Circuit DSL path does NOT go through the
+          -- `llamaCppDp4aOverride` hook installed by
+          -- `Hesper.Layers.Linear.forwardDP4A`.
+          Linear.LinearLayer.forward ctx block.attention.wQ state.normedBuf state.qBuf
+          Linear.LinearLayer.forward ctx block.attention.wK state.normedBuf state.kBuf
+          Linear.LinearLayer.forward ctx block.attention.wV state.normedBuf state.vBuf
+        else if useFusedQKV then
           let key := hash ("qkvFusedDP4A",
             block.attention.wQ.config.inDim, block.attention.wQ.config.outDim,
             block.attention.wK.config.outDim)
@@ -2114,6 +2125,9 @@ def forwardBlock [GPUBackend β] (ctx : β)
               let _v ← Hesper.Circuit.CircuitM.matmulQ4K normed block.attention.wV
               pure ())
             [(0, state.normedBuf), (1, state.qBuf), (2, state.kBuf), (3, state.vBuf)]
+      else if disableFusion then
+        -- Shared-KV layer under HESPER_FUSION_DISABLE: plain path.
+        Linear.LinearLayer.forward ctx block.attention.wQ state.normedBuf state.qBuf
       else
         -- No-KV layer: wQ only, via Circuit DSL.  `runCached` builds
         -- the Circuit ONCE per (inDim, outDim, backend), caches the
@@ -2365,17 +2379,22 @@ def forwardBlock [GPUBackend β] (ctx : β)
     -- Equivalent to direct LinearLayer.forward; sets up the IR for later
     -- fusion with the post-attn norm chain.
     Hesper.WGSL.Execute.withSection "oProj" do
-      let keyO := hash ("circuitWO-cuda", block.attention.wO.config.inDim,
-                        block.attention.wO.config.outDim, li)
-      let ccRefO ← Hesper.Circuit.getGlobalCircuitRef (β := β) keyO
-      Hesper.Circuit.runCached ctx ccRefO
-        (do
-          let attnOut ← Hesper.Circuit.CircuitM.registerExternal
-            (BufT := GPUBackend.Buf β) (CacheT := GPUBackend.CachedDispatch β)
-            state.attnOutBuf #[block.attention.wO.config.inDim] .f32 .Global
-          let _o ← Hesper.Circuit.CircuitM.matmulQ4K attnOut block.attention.wO
-          pure ())
-        [(0, state.attnOutBuf), (1, state.normedBuf)]
+      if disableFusion then
+        -- HESPER_FUSION_DISABLE=1: plain path so llama.cpp override fires.
+        Linear.LinearLayer.forward ctx block.attention.wO
+          state.attnOutBuf state.normedBuf
+      else
+        let keyO := hash ("circuitWO-cuda", block.attention.wO.config.inDim,
+                          block.attention.wO.config.outDim, li)
+        let ccRefO ← Hesper.Circuit.getGlobalCircuitRef (β := β) keyO
+        Hesper.Circuit.runCached ctx ccRefO
+          (do
+            let attnOut ← Hesper.Circuit.CircuitM.registerExternal
+              (BufT := GPUBackend.Buf β) (CacheT := GPUBackend.CachedDispatch β)
+              state.attnOutBuf #[block.attention.wO.config.inDim] .f32 .Global
+            let _o ← Hesper.Circuit.CircuitM.matmulQ4K attnOut block.attention.wO
+            pure ())
+          [(0, state.attnOutBuf), (1, state.normedBuf)]
   else
     -- Fallback: skip attention (shouldn't happen)
     Linear.LinearLayer.forward ctx block.attention.wO state.qBuf state.normedBuf
@@ -2559,17 +2578,21 @@ def forwardBlock [GPUBackend β] (ctx : β)
     -- ffn.down: gelu*up [intermediateSize] → ffnOut [hiddenSize].  Same
     -- Circuit DSL pattern as wO above.
     Hesper.WGSL.Execute.withSection "ffnDown" do
-      let keyFD := hash ("circuitFFNDown-cuda", block.ffn.down.config.inDim,
-                         block.ffn.down.config.outDim, li)
-      let ccRefFD ← Hesper.Circuit.getGlobalCircuitRef (β := β) keyFD
-      Hesper.Circuit.runCached ctx ccRefFD
-        (do
-          let gelu ← Hesper.Circuit.CircuitM.registerExternal
-            (BufT := GPUBackend.Buf β) (CacheT := GPUBackend.CachedDispatch β)
-            state.geluBuf #[block.ffn.down.config.inDim] .f32 .Global
-          let _o ← Hesper.Circuit.CircuitM.matmulQ4K gelu block.ffn.down
-          pure ())
-        [(0, state.geluBuf), (1, state.ffnOutBuf)]
+      if disableFusion then
+        Linear.LinearLayer.forward ctx block.ffn.down
+          state.geluBuf state.ffnOutBuf
+      else
+        let keyFD := hash ("circuitFFNDown-cuda", block.ffn.down.config.inDim,
+                           block.ffn.down.config.outDim, li)
+        let ccRefFD ← Hesper.Circuit.getGlobalCircuitRef (β := β) keyFD
+        Hesper.Circuit.runCached ctx ccRefFD
+          (do
+            let gelu ← Hesper.Circuit.CircuitM.registerExternal
+              (BufT := GPUBackend.Buf β) (CacheT := GPUBackend.CachedDispatch β)
+              state.geluBuf #[block.ffn.down.config.inDim] .f32 .Global
+            let _o ← Hesper.Circuit.CircuitM.matmulQ4K gelu block.ffn.down
+            pure ())
+          [(0, state.geluBuf), (1, state.ffnOutBuf)]
 
     -- Post-FFN norm + residual, fused.  output = RMSNorm(ffn_out) * scale + attn_residual.
     Hesper.WGSL.Execute.withSection "postFFNNorm" do
