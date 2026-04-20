@@ -3038,7 +3038,11 @@ def forwardPrefillBatch [GPUBackend β] (ctx : β)
       -- Q6_K fallback: RMSNorm into batchNormedBuf as scratch (CANNOT use
       -- batchBuf1 since it may alias currentBuf during ping-pong).  Then
       -- batch matmul in f32.
+      -- Use a throwaway ref: batchNormedBuf/currentBuf are per-call allocations
+      -- so layer.prepared's cached args would point to stale pointers.
+      let attnNormRef ← IO.mkRef none
       RMSNorm.forward ctx block.attnNorm currentBuf batchNormedBuf seqLen
+        (refOverride := some attnNormRef)
       Linear.forwardBatchDP4A ctx block.attention.wQ batchNormedBuf batchQBuf seqLen
       if cfg.hasKV li then
         Linear.forwardBatchDP4A ctx block.attention.wK batchNormedBuf batchKBuf seqLen
@@ -3375,7 +3379,10 @@ def forwardPrefillBatch [GPUBackend β] (ctx : β)
       GPUBackend.freeBuffer ctx ffnBatchQ8Buf
     else
       -- FFN Q6_K fallback: normedBuf can't be batchBuf1 (ping-pong alias).
+      -- Throwaway ref: transient batch buffers.
+      let ffnNormRef ← IO.mkRef none
       RMSNorm.forward ctx block.ffnNorm batchAttnResidBuf batchNormedBuf seqLen
+        (refOverride := some ffnNormRef)
       -- Golden dump: ffn_norm output (post-RMSNorm, pre-gate/up).
       -- Only visible in the fallback branch; fast path bakes it into Q8_1.
       dumpGolden s!"ffn_norm-{li}" batchNormedBuf (dim * seqLen)

@@ -484,3 +484,49 @@ path or risking the correctness tests.
 Perf target 120 TPS remains open.  Current decode: 65.8 TPS with
 `HESPER_CUDA_GRAPHS=1` (doc 23).  Phase 3, when correct, should move
 this past 100 TPS in one step.
+
+---
+
+## Update 2026-04-20 PM: bug found and fixed
+
+**Root cause:** `RMSNorm.forward` has a `numRows == 1` fast path that
+replays a cached dispatch from `layer.prepared` via
+`GPUBackend.replayCached`.  `replayCached` reuses `cached.args` — the
+buffer pointers captured at first call.
+
+Sequence that triggered the bug:
+1. Prefill: `forwardPrefillBatch` calls `RMSNorm.forward` with
+   `numRows=18` → misses the fast path → executes and **writes the
+   numRows=18 dispatch to `layer.prepared`** (args = prefill batch
+   buffers).
+2. First decode (unified, seqLen=1): `forwardPrefillBatch` calls
+   `RMSNorm.forward` with `numRows=1` → hits the fast path →
+   `replayCached` with the numRows=18 dispatch and its stale args
+   (prefill batch buffers, freed at end of step 1).
+
+The stale dispatch launches against freed/reused memory, which
+manifested as all-zero `attn_norm`, `Qcur`, `Kcur`, `Vcur` at L0 and
+a collapsed decode output.
+
+Non-unified decode didn't trip this because `forwardSingleToken` uses
+persistent `state.*` buffers — the cached args stay valid.
+
+**Fix** (commit pending): added an optional `refOverride :
+Option (IO.Ref (Option CachedDispatch))` parameter to
+`RMSNorm.forward`.  When caller passes a throwaway ref, the fast path
+is bypassed (it only replays when the shared `layer.prepared` is
+used).  Applied at the two `forwardPrefillBatch` fallback call sites
+(attnNorm and ffnNorm) so transient batch buffers don't pollute the
+layer-level cache.
+
+**Verification:**
+- `HESPER_UNIFIED_DECODE=1 ... "What is 2+2?"` → "The value of 2+2 is 4" ✓
+- `HESPER_UNIFIED_DECODE=1 ... "The capital of France is"` → "The capital of France is **Paris**." ✓
+- All 16 golden unit tests still pass.
+- Non-unified decode unchanged (36 TPS; no regression).
+
+**Remaining perf work:** unified decode currently at ~9 TPS because
+`forwardPrefillBatch` allocates and frees ~15 batch buffers per call.
+Moving these to persistent `InferenceState` slots is the next step;
+the kernel-count reduction this enables is what makes Phase 3 a
+measurable win.
