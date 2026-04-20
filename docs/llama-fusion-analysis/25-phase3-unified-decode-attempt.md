@@ -607,3 +607,68 @@ distinct values written to the same slot).
 
 That's the one remaining bottleneck to close the gap to llama.cpp.
 Tracked as #142 (pending) and #127 (Phase C2).
+
+---
+
+## Update 2026-04-20 late evening: single-token + Graphs = 70 TPS
+
+After the forwardBatchDP4A_fromQ8 cache fix landed (doc section above),
+we returned to the single-token + CUDA Graphs path as the fastest
+working config.  Two small additions:
+
+### Fix: capture flow must launch graph once
+
+`cuStreamBeginCapture` intercepts kernel launches — they are recorded
+but do NOT execute.  The capture branch originally only captured-then-
+instantiated; the first decoded token's forward pass never actually
+ran, so next-iteration argmax saw stale prefill logits → the first
+token was duplicated ("TheThe" / "SoftSoft" bug).  Fix: explicit
+`cuGraphLaunch` after instantiate.
+
+### Fold argmax into the captured graph
+
+Argmax ran as a separate `cuLaunchKernel + D2H read` per token
+outside the graph.  Now appended to the captured graph; replay just
+reads `argmaxBuf[0]` after the graph sync.  Marginal TPS gain (70.6
+vs 69.6) but cleaner control flow.
+
+### forwardFusedNormWQ for shared-KV layers
+
+21 of Gemma 4 E4B's 42 attention layers share KV with an earlier
+full-attn layer.  These only need wQ, not wK/wV.  The old path
+invoked `circuitRMSNorm` (Circuit DSL) + `runCached wQ matmul`
+as two separate `executeWithConfigCached` call chains, each with its
+own cache ref.  `forwardFusedNormWQ` replaces them with the same
+2-dispatch `fusedRMSNormQ8_1Kernel + dp4a matmul` pair that
+`forwardFusedNormQKV` uses on its Q path, on the layer's existing
+`dp4aQuantizePrepared` / `dp4aMatmulPrepared` refs.  No dispatch
+count change; moves shared-KV onto the same stable prepared-ref
+pattern as full-attn layers.
+
+### Current status (2026-04-20 late)
+
+| Path | TPS | vs llama.cpp 115-120 |
+|------|-----|---------------------|
+| single-token no-Graphs | 35 | 30% |
+| single-token + Graphs | 25 (short) / **70 (long)** | **61%** |
+| unified no-Graphs | 62 | 54% |
+| unified + Graphs | SEGV | — |
+
+Session delta: 10.2 → 70 TPS on the best config (6.9×).
+
+### Remaining 70 → 115 TPS gap
+
+Per doc 24 per-kernel microbench, hesper's Q4_K matmuls are already at
+75-93% of theoretical BW.  The 45-TPS gap is mostly at the kernel
+level, not host-launch overhead (Graphs already fixed that):
+- llama.cpp kernels run with low occupancy + 66 regs/thread (ILP)
+- hesper kernels run with high occupancy + 34-36 regs/thread
+- Per-kernel wall-time differs ~3x on Q4_K matmul (doc 00 table)
+
+Closing this needs either:
+1. Rewrite Q4_K dp4a kernel to llama.cpp pattern (#47, #119)
+2. TurboQuant for Q4_K (#50 — not yet verified if llama.cpp uses it)
+3. Larger fusions reducing memory traffic (already at 93% BW on main
+   kernels so ceiling is tight)
+
+Session stops here.  Next major moves tracked as #47, #119, #127.
