@@ -627,9 +627,16 @@ def create [GPUBackend β] (ctx : β) (config : Config) (scaleData : ByteArray)
 def forward [GPUBackend β] (ctx : β)
             (layer : RMSNorm (GPUBackend.Buf β) (GPUBackend.CachedDispatch β))
             (inputBuf outputBuf : GPUBackend.Buf β) (numRows : Nat := 1) (workgroupSize : Nat := 256)
-            (preAllocRmsBuf : Option (GPUBackend.Buf β) := none) : IO Unit := do
-  -- Fast path: replay cached dispatch
-  if numRows == 1 then
+            (preAllocRmsBuf : Option (GPUBackend.Buf β) := none)
+            (refOverride : Option (IO.Ref (Option (GPUBackend.CachedDispatch β))) := none) : IO Unit := do
+  -- Pick cache ref: caller may pass a throwaway ref to bypass `layer.prepared`
+  -- when the input/output buffers are transient (e.g., per-call batch buffers
+  -- in forwardPrefillBatch).  Using `layer.prepared` in that setting lets the
+  -- fast-path replay launch with stale buffer pointers from a prior call.
+  let refToUse := refOverride.getD layer.prepared
+  -- Fast path: replay cached dispatch (only valid for numRows=1 + the shared
+  -- layer.prepared ref; overridden refs may be None and fall through).
+  if numRows == 1 && refOverride.isNone then
     if let some p ← layer.prepared.get then
       preparedHitsRef.modify (· + 1)
       GPUBackend.replayCached ctx p (numRows, 1, 1)
@@ -642,7 +649,7 @@ def forward [GPUBackend β] (ctx : β)
   GPUBackend.executeWithConfigCached ctx shader
     [("input", inputBuf), ("scale", layer.scale), ("output", outputBuf)]
     { workgroupSize := { x := workgroupSize }, numWorkgroups := (numRows, 1, 1) }
-    cacheKey layer.prepared
+    cacheKey refToUse
   logVerbose "[RMSNorm] ✓ Forward pass complete"
 
 /-- Fused post-norm: `output = RMSNorm(layer_out) * scale + residual`.
