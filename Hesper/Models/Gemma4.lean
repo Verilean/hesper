@@ -4336,8 +4336,28 @@ def generate [GPUBackend β] (ctx : β) (model : Gemma4Model (GPUBackend.Buf β)
         let unifiedDecode := (← IO.getEnv "HESPER_UNIFIED_DECODE").isSome
         if useCudaGraphs && genCount == 1 then
           -- Capture path: run decode forward on a capture stream.
+          -- IMPORTANT: `cuStreamBeginCapture` intercepts kernel launches —
+          -- they are recorded into the graph but do NOT execute.  So the
+          -- forward pass captured here does not produce logits.  We must
+          -- explicitly launch the instantiated graph once at the end of
+          -- this iteration so the first decoded token actually advances
+          -- the model state.  Skipping this step causes the next iter's
+          -- gpuArgmax to read stale prefill logits → duplicated first
+          -- token (the infamous "TheThe" bug).
           let stream ← Hesper.CUDA.cuStreamCreate
           Hesper.cudaCaptureStream.set (some stream)
+          -- Before capture starts, seed the pinned slots with the args
+          -- we'll use at replay time so the graph's memcpy nodes snapshot
+          -- correct source bytes during capture.
+          let tokenBytes := Hesper.WebGPU.BufferOps.uint32ToBytes nextToken.toUInt32
+          let posBytes := Hesper.WebGPU.BufferOps.uint32ToBytes newPos.toUInt32
+          let cacheLenBytes := Hesper.WebGPU.BufferOps.uint32ToBytes (newPos + 1).toUInt32
+          let posF32Bytes ← Hesper.Basic.floatToBytes newPos.toFloat
+          Hesper.CUDA.cuWritePinned state.stagingTokenPtr  0 tokenBytes 4
+          Hesper.CUDA.cuWritePinned state.stagingParamsPtr 0 posBytes 4
+          Hesper.CUDA.cuWritePinned state.stagingParamsPtr 4 cacheLenBytes 4
+          Hesper.CUDA.cuWritePinned state.stagingPLRowPtr  0 tokenBytes 4
+          Hesper.CUDA.cuWritePinned state.stagingPosF32Ptr 0 posF32Bytes 4
           Hesper.CUDA.cuStreamBeginCapture stream
           if unifiedDecode then
             forwardPrefillBatch ctx model #[nextToken] state
@@ -4348,6 +4368,9 @@ def generate [GPUBackend β] (ctx : β) (model : Gemma4Model (GPUBackend.Buf β)
           Hesper.cudaCaptureStream.set none
           let exec ← Hesper.CUDA.cuGraphInstantiate graph
           Hesper.CUDA.cuGraphDestroy graph
+          -- Execute the captured graph once for the current token, so
+          -- the next loop iteration's argmax sees logits from this token.
+          Hesper.CUDA.cuGraphLaunch exec stream
           Hesper.CUDA.cuStreamSynchronize stream
           graphExecOpt := some (exec, stream)
           IO.println s!"[Graph] captured decode graph; subsequent tokens will replay"
