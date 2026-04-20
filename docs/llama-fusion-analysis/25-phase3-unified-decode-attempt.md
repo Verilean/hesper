@@ -96,6 +96,66 @@ a *second* time with the same InferenceState and an incremented
 - trips a PTX cache key reuse between different call sites that
   happen to hash the same way.
 
+## 2026-04-20 🎉 FIRST FIX: missing startPos in shared-KV path
+
+Running with `HESPER_PREFILL_TWICE=1` (call forwardPrefillBatch twice
+with the SAME args) produced correct output: "The value of 2+2 is 4."
+This ruled out state corruption (state is fine when args are the same).
+
+So the bug was in how the 2nd call's DIFFERENT args (startPos > 0) were
+being propagated.  Audit found that line 3147 — the shared-KV batched
+path (not the regular full-attn batched path) — was still writing
+`state.paramsBuf[0] = 0` instead of `startPos.toUInt32`:
+
+```lean
+| some freqFactors, false =>
+    ...
+    GPUBackend.writeBufferOffset ctx state.paramsBuf 0
+      (Hesper.WebGPU.BufferOps.uint32ToBytes 0)  ← was 0, fixed to startPos.toUInt32
+```
+
+Since Gemma 4 has full-attn and shared-KV layers interleaved, this meant
+shared-KV layers attended with startPos=0 while full-attn layers used
+startPos=18 — a layer-by-layer inconsistency.
+
+### Immediate effect after fix:
+
+| Prompt | Before | After |
+|--------|--------|-------|
+| "The capital of France is" | "The<turn\|>" | **"The capital of France is Paris."** ✓ |
+| "What is 2+2?" | "The<turn\|>" | "The answer is the answer is the answer..." (looping) |
+| "Write a poem about autumn." | — | "The amber, the amber, the amber..." (looping) |
+| "Hello, how are you?" | — | "I'm doing well, thanks! I'm doing well, thanks! ..." (looping) |
+
+The magnitude-halving is GONE — no more early EOS.  But prompts that
+require multi-token coherent answers still loop, suggesting a similar
+missing-startPos bug elsewhere (most likely another kernel reading
+cached state from prefill time).
+
+TPS under HESPER_UNIFIED_DECODE=1 is 9 TPS — much slower than single
+path (39 TPS).  The slowdown is from `mkBuf` calls per
+forwardPrefillBatch invocation (~16 × 2560-float bufs = ~80 MB of
+alloc/free per token).  Once correctness is done, moving batch buffers
+to state will recover TPS.
+
+### Remaining bug hypothesis: 3-token decode cycle "answer is the"
+
+The cycle suggests attention is aligning each new query with a fixed
+earlier position instead of the most-recent one.  Possible causes:
+- Some cache-write path still uses startPos=0, so slot 18 is not
+  being written.
+- The `posF32Buf` (used by Circuit DSL scatter) may also need a
+  startPos-aware update.
+- PLE precompute may be reading from the wrong column of
+  `batchPLInputAll` across decode steps.
+
+Worth checking next:
+- All uses of `state.posF32Buf` in forwardPrefillBatch.
+- The Circuit DSL scatter path for RoPE-K+KV-write (line 2180+ in
+  forwardBlock, invoked when HESPER_SCATTER_KV=1).
+- Whether the cache writes at line 3097 (ropeKKvWBatch) actually use
+  absolute position or just col offset.
+
 ## 2026-04-20 EVEN FINAL-ER: all quant kernels bypassed, still broken
 
 Tested combinations:
