@@ -3144,7 +3144,7 @@ def forwardPrefillBatch [GPUBackend β] (ctx : β)
         handledByBatched := true
         let kvCache := state.kvCaches[kvLi]
         GPUBackend.writeBufferOffset ctx state.paramsBuf 0
-          (Hesper.WebGPU.BufferOps.uint32ToBytes 0)
+          (Hesper.WebGPU.BufferOps.uint32ToBytes startPos.toUInt32)
         -- Q-only norm, grid (numHeads, seqLen, 1).
         ce s!"qNormBatch_{headDim}"
           (perHeadRMSNormBatchKernel numHeads headDim seqLen cfg.rmsNormEps)
@@ -4100,6 +4100,11 @@ def generate [GPUBackend β] (ctx : β) (model : Gemma4Model (GPUBackend.Buf β)
   if useBatch then
     IO.println s!"[Prefill] Batched path (seqLen={promptTokens.size})"
     forwardPrefillBatch ctx model promptTokens state (kcr := some kcr)
+    -- HESPER_PREFILL_TWICE=1: run prefill a second time with the same args
+    -- to test whether forwardPrefillBatch is idempotent on shared state.
+    if (← IO.getEnv "HESPER_PREFILL_TWICE").isSome then
+      IO.println "[Prefill] TWICE mode: calling forwardPrefillBatch again with same args"
+      forwardPrefillBatch ctx model promptTokens state (kcr := some kcr)
   else
     for i in [0:promptTokens.size] do
       if i >= model.config.maxSeqLen then break
