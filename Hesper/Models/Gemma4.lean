@@ -2046,6 +2046,13 @@ def forwardBlock [GPUBackend β] (ctx : β)
   let useFusedNormQKV := useFusedQKV
                       && block.attention.wQ.config.inDim == block.attnNorm.config.dim
                       && block.attention.wQ.config.inDim % 256 == 0
+  -- Shared-KV layer fast path: RMSNorm fused with the single wQ matmul.
+  -- Applies when this layer has no own K/V (cfg.hasKV li = false) but still
+  -- needs Q, and the shape constraints for dp4a Q8_1 quantize hold.
+  let useFusedNormWQ := !cfg.hasKV li
+                    && block.attention.wQ.quantFormat == .Q4_K
+                    && block.attention.wQ.config.inDim == block.attnNorm.config.dim
+                    && block.attention.wQ.config.inDim % 256 == 0
   if useFusedNormQKV then
     Hesper.WGSL.Execute.withSection "attnNormQKV" do
       let key := hash ("qkvFusedNormDP4A",
@@ -2057,6 +2064,10 @@ def forwardBlock [GPUBackend β] (ctx : β)
       Linear.forwardFusedNormQKV ctx block.attnNorm
         block.attention.wQ block.attention.wK block.attention.wV
         inputBuf state.qBuf state.kBuf state.vBuf kvRef
+  else if useFusedNormWQ then
+    Hesper.WGSL.Execute.withSection "attnNormWQ" do
+      Linear.forwardFusedNormWQ ctx block.attnNorm block.attention.wQ
+        inputBuf state.qBuf
   else do
     -- Standalone attnNorm via Circuit DSL.
     Hesper.WGSL.Execute.withSection "attnNorm" do
