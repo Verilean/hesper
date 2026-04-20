@@ -2908,7 +2908,7 @@ def forwardPrefillBatch [GPUBackend β] (ctx : β)
     -- GPU-side: copy tokenIdsBuf[i] → state.tokenBuf[0]
     let idxBytes := Hesper.WebGPU.BufferOps.uint32ToBytes i.toUInt32
     GPUBackend.writeBufferOffset ctx colIdxBuf 0 idxBytes
-    GPUBackend.execute ctx
+    ce s!"copyU32FromTokIds_sl{seqLen}"
       (copyU32Kernel seqLen 1 0)
       [("src", tokenIdsBuf), ("params", colIdxBuf), ("dst", state.tokenBuf)]
       { numWorkgroups := (1, 1, 1), workgroupSize := { x := 1, y := 1, z := 1 } }
@@ -2922,7 +2922,7 @@ def forwardPrefillBatch [GPUBackend β] (ctx : β)
       Embedding.forward ctx model.embedding state.tokenBuf state.buf1 1 1
     -- Copy state.buf1 → batchBuf1 column i
     GPUBackend.writeBufferOffset ctx colIdxBuf 0 idxBytes
-    GPUBackend.execute ctx
+    ce s!"colInsEmbd_sl{seqLen}"
       (columnInsertKernel dim seqLen)
       [("src", state.buf1), ("params", colIdxBuf), ("batch", batchBuf1)]
       (.dispatch1D dim)
@@ -3000,7 +3000,7 @@ def forwardPrefillBatch [GPUBackend β] (ctx : β)
         (.dispatch1D totalPL)
       let colIdxBytes := Hesper.WebGPU.BufferOps.uint32ToBytes i.toUInt32
       GPUBackend.writeBufferOffset ctx colIdxBuf 0 colIdxBytes
-      GPUBackend.execute ctx
+      ce s!"colExtrScaledEmb_sl{seqLen}"
         (columnExtractKernel dim seqLen)
         [("batch", batchBuf2), ("params", colIdxBuf), ("out", state.buf1)]
         (.dispatch1D dim)
@@ -3123,14 +3123,34 @@ def forwardPrefillBatch [GPUBackend β] (ctx : β)
           let b ← GPUBackend.allocBuffer ctx batchQ8Bytes
           state.prefillAttnQ8BufRef.set (some (b, batchQ8Bytes))
           pure b
-      GPUBackend.executeWithConfig ctx
+      ce s!"attnNormQ8_1_sl{seqLen}_d{dim}"
         (RMSNorm.fusedRMSNormQ8_1Kernel block.attnNorm.config seqLen 256)
         [("input", currentBuf), ("scale", block.attnNorm.scale), ("output", batchQ8Buf)]
         { workgroupSize := { x := 256 }, numWorkgroups := (seqLen, 1, 1) }
+      -- kcr-scoped per-layer refs so prefill (seqLen=N) and unified-decode
+      -- (seqLen=1) each get their own cached dispatch and don't collide.
+      let wQKey := hash ("q4k-batch-matmul-q8-attn", li, "wQ",
+        block.attention.wQ.config.inDim, block.attention.wQ.config.outDim, seqLen)
+      let wQRef ← match kcr with
+        | some k => k.getRef wQKey |>.map some
+        | none   => pure none
       Linear.forwardBatchDP4A_fromQ8 ctx block.attention.wQ batchQ8Buf batchQBuf seqLen
+        (refOverride := wQRef)
       if cfg.hasKV li then
+        let wKKey := hash ("q4k-batch-matmul-q8-attn", li, "wK",
+          block.attention.wK.config.inDim, block.attention.wK.config.outDim, seqLen)
+        let wVKey := hash ("q4k-batch-matmul-q8-attn", li, "wV",
+          block.attention.wV.config.inDim, block.attention.wV.config.outDim, seqLen)
+        let wKRef ← match kcr with
+          | some k => k.getRef wKKey |>.map some
+          | none   => pure none
+        let wVRef ← match kcr with
+          | some k => k.getRef wVKey |>.map some
+          | none   => pure none
         Linear.forwardBatchDP4A_fromQ8 ctx block.attention.wK batchQ8Buf batchKBuf seqLen
+          (refOverride := wKRef)
         Linear.forwardBatchDP4A_fromQ8 ctx block.attention.wV batchQ8Buf batchVBuf seqLen
+          (refOverride := wVRef)
     else
       -- Q6_K fallback: RMSNorm into batchNormedBuf as scratch (CANNOT use
       -- batchBuf1 since it may alias currentBuf during ping-pong).  Then
@@ -3480,12 +3500,24 @@ def forwardPrefillBatch [GPUBackend β] (ctx : β)
           let b ← GPUBackend.allocBuffer ctx ffnQ8Bytes
           state.prefillFfnQ8BufRef.set (some (b, ffnQ8Bytes))
           pure b
-      GPUBackend.executeWithConfig ctx
+      ce s!"ffnNormQ8_1_sl{seqLen}_d{dim}"
         (RMSNorm.fusedRMSNormQ8_1Kernel block.ffnNorm.config seqLen 256)
         [("input", batchAttnResidBuf), ("scale", block.ffnNorm.scale), ("output", ffnBatchQ8Buf)]
         { workgroupSize := { x := 256 }, numWorkgroups := (seqLen, 1, 1) }
+      let gateKey := hash ("q4k-batch-matmul-q8-ffn", li, "gate",
+        block.ffn.gate.config.inDim, block.ffn.gate.config.outDim, seqLen)
+      let upKey := hash ("q4k-batch-matmul-q8-ffn", li, "up",
+        block.ffn.up.config.inDim, block.ffn.up.config.outDim, seqLen)
+      let gateRef ← match kcr with
+        | some k => k.getRef gateKey |>.map some
+        | none   => pure none
+      let upRef ← match kcr with
+        | some k => k.getRef upKey |>.map some
+        | none   => pure none
       Linear.forwardBatchDP4A_fromQ8 ctx block.ffn.gate ffnBatchQ8Buf batchGateBuf seqLen
+        (refOverride := gateRef)
       Linear.forwardBatchDP4A_fromQ8 ctx block.ffn.up ffnBatchQ8Buf batchUpBuf seqLen
+        (refOverride := upRef)
     else
       -- FFN Q6_K fallback: normedBuf can't be batchBuf1 (ping-pong alias).
       -- Throwaway ref: transient batch buffers.

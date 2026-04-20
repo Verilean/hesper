@@ -3422,13 +3422,30 @@ def forwardBatchDP4A [GPUBackend β] (ctx : β)
 def forwardBatchDP4A_fromQ8 [GPUBackend β] (ctx : β)
     (layer : LinearLayer (GPUBackend.Buf β) (GPUBackend.CachedDispatch β))
     (q8Buf outputBuf : GPUBackend.Buf β)
-    (seqLen : Nat) : IO Unit := do
+    (seqLen : Nat)
+    (refOverride : Option (IO.Ref (Option (GPUBackend.CachedDispatch β))) := none)
+    : IO Unit := do
   if layer.quantFormat != .Q4_K then
     throw (IO.userError s!"forwardBatchDP4A_fromQ8: only Q4_K, got {repr layer.quantFormat}")
-  GPUBackend.executeWithConfig ctx
+  -- Cache the (q4kMatmulBatchKernel, seqLen) dispatch so the 2nd+
+  -- forwardPrefillBatch call replays it instead of re-running generatePTX
+  -- + cuModuleLoad (~350µs × 126 calls = ~44ms/token of pure JIT overhead
+  -- that was eating half the decode budget).
+  --
+  -- `layer.dp4aBatchMatmulPrepared` is seqLen-agnostic, so sharing it
+  -- between prefill (seqLen=N) and unified-decode (seqLen=1) would make
+  -- the 2nd path replay a wrong-shape dispatch.  Caller passes a
+  -- seqLen-specific `refOverride` in that case (typically a kcr-backed
+  -- ref keyed on seqLen); absent an override we fall back to the shared
+  -- layer ref.
+  let ref := refOverride.getD layer.dp4aBatchMatmulPrepared
+  let cacheKey : UInt64 := hash ("q4k-batch-matmul-q8",
+    layer.config.inDim, layer.config.outDim, seqLen)
+  GPUBackend.executeWithConfigCached ctx
     (q4kMatmulBatchKernel layer.config seqLen)
     [("weights", layer.weightBuf), ("input_q8", q8Buf), ("output", outputBuf)]
     { numWorkgroups := (layer.config.outDim, seqLen, 1), workgroupSize := { x := 32, y := 1, z := 1 } }
+    cacheKey ref
 
 /-- Execute the linear layer: output = input @ weights^T
 
