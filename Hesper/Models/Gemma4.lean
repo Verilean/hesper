@@ -216,6 +216,23 @@ def embeddingScaleKernel (size : Nat) (hiddenSize : Nat) : ShaderM Unit := do
     ShaderM.writeBuffer (ty := .scalar .f32) "output" idx result
   ) (pure ())
 
+/-- In-place batched broadcast multiply: `buf[i] *= scale[0]` for all
+    `i in [0, total)`.  Replaces the per-column
+    `extract → runCachedFused(scaleByBroadcast) → insert` chain used by
+    Gemma 4's per-layer output-scale step.  One dispatch over the whole
+    `[dim, seqLen]` batch tensor; the scale is a single f32. -/
+def batchBroadcastScaleInPlaceKernel (total : Nat) : ShaderM Unit := do
+  let gid ← ShaderM.globalId
+  let idx := Exp.vec3X gid
+  let _buf ← ShaderM.declareStorageBuffer "buf"
+    (.array (.scalar .f32) total) .readWrite
+  let _scale ← ShaderM.declareInputBuffer "scale" (.array (.scalar .f32) 1)
+  ShaderM.if_ (Exp.lt idx (Exp.litU32 total)) (do
+    let s ← ShaderM.readBuffer (ty := .scalar .f32) (n := 1) "scale" (Exp.litU32 0)
+    let v ← ShaderM.readBuffer (ty := .scalar .f32) (n := total) "buf" idx
+    ShaderM.writeBuffer (ty := .scalar .f32) "buf" idx (Exp.mul v s)
+  ) (pure ())
+
 /-- Fused post-norm + residual-add kernel, in place on the residual
     buffer. Replaces the 3-dispatch chain used by the per-layer
     embedding:
@@ -1756,6 +1773,13 @@ structure InferenceState (BufT CacheT : Type) where
   lmHeadQ8Buf : IO.Ref (Option BufT)
   lmHeadQuantizePrepared : IO.Ref (Option CacheT)
   lmHeadDP4APrepared : IO.Ref (Option CacheT)
+  -- Pooled Q8_1 scratch buffers used by forwardPrefillBatch, one for the
+  -- attention input path and one for the FFN input path.  Stored as
+  -- `(ref, sizeBytes)`; we reuse when the request fits, reallocate when it
+  -- doesn't.  Eliminates 2 × layers × 2 = ~168 cudaMalloc/cudaFree calls
+  -- per decode token at seqLen=1.
+  prefillAttnQ8BufRef : IO.Ref (Option (BufT × USize))
+  prefillFfnQ8BufRef  : IO.Ref (Option (BufT × USize))
   /-- Pinned host pointer (4 bytes).  See §CUDA Graph notes in the
       InferenceState doc header. -/
   stagingTokenPtr   : USize := 0
@@ -1855,6 +1879,8 @@ def createInferenceState [GPUBackend β] (ctx : β) (cfg : Config) : IO (Inferen
     lmHeadQ8Buf := ← IO.mkRef none
     lmHeadQuantizePrepared := ← GPUBackend.newCacheRef (β := β)
     lmHeadDP4APrepared := ← GPUBackend.newCacheRef (β := β)
+    prefillAttnQ8BufRef := ← IO.mkRef none
+    prefillFfnQ8BufRef  := ← IO.mkRef none
     -- Pinned-host staging (CUDA only; zero on other backends).  Using
     -- IO.getEnv as a crude backend check for now — a typeclass method
     -- `allocPinnedHost` on GPUBackend is the proper extension point.
@@ -3024,7 +3050,22 @@ def forwardPrefillBatch [GPUBackend β] (ctx : β)
                      && block.attention.wV.quantFormat == .Q4_K))
     if allQ4K then
       let batchQ8Bytes : USize := (nQ8Blocks * 9 * seqLen * 4).toUSize
-      let batchQ8Buf ← GPUBackend.allocBuffer ctx batchQ8Bytes
+      -- Pooled Q8_1 scratch: reuse an existing state buffer if it's large
+      -- enough, otherwise free and re-alloc.  Saves ~84 cudaMalloc/free per
+      -- decode token (2 × 42 layers).  Pool lifetime: until InferenceState
+      -- is dropped (no explicit free here).
+      let batchQ8Buf ← do
+        match ← state.prefillAttnQ8BufRef.get with
+        | some (b, sz) => if sz >= batchQ8Bytes then pure b
+                          else
+                            GPUBackend.freeBuffer ctx b
+                            let b' ← GPUBackend.allocBuffer ctx batchQ8Bytes
+                            state.prefillAttnQ8BufRef.set (some (b', batchQ8Bytes))
+                            pure b'
+        | none =>
+          let b ← GPUBackend.allocBuffer ctx batchQ8Bytes
+          state.prefillAttnQ8BufRef.set (some (b, batchQ8Bytes))
+          pure b
       GPUBackend.executeWithConfig ctx
         (RMSNorm.fusedRMSNormQ8_1Kernel block.attnNorm.config seqLen 256)
         [("input", currentBuf), ("scale", block.attnNorm.scale), ("output", batchQ8Buf)]
@@ -3033,7 +3074,6 @@ def forwardPrefillBatch [GPUBackend β] (ctx : β)
       if cfg.hasKV li then
         Linear.forwardBatchDP4A_fromQ8 ctx block.attention.wK batchQ8Buf batchKBuf seqLen
         Linear.forwardBatchDP4A_fromQ8 ctx block.attention.wV batchQ8Buf batchVBuf seqLen
-      GPUBackend.freeBuffer ctx batchQ8Buf
     else
       -- Q6_K fallback: RMSNorm into batchNormedBuf as scratch (CANNOT use
       -- batchBuf1 since it may alias currentBuf during ping-pong).  Then
@@ -3369,14 +3409,26 @@ def forwardPrefillBatch [GPUBackend β] (ctx : β)
                   && !ffnFastDisabled
     if ffnAllQ4K then
       let ffnQ8Bytes : USize := (nQ8Blocks * 9 * seqLen * 4).toUSize
-      let ffnBatchQ8Buf ← GPUBackend.allocBuffer ctx ffnQ8Bytes
+      -- Pooled FFN Q8_1 scratch (separate from the attention-side pool so
+      -- they can coexist within a single block's forward without clashing).
+      let ffnBatchQ8Buf ← do
+        match ← state.prefillFfnQ8BufRef.get with
+        | some (b, sz) => if sz >= ffnQ8Bytes then pure b
+                          else
+                            GPUBackend.freeBuffer ctx b
+                            let b' ← GPUBackend.allocBuffer ctx ffnQ8Bytes
+                            state.prefillFfnQ8BufRef.set (some (b', ffnQ8Bytes))
+                            pure b'
+        | none =>
+          let b ← GPUBackend.allocBuffer ctx ffnQ8Bytes
+          state.prefillFfnQ8BufRef.set (some (b, ffnQ8Bytes))
+          pure b
       GPUBackend.executeWithConfig ctx
         (RMSNorm.fusedRMSNormQ8_1Kernel block.ffnNorm.config seqLen 256)
         [("input", batchAttnResidBuf), ("scale", block.ffnNorm.scale), ("output", ffnBatchQ8Buf)]
         { workgroupSize := { x := 256 }, numWorkgroups := (seqLen, 1, 1) }
       Linear.forwardBatchDP4A_fromQ8 ctx block.ffn.gate ffnBatchQ8Buf batchGateBuf seqLen
       Linear.forwardBatchDP4A_fromQ8 ctx block.ffn.up ffnBatchQ8Buf batchUpBuf seqLen
-      GPUBackend.freeBuffer ctx ffnBatchQ8Buf
     else
       -- FFN Q6_K fallback: normedBuf can't be batchBuf1 (ping-pong alias).
       -- Throwaway ref: transient batch buffers.
@@ -3504,38 +3556,18 @@ def forwardPrefillBatch [GPUBackend β] (ctx : β)
     -- `pre_out_scaled-<li>`.
     dumpGolden s!"pre_out_scaled-{li}" nextBuf (dim * seqLen)
 
-    -- Layer output scale (per-token) — uses Circuit DSL scalar broadcast multiply
+    -- Layer output scale (per-token).  In-place broadcast multiply over the
+    -- entire [dim, seqLen] batch tensor — 1 dispatch total, no per-column
+    -- extract/insert.  Replaces a `for i in [0:seqLen]` chain of 3 dispatches
+    -- per column (84 saved at seqLen=1 × 42 layers).
     let skipOutScale := (← IO.getEnv "HESPER_SKIP_OUTSCALE").isSome
     match if skipOutScale then none else block.outScale with
     | some scale =>
-      for i in [0:seqLen] do
-        let colIdxBytes := Hesper.WebGPU.BufferOps.uint32ToBytes i.toUInt32
-        GPUBackend.writeBufferOffset ctx colIdxBuf 0 colIdxBytes
-        GPUBackend.execute ctx
-          (columnExtractKernel dim seqLen)
-          [("batch", nextBuf), ("params", colIdxBuf), ("out", state.buf2)]
-          (.dispatch1D dim)
-        -- output[j] = buf2[j] * scale[0] via Circuit DSL runCachedFused
-        let key := hash ("batchPrefillOutScale", dim, li)
-        let ccRef ← Hesper.Circuit.getGlobalCircuitRef (β := β) key
-        Hesper.Circuit.runCachedFused ctx ccRef
-          (do
-            let x ← Hesper.Circuit.CircuitM.registerExternal
-                      (BufT := GPUBackend.Buf β) (CacheT := GPUBackend.CachedDispatch β)
-                      state.buf2 #[dim] .f32 .Global
-            let s ← Hesper.Circuit.CircuitM.registerExternal
-                      (BufT := GPUBackend.Buf β) (CacheT := GPUBackend.CachedDispatch β)
-                      scale #[1] .f32 .Global
-            let scaled ← Hesper.Circuit.CircuitM.scaleByBroadcast x s
-            let _out   ← Hesper.Circuit.CircuitM.map scaled
-                           (.mul (.input 0) (.const 1.0))
-            pure ())
-          -- ids: 0=x (state.buf2), 1=s (scale), 3=final map output written back.
-          [(0, state.buf2), (1, scale), (3, state.buf2)]
-        GPUBackend.execute ctx
-          (columnInsertKernel dim seqLen)
-          [("src", state.buf2), ("params", colIdxBuf), ("batch", nextBuf)]
-          (.dispatch1D dim)
+      let total := dim * seqLen
+      ce s!"batchPrefillOutScale_{dim}"
+        (batchBroadcastScaleInPlaceKernel total)
+        [("buf", nextBuf), ("scale", scale)]
+        (.dispatch1D total)
     | none => pure ()
 
     -- Per-layer batch Q8_1 buffers are freed inside their respective
