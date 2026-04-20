@@ -96,6 +96,31 @@ a *second* time with the same InferenceState and an incremented
 - trips a PTX cache key reuse between different call sites that
   happen to hash the same way.
 
+## 2026-04-20 EVEN FINAL-ER: all quant kernels bypassed, still broken
+
+Tested combinations:
+- `HESPER_DP4A_Q6K=0` (bypass fused RMSNorm+Q8_1 + Q6_K lm_head): STILL broken
+- `HESPER_DP4A=0` (disable entire dp4a path — uses split-K F32 fallback): STILL broken
+
+So the bug is NOT in any of:
+- fusedRMSNormQ8_1 (final norm)
+- fusedQ6KLinearDP4A4RowKernel (lm_head dp4a)
+- The entire dp4a code path
+
+The only remaining place for the bug is:
+- forwardPrefillBatch's first 42-block loop producing different hidden
+  states on 2nd call than 1st call
+- Even though state.buf2 at PREFILL END is bit-identical, the
+  DECODE-STEP-1 buf2 is subtly wrong.
+
+Strongest evidence now: **the 2nd `forwardPrefillBatch` call, regardless
+of all kernel-level configurations, produces half-magnitude logits**.
+
+Given we've bypassed all known-shared kernel optimisations and the bug
+persists, the likely remaining culprit is at the **InferenceState
+level**: a buffer that gets reused between calls and carries stale
+state across the forwardPrefillBatch→forwardPrefillBatch boundary.
+
 ## 2026-04-20 FINAL: bypass fused kernel doesn't fix — bug is upstream
 
 Test: HESPER_DP4A_Q6K=0 forces the f32 fallback path

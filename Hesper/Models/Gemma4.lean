@@ -2695,6 +2695,8 @@ def forwardPrefillBatch [GPUBackend β] (ctx : β)
     (kcr : Option (KernelCacheRefs (GPUBackend.CachedDispatch β)) := none)
     (startPos : Nat := 0) : IO Unit := do
   let seqLen := promptTokens.size
+  if (← IO.getEnv "HESPER_PREFILL_TRACE").isSome then
+    IO.println s!"[prefillBatch] startPos={startPos} seqLen={seqLen} tokens={promptTokens.toList}"
   if seqLen == 0 then return
   -- `startPos` > 0 enables using this function for continuation / decode:
   -- the N tokens in `promptTokens` are written to KV cache slots
@@ -2737,6 +2739,16 @@ def forwardPrefillBatch [GPUBackend β] (ctx : β)
   let batchUpBuf ← mkBuf (interSize * seqLen)
   let batchGeluBuf ← mkBuf (interSize * seqLen)
   let batchFFNOutBuf ← mkBuf (dim * seqLen)
+  -- HESPER_ZERO_BATCH=1: zero-init all batch buffers via write of zeros.
+  -- Used to rule out uninitialised-memory bugs in unified decode.
+  if (← IO.getEnv "HESPER_ZERO_BATCH").isSome then
+    let zero4 : ByteArray := ByteArray.mk #[0,0,0,0]
+    -- Only write 4B to trigger the path; full zero-init is unnecessary
+    -- because every kernel writes every element it reads.  If ZERO_BATCH
+    -- FIXES the bug, that means an unexpected kernel IS reading uninit mem.
+    -- For now, leave as a no-op marker; full memset wiring requires
+    -- extending GPUBackend.  Skipping.
+    let _ := zero4
   -- Scaled embedding cache: PLE input uses the embedding (not per-layer output)
   let batchScaledEmbdBuf ← mkBuf (dim * seqLen)
   -- PLE batched scratch: inpGate output, gelu*gate*slice output, proj output.
