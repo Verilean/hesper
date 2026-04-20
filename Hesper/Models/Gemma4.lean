@@ -2036,20 +2036,30 @@ def forwardBlock [GPUBackend β] (ctx : β)
   --
   -- Falls back to the prior 4-dispatch sequence otherwise: standalone
   -- RMSNorm via Circuit DSL, then `forwardFusedQKV` reading normedBuf.
-  let useFusedQKV := cfg.hasKV li
+  -- HESPER_FUSION_DISABLE=1 forces every Q4_K matmul through the plain
+  -- `forwardDP4A` path so the llama.cpp-PTX override (if installed) is
+  -- actually used by all QKV/gate/up/down matmuls — otherwise fused
+  -- helpers use hesper's own Q8_1 layout and the override only covers
+  -- unfused matmuls, producing a mixed-precision regime that garbles
+  -- output.  Turn this on together with HESPER_USE_LLAMACPP_PTX=1.
+  let disableFusion := (← IO.getEnv "HESPER_FUSION_DISABLE").isSome
+  let useFusedQKV := !disableFusion
+                  && cfg.hasKV li
                   && block.attention.wQ.quantFormat == .Q4_K
                   && block.attention.wK.quantFormat == .Q4_K
                   && block.attention.wV.quantFormat == .Q4_K
                   && block.attention.wK.config.inDim == block.attention.wQ.config.inDim
                   && block.attention.wV.config.inDim == block.attention.wQ.config.inDim
                   && block.attention.wK.config.outDim == block.attention.wV.config.outDim
-  let useFusedNormQKV := useFusedQKV
+  let useFusedNormQKV := !disableFusion
+                      && useFusedQKV
                       && block.attention.wQ.config.inDim == block.attnNorm.config.dim
                       && block.attention.wQ.config.inDim % 256 == 0
   -- Shared-KV layer fast path: RMSNorm fused with the single wQ matmul.
   -- Applies when this layer has no own K/V (cfg.hasKV li = false) but still
   -- needs Q, and the shape constraints for dp4a Q8_1 quantize hold.
-  let useFusedNormWQ := !cfg.hasKV li
+  let useFusedNormWQ := !disableFusion
+                    && !cfg.hasKV li
                     && block.attention.wQ.quantFormat == .Q4_K
                     && block.attention.wQ.config.inDim == block.attnNorm.config.dim
                     && block.attention.wQ.config.inDim % 256 == 0
@@ -2508,11 +2518,14 @@ def forwardBlock [GPUBackend β] (ctx : β)
     -- A/B confirmed 2026-04-16: fused path is 5.6 TPS faster than the
     -- unfused 2-matmul+geluMul alternative (148 µs/layer vs 122 µs/layer
     -- for the heavy kernel).
-    let useFused := block.ffn.gate.quantFormat == .Q4_K
+    let disableFusion := (← IO.getEnv "HESPER_FUSION_DISABLE").isSome
+    let useFused := !disableFusion
+                  && block.ffn.gate.quantFormat == .Q4_K
                   && block.ffn.up.quantFormat == .Q4_K
                   && block.ffn.gate.config.inDim == block.ffn.up.config.inDim
                   && block.ffn.gate.config.outDim == block.ffn.up.config.outDim
-    let useFusedNorm := useFused
+    let useFusedNorm := !disableFusion
+                     && useFused
                      && block.ffn.gate.config.inDim == block.ffnNorm.config.dim
                      && block.ffn.gate.config.inDim % 256 == 0
     if useFusedNorm then
@@ -3022,16 +3035,18 @@ def forwardPrefillBatch [GPUBackend β] (ctx : β)
     batchPLInputAllOpt := some batchPLInputAll
     for i in [0:seqLen] do
       let tokenId := promptTokens[i]!
-      let tokenIdBytes := Hesper.WebGPU.BufferOps.uint32ToBytes tokenId.toUInt32
-      GPUBackend.writeBufferOffset ctx state.plRawRowBuf 0 tokenIdBytes
+      -- Pin tokenId and colIdx through the state pinned slots so a CUDA
+      -- Graph can capture this loop (Lean ByteArray host pointers would
+      -- otherwise be baked in and invalidated by GC across captures).
+      writeScalarViaStaging ctx state.plRawRowBuf 0 state.stagingPLRowPtr 0
+        (Hesper.WebGPU.BufferOps.uint32ToBytes tokenId.toUInt32)
       let scaleFactor : Float := Float.sqrt embdPL.toFloat
       ce "q6kDequantScale_pf"
         (Hesper.Quantization.Q6_K.q6kTableRowDequantScaleKernel totalPL scaleFactor
           cfg.vocabSize)
         [("table", embdTableGPU), ("params", state.plRawRowBuf), ("output", state.plModelProj)]
         (.dispatch1D totalPL)
-      let colIdxBytes := Hesper.WebGPU.BufferOps.uint32ToBytes i.toUInt32
-      GPUBackend.writeBufferOffset ctx colIdxBuf 0 colIdxBytes
+      writeColIdxU32 colIdxBuf i
       ce s!"colExtrScaledEmb_sl{seqLen}"
         (columnExtractKernel dim seqLen)
         [("batch", batchBuf2), ("params", colIdxBuf), ("out", state.buf1)]
@@ -3058,8 +3073,7 @@ def forwardPrefillBatch [GPUBackend β] (ctx : β)
       -- Copy the per-token plInputAll into column `i` of the batched
       -- buffer via a params-indexed kernel so the PTX cache key does
       -- NOT embed `i` (otherwise every iteration is a JIT miss).
-      let colIdxBytes2 := Hesper.WebGPU.BufferOps.uint32ToBytes i.toUInt32
-      GPUBackend.writeBufferOffset ctx colIdxBuf 0 colIdxBytes2
+      writeColIdxU32 colIdxBuf i
       let copyShader : ShaderM Unit := do
         let gid ← ShaderM.globalId
         let k := Exp.vec3X gid
