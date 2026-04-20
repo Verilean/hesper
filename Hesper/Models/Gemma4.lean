@@ -2766,11 +2766,23 @@ def forwardPrefillBatch [GPUBackend β] (ctx : β)
   -- capture mode the `writeBufferOffset` path would record a memcpy
   -- with the Lean `ByteArray`'s host pointer — moved by GC between
   -- captures.  `writeScalarViaStaging` routes through the pinned-host
-  -- slot at `state.stagingColIdxPtr`, giving the graph a stable source
-  -- address.  Outside capture it falls back to the normal path.
+  -- slot, giving the graph a stable source address.  Outside capture
+  -- it falls back to the normal path.
+  --
+  -- Single `stagingColIdxPtr` is OK here because:
+  --   * The colIdxBuf write sites reachable during unified decode
+  --     (seqLen=1, `handledByBatched = true`) all store the SAME
+  --     value, `0`, so multiple recorded memcpy nodes sharing the
+  --     slot read the same scalar.
+  --   * The paramsBuf write (startPos) uses a separate pinned slot
+  --     via `state.stagingParamsPtr`.
   let writeColIdxU32 := fun (buf : GPUBackend.Buf β) (v : Nat) => do
     let bytes := Hesper.WebGPU.BufferOps.uint32ToBytes v.toUInt32
     writeScalarViaStaging ctx buf 0 state.stagingColIdxPtr 0 bytes
+  let writeParamsU32At := fun (offset : USize) (v : Nat) => do
+    let bytes := Hesper.WebGPU.BufferOps.uint32ToBytes v.toUInt32
+    writeScalarViaStaging ctx state.paramsBuf offset
+      state.stagingParamsPtr offset bytes
 
   -- ── Allocate prefill-sized batch buffers (column-major) ──────────────
   let batchBuf1 ← mkBuf (dim * seqLen)       -- ping-pong A
@@ -2916,8 +2928,7 @@ def forwardPrefillBatch [GPUBackend β] (ctx : β)
   -- ── Step 1: Embedding lookup — per token into batch buffer ──────────
   for i in [0:seqLen] do
     -- GPU-side: copy tokenIdsBuf[i] → state.tokenBuf[0]
-    let idxBytes := Hesper.WebGPU.BufferOps.uint32ToBytes i.toUInt32
-    GPUBackend.writeBufferOffset ctx colIdxBuf 0 idxBytes
+    writeColIdxU32 colIdxBuf i
     ce s!"copyU32FromTokIds_sl{seqLen}"
       (copyU32Kernel seqLen 1 0)
       [("src", tokenIdsBuf), ("params", colIdxBuf), ("dst", state.tokenBuf)]
@@ -2930,8 +2941,8 @@ def forwardPrefillBatch [GPUBackend β] (ctx : β)
         (.dispatch1D dim)
     | _ =>
       Embedding.forward ctx model.embedding state.tokenBuf state.buf1 1 1
-    -- Copy state.buf1 → batchBuf1 column i
-    GPUBackend.writeBufferOffset ctx colIdxBuf 0 idxBytes
+    -- Copy state.buf1 → batchBuf1 column i  (same i, no re-write needed —
+    -- colIdxBuf already holds `i` from above).
     ce s!"colInsEmbd_sl{seqLen}"
       (columnInsertKernel dim seqLen)
       [("src", state.buf1), ("params", colIdxBuf), ("batch", batchBuf1)]
@@ -3212,8 +3223,7 @@ def forwardPrefillBatch [GPUBackend β] (ctx : β)
 
         -- Write startPos to paramsBuf[0]; the kernel treats wgid.y/z as
         -- the per-token offset (absolute position = startPos + col).
-        GPUBackend.writeBufferOffset ctx state.paramsBuf 0
-          (Hesper.WebGPU.BufferOps.uint32ToBytes startPos.toUInt32)
+        writeParamsU32At 0 startPos
 
         -- Batched fused QKV norm: grid (numHeads*seqLen, 3, 1).
         ce (if isFull then "qkvNormFullBatch" else "qkvNormSWABatch")
@@ -3274,8 +3284,7 @@ def forwardPrefillBatch [GPUBackend β] (ctx : β)
         -- Flow: Q-only batched norm → batched RoPE-Q → batched FA.
         handledByBatched := true
         let kvCache := state.kvCaches[kvLi]
-        GPUBackend.writeBufferOffset ctx state.paramsBuf 0
-          (Hesper.WebGPU.BufferOps.uint32ToBytes startPos.toUInt32)
+        writeParamsU32At 0 startPos
         -- Q-only norm, grid (numHeads, seqLen, 1).
         ce s!"qNormBatch_{headDim}"
           (perHeadRMSNormBatchKernel numHeads headDim seqLen cfg.rmsNormEps)
@@ -3721,8 +3730,10 @@ def forwardPrefillBatch [GPUBackend β] (ctx : β)
   -- ── Step 3: Extract last token → final norm → lm head ─────────────
   -- Copy last column of currentBuf → state.buf2 (single-token)
   let lastCol := seqLen - 1
-  let lastColBytes := Hesper.WebGPU.BufferOps.uint32ToBytes lastCol.toUInt32
-  GPUBackend.writeBufferOffset ctx colIdxBuf 0 lastColBytes
+  -- For seqLen=1 (unified decode) lastCol is always 0 so this reuses the
+  -- shared colIdx slot without value conflict.  For prefill we fall into
+  -- the graph-safe helper too but capture doesn't run for prefill.
+  writeColIdxU32 colIdxBuf lastCol
   GPUBackend.execute ctx
     (columnExtractKernel dim seqLen)
     [("batch", currentBuf), ("params", colIdxBuf), ("out", state.buf2)]
