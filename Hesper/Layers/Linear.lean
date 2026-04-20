@@ -3966,6 +3966,64 @@ def forwardFusedNormQKV [GPUBackend β] (ctx : β)
     (hash ("q4k-kv-dp4a", wK.config.inDim, wK.config.outDim))
     kvPreparedRef
 
+/-- Fused `RMSNorm → Q8_1 quantize → wQ dp4a matmul` for shared-KV layers
+    (Gemma 4's half of the transformer stack where K/V are reused from an
+    earlier layer).  Mirrors `forwardFusedNormQKV` but only produces Q —
+    no wK/wV projection.  Replaces the `circuitRMSNorm + runCached wQ`
+    pair (2 dispatches + a circuit-DSL pass) with 2 dispatches (fused
+    norm+quantize, then dp4a matmul) through a stable pair of
+    prepared-dispatch refs.
+
+    Rationale: Gemma 4 E4B has 21 shared-KV layers out of 42.  Eliminating
+    one dispatch per layer saves 21 × cuLaunchKernel (~40 µs/tok) and a
+    single D2H-less kernel launch on the replay path of CUDA Graphs. -/
+def forwardFusedNormWQ [GPUBackend β] (ctx : β)
+    (norm : RMSNorm.RMSNorm (GPUBackend.Buf β) (GPUBackend.CachedDispatch β))
+    (wQ : LinearLayer (GPUBackend.Buf β) (GPUBackend.CachedDispatch β))
+    (inputBuf qBuf : GPUBackend.Buf β)
+    : IO Unit := do
+  if wQ.quantFormat != .Q4_K then
+    throw (IO.userError "forwardFusedNormWQ: wQ must be Q4_K")
+  if wQ.config.inDim != norm.config.dim then
+    throw (IO.userError s!"forwardFusedNormWQ: dim mismatch norm={norm.config.dim} wQ.in={wQ.config.inDim}")
+  let useDP4A ← do
+    let on ← dp4aEnabled.get
+    pure (on && wQ.config.inDim % 32 == 0 && wQ.config.inDim % 256 == 0)
+  if !useDP4A then
+    throw (IO.userError "forwardFusedNormWQ: dp4a precondition failed; caller should fall back")
+  let nQ8Blocks := wQ.config.inDim / 32
+  let q8BufBytes : USize := (nQ8Blocks * 9 * 4).toUSize
+  let q8Buf ← match ← wQ.dp4aQ8Buf.get with
+    | some b => pure b
+    | none =>
+      let b ← GPUBackend.allocBuffer ctx q8BufBytes
+      wQ.dp4aQ8Buf.set (some b)
+      pure b
+  -- Fused RMSNorm + Q8_1 quantize.
+  GPUBackend.executeWithConfigCached ctx
+    (Hesper.Layers.RMSNorm.fusedRMSNormQ8_1Kernel norm.config)
+    [("input", inputBuf), ("scale", norm.scale), ("output", q8Buf)]
+    { numWorkgroups := (1, 1, 1), workgroupSize := { x := 256, y := 1, z := 1 } }
+    (hash ("fused-rmsnorm-q8_1", norm.config.dim))
+    wQ.dp4aQuantizePrepared
+  -- Q matmul.  Pick 2-row when outDim is even (typical).
+  let qIs2Row := wQ.config.outDim ≤ 5120 && wQ.config.outDim % 2 == 0
+  if qIs2Row then
+    GPUBackend.executeWithConfigCached ctx
+      (fusedQ4KMLinearDP4A2RowKernel wQ.config)
+      [("weights", wQ.weightBuf), ("input_q8", q8Buf), ("output", qBuf)]
+      { numWorkgroups := (wQ.config.outDim / 2, 1, 1)
+        workgroupSize := { x := 64, y := 1, z := 1 } }
+      (hash ("q4k-dp4a-matmul-2row", wQ.config.inDim, wQ.config.outDim))
+      wQ.dp4aMatmulPrepared
+  else
+    GPUBackend.executeWithConfigCached ctx
+      (fusedQ4KMLinearDP4AKernel wQ.config)
+      [("weights", wQ.weightBuf), ("input_q8", q8Buf), ("output", qBuf)]
+      { numWorkgroups := (wQ.config.outDim, 1, 1), workgroupSize := { x := 32, y := 1, z := 1 } }
+      (hash ("q4k-dp4a-matmul", wQ.config.inDim, wQ.config.outDim))
+      wQ.dp4aMatmulPrepared
+
 /-- Fused Q4_K dp4a wK + wV forward pass (attention KV projection).
 
     Runs `quantizeQ8_1` once on the shared input, then the fused dp4a
