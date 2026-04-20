@@ -562,16 +562,23 @@ def fusedRMSNormQ8_1Kernel (config : Config) (numRows : Nat := 1) (workgroupSize
     let qF32 := Exp.select (Exp.eq d (Exp.litF32 0.0))
                            (Exp.litF32 0.0) (Exp.div xNRef d)
     let qByte := Exp.bitAnd (Exp.roundToI32 qF32) (Exp.litU32 0xFF)
+    -- llama.cpp Q8_1 layout: block header is `half2(d, sum)` — NOT f32 d.
+    -- `sum` is the f32 sum of the *input* normalised values xN across the
+    -- 32-lane block (NOT the sum of quantised ints).  Computed via a
+    -- subgroup reduction so all lanes see the same value.
+    let sumName ← ShaderM.var (.scalar .f32) (Exp.subgroupAdd xNRef)
+    let sumVal : Exp (.scalar .f32) := Exp.var sumName
     -- Stage byte in shared mem (each lane writes its slot).
     ShaderM.writeWorkgroup (ty := .scalar .u32) "shared_q" localIdx qByte
     ShaderM.barrier
-    -- Write the d|s header (s=0; downstream Q4_K dp4a kernel ignores s
-    -- — see fusedQ4KMLinearDP4AKernel which reconstructs sums per
-    -- block from the int8 quants).  Lane 0 of each warp owns its block.
+    -- Write the half2(d, sum) header as a single packed u32 so the
+    -- downstream matmul (hesper's or llama.cpp's) can read `ds` as a
+    -- half2.  Lane 0 of each warp owns its block.
     let hdrOff := Exp.add outputRowBase (Exp.mul blockIdx (Exp.litU32 9))
     ShaderM.if_ (Exp.eq laneInW (Exp.litU32 0)) (do
-      let dBits : Exp (.scalar .u32) := Exp.bitcast d
-      ShaderM.writeBuffer (ty := .scalar .u32) "output" hdrOff dBits
+      let packed : Exp (.scalar .u32) :=
+        Exp.pack2x16float (Exp.vec2 d sumVal)
+      ShaderM.writeBuffer (ty := .scalar .u32) "output" hdrOff packed
     ) (pure ())
     -- Pack 4 bytes per output u32.  Lanes with laneInW % 4 == 0 (that
     -- is, lanes 0,4,8,…,28 within each warp) write one packed u32.
