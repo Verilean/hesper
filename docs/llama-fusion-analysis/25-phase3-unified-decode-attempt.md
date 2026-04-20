@@ -530,3 +530,80 @@ layer-level cache.
 Moving these to persistent `InferenceState` slots is the next step;
 the kernel-count reduction this enables is what makes Phase 3 a
 measurable win.
+
+---
+
+## Update 2026-04-20 evening: unified decode at 62 TPS
+
+Two more perf fixes stacked on the RMSNorm shape-guard:
+
+### Fix 3: `unifiedKcr` separate from prefill `kcr`
+
+`forwardPrefillBatch` takes an optional `kcr : KernelCacheRefs`; decode had
+been passing `none` (a debug leftover).  That bypassed `ce`-level cache
+lookup entirely, re-running `generatePTX + cuModuleLoad` for every
+dispatch on every token.  Fix: allocate a decode-local `unifiedKcr` in
+the generate loop and pass `some unifiedKcr` to the unified-decode call.
+Must be a *separate* cache from the prefill `kcr` because some `ce`
+cacheKeys inside `forwardPrefillBatch` don't include `seqLen` — a
+cached prefill (seqLen=18) dispatch would otherwise fire at decode
+(seqLen=1) shape.
+
+Measured: 10 → 12 TPS (+22%).  Small because most of the kernel cost
+actually came from `forwardBatchDP4A_fromQ8`, which goes through
+`GPUBackend.executeWithConfig` directly and not `ce`.
+
+### Fix 4: cache `forwardBatchDP4A_fromQ8` per (layer, seqLen)
+
+The real jump.  `Linear.forwardBatchDP4A_fromQ8` was calling
+`executeWithConfig` (non-cached), so the 210 Q4_K batched matmuls per
+decode token (wQ/wK/wV/gate/up × 42 layers) were each regenerating PTX
+→ ~70 ms/token of pure JIT overhead.  The weirdest part: there *was*
+a dedicated `layer.dp4aBatchMatmulPrepared` ref — it just wasn't
+wired into the function.
+
+Fix: add `refOverride : Option (IO.Ref ...)` parameter.  Default to
+`layer.dp4aBatchMatmulPrepared`; caller in `forwardPrefillBatch` passes
+kcr-backed per-(layer, role, seqLen) refs so prefill and unified decode
+each get their own ref pool.
+
+Measured:
+- 12-token "What is 2+2?": 12.4 → 22.3 TPS (+80%)
+- 80-token "Write a short poem about cats": 12.2 → **62.2 TPS (+410%)**
+
+### Pool batch scratch buffers
+
+Separate fix, same commit train: the 5 small per-call allocBuffers
+(`tokenIdsBuf`, `posBuf`, `cacheLenBuf`, `colIdxBuf`, `batchPLInputAll`)
+now live on `state.prefill*Ref` with lazy-allocate / grow-only policy.
+No measurable TPS impact on its own; eliminates 5 cudaMalloc+cudaFree
+per decode token and is a prerequisite for any future CUDA Graph
+capture (where in-capture allocation is illegal).
+
+### Current status (2026-04-20)
+
+| Path | TPS | vs llama.cpp 115-120 |
+|------|-----|---------------------|
+| single-token decode | 35.5 | 30% |
+| single-token + CUDA Graphs | 29.8 | 25% (capture overhead pays off at longer gen) |
+| **unified decode (no Graphs)** | **62.2** | **54%** |
+| unified decode + CUDA Graphs | SEGV | — |
+
+### Remaining 62 → 115 TPS gap
+
+Per-kernel profile (doc 24) shows GPU matmuls already at 75-93% of
+theoretical BW.  The gap is host-side `cuLaunchKernel` overhead
+(~2µs × ~500 dispatches = 1ms/token).  Only CUDA Graphs can amortize
+that — `cuGraphLaunch` submits the whole graph as one API call.
+
+The Graphs capture crashes at the first decode iteration because
+`forwardPrefillBatch` contains 18 `writeBufferOffset` call sites whose
+Lean `ByteArray` host source gets baked into the graph by address.
+Between replays Lean's GC can relocate that memory → replay reads
+garbage.  Fix is mechanical but invasive: route every such write
+through `writeScalarViaStaging` (pinned host) — 18 sites × one pinned
+slot per site (can't share because a single capture contains multiple
+distinct values written to the same slot).
+
+That's the one remaining bottleneck to close the gap to llama.cpp.
+Tracked as #142 (pending) and #127 (Phase C2).

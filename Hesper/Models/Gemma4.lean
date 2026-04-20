@@ -2762,6 +2762,16 @@ def forwardPrefillBatch [GPUBackend β] (ctx : β)
       GPUBackend.executeWithConfigCached ctx shader namedBufs config key ref
     | none => GPUBackend.execute ctx shader namedBufs config
 
+  -- CUDA-Graph-safe write of a u32 into a small device buffer.  In
+  -- capture mode the `writeBufferOffset` path would record a memcpy
+  -- with the Lean `ByteArray`'s host pointer — moved by GC between
+  -- captures.  `writeScalarViaStaging` routes through the pinned-host
+  -- slot at `state.stagingColIdxPtr`, giving the graph a stable source
+  -- address.  Outside capture it falls back to the normal path.
+  let writeColIdxU32 := fun (buf : GPUBackend.Buf β) (v : Nat) => do
+    let bytes := Hesper.WebGPU.BufferOps.uint32ToBytes v.toUInt32
+    writeScalarViaStaging ctx buf 0 state.stagingColIdxPtr 0 bytes
+
   -- ── Allocate prefill-sized batch buffers (column-major) ──────────────
   let batchBuf1 ← mkBuf (dim * seqLen)       -- ping-pong A
   let batchBuf2 ← mkBuf (dim * seqLen)       -- ping-pong B
