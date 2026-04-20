@@ -128,10 +128,10 @@ def launchQuantizeQ8_1 (k : Kernels) (xBuf : CUdeviceptr) (yBuf : CUdeviceptr)
   -- param 7: uint32_t ne1 = 1
   offsets := offsets.push bytes.size.toUSize
   bytes := pushU32 bytes 1
-  -- param 8: uint3 ne2_fastdiv = (0, 0, 1)  (12 bytes, 4-byte aligned — already is)
+  -- param 8: uint3 ne2_fastdiv = init_fastdiv_values(1) = (mp=1, L=0, d=1)
   bytes := alignTo bytes 4
   offsets := offsets.push bytes.size.toUSize
-  bytes := pushU32 bytes 0
+  bytes := pushU32 bytes 1
   bytes := pushU32 bytes 0
   bytes := pushU32 bytes 1
   let grid := (inDim + 255) / 256
