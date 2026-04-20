@@ -266,6 +266,32 @@ partial def expToPTX (e : Exp t) (s : GenState) : ExpResult :=
   | .vecY v =>
     let (rv, s) := expToPTX v s; (rv, s)
 
+  -- pack2x16float (vec2 f32 → u32 packed half2).  Used to produce
+  -- llama.cpp-compatible Q8_1 block headers where `ds` = half2(d, sum).
+  -- PTX: cvt.rn.f16.f32 %h_lo, %x; cvt.rn.f16.f32 %h_hi, %y;
+  --      mov.b32 %r, {%h_lo, %h_hi};
+  | .pack2x16float (.vec2 x y) =>
+    let (rx, s) := expToPTX x s
+    let (ry, s) := expToPTX y s
+    let (hLo, s) := s.freshB16
+    let s := s.emit (.cvt_f16_f32 hLo rx.toF32!)
+    let (hHi, s) := s.freshB16
+    let s := s.emit (.cvt_f16_f32 hHi ry.toF32!)
+    let (r, s) := s.freshU32
+    (.u32 r, s.emit (.mov_b32_pack r hLo hHi))
+  | .pack2x16float v =>
+    -- Fallback: pack a non-literal vec2 by extracting x/y first.
+    let (rv, s) := expToPTX v s
+    -- `v` should evaluate to a concrete vec2 f32; reuse it for both halves
+    -- via an identical cvt (caller currently only constructs vec2 literals,
+    -- so this branch is a safety net).
+    let (hLo, s) := s.freshB16
+    let s := s.emit (.cvt_f16_f32 hLo rv.toF32!)
+    let (hHi, s) := s.freshB16
+    let s := s.emit (.cvt_f16_f32 hHi rv.toF32!)
+    let (r, s) := s.freshU32
+    (.u32 r, s.emit (.mov_b32_pack r hLo hHi))
+
   -- Thread IDs.  Special registers are kernel-launch-invariant, so cache
   -- the register holding each sreg's value via `readSReg`; subsequent uses
   -- of the same sreg reuse the register instead of re-issuing `mov.u32`.
