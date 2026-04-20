@@ -209,6 +209,8 @@ inductive Inst where
 
   -- ── f16 unpack (u32 → two b16) ──
   | mov_b32_unpack (lo hi : RegB16) (src : RegU32)  -- mov.b32 {%h_lo, %h_hi}, %r
+  -- ── f16 pack (two b16 → u32) ──
+  | mov_b32_pack (dst : RegU32) (lo hi : RegB16)    -- mov.b32 %r, {%h_lo, %h_hi}
 
   -- ── comparison → predicate ── (operands must match comparison type)
   | setp_f32    (op : CmpOp) (dst : RegPred) (src1 src2 : RegF32)
@@ -309,6 +311,7 @@ def Inst.toString : Inst → String
   | .cvt_f32_f16 d s     => s!"  cvt.f32.f16 {d}, {s};"
   | .cvt_f16_f32 d s     => s!"  cvt.rn.f16.f32 {d}, {s};"
   | .mov_b32_unpack l h src => s!"  mov.b32 " ++ "{" ++ s!"{l}, {h}" ++ "}" ++ s!", {src};"
+  | .mov_b32_pack d l h     => s!"  mov.b32 {d}, " ++ "{" ++ s!"{l}, {h}" ++ "};"
   | .setp_f32 op d a b   => s!"  setp.{op}.f32 {d}, {a}, {b};"
   | .setp_u32 op d a b   => s!"  setp.{op}.u32 {d}, {a}, {b};"
   | .and_pred d a b      => s!"  and.pred {d}, {a}, {b};"

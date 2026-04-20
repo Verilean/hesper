@@ -954,6 +954,11 @@ def quantizeQ8_1Kernel (inDim : Nat) : ShaderM Unit := do
   ShaderM.varNamed "amax" (.scalar .f32) (Exp.subgroupMax absX)
   let amax : Exp (.scalar .f32) := Exp.var "amax"
 
+  -- 1b. Sum of input (not of quantised ints): `ds.y` in llama.cpp's
+  -- Q8_1 block header.
+  ShaderM.varNamed "sumX" (.scalar .f32) (Exp.subgroupAdd x)
+  let sumX : Exp (.scalar .f32) := Exp.var "sumX"
+
   -- 2. Compute scale d = amax / 127, materialize.
   ShaderM.varNamed "d_q8" (.scalar .f32) (Exp.div amax (Exp.litF32 127.0))
   let d : Exp (.scalar .f32) := Exp.var "d_q8"
@@ -971,11 +976,14 @@ def quantizeQ8_1Kernel (inDim : Nat) : ShaderM Unit := do
     (Exp.bitAnd (Exp.roundToI32 qF32) (Exp.litU32 0xFF))
   let qByte : Exp (.scalar .u32) := Exp.var "qByte"
 
-  -- 4. Thread 0 writes header: d as f32 (bitcast to u32 for storage).
+  -- 4. Thread 0 writes header: half2(d, sumX) packed into a single u32,
+  -- matching llama.cpp's `block_q8_1.ds`.  Allows shared consumption by
+  -- hesper's dp4a matmul AND llama.cpp's PTX matmul.
   let hdrOff := Exp.mul blockIdx (Exp.litU32 9)
   ShaderM.if_ (Exp.eq tid (Exp.litU32 0)) (do
-    let dBits : Exp (.scalar .u32) := Exp.bitcast d
-    ShaderM.writeBuffer (ty := .scalar .u32) "output" hdrOff dBits
+    let packed : Exp (.scalar .u32) :=
+      Exp.pack2x16float (Exp.vec2 d sumX)
+    ShaderM.writeBuffer (ty := .scalar .u32) "output" hdrOff packed
   ) (pure ())
 
   -- 5. Pack quants via shared memory: all threads write their q byte to shared mem,
@@ -1026,6 +1034,8 @@ def quantizeQ8_1BatchKernel (inDim seqLen : Nat) : ShaderM Unit := do
   let absX := Exp.select (Exp.lt x (Exp.litF32 0.0)) (Exp.sub (Exp.litF32 0.0) x) x
   ShaderM.varNamed "amax" (.scalar .f32) (Exp.subgroupMax absX)
   let amax : Exp (.scalar .f32) := Exp.var "amax"
+  ShaderM.varNamed "sumX" (.scalar .f32) (Exp.subgroupAdd x)
+  let sumX : Exp (.scalar .f32) := Exp.var "sumX"
 
   ShaderM.varNamed "d_q8" (.scalar .f32) (Exp.div amax (Exp.litF32 127.0))
   let d : Exp (.scalar .f32) := Exp.var "d_q8"
@@ -1040,8 +1050,9 @@ def quantizeQ8_1BatchKernel (inDim seqLen : Nat) : ShaderM Unit := do
   let colOutputBase := Exp.mul colIdx (Exp.litU32 (nBlocks * 9))
   let hdrOff := Exp.add colOutputBase (Exp.mul blockIdx (Exp.litU32 9))
   ShaderM.if_ (Exp.eq tid (Exp.litU32 0)) (do
-    let dBits : Exp (.scalar .u32) := Exp.bitcast d
-    ShaderM.writeBuffer (ty := .scalar .u32) "output" hdrOff dBits
+    let packed : Exp (.scalar .u32) :=
+      Exp.pack2x16float (Exp.vec2 d sumX)
+    ShaderM.writeBuffer (ty := .scalar .u32) "output" hdrOff packed
   ) (pure ())
 
   ShaderM.sharedNamed "shared_q" (.array (.scalar .u32) 32)
@@ -1151,8 +1162,11 @@ def q4kMatmulBatchKernel (config : Config) (seqLen : Nat) : ShaderM Unit := do
     let u3 ← ShaderM.readBuffer (ty := .scalar .u32) (n := q8InputU32Size) "input_q8" (Exp.add q8Sub1Base (Exp.add (Exp.litU32 5) elemOff))
     let q8Hdr0 ← ShaderM.readBuffer (ty := .scalar .u32) (n := q8InputU32Size) "input_q8" q8Sub0Base
     let q8Hdr1 ← ShaderM.readBuffer (ty := .scalar .u32) (n := q8InputU32Size) "input_q8" q8Sub1Base
-    let d8A : Exp (.scalar .f32) := Exp.bitcast q8Hdr0
-    let d8B : Exp (.scalar .f32) := Exp.bitcast q8Hdr1
+    -- Q8_1 header is now half2(d, sum) packed in a u32.  Extract `d` via
+    -- the low f16 (sum lives in the high f16 — currently unused by hesper's
+    -- matmul, but matches llama.cpp layout).
+    let d8A : Exp (.scalar .f32) := Exp.vecX (Exp.unpack2x16float q8Hdr0)
+    let d8B : Exp (.scalar .f32) := Exp.vecX (Exp.unpack2x16float q8Hdr1)
 
     let v0i0 := Exp.bitAnd v0 (Exp.litU32 0x0F0F0F0F)
     let v1i0 := Exp.bitAnd v1 (Exp.litU32 0x0F0F0F0F)
@@ -1319,8 +1333,11 @@ def emitQ4KMLinearDP4ABody (config : Config)
     -- Read d8 for each Q8_1 sub-block (f32, bitcast from u32 header)
     let q8Hdr0 ← ShaderM.readBuffer (ty := .scalar .u32) (n := q8InputU32Size) "input_q8" q8Sub0Base
     let q8Hdr1 ← ShaderM.readBuffer (ty := .scalar .u32) (n := q8InputU32Size) "input_q8" q8Sub1Base
-    let d8A : Exp (.scalar .f32) := Exp.bitcast q8Hdr0
-    let d8B : Exp (.scalar .f32) := Exp.bitcast q8Hdr1
+    -- Q8_1 header is now half2(d, sum) packed in a u32.  Extract `d` via
+    -- the low f16 (sum lives in the high f16 — currently unused by hesper's
+    -- matmul, but matches llama.cpp layout).
+    let d8A : Exp (.scalar .f32) := Exp.vecX (Exp.unpack2x16float q8Hdr0)
+    let d8B : Exp (.scalar .f32) := Exp.vecX (Exp.unpack2x16float q8Hdr1)
 
     -- llama.cpp loop: QR4_K=2 iterations. i=0 uses v[0]>>0 & 0x0F..., u[0]+u[1], d8[0], sc[0], m[0]
     --                                       i=1 uses v[0]>>4 & 0x0F..., u[2]+u[3], d8[1], sc[1], m[1]
@@ -1489,8 +1506,11 @@ def fusedQ4KMGateUpDP4AKernel (config : Config) : ShaderM Unit := do
     let u3 ← ShaderM.readBuffer (ty := .scalar .u32) (n := q8InputU32Size) "input_q8" (Exp.add q8Sub1Base (Exp.add (Exp.litU32 5) elemOff))
     let q8Hdr0 ← ShaderM.readBuffer (ty := .scalar .u32) (n := q8InputU32Size) "input_q8" q8Sub0Base
     let q8Hdr1 ← ShaderM.readBuffer (ty := .scalar .u32) (n := q8InputU32Size) "input_q8" q8Sub1Base
-    let d8A : Exp (.scalar .f32) := Exp.bitcast q8Hdr0
-    let d8B : Exp (.scalar .f32) := Exp.bitcast q8Hdr1
+    -- Q8_1 header is now half2(d, sum) packed in a u32.  Extract `d` via
+    -- the low f16 (sum lives in the high f16 — currently unused by hesper's
+    -- matmul, but matches llama.cpp layout).
+    let d8A : Exp (.scalar .f32) := Exp.vecX (Exp.unpack2x16float q8Hdr0)
+    let d8B : Exp (.scalar .f32) := Exp.vecX (Exp.unpack2x16float q8Hdr1)
 
     let newAccG ← processWeight "weights_gate" accG u0 u1 u2 u3 d8A d8B
     ShaderM.assign "accG" newAccG
@@ -1646,8 +1666,11 @@ def fusedQ4KMKVDP4AKernel (config : Config) : ShaderM Unit := do
     let u3 ← ShaderM.readBuffer (ty := .scalar .u32) (n := q8InputU32Size) "input_q8" (Exp.add q8Sub1Base (Exp.add (Exp.litU32 5) elemOff))
     let q8Hdr0 ← ShaderM.readBuffer (ty := .scalar .u32) (n := q8InputU32Size) "input_q8" q8Sub0Base
     let q8Hdr1 ← ShaderM.readBuffer (ty := .scalar .u32) (n := q8InputU32Size) "input_q8" q8Sub1Base
-    let d8A : Exp (.scalar .f32) := Exp.bitcast q8Hdr0
-    let d8B : Exp (.scalar .f32) := Exp.bitcast q8Hdr1
+    -- Q8_1 header is now half2(d, sum) packed in a u32.  Extract `d` via
+    -- the low f16 (sum lives in the high f16 — currently unused by hesper's
+    -- matmul, but matches llama.cpp layout).
+    let d8A : Exp (.scalar .f32) := Exp.vecX (Exp.unpack2x16float q8Hdr0)
+    let d8B : Exp (.scalar .f32) := Exp.vecX (Exp.unpack2x16float q8Hdr1)
 
     let newAccK ← processWeight "weights_k" accK u0 u1 u2 u3 d8A d8B
     ShaderM.assign "accK" newAccK
@@ -1826,8 +1849,11 @@ def fusedQ4KMGateUpDP4A4RowKernel (config : Config) : ShaderM Unit := do
     let u3 ← ShaderM.readWorkgroup (ty := .scalar .u32) (n := q8InputU32Size) "s_input_q8" (Exp.add q8Sub1Base (Exp.add (Exp.litU32 5) elemOff))
     let q8Hdr0 ← ShaderM.readWorkgroup (ty := .scalar .u32) (n := q8InputU32Size) "s_input_q8" q8Sub0Base
     let q8Hdr1 ← ShaderM.readWorkgroup (ty := .scalar .u32) (n := q8InputU32Size) "s_input_q8" q8Sub1Base
-    let d8A : Exp (.scalar .f32) := Exp.bitcast q8Hdr0
-    let d8B : Exp (.scalar .f32) := Exp.bitcast q8Hdr1
+    -- Q8_1 header is now half2(d, sum) packed in a u32.  Extract `d` via
+    -- the low f16 (sum lives in the high f16 — currently unused by hesper's
+    -- matmul, but matches llama.cpp layout).
+    let d8A : Exp (.scalar .f32) := Exp.vecX (Exp.unpack2x16float q8Hdr0)
+    let d8B : Exp (.scalar .f32) := Exp.vecX (Exp.unpack2x16float q8Hdr1)
 
     let newAccG ← processWeight "weights_gate" accG u0 u1 u2 u3 d8A d8B
     ShaderM.assign "accG" newAccG
@@ -1959,8 +1985,11 @@ def fusedQ4KMLinearDP4A2RowKernel (config : Config) : ShaderM Unit := do
 
     let q8Hdr0 ← ShaderM.readBuffer (ty := .scalar .u32) (n := q8InputU32Size) "input_q8" q8Sub0Base
     let q8Hdr1 ← ShaderM.readBuffer (ty := .scalar .u32) (n := q8InputU32Size) "input_q8" q8Sub1Base
-    let d8A : Exp (.scalar .f32) := Exp.bitcast q8Hdr0
-    let d8B : Exp (.scalar .f32) := Exp.bitcast q8Hdr1
+    -- Q8_1 header is now half2(d, sum) packed in a u32.  Extract `d` via
+    -- the low f16 (sum lives in the high f16 — currently unused by hesper's
+    -- matmul, but matches llama.cpp layout).
+    let d8A : Exp (.scalar .f32) := Exp.vecX (Exp.unpack2x16float q8Hdr0)
+    let d8B : Exp (.scalar .f32) := Exp.vecX (Exp.unpack2x16float q8Hdr1)
 
     -- i=0: vl & 0x0F
     let v0i0 := Exp.bitAnd v0 (Exp.litU32 0x0F0F0F0F)
@@ -2118,8 +2147,11 @@ def fusedQ4KMLinearDP4A4WarpKernel (config : Config) : ShaderM Unit := do
     let u3 ← ShaderM.readBuffer (ty := .scalar .u32) (n := q8InputU32Size) "input_q8" (Exp.add q8Sub1Base (Exp.add (Exp.litU32 5) elemOff))
     let q8Hdr0 ← ShaderM.readBuffer (ty := .scalar .u32) (n := q8InputU32Size) "input_q8" q8Sub0Base
     let q8Hdr1 ← ShaderM.readBuffer (ty := .scalar .u32) (n := q8InputU32Size) "input_q8" q8Sub1Base
-    let d8A : Exp (.scalar .f32) := Exp.bitcast q8Hdr0
-    let d8B : Exp (.scalar .f32) := Exp.bitcast q8Hdr1
+    -- Q8_1 header is now half2(d, sum) packed in a u32.  Extract `d` via
+    -- the low f16 (sum lives in the high f16 — currently unused by hesper's
+    -- matmul, but matches llama.cpp layout).
+    let d8A : Exp (.scalar .f32) := Exp.vecX (Exp.unpack2x16float q8Hdr0)
+    let d8B : Exp (.scalar .f32) := Exp.vecX (Exp.unpack2x16float q8Hdr1)
 
     let v0i0 := Exp.bitAnd v0 (Exp.litU32 0x0F0F0F0F)
     let v1i0 := Exp.bitAnd v1 (Exp.litU32 0x0F0F0F0F)
@@ -2369,8 +2401,11 @@ def fusedQ6KLinearDP4AKernel (inDim outDim : Nat) (gridX : Nat := 0) : ShaderM U
               (Exp.add q8Sub1 (Exp.add (Exp.litU32 1) q8ElemOff))
     let q8Hdr0 ← ShaderM.readBuffer (ty := .scalar .u32) (n := q8InputU32Size) "input_q8" q8Sub0
     let q8Hdr1 ← ShaderM.readBuffer (ty := .scalar .u32) (n := q8InputU32Size) "input_q8" q8Sub1
-    let d8A : Exp (.scalar .f32) := Exp.bitcast q8Hdr0
-    let d8B : Exp (.scalar .f32) := Exp.bitcast q8Hdr1
+    -- Q8_1 header is now half2(d, sum) packed in a u32.  Extract `d` via
+    -- the low f16 (sum lives in the high f16 — currently unused by hesper's
+    -- matmul, but matches llama.cpp layout).
+    let d8A : Exp (.scalar .f32) := Exp.vecX (Exp.unpack2x16float q8Hdr0)
+    let d8B : Exp (.scalar .f32) := Exp.vecX (Exp.unpack2x16float q8Hdr1)
 
     -- QR6_K=2 iterations. dot × sc done in i32; single FFMA d8 × f32(dot*sc).
     let vil_0 := Exp.bitAnd vl (Exp.litU32 0x0F0F0F0F)
@@ -2531,8 +2566,11 @@ def fusedQ6KLinearDP4A2RowKernel (inDim outDim : Nat) (gridX : Nat := 0) : Shade
               (Exp.add q8Sub1 (Exp.add (Exp.litU32 1) q8ElemOff))
     let q8Hdr0 ← ShaderM.readWorkgroup (ty := .scalar .u32) (n := q8InputU32Size) "s_input_q8" q8Sub0
     let q8Hdr1 ← ShaderM.readWorkgroup (ty := .scalar .u32) (n := q8InputU32Size) "s_input_q8" q8Sub1
-    let d8A : Exp (.scalar .f32) := Exp.bitcast q8Hdr0
-    let d8B : Exp (.scalar .f32) := Exp.bitcast q8Hdr1
+    -- Q8_1 header is now half2(d, sum) packed in a u32.  Extract `d` via
+    -- the low f16 (sum lives in the high f16 — currently unused by hesper's
+    -- matmul, but matches llama.cpp layout).
+    let d8A : Exp (.scalar .f32) := Exp.vecX (Exp.unpack2x16float q8Hdr0)
+    let d8B : Exp (.scalar .f32) := Exp.vecX (Exp.unpack2x16float q8Hdr1)
 
     let vil_0 := Exp.bitAnd vl (Exp.litU32 0x0F0F0F0F)
     let vih_0 := Exp.bitAnd (Exp.shiftLeft vh (Exp.litU32 4)) (Exp.litU32 0x30303030)
@@ -2691,8 +2729,11 @@ def fusedQ6KLinearDP4A4RowKernel (inDim outDim : Nat) (gridX : Nat := 0) : Shade
               (Exp.add q8Sub1 (Exp.add (Exp.litU32 1) q8ElemOff))
     let q8Hdr0 ← ShaderM.readWorkgroup (ty := .scalar .u32) (n := q8InputU32Size) "s_input_q8" q8Sub0
     let q8Hdr1 ← ShaderM.readWorkgroup (ty := .scalar .u32) (n := q8InputU32Size) "s_input_q8" q8Sub1
-    let d8A : Exp (.scalar .f32) := Exp.bitcast q8Hdr0
-    let d8B : Exp (.scalar .f32) := Exp.bitcast q8Hdr1
+    -- Q8_1 header is now half2(d, sum) packed in a u32.  Extract `d` via
+    -- the low f16 (sum lives in the high f16 — currently unused by hesper's
+    -- matmul, but matches llama.cpp layout).
+    let d8A : Exp (.scalar .f32) := Exp.vecX (Exp.unpack2x16float q8Hdr0)
+    let d8B : Exp (.scalar .f32) := Exp.vecX (Exp.unpack2x16float q8Hdr1)
 
     let vil_0 := Exp.bitAnd vl (Exp.litU32 0x0F0F0F0F)
     let vih_0 := Exp.bitAnd (Exp.shiftLeft vh (Exp.litU32 4)) (Exp.litU32 0x30303030)
