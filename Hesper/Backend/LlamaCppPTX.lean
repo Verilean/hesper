@@ -300,10 +300,27 @@ private def getQ8Scratch (inDim : Nat) : IO CUdeviceptr := do
 initialize enableQ4K : IO.Ref Bool ← IO.mkRef true
 initialize enableQ6K : IO.Ref Bool ← IO.mkRef false
 
+/-- Debug counter: how many Q4_K (+Q6_K) calls have reached the override
+    since it was installed.  Reset to 0 at install time; monotonically
+    incremented on every call.  Used by the `HESPER_LLAMACPP_CALL_FROM` /
+    `HESPER_LLAMACPP_CALL_UNTIL` gating below to bisect which specific
+    override invocation (not layer — layer has Q/K/V/gate/up/down × 42 =
+    252 matmul calls) is responsible for the garbage output.  Single-
+    threaded decode so no locking needed. -/
+initialize q4kCallCounter : IO.Ref Nat ← IO.mkRef 0
+
+/-- Inclusive [from, until) range of override calls on which to fire the
+    llama.cpp kernel.  Calls outside this range return `false` and fall
+    back to hesper's kernel.  Defaults (from=0, until=None) = all calls.
+    Set via `HESPER_LLAMACPP_CALL_FROM=<n>` / `HESPER_LLAMACPP_CALL_UNTIL=<m>`. -/
+initialize callFrom : IO.Ref Nat ← IO.mkRef 0
+initialize callUntil : IO.Ref (Option Nat) ← IO.mkRef none
+
 /-- Install `llamaCppDp4aOverride` so `forwardDP4A` dispatches to the llama.cpp
     PTX path.  Call once after CUDA init if `HESPER_USE_LLAMACPP_PTX=1`.
     Per-quant toggles: `HESPER_LLAMACPP_Q4K` (default on), `HESPER_LLAMACPP_Q6K`
-    (default off). -/
+    (default off).  Call-range toggles: `HESPER_LLAMACPP_CALL_FROM`,
+    `HESPER_LLAMACPP_CALL_UNTIL` for bisection. -/
 def installOverride : IO Unit := do
   let k ← loadKernels
   let q4on ← enableQ4K.get
@@ -315,7 +332,13 @@ def installOverride : IO Unit := do
               | some "1" => true | _ => q6on
   enableQ4K.set q4on
   enableQ6K.set q6on
-  IO.println s!"[hesper-llamacpp] Q4_K override = {q4on}, Q6_K override = {q6on}"
+  -- Call-range gating for bisection.
+  let fromN := (← IO.getEnv "HESPER_LLAMACPP_CALL_FROM").bind String.toNat? |>.getD 0
+  let untilOpt := (← IO.getEnv "HESPER_LLAMACPP_CALL_UNTIL").bind String.toNat?
+  callFrom.set fromN
+  callUntil.set untilOpt
+  q4kCallCounter.set 0
+  IO.println s!"[hesper-llamacpp] Q4_K override = {q4on}, Q6_K override = {q6on}, call range = [{fromN}, {untilOpt})"
   Hesper.Layers.Linear.llamaCppDp4aOverride.set (some fun inPtr wPtr outPtr inDim outDim tag => do
     let useLlama := match tag with
       | 0 => q4on  -- Q4_K
@@ -323,6 +346,15 @@ def installOverride : IO Unit := do
       | _ => false
     if !useLlama then
       return false  -- fall through to hesper's kernel
+    -- Call counter + range gating.
+    let n ← q4kCallCounter.get
+    q4kCallCounter.set (n + 1)
+    let fromN ← callFrom.get
+    let untilOpt ← callUntil.get
+    let inRange := n ≥ fromN &&
+      (match untilOpt with | some u => n < u | none => true)
+    if !inRange then
+      return false  -- fall back to hesper for this call
     let q8Ptr ← getQ8Scratch inDim
     launchQuantizeQ8_1 k inPtr q8Ptr inDim
     match tag with
