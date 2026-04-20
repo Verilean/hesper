@@ -1780,6 +1780,16 @@ structure InferenceState (BufT CacheT : Type) where
   -- per decode token at seqLen=1.
   prefillAttnQ8BufRef : IO.Ref (Option (BufT × USize))
   prefillFfnQ8BufRef  : IO.Ref (Option (BufT × USize))
+  -- Pooled small per-call scratch buffers used by forwardPrefillBatch.
+  -- Each holds `seqLen * 4` bytes of u32 values.  Pool by `(buf, capBytes)`
+  -- so we only re-allocate when the next call needs a larger seqLen.
+  prefillTokenIdsRef  : IO.Ref (Option (BufT × USize))
+  prefillPosRef       : IO.Ref (Option (BufT × USize))
+  prefillCacheLenRef  : IO.Ref (Option (BufT × USize))
+  prefillColIdxRef    : IO.Ref (Option BufT)
+  -- Pooled per-layer-embedding batch tensor `[embdPerLayer * numLayers, seqLen]`.
+  -- Only re-allocated when seqLen grows.
+  prefillPLInputAllRef : IO.Ref (Option (BufT × USize))
   /-- Pinned host pointer (4 bytes).  See §CUDA Graph notes in the
       InferenceState doc header. -/
   stagingTokenPtr   : USize := 0
@@ -1881,6 +1891,11 @@ def createInferenceState [GPUBackend β] (ctx : β) (cfg : Config) : IO (Inferen
     lmHeadDP4APrepared := ← GPUBackend.newCacheRef (β := β)
     prefillAttnQ8BufRef := ← IO.mkRef none
     prefillFfnQ8BufRef  := ← IO.mkRef none
+    prefillTokenIdsRef  := ← IO.mkRef none
+    prefillPosRef       := ← IO.mkRef none
+    prefillCacheLenRef  := ← IO.mkRef none
+    prefillColIdxRef    := ← IO.mkRef none
+    prefillPLInputAllRef := ← IO.mkRef none
     -- Pinned-host staging (CUDA only; zero on other backends).  Using
     -- IO.getEnv as a crude backend check for now — a typeclass method
     -- `allocPinnedHost` on GPUBackend is the proper extension point.
@@ -2781,7 +2796,16 @@ def forwardPrefillBatch [GPUBackend β] (ctx : β)
   let plGateBatchBuf ← mkBuf (cfg.embdPerLayer * seqLen)
   let plMoeOutBatchBuf ← mkBuf (cfg.embdPerLayer * seqLen)
   let plProjBatchBuf ← mkBuf (dim * seqLen)
-  let colIdxBuf ← GPUBackend.allocBuffer ctx (4 : USize)
+  -- colIdxBuf is a 4-byte u32 index holder used across ~20 call sites;
+  -- pool it on `state` so it's allocated once at first prefill and then
+  -- reused for every subsequent call.
+  let colIdxBuf ← do
+    match ← state.prefillColIdxRef.get with
+    | some b => pure b
+    | none =>
+        let b ← GPUBackend.allocBuffer ctx (4 : USize)
+        state.prefillColIdxRef.set (some b)
+        pure b
 
   -- Debug dumps (per-token column extracts + disk writes) are extremely
   -- expensive: 5 loops × 9 tokens × 42 blocks ≈ 1540 wasted dispatches
@@ -2842,8 +2866,28 @@ def forwardPrefillBatch [GPUBackend β] (ctx : β)
   -- Upload all token IDs and position indices to GPU buffers BEFORE any
   -- kernel dispatch.  This eliminates per-token host→device transfers
   -- inside the per-token attention loop, enabling batch dispatch.
-  let tokenIdsBuf ← GPUBackend.allocBuffer ctx (seqLen * 4).toUSize
-  let posBuf ← GPUBackend.allocBuffer ctx (seqLen * 4).toUSize
+  --
+  -- Pool the three small u32 buffers on `state` so they are not
+  -- reallocated every call — saves 3 × (cudaMalloc + cudaFree) per
+  -- decode token.
+  let needBytes : USize := (seqLen * 4).toUSize
+  let ensureBuf (ref : IO.Ref (Option (GPUBackend.Buf β × USize)))
+      : IO (GPUBackend.Buf β) := do
+    match ← ref.get with
+    | some (b, cap) =>
+        if cap >= needBytes then pure b
+        else
+          GPUBackend.freeBuffer ctx b
+          let b' ← GPUBackend.allocBuffer ctx needBytes
+          ref.set (some (b', needBytes))
+          pure b'
+    | none =>
+        let b ← GPUBackend.allocBuffer ctx needBytes
+        ref.set (some (b, needBytes))
+        pure b
+  let tokenIdsBuf ← ensureBuf state.prefillTokenIdsRef
+  let posBuf      ← ensureBuf state.prefillPosRef
+  let cacheLenBuf ← ensureBuf state.prefillCacheLenRef
   let mut tokBytes : ByteArray := ByteArray.empty
   let mut posBytes : ByteArray := ByteArray.empty
   for i in [0:seqLen] do
@@ -2852,7 +2896,6 @@ def forwardPrefillBatch [GPUBackend β] (ctx : β)
     -- Absolute rotary position of this token.
     posBytes := posBytes ++ Hesper.WebGPU.BufferOps.uint32ToBytes (startPos + i).toUInt32
   -- cacheLenBuf[i] = startPos + i + 1 (number of KV entries after this token's write)
-  let cacheLenBuf ← GPUBackend.allocBuffer ctx (seqLen * 4).toUSize
   let mut clBytes : ByteArray := ByteArray.empty
   for i in [0:seqLen] do
     clBytes := clBytes ++ Hesper.WebGPU.BufferOps.uint32ToBytes (startPos + i + 1).toUInt32
@@ -2928,8 +2971,22 @@ def forwardPrefillBatch [GPUBackend β] (ctx : β)
     let embdPL := model.config.embdPerLayer
     let nLayers := model.config.numHiddenLayers
     let totalPL := embdPL * nLayers
-    -- Allocate the batched scratch: one totalPL-vector per prompt token.
-    let batchPLInputAll ← GPUBackend.allocBuffer ctx (seqLen * totalPL * 4).toUSize
+    -- Pooled batched scratch: one totalPL-vector per prompt token.
+    -- Re-allocate only when seqLen grows beyond the cached capacity.
+    let need := (seqLen * totalPL * 4).toUSize
+    let batchPLInputAll ← do
+      match ← state.prefillPLInputAllRef.get with
+      | some (b, cap) =>
+          if cap >= need then pure b
+          else
+            GPUBackend.freeBuffer ctx b
+            let b' ← GPUBackend.allocBuffer ctx need
+            state.prefillPLInputAllRef.set (some (b', need))
+            pure b'
+      | none =>
+          let b ← GPUBackend.allocBuffer ctx need
+          state.prefillPLInputAllRef.set (some (b, need))
+          pure b
     batchPLInputAllOpt := some batchPLInputAll
     for i in [0:seqLen] do
       let tokenId := promptTokens[i]!
@@ -3721,13 +3778,12 @@ def forwardPrefillBatch [GPUBackend β] (ctx : β)
   GPUBackend.freeBuffer ctx batchUpBuf
   GPUBackend.freeBuffer ctx batchGeluBuf
   GPUBackend.freeBuffer ctx batchFFNOutBuf
-  GPUBackend.freeBuffer ctx colIdxBuf
   GPUBackend.freeBuffer ctx plGateBatchBuf
   GPUBackend.freeBuffer ctx plMoeOutBatchBuf
   GPUBackend.freeBuffer ctx plProjBatchBuf
-  match batchPLInputAllOpt with
-  | some b => GPUBackend.freeBuffer ctx b
-  | none => pure ()
+  -- NOTE: tokenIdsBuf, posBuf, cacheLenBuf, colIdxBuf, batchPLInputAll
+  -- are pooled on `state.prefill*Ref` — NOT freed here.  They live for
+  -- the entire InferenceState lifetime.
 
 /-- Run full single-token forward pass through the model.
     Returns logits in state.logitsBuf. -/
@@ -4122,9 +4178,15 @@ def generate [GPUBackend β] (ctx : β) (model : Gemma4Model (GPUBackend.Buf β)
     (extraEosTokens : Array Nat := #[]) : IO (Array Nat) := do
   IO.println s!"[Gemma4] Generating: {promptTokens.size} prompt tokens, max {maxTokens} new tokens"
 
-  -- Create inference state + kernel cache refs
+  -- Create inference state + kernel cache refs.  `kcr` is used by prefill
+  -- (seqLen=N), `unifiedKcr` by unified decode (seqLen=1).  They must NOT
+  -- share — some `ce` cacheKeys inside `forwardPrefillBatch` don't include
+  -- `seqLen`, so a cached prefill dispatch would fire at decode shape and
+  -- launch with (18,1,1) workgroups for a (1,1,1)-sized buffer batch → crash
+  -- or silent corruption.
   let state ← createInferenceState ctx model.config
   let kcr ← createKernelCacheRefs (β := β)
+  let unifiedKcr ← createKernelCacheRefs (β := β)
 
   let mut tokens := promptTokens
 
@@ -4226,7 +4288,7 @@ def generate [GPUBackend β] (ctx : β) (model : Gemma4Model (GPUBackend.Buf β)
           Hesper.CUDA.cuStreamBeginCapture stream
           if unifiedDecode then
             forwardPrefillBatch ctx model #[nextToken] state
-              (kcr := none) (startPos := newPos)
+              (kcr := some unifiedKcr) (startPos := newPos)
           else
             forwardSingleToken ctx model nextToken newPos state (kcr := some kcr)
           let graph ← Hesper.CUDA.cuStreamEndCapture stream
@@ -4238,15 +4300,18 @@ def generate [GPUBackend β] (ctx : β) (model : Gemma4Model (GPUBackend.Buf β)
           IO.println s!"[Graph] captured decode graph; subsequent tokens will replay"
         else
           if unifiedDecode then
-            -- Debug: pass kcr := none to rule out key-collision cache bugs.
+            -- Pass a decode-local `unifiedKcr`.  The 2nd+ decode tokens then
+            -- replay cached dispatches instead of re-generating PTX.  Prefill's
+            -- `kcr` is kept separate so its cached (seqLen=18)-shape dispatches
+            -- never fire at decode shape.
             forwardPrefillBatch ctx model #[nextToken] state
-              (kcr := none) (startPos := newPos)
+              (kcr := some unifiedKcr) (startPos := newPos)
             -- Debug for state-dirtying: run it TWICE in a row with same args
             -- and see if 2nd call produces same logits.  If HESPER_DOUBLE_CALL=1.
             if (← IO.getEnv "HESPER_DOUBLE_CALL").isSome then
               let firstArg ← GPUBackend.readBuffer ctx state.logitsBuf (16 : USize)
               forwardPrefillBatch ctx model #[nextToken] state
-                (kcr := none) (startPos := newPos)
+                (kcr := some unifiedKcr) (startPos := newPos)
               let secondArg ← GPUBackend.readBuffer ctx state.logitsBuf (16 : USize)
               IO.println s!"[doubleCall] genCount={genCount} first={firstArg.toList.take 16} second={secondArg.toList.take 16}"
             if (← IO.getEnv "HESPER_DUMP_LOGITS_UNIFIED").isSome then
