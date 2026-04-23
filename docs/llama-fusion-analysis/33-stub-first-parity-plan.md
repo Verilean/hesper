@@ -366,8 +366,25 @@ Each op close will append a line here:
   within Q6_K quant-noise range.  argmax still matches.
 - [2026-04-23] **Multi-token generation loop ✓** via O(N²) re-prefill
   per step.  Driver accepts a third CLI arg `maxTokens`.
-- [next] persistent-KV decode path (seqLen=1, startPos=prevLen)
-  for O(N) generation and realistic TPS.
+- [2026-04-23] **Persistent-KV decode path ✓**.  Driver allocates 24
+  KV-cache pairs upfront, runs the prompt as one seqLen=N prefill
+  (startPos=0), then enters a decode loop: seqLen=1, startPos=N+k-1,
+  one token in tokenIdsBuf.  FlashAttention's
+  `cacheLen = startPos + col + 1` picks up prior prompt KVs from the
+  shared cache.  Each forward accepts `persistentCaches :
+  Option (Array (Buf × Buf))` to skip per-call allocation.
+  Results on "Hello world how are you" × 5 generated tokens:
+    prefill  seqLen=5  270ms  2112 dispatches
+    decode   seqLen=1   71ms  1492 dispatches/token
+    tokens/sec: 4.6 (was 2.3 with O(N²) re-prefill)
+  Same tokens generated as the O(N²) path → no correctness regression.
+- [next] Decode-path dispatch reduction.  Current 1492 dispatches/tok
+  is still prefill-shaped (PLE prelude runs 7 dispatches for the 1
+  new token, then 42 layers × ~35 ops).  Real decode in llama.cpp
+  lands at ~113 kernels with graph replay or ~900 without.  Stub's
+  loop-faithful count at seqLen=1 should trend to ~50-60 ops/layer
+  × 42 = ~2100 if nothing is de-duplicated; deeper optimisation is
+  separate work.
 - [next] Implement `Qcur_pos-0` (RoPE Q).  Input: `batchQBuf` (normed),
   output: dedicated `batchQRopedBuf`.  Weight: none (freq base + freq
   factors for full-attention layers).
