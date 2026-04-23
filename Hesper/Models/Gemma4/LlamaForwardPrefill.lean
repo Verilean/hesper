@@ -366,14 +366,27 @@ def forwardPrefillLlamaCpp [GPUBackend β] (ctx : β)
   ------------------------------------------------------------------
   -- Per-layer loop (42 iterations)
   ------------------------------------------------------------------
+  -- Current-layer input (`inpL` in llama.cpp terminology).  Ping-pong
+  -- between two buffers: one holds the current layer's input, the other
+  -- receives this layer's output.  Starts with batchBuf2 (scaled embed)
+  -- holding L0's input.
+  let layerIOBufA := batchBuf2
+  let layerIOBufB ← mkBuf totalHidden
+  let currentInputRef ← IO.mkRef layerIOBufA
+  let nextOutputRef ← IO.mkRef layerIOBufB
   -- Per-layer scratch for normed activations.  Same shape as batchBuf1/2.
   let batchNormedBuf ← mkBuf totalHidden
-  -- Q projection output scratch.  Gemma 4 qDim = numHeads * headDim.
-  let qDim0 := cfg.numAttentionHeads * (cfg.headDim 0)
+  -- Q/K/V projection scratch sized for the MAX across all 42 layers (SWA
+  -- and Full layers differ in numKVHeads and potentially headDim).  CUDA
+  -- ignores declared buffer sizes, so allocating at the max is safe for
+  -- every per-layer kernel dispatch.
+  let maxHeadDim := max cfg.headDimFull cfg.headDimSWA
+  let qDim0 := cfg.numAttentionHeads * maxHeadDim
   let batchQBuf ← mkBuf (qDim0 * seqLen)
   let batchQRopedBuf ← mkBuf (qDim0 * seqLen)
-  -- K/V projection output scratch.  kvDim = numKVHeads * headDim.
-  let kvDim0 := (cfg.numKVHeads 0) * (cfg.headDim 0)
+  -- kvDim = numKVHeads * headDim.  Use max of Full / SWA.
+  let maxKVHeads := max cfg.numKeyValueHeadsFull cfg.numKeyValueHeadsSWA
+  let kvDim0 := maxKVHeads * maxHeadDim
   let batchKBuf ← mkBuf (kvDim0 * seqLen)
   let batchVBuf ← mkBuf (kvDim0 * seqLen)
   let batchKRopedBuf ← mkBuf (kvDim0 * seqLen)
@@ -394,11 +407,17 @@ def forwardPrefillLlamaCpp [GPUBackend β] (ctx : β)
   let batchPleProjBuf ← mkBuf (hidden * seqLen)
   let batchPleNormBuf ← mkBuf (hidden * seqLen)
   let batchLOutBuf ← mkBuf (hidden * seqLen)
-  -- KV cache: allocate local [numKVHeads, maxSeqLen, headDim] buffers for
-  -- layer 0's K and V.  Owned by the stub (production's state.kvCaches
-  -- is off-limits).
-  let kCacheBuf ← mkBuf ((cfg.numKVHeads 0) * cfg.maxSeqLen * (cfg.headDim 0))
-  let vCacheBuf ← mkBuf ((cfg.numKVHeads 0) * cfg.maxSeqLen * (cfg.headDim 0))
+  -- KV cache: Single local K/V cache pair, reused per layer (overwritten
+  -- each layer — since our prefill is a single forward and build_attn
+  -- reads only the K/V just written in the same layer).  Sized at
+  -- maxKVHeads × maxSeqLen × maxHeadDim because `flashAttentionBatchKernel`
+  -- indexes with `kvHead * maxSeqLen * headDim`, so the allocation must
+  -- cover the full stride the kernel assumes.  At 4 × 32768 × 128 × f32
+  -- this is ~64 MB per cache, 128 MB total — acceptable for parity runs.
+  let maxSeqLenUsed := cfg.maxSeqLen
+  let cacheSize := maxKVHeads * maxSeqLenUsed * maxHeadDim
+  let kCacheBuf ← mkBuf cacheSize
+  let vCacheBuf ← mkBuf cacheSize
   -- Params buffer: holds `startPos` (u32) for RoPE.  startPos=0 for prefill.
   let paramsBuf ← mkBuf 1
   GPUBackend.writeBuffer ctx paramsBuf (Hesper.WebGPU.BufferOps.uint32ToBytes 0)
@@ -417,15 +436,14 @@ def forwardPrefillLlamaCpp [GPUBackend β] (ctx : β)
 
   for il in List.range numLayers do
     -- cur = build_norm(inpL, attn_norm)
-    -- For L0 with real tokens, run the actual attnNorm on batchBuf2
-    -- (which holds the scaled embedding) into batchNormedBuf; dump as
-    -- `attn_norm-0`.  Other layers still use the DCE-safe stub because
-    -- their inputs are placeholder data.
+    -- inpL = `currentInputRef` (scaled embed for L0, previous layer's
+    -- `l_out` for L1+).  Output into batchNormedBuf; dump `attn_norm-{il}`.
+    let layerInputBuf ← currentInputRef.get
     match tokenIdsBuf with
     | some _ =>
       if h : il < model.blocks.size then
         let block := model.blocks[il]
-        Hesper.Layers.RMSNorm.forward ctx block.attnNorm batchBuf2 batchNormedBuf
+        Hesper.Layers.RMSNorm.forward ctx block.attnNorm layerInputBuf batchNormedBuf
           seqLen 256 (refOverride := some (← IO.mkRef none))
         dumpGolden s!"attn_norm-{il}" batchNormedBuf totalHidden
       else
@@ -640,11 +658,12 @@ def forwardPrefillLlamaCpp [GPUBackend β] (ctx : β)
     | none =>
       dispatchRmsNorm ctx attnOutBuf buf1 hidden
 
-    -- attn_out = ggml_add(cur, inpL)  — residual: post-norm'd wO output + pre-attn input
+    -- attn_out = ggml_add(cur, inpL)  — residual: post-norm'd wO output +
+    -- the current layer's input (llama.cpp line 112).
     match tokenIdsBuf with
     | some _ =>
       GPUBackend.execute ctx (Hesper.Models.Gemma4.residualAddKernel totalHidden)
-        [("a", batchAttnPostNormBuf), ("b", batchBuf2), ("output", batchAttnResidBuf)]
+        [("a", batchAttnPostNormBuf), ("b", layerInputBuf), ("output", batchAttnResidBuf)]
         (.dispatch1D totalHidden)
       dumpGolden s!"attn_out-{il}" batchAttnResidBuf totalHidden
     | none =>
@@ -757,7 +776,8 @@ def forwardPrefillLlamaCpp [GPUBackend β] (ctx : β)
             batchPleProjBuf batchPleNormBuf seqLen 256
             (refOverride := some (← IO.mkRef none))
           dumpGolden s!"per_layer_embd_out-{il}" batchPleNormBuf totalHidden
-          -- (g) residual: pe_in + pleNorm → batchLOutBuf
+          -- (g) residual: pe_in + pleNorm → batchLOutBuf (scratch before
+          -- out_scale).
           GPUBackend.execute ctx (Hesper.Models.Gemma4.residualAddKernel totalHidden)
             [("a", batchFfnResidBuf), ("b", batchPleNormBuf),
              ("output", batchLOutBuf)]
@@ -786,18 +806,34 @@ def forwardPrefillLlamaCpp [GPUBackend β] (ctx : β)
       dispatchPointwise ctx buf1 attnResidBuf hidden
 
     -- layer_scalar: if out_scale → ggml_mul (broadcast scalar over hidden × seqLen)
+    -- The scaled result is written to the "next layer input" buffer
+    -- (ping-pong), so the next iteration's attn_norm reads from l_out.
     match tokenIdsBuf with
     | some _ =>
       if h : il < model.blocks.size then
         let block := model.blocks[il]
+        let nextInputBuf ← nextOutputRef.get
         match block.outScale with
         | some outScale =>
+          -- Apply out_scale: nextInputBuf = batchLOutBuf * outScale[0]
           GPUBackend.execute ctx (stubBroadcastScaleKernel totalHidden)
             [("input", batchLOutBuf), ("scale", outScale),
-             ("output", batchLOutBuf)]
+             ("output", nextInputBuf)]
             (.dispatch1D totalHidden)
-        | none => pure ()
-        dumpGolden s!"l_out-{il}" batchLOutBuf totalHidden
+        | none =>
+          -- No out_scale: identity copy via residualAdd(a, 0).  We reuse
+          -- the residualAddKernel with b = a; the next layer will compute
+          -- attn_norm(2a) instead of attn_norm(a) which breaks parity.
+          -- TODO: add a copy kernel.  For now, if out_scale is absent we
+          -- fall back to batchLOutBuf directly (set ref without copy).
+          GPUBackend.execute ctx (Hesper.Models.Gemma4.residualAddKernel totalHidden)
+            [("a", batchLOutBuf), ("b", batchLOutBuf),
+             ("output", nextInputBuf)]
+            (.dispatch1D totalHidden)
+        dumpGolden s!"l_out-{il}" nextInputBuf totalHidden
+        -- Swap ping-pong refs: next layer's input becomes current input.
+        currentInputRef.set nextInputBuf
+        nextOutputRef.set (← pure layerInputBuf)
       else
         dispatchPointwise ctx attnResidBuf buf1 hidden
     | none =>

@@ -301,12 +301,36 @@ Each op close will append a line here:
     pe_in-0            = 1.35e-02
     per_layer_embd_out-0 = 3.48e-02 (see note above)
     l_out-0            = 1.52e-02  ✓
-- [next] Extend to L1..L41 — currently the stub runs real ops on all
-  42 layers but only L0's output can be compared (L1+ input = L0
-  output which flows through the stub's real pipeline, so in principle
-  L1+ should accumulate quant-noise-scale error too).  Add dumps and
-  diffs for all layers.
-- [next] Skeleton `result_norm` + `result_output` for end-to-end
+- [2026-04-23] **L0..L23 parity ACHIEVED**.  Wired a ping-pong input
+  buffer (`currentInputRef`/`nextOutputRef` via IO.Ref) so each layer's
+  attn_norm reads from the previous layer's `l_out`.  Also: `attn_out`
+  residual now uses `layerInputBuf` (the current layer's input, per
+  llama.cpp's `ggml_add(cur, inpL)`), not the fixed scaled embedding.
+  Sized Q/K/V and KV-cache buffers at max across Full/SWA to handle
+  both layer types.  Result:
+  ```
+  L 0: rel=1.52e-02    L12: rel=7.74e-03   L18: rel=2.79e-02
+  L 1: rel=5.24e-03    L13: rel=8.12e-03   L19: rel=2.79e-02
+  L 2: rel=7.45e-03    L14: rel=1.10e-02   L20: rel=1.87e-02
+  L 3: rel=9.73e-03    L15: rel=1.38e-02   L21: rel=1.23e-02
+  L 4: rel=1.06e-02    L16: rel=1.57e-02   L22: rel=1.46e-02
+  L 5: rel=1.31e-02    L17: rel=2.49e-02   L23: rel=1.86e-02
+  ...
+  L 6-11: rel=8-14e-03  (all < 1.4 %)
+  ```
+  All L0-L23 within 2.8 % (quant-noise scale).
+- [2026-04-23] **L24..L41 FAIL (rel 60-90 %)**.  Root cause:
+  **shared-KV layers**.  E4B has `numKVSharedLayers=18`, so L24..L41
+  (`hasKV(il)=false`) share KV cache with earlier Full/SWA layers.  My
+  stub unconditionally runs wK, wV, k_norm, v_norm, rope_K, KV-write
+  on every layer, overwriting shared caches.  Need to:
+    (a) skip K/V projections and cache writes when `!cfg.hasKV il`;
+    (b) keep per-layer KV caches (allocate 24 pairs — one per "own-KV"
+        layer — and look them up via `cfg.kvSharedFromBase`).
+  Memory: 24 × 64 MB × 2 = 3 GB at maxSeqLen=131072, feasible on the
+  4070 Ti if we allocate only what we use (seqLen=5) and declare max.
+- [next] Fix shared-KV support for L24..L41 parity.
+- [next] `result_norm` + `result_output` (Q6_K lm_head) for end-to-end
   token-level parity.
 - [next] Implement `Qcur_pos-0` (RoPE Q).  Input: `batchQBuf` (normed),
   output: dedicated `batchQRopedBuf`.  Weight: none (freq base + freq
