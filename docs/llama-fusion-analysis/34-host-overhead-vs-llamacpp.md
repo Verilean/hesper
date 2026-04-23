@@ -128,17 +128,18 @@ behavior.  Issue #136 (Phase 3 Step 1) stays open.
 4. **Fuse `quantize_q8_1` into Q4_K matmul kernel** — the big kernel-time
    item; cuts ~126 graph nodes/token and likely halves GPU time.
 
-## Postscript — graph-capture attempt (2026-04-22 PM)
+## Postscript — graph-capture now works (2026-04-22 PM)
 
-Attempted (2) with `HESPER_LLAMA_GRAPHS=1` env gate.  Capture succeeds
-(step 2 produces logits matching the eager baseline), but first replay
-on step 3 aborts with `CUDA_ERROR_ILLEGAL_ADDRESS`.
+Attempted (2) with `HESPER_LLAMA_GRAPHS=1` env gate.  First attempt hit
+`CUDA_ERROR_ILLEGAL_ADDRESS` on replay; second attempt with pinned host
+memory for the varying sources **works**.
 
-Root cause is identified and already documented in `Hesper/CUDA/FFI.lean`
-near `cuMemAllocHost`: hesper's `GPUBackend.writeBuffer` on the capture
-stream hands CUDA a pointer into a Lean-managed `ByteArray`.  The graph
-records that pointer.  Between capture and replay the `ByteArray` is
-GC'd → replay dereferences freed memory.
+Root cause (first attempt) is identified and already documented in
+`Hesper/CUDA/FFI.lean` near `cuMemAllocHost`: hesper's
+`GPUBackend.writeBuffer` on the capture stream hands CUDA a pointer
+into a Lean-managed `ByteArray`.  The graph records that pointer.
+Between capture and replay the `ByteArray` is GC'd → replay
+dereferences freed memory.
 
 The per-decode forward has 5 `writeBuffer` sites:
 
@@ -151,14 +152,41 @@ The per-decode forward has 5 `writeBuffer` sites:
 | `paramsBuf`     | **yes** (startPos)     | always written (but handled via `paramsBufOverride` now) |
 | `tokenIdsBuf`   | **yes** (last-gen tok) | caller-side |
 
-Fix direction (not implemented this session):
-* For the 4 **constant** sites, init once at session start and skip
-  re-writes inside the forward.  Since ScratchPool returns the same
-  device pointer every call, contents persist across forwards.
-* For `paramsBuf` and `tokenIdsBuf`, route through `cuMemAllocHost` +
-  `cuMemcpyHtoDFromPinned` (helpers already in `Hesper/CUDA/FFI.lean`).
+Fix that shipped (commit 8a00295):
+* Added `skipConstantWrites` flag; set `true` on captured/replayed
+  forwards.  The 4 constant sites are initialised during step-1 eager
+  warm-up and never re-written — ScratchPool pointer reuse keeps the
+  contents alive.
+* Two pinned host slots hold `startPos` and `tokenIdsBuf[0]`; driver
+  calls `cuWritePinned` before each step, and a captured
+  `cuMemcpyHtoDFromPinned` on the capture stream updates the device
+  buffers during replay.
+* Capture step itself launches the instantiated graph once so its
+  result matches an eager decode (capture-only would return stale
+  step-1 logits because capture records without executing).
 
-Expected impact after fix: `cuLaunchKernel` overhead (~2 ms/forward at
-decode) drops to ~0, plus the 4-5 small cuMemcpyHtoD per decode go
-away entirely.  That's ~3 ms/forward recovered — ~1.7 % TPS lift at
-our current 5.65 TPS, scaling to ~25 % at the 115 TPS budget.
+Measured impact (same workload, RTX 4070 Ti):
+
+|  Tokens | No graphs | Graphs | Δ     |
+|:-------:|----------:|-------:|:-----:|
+|    5    |     5.72  |  6.26  | +9%   |
+|   10    |     6.72  |  9.02  | +34%  |
+|   20    |     7.14  | 11.20  | +57%  |
+
+Per-decode wall clock drops from ~68 ms → ~59 ms once replay kicks in
+— essentially the ~10 ms of `cuLaunchKernel` overhead the earlier
+profile predicted.  `dispatchCounter=0` on replays confirms one
+`cuGraphLaunch` replaces ~1500 individual launches each decode step.
+
+## Status summary
+
+| Tax item            | Before          | After ScratchPool | After Graphs | llama.cpp |
+|---------------------|-----------------|-------------------|--------------|-----------|
+| `cuMemAlloc` /fwd   | ~3 ms           | ~0                | ~0           | ~0        |
+| `cuLaunchKernel`/fwd| ~2 ms           | ~2 ms             | ~0           | ~0        |
+| const writeBuffer   | ~0.5 ms         | ~0.5 ms           | 0            | 0         |
+| GPU kernel time     | 60 ms           | 60 ms             | 60 ms        | 7 ms      |
+
+Non-kernel overhead is now essentially at llama.cpp's level in absolute
+ms per decode.  Remaining ~8× TPS gap lives entirely inside the GPU
+kernels.
