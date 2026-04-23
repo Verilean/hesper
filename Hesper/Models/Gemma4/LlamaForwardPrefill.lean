@@ -171,12 +171,16 @@ private def dispatchBuildFfn
 
     Set `HESPER_GOLDEN_DUMP_DIR=<dir>` to write each named intermediate
     tensor (matching llama.cpp's `cb()` names) to `<dir>/<name>.bin` for
-    side-by-side diffing against `llama-eval-callback`'s dumps. -/
+    side-by-side diffing against `llama-eval-callback`'s dumps.
+
+    Returns the last-token logits buffer (vocabSize f32 elements) when
+    a prompt is provided.  Callers can argmax this to pick the next
+    token for greedy decoding. -/
 def forwardPrefillLlamaCpp [GPUBackend β] (ctx : β)
     (model : Gemma4Model (GPUBackend.Buf β) (GPUBackend.CachedDispatch β))
     (seqLen : Nat)
     (state : InferenceState (GPUBackend.Buf β) (GPUBackend.CachedDispatch β))
-    (tokenIdsBuf : Option (GPUBackend.Buf β) := none) : IO Unit := do
+    (tokenIdsBuf : Option (GPUBackend.Buf β) := none) : IO (Option (GPUBackend.Buf β)) := do
   let cfg := model.config
   let numLayers := cfg.numHiddenLayers
   let hidden := cfg.hiddenSize
@@ -864,6 +868,7 @@ def forwardPrefillLlamaCpp [GPUBackend β] (ctx : β)
       -- for argmax parity).  Defer proper softcap for bit-parity work.
       pure ()
     dumpGolden "result_output" logitsBuf vocab
+    return some logitsBuf
   | none =>
     -- Dispatch-count mode
     dispatchRmsNorm ctx buf1 buf2 hidden
@@ -879,5 +884,6 @@ def forwardPrefillLlamaCpp [GPUBackend β] (ctx : β)
     dispatchPointwise ctx buf1 buf2 hidden
     dispatchPointwise ctx buf2 buf1 hidden
     dispatchPointwise ctx buf1 buf2 hidden
+    return none
 
 end Hesper.Models.Gemma4
