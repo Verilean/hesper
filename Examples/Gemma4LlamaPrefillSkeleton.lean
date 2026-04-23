@@ -165,6 +165,15 @@ unsafe def main (args : List String) : IO Unit := do
     | some "1" => pure true
     | _        => pure false
   let persistentParamsBuf ← GPUBackend.allocBuffer ctx (4 : USize)
+  -- Pinned host slots: graph replay needs a source pointer that stays
+  -- valid across the capture→replay boundary.  Lean ByteArrays are GC'd
+  -- and their addresses aren't stable, which is exactly the
+  -- CUDA_ERROR_ILLEGAL_ADDRESS hazard that Hesper/CUDA/FFI.lean warns
+  -- about near cuMemAllocHost.  Allocate two 4-byte pinned slots (one
+  -- for startPos, one for tokenIdsBuf[0]) and issue captured memcpys
+  -- against them instead of ByteArrays.
+  let pinnedStartPos ← Hesper.CUDA.cuMemAllocHost (4 : USize)
+  let pinnedTokenId  ← Hesper.CUDA.cuMemAllocHost (4 : USize)
   let mut graphExec : Option Hesper.CUDA.CUgraphExec := none
   let mut graphStream : Option Hesper.CUDA.CUstream := none
   let mut capturedLogits : Option Hesper.CUDA.CUDABuffer := none
@@ -176,9 +185,14 @@ unsafe def main (args : List String) : IO Unit := do
     -- initialToks.size (written during prefill).  After this decode
     -- step we'll have initialToks.size + 1 cached tokens (slot 0..size).
     let startPos := initialToks.size + (generatedIds.size - 1)
-    -- Upload a single u32 = lastGen to tokenIdsBuf[0].
-    let b := Hesper.WebGPU.BufferOps.uint32ToBytes lastGen.toUInt32
-    GPUBackend.writeBuffer ctx tokenIdsBuf b
+
+    -- Stage the two varying values into pinned host memory.  These
+    -- memcpys do NOT touch the GPU — they are plain memcpys — so they
+    -- never fall inside any capture scope.
+    Hesper.CUDA.cuWritePinned pinnedTokenId 0
+      (Hesper.WebGPU.BufferOps.uint32ToBytes lastGen.toUInt32) (4 : USize)
+    Hesper.CUDA.cuWritePinned pinnedStartPos 0
+      (Hesper.WebGPU.BufferOps.uint32ToBytes startPos.toUInt32) (4 : USize)
 
     scratchPool.reset
     Hesper.resetDispatchCounter
@@ -189,38 +203,58 @@ unsafe def main (args : List String) : IO Unit := do
       match graphStream with
       | none => pure none
       | some s =>
-        -- Update paramsBuf on the capture stream BEFORE replay so the
-        -- graph's kernels pick up the new startPos.
-        let posBytes := Hesper.WebGPU.BufferOps.uint32ToBytes startPos.toUInt32
-        Hesper.CUDA.cuMemcpyHtoDAsync persistentParamsBuf.ptr posBytes 0 (4 : USize) s
+        -- Replay: push the fresh pinned values to device on the capture
+        -- stream, then launch the graph.  Because the host-side pointers
+        -- (pinnedStartPos / pinnedTokenId) were also the sources used
+        -- during capture, the graph's memcpy nodes stay valid.
+        Hesper.CUDA.cuMemcpyHtoDFromPinned persistentParamsBuf.ptr
+          pinnedStartPos 0 (4 : USize) s
+        Hesper.CUDA.cuMemcpyHtoDFromPinned tokenIdsBuf.ptr
+          pinnedTokenId 0 (4 : USize) s
         Hesper.CUDA.cuGraphLaunch exec s
         Hesper.CUDA.cuStreamSynchronize s
         pure capturedLogits
     | true, none =>
       if step == 1 then
-        -- Eager warm-up: grow the ScratchPool to its final size.  Also
-        -- initialises persistentParamsBuf side-by-side so the forward uses
-        -- it from step 1 onwards (keeps kernel-arg identity across steps).
+        -- Eager warm-up: grow ScratchPool to final size.  Write the
+        -- current values via the usual host writeBuffer path — this is
+        -- outside any capture so ByteArray stability doesn't matter.
         GPUBackend.writeBuffer ctx persistentParamsBuf
           (Hesper.WebGPU.BufferOps.uint32ToBytes startPos.toUInt32)
+        GPUBackend.writeBuffer ctx tokenIdsBuf
+          (Hesper.WebGPU.BufferOps.uint32ToBytes lastGen.toUInt32)
         forwardPrefillLlamaCpp ctx model 1 state
           (tokenIdsBuf := some tokenIdsBuf) (startPos := startPos)
           (persistentCaches := some kvPairs)
           (scratchPool := some scratchPool)
           (paramsBufOverride := some persistentParamsBuf)
       else
+        -- Capture: update the two varying devices from pinned sources
+        -- on the capture stream so the memcpys become graph nodes whose
+        -- source pointers outlive GC.  Then run the forward to record
+        -- the kernel sequence.
         let stream ← Hesper.CUDA.cuStreamCreate
         Hesper.cudaCaptureStream.set (some stream)
         Hesper.CUDA.cuStreamBeginCapture stream
+        Hesper.CUDA.cuMemcpyHtoDFromPinned persistentParamsBuf.ptr
+          pinnedStartPos 0 (4 : USize) stream
+        Hesper.CUDA.cuMemcpyHtoDFromPinned tokenIdsBuf.ptr
+          pinnedTokenId 0 (4 : USize) stream
         let logits ← forwardPrefillLlamaCpp ctx model 1 state
           (tokenIdsBuf := some tokenIdsBuf) (startPos := startPos)
           (persistentCaches := some kvPairs)
           (scratchPool := some scratchPool)
           (paramsBufOverride := some persistentParamsBuf)
+          (skipConstantWrites := true)
         let graph ← Hesper.CUDA.cuStreamEndCapture stream
         Hesper.cudaCaptureStream.set none
         let exec ← Hesper.CUDA.cuGraphInstantiate graph
         Hesper.CUDA.cuGraphDestroy graph
+        -- Capture only RECORDS; it doesn't run.  Launch once now so this
+        -- step's logits are correct (kernels actually execute with the
+        -- current pinnedStartPos / pinnedTokenId), and the caller sees
+        -- coherent output instead of stale step-1 contents.
+        Hesper.CUDA.cuGraphLaunch exec stream
         Hesper.CUDA.cuStreamSynchronize stream
         graphExec := some exec
         graphStream := some stream
@@ -228,6 +262,10 @@ unsafe def main (args : List String) : IO Unit := do
         IO.println s!"[Graph] captured decode step (step={step})"
         pure logits
     | false, _ =>
+      -- No graphs: write tokenIdsBuf the usual way (pinned is
+      -- graph-capture specific) and run eager.
+      GPUBackend.writeBuffer ctx tokenIdsBuf
+        (Hesper.WebGPU.BufferOps.uint32ToBytes lastGen.toUInt32)
       forwardPrefillLlamaCpp ctx model 1 state
         (tokenIdsBuf := some tokenIdsBuf) (startPos := startPos)
         (persistentCaches := some kvPairs)
