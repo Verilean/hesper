@@ -2128,14 +2128,23 @@ def fusedQ4KMLinearDP4A4WarpKernel (config : Config) : ShaderM Unit := do
   let acc : Exp (.scalar .f32) := Exp.var "acc"
 
   -- Outer loop: `for kbx = kbxStart; kbx < blocksPerRow; kbx += 8`.
-  -- Encoded as a bounded iter loop to keep ShaderM happy.  max iter count
-  -- is ⌈blocksPerRow / 8⌉ + 1 (kbxStart can be up to 7; 7 + 8k < bpr).
+  -- Encoded as a bounded iter loop.  On llama.cpp the `for (; kbx <
+  -- blocksPerRow; kbx += 8)` exits early when OOB; hesper can't break
+  -- so we wrap the loop body in `if blockInRange` — threads whose
+  -- slot is past the end skip ALL global reads + dp4a work for that
+  -- iteration instead of doing the work and masking the result.
+  --
+  -- Impact on the hot shapes: for inDim=2560 matmuls (wQ, wK, wV, wO,
+  -- ffn_gate, ffn_up, PLE inp_gate/proj) blocksPerRow=10, so threads
+  -- with kbxStart=3..7 do 1 useful iter + 1 skipped iter; without
+  -- the guard they'd do 2 full iters with the 2nd masked to 0 — about
+  -- 30 % of the lane-iterations on those kernels.
   let maxIter := (blocksPerRow + 7) / 8
   ShaderM.loop (Exp.litU32 0) (Exp.litU32 maxIter) (Exp.litU32 1) fun iter => do
     let blockIdx := Exp.add kbxStart (Exp.mul iter (Exp.litU32 8))
     let blockInRange := Exp.lt blockIdx (Exp.litU32 blocksPerRow)
-    let safeBlockIdx := Exp.select blockInRange blockIdx (Exp.litU32 0)
-    let blockU32Base := Exp.add rowBaseU32 (Exp.mul safeBlockIdx (Exp.litU32 36))
+    ShaderM.if_ blockInRange (do
+    let blockU32Base := Exp.add rowBaseU32 (Exp.mul blockIdx (Exp.litU32 36))
 
     let dmU32 ← ShaderM.readBuffer (ty := .scalar .u32) (n := totalWeightU32) "weights" blockU32Base
     let dF := fp16ToF32 (Exp.bitAnd dmU32 (Exp.litU32 0xFFFF))
@@ -2175,7 +2184,7 @@ def fusedQ4KMLinearDP4A4WarpKernel (config : Config) : ShaderM Unit := do
     let v1 ← ShaderM.readBuffer (ty := .scalar .u32) (n := totalWeightU32) "weights" (Exp.add q4BaseIdx (Exp.litU32 4))
 
     -- Q8_1 reads from global memory (no smem staging — maximizes occupancy).
-    let q8Sub0Base := Exp.add (Exp.mul safeBlockIdx (Exp.litU32 (8 * 9))) (Exp.mul bq8Off (Exp.litU32 9))
+    let q8Sub0Base := Exp.add (Exp.mul blockIdx (Exp.litU32 (8 * 9))) (Exp.mul bq8Off (Exp.litU32 9))
     let q8Sub1Base := Exp.add q8Sub0Base (Exp.litU32 9)
     let u0 ← ShaderM.readBuffer (ty := .scalar .u32) (n := q8InputU32Size) "input_q8" (Exp.add q8Sub0Base (Exp.add (Exp.litU32 1) elemOff))
     let u1 ← ShaderM.readBuffer (ty := .scalar .u32) (n := q8InputU32Size) "input_q8" (Exp.add q8Sub0Base (Exp.add (Exp.litU32 5) elemOff))
@@ -2218,10 +2227,8 @@ def fusedQ4KMLinearDP4A4WarpKernel (config : Config) : ShaderM Unit := do
     let blockSumfD := Exp.add sumfD_0 sumfD_1
     let blockSumfM := Exp.add sumfM_0 sumfM_1
     let blockContrib := Exp.sub (Exp.mul dF blockSumfD) (Exp.mul dminF blockSumfM)
-    -- Gate OOB iterations (threads with kbxStart past blocksPerRow, or
-    -- kbxStart + 8*iter past blocksPerRow).
-    let gatedContrib := Exp.select blockInRange blockContrib (Exp.litF32 0.0)
-    ShaderM.assign "acc" (Exp.add acc gatedContrib)
+    ShaderM.assign "acc" (Exp.add acc blockContrib)
+    ) (pure ())
 
   -- Intra-warp reduce: all 32 lanes contribute distinct products (matches
   -- llama.cpp's mul_mat_vec_q where each thread handles a unique
