@@ -133,6 +133,83 @@ def stubBroadcastScaleKernel (total : Nat) : ShaderM Unit := do
     ShaderM.writeBuffer (ty := .scalar .f32) "output" idx (Exp.mul v s)
   ) (pure ())
 
+/-! ## Batched PLE prelude helpers
+
+Used by `forwardPrefillLlamaCpp` to compute the full
+`[seqLen × totalPL]` PLE input tensor in O(1) dispatches per stage,
+matching llama.cpp's `project_per_layer_inputs` which uses a single
+batched matmul + batched rmsnorm + batched add/scale over all tokens.
+-/
+
+/-- Batched 1D scale: `out[i] = in[i] * scale` for `i in [0, total)`.  Single
+    kernel for `project_per_layer_inputs`'s `ggml_scale(1/√hidden)` step. -/
+def stubBatchScaleKernel (total : Nat) (scale : Float) : ShaderM Unit := do
+  let gid ← ShaderM.globalId
+  let idx := Exp.vec3X gid
+  let _input ← ShaderM.declareInputBuffer "input" (.array (.scalar .f32) total)
+  let _output ← ShaderM.declareOutputBuffer "output" (.array (.scalar .f32) total)
+  ShaderM.if_ (Exp.lt idx (Exp.litU32 total)) (do
+    let x ← ShaderM.readBuffer (ty := .scalar .f32) (n := total) "input" idx
+    ShaderM.writeBuffer (ty := .scalar .f32) "output" idx (Exp.mul x (Exp.litF32 scale))
+  ) (pure ())
+
+/-- Batched chunked RMSNorm: same as `chunkedRMSNormKernel` but over a
+    `[seqLen × totalPL]` buffer, normalising each `embdPerLayer`-sized
+    chunk across its own column.  Grid `(numChunks, seqLen, 1)`. -/
+def stubChunkedRMSNormBatchKernel
+    (chunkDim numChunks seqLen : Nat) (eps : Float)
+    (workgroupSize : Nat := 256) : ShaderM Unit := do
+  let wid ← ShaderM.workgroupId
+  let lid ← ShaderM.localId
+  let chunkIdx := Exp.vec3X wid
+  let col := Exp.vec3Y wid
+  let tid := Exp.vec3X lid
+  let totalPL := chunkDim * numChunks
+  let total := totalPL * seqLen
+  let _input ← ShaderM.declareInputBuffer "input" (.array (.scalar .f32) total)
+  let _weight ← ShaderM.declareInputBuffer "weight" (.array (.scalar .f32) chunkDim)
+  let _output ← ShaderM.declareOutputBuffer "output" (.array (.scalar .f32) total)
+  ShaderM.sharedNamed "shared_sum" (.array (.scalar .f32) workgroupSize)
+  let colBase := Exp.mul col (Exp.litU32 totalPL)
+  let chunkBase := Exp.add colBase (Exp.mul chunkIdx (Exp.litU32 chunkDim))
+  ShaderM.varNamed "local_sum" (.scalar .f32) (Exp.litF32 0.0)
+  let localSum : Exp (.scalar .f32) := Exp.var "local_sum"
+  ShaderM.loop tid (Exp.litU32 chunkDim) (Exp.litU32 workgroupSize) fun i => do
+    let v ← ShaderM.readBuffer (ty := .scalar .f32) (n := total) "input" (Exp.add chunkBase i)
+    ShaderM.assign "local_sum" (Exp.add localSum (Exp.mul v v))
+  ShaderM.writeWorkgroup (ty := .scalar .f32) "shared_sum" tid localSum
+  ShaderM.barrier
+  let mut stride := workgroupSize / 2
+  while stride > 0 do
+    ShaderM.if_ (Exp.lt tid (Exp.litU32 stride)) (do
+      let a ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := workgroupSize) "shared_sum" tid
+      let b ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := workgroupSize) "shared_sum" (Exp.add tid (Exp.litU32 stride))
+      ShaderM.writeWorkgroup (ty := .scalar .f32) "shared_sum" tid (Exp.add a b)
+    ) (pure ())
+    ShaderM.barrier
+    stride := stride / 2
+  let sumSq ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := workgroupSize) "shared_sum" (Exp.litU32 0)
+  let rms := Exp.inverseSqrt (Exp.add (Exp.div sumSq (Exp.litF32 chunkDim.toFloat)) (Exp.litF32 eps))
+  ShaderM.loop tid (Exp.litU32 chunkDim) (Exp.litU32 workgroupSize) fun i => do
+    let v ← ShaderM.readBuffer (ty := .scalar .f32) (n := total) "input" (Exp.add chunkBase i)
+    let w ← ShaderM.readBuffer (ty := .scalar .f32) (n := chunkDim) "weight" i
+    let normed := Exp.mul (Exp.mul v rms) w
+    ShaderM.writeBuffer (ty := .scalar .f32) "output" (Exp.add chunkBase i) normed
+
+/-- Batched scaled-add: `out[i] = (a[i] + b[i]) * scale`. -/
+def stubScaledAddBatchKernel (total : Nat) (scale : Float) : ShaderM Unit := do
+  let gid ← ShaderM.globalId
+  let idx := Exp.vec3X gid
+  let _a ← ShaderM.declareInputBuffer "a" (.array (.scalar .f32) total)
+  let _b ← ShaderM.declareInputBuffer "b" (.array (.scalar .f32) total)
+  let _output ← ShaderM.declareOutputBuffer "output" (.array (.scalar .f32) total)
+  ShaderM.if_ (Exp.lt idx (Exp.litU32 total)) (do
+    let av ← ShaderM.readBuffer (ty := .scalar .f32) (n := total) "a" idx
+    let bv ← ShaderM.readBuffer (ty := .scalar .f32) (n := total) "b" idx
+    ShaderM.writeBuffer (ty := .scalar .f32) "output" idx
+      (Exp.mul (Exp.add av bv) (Exp.litF32 scale))
+  ) (pure ())
+
 /-- Final-logit softcap: `out[i] = softcap * tanh(in[i] / softcap)`.
     Matches llama.cpp's `scale(1/s) + tanh + scale(s)` chain at
     gemma4-iswa.cpp:239-243.  Fused into one kernel because the three

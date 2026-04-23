@@ -288,16 +288,15 @@ def forwardPrefillLlamaCpp [GPUBackend β] (ctx : β)
     dispatchPointwise ctx buf1 buf2 hidden
     dispatchPointwise ctx buf2 buf1 hidden
 
-  -- project_per_layer_inputs (if tok_embd_per_layer).  For parity mode,
-  -- compute the full [seqLen × totalPL] PLE input batch and stash it
-  -- in `batchPLInputAll`; the layer-0 loop will slice this to get
-  -- `inp_this_layer`.  For dispatch-count mode, emit 7 DCE-safe stubs.
+  -- project_per_layer_inputs (if tok_embd_per_layer).  Matches
+  -- llama.cpp's `project_per_layer_inputs` which is 1 batched matmul +
+  -- 1 batched scale + 1 batched chunked-rmsnorm + 1 batched scaled-add,
+  -- plus per-token Q6_K dequant for the `inp_per_layer_selected` term.
   let totalPL := cfg.embdPerLayer * numLayers
   let batchPLInputAll ← mkBuf (seqLen * totalPL)
-  let plModelProjScratch ← mkBuf totalPL     -- scaled tok_embd_per_layer row (per-token)
-  let plProjScratch ← mkBuf totalPL          -- matmul output (per-token)
-  let plNormedScratch ← mkBuf totalPL        -- rms-normed (per-token)
-  let plColScratch ← mkBuf hidden            -- column extract of batchBuf2
+  let batchPLInpSelected ← mkBuf (seqLen * totalPL)  -- Q6_K dequant → batched
+  let batchPLProj ← mkBuf (seqLen * totalPL)         -- matmul output → batched
+  let batchPLNormed ← mkBuf (seqLen * totalPL)       -- rms-normed → batched
   let plColIdxBuf ← mkBuf 1
 
   match tokenIdsBuf, model.perLayerEmbdTableGPU, model.perLayerModelProj, model.perLayerProjNorm with
@@ -305,66 +304,65 @@ def forwardPrefillLlamaCpp [GPUBackend β] (ctx : β)
     let embdPL := cfg.embdPerLayer
     let nLayers := numLayers
     let scaleFactor : Float := Float.sqrt embdPL.toFloat
-    -- Need per-token tokenId.  We read from a 1-element scratch that we
-    -- fill each iteration via stubCopyU32Kernel from tokenIdsBuf.
+    -- 1. Per-token Q6_K dequant + scale into [seqLen × totalPL] batch.
+    --    (q6kTableRowDequantScaleKernel is per-row; we call it seqLen
+    --    times with different token IDs and column-insert the result.
+    --    Cheap relative to the matmul, but could be batched in a future
+    --    pass if dequantQ6KElement becomes public.)
     let tokenScratch2 ← mkBuf 1
     for i in [0:seqLen] do
-      -- colIdxBuf := i
       let iBytes := Hesper.WebGPU.BufferOps.uint32ToBytes i.toUInt32
       GPUBackend.writeBuffer ctx plColIdxBuf iBytes
-      -- tokenScratch2 := tokenIdsBuf[i]
       match tokenIdsBuf with
       | some tokIds =>
         GPUBackend.execute ctx (stubCopyU32Kernel seqLen 1 0)
           [("src", tokIds), ("params", plColIdxBuf), ("dst", tokenScratch2)]
           { workgroupSize := { x := 1, y := 1, z := 1 }, numWorkgroups := (1, 1, 1) }
       | none => pure ()
-      -- 1. Dequant Q6_K tok_embd_per_layer row * √embdPerLayer → plModelProjScratch
-      --    (matches llama.cpp's get_per_layer_inputs: get_rows + scale)
+      -- Dequant row of tok_embd_per_layer directly into slice i of the
+      -- batch buffer (via columnExtract-style access).  Use a temp totalPL
+      -- scratch then column-insert.
+      let tmp ← mkBuf totalPL
       GPUBackend.execute ctx
         (Hesper.Quantization.Q6_K.q6kTableRowDequantScaleKernel totalPL scaleFactor
           cfg.vocabSize)
-        [("table", embdTableGPU), ("params", tokenScratch2),
-         ("output", plModelProjScratch)]
+        [("table", embdTableGPU), ("params", tokenScratch2), ("output", tmp)]
         (.dispatch1D totalPL)
-      -- 2. Extract column i of batchBuf2 (scaled embedding) into plColScratch
-      GPUBackend.execute ctx (stubColumnExtractKernel hidden seqLen)
-        [("batch", batchBuf2), ("params", plColIdxBuf), ("out", plColScratch)]
-        (.dispatch1D hidden)
-      -- 3. matmul: per_layer_model_proj × plColScratch → plProjScratch
-      let projConfig : Hesper.WGSL.MatMul.Config := {
-        M := 1, N := totalPL, K := hidden
-      }
-      if projConfig.K % 64 == 0 then
-        Hesper.WGSL.MatMul.executeMatMulTransposeF16BlockCoop ctx
-          plColScratch modelProj plProjScratch projConfig
-      else
-        Hesper.WGSL.MatMul.executeMatMulTransposeF16 ctx
-          plColScratch modelProj plProjScratch projConfig
-      -- 4. Scale by 1/√hidden (in-place via separate buf): plProjScratch → plNormedScratch
-      GPUBackend.execute ctx
-        (Hesper.Layers.PerLayerEmbedding.scaleKernel totalPL (1.0 / Float.sqrt hidden.toFloat))
-        [("input", plProjScratch), ("output", plNormedScratch)]
+      GPUBackend.execute ctx (stubBatchInsertKernel totalPL (seqLen * totalPL))
+        [("src", tmp), ("params", plColIdxBuf), ("dst", batchPLInpSelected)]
         (.dispatch1D totalPL)
-      -- 5. chunked RMSNorm across embdPerLayer, for each of nLayers chunks
-      GPUBackend.execute ctx
-        (chunkedRMSNormKernel embdPL nLayers cfg.rmsNormEps)
-        [("input", plNormedScratch), ("weight", projNorm.scale),
-         ("output", plProjScratch)]
-        { numWorkgroups := (nLayers, 1, 1),
-          workgroupSize := { x := min embdPL 256, y := 1, z := 1 } : Hesper.ExecConfig }
-      -- 6. scaled-add: (normed + inp_per_layer_selected) * (1/√2)
-      GPUBackend.execute ctx
-        (scaledAddKernel totalPL (1.0 / Float.sqrt 2.0))
-        [("a", plProjScratch), ("b", plModelProjScratch),
-         ("output", plNormedScratch)]
-        (.dispatch1D totalPL)
-      -- 7. column-insert: plNormedScratch → batchPLInputAll[:, i]
-      GPUBackend.execute ctx
-        (stubBatchInsertKernel totalPL (seqLen * totalPL))
-        [("src", plNormedScratch), ("params", plColIdxBuf),
-         ("dst", batchPLInputAll)]
-        (.dispatch1D totalPL)
+
+    -- 2. ONE batched matmul: per_layer_model_proj × batchBuf2[:, :]
+    --    → batchPLProj.  batchBuf2 is [hidden, seqLen] (col-major), the
+    --    matmul expects A[M, K] with M=seqLen, K=hidden, N=totalPL.
+    --    BlockCoop is M=1 only, so use the general F16 matmul.
+    let projConfig : Hesper.WGSL.MatMul.Config := {
+      M := seqLen, N := totalPL, K := hidden
+    }
+    Hesper.WGSL.MatMul.executeMatMulTransposeF16 ctx
+      batchBuf2 modelProj batchPLProj projConfig
+
+    -- 3. ONE batched scale by 1/√hidden.
+    GPUBackend.execute ctx
+      (stubBatchScaleKernel (seqLen * totalPL) (1.0 / Float.sqrt hidden.toFloat))
+      [("input", batchPLProj), ("output", batchPLNormed)]
+      (.dispatch1D (seqLen * totalPL))
+
+    -- 4. ONE batched chunked RMSNorm: grid (nLayers, seqLen, 1).
+    GPUBackend.execute ctx
+      (stubChunkedRMSNormBatchKernel embdPL nLayers seqLen cfg.rmsNormEps)
+      [("input", batchPLNormed), ("weight", projNorm.scale),
+       ("output", batchPLProj)]
+      { numWorkgroups := (nLayers, seqLen, 1),
+        workgroupSize := { x := min embdPL 256, y := 1, z := 1 } : Hesper.ExecConfig }
+
+    -- 5. ONE batched scaled-add: (normed + inp_per_layer_selected) * (1/√2)
+    --    → batchPLInputAll (layout-compatible with slice kernel).
+    GPUBackend.execute ctx
+      (stubScaledAddBatchKernel (seqLen * totalPL) (1.0 / Float.sqrt 2.0))
+      [("a", batchPLProj), ("b", batchPLInpSelected),
+       ("output", batchPLInputAll)]
+      (.dispatch1D (seqLen * totalPL))
   | _, _, _, _ =>
     -- No PLE table / no prompt: emit the earlier DCE-safe stubs so dispatch
     -- count stays consistent.
