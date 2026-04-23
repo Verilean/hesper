@@ -407,17 +407,22 @@ def forwardPrefillLlamaCpp [GPUBackend β] (ctx : β)
   let batchPleProjBuf ← mkBuf (hidden * seqLen)
   let batchPleNormBuf ← mkBuf (hidden * seqLen)
   let batchLOutBuf ← mkBuf (hidden * seqLen)
-  -- KV cache: Single local K/V cache pair, reused per layer (overwritten
-  -- each layer — since our prefill is a single forward and build_attn
-  -- reads only the K/V just written in the same layer).  Sized at
-  -- maxKVHeads × maxSeqLen × maxHeadDim because `flashAttentionBatchKernel`
-  -- indexes with `kvHead * maxSeqLen * headDim`, so the allocation must
-  -- cover the full stride the kernel assumes.  At 4 × 32768 × 128 × f32
-  -- this is ~64 MB per cache, 128 MB total — acceptable for parity runs.
+  -- KV caches: one K and V buffer per "own-KV" layer.  Shared-KV
+  -- layers (last numKVSharedLayers layers in Gemma 4 E4B) reuse these
+  -- via `cfg.kvSharedFromBase`.  Sized at maxKVHeads × maxSeqLen ×
+  -- maxHeadDim so `flashAttentionBatchKernel`'s
+  -- `kvHead * maxSeqLen * headDim` stride is always in-bounds.
   let maxSeqLenUsed := cfg.maxSeqLen
   let cacheSize := maxKVHeads * maxSeqLenUsed * maxHeadDim
-  let kCacheBuf ← mkBuf cacheSize
-  let vCacheBuf ← mkBuf cacheSize
+  let ownKVLayers := numLayers - cfg.numKVSharedLayers
+  let mut kCaches : Array (GPUBackend.Buf β) := Array.empty
+  let mut vCaches : Array (GPUBackend.Buf β) := Array.empty
+  for _ in [0:ownKVLayers] do
+    kCaches := kCaches.push (← mkBuf cacheSize)
+    vCaches := vCaches.push (← mkBuf cacheSize)
+  -- For backwards-compatible naming with earlier single-cache code:
+  let kCacheBuf ← if h : 0 < kCaches.size then pure kCaches[0] else mkBuf cacheSize
+  let vCacheBuf ← if h : 0 < vCaches.size then pure vCaches[0] else mkBuf cacheSize
   -- Params buffer: holds `startPos` (u32) for RoPE.  startPos=0 for prefill.
   let paramsBuf ← mkBuf 1
   GPUBackend.writeBuffer ctx paramsBuf (Hesper.WebGPU.BufferOps.uint32ToBytes 0)
@@ -515,124 +520,95 @@ def forwardPrefillLlamaCpp [GPUBackend β] (ctx : β)
     -- For stub purposes emit KV branch unconditionally; llama.cpp's 2016
     -- count reflects the full layer mix.
 
-    -- Kcur = build_lora_mm(wk, cur)
+    -- wK / wV / k_norm / v_rms_norm / rope_K: ONLY for own-KV layers.
+    -- Shared-KV layers (last numKVSharedLayers layers in Gemma 4 E4B)
+    -- reuse the prior layer's KV cache unchanged.
     match tokenIdsBuf with
     | some _ =>
       if h : il < model.blocks.size then
-        let block := model.blocks[il]
-        Hesper.Layers.Linear.forwardBatchDP4A ctx block.attention.wK
-          batchNormedBuf batchKBuf seqLen
-        dumpGolden s!"Kcur-{il}" batchKBuf (kvDim0 * seqLen)
+        if cfg.hasKV il then
+          let block := model.blocks[il]
+          -- Kcur = build_lora_mm(wk, cur)
+          Hesper.Layers.Linear.forwardBatchDP4A ctx block.attention.wK
+            batchNormedBuf batchKBuf seqLen
+          dumpGolden s!"Kcur-{il}" batchKBuf (kvDim0 * seqLen)
+          -- Vcur = build_lora_mm(wv, cur)
+          Hesper.Layers.Linear.forwardBatchDP4A ctx block.attention.wV
+            batchNormedBuf batchVBuf seqLen
+          dumpGolden s!"Vcur-{il}" batchVBuf (kvDim0 * seqLen)
+          -- ggml_reshape_3d × 2                  [no kernel]
+          -- Kcur = build_norm(Kcur, attn_k_norm)
+          let numKVH := cfg.numKVHeads il
+          let headDim := cfg.headDim il
+          GPUBackend.execute ctx
+            (perHeadRMSNormBatchKernel numKVH headDim seqLen cfg.rmsNormEps)
+            [("input", batchKBuf), ("weight", block.attention.kNormWeight),
+             ("output", batchKBuf)]
+            { numWorkgroups := (numKVH, seqLen, 1),
+              workgroupSize := { x := (if headDim < 256 then headDim else 256),
+                                 y := 1, z := 1 } : Hesper.ExecConfig }
+          dumpGolden s!"Kcur_normed-{il}" batchKBuf (kvDim0 * seqLen)
+          -- Vcur = ggml_rms_norm(Vcur)  [bare RMSNorm, no learned weight]
+          GPUBackend.execute ctx
+            (stubPerHeadBareRMSNormBatchKernel numKVH headDim seqLen cfg.rmsNormEps)
+            [("input", batchVBuf), ("output", batchVBuf)]
+            { numWorkgroups := (numKVH, seqLen, 1),
+              workgroupSize := { x := (if headDim < 256 then headDim else 256),
+                                 y := 1, z := 1 } : Hesper.ExecConfig }
+          dumpGolden s!"Vcur_normed-{il}" batchVBuf (kvDim0 * seqLen)
+          -- Kcur = ggml_rope_ext(Kcur, ...)
+          let freqFactors := block.ropeFreqFactors.getD onesBuf
+          GPUBackend.execute ctx
+            (ropeWithFreqFactorsBatchKernel headDim numKVH seqLen (cfg.ropeBase il))
+            [("input", batchKBuf), ("output", batchKRopedBuf),
+             ("params", paramsBuf), ("freq_factors", freqFactors)]
+            (.dispatch1D (numKVH * headDim / 2 * seqLen))
+          dumpGolden s!"Kcur_pos-{il}" batchKRopedBuf (kvDim0 * seqLen)
       else
         dispatchMulMat ctx buf2 kBuf seqLen hidden hidden
     | none =>
       dispatchMulMat ctx buf2 kBuf seqLen hidden hidden
 
-    -- Vcur = build_lora_mm(wv, cur)
-    match tokenIdsBuf with
-    | some _ =>
-      if h : il < model.blocks.size then
-        let block := model.blocks[il]
-        Hesper.Layers.Linear.forwardBatchDP4A ctx block.attention.wV
-          batchNormedBuf batchVBuf seqLen
-        dumpGolden s!"Vcur-{il}" batchVBuf (kvDim0 * seqLen)
-      else
-        dispatchMulMat ctx buf2 vBuf seqLen hidden hidden
-    | none =>
-      dispatchMulMat ctx buf2 vBuf seqLen hidden hidden
-
-    -- ggml_reshape_3d × 2                  [no kernel]
-
-    -- Kcur = build_norm(Kcur, attn_k_norm)
-    match tokenIdsBuf with
-    | some _ =>
-      if h : il < model.blocks.size then
-        let block := model.blocks[il]
-        let numKVH := cfg.numKVHeads il
-        let headDim := cfg.headDim il
-        GPUBackend.execute ctx
-          (perHeadRMSNormBatchKernel numKVH headDim seqLen cfg.rmsNormEps)
-          [("input", batchKBuf), ("weight", block.attention.kNormWeight),
-           ("output", batchKBuf)]
-          { numWorkgroups := (numKVH, seqLen, 1),
-            workgroupSize := { x := (if headDim < 256 then headDim else 256),
-                               y := 1, z := 1 } : Hesper.ExecConfig }
-        dumpGolden s!"Kcur_normed-{il}" batchKBuf (kvDim0 * seqLen)
-      else
-        dispatchRmsNorm ctx kBuf kBuf hidden
-    | none =>
-      dispatchRmsNorm ctx kBuf kBuf hidden
-
-    -- Vcur = ggml_rms_norm(Vcur)  [bare RMSNorm, no learned weight]
-    match tokenIdsBuf with
-    | some _ =>
-      if h : il < model.blocks.size then
-        let numKVH := cfg.numKVHeads il
-        let headDim := cfg.headDim il
-        GPUBackend.execute ctx
-          (stubPerHeadBareRMSNormBatchKernel numKVH headDim seqLen cfg.rmsNormEps)
-          [("input", batchVBuf), ("output", batchVBuf)]
-          { numWorkgroups := (numKVH, seqLen, 1),
-            workgroupSize := { x := (if headDim < 256 then headDim else 256),
-                               y := 1, z := 1 } : Hesper.ExecConfig }
-        dumpGolden s!"Vcur_normed-{il}" batchVBuf (kvDim0 * seqLen)
-      else
-        dispatchRmsNorm ctx vBuf vBuf hidden
-    | none =>
-      dispatchRmsNorm ctx vBuf vBuf hidden
-
-    -- Kcur = ggml_rope_ext(Kcur, ...)
-    match tokenIdsBuf with
-    | some _ =>
-      if h : il < model.blocks.size then
-        let block := model.blocks[il]
-        let numKVH := cfg.numKVHeads il
-        let headDim := cfg.headDim il
-        let freqFactors := block.ropeFreqFactors.getD onesBuf
-        GPUBackend.execute ctx
-          (ropeWithFreqFactorsBatchKernel headDim numKVH seqLen (cfg.ropeBase il))
-          [("input", batchKBuf), ("output", batchKRopedBuf),
-           ("params", paramsBuf), ("freq_factors", freqFactors)]
-          (.dispatch1D (numKVH * headDim / 2 * seqLen))
-        dumpGolden s!"Kcur_pos-{il}" batchKRopedBuf (kvDim0 * seqLen)
-      else
-        GPUBackend.execute ctx (llamaRopeKBatchedKernel 1 hidden)
-          [("k_in", kBuf), ("k_roped", kBuf)]
-          { workgroupSize := { x := 1, y := 1, z := 1 }, numWorkgroups := (1, 1, 1) }
-    | none =>
-      GPUBackend.execute ctx (llamaRopeKBatchedKernel 1 hidden)
-        [("k_in", kBuf), ("k_roped", kBuf)]
-        { workgroupSize := { x := 1, y := 1, z := 1 }, numWorkgroups := (1, 1, 1) }
-
     -- cur = build_attn(Qcur_pos, Kcur_pos, Vcur_normed, wo, ...)
-    -- Sub-steps: KV cache write × 2 + flash_attn + wO matmul
+    -- Sub-steps: KV cache write × 2 (own-KV layers only) + flash_attn + wO matmul
     match tokenIdsBuf with
     | some _ =>
       if h : il < model.blocks.size then
         let block := model.blocks[il]
         let numHeads := cfg.numAttentionHeads
-        let numKVH := cfg.numKVHeads il
-        let headDim := cfg.headDim il
-        -- 1. K cache write
-        GPUBackend.execute ctx
-          (stubKVCacheWriteBatchKernel numKVH cfg.maxSeqLen headDim seqLen)
-          [("new_data", batchKRopedBuf), ("cache", kCacheBuf), ("params", paramsBuf)]
-          { numWorkgroups := (seqLen, 1, 1),
-            workgroupSize := { x := (if (numKVH * headDim) < 256 then numKVH * headDim else 256),
-                               y := 1, z := 1 } : Hesper.ExecConfig }
-        -- 2. V cache write
-        GPUBackend.execute ctx
-          (stubKVCacheWriteBatchKernel numKVH cfg.maxSeqLen headDim seqLen)
-          [("new_data", batchVBuf), ("cache", vCacheBuf), ("params", paramsBuf)]
-          { numWorkgroups := (seqLen, 1, 1),
-            workgroupSize := { x := (if (numKVH * headDim) < 256 then numKVH * headDim else 256),
-                               y := 1, z := 1 } : Hesper.ExecConfig }
-        -- 3. Flash attention (batched across seqLen query tokens)
+        -- Determine which layer's KV cache to use.  For own-KV layers
+        -- this is `il` itself; for shared-KV layers it's an earlier
+        -- full-attn or SWA layer per `cfg.kvSharedFromBase`.
+        let kvLi := cfg.kvCacheLayer il
+        let numKVH := cfg.numKVHeads kvLi
+        let headDim := cfg.headDim kvLi
+        let kCacheL := if h2 : kvLi < kCaches.size then kCaches[kvLi] else kCacheBuf
+        let vCacheL := if h2 : kvLi < vCaches.size then vCaches[kvLi] else vCacheBuf
+        -- KV cache writes only for own-KV layers; shared-KV layers read
+        -- from the prior layer's cache unchanged.
+        if cfg.hasKV il then
+          -- 1. K cache write
+          GPUBackend.execute ctx
+            (stubKVCacheWriteBatchKernel numKVH cfg.maxSeqLen headDim seqLen)
+            [("new_data", batchKRopedBuf), ("cache", kCacheL), ("params", paramsBuf)]
+            { numWorkgroups := (seqLen, 1, 1),
+              workgroupSize := { x := (if (numKVH * headDim) < 256 then numKVH * headDim else 256),
+                                 y := 1, z := 1 } : Hesper.ExecConfig }
+          -- 2. V cache write
+          GPUBackend.execute ctx
+            (stubKVCacheWriteBatchKernel numKVH cfg.maxSeqLen headDim seqLen)
+            [("new_data", batchVBuf), ("cache", vCacheL), ("params", paramsBuf)]
+            { numWorkgroups := (seqLen, 1, 1),
+              workgroupSize := { x := (if (numKVH * headDim) < 256 then numKVH * headDim else 256),
+                                 y := 1, z := 1 } : Hesper.ExecConfig }
+        -- 3. Flash attention (batched across seqLen query tokens).
+        -- Use the cache we just wrote (own-KV) or the prior layer's
+        -- cache (shared-KV) as K and V inputs.
         let scale : Float := 1.0
         GPUBackend.execute ctx
           (Hesper.WGSL.FlashAttention.flashAttentionBatchKernel numHeads numKVH
              cfg.maxSeqLen headDim seqLen scale)
-          [("q", batchQRopedBuf), ("k_cache", kCacheBuf), ("v_cache", vCacheBuf),
+          [("q", batchQRopedBuf), ("k_cache", kCacheL), ("v_cache", vCacheL),
            ("output", batchAttnOutBuf), ("params", paramsBuf)]
           { numWorkgroups := (numHeads, seqLen, 1),
             workgroupSize := { x := 256, y := 1, z := 1 } : Hesper.ExecConfig }
