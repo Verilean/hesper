@@ -175,12 +175,24 @@ private def dispatchBuildFfn
 
     Returns the last-token logits buffer (vocabSize f32 elements) when
     a prompt is provided.  Callers can argmax this to pick the next
-    token for greedy decoding. -/
+    token for greedy decoding.
+
+    `startPos` is the rotary / KV-cache offset for the first new token.
+    Prefill uses `startPos=0`; decode steps pass the total number of
+    previously-seen tokens.
+
+    `persistentCaches`, when provided, overrides per-call KV-cache
+    allocation — caches persist across forwards for decode loops.
+    Expected length: `numHiddenLayers - numKVSharedLayers` = 24 for E4B.
+    Each entry is a pair `(kCache, vCache)`. -/
 def forwardPrefillLlamaCpp [GPUBackend β] (ctx : β)
     (model : Gemma4Model (GPUBackend.Buf β) (GPUBackend.CachedDispatch β))
     (seqLen : Nat)
     (state : InferenceState (GPUBackend.Buf β) (GPUBackend.CachedDispatch β))
-    (tokenIdsBuf : Option (GPUBackend.Buf β) := none) : IO (Option (GPUBackend.Buf β)) := do
+    (tokenIdsBuf : Option (GPUBackend.Buf β) := none)
+    (startPos : Nat := 0)
+    (persistentCaches : Option (Array (GPUBackend.Buf β × GPUBackend.Buf β)) := none)
+    : IO (Option (GPUBackend.Buf β)) := do
   let cfg := model.config
   let numLayers := cfg.numHiddenLayers
   let hidden := cfg.hiddenSize
@@ -413,23 +425,31 @@ def forwardPrefillLlamaCpp [GPUBackend β] (ctx : β)
   let batchLOutBuf ← mkBuf (hidden * seqLen)
   -- KV caches: one K and V buffer per "own-KV" layer.  Shared-KV
   -- layers (last numKVSharedLayers layers in Gemma 4 E4B) reuse these
-  -- via `cfg.kvSharedFromBase`.  Sized at maxKVHeads × maxSeqLen ×
-  -- maxHeadDim so `flashAttentionBatchKernel`'s
-  -- `kvHead * maxSeqLen * headDim` stride is always in-bounds.
+  -- via `cfg.kvCacheLayer`.  Sized at maxKVHeads × maxSeqLen × maxHeadDim
+  -- so `flashAttentionBatchKernel`'s `kvHead * maxSeqLen * headDim`
+  -- stride is always in-bounds.  When `persistentCaches` is provided
+  -- (decode loop) we reuse the caller's buffers instead of allocating.
   let maxSeqLenUsed := cfg.maxSeqLen
   let cacheSize := maxKVHeads * maxSeqLenUsed * maxHeadDim
   let ownKVLayers := numLayers - cfg.numKVSharedLayers
   let mut kCaches : Array (GPUBackend.Buf β) := Array.empty
   let mut vCaches : Array (GPUBackend.Buf β) := Array.empty
-  for _ in [0:ownKVLayers] do
-    kCaches := kCaches.push (← mkBuf cacheSize)
-    vCaches := vCaches.push (← mkBuf cacheSize)
+  match persistentCaches with
+  | some arr =>
+    for (k, v) in arr do
+      kCaches := kCaches.push k
+      vCaches := vCaches.push v
+  | none =>
+    for _ in [0:ownKVLayers] do
+      kCaches := kCaches.push (← mkBuf cacheSize)
+      vCaches := vCaches.push (← mkBuf cacheSize)
   -- For backwards-compatible naming with earlier single-cache code:
   let kCacheBuf ← if h : 0 < kCaches.size then pure kCaches[0] else mkBuf cacheSize
   let vCacheBuf ← if h : 0 < vCaches.size then pure vCaches[0] else mkBuf cacheSize
-  -- Params buffer: holds `startPos` (u32) for RoPE.  startPos=0 for prefill.
+  -- Params buffer: holds `startPos` (u32) for RoPE / KV cache indexing.
   let paramsBuf ← mkBuf 1
-  GPUBackend.writeBuffer ctx paramsBuf (Hesper.WebGPU.BufferOps.uint32ToBytes 0)
+  GPUBackend.writeBuffer ctx paramsBuf
+    (Hesper.WebGPU.BufferOps.uint32ToBytes startPos.toUInt32)
   -- Ones buffer: `headDim/2` f32 elements all set to 1.0, used as
   -- `freq_factors` for SWA layers (which llama.cpp calls with nullptr =
   -- equivalent to 1.0 everywhere).  Pattern copied from production.
