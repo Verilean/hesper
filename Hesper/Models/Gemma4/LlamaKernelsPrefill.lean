@@ -52,6 +52,104 @@ def stubCopyU32Kernel (srcSize : Nat) (dstSize : Nat) (dstIdx : Nat) : ShaderM U
   let v ← ShaderM.readBuffer (ty := .scalar .u32) (n := srcSize) "src" srcIdx
   ShaderM.writeBuffer (ty := .scalar .u32) "dst" (Exp.litU32 dstIdx) v
 
+/-- `out[i] = batch[params[0] * dim + i]` for `i in [0, dim)`.
+    Column-extract companion to `stubColumnInsertKernel`. -/
+def stubColumnExtractKernel (dim : Nat) (seqLen : Nat) : ShaderM Unit := do
+  let gid ← ShaderM.globalId
+  let i := Exp.vec3X gid
+  let totalBatch := dim * seqLen
+  let _batch  ← ShaderM.declareInputBuffer "batch" (.array (.scalar .f32) totalBatch)
+  let _params ← ShaderM.declareInputBuffer "params" (.array (.scalar .u32) 1)
+  let _out    ← ShaderM.declareOutputBuffer "out" (.array (.scalar .f32) dim)
+  ShaderM.if_ (Exp.lt i (Exp.litU32 dim)) (do
+    let colIdx ← ShaderM.readBuffer (ty := .scalar .u32) (n := 1) "params" (Exp.litU32 0)
+    let srcIdx := Exp.add (Exp.mul colIdx (Exp.litU32 dim)) i
+    let v ← ShaderM.readBuffer (ty := .scalar .f32) (n := totalBatch) "batch" srcIdx
+    ShaderM.writeBuffer (ty := .scalar .f32) "out" i v
+  ) (pure ())
+
+/-- Extract a single layer's slice `[embdPerLayer, seqLen]` from a
+    batched [seqLen × (embdPerLayer * numLayers)] PLE buffer.
+    Layout: `plInputAllBatched[col * totalPL + li * embdPerLayer + d]`
+    → `out[col * embdPerLayer + d]` for a fixed `li`.
+    Grid: `(embdPerLayer * seqLen, 1, 1)`. -/
+def stubPerLayerSliceKernel (embdPerLayer seqLen numLayers layerIdx : Nat) : ShaderM Unit := do
+  let gid ← ShaderM.globalId
+  let idx := Exp.vec3X gid
+  let totalPL := embdPerLayer * numLayers
+  let totalOut := embdPerLayer * seqLen
+  let _src ← ShaderM.declareInputBuffer "src" (.array (.scalar .f32) (seqLen * totalPL))
+  let _dst ← ShaderM.declareOutputBuffer "dst" (.array (.scalar .f32) totalOut)
+  ShaderM.if_ (Exp.lt idx (Exp.litU32 totalOut)) (do
+    let col := Exp.div idx (Exp.litU32 embdPerLayer)
+    let d := Exp.sub idx (Exp.mul col (Exp.litU32 embdPerLayer))
+    let srcIdx := Exp.add (Exp.mul col (Exp.litU32 totalPL))
+                          (Exp.add (Exp.litU32 (layerIdx * embdPerLayer)) d)
+    let v ← ShaderM.readBuffer (ty := .scalar .f32) (n := seqLen * totalPL) "src" srcIdx
+    ShaderM.writeBuffer (ty := .scalar .f32) "dst" idx v
+  ) (pure ())
+
+/-- Element-wise multiply: `out[i] = a[i] * b[i]` over `size` f32 elements. -/
+def stubMulKernel (size : Nat) : ShaderM Unit := do
+  let gid ← ShaderM.globalId
+  let idx := Exp.vec3X gid
+  let _a ← ShaderM.declareInputBuffer "a" (.array (.scalar .f32) size)
+  let _b ← ShaderM.declareInputBuffer "b" (.array (.scalar .f32) size)
+  let _output ← ShaderM.declareOutputBuffer "output" (.array (.scalar .f32) size)
+  ShaderM.if_ (Exp.lt idx (Exp.litU32 size)) (do
+    let a ← ShaderM.readBuffer (ty := .scalar .f32) (n := size) "a" idx
+    let b ← ShaderM.readBuffer (ty := .scalar .f32) (n := size) "b" idx
+    ShaderM.writeBuffer (ty := .scalar .f32) "output" idx (Exp.mul a b)
+  ) (pure ())
+
+/-- Element-wise GELU: `out[i] = gelu(x[i])` over `size` f32 elements. -/
+def stubGeluKernel (size : Nat) : ShaderM Unit := do
+  let gid ← ShaderM.globalId
+  let idx := Exp.vec3X gid
+  let _input ← ShaderM.declareInputBuffer "input" (.array (.scalar .f32) size)
+  let _output ← ShaderM.declareOutputBuffer "output" (.array (.scalar .f32) size)
+  ShaderM.if_ (Exp.lt idx (Exp.litU32 size)) (do
+    let x ← ShaderM.readBuffer (ty := .scalar .f32) (n := size) "input" idx
+    let c0 := Exp.litF32 0.7978845608028654
+    let c1 := Exp.litF32 0.044715
+    let x3 := Exp.mul (Exp.mul x x) x
+    let inner := Exp.mul c0 (Exp.add x (Exp.mul c1 x3))
+    let gelu := Exp.mul (Exp.mul x (Exp.litF32 0.5))
+                        (Exp.add (Exp.litF32 1.0) (Exp.tanh inner))
+    ShaderM.writeBuffer (ty := .scalar .f32) "output" idx gelu
+  ) (pure ())
+
+/-- Broadcast scalar multiply: `buf[i] *= scale[0]` over `total` elements.
+    Used for per-layer output scale (`out_scale`, a single f32 per layer). -/
+def stubBroadcastScaleKernel (total : Nat) : ShaderM Unit := do
+  let gid ← ShaderM.globalId
+  let idx := Exp.vec3X gid
+  let _input ← ShaderM.declareInputBuffer "input" (.array (.scalar .f32) total)
+  let _scale ← ShaderM.declareInputBuffer "scale" (.array (.scalar .f32) 1)
+  let _output ← ShaderM.declareOutputBuffer "output" (.array (.scalar .f32) total)
+  ShaderM.if_ (Exp.lt idx (Exp.litU32 total)) (do
+    let s ← ShaderM.readBuffer (ty := .scalar .f32) (n := 1) "scale" (Exp.litU32 0)
+    let v ← ShaderM.readBuffer (ty := .scalar .f32) (n := total) "input" idx
+    ShaderM.writeBuffer (ty := .scalar .f32) "output" idx (Exp.mul v s)
+  ) (pure ())
+
+/-- Copy-insert: `dst[params[0] * size + i] = src[i]` for `i in [0, size)`.
+    Column-insert variant whose declared buffer size matches `totalDst`
+    rather than `size * seqLen` — used for PLE (where `size = totalPL` and
+    seqLen is separate). -/
+def stubBatchInsertKernel (size totalDst : Nat) : ShaderM Unit := do
+  let gid ← ShaderM.globalId
+  let k := Exp.vec3X gid
+  let _src ← ShaderM.declareInputBuffer "src" (.array (.scalar .f32) size)
+  let _params ← ShaderM.declareInputBuffer "params" (.array (.scalar .u32) 1)
+  let _dst ← ShaderM.declareOutputBuffer "dst" (.array (.scalar .f32) totalDst)
+  ShaderM.if_ (Exp.lt k (Exp.litU32 size)) (do
+    let colId ← ShaderM.readBuffer (ty := .scalar .u32) (n := 1) "params" (Exp.litU32 0)
+    let v ← ShaderM.readBuffer (ty := .scalar .f32) (n := size) "src" k
+    let dstIdx := Exp.add (Exp.mul colId (Exp.litU32 size)) k
+    ShaderM.writeBuffer (ty := .scalar .f32) "dst" dstIdx v
+  ) (pure ())
+
 /-- `batch[params[0] * dim + i] = src[i]` for `i in [0, dim)`. -/
 def stubColumnInsertKernel (dim : Nat) (seqLen : Nat) : ShaderM Unit := do
   let gid ← ShaderM.globalId
