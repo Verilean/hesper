@@ -9,6 +9,7 @@ import Hesper.Quantization.Q6_K
 import Hesper.WebGPU.BufferOps
 import Hesper.WGSL.MatMul
 import Hesper.Models.Gemma4.Kernels
+import Hesper.Models.Gemma4.ScratchPool
 
 /-!
 # Phase 0 v3 LlamaPath: forwardPrefillLlamaCpp (loop-faithful stub)
@@ -184,7 +185,12 @@ private def dispatchBuildFfn
     `persistentCaches`, when provided, overrides per-call KV-cache
     allocation — caches persist across forwards for decode loops.
     Expected length: `numHiddenLayers - numKVSharedLayers` = 24 for E4B.
-    Each entry is a pair `(kCache, vCache)`. -/
+    Each entry is a pair `(kCache, vCache)`.
+
+    `scratchPool`, when provided, is used for all per-forward transient
+    buffers (batch activations, PLE scratches, etc.) — the pool's slots
+    are reused across calls, eliminating per-forward cuMemAlloc churn.
+    If `none`, each call allocates fresh buffers via `allocBuffer`. -/
 def forwardPrefillLlamaCpp [GPUBackend β] (ctx : β)
     (model : Gemma4Model (GPUBackend.Buf β) (GPUBackend.CachedDispatch β))
     (seqLen : Nat)
@@ -192,6 +198,7 @@ def forwardPrefillLlamaCpp [GPUBackend β] (ctx : β)
     (tokenIdsBuf : Option (GPUBackend.Buf β) := none)
     (startPos : Nat := 0)
     (persistentCaches : Option (Array (GPUBackend.Buf β × GPUBackend.Buf β)) := none)
+    (scratchPool : Option (ScratchPool β) := none)
     : IO (Option (GPUBackend.Buf β)) := do
   let cfg := model.config
   let numLayers := cfg.numHiddenLayers
@@ -226,7 +233,12 @@ def forwardPrefillLlamaCpp [GPUBackend β] (ctx : β)
   -- Batch buffer: column-major `[hidden, seqLen]` holding embedded tokens
   -- and their per-op transforms.  Allocated fresh each forward so the
   -- stub is isolated from any production state.
-  let mkBuf := fun (n : Nat) => GPUBackend.allocBuffer ctx (n * 4).toUSize
+  -- Scratch allocator: if the caller provided a pool, reuse its slots
+  -- (zero cuMemAlloc in steady state).  Otherwise fall back to direct
+  -- cuMemAlloc per call.
+  let mkBuf := fun (n : Nat) => match scratchPool with
+    | some pool => pool.alloc n
+    | none      => GPUBackend.allocBuffer ctx (n * 4).toUSize
   let totalHidden := hidden * seqLen
   let batchBuf1 ← mkBuf totalHidden
   let batchBuf2 ← mkBuf totalHidden

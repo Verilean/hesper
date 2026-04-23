@@ -2,6 +2,7 @@ import Hesper.Backend.CUDA
 import Hesper.CUDA.FFI
 import Hesper.Models.Gemma4
 import Hesper.Models.Gemma4.LlamaForwardPrefill
+import Hesper.Models.Gemma4.ScratchPool
 import Hesper.Tokenizer.SentencePiece
 import Hesper.GGUF.Parser
 import Hesper.WebGPU.BufferOps
@@ -107,6 +108,12 @@ unsafe def main (args : List String) : IO Unit := do
   let maxSeq := initialToks.size + maxTokens
   let tokenIdsBuf ← GPUBackend.allocBuffer ctx (maxSeq * 4).toUSize
 
+  -- ScratchPool: all per-forward transient buffers (batch scratch, PLE
+  -- staging, etc.) go through this pool.  On the first forward the pool
+  -- grows to N slots; every subsequent forward reuses the same slots
+  -- with zero cuMemAlloc calls.
+  let scratchPool ← Hesper.Models.Gemma4.ScratchPool.new ctx
+
   let genStart ← IO.monoNanosNow
   let mut lastDisp : Nat := 0
 
@@ -118,10 +125,12 @@ unsafe def main (args : List String) : IO Unit := do
       bytes := bytes ++ Hesper.WebGPU.BufferOps.uint32ToBytes initialToks[i]!.toUInt32
     GPUBackend.writeBuffer ctx tokenIdsBuf bytes
 
+    scratchPool.reset
     Hesper.resetDispatchCounter
     let logitsOpt ← forwardPrefillLlamaCpp ctx model initialToks.size state
       (tokenIdsBuf := some tokenIdsBuf) (startPos := 0)
       (persistentCaches := some kvPairs)
+      (scratchPool := some scratchPool)
     let prefillEnd ← IO.monoNanosNow
     lastDisp ← Hesper.getDispatchCounter
 
@@ -155,11 +164,13 @@ unsafe def main (args : List String) : IO Unit := do
     let b := Hesper.WebGPU.BufferOps.uint32ToBytes lastGen.toUInt32
     GPUBackend.writeBuffer ctx tokenIdsBuf b
 
+    scratchPool.reset
     Hesper.resetDispatchCounter
     let stepStart ← IO.monoNanosNow
     let logitsOpt ← forwardPrefillLlamaCpp ctx model 1 state
       (tokenIdsBuf := some tokenIdsBuf) (startPos := startPos)
       (persistentCaches := some kvPairs)
+      (scratchPool := some scratchPool)
     let stepEnd ← IO.monoNanosNow
     lastDisp ← Hesper.getDispatchCounter
 
