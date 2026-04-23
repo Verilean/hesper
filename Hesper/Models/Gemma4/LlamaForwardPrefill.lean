@@ -4,8 +4,10 @@ import Hesper.Models.Gemma4.LlamaKernels
 import Hesper.Models.Gemma4.LlamaKernelsPrefill
 import Hesper.Layers.Embedding
 import Hesper.Layers.Linear
+import Hesper.Layers.PerLayerEmbedding
 import Hesper.Quantization.Q6_K
 import Hesper.WebGPU.BufferOps
+import Hesper.WGSL.MatMul
 import Hesper.Models.Gemma4.Kernels
 
 /-!
@@ -269,20 +271,95 @@ def forwardPrefillLlamaCpp [GPUBackend β] (ctx : β)
     -- so the skeleton can still be run without a real prompt.
     dispatchPointwise ctx buf1 buf2 hidden
     dispatchPointwise ctx buf2 buf1 hidden
-  -- build_inp_pos → no kernel (input tensor)
-  -- build_attn_inp_kv_iswa → no kernel (KV mask setup, already cached)
 
-  -- project_per_layer_inputs (if tok_embd_per_layer) → 7 ops
-  -- get_per_layer_inputs:
-  dispatchPointwise ctx buf1 buf2 hidden     -- ggml_get_rows
-  dispatchPointwise ctx buf2 buf1 hidden     -- ggml_scale
-  -- project_per_layer_inputs body:
-  dispatchMulMat ctx buf1 buf2 seqLen hidden hidden         -- per_layer_model_proj
-  dispatchPointwise ctx buf2 buf1 hidden     -- ggml_scale
-  dispatchRmsNorm   ctx buf1 buf2 hidden     -- per_layer_proj_norm
-  dispatchPointwise ctx buf2 buf1 hidden     -- ggml_add
-  dispatchPointwise ctx buf1 buf2 hidden     -- ggml_scale
-  dispatchPointwise ctx buf2 buf1 hidden     -- ggml_cont (after permute)
+  -- project_per_layer_inputs (if tok_embd_per_layer).  For parity mode,
+  -- compute the full [seqLen × totalPL] PLE input batch and stash it
+  -- in `batchPLInputAll`; the layer-0 loop will slice this to get
+  -- `inp_this_layer`.  For dispatch-count mode, emit 7 DCE-safe stubs.
+  let totalPL := cfg.embdPerLayer * numLayers
+  let batchPLInputAll ← mkBuf (seqLen * totalPL)
+  let plModelProjScratch ← mkBuf totalPL     -- scaled tok_embd_per_layer row (per-token)
+  let plProjScratch ← mkBuf totalPL          -- matmul output (per-token)
+  let plNormedScratch ← mkBuf totalPL        -- rms-normed (per-token)
+  let plColScratch ← mkBuf hidden            -- column extract of batchBuf2
+  let plColIdxBuf ← mkBuf 1
+
+  match tokenIdsBuf, model.perLayerEmbdTableGPU, model.perLayerModelProj, model.perLayerProjNorm with
+  | some _, some embdTableGPU, some modelProj, some projNorm =>
+    let embdPL := cfg.embdPerLayer
+    let nLayers := numLayers
+    let scaleFactor : Float := Float.sqrt embdPL.toFloat
+    -- Need per-token tokenId.  We read from a 1-element scratch that we
+    -- fill each iteration via stubCopyU32Kernel from tokenIdsBuf.
+    let tokenScratch2 ← mkBuf 1
+    for i in [0:seqLen] do
+      -- colIdxBuf := i
+      let iBytes := Hesper.WebGPU.BufferOps.uint32ToBytes i.toUInt32
+      GPUBackend.writeBuffer ctx plColIdxBuf iBytes
+      -- tokenScratch2 := tokenIdsBuf[i]
+      match tokenIdsBuf with
+      | some tokIds =>
+        GPUBackend.execute ctx (stubCopyU32Kernel seqLen 1 0)
+          [("src", tokIds), ("params", plColIdxBuf), ("dst", tokenScratch2)]
+          { workgroupSize := { x := 1, y := 1, z := 1 }, numWorkgroups := (1, 1, 1) }
+      | none => pure ()
+      -- 1. Dequant Q6_K tok_embd_per_layer row * √embdPerLayer → plModelProjScratch
+      --    (matches llama.cpp's get_per_layer_inputs: get_rows + scale)
+      GPUBackend.execute ctx
+        (Hesper.Quantization.Q6_K.q6kTableRowDequantScaleKernel totalPL scaleFactor
+          cfg.vocabSize)
+        [("table", embdTableGPU), ("params", tokenScratch2),
+         ("output", plModelProjScratch)]
+        (.dispatch1D totalPL)
+      -- 2. Extract column i of batchBuf2 (scaled embedding) into plColScratch
+      GPUBackend.execute ctx (stubColumnExtractKernel hidden seqLen)
+        [("batch", batchBuf2), ("params", plColIdxBuf), ("out", plColScratch)]
+        (.dispatch1D hidden)
+      -- 3. matmul: per_layer_model_proj × plColScratch → plProjScratch
+      let projConfig : Hesper.WGSL.MatMul.Config := {
+        M := 1, N := totalPL, K := hidden
+      }
+      if projConfig.K % 64 == 0 then
+        Hesper.WGSL.MatMul.executeMatMulTransposeF16BlockCoop ctx
+          plColScratch modelProj plProjScratch projConfig
+      else
+        Hesper.WGSL.MatMul.executeMatMulTransposeF16 ctx
+          plColScratch modelProj plProjScratch projConfig
+      -- 4. Scale by 1/√hidden (in-place via separate buf): plProjScratch → plNormedScratch
+      GPUBackend.execute ctx
+        (Hesper.Layers.PerLayerEmbedding.scaleKernel totalPL (1.0 / Float.sqrt hidden.toFloat))
+        [("input", plProjScratch), ("output", plNormedScratch)]
+        (.dispatch1D totalPL)
+      -- 5. chunked RMSNorm across embdPerLayer, for each of nLayers chunks
+      GPUBackend.execute ctx
+        (chunkedRMSNormKernel embdPL nLayers cfg.rmsNormEps)
+        [("input", plNormedScratch), ("weight", projNorm.scale),
+         ("output", plProjScratch)]
+        { numWorkgroups := (nLayers, 1, 1),
+          workgroupSize := { x := min embdPL 256, y := 1, z := 1 } : Hesper.ExecConfig }
+      -- 6. scaled-add: (normed + inp_per_layer_selected) * (1/√2)
+      GPUBackend.execute ctx
+        (scaledAddKernel totalPL (1.0 / Float.sqrt 2.0))
+        [("a", plProjScratch), ("b", plModelProjScratch),
+         ("output", plNormedScratch)]
+        (.dispatch1D totalPL)
+      -- 7. column-insert: plNormedScratch → batchPLInputAll[:, i]
+      GPUBackend.execute ctx
+        (stubBatchInsertKernel totalPL (seqLen * totalPL))
+        [("src", plNormedScratch), ("params", plColIdxBuf),
+         ("dst", batchPLInputAll)]
+        (.dispatch1D totalPL)
+  | _, _, _, _ =>
+    -- No PLE table / no prompt: emit the earlier DCE-safe stubs so dispatch
+    -- count stays consistent.
+    dispatchPointwise ctx buf1 buf2 hidden     -- ggml_get_rows
+    dispatchPointwise ctx buf2 buf1 hidden     -- ggml_scale
+    dispatchMulMat ctx buf1 buf2 seqLen hidden hidden
+    dispatchPointwise ctx buf2 buf1 hidden     -- ggml_scale
+    dispatchRmsNorm   ctx buf1 buf2 hidden     -- per_layer_proj_norm
+    dispatchPointwise ctx buf2 buf1 hidden     -- ggml_add
+    dispatchPointwise ctx buf1 buf2 hidden     -- ggml_scale
+    dispatchPointwise ctx buf2 buf1 hidden     -- ggml_cont
 
   -- build_inp_out_ids → no kernel
 
@@ -640,23 +717,91 @@ def forwardPrefillLlamaCpp [GPUBackend β] (ctx : β)
     | none =>
       dispatchPointwise ctx buf1 attnResidBuf hidden
 
-    -- PLE block (when inp_per_layer exists, which is always for Gemma 4)
-    -- cur = build_lora_mm(per_layer_inp_gate, cur)
-    dispatchMulMat ctx attnResidBuf pleOutBuf seqLen hidden hidden
-    -- cur = ggml_gelu(cur)
-    dispatchPointwise ctx pleOutBuf buf1 hidden
-    -- ggml_view_2d slice                   [no kernel]
-    -- cur = ggml_mul(cur, inp_this_layer)
-    dispatchPointwise ctx buf1 buf2 hidden
-    -- cur = build_lora_mm(per_layer_proj, cur)
-    dispatchMulMat ctx buf2 pleOutBuf seqLen hidden hidden
-    -- cur = build_norm(cur, per_layer_post_norm)
-    dispatchRmsNorm ctx pleOutBuf buf1 hidden
-    -- residual: ggml_add(pe_in, cur)
-    dispatchPointwise ctx buf1 attnResidBuf hidden
+    -- PLE block (gemma4-iswa.cpp:193-213, always present for Gemma 4).
+    -- Input: `pe_in` (= attnResidBuf after FFN residual).  Reads per-layer
+    -- input slice from batchPLInputAll; matmuls through inpGate, applies
+    -- gelu, multiplies by inp_this_layer slice, matmuls through proj,
+    -- applies post_norm, and residual-adds back onto pe_in.
+    match tokenIdsBuf with
+    | some _ =>
+      if h : il < model.blocks.size then
+        let _ := model.blocks[il]
+        let pleOpt := if h2 : il < model.perLayerBlocks.size then
+          model.perLayerBlocks[il] else none
+        match pleOpt, model.perLayerEmbdTableGPU with
+        | some pleBlock, some _ =>
+          let embdPL := cfg.embdPerLayer
+          -- (a) inpGate matmul: pe_in [hidden × seqLen] → [embdPL × seqLen]
+          Hesper.Layers.Linear.forwardBatchDP4A ctx pleBlock.inpGate
+            batchFfnResidBuf batchPleGateBuf seqLen
+          -- (b) gelu in-place
+          GPUBackend.execute ctx (stubGeluKernel (embdPL * seqLen))
+            [("input", batchPleGateBuf), ("output", batchPleGeluBuf)]
+            (.dispatch1D (embdPL * seqLen))
+          -- (c) extract layer-il slice from batchPLInputAll into plSliceBuf
+          let plSliceBuf ← mkBuf (embdPL * seqLen)
+          GPUBackend.execute ctx
+            (stubPerLayerSliceKernel embdPL seqLen numLayers il)
+            [("src", batchPLInputAll), ("dst", plSliceBuf)]
+            (.dispatch1D (embdPL * seqLen))
+          -- (d) elementwise mul: gelu * inp_this_layer
+          GPUBackend.execute ctx (stubMulKernel (embdPL * seqLen))
+            [("a", batchPleGeluBuf), ("b", plSliceBuf),
+             ("output", batchPleMulBuf)]
+            (.dispatch1D (embdPL * seqLen))
+          -- (e) proj matmul: [embdPL × seqLen] → [hidden × seqLen]
+          Hesper.Layers.Linear.forwardBatchDP4A ctx pleBlock.proj
+            batchPleMulBuf batchPleProjBuf seqLen
+          -- (f) per_layer_post_norm (RMSNorm across hidden)
+          Hesper.Layers.RMSNorm.forward ctx pleBlock.postNorm
+            batchPleProjBuf batchPleNormBuf seqLen 256
+            (refOverride := some (← IO.mkRef none))
+          dumpGolden s!"per_layer_embd_out-{il}" batchPleNormBuf totalHidden
+          -- (g) residual: pe_in + pleNorm → batchLOutBuf
+          GPUBackend.execute ctx (Hesper.Models.Gemma4.residualAddKernel totalHidden)
+            [("a", batchFfnResidBuf), ("b", batchPleNormBuf),
+             ("output", batchLOutBuf)]
+            (.dispatch1D totalHidden)
+        | _, _ =>
+          -- No PLE block for this layer: just copy pe_in through.
+          dispatchPointwise ctx attnResidBuf pleOutBuf hidden
+          dispatchPointwise ctx pleOutBuf buf1 hidden
+          dispatchPointwise ctx buf1 buf2 hidden
+          dispatchMulMat ctx buf2 pleOutBuf seqLen hidden hidden
+          dispatchRmsNorm ctx pleOutBuf buf1 hidden
+          dispatchPointwise ctx buf1 attnResidBuf hidden
+      else
+        dispatchMulMat ctx attnResidBuf pleOutBuf seqLen hidden hidden
+        dispatchPointwise ctx pleOutBuf buf1 hidden
+        dispatchPointwise ctx buf1 buf2 hidden
+        dispatchMulMat ctx buf2 pleOutBuf seqLen hidden hidden
+        dispatchRmsNorm ctx pleOutBuf buf1 hidden
+        dispatchPointwise ctx buf1 attnResidBuf hidden
+    | none =>
+      dispatchMulMat ctx attnResidBuf pleOutBuf seqLen hidden hidden
+      dispatchPointwise ctx pleOutBuf buf1 hidden
+      dispatchPointwise ctx buf1 buf2 hidden
+      dispatchMulMat ctx buf2 pleOutBuf seqLen hidden hidden
+      dispatchRmsNorm ctx pleOutBuf buf1 hidden
+      dispatchPointwise ctx buf1 attnResidBuf hidden
 
-    -- layer_scalar: if out_scale → ggml_mul
-    dispatchPointwise ctx attnResidBuf buf1 hidden
+    -- layer_scalar: if out_scale → ggml_mul (broadcast scalar over hidden × seqLen)
+    match tokenIdsBuf with
+    | some _ =>
+      if h : il < model.blocks.size then
+        let block := model.blocks[il]
+        match block.outScale with
+        | some outScale =>
+          GPUBackend.execute ctx (stubBroadcastScaleKernel totalHidden)
+            [("input", batchLOutBuf), ("scale", outScale),
+             ("output", batchLOutBuf)]
+            (.dispatch1D totalHidden)
+        | none => pure ()
+        dumpGolden s!"l_out-{il}" batchLOutBuf totalHidden
+      else
+        dispatchPointwise ctx attnResidBuf buf1 hidden
+    | none =>
+      dispatchPointwise ctx attnResidBuf buf1 hidden
     -- build_cvec                           [no kernel in practice]
 
   ------------------------------------------------------------------
