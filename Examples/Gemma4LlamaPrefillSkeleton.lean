@@ -153,6 +153,22 @@ unsafe def main (args : List String) : IO Unit := do
   -- 2. Decode loop: each step feeds the most recently generated token T_{k-1}
   --    as seqLen=1 with startPos = `prevSeqLen`, i.e. the position where
   --    T_{k-1}'s own KV will be written.  Attention then reads cache[0..startPos].
+  --
+  -- CUDA Graphs opt-in: HESPER_LLAMA_GRAPHS=1.
+  -- First decode step runs eagerly so ScratchPool grows to its final slot
+  -- count (CUDA forbids cuMemAlloc during stream capture).  Second step is
+  -- captured; subsequent steps replay with one `cuGraphLaunch` instead of
+  -- ~1500 `cuLaunchKernel` calls.  To let the graph see the new startPos
+  -- on each replay, we pass a persistent `paramsBufOverride` that lives
+  -- outside ScratchPool and is updated by the caller on the capture stream.
+  let graphsEnabled ← match ← IO.getEnv "HESPER_LLAMA_GRAPHS" with
+    | some "1" => pure true
+    | _        => pure false
+  let persistentParamsBuf ← GPUBackend.allocBuffer ctx (4 : USize)
+  let mut graphExec : Option Hesper.CUDA.CUgraphExec := none
+  let mut graphStream : Option Hesper.CUDA.CUstream := none
+  let mut capturedLogits : Option Hesper.CUDA.CUDABuffer := none
+
   for step in [1:maxTokens] do
     -- Last-generated token = the token we feed through this step.
     let lastGen := generatedIds[generatedIds.size - 1]!
@@ -167,10 +183,56 @@ unsafe def main (args : List String) : IO Unit := do
     scratchPool.reset
     Hesper.resetDispatchCounter
     let stepStart ← IO.monoNanosNow
-    let logitsOpt ← forwardPrefillLlamaCpp ctx model 1 state
-      (tokenIdsBuf := some tokenIdsBuf) (startPos := startPos)
-      (persistentCaches := some kvPairs)
-      (scratchPool := some scratchPool)
+
+    let logitsOpt ← match graphsEnabled, graphExec with
+    | true, some exec =>
+      match graphStream with
+      | none => pure none
+      | some s =>
+        -- Update paramsBuf on the capture stream BEFORE replay so the
+        -- graph's kernels pick up the new startPos.
+        let posBytes := Hesper.WebGPU.BufferOps.uint32ToBytes startPos.toUInt32
+        Hesper.CUDA.cuMemcpyHtoDAsync persistentParamsBuf.ptr posBytes 0 (4 : USize) s
+        Hesper.CUDA.cuGraphLaunch exec s
+        Hesper.CUDA.cuStreamSynchronize s
+        pure capturedLogits
+    | true, none =>
+      if step == 1 then
+        -- Eager warm-up: grow the ScratchPool to its final size.  Also
+        -- initialises persistentParamsBuf side-by-side so the forward uses
+        -- it from step 1 onwards (keeps kernel-arg identity across steps).
+        GPUBackend.writeBuffer ctx persistentParamsBuf
+          (Hesper.WebGPU.BufferOps.uint32ToBytes startPos.toUInt32)
+        forwardPrefillLlamaCpp ctx model 1 state
+          (tokenIdsBuf := some tokenIdsBuf) (startPos := startPos)
+          (persistentCaches := some kvPairs)
+          (scratchPool := some scratchPool)
+          (paramsBufOverride := some persistentParamsBuf)
+      else
+        let stream ← Hesper.CUDA.cuStreamCreate
+        Hesper.cudaCaptureStream.set (some stream)
+        Hesper.CUDA.cuStreamBeginCapture stream
+        let logits ← forwardPrefillLlamaCpp ctx model 1 state
+          (tokenIdsBuf := some tokenIdsBuf) (startPos := startPos)
+          (persistentCaches := some kvPairs)
+          (scratchPool := some scratchPool)
+          (paramsBufOverride := some persistentParamsBuf)
+        let graph ← Hesper.CUDA.cuStreamEndCapture stream
+        Hesper.cudaCaptureStream.set none
+        let exec ← Hesper.CUDA.cuGraphInstantiate graph
+        Hesper.CUDA.cuGraphDestroy graph
+        Hesper.CUDA.cuStreamSynchronize stream
+        graphExec := some exec
+        graphStream := some stream
+        capturedLogits := logits
+        IO.println s!"[Graph] captured decode step (step={step})"
+        pure logits
+    | false, _ =>
+      forwardPrefillLlamaCpp ctx model 1 state
+        (tokenIdsBuf := some tokenIdsBuf) (startPos := startPos)
+        (persistentCaches := some kvPairs)
+        (scratchPool := some scratchPool)
+
     let stepEnd ← IO.monoNanosNow
     lastDisp ← Hesper.getDispatchCounter
 
