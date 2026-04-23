@@ -817,25 +817,67 @@ def forwardPrefillLlamaCpp [GPUBackend β] (ctx : β)
     -- build_cvec                           [no kernel in practice]
 
   ------------------------------------------------------------------
-  -- Post-loop (once)
+  -- Post-loop (once): output_norm + lm_head (+ optional softcap)
   ------------------------------------------------------------------
-  -- cur = build_norm(cur, output_norm)
-  dispatchRmsNorm ctx buf1 buf2 hidden
-  -- cur = build_lora_mm(output, cur)       — lm_head
-  -- lm_head uses Q6_K mmq path (3 kernels)
-  GPUBackend.execute ctx (prefillQuantizeMmqQ8_1Q6KKernel seqLen hidden)
-    [("lm_mmq_in", buf2), ("lm_mmq_q8", buf1)]
-    { workgroupSize := { x := 1, y := 1, z := 1 }, numWorkgroups := (1, 1, 1) }
-  GPUBackend.execute ctx (prefillMulMatQQ6KKernel seqLen vocab hidden)
-    [("lm_mmq_q8", buf1), ("lm_mmq_part", buf2)]
-    { workgroupSize := { x := 1, y := 1, z := 1 }, numWorkgroups := (1, 1, 1) }
-  GPUBackend.execute ctx (prefillMulMatQStreamKFixupQ6KKernel seqLen vocab)
-    [("lm_mmq_part", buf2), ("lm_mmq_out", buf1)]
-    { workgroupSize := { x := 1, y := 1, z := 1 }, numWorkgroups := (1, 1, 1) }
+  match tokenIdsBuf with
+  | some _ =>
+    -- llama.cpp applies `inp_out_ids` to trim to just the last token
+    -- before output_norm.  We do the same: extract column seqLen-1
+    -- from the final layer input (currentInputRef) into a hidden-sized
+    -- scratch, then run output_norm + lm_head on that single row.
+    let finalInputBuf ← currentInputRef.get
+    let lastTokenBuf ← mkBuf hidden
+    let lastColIdx := seqLen - 1
+    let lastColIdxBuf ← mkBuf 1
+    GPUBackend.writeBuffer ctx lastColIdxBuf
+      (Hesper.WebGPU.BufferOps.uint32ToBytes lastColIdx.toUInt32)
+    GPUBackend.execute ctx (stubColumnExtractKernel hidden seqLen)
+      [("batch", finalInputBuf), ("params", lastColIdxBuf),
+       ("out", lastTokenBuf)]
+      (.dispatch1D hidden)
 
-  -- softcap: scale + tanh + scale (3 ops)
-  dispatchPointwise ctx buf1 buf2 hidden
-  dispatchPointwise ctx buf2 buf1 hidden
-  dispatchPointwise ctx buf1 buf2 hidden
+    -- build_norm(cur, output_norm) [RMSNorm on single-token]
+    let resultNormBuf ← mkBuf hidden
+    Hesper.Layers.RMSNorm.forward ctx model.finalNorm
+      lastTokenBuf resultNormBuf 1 256
+      (refOverride := some (← IO.mkRef none))
+    dumpGolden "result_norm" resultNormBuf hidden
+
+    -- lm_head: Q6_K matmul [hidden → vocabSize] on single-token f32
+    let logitsBuf ← mkBuf vocab
+    GPUBackend.execute ctx
+      (Hesper.Quantization.Q6_K.fusedQ6KLinearKernel hidden vocab)
+      [("weights", model.outputWeight), ("input", resultNormBuf),
+       ("output", logitsBuf)]
+      { numWorkgroups := (vocab, 1, 1),
+        workgroupSize := { x := 256, y := 1, z := 1 } : Hesper.ExecConfig }
+
+    -- softcap: logit = softcap * tanh(logit / softcap)  (if f_final_logit_softcapping)
+    -- Gemma 4 has softcap=30.0; apply as scale(1/s) + tanh + scale(s).
+    -- For stub simplicity, skip softcap if softcapScale == 0 (interpret as disabled).
+    let softcap := cfg.logitSoftcapScale
+    if softcap > 0.0 then
+      -- TODO: need a fused softcap kernel; for now apply via three
+      -- separate dispatches using existing broadcast-scale + a new tanh.
+      -- Simpler: write directly as result_output (softcap is
+      -- tanh-applied monotonic, so dumping pre-softcap is sufficient
+      -- for argmax parity).  Defer proper softcap for bit-parity work.
+      pure ()
+    dumpGolden "result_output" logitsBuf vocab
+  | none =>
+    -- Dispatch-count mode
+    dispatchRmsNorm ctx buf1 buf2 hidden
+    GPUBackend.execute ctx (prefillQuantizeMmqQ8_1Q6KKernel seqLen hidden)
+      [("lm_mmq_in", buf2), ("lm_mmq_q8", buf1)]
+      { workgroupSize := { x := 1, y := 1, z := 1 }, numWorkgroups := (1, 1, 1) }
+    GPUBackend.execute ctx (prefillMulMatQQ6KKernel seqLen vocab hidden)
+      [("lm_mmq_q8", buf1), ("lm_mmq_part", buf2)]
+      { workgroupSize := { x := 1, y := 1, z := 1 }, numWorkgroups := (1, 1, 1) }
+    GPUBackend.execute ctx (prefillMulMatQStreamKFixupQ6KKernel seqLen vocab)
+      [("lm_mmq_part", buf2), ("lm_mmq_out", buf1)]
+      { workgroupSize := { x := 1, y := 1, z := 1 }, numWorkgroups := (1, 1, 1) }
+    dispatchPointwise ctx buf1 buf2 hidden
+    dispatchPointwise ctx buf2 buf1 hidden
+    dispatchPointwise ctx buf1 buf2 hidden
 
 end Hesper.Models.Gemma4

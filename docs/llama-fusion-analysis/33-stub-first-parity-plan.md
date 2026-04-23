@@ -345,8 +345,22 @@ Each op close will append a line here:
   L19-21: 1.2e-02 to 2.8e-02      L41:    1.04e-02 (last-token slice)
   ```
   All layers rel ≤ 2.8 %, well within Q4_K quant-noise scale.
-- [next] `result_norm` + `result_output` (Q6_K lm_head) + softcap for
-  end-to-end token-level parity.
+- [2026-04-23] **END-TO-END TOKEN PARITY ✓**.  Added post-loop:
+  - Extract last token (column seqLen-1) from `currentInputRef` into
+    hidden-sized scratch (matches llama.cpp's `inp_out_ids` trim).
+  - `RMSNorm.forward ctx model.finalNorm` → `result_norm` (single token).
+  - `fusedQ6KLinearKernel hidden vocab` with `model.outputWeight` →
+    `result_output` (single token, vocab-sized).
+  - Softcap skipped for now (tanh kernel TODO; argmax is preserved by
+    monotonic tanh).
+  Results on `"Hello world how are you"`:
+    result_norm          : rel=3.73e-02, argmax token MATCH
+    result_output        : rel=1.11e-01 (Q6_K quant + no softcap)
+    **argmax**: hesper=236881, llama.cpp=236881 (token `?`, correct)
+  End-to-end greedy sampling produces the same token as llama.cpp.
+- [next] Apply softcap for sub-0.05 `result_output` parity.
+- [next] Wire this forward into end-to-end generation for multi-token
+  parity / TPS measurement vs llama.cpp.
 - [next] Implement `Qcur_pos-0` (RoPE Q).  Input: `batchQBuf` (normed),
   output: dedicated `batchQRopedBuf`.  Weight: none (freq base + freq
   factors for full-attention layers).
