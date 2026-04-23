@@ -857,18 +857,21 @@ def forwardPrefillLlamaCpp [GPUBackend β] (ctx : β)
         workgroupSize := { x := 256, y := 1, z := 1 } : Hesper.ExecConfig }
 
     -- softcap: logit = softcap * tanh(logit / softcap)  (if f_final_logit_softcapping)
-    -- Gemma 4 has softcap=30.0; apply as scale(1/s) + tanh + scale(s).
-    -- For stub simplicity, skip softcap if softcapScale == 0 (interpret as disabled).
+    -- Gemma 4 has softcap=30.0; apply as one fused kernel that matches
+    -- llama.cpp's scale + tanh + scale triple at gemma4-iswa.cpp:239-243.
+    -- softcap is monotonic-increasing (tanh), so argmax is preserved
+    -- either way, but applying it improves result_output parity from
+    -- ~11 % (arbitrary scale) to Q6_K-quant-noise scale.
     let softcap := cfg.logitSoftcapScale
-    if softcap > 0.0 then
-      -- TODO: need a fused softcap kernel; for now apply via three
-      -- separate dispatches using existing broadcast-scale + a new tanh.
-      -- Simpler: write directly as result_output (softcap is
-      -- tanh-applied monotonic, so dumping pre-softcap is sufficient
-      -- for argmax parity).  Defer proper softcap for bit-parity work.
-      pure ()
-    dumpGolden "result_output" logitsBuf vocab
-    return some logitsBuf
+    let softcappedBuf ← if softcap > 0.0 then do
+      let buf ← mkBuf vocab
+      GPUBackend.execute ctx (stubLogitSoftcapKernel vocab softcap)
+        [("input", logitsBuf), ("output", buf)]
+        (.dispatch1D vocab)
+      pure buf
+    else pure logitsBuf
+    dumpGolden "result_output" softcappedBuf vocab
+    return some softcappedBuf
   | none =>
     -- Dispatch-count mode
     dispatchRmsNorm ctx buf1 buf2 hidden
