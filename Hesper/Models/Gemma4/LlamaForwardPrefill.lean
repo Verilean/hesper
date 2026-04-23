@@ -909,14 +909,29 @@ def forwardPrefillLlamaCpp [GPUBackend β] (ctx : β)
       (refOverride := some (← IO.mkRef none))
     dumpGolden "result_norm" resultNormBuf hidden
 
-    -- lm_head: Q6_K matmul [hidden → vocabSize] on single-token f32
+    -- lm_head: Q6_K matmul [hidden → vocabSize] on single-token f32.
+    -- Two-step dp4a path mirroring Linear.forwardDP4A: inline-quantize
+    -- input to Q8_1, then 4-row/workgroup Q6_K matmul with smem Q8_1
+    -- input reuse.  Replaces the earlier `fusedQ6KLinearKernel` which
+    -- emitted one workgroup per output row (262 144 WGs × 256 threads,
+    -- no tiling) and dominated decode wall time at 51 ms/call.  The
+    -- 4-row variant gives the same result within Q8_1 quant noise but
+    -- at roughly llama.cpp's Q6_K mul_mat_vec_q throughput.
     let logitsBuf ← mkBuf vocab
+    let nQ8Blocks := hidden / 32
+    let q8BufSize := nQ8Blocks * 9   -- u32 words per Q8_1 column
+    let lmHeadQ8Buf ← mkBuf q8BufSize
     GPUBackend.execute ctx
-      (Hesper.Quantization.Q6_K.fusedQ6KLinearKernel hidden vocab)
-      [("weights", model.outputWeight), ("input", resultNormBuf),
+      (Hesper.Layers.Linear.quantizeQ8_1Kernel hidden)
+      [("input", resultNormBuf), ("output", lmHeadQ8Buf)]
+      { numWorkgroups := (nQ8Blocks, 1, 1),
+        workgroupSize := { x := 32, y := 1, z := 1 } : Hesper.ExecConfig }
+    GPUBackend.execute ctx
+      (Hesper.Layers.Linear.fusedQ6KLinearDP4A4RowKernel hidden vocab)
+      [("weights", model.outputWeight), ("input_q8", lmHeadQ8Buf),
        ("output", logitsBuf)]
-      { numWorkgroups := (vocab, 1, 1),
-        workgroupSize := { x := 256, y := 1, z := 1 } : Hesper.ExecConfig }
+      { numWorkgroups := (vocab / 4, 1, 1),
+        workgroupSize := { x := 128, y := 1, z := 1 } : Hesper.ExecConfig }
 
     -- softcap: logit = softcap * tanh(logit / softcap)  (if f_final_logit_softcapping)
     -- Gemma 4 has softcap=30.0; apply as one fused kernel that matches
