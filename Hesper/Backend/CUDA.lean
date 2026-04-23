@@ -2,6 +2,7 @@ import Hesper.Backend
 import Hesper.CUDA.FFI
 import Hesper.CUDA.Buffer
 import Hesper.CUDA.CodeGen
+import Hesper.WGSL.Execute
 
 /-!
 # CUDA Backend Instance
@@ -17,6 +18,11 @@ structure CUDAContext where
   ctx : CUcontext
   deriving Inhabited
 
+/-- Dispatch counter (declared up-front so `CUDAContext.init` can wire
+    it into Execute.withSection).  Incremented by `launchKernelMaybeStream`
+    below on every kernel launch. -/
+initialize dispatchCounter : IO.Ref Nat ← IO.mkRef 0
+
 def CUDAContext.init : IO CUDAContext := do
   cuDriverInit
   let count ← cuDeviceCount
@@ -27,6 +33,9 @@ def CUDAContext.init : IO CUDAContext := do
   let mem ← cuTotalMem dev
   IO.println s!"[CUDA] Device: {name}, SM {cc / 10}.{cc % 10}, {mem / (1024*1024)} MB"
   let ctx ← cuCtxCreate dev
+  -- Wire the dispatch counter into Execute.withSection so per-section
+  -- profiling (HESPER_DISPATCH_COUNT=1) can attribute kernel launches.
+  Hesper.WGSL.Execute.registerDispatchCounter dispatchCounter.get
   return ⟨ctx⟩
 
 /-- CUDA cached dispatch — compiled function + buffer args for replay. -/
@@ -76,14 +85,47 @@ cuMemset) stays on the default stream because they sync + reading
 happens only OUTSIDE capture scope. -/
 initialize cudaCaptureStream : IO.Ref (Option Hesper.CUDA.CUstream) ← IO.mkRef none
 
+def resetDispatchCounter : IO Unit := dispatchCounter.set 0
+def getDispatchCounter : IO Nat := dispatchCounter.get
+
 /-- Helper: route a kernel launch through the capture stream when active.
-    Mirrors `cuLaunchKernel` signature. -/
+    Mirrors `cuLaunchKernel` signature.  Does NOT increment the dispatch
+    counter — that happens earlier, when the launch is *emitted* (queued
+    or immediate).  See `bumpDispatchOnEmit`. -/
 private def launchKernelMaybeStream
     (func : CUfunction) (gx gy gz bx byDim bz : UInt32) (smem : UInt32)
     (args : Array USize) : IO Unit := do
   match ← cudaCaptureStream.get with
   | some s => Hesper.CUDA.cuLaunchKernelOnStream func gx gy gz bx byDim bz smem s args
   | none   => cuLaunchKernel func gx gy gz bx byDim bz smem args
+
+/-- Bump the dispatch counter when a launch is emitted.  Called at the
+    point where the launch is first decided — whether it gets queued into
+    the batch or fired immediately, from the caller's perspective it IS
+    a dispatch.  This makes per-section profiling see the launches even
+    when batching is active (`beginBatch` is called upstream). -/
+private def bumpDispatchOnEmit : IO Unit :=
+  dispatchCounter.modify (· + 1)
+
+/-- Cached result of `getenv HESPER_KERNEL_TRACE`.  Env lookup per launch
+    is slow enough to show up in traces; check once at first use. -/
+initialize kernelTraceEnabled : IO.Ref (Option Bool) ← IO.mkRef none
+
+private def kernelTraceOn : IO Bool := do
+  match ← kernelTraceEnabled.get with
+  | some b => pure b
+  | none =>
+    let b := (← IO.getEnv "HESPER_KERNEL_TRACE").isSome
+    kernelTraceEnabled.set (some b)
+    pure b
+
+/-- Emit a `[hs] funcName grid=(..) block=(..)` line to stderr when
+    HESPER_KERNEL_TRACE=1.  Pair with llama.cpp's `[lc] ...` trace and
+    diff the two captures to drive fusion work. -/
+private def traceLaunch (funcName : String)
+    (gx gy gz bx byDim bz : UInt32) : IO Unit := do
+  if ← kernelTraceOn then
+    IO.eprintln s!"[hs] {funcName} grid=({gx},{gy},{gz}) block=({bx},{byDim},{bz})"
 
 private def cudaExecuteImpl (computation : ShaderM Unit) (namedBuffers : List (String × CUDABuffer))
     (funcName : String) (workgroupSize : Hesper.WGSL.WorkgroupSize)
@@ -133,14 +175,29 @@ instance : GPUBackend CUDAContext where
   CachedDispatch := CUDACachedDispatch
   CompiledKernel := CUDACompiledKernel
   executeWithConfig _ctx computation namedBuffers config := do
-    let ptx := generatePTX config.funcName config.workgroupSize computation
+    -- If the caller left funcName at its default "main", derive a
+    -- stable unique PTX symbol from the PTX hash.  That lets nsys
+    -- break apart the per-kernel time bucket (otherwise every
+    -- un-named execute call lands in one giant "main" row).  Same
+    -- PTX → same symbol, so the module cache still hits identically.
+    --
+    -- Two-step: first generate PTX with "main", hash it, then if the
+    -- caller didn't provide a name, regenerate with the hash-derived
+    -- name.  The regeneration is cheap (same ShaderM state) and only
+    -- costs once per unique PTX (cached downstream by ptxHash).
+    let ptxInit := generatePTX config.funcName config.workgroupSize computation
+    let ptxInitHash ← Hesper.CUDA.fastStringHash ptxInit
+    let (effFuncName, ptx) := if config.funcName == "main" then
+        let name := s!"k_{(toString ptxInitHash.toNat).take 16}"
+        (name, generatePTX name config.workgroupSize computation)
+      else (config.funcName, ptxInit)
     let ptxHash ← Hesper.CUDA.fastStringHash ptx
     let autoCache ← cudaAutoCache.get
     let (func, declaredNames) ← match autoCache.find? (fun e => e.1 == ptxHash) with
     | some (_, f, dn) => pure (f, dn)
     | none =>
       let cudaMod ← cuModuleLoadData ptx
-      let f ← cuModuleGetFunction cudaMod config.funcName
+      let f ← cuModuleGetFunction cudaMod effFuncName
       let state := Hesper.WGSL.Monad.ShaderM.exec computation
       let dn := state.declaredBuffers.map (·.1) |>.toArray
       cudaModuleCache.modify (·.push (ptxHash, f))
@@ -157,6 +214,9 @@ instance : GPUBackend CUDAContext where
       blockZ := config.workgroupSize.z.toUInt32, args
     }
     -- If batching, queue the launch; otherwise fire immediately
+    bumpDispatchOnEmit
+    traceLaunch effFuncName gx.toUInt32 gy.toUInt32 gz.toUInt32
+      config.workgroupSize.x.toUInt32 config.workgroupSize.y.toUInt32 config.workgroupSize.z.toUInt32
     match ← cudaBatchQueue.get with
     | some queue => cudaBatchQueue.set (some (queue.push pending))
     | none => launchKernelMaybeStream func gx.toUInt32 gy.toUInt32 gz.toUInt32
@@ -199,17 +259,88 @@ instance : GPUBackend CUDAContext where
       blockX := config.workgroupSize.x.toUInt32, blockY := config.workgroupSize.y.toUInt32,
       blockZ := config.workgroupSize.z.toUInt32, args
     }
+    bumpDispatchOnEmit
+    let effName :=
+      if cacheKey == 0 then config.funcName
+      else s!"k_{(toString cacheKey.toNat).take 16}"
+    traceLaunch effName gx.toUInt32 gy.toUInt32 gz.toUInt32
+      config.workgroupSize.x.toUInt32 config.workgroupSize.y.toUInt32 config.workgroupSize.z.toUInt32
     match ← cudaBatchQueue.get with
     | some queue => cudaBatchQueue.set (some (queue.push pending))
     | none => launchKernelMaybeStream func gx.toUInt32 gy.toUInt32 gz.toUInt32
                 config.workgroupSize.x.toUInt32 config.workgroupSize.y.toUInt32
                 config.workgroupSize.z.toUInt32 0 args
+  executeWithConfigCachedArrays _ctx computation namedBuffers namedBufferArrays config cacheKey cacheRef := do
+    -- Pointer tables live as IO.Ref-owned device allocations.  We allocate
+    -- lazily and reuse via cacheRef — the table base pointer is captured
+    -- in `cached.args`, so replays pick it up cheaply.  The table contents
+    -- (per-layer device ptrs) are updated in-place on each call in case
+    -- the layer buffers change.
+    let cached ← cacheRef.get
+    let (func, declaredNames, tablePtrs) ← match cached with
+    | some c => pure (c.func, c.declaredNames.toList,
+        -- Re-use captured args' tail which holds pointer-table bases.
+        c.args.extract (c.args.size - namedBufferArrays.length.toUSize.toNat) c.args.size)
+    | none => do
+      let funcName :=
+        if cacheKey == 0 then config.funcName
+        else s!"k_{(toString cacheKey.toNat).take 16}"
+      let f ← cudaExecuteImpl computation namedBuffers funcName config.workgroupSize config.numWorkgroups
+      let state := Hesper.WGSL.Monad.ShaderM.exec computation
+      let dn := state.declaredBuffers.map (·.1)
+      -- Allocate one device-side pointer table per bufferArray binding.
+      let mut tableBases : Array USize := #[]
+      for (_, bufs) in namedBufferArrays do
+        let n := bufs.length
+        let p ← Hesper.CUDA.cuMalloc (n * 8).toUSize
+        tableBases := tableBases.push p
+      let args := #[]  -- filled fresh below each call
+      cacheRef.set (some {
+        func := f, sourceHash := 0, declaredNames := dn.toArray, args
+        blockX := config.workgroupSize.x.toUInt32
+        blockY := config.workgroupSize.y.toUInt32
+        blockZ := config.workgroupSize.z.toUInt32
+      })
+      pure (f, dn, tableBases)
+    -- Upload current layer pointers into the tables (H→D copy of N×8 bytes).
+    let mut tIdx : Nat := 0
+    for (_name, bufs) in namedBufferArrays do
+      let tablePtr := tablePtrs[tIdx]!
+      let mut bytes : ByteArray := ByteArray.empty
+      for buf in bufs do
+        -- Little-endian encode CUdeviceptr (USize, 64-bit) as 8 bytes.
+        let p := buf.ptr
+        for i in [0:8] do
+          bytes := bytes.push ((p >>> (i*8).toUSize).toUInt8)
+      Hesper.CUDA.cuMemcpyHtoD tablePtr bytes 0 (bufs.length * 8).toUSize
+      tIdx := tIdx + 1
+    -- Resolve single-buffer args, then append the per-array table base ptrs.
+    let mut args : Array USize := #[]
+    for name in declaredNames do
+      match namedBuffers.find? (fun p => p.1 == name) with
+      | some (_, buf) => args := args.push buf.ptr
+      | none =>
+        match namedBufferArrays.findIdx? (fun p => p.1 == name) with
+        | some i => args := args.push tablePtrs[i]!
+        | none => throw (IO.userError s!"CUDA executeCachedArrays: missing binding '{name}'")
+    let (gx, gy, gz) := config.numWorkgroups
+    let effName :=
+      if cacheKey == 0 then config.funcName
+      else s!"k_{(toString cacheKey.toNat).take 16}"
+    traceLaunch effName gx.toUInt32 gy.toUInt32 gz.toUInt32
+      config.workgroupSize.x.toUInt32 config.workgroupSize.y.toUInt32 config.workgroupSize.z.toUInt32
+    launchKernelMaybeStream func gx.toUInt32 gy.toUInt32 gz.toUInt32
+      config.workgroupSize.x.toUInt32 config.workgroupSize.y.toUInt32
+      config.workgroupSize.z.toUInt32 0 args
   replayCached _ctx cached dims := do
     let (gx, gy, gz) := dims
     let pending : PendingLaunch := {
       func := cached.func, gridX := gx.toUInt32, gridY := gy.toUInt32, gridZ := gz.toUInt32,
       blockX := cached.blockX, blockY := cached.blockY, blockZ := cached.blockZ, args := cached.args
     }
+    bumpDispatchOnEmit
+    traceLaunch "<replay>" gx.toUInt32 gy.toUInt32 gz.toUInt32
+      cached.blockX cached.blockY cached.blockZ
     match ← cudaBatchQueue.get with
     | some queue => cudaBatchQueue.set (some (queue.push pending))
     | none => launchKernelMaybeStream cached.func gx.toUInt32 gy.toUInt32 gz.toUInt32
@@ -254,6 +385,9 @@ instance : GPUBackend CUDAContext where
       func := kernel.func, gridX := gx.toUInt32, gridY := gy.toUInt32, gridZ := gz.toUInt32,
       blockX := kernel.blockX, blockY := kernel.blockY, blockZ := kernel.blockZ, args
     }
+    bumpDispatchOnEmit
+    traceLaunch "<compiled>" gx.toUInt32 gy.toUInt32 gz.toUInt32
+      kernel.blockX kernel.blockY kernel.blockZ
     match ← cudaBatchQueue.get with
     | some queue => cudaBatchQueue.set (some (queue.push pending))
     | none => launchKernelMaybeStream kernel.func gx.toUInt32 gy.toUInt32 gz.toUInt32
