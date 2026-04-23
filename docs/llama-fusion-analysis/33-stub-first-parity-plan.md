@@ -358,9 +358,16 @@ Each op close will append a line here:
     result_output        : rel=1.11e-01 (Q6_K quant + no softcap)
     **argmax**: hesper=236881, llama.cpp=236881 (token `?`, correct)
   End-to-end greedy sampling produces the same token as llama.cpp.
-- [next] Apply softcap for sub-0.05 `result_output` parity.
-- [next] Wire this forward into end-to-end generation for multi-token
-  parity / TPS measurement vs llama.cpp.
+- [2026-04-23] **Softcap ✓**: added `stubLogitSoftcapKernel` (fused
+  `softcap * tanh(x / softcap)` — llama.cpp's 3-op chain collapsed
+  into 1 since all three are pointwise).  Applied after lm_head when
+  `cfg.logitSoftcapScale > 0`.  result_output parity on the same
+  prompt: **rel=1.10e-02** (was 1.11e-01 without softcap), solidly
+  within Q6_K quant-noise range.  argmax still matches.
+- [2026-04-23] **Multi-token generation loop ✓** via O(N²) re-prefill
+  per step.  Driver accepts a third CLI arg `maxTokens`.
+- [next] persistent-KV decode path (seqLen=1, startPos=prevLen)
+  for O(N) generation and realistic TPS.
 - [next] Implement `Qcur_pos-0` (RoPE Q).  Input: `batchQBuf` (normed),
   output: dedicated `batchQRopedBuf`.  Weight: none (freq base + freq
   factors for full-attention layers).
