@@ -1,7 +1,8 @@
-# 37 — Q4_K widen + mis-measured dispatch-count detour (retracted)
+# 37 — Q4_K widen + retracted detour (second correction)
 
 *Written 2026-04-23.  Small Q4_K win landed; then I mis-reasoned the
-rest of this doc and withdrew the conclusion in revision below.*
+rest of this doc TWICE.  Second correction leaves us back where doc 36
+started: per-kernel throughput is the right lever.*
 
 ## What actually landed
 
@@ -19,80 +20,82 @@ Measured impact on the canonical 10-token workload:
 
 Small but clean — keeps.
 
-## What I got wrong (retracted)
+## What I got wrong, version 1 (already withdrawn)
 
-The first revision of this doc claimed:
-- "hesper emits 1491 dispatches/decode, llama.cpp emits 89"
-- "per-decode 45 ms are GPU-side scheduling gaps from 1491 × 30 µs"
-- "per-kernel tuning has a hard ceiling at ~20–26 TPS"
+Claimed "llama.cpp = 89 ops/token".  That's ggml's logical op count in
+`trace_lc.txt`, not CUDA kernel launches.
 
-All three are wrong.  Recovered reality after re-measuring with
-nsys on llama.cpp directly (doc 35 §A.3 workload):
+## What I got wrong, version 2 (this correction)
 
-| Metric                           | hesper stub | llama.cpp |
-|----------------------------------|------------:|----------:|
-| kernel instances / 11 forwards   | ~13 500     | **5 615** |
-| per-decode kernel dispatches     | ~1 491      | **~510**  |
-| per-decode GPU kernel time       | ~11 ms      | ~3 ms     |
-| per-decode wall time             | 58 ms       | 8.6 ms    |
+After version 1, I re-measured llama.cpp (graphs ON) and claimed
+"~510 dispatches/decode" for llama.cpp.  That came from naive
+division of nsys's total kernel instances (5615) by my assumed
+forward count (11).  Both the numerator and the denominator were
+wrong:
 
-The "89" figure I used for llama.cpp came from a count of **op rows in
-`trace_lc.txt`**, which is ggml's *logical* op count.  ggml's graph
-batcher collapses several of those ops into each `cudaLaunchKernel`
-(multi-row matmul + epilogue etc.), but each logical op is NOT one
-kernel launch.  And conversely, a single ggml op can expand to
-multiple kernels (quantize_q8_1 + mul_mat_vec_q + combine, etc.).
+- With CUDA Graphs ON, llama.cpp emits 16 `cudaGraphLaunch` calls
+  that each replay ~hundreds of kernel nodes; kernel instance count
+  isn't the same as launch count.
+- Internal forward count for `llama-cli … -n 10` isn't 11 — there are
+  additional preparatory forwards, tokenize paths, etc.
 
-Re-measured with nsys: llama.cpp actually issues ~510
-`cudaLaunchKernel`/decode.  That's 2.9× fewer than hesper's 1491,
-not 17×.  dispatch count matters but it's not the 45 ms fire-alarm I
-painted it as.
+The apples-to-apples measurement uses `llama-bench` with
+`GGML_CUDA_DISABLE_GRAPHS=1` (same flags Doc 33 used):
 
-And the "30 µs per-kernel gap" is wrong too — if it were real,
-llama.cpp's 510 × 30 µs = 15 ms would already exceed its total
-8.6 ms/decode budget.  Inside a CUDA graph, adjacent-kernel gaps are
-much smaller (~1–3 µs median), and wall time is dominated by
-kernel-active time, not gaps.
+| Config                                | dispatches |
+|---------------------------------------|-----------:|
+| llama.cpp  prefill seqLen=50, n=0     |    2 016   |
+| llama.cpp  decode only, n=20          |   26 020   |
+| → per decode                          |    **1 301** |
+| hesper stub decode (graphs OFF)       |    1 491   |
+| → ratio                               |   **1.15×** |
 
-## Where the gap actually sits (corrected)
+**Hesper is within 15% of llama.cpp on dispatch count**, exactly as
+doc 33's plan predicted and previous measurements recorded.  Kernel
+fusion isn't the missing lever.
 
-Per decode:
+## Corrected per-decode attribution
 
-| Bucket                | hesper   | llama.cpp | Gap     |
-|-----------------------|---------:|----------:|--------:|
-| Host API (pre-graph)  |  ~0.3 ms |   ~0.3 ms | ≈0      |
-| GPU kernel active     |   ~11 ms |    ~3 ms  | **8 ms**|
-| Kernel-count overhead |  ~2–3 ms |   ~1 ms   | ~2 ms   |
-| Other (scheduling)    | ~43 ms   |   ~4 ms   | ??      |
+At steady-state decode with hesper graphs ON (58 ms/decode wall):
 
-That **~43 ms "other"** is the real unknown.  It's still way larger
-than CUDA's theoretical scheduling cost for 1491 kernels.  Candidate
-explanations to rule in or out:
-- Hidden serialisation inside the graph (missing barriers forcing
-  scoreboard stalls).
-- FFI / driver per-launch overhead that nsys doesn't attribute.
-- `main` kernel in nsys sum is collapsing many actual kernels whose
-  individual latencies nsys is under-reporting.
+| Bucket                              | hesper   | llama.cpp | Gap    |
+|-------------------------------------|---------:|----------:|-------:|
+| Host API                            |  ~0.3 ms |   ~0.3 ms | ~0     |
+| GPU kernel active (sum of durations)| **~13 ms** | ~3 ms  | 10 ms  |
+| Schedule/driver overhead (residual) |  ~44 ms  |  ~5 ms    | 39 ms  |
 
-Without an answer here, I can't honestly predict what per-kernel
-improvements buy.  Doc 36's priority list should stand, but with the
-caveat that each win should be re-measured *end-to-end TPS* — not
-just "this kernel got faster by X ms".
+That 39 ms residual is real and still unexplained — but with
+dispatch counts comparable, it can't be framed as a
+"dispatch-gap-arithmetic" story.  Candidate explanations (need
+verification, not more hand-waving):
 
-## Revised plan
+1. **`cudaMallocHost` / host-buffer cost**: llama.cpp's nsys showed
+   `cudaMallocHost` at 94.8 ms total — prefill one-shot.  Does
+   hesper have an equivalent cost per-decode somewhere?
+2. **CUDA Graph quality on the hesper side**: our capture-then-replay
+   works but the graph may be serialising across kernels that CUDA
+   normally pipelines.  Need to look at the graph's dep structure in
+   nsys timeline view, not just the summary.
+3. **Per-kernel launch-to-start latency on the GPU**: nsys's "Total
+   Time" for kernels is occupancy time, not wall time.  If our
+   kernels stall waiting for scoreboard clears between launches,
+   that doesn't show up in the kernel sum.
 
-1. **Finish doc 36 priority 1** — continue Q4_K matmul work beyond
-   the 4-warp widen (inline Q8_1 quantize into the matmul, multi-row
-   tiling for ≤5120 outDim, ncu to find the actual stall reason).
-2. **Instrument the 43 ms "other" bucket** before pivoting.  Options:
-   enable nsys GPU metric export, or run a small test with KernelTrace
-   that measures wall - kernel_active and attributes it.
-3. **Only then** decide if dispatch-count work (kernel fusion) is the
-   right next lever.  The earlier "fusion is mandatory" claim is
-   withdrawn.
+## Revised plan (back to doc 36's priority list)
 
-## Lesson
+1. **Q4_K matmul per-kernel throughput** — the 4-warp widen landed
+   (-9 ms GPU).  Next: port `mul_mat_vec_q` inline-q8 path (removes
+   the standalone quantize dispatch, ~42 fewer launches per decode),
+   try multi-row variants for outDim ≤ 5120.
+2. **FlashAttention vec-f16 decode path** — currently the FLASH_ATTN
+   kernel is ~76 µs, llama.cpp's is ~15-25 µs.  Port fattn-vec-f16.
+3. **Instrument the 39 ms residual** alongside #1 and #2 — don't
+   pivot to fusion without evidence.
 
-When a number looks suspiciously round (89 ops/token?), re-measure
-before building a plan on top of it.  I let a stale figure from an
-old doc propagate into a false conclusion.
+## Lesson learned, logged
+
+When a dispatch count looks wildly off between us and llama.cpp,
+re-run with **identical flags** (same graphs setting, same prompt,
+same n tokens) and use nsys kernel instance counts — NOT op-row
+counts from trace files.  Both failures above came from comparing
+different measurement setups and calling the diff a "gap".
