@@ -133,6 +133,22 @@ def stubBroadcastScaleKernel (total : Nat) : ShaderM Unit := do
     ShaderM.writeBuffer (ty := .scalar .f32) "output" idx (Exp.mul v s)
   ) (pure ())
 
+/-- Final-logit softcap: `out[i] = softcap * tanh(in[i] / softcap)`.
+    Matches llama.cpp's `scale(1/s) + tanh + scale(s)` chain at
+    gemma4-iswa.cpp:239-243.  Fused into one kernel because the three
+    ops are pointwise and the constant is compile-time known. -/
+def stubLogitSoftcapKernel (size : Nat) (softcap : Float) : ShaderM Unit := do
+  let gid ← ShaderM.globalId
+  let idx := Exp.vec3X gid
+  let _input ← ShaderM.declareInputBuffer "input" (.array (.scalar .f32) size)
+  let _output ← ShaderM.declareOutputBuffer "output" (.array (.scalar .f32) size)
+  ShaderM.if_ (Exp.lt idx (Exp.litU32 size)) (do
+    let x ← ShaderM.readBuffer (ty := .scalar .f32) (n := size) "input" idx
+    let scaled := Exp.mul x (Exp.litF32 (1.0 / softcap))
+    let capped := Exp.mul (Exp.tanh scaled) (Exp.litF32 softcap)
+    ShaderM.writeBuffer (ty := .scalar .f32) "output" idx capped
+  ) (pure ())
+
 /-- Copy-insert: `dst[params[0] * size + i] = src[i]` for `i in [0, size)`.
     Column-insert variant whose declared buffer size matches `totalDst`
     rather than `size * seqLen` — used for PLE (where `size = totalPL` and
