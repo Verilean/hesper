@@ -859,6 +859,7 @@ Apache License 2.0 - see LICENSE file for details
 - **Lean 4** for the foundation of verified programming
 - **WebGPU Working Group** for the standard
 - **gpu.cpp (Answer.AI):** High-level C++ API wrapper inspiration.
+- **[llama.cpp](https://github.com/ggerganov/llama.cpp) (Georgi Gerganov & contributors):** Reference implementation for Gemma 4 architecture and Q4_K_M quantization. Its per-op trace (`llama-eval-callback`) is the golden oracle for hesper's per-layer parity work, and its `ggml_gallocr` compute-buffer allocator inspired hesper's `ScratchPool` design for eliminating per-forward `cuMemAlloc` churn.
 
 ---
 
