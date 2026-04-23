@@ -198,7 +198,17 @@ private def dispatchBuildFfn
     the graph's kernel args reference a stable device pointer; the caller
     is responsible for writing the current startPos into it before each
     replay.  When the override is provided, this function does NOT write
-    to it — the caller owns the update schedule. -/
+    to it — the caller owns the update schedule.
+
+    `skipConstantWrites`, when `true`, suppresses re-writing the ScratchPool
+    buffers whose contents are identical on every call (colIdxBuf=0,
+    plColIdxBuf=0, onesBuf=all-1.0, lastColIdxBuf=seqLen-1).  Because
+    ScratchPool returns the same device pointer on every forward, the
+    previous call's contents persist — re-writing is redundant on warm
+    runs.  Callers that have already run at least one eager forward with
+    the same `scratchPool` (e.g. graph-capture drivers after a warm-up
+    step) may pass `true` to eliminate ~4 cuMemcpyHtoD ops per forward.
+    Leave as `false` for the first-ever call. -/
 def forwardPrefillLlamaCpp [GPUBackend β] (ctx : β)
     (model : Gemma4Model (GPUBackend.Buf β) (GPUBackend.CachedDispatch β))
     (seqLen : Nat)
@@ -208,6 +218,7 @@ def forwardPrefillLlamaCpp [GPUBackend β] (ctx : β)
     (persistentCaches : Option (Array (GPUBackend.Buf β × GPUBackend.Buf β)) := none)
     (scratchPool : Option (ScratchPool β) := none)
     (paramsBufOverride : Option (GPUBackend.Buf β) := none)
+    (skipConstantWrites : Bool := false)
     : IO (Option (GPUBackend.Buf β)) := do
   let cfg := model.config
   let numLayers := cfg.numHiddenLayers
@@ -269,9 +280,11 @@ def forwardPrefillLlamaCpp [GPUBackend β] (ctx : β)
     let tokenScratch ← mkBuf 1 -- 4 bytes, u32 (overwritten per token)
     let embdScratch ← mkBuf hidden
     for i in [0:seqLen] do
-      -- colIdxBuf := i
-      let iBytes := Hesper.WebGPU.BufferOps.uint32ToBytes i.toUInt32
-      GPUBackend.writeBuffer ctx colIdxBuf iBytes
+      -- colIdxBuf := i.  Skip the write when caller asserts the pool
+      -- buffer already holds the right value (decode-graph fast path).
+      unless skipConstantWrites do
+        let iBytes := Hesper.WebGPU.BufferOps.uint32ToBytes i.toUInt32
+        GPUBackend.writeBuffer ctx colIdxBuf iBytes
       -- tokenScratch := tokIds[i]
       GPUBackend.execute ctx (stubCopyU32Kernel seqLen 1 0)
         [("src", tokIds), ("params", colIdxBuf), ("dst", tokenScratch)]
@@ -332,8 +345,9 @@ def forwardPrefillLlamaCpp [GPUBackend β] (ctx : β)
     --    pass if dequantQ6KElement becomes public.)
     let tokenScratch2 ← mkBuf 1
     for i in [0:seqLen] do
-      let iBytes := Hesper.WebGPU.BufferOps.uint32ToBytes i.toUInt32
-      GPUBackend.writeBuffer ctx plColIdxBuf iBytes
+      unless skipConstantWrites do
+        let iBytes := Hesper.WebGPU.BufferOps.uint32ToBytes i.toUInt32
+        GPUBackend.writeBuffer ctx plColIdxBuf iBytes
       match tokenIdsBuf with
       | some tokIds =>
         GPUBackend.execute ctx (stubCopyU32Kernel seqLen 1 0)
@@ -483,7 +497,7 @@ def forwardPrefillLlamaCpp [GPUBackend β] (ctx : β)
   let headDim0 := cfg.headDim 0
   let dimPairs0 := headDim0 / 2
   let onesBuf ← mkBuf dimPairs0
-  do
+  unless skipConstantWrites do
     let oneBytes ← Hesper.WebGPU.BufferOps.floatToBytes 1.0
     let mut bytes : ByteArray := ByteArray.empty
     for _ in [0:dimPairs0] do
@@ -880,8 +894,9 @@ def forwardPrefillLlamaCpp [GPUBackend β] (ctx : β)
     let lastTokenBuf ← mkBuf hidden
     let lastColIdx := seqLen - 1
     let lastColIdxBuf ← mkBuf 1
-    GPUBackend.writeBuffer ctx lastColIdxBuf
-      (Hesper.WebGPU.BufferOps.uint32ToBytes lastColIdx.toUInt32)
+    unless skipConstantWrites do
+      GPUBackend.writeBuffer ctx lastColIdxBuf
+        (Hesper.WebGPU.BufferOps.uint32ToBytes lastColIdx.toUInt32)
     GPUBackend.execute ctx (stubColumnExtractKernel hidden seqLen)
       [("batch", finalInputBuf), ("params", lastColIdxBuf),
        ("out", lastTokenBuf)]
