@@ -2116,13 +2116,25 @@ def fusedQ4KMLinearDP4A4WarpKernel (config : Config) : ShaderM Unit := do
   -- Each of the 16 threads sharing a kbxStart uniquely indexes (bq8Off, elemOff)
   -- via (tid & 15), so together they cover all 16 sub-slots of one block.
   -- No duplicated work — every thread contributes distinct products.
-  let kbxStart := Exp.shiftRight tid (Exp.litU32 4)  -- 0..7
-  let laneLow := Exp.bitAnd tid (Exp.litU32 15)
-  let pairIdxInRow := Exp.shiftRight laneLow (Exp.litU32 2)  -- 0..3
-  let elemOff := Exp.bitAnd laneLow (Exp.litU32 3)           -- 0..3
-  let bq8Off := Exp.shiftLeft pairIdxInRow (Exp.litU32 1)    -- 0,2,4,6
+  -- Hoist thread-invariant subexpressions into explicit registers.  Lean's
+  -- `Exp` lowering re-emits every use, and ptxas doesn't always CSE them
+  -- back (PTX dump of this kernel showed `shr.u32 tid, 5` appearing 51×
+  -- and `bfe.u32 tid, 0, 4` appearing 42× inside the outer loop body).
+  -- Binding them via `ShaderM.var` forces one materialisation.
+  let kbxStartName ← ShaderM.var (.scalar .u32) (Exp.shiftRight tid (Exp.litU32 4))
+  let laneLowName  ← ShaderM.var (.scalar .u32) (Exp.bitAnd tid (Exp.litU32 15))
+  let kbxStart : Exp (.scalar .u32) := Exp.var kbxStartName         -- 0..7
+  let laneLow  : Exp (.scalar .u32) := Exp.var laneLowName
+  let pairIdxInRowName ← ShaderM.var (.scalar .u32) (Exp.shiftRight laneLow (Exp.litU32 2))
+  let elemOffName      ← ShaderM.var (.scalar .u32) (Exp.bitAnd laneLow (Exp.litU32 3))
+  let pairIdxInRow : Exp (.scalar .u32) := Exp.var pairIdxInRowName  -- 0..3
+  let elemOff      : Exp (.scalar .u32) := Exp.var elemOffName       -- 0..3
+  let bq8OffName ← ShaderM.var (.scalar .u32) (Exp.shiftLeft pairIdxInRow (Exp.litU32 1))
+  let bq8Off : Exp (.scalar .u32) := Exp.var bq8OffName              -- 0,2,4,6
 
-  let rowBaseU32 := Exp.mul outIdx (Exp.litU32 (blocksPerRow * 36))
+  let rowBaseU32Name ← ShaderM.var (.scalar .u32)
+    (Exp.mul outIdx (Exp.litU32 (blocksPerRow * 36)))
+  let rowBaseU32 : Exp (.scalar .u32) := Exp.var rowBaseU32Name
 
   ShaderM.varNamed "acc" (.scalar .f32) (Exp.litF32 0.0)
   let acc : Exp (.scalar .f32) := Exp.var "acc"
@@ -2141,10 +2153,16 @@ def fusedQ4KMLinearDP4A4WarpKernel (config : Config) : ShaderM Unit := do
   -- 30 % of the lane-iterations on those kernels.
   let maxIter := (blocksPerRow + 7) / 8
   ShaderM.loop (Exp.litU32 0) (Exp.litU32 maxIter) (Exp.litU32 1) fun iter => do
-    let blockIdx := Exp.add kbxStart (Exp.mul iter (Exp.litU32 8))
+    let blockIdxName ← ShaderM.var (.scalar .u32)
+      (Exp.add kbxStart (Exp.mul iter (Exp.litU32 8)))
+    let blockIdx : Exp (.scalar .u32) := Exp.var blockIdxName
     let blockInRange := Exp.lt blockIdx (Exp.litU32 blocksPerRow)
     ShaderM.if_ blockInRange (do
-    let blockU32Base := Exp.add rowBaseU32 (Exp.mul blockIdx (Exp.litU32 36))
+    -- Bind the per-iter base addresses as explicit registers so the 12 ld.global
+    -- calls inside the iter all share the same address-chain materialisation.
+    let blockU32BaseName ← ShaderM.var (.scalar .u32)
+      (Exp.add rowBaseU32 (Exp.mul blockIdx (Exp.litU32 36)))
+    let blockU32Base : Exp (.scalar .u32) := Exp.var blockU32BaseName
 
     let dmU32 ← ShaderM.readBuffer (ty := .scalar .u32) (n := totalWeightU32) "weights" blockU32Base
     let dF := fp16ToF32 (Exp.bitAnd dmU32 (Exp.litU32 0xFFFF))
@@ -2184,8 +2202,13 @@ def fusedQ4KMLinearDP4A4WarpKernel (config : Config) : ShaderM Unit := do
     let v1 ← ShaderM.readBuffer (ty := .scalar .u32) (n := totalWeightU32) "weights" (Exp.add q4BaseIdx (Exp.litU32 4))
 
     -- Q8_1 reads from global memory (no smem staging — maximizes occupancy).
-    let q8Sub0Base := Exp.add (Exp.mul blockIdx (Exp.litU32 (8 * 9))) (Exp.mul bq8Off (Exp.litU32 9))
-    let q8Sub1Base := Exp.add q8Sub0Base (Exp.litU32 9)
+    -- Hoist the two sub-block bases into explicit registers (shared across
+    -- 6 ld.global for this block of Q8_1).
+    let q8Sub0BaseName ← ShaderM.var (.scalar .u32)
+      (Exp.add (Exp.mul blockIdx (Exp.litU32 (8 * 9))) (Exp.mul bq8Off (Exp.litU32 9)))
+    let q8Sub0Base : Exp (.scalar .u32) := Exp.var q8Sub0BaseName
+    let q8Sub1BaseName ← ShaderM.var (.scalar .u32) (Exp.add q8Sub0Base (Exp.litU32 9))
+    let q8Sub1Base : Exp (.scalar .u32) := Exp.var q8Sub1BaseName
     let u0 ← ShaderM.readBuffer (ty := .scalar .u32) (n := q8InputU32Size) "input_q8" (Exp.add q8Sub0Base (Exp.add (Exp.litU32 1) elemOff))
     let u1 ← ShaderM.readBuffer (ty := .scalar .u32) (n := q8InputU32Size) "input_q8" (Exp.add q8Sub0Base (Exp.add (Exp.litU32 5) elemOff))
     let u2 ← ShaderM.readBuffer (ty := .scalar .u32) (n := q8InputU32Size) "input_q8" (Exp.add q8Sub1Base (Exp.add (Exp.litU32 1) elemOff))
