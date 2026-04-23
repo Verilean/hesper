@@ -2968,7 +2968,12 @@ def fusedQ6KLinearDP4A2RowKernel (inDim outDim : Nat) (gridX : Nat := 0) : Shade
       (Exp.litU32 0x80808080)
 
   ShaderM.loop (Exp.litU32 0) (Exp.litU32 blocksPerRow) (Exp.litU32 1) fun blockIdx => do
-    let blockByteBase := Exp.add rowByteBase (Exp.mul blockIdx (Exp.litU32 blockSizeBytes))
+    -- Hoist per-iter base so all readByte/read4Bytes calls below share
+    -- one address-chain register (roughly a dozen global-memory reads
+    -- per iter — without this the base re-materialises for each one).
+    let blockByteBaseName ← ShaderM.var (.scalar .u32)
+      (Exp.add rowByteBase (Exp.mul blockIdx (Exp.litU32 blockSizeBytes)))
+    let blockByteBase : Exp (.scalar .u32) := Exp.var blockByteBaseName
 
     let dLo ← readByte blockByteBase (Exp.litU32 208)
     let dHi ← readByte blockByteBase (Exp.litU32 209)
@@ -3093,15 +3098,32 @@ def fusedQ6KLinearDP4A4RowKernel (inDim outDim : Nat) (gridX : Nat := 0) : Shade
   let inBounds := Exp.lt outIdx (Exp.litU32 outDim)
 
   -- Per-warp dp4a lane assignment; identical to the 1-row / 2-row variants.
-  let iqs : Exp (.scalar .u32) := laneId
-  let iqsDiv16 := Exp.shiftRight iqs (Exp.litU32 4)
-  let iqsMod16 := Exp.bitAnd iqs (Exp.litU32 15)
-  let bq8Off := Exp.add (Exp.mul iqsDiv16 (Exp.litU32 4)) (Exp.shiftRight iqsMod16 (Exp.litU32 3))
-  let scaleOff := Exp.add (Exp.mul iqsDiv16 (Exp.litU32 8)) (Exp.shiftRight iqsMod16 (Exp.litU32 2))
-  let vhShift := Exp.mul (Exp.shiftRight iqsMod16 (Exp.litU32 3)) (Exp.litU32 2)
-  let iqsMod8 := Exp.bitAnd iqs (Exp.litU32 7)
-  let vhIdx := Exp.add (Exp.mul iqsDiv16 (Exp.litU32 8)) iqsMod8
-  let q8ElemOff := iqsMod8
+  -- Hoist every thread-invariant sub-expression into an explicit register.
+  -- Without this `ShaderM.var` lift, the lazy `Exp` representation re-emits
+  -- each use at its call site; ptxas often CSEs them back, but the
+  -- verbose PTX hides register pressure and forced the same fix that
+  -- landed on the Q4_K 4-warp kernel (commit 9d43d81).
+  let iqsName       ← ShaderM.var (.scalar .u32) laneId
+  let iqs           : Exp (.scalar .u32) := Exp.var iqsName
+  let iqsDiv16Name  ← ShaderM.var (.scalar .u32) (Exp.shiftRight iqs (Exp.litU32 4))
+  let iqsMod16Name  ← ShaderM.var (.scalar .u32) (Exp.bitAnd iqs (Exp.litU32 15))
+  let iqsMod8Name   ← ShaderM.var (.scalar .u32) (Exp.bitAnd iqs (Exp.litU32 7))
+  let iqsDiv16      : Exp (.scalar .u32) := Exp.var iqsDiv16Name
+  let iqsMod16      : Exp (.scalar .u32) := Exp.var iqsMod16Name
+  let iqsMod8       : Exp (.scalar .u32) := Exp.var iqsMod8Name
+  let bq8OffName    ← ShaderM.var (.scalar .u32)
+    (Exp.add (Exp.mul iqsDiv16 (Exp.litU32 4)) (Exp.shiftRight iqsMod16 (Exp.litU32 3)))
+  let scaleOffName  ← ShaderM.var (.scalar .u32)
+    (Exp.add (Exp.mul iqsDiv16 (Exp.litU32 8)) (Exp.shiftRight iqsMod16 (Exp.litU32 2)))
+  let vhShiftName   ← ShaderM.var (.scalar .u32)
+    (Exp.mul (Exp.shiftRight iqsMod16 (Exp.litU32 3)) (Exp.litU32 2))
+  let vhIdxName     ← ShaderM.var (.scalar .u32)
+    (Exp.add (Exp.mul iqsDiv16 (Exp.litU32 8)) iqsMod8)
+  let bq8Off    : Exp (.scalar .u32) := Exp.var bq8OffName
+  let scaleOff  : Exp (.scalar .u32) := Exp.var scaleOffName
+  let vhShift   : Exp (.scalar .u32) := Exp.var vhShiftName
+  let vhIdx     : Exp (.scalar .u32) := Exp.var vhIdxName
+  let q8ElemOff : Exp (.scalar .u32) := iqsMod8  -- alias; already in register
 
   ShaderM.varNamed "acc" (.scalar .f32) (Exp.litF32 0.0)
   let acc : Exp (.scalar .f32) := Exp.var "acc"
@@ -3137,7 +3159,12 @@ def fusedQ6KLinearDP4A4RowKernel (inDim outDim : Nat) (gridX : Nat := 0) : Shade
       (Exp.litU32 0x80808080)
 
   ShaderM.loop (Exp.litU32 0) (Exp.litU32 blocksPerRow) (Exp.litU32 1) fun blockIdx => do
-    let blockByteBase := Exp.add rowByteBase (Exp.mul blockIdx (Exp.litU32 blockSizeBytes))
+    -- Hoist per-iter base so all readByte/read4Bytes calls below share
+    -- one address-chain register (roughly a dozen global-memory reads
+    -- per iter — without this the base re-materialises for each one).
+    let blockByteBaseName ← ShaderM.var (.scalar .u32)
+      (Exp.add rowByteBase (Exp.mul blockIdx (Exp.litU32 blockSizeBytes)))
+    let blockByteBase : Exp (.scalar .u32) := Exp.var blockByteBaseName
 
     let dLo ← readByte blockByteBase (Exp.litU32 208)
     let dHi ← readByte blockByteBase (Exp.litU32 209)
