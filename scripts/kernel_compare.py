@@ -86,16 +86,20 @@ def classify_hs(grid: tuple[int, int, int, int] | None) -> str:
         return "(untagged)"
     gx, gy, gz, bx = grid
     phase = "decode" if gy == 1 else "prefill"
-    # 4-warp matmul path (block=128)
+    # Dispatch identification (block=128 family):
+    #   - Q4_K 4-warp: grid=(outDim, 1, 1), block=128, one WG per output row
+    #   - Q6_K 4-row:  grid=(outDim/4, 1, 1), block=128, 4 rows per WG
+    # Gemma 4 E4B ffn_down is Q6_K (outDim=2560 → grid=640), all other
+    # per-layer matmuls are Q4_K (so grid == outDim).
     if bx == 128:
-        if gx == 65536:  return f"Q6_K lm_head ({phase})"
-        if gx == 10240:  return f"Q4_K matmul 10240 ({phase})"   # ffn_gate/up
-        if gx == 2560:   return f"Q4_K matmul 2560 ({phase})"    # wO/ffn_down
-        if gx == 2048:   return f"Q4_K matmul 2048 ({phase})"    # wQ
-        if gx == 640:    return f"Q4_K matmul 640 ({phase})"     # wK+wV fused
-        if gx == 512:    return f"Q4_K matmul 512 ({phase})"
-        if gx == 256:    return f"Q4_K matmul 256 ({phase})"     # PLE
-        if gx == 4096:   return f"Q4_K matmul 4096 ({phase})"
+        if gx == 65536:  return f"Q6_K lm_head ({phase})"            # vocab/4
+        if gx == 10240:  return f"Q4_K matmul 10240 ({phase})"       # ffn_gate/up  (Q4_K 4-warp)
+        if gx == 2560:   return f"Q4_K matmul 2560 ({phase})"        # wO           (Q4_K 4-warp)
+        if gx == 2048:   return f"Q4_K matmul 2048 ({phase})"        # wQ           (Q4_K 4-warp)
+        if gx == 640:    return f"Q6_K matmul ffn_down ({phase})"    # ffn_down 2560/4 (Q6_K 4-row)
+        if gx == 512:    return f"Q4_K matmul 512 ({phase})"         # wK or wV     (Q4_K 4-warp)
+        if gx == 256:    return f"Q4_K matmul 256 ({phase})"         # PLE          (Q4_K 4-warp)
+        if gx == 4096:   return f"Q4_K matmul 4096 ({phase})"        # perLayerProj (Q4_K 4-warp)
         if gx == 128:    return f"pointwise/residual ({phase})"
         return f"b=128 other gx={gx} ({phase})"
     # 1-warp matmul (prefill path), block=32
@@ -115,12 +119,13 @@ def classify_hs(grid: tuple[int, int, int, int] | None) -> str:
 
 # hesper class → llama.cpp class (for aggregation)
 def hs_to_lc_class(c: str) -> str:
-    if c.startswith("Q4_K matmul"):      return "Q4_K matmul"
+    if c.startswith("Q4_K matmul"):        return "Q4_K matmul"
     if c.startswith("Q4_K matmul 1-warp"): return "Q4_K matmul"
-    if c.startswith("Q6_K lm_head"):     return "Q6_K matmul"
-    if c.startswith("quantize_q8_1"):    return "quantize_q8_1"
+    if c.startswith("Q6_K lm_head"):       return "Q6_K matmul"
+    if c.startswith("Q6_K matmul"):        return "Q6_K matmul"  # ffn_down etc.
+    if c.startswith("quantize_q8_1"):      return "quantize_q8_1"
     if c.startswith("pointwise/residual"): return "binary bcast (add/mul)"
-    if c.startswith("RMSNorm/stub"):     return "RMSNorm"
+    if c.startswith("RMSNorm/stub"):       return "RMSNorm"
     return "(unmapped)"
 
 
