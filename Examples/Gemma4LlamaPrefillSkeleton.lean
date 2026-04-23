@@ -232,6 +232,7 @@ unsafe def main (args : List String) : IO Unit := do
         (tokenIdsBuf := some tokenIdsBuf) (startPos := startPos)
         (persistentCaches := some kvPairs)
         (scratchPool := some scratchPool)
+        (skipConstantWrites := step > 1)
 
     let stepEnd ← IO.monoNanosNow
     lastDisp ← Hesper.getDispatchCounter
