@@ -329,9 +329,24 @@ Each op close will append a line here:
         layer — and look them up via `cfg.kvSharedFromBase`).
   Memory: 24 × 64 MB × 2 = 3 GB at maxSeqLen=131072, feasible on the
   4070 Ti if we allocate only what we use (seqLen=5) and declare max.
-- [next] Fix shared-KV support for L24..L41 parity.
-- [next] `result_norm` + `result_output` (Q6_K lm_head) for end-to-end
-  token-level parity.
+- [2026-04-23] **L24..L41 FIXED via shared-KV support**.  Changes:
+  - Allocate per-own-KV-layer K/V cache arrays (24 pairs for E4B).
+  - For shared-KV layers (`!cfg.hasKV il`), skip wK/wV/k_norm/v_norm/
+    rope_K entirely; their KV is reused from the prior own-KV layer
+    via `cfg.kvCacheLayer il` lookup.
+  - FlashAttention reads the correct `kCaches[kvLi]` / `vCaches[kvLi]`.
+- [2026-04-23] **ALL 42 LAYERS PARITY ✓** on `"Hello world how are you"`:
+  ```
+  worst: L19 rel=2.79e-02 (other layers 0.5-2.0%).  Full table:
+  L 0-4:  8e-08 to 1.1e-02        L22-26: 9.9e-03 to 1.58e-02
+  L 5-9:  9.7e-03 to 1.4e-02      L27-31: 9.9e-03 to 1.4e-02
+  L10-13: 7.7e-03 to 1.05e-02     L32-36: 7.8e-03 to 1.3e-02
+  L14-18: 1.1e-02 to 2.8e-02      L37-40: 7.8e-03 to 8.6e-03
+  L19-21: 1.2e-02 to 2.8e-02      L41:    1.04e-02 (last-token slice)
+  ```
+  All layers rel ≤ 2.8 %, well within Q4_K quant-noise scale.
+- [next] `result_norm` + `result_output` (Q6_K lm_head) + softcap for
+  end-to-end token-level parity.
 - [next] Implement `Qcur_pos-0` (RoPE Q).  Input: `batchQBuf` (normed),
   output: dedicated `batchQRopedBuf`.  Weight: none (freq base + freq
   factors for full-attention layers).
