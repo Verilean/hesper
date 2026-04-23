@@ -127,3 +127,38 @@ behavior.  Issue #136 (Phase 3 Step 1) stays open.
    115 TPS it's ~5 % of budget.
 4. **Fuse `quantize_q8_1` into Q4_K matmul kernel** — the big kernel-time
    item; cuts ~126 graph nodes/token and likely halves GPU time.
+
+## Postscript — graph-capture attempt (2026-04-22 PM)
+
+Attempted (2) with `HESPER_LLAMA_GRAPHS=1` env gate.  Capture succeeds
+(step 2 produces logits matching the eager baseline), but first replay
+on step 3 aborts with `CUDA_ERROR_ILLEGAL_ADDRESS`.
+
+Root cause is identified and already documented in `Hesper/CUDA/FFI.lean`
+near `cuMemAllocHost`: hesper's `GPUBackend.writeBuffer` on the capture
+stream hands CUDA a pointer into a Lean-managed `ByteArray`.  The graph
+records that pointer.  Between capture and replay the `ByteArray` is
+GC'd → replay dereferences freed memory.
+
+The per-decode forward has 5 `writeBuffer` sites:
+
+| Buffer          | Varies across decodes? | Per-forward |
+|-----------------|-----------------------:|------------:|
+| `colIdxBuf`     | no (always = 0)        | always written |
+| `plColIdxBuf`   | no (always = 0)        | always written |
+| `onesBuf`       | no (all 1.0)           | always written |
+| `lastColIdxBuf` | no (seqLen-1 = 0)      | always written |
+| `paramsBuf`     | **yes** (startPos)     | always written (but handled via `paramsBufOverride` now) |
+| `tokenIdsBuf`   | **yes** (last-gen tok) | caller-side |
+
+Fix direction (not implemented this session):
+* For the 4 **constant** sites, init once at session start and skip
+  re-writes inside the forward.  Since ScratchPool returns the same
+  device pointer every call, contents persist across forwards.
+* For `paramsBuf` and `tokenIdsBuf`, route through `cuMemAllocHost` +
+  `cuMemcpyHtoDFromPinned` (helpers already in `Hesper/CUDA/FFI.lean`).
+
+Expected impact after fix: `cuLaunchKernel` overhead (~2 ms/forward at
+decode) drops to ~0, plus the 4-5 small cuMemcpyHtoD per decode go
+away entirely.  That's ~3 ms/forward recovered — ~1.7 % TPS lift at
+our current 5.65 TPS, scaling to ~25 % at the 115 TPS budget.
