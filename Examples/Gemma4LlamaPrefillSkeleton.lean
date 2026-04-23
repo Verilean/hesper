@@ -79,7 +79,7 @@ unsafe def main (args : List String) : IO Unit := do
 
   Hesper.resetDispatchCounter
   let startNs ← IO.monoNanosNow
-  forwardPrefillLlamaCpp ctx model seqLen state (tokenIdsBuf := tokenIdsBufOpt)
+  let logitsOpt ← forwardPrefillLlamaCpp ctx model seqLen state (tokenIdsBuf := tokenIdsBufOpt)
   let endNs ← IO.monoNanosNow
   let totalDisp ← Hesper.getDispatchCounter
   let wallMs := (endNs - startNs).toFloat / 1000000.0
@@ -98,3 +98,32 @@ unsafe def main (args : List String) : IO Unit := do
   match ← IO.getEnv "HESPER_GOLDEN_DUMP_DIR" with
   | some dir => IO.println s!"[Golden] Dumps written to {dir}/"
   | none => pure ()
+
+  -- Greedy sampling: argmax over logits + decode to a string.
+  match logitsOpt with
+  | some logitsBuf =>
+    let vocab := cfg.vocabSize
+    let bytes ← GPUBackend.readBuffer ctx logitsBuf (vocab * 4).toUSize
+    -- Simple host-side argmax.
+    let mut bestIdx : Nat := 0
+    let mut bestVal : Float := Float.ofNat 0
+    let mut first := true
+    for i in [0:vocab] do
+      let fb ← Hesper.Basic.bytesToFloat32 bytes (i * 4)
+      if first ∨ fb > bestVal then
+        bestVal := fb
+        bestIdx := i
+        first := false
+    IO.println ""
+    IO.println s!"[Greedy] Next token id: {bestIdx} (logit={bestVal})"
+    -- Decode that single token back to text.
+    let ggufData ← Hesper.CUDA.readFileFast ggufPath
+    let gguf ← match Hesper.GGUF.Parser.parseGGUF ggufData with
+      | .ok g => pure g
+      | .error e => throw (IO.userError s!"GGUF parse error: {e}")
+    let tokenizer ← Hesper.Tokenizer.SentencePiece.fromGGUF gguf
+    let decoded := Hesper.Tokenizer.SentencePiece.decode tokenizer #[bestIdx]
+    IO.println s!"[Greedy] Next token text: \"{decoded}\""
+    IO.println s!"[Greedy] Full greedy output: \"{prompt}\" → \"{prompt}{decoded}\""
+  | none =>
+    IO.println "[Greedy] No logits (dispatch-count mode); skipping next-token sampling."
