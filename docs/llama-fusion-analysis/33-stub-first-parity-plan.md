@@ -378,13 +378,37 @@ Each op close will append a line here:
     decode   seqLen=1   71ms  1492 dispatches/token
     tokens/sec: 4.6 (was 2.3 with O(N²) re-prefill)
   Same tokens generated as the O(N²) path → no correctness regression.
-- [next] Decode-path dispatch reduction.  Current 1492 dispatches/tok
-  is still prefill-shaped (PLE prelude runs 7 dispatches for the 1
-  new token, then 42 layers × ~35 ops).  Real decode in llama.cpp
-  lands at ~113 kernels with graph replay or ~900 without.  Stub's
-  loop-faithful count at seqLen=1 should trend to ~50-60 ops/layer
-  × 42 = ~2100 if nothing is de-duplicated; deeper optimisation is
-  separate work.
+- [2026-04-23] **Batched PLE prelude ✓**.  Added stubBatchScaleKernel,
+  stubChunkedRMSNormBatchKernel, stubScaledAddBatchKernel.  Rewrote
+  PLE prelude: per-token Q6_K dequants (dequantQ6KElement is private,
+  so can't batch that) → ONE batched F16 matmul (M=seqLen, N=totalPL,
+  K=hidden) → ONE batched scale → ONE batched chunked-rmsnorm (grid
+  [nLayers, seqLen, 1]) → ONE batched scaled-add.  Parity preserved:
+  worst L19=2.79e-02, result_output=1.10e-02, argmax 236881.
+
+### TPS snapshot (Gemma 4 E4B Q4_K_M, "Hello world how are you", 5 tokens)
+
+| config                              | tg5 TPS |
+|-------------------------------------|---------|
+| **llama.cpp, CUDA Graphs ON**       | **112.30** |
+| llama.cpp, graphs OFF               | 107.50  |
+| hesper stub, persistent-KV, batched-PLE | **5.5** |
+| hesper stub, persistent-KV          | 4.6     |
+| hesper stub, O(N²) re-prefill       | 2.3     |
+
+Stub is ~20× slower than llama.cpp.  Sources of slowness:
+  1. Loop-faithful structure (~1491 dispatches/decode vs 1 graph replay)
+  2. Lean ↔ C++ FFI overhead per dispatch
+  3. Per-call kernel launch setup (no graph capture)
+
+The parity path is **structurally** faithful to llama.cpp but not
+yet performance-faithful.  Closing the gap requires graph-replay
+capture (separate concern) or per-kernel GPU-time optimisation.
+
+- [next] TPS improvement paths: (a) CUDA Graph capture of the
+  per-token forward, (b) reduce kernel launch count for decode
+  (seqLen=1 variants of batched kernels), (c) graph-replay across
+  decode steps.
 - [next] Implement `Qcur_pos-0` (RoPE Q).  Input: `batchQBuf` (normed),
   output: dedicated `batchQRopedBuf`.  Weight: none (freq base + freq
   factors for full-attention layers).
