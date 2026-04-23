@@ -190,7 +190,15 @@ private def dispatchBuildFfn
     `scratchPool`, when provided, is used for all per-forward transient
     buffers (batch activations, PLE scratches, etc.) — the pool's slots
     are reused across calls, eliminating per-forward cuMemAlloc churn.
-    If `none`, each call allocates fresh buffers via `allocBuffer`. -/
+    If `none`, each call allocates fresh buffers via `allocBuffer`.
+
+    `paramsBufOverride`, when provided, is used as the paramsBuf (the 4-byte
+    u32 holding `startPos` for RoPE / KV-cache kernels).  Callers that want
+    to capture this forward into a CUDA graph pass a persistent buffer so
+    the graph's kernel args reference a stable device pointer; the caller
+    is responsible for writing the current startPos into it before each
+    replay.  When the override is provided, this function does NOT write
+    to it — the caller owns the update schedule. -/
 def forwardPrefillLlamaCpp [GPUBackend β] (ctx : β)
     (model : Gemma4Model (GPUBackend.Buf β) (GPUBackend.CachedDispatch β))
     (seqLen : Nat)
@@ -199,6 +207,7 @@ def forwardPrefillLlamaCpp [GPUBackend β] (ctx : β)
     (startPos : Nat := 0)
     (persistentCaches : Option (Array (GPUBackend.Buf β × GPUBackend.Buf β)) := none)
     (scratchPool : Option (ScratchPool β) := none)
+    (paramsBufOverride : Option (GPUBackend.Buf β) := none)
     : IO (Option (GPUBackend.Buf β)) := do
   let cfg := model.config
   let numLayers := cfg.numHiddenLayers
@@ -457,9 +466,17 @@ def forwardPrefillLlamaCpp [GPUBackend β] (ctx : β)
   let kCacheBuf ← if h : 0 < kCaches.size then pure kCaches[0] else mkBuf cacheSize
   let vCacheBuf ← if h : 0 < vCaches.size then pure vCaches[0] else mkBuf cacheSize
   -- Params buffer: holds `startPos` (u32) for RoPE / KV cache indexing.
-  let paramsBuf ← mkBuf 1
-  GPUBackend.writeBuffer ctx paramsBuf
-    (Hesper.WebGPU.BufferOps.uint32ToBytes startPos.toUInt32)
+  -- When `paramsBufOverride` is provided (graph-capture path), use it and
+  -- skip the write — caller owns the pre-launch update.  Otherwise alloc
+  -- from the pool and write startPos ourselves.
+  let paramsBuf ← match paramsBufOverride with
+    | some b => pure b
+    | none   => mkBuf 1
+  match paramsBufOverride with
+  | some _ => pure ()
+  | none =>
+    GPUBackend.writeBuffer ctx paramsBuf
+      (Hesper.WebGPU.BufferOps.uint32ToBytes startPos.toUInt32)
   -- Ones buffer: `headDim/2` f32 elements all set to 1.0, used as
   -- `freq_factors` for SWA layers (which llama.cpp calls with nullptr =
   -- equivalent to 1.0 everywhere).  Pattern copied from production.
