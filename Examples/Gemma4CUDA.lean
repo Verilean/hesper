@@ -17,6 +17,11 @@ Usage:
 open Hesper
 open Hesper.Models.Gemma4
 
+-- Raised from the default 200K because `GPUBackend CUDAContext`'s
+-- instance body has grown large enough that `main` elaboration busts
+-- the budget when the typeclass is resolved across the forward path.
+set_option maxHeartbeats 800000
+
 unsafe def main (args : List String) : IO Unit := do
   let ggufPath := args.getD 0 "data/gemma-4-e4b-it-Q4_K_M.gguf"
   let prompt := args.getD 1 "Hello"
@@ -81,11 +86,9 @@ unsafe def main (args : List String) : IO Unit := do
   | some _ =>
     IO.println "[Config] HESPER_L2_PIN set — will install access window after model load"
 
-  -- Load model on CUDA (fast file read via mmap)
-  IO.println "[Load] Reading GGUF file..."
-  let ggufData ← Hesper.CUDA.readFileFast ggufPath
-  IO.println s!"[Load] Read {ggufData.size} bytes, loading model..."
-  let model ← Gemma4Model.fromGGUFData ctx ggufData
+  -- Load model on CUDA.  Uses mmap path when HESPER_USE_MMAP=1,
+  -- else reads the whole file into a Lean ByteArray.
+  let model ← Gemma4Model.fromGGUF ctx ggufPath
 
   -- Install an L2 access window on the default stream if requested.  We pin
   -- the requested layer's ffn.gate weight buffer; its (ptr, size) defines
@@ -105,11 +108,11 @@ unsafe def main (args : List String) : IO Unit := do
       IO.println s!"[Config] L2 pin: layer {idx} out of range (have {model.blocks.size} layers)"
   | none => pure ()
 
-  -- Load tokenizer (reuse already-read ggufData)
+  -- Load tokenizer.  Parses GGUF metadata only (small prefix); this
+  -- re-reads the header portion which is fine — the tensor bodies
+  -- have already been mmapped or copied by `fromGGUF`.
   IO.println "[Tokenize] Loading tokenizer..."
-  let gguf ← match Hesper.GGUF.Parser.parseGGUF ggufData with
-    | .ok g => pure g
-    | .error e => throw (IO.userError s!"GGUF parse error: {e}")
+  let gguf ← Hesper.GGUF.loadGGUF ggufPath
   let tokenizer ← Hesper.Tokenizer.SentencePiece.fromGGUF gguf
 
   -- HESPER_CHAT=1: wrap the user prompt in the Gemma 4 E4B chat template

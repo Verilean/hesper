@@ -514,7 +514,7 @@ def forwardPrefillLlamaCpp [GPUBackend β] (ctx : β)
       if h : il < model.blocks.size then
         let block := model.blocks[il]
         Hesper.Layers.RMSNorm.forward ctx block.attnNorm layerInputBuf batchNormedBuf
-          seqLen 256 (refOverride := some (← IO.mkRef none))
+          seqLen 1024 (refOverride := some (← IO.mkRef none))
         dumpGolden s!"attn_norm-{il}" batchNormedBuf totalHidden
       else
         dispatchRmsNorm ctx buf1 buf2 hidden
@@ -692,7 +692,7 @@ def forwardPrefillLlamaCpp [GPUBackend β] (ctx : β)
       if h : il < model.blocks.size then
         let block := model.blocks[il]
         Hesper.Layers.RMSNorm.forward ctx block.postAttnNorm
-          batchOProjBuf batchAttnPostNormBuf seqLen 256
+          batchOProjBuf batchAttnPostNormBuf seqLen 1024
           (refOverride := some (← IO.mkRef none))
       else
         dispatchRmsNorm ctx attnOutBuf buf1 hidden
@@ -716,7 +716,7 @@ def forwardPrefillLlamaCpp [GPUBackend β] (ctx : β)
       if h : il < model.blocks.size then
         let block := model.blocks[il]
         Hesper.Layers.RMSNorm.forward ctx block.ffnNorm
-          batchAttnResidBuf batchFfnNormBuf seqLen 256
+          batchAttnResidBuf batchFfnNormBuf seqLen 1024
           (refOverride := some (← IO.mkRef none))
         dumpGolden s!"ffn_norm-{il}" batchFfnNormBuf totalHidden
       else
@@ -758,7 +758,7 @@ def forwardPrefillLlamaCpp [GPUBackend β] (ctx : β)
       if h : il < model.blocks.size then
         let block := model.blocks[il]
         Hesper.Layers.RMSNorm.forward ctx block.postFFNNorm
-          batchFfnOutBuf batchFfnPostNormBuf seqLen 256
+          batchFfnOutBuf batchFfnPostNormBuf seqLen 1024
           (refOverride := some (← IO.mkRef none))
         dumpGolden s!"ffn_post_norm-{il}" batchFfnPostNormBuf totalHidden
       else
@@ -814,7 +814,7 @@ def forwardPrefillLlamaCpp [GPUBackend β] (ctx : β)
             batchPleMulBuf batchPleProjBuf seqLen
           -- (f) per_layer_post_norm (RMSNorm across hidden)
           Hesper.Layers.RMSNorm.forward ctx pleBlock.postNorm
-            batchPleProjBuf batchPleNormBuf seqLen 256
+            batchPleProjBuf batchPleNormBuf seqLen 1024
             (refOverride := some (← IO.mkRef none))
           dumpGolden s!"per_layer_embd_out-{il}" batchPleNormBuf totalHidden
           -- (g) residual: pe_in + pleNorm → batchLOutBuf (scratch before
@@ -905,7 +905,7 @@ def forwardPrefillLlamaCpp [GPUBackend β] (ctx : β)
     -- build_norm(cur, output_norm) [RMSNorm on single-token]
     let resultNormBuf ← mkBuf hidden
     Hesper.Layers.RMSNorm.forward ctx model.finalNorm
-      lastTokenBuf resultNormBuf 1 256
+      lastTokenBuf resultNormBuf 1 1024
       (refOverride := some (← IO.mkRef none))
     dumpGolden "result_norm" resultNormBuf hidden
 

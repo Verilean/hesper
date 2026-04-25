@@ -35,6 +35,12 @@ inductive WGSLType where
   | mat4x4 : ScalarType → WGSLType
   | array : WGSLType → Nat → WGSLType
   | runtimeArray : WGSLType → WGSLType  -- Runtime-sized array (no size specified)
+  /-- Array of N separate runtime-sized storage buffers, indexed at runtime by
+      layer index.  Used for cross-layer kernel fusion: e.g. 42 layers of Q4_K
+      weights accessed by the same kernel via `readBufferArray name layer elem`.
+      On CUDA lowers to a pointer-table constant in global memory; on WGSL
+      lowers to a `binding_array<...>` (binding_array extension). -/
+  | bufferArray : WGSLType → Nat → WGSLType  -- element type per buffer, count
   | ptr : MemorySpace → WGSLType → WGSLType
   | struct : String → WGSLType  -- Reference to a struct by name
   -- Subgroup matrix types (chromium_experimental_subgroup_matrix extension)
@@ -113,6 +119,7 @@ def WGSLType.toWGSL : WGSLType → String
   | .mat4x4 st => s!"mat4x4<{st.toWGSL}>"
   | .array elemTy n => s!"array<{elemTy.toWGSL}, {n}>"
   | .runtimeArray elemTy => s!"array<{elemTy.toWGSL}>"  -- Runtime-sized array (no size)
+  | .bufferArray elemTy n => s!"binding_array<array<{elemTy.toWGSL}>, {n}>"
   | .ptr space ty => s!"ptr<{space.toWGSL}, {ty.toWGSL}>"
   | .struct name => name  -- Just the struct name
   | .subgroupMatrixLeft st m k => s!"subgroup_matrix_left<{st.toWGSL}, {m}, {k}>"
@@ -142,6 +149,7 @@ def WGSLType.byteSize : WGSLType → Nat
   | .mat4x4 st => 16 * st.byteSize
   | .array elemTy n => n * elemTy.byteSize
   | .runtimeArray _ => 0  -- Size determined at runtime by buffer size
+  | .bufferArray _ _ => 0  -- Opaque: N separate buffer bindings; no inline size
   | .ptr _ _ => 8  -- Pointers are conceptual, but 8 for compatibility
   | .struct _ => 0  -- Size depends on actual struct definition (to be calculated)
   | .subgroupMatrixLeft st m k => m * k * st.byteSize  -- Approximate
@@ -174,6 +182,7 @@ def WGSLType.alignment (rule : LayoutRule) : WGSLType → Nat
   | .mat4x4 _ => 16
   | .array elemTy _ => elemTy.alignment rule
   | .runtimeArray elemTy => elemTy.alignment rule  -- Same alignment as fixed array
+  | .bufferArray elemTy _ => elemTy.alignment rule
   | .ptr _ _ => 8
   | .struct _ => 16  -- Structs align to 16 bytes (max alignment of members)
   | .subgroupMatrixLeft _ _ _ => 16  -- Subgroup matrices are opaque, assume 16-byte alignment

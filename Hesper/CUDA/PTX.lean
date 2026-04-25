@@ -161,6 +161,10 @@ inductive Inst where
   | cos_f32     (dst src : RegF32)
   | tanh_f32    (dst src : RegF32)
   | rcp_f32     (dst src : RegF32)
+  /-- Reciprocal square root (1/sqrt(x)) — single PTX HW instruction,
+      much faster than `sqrt.rn` + `rcp.approx`.  Used for RMSNorm
+      scale computation (llama.cpp emits the same). -/
+  | rsqrt_f32   (dst src : RegF32)
   | floor_f32   (dst src : RegF32)
   | ceil_f32    (dst src : RegF32)
   | selp_f32    (dst ifTrue ifFalse : RegF32) (pred : RegPred)
@@ -183,6 +187,11 @@ inductive Inst where
   | or_u32      (dst src1 src2 : RegU32)
   | xor_u32     (dst src1 src2 : RegU32)
   | not_u32     (dst src : RegU32)
+  /-- Bit field extract (unsigned): `bfe.u32 dst, src, startBit, numBits`.
+      Equivalent to `(src >> startBit) & ((1 << numBits) - 1)` but as a
+      single hardware instruction (1-cycle on sm_8x vs 2-3 cycles for
+      shr+and).  `startBit` and `numBits` may be literals up to 32. -/
+  | bfe_u32     (dst src : RegU32) (startBit numBits : Nat)
 
   -- ── bitcast (f32 ↔ u32 reinterpret, same 32-bit register file) ──
   | mov_b32_f32_to_u32 (dst : RegU32) (src : RegF32)
@@ -229,6 +238,13 @@ inductive Inst where
   | st_f32        (space : AddrSpace) (addr : RegU64) (val : RegF32)
   | ld_u32        (space : AddrSpace) (dst : RegU32) (addr : RegU64) (nc : Bool := false)
   | st_u32        (space : AddrSpace) (addr : RegU64) (val : RegU32)
+  -- 8-bit and 16-bit loads — zero-extend into a 32-bit dest register (PTX
+  -- `ld.*.u8` / `ld.*.u16` with a `.reg .u32` dst is syntactically legal
+  -- and the upper bits are zeroed).  Used for packed Q6_K scale/fp16 reads.
+  | ld_u8         (space : AddrSpace) (dst : RegU32) (addr : RegU64) (nc : Bool := false)
+  | ld_u16        (space : AddrSpace) (dst : RegU32) (addr : RegU64) (nc : Bool := false)
+  -- 64-bit load (used for pointer-table indirection in bufferArray).
+  | ld_u64        (space : AddrSpace) (dst : RegU64) (addr : RegU64) (nc : Bool := false)
   -- shared memory via symbol: mov.u32 %r, sym; add.u32 %r, %r, off; ld/st
   | ld_shared_sym (dst : RegF32) (symAddr : RegU32) (offset : RegU32) (addr : RegU32)
   | st_shared_sym (val : RegF32) (symAddr : RegU32) (offset : RegU32) (addr : RegU32)
@@ -276,6 +292,7 @@ def Inst.toString : Inst → String
   | .cos_f32 d s         => s!"  cos.approx.f32 {d}, {s};"
   | .tanh_f32 d s        => s!"  tanh.approx.f32 {d}, {s};"
   | .rcp_f32 d s         => s!"  rcp.approx.f32 {d}, {s};"
+  | .rsqrt_f32 d s       => s!"  rsqrt.approx.f32 {d}, {s};"
   | .floor_f32 d s       => s!"  cvt.rmi.f32.f32 {d}, {s};"
   | .ceil_f32 d s        => s!"  cvt.rpi.f32.f32 {d}, {s};"
   | .selp_f32 d t f p    => s!"  selp.f32 {d}, {t}, {f}, {p};"
@@ -296,13 +313,21 @@ def Inst.toString : Inst → String
   | .or_u32 d a b        => s!"  or.b32 {d}, {a}, {b};"
   | .xor_u32 d a b       => s!"  xor.b32 {d}, {a}, {b};"
   | .not_u32 d s         => s!"  not.b32 {d}, {s};"
+  | .bfe_u32 d s start n => s!"  bfe.u32 {d}, {s}, {start}, {n};"
   | .dp4a_s32 d a b c    => s!"  dp4a.s32.s32 {d}, {a}, {b}, {c};"
   | .dp4a_u32 d a b c    => s!"  dp4a.u32.u32 {d}, {a}, {b}, {c};"
   | .mov_b32_f32_to_u32 d s => s!"  mov.b32 {d}, {s};"
   | .mov_b32_u32_to_f32 d s => s!"  mov.b32 {d}, {s};"
   | .mov_u64 d s         => s!"  mov.u64 {d}, {s};"
   | .add_u64 d a b       => s!"  add.u64 {d}, {a}, {b};"
-  | .mul_wide_u32 d s n  => s!"  mul.wide.u32 {d}, {s}, {n};"
+  | .mul_wide_u32 d s n  =>
+    -- Peephole: mul.wide.u32 with multiplier 1 is just a zero-extend.
+    -- Emit `cvt.u64.u32` instead of `mul.wide.u32 d, s, 1;` — same
+    -- semantics, but ptxas recognises cvt as a no-op register alias
+    -- while it schedules the multiplier even when the value is 1.
+    -- Appears dozens of times in Q6_K byte-load address computation.
+    if n == 1 then s!"  cvt.u64.u32 {d}, {s};"
+    else s!"  mul.wide.u32 {d}, {s}, {n};"
   -- Use signed conversion so negative i32 (from dp4a.s32) round-trips correctly.
   -- cvt.rn.f32.s32 produces the same result as .u32 variant for positive inputs.
   | .cvt_f32_u32 d s     => s!"  cvt.rn.f32.s32 {d}, {s};"
@@ -324,6 +349,15 @@ def Inst.toString : Inst → String
     let ncStr := if nc && sp matches .global then ".nc" else ""
     s!"  ld.{spStr sp}{ncStr}.u32 {d}, [{a}];"
   | .st_u32 sp a v       => s!"  st.{spStr sp}.u32 [{a}], {v};"
+  | .ld_u8 sp d a nc     =>
+    let ncStr := if nc && sp matches .global then ".nc" else ""
+    s!"  ld.{spStr sp}{ncStr}.u8 {d}, [{a}];"
+  | .ld_u16 sp d a nc    =>
+    let ncStr := if nc && sp matches .global then ".nc" else ""
+    s!"  ld.{spStr sp}{ncStr}.u16 {d}, [{a}];"
+  | .ld_u64 sp d a nc    =>
+    let ncStr := if nc && sp matches .global then ".nc" else ""
+    s!"  ld.{spStr sp}{ncStr}.u64 {d}, [{a}];"
   | .ld_shared_sym d _sa _off addr => s!"  ld.shared.f32 {d}, [{addr}];"
   | .st_shared_sym v _sa _off addr => s!"  st.shared.f32 [{addr}], {v};"
   | .ld_shared_sym_u32 d _sa _off addr => s!"  ld.shared.u32 {d}, [{addr}];"
@@ -410,6 +444,10 @@ structure GenState where
       (conservative — sreg values don't actually change, but this keeps the
       optimisation local to straight-line code for safety). -/
   sregCache : List (SReg × RegU32) := []
+  /-- CSE cache for u32 immediate loads (`mov.u32 %rN, N`).  Same literal
+      used many times in one basic block reuses the same register instead of
+      re-issuing `mov.u32` for each reference.  Cleared at barriers/labels. -/
+  immCache : List (Nat × RegU32) := []
   deriving Inhabited
 
 namespace GenState
@@ -468,7 +506,21 @@ def readSReg (s : GenState) (sreg : SReg) : RegU32 × GenState :=
 /-- Invalidate the sreg cache at control-flow boundaries.
     Called when emitting a label/branch target so cached registers (which may
     have been SSA-defined before the branch) are re-materialised afterwards. -/
-def clearSregCache (s : GenState) : GenState := { s with sregCache := [] }
+def clearSregCache (s : GenState) : GenState :=
+  { s with sregCache := [], immCache := [] }
+
+/-- CSE entry point for loading a u32 immediate.  Reuses the same register
+    if the same literal has already been materialised in this basic block;
+    emits `mov.u32 %r, N` only on first use.  Slashes mov.u32 count in
+    kernels that reference the same small constants many times (e.g.
+    Q4_K's `0x0F0F0F0F`, `0x01010101`, `4`, `8`, `9`, `36`, block sizes). -/
+def readImmU32 (s : GenState) (imm : Nat) : RegU32 × GenState :=
+  match s.immCache.find? (·.1 == imm) with
+  | some (_, r) => (r, s)
+  | none =>
+    let (r, s) := s.freshU32
+    let s := s.emit (.mov_u32_imm r imm)
+    (r, { s with immCache := (imm, r) :: s.immCache })
 
 end GenState
 

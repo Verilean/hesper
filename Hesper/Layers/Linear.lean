@@ -2725,12 +2725,18 @@ def fusedQ6KLinearDP4AKernel (inDim outDim : Nat) (gridX : Nat := 0) : ShaderM U
   let rowByteBase : Exp (.scalar .u32) := Exp.var "rowByteBase"
 
   -- Byte-read helper (Q6_K block is 210 bytes, not a multiple of 4).
+  -- Native u8 load — one `ld.global.nc.u8` on CUDA (vs 1 u32 load + shift +
+  -- mask previously).  See docs/llama-fusion-analysis/41.md for the PTX
+  -- diff that motivated this primitive.
   let readByte (blockBase : Exp (.scalar .u32)) (offset : Exp (.scalar .u32)) : ShaderM (Exp (.scalar .u32)) := do
     let byteIdx := Exp.add blockBase offset
-    let u32Idx := Exp.shiftRight byteIdx (Exp.litU32 2)
-    let byteShift := Exp.mul (Exp.bitAnd byteIdx (Exp.litU32 3)) (Exp.litU32 8)
-    let u32 ← ShaderM.readBuffer (ty := .scalar .u32) (n := totalWeightU32) "weights" u32Idx
-    pure (Exp.bitAnd (Exp.shiftRight u32 byteShift) (Exp.litU32 0xFF))
+    ShaderM.readBufferByte (n := totalWeightU32) "weights" byteIdx
+
+  -- Native u16 load — one `ld.global.nc.u16` on CUDA.  Used to read the
+  -- 2-byte fp16 block scale `d` in a single instruction.
+  let readU16 (blockBase : Exp (.scalar .u32)) (offset : Exp (.scalar .u32)) : ShaderM (Exp (.scalar .u32)) := do
+    let byteIdx := Exp.add blockBase offset
+    ShaderM.readBufferU16 (n := totalWeightU32) "weights" byteIdx
 
   -- Read 4 consecutive bytes starting at `base + offset` and pack into one u32
   -- (little-endian: byte[base+offset] in lowest 8 bits).
@@ -2749,9 +2755,15 @@ def fusedQ6KLinearDP4AKernel (inDim outDim : Nat) (gridX : Nat := 0) : ShaderM U
   -- When byteOff == 0 the load is aligned and hi must be zero; the `select`
   -- guards against an undefined shl-by-32.
   let read4Bytes (blockBase : Exp (.scalar .u32)) (offset : Exp (.scalar .u32)) : ShaderM (Exp (.scalar .u32)) := do
-    let byteIdx := Exp.add blockBase offset
-    let u32Idx := Exp.shiftRight byteIdx (Exp.litU32 2)
-    let byteOff := Exp.bitAnd byteIdx (Exp.litU32 3)
+    -- Bind byteIdx / u32Idx / byteOff so they materialise once in PTX.
+    -- Without these, each downstream use re-emits the `blockBase+offset`
+    -- chain (6× add.u32 + 6× shl.b32 per read4Bytes call in earlier PTX).
+    let byteIdxName ← ShaderM.var (.scalar .u32) (Exp.add blockBase offset)
+    let byteIdx : Exp (.scalar .u32) := Exp.var byteIdxName
+    let u32IdxName ← ShaderM.var (.scalar .u32) (Exp.shiftRight byteIdx (Exp.litU32 2))
+    let u32Idx : Exp (.scalar .u32) := Exp.var u32IdxName
+    let byteOffName ← ShaderM.var (.scalar .u32) (Exp.bitAnd byteIdx (Exp.litU32 3))
+    let byteOff : Exp (.scalar .u32) := Exp.var byteOffName
     let shiftLo := Exp.mul byteOff (Exp.litU32 8)
     let shiftHi := Exp.mul (Exp.sub (Exp.litU32 4) byteOff) (Exp.litU32 8)
     let w0 ← ShaderM.readBuffer (ty := .scalar .u32) (n := totalWeightU32) "weights" u32Idx
@@ -2787,18 +2799,29 @@ def fusedQ6KLinearDP4AKernel (inDim outDim : Nat) (gridX : Nat := 0) : ShaderM U
     let blockByteBase := Exp.add rowByteBase (Exp.mul blockIdx (Exp.litU32 blockSizeBytes))
 
     -- Read d (fp16 at byte offset 208)
-    let dLo ← readByte blockByteBase (Exp.litU32 208)
-    let dHi ← readByte blockByteBase (Exp.litU32 209)
-    let dBits := Exp.bitOr dLo (Exp.shiftLeft dHi (Exp.litU32 8))
-    let d := fp16ToF32 dBits
+    -- Single ld.global.nc.u16 for the fp16 block scale, converted to f32
+    -- via `cvt.f32.f16` (hardware instruction, 1 op) instead of the
+    -- `fp16ToF32` arithmetic soft-impl which PTX-expands to 15+ ops
+    -- (selp/div/ex2/sub for sign/mantissa/exponent).  We reinterpret the
+    -- u16 as the low half of a packed half2 and extract the low f16 — the
+    -- codegen path for `vecX (unpack2x16float _)` lowers to exactly
+    -- `mov.b32 {lo,hi}, r; cvt.f32.f16 f, lo`.
+    let dBitsName ← ShaderM.var (.scalar .u32) (← readU16 blockByteBase (Exp.litU32 208))
+    let dBits : Exp (.scalar .u32) := Exp.var dBitsName
+    let d := Exp.vecX (Exp.unpack2x16float dBits)
 
-    -- Read vl (4 bytes of ql at byte offset 4*iqs)
+    -- Read vl (4 bytes of ql at byte offset 4*iqs).  Bind so the 2 u32
+    -- reads inside read4Bytes happen once — vl is referenced twice below
+    -- (vil_0 via `vl & 0x0F…`, vil_1 via `(vl >> 4) & 0x0F…`).
     let vlOffset := Exp.mul iqs (Exp.litU32 4)
-    let vl ← read4Bytes blockByteBase vlOffset
-    -- Read vh_raw (4 bytes of qh at byte offset 128 + 4*vhIdx), shift right by vh_shift
+    let vlName ← ShaderM.var (.scalar .u32) (← read4Bytes blockByteBase vlOffset)
+    let vl : Exp (.scalar .u32) := Exp.var vlName
+    -- Read vh_raw (4 bytes of qh at byte offset 128 + 4*vhIdx), shift right by vh_shift.
+    -- Bind `vh` (not just vhRaw) since `vh` is referenced in vih_0 and vih_1.
     let vhOffset := Exp.add (Exp.litU32 128) (Exp.mul vhIdx (Exp.litU32 4))
     let vhRaw ← read4Bytes blockByteBase vhOffset
-    let vh := Exp.shiftRight vhRaw vhShift
+    let vhName ← ShaderM.var (.scalar .u32) (Exp.shiftRight vhRaw vhShift)
+    let vh : Exp (.scalar .u32) := Exp.var vhName
 
     -- Read 2 scales: scales[scale_offset], scales[scale_offset + 4]
     -- (scales start at byte 192, each is 1 signed byte).
@@ -2808,8 +2831,16 @@ def fusedQ6KLinearDP4AKernel (inDim outDim : Nat) (gridX : Nat := 0) : ShaderM U
     -- iter instead of 2 (the old `d8 * (f32(dot) * f32(sc))` required two
     -- f32 conversions and two FFMAs).  SASS confirms: llama has 3 FFMA
     -- vs hesper's 24 in the old version.
-    let sc0Byte ← readByte blockByteBase (Exp.add (Exp.litU32 192) scaleOff)
-    let sc1Byte ← readByte blockByteBase (Exp.add (Exp.litU32 192) (Exp.add scaleOff (Exp.litU32 4)))
+    -- Bind each scale byte so it's loaded exactly once — signExtI8 below
+    -- references `b` three times, and without the bind the readByte call
+    -- inlines to 3× ld.global.u8 per scale (6 total per iter) even though
+    -- the HW would cache them.  Makes PTX match llama.cpp's 2 ld.u8/iter.
+    let sc0ByteName ← ShaderM.var (.scalar .u32)
+      (← readByte blockByteBase (Exp.add (Exp.litU32 192) scaleOff))
+    let sc1ByteName ← ShaderM.var (.scalar .u32)
+      (← readByte blockByteBase (Exp.add (Exp.litU32 192) (Exp.add scaleOff (Exp.litU32 4))))
+    let sc0Byte : Exp (.scalar .u32) := Exp.var sc0ByteName
+    let sc1Byte : Exp (.scalar .u32) := Exp.var sc1ByteName
     -- Sign-extend i8 → i32 via "or 0xFFFFFF00 when byte ≥ 128" trick; bit
     -- pattern is identical to two's-complement signed extension, so reinterpret
     -- the u32 as i32 afterwards for the signed multiply with dot_0 (i32).
@@ -2941,17 +2972,29 @@ def fusedQ6KLinearDP4A2RowKernel (inDim outDim : Nat) (gridX : Nat := 0) : Shade
     (Exp.mul outIdx (Exp.litU32 (blocksPerRow * blockSizeBytes)))
   let rowByteBase : Exp (.scalar .u32) := Exp.var "rowByteBase"
 
+  -- Native u8 load — one `ld.global.nc.u8` on CUDA (vs 1 u32 load + shift +
+  -- mask previously).  See docs/llama-fusion-analysis/41.md for the PTX
+  -- diff that motivated this primitive.
   let readByte (blockBase : Exp (.scalar .u32)) (offset : Exp (.scalar .u32)) : ShaderM (Exp (.scalar .u32)) := do
     let byteIdx := Exp.add blockBase offset
-    let u32Idx := Exp.shiftRight byteIdx (Exp.litU32 2)
-    let byteShift := Exp.mul (Exp.bitAnd byteIdx (Exp.litU32 3)) (Exp.litU32 8)
-    let u32 ← ShaderM.readBuffer (ty := .scalar .u32) (n := totalWeightU32) "weights" u32Idx
-    pure (Exp.bitAnd (Exp.shiftRight u32 byteShift) (Exp.litU32 0xFF))
+    ShaderM.readBufferByte (n := totalWeightU32) "weights" byteIdx
+
+  -- Native u16 load — one `ld.global.nc.u16` on CUDA.  Used to read the
+  -- 2-byte fp16 block scale `d` in a single instruction.
+  let readU16 (blockBase : Exp (.scalar .u32)) (offset : Exp (.scalar .u32)) : ShaderM (Exp (.scalar .u32)) := do
+    let byteIdx := Exp.add blockBase offset
+    ShaderM.readBufferU16 (n := totalWeightU32) "weights" byteIdx
 
   let read4Bytes (blockBase : Exp (.scalar .u32)) (offset : Exp (.scalar .u32)) : ShaderM (Exp (.scalar .u32)) := do
-    let byteIdx := Exp.add blockBase offset
-    let u32Idx := Exp.shiftRight byteIdx (Exp.litU32 2)
-    let byteOff := Exp.bitAnd byteIdx (Exp.litU32 3)
+    -- Bind byteIdx / u32Idx / byteOff so they materialise once in PTX.
+    -- Without these, each downstream use re-emits the `blockBase+offset`
+    -- chain (6× add.u32 + 6× shl.b32 per read4Bytes call in earlier PTX).
+    let byteIdxName ← ShaderM.var (.scalar .u32) (Exp.add blockBase offset)
+    let byteIdx : Exp (.scalar .u32) := Exp.var byteIdxName
+    let u32IdxName ← ShaderM.var (.scalar .u32) (Exp.shiftRight byteIdx (Exp.litU32 2))
+    let u32Idx : Exp (.scalar .u32) := Exp.var u32IdxName
+    let byteOffName ← ShaderM.var (.scalar .u32) (Exp.bitAnd byteIdx (Exp.litU32 3))
+    let byteOff : Exp (.scalar .u32) := Exp.var byteOffName
     let shiftLo := Exp.mul byteOff (Exp.litU32 8)
     let shiftHi := Exp.mul (Exp.sub (Exp.litU32 4) byteOff) (Exp.litU32 8)
     let w0 ← ShaderM.readBuffer (ty := .scalar .u32) (n := totalWeightU32) "weights" u32Idx
@@ -2975,10 +3018,16 @@ def fusedQ6KLinearDP4A2RowKernel (inDim outDim : Nat) (gridX : Nat := 0) : Shade
       (Exp.add rowByteBase (Exp.mul blockIdx (Exp.litU32 blockSizeBytes)))
     let blockByteBase : Exp (.scalar .u32) := Exp.var blockByteBaseName
 
-    let dLo ← readByte blockByteBase (Exp.litU32 208)
-    let dHi ← readByte blockByteBase (Exp.litU32 209)
-    let dBits := Exp.bitOr dLo (Exp.shiftLeft dHi (Exp.litU32 8))
-    let d := fp16ToF32 dBits
+    -- Single ld.global.nc.u16 for the fp16 block scale, converted to f32
+    -- via `cvt.f32.f16` (hardware instruction, 1 op) instead of the
+    -- `fp16ToF32` arithmetic soft-impl which PTX-expands to 15+ ops
+    -- (selp/div/ex2/sub for sign/mantissa/exponent).  We reinterpret the
+    -- u16 as the low half of a packed half2 and extract the low f16 — the
+    -- codegen path for `vecX (unpack2x16float _)` lowers to exactly
+    -- `mov.b32 {lo,hi}, r; cvt.f32.f16 f, lo`.
+    let dBitsName ← ShaderM.var (.scalar .u32) (← readU16 blockByteBase (Exp.litU32 208))
+    let dBits : Exp (.scalar .u32) := Exp.var dBitsName
+    let d := Exp.vecX (Exp.unpack2x16float dBits)
 
     let vlOffset := Exp.mul iqs (Exp.litU32 4)
     let vl ← read4Bytes blockByteBase vlOffset
@@ -2986,8 +3035,16 @@ def fusedQ6KLinearDP4A2RowKernel (inDim outDim : Nat) (gridX : Nat := 0) : Shade
     let vhRaw ← read4Bytes blockByteBase vhOffset
     let vh := Exp.shiftRight vhRaw vhShift
 
-    let sc0Byte ← readByte blockByteBase (Exp.add (Exp.litU32 192) scaleOff)
-    let sc1Byte ← readByte blockByteBase (Exp.add (Exp.litU32 192) (Exp.add scaleOff (Exp.litU32 4)))
+    -- Bind each scale byte so it's loaded exactly once — signExtI8 below
+    -- references `b` three times, and without the bind the readByte call
+    -- inlines to 3× ld.global.u8 per scale (6 total per iter) even though
+    -- the HW would cache them.  Makes PTX match llama.cpp's 2 ld.u8/iter.
+    let sc0ByteName ← ShaderM.var (.scalar .u32)
+      (← readByte blockByteBase (Exp.add (Exp.litU32 192) scaleOff))
+    let sc1ByteName ← ShaderM.var (.scalar .u32)
+      (← readByte blockByteBase (Exp.add (Exp.litU32 192) (Exp.add scaleOff (Exp.litU32 4))))
+    let sc0Byte : Exp (.scalar .u32) := Exp.var sc0ByteName
+    let sc1Byte : Exp (.scalar .u32) := Exp.var sc1ByteName
     let scaleToF32 (b : Exp (.scalar .u32)) : Exp (.scalar .f32) :=
       Exp.select (Exp.ge b (Exp.litU32 128))
         (Exp.sub (Exp.toF32 b) (Exp.litF32 256.0))
@@ -3132,17 +3189,29 @@ def fusedQ6KLinearDP4A4RowKernel (inDim outDim : Nat) (gridX : Nat := 0) : Shade
     (Exp.mul outIdx (Exp.litU32 (blocksPerRow * blockSizeBytes)))
   let rowByteBase : Exp (.scalar .u32) := Exp.var "rowByteBase"
 
+  -- Native u8 load — one `ld.global.nc.u8` on CUDA (vs 1 u32 load + shift +
+  -- mask previously).  See docs/llama-fusion-analysis/41.md for the PTX
+  -- diff that motivated this primitive.
   let readByte (blockBase : Exp (.scalar .u32)) (offset : Exp (.scalar .u32)) : ShaderM (Exp (.scalar .u32)) := do
     let byteIdx := Exp.add blockBase offset
-    let u32Idx := Exp.shiftRight byteIdx (Exp.litU32 2)
-    let byteShift := Exp.mul (Exp.bitAnd byteIdx (Exp.litU32 3)) (Exp.litU32 8)
-    let u32 ← ShaderM.readBuffer (ty := .scalar .u32) (n := totalWeightU32) "weights" u32Idx
-    pure (Exp.bitAnd (Exp.shiftRight u32 byteShift) (Exp.litU32 0xFF))
+    ShaderM.readBufferByte (n := totalWeightU32) "weights" byteIdx
+
+  -- Native u16 load — one `ld.global.nc.u16` on CUDA.  Used to read the
+  -- 2-byte fp16 block scale `d` in a single instruction.
+  let readU16 (blockBase : Exp (.scalar .u32)) (offset : Exp (.scalar .u32)) : ShaderM (Exp (.scalar .u32)) := do
+    let byteIdx := Exp.add blockBase offset
+    ShaderM.readBufferU16 (n := totalWeightU32) "weights" byteIdx
 
   let read4Bytes (blockBase : Exp (.scalar .u32)) (offset : Exp (.scalar .u32)) : ShaderM (Exp (.scalar .u32)) := do
-    let byteIdx := Exp.add blockBase offset
-    let u32Idx := Exp.shiftRight byteIdx (Exp.litU32 2)
-    let byteOff := Exp.bitAnd byteIdx (Exp.litU32 3)
+    -- Bind byteIdx / u32Idx / byteOff so they materialise once in PTX.
+    -- Without these, each downstream use re-emits the `blockBase+offset`
+    -- chain (6× add.u32 + 6× shl.b32 per read4Bytes call in earlier PTX).
+    let byteIdxName ← ShaderM.var (.scalar .u32) (Exp.add blockBase offset)
+    let byteIdx : Exp (.scalar .u32) := Exp.var byteIdxName
+    let u32IdxName ← ShaderM.var (.scalar .u32) (Exp.shiftRight byteIdx (Exp.litU32 2))
+    let u32Idx : Exp (.scalar .u32) := Exp.var u32IdxName
+    let byteOffName ← ShaderM.var (.scalar .u32) (Exp.bitAnd byteIdx (Exp.litU32 3))
+    let byteOff : Exp (.scalar .u32) := Exp.var byteOffName
     let shiftLo := Exp.mul byteOff (Exp.litU32 8)
     let shiftHi := Exp.mul (Exp.sub (Exp.litU32 4) byteOff) (Exp.litU32 8)
     let w0 ← ShaderM.readBuffer (ty := .scalar .u32) (n := totalWeightU32) "weights" u32Idx
@@ -3166,10 +3235,16 @@ def fusedQ6KLinearDP4A4RowKernel (inDim outDim : Nat) (gridX : Nat := 0) : Shade
       (Exp.add rowByteBase (Exp.mul blockIdx (Exp.litU32 blockSizeBytes)))
     let blockByteBase : Exp (.scalar .u32) := Exp.var blockByteBaseName
 
-    let dLo ← readByte blockByteBase (Exp.litU32 208)
-    let dHi ← readByte blockByteBase (Exp.litU32 209)
-    let dBits := Exp.bitOr dLo (Exp.shiftLeft dHi (Exp.litU32 8))
-    let d := fp16ToF32 dBits
+    -- Single ld.global.nc.u16 for the fp16 block scale, converted to f32
+    -- via `cvt.f32.f16` (hardware instruction, 1 op) instead of the
+    -- `fp16ToF32` arithmetic soft-impl which PTX-expands to 15+ ops
+    -- (selp/div/ex2/sub for sign/mantissa/exponent).  We reinterpret the
+    -- u16 as the low half of a packed half2 and extract the low f16 — the
+    -- codegen path for `vecX (unpack2x16float _)` lowers to exactly
+    -- `mov.b32 {lo,hi}, r; cvt.f32.f16 f, lo`.
+    let dBitsName ← ShaderM.var (.scalar .u32) (← readU16 blockByteBase (Exp.litU32 208))
+    let dBits : Exp (.scalar .u32) := Exp.var dBitsName
+    let d := Exp.vecX (Exp.unpack2x16float dBits)
 
     let vlOffset := Exp.mul iqs (Exp.litU32 4)
     let vl ← read4Bytes blockByteBase vlOffset
@@ -3177,8 +3252,16 @@ def fusedQ6KLinearDP4A4RowKernel (inDim outDim : Nat) (gridX : Nat := 0) : Shade
     let vhRaw ← read4Bytes blockByteBase vhOffset
     let vh := Exp.shiftRight vhRaw vhShift
 
-    let sc0Byte ← readByte blockByteBase (Exp.add (Exp.litU32 192) scaleOff)
-    let sc1Byte ← readByte blockByteBase (Exp.add (Exp.litU32 192) (Exp.add scaleOff (Exp.litU32 4)))
+    -- Bind each scale byte so it's loaded exactly once — signExtI8 below
+    -- references `b` three times, and without the bind the readByte call
+    -- inlines to 3× ld.global.u8 per scale (6 total per iter) even though
+    -- the HW would cache them.  Makes PTX match llama.cpp's 2 ld.u8/iter.
+    let sc0ByteName ← ShaderM.var (.scalar .u32)
+      (← readByte blockByteBase (Exp.add (Exp.litU32 192) scaleOff))
+    let sc1ByteName ← ShaderM.var (.scalar .u32)
+      (← readByte blockByteBase (Exp.add (Exp.litU32 192) (Exp.add scaleOff (Exp.litU32 4))))
+    let sc0Byte : Exp (.scalar .u32) := Exp.var sc0ByteName
+    let sc1Byte : Exp (.scalar .u32) := Exp.var sc1ByteName
     let scaleToF32 (b : Exp (.scalar .u32)) : Exp (.scalar .f32) :=
       Exp.select (Exp.ge b (Exp.litU32 128))
         (Exp.sub (Exp.toF32 b) (Exp.litF32 256.0))
@@ -3867,7 +3950,27 @@ def forwardDP4A [GPUBackend β] (ctx : β)
         (hash ("q4k-dp4a-matmul", layer.config.inDim, layer.config.outDim))
         layer.dp4aMatmulPrepared
   else  -- Q6_K
-    if layer.config.outDim % 4 == 0 then
+    -- Kernel-variant gate.  Default is "1row" after A/B (docs 45-47):
+    -- ncu showed the 4-row kernel suffers a 50% tail-wave penalty on
+    -- the RTX 4070 Ti (grid 640 = 480 full + 160 partial wave); the
+    -- 1-row kernel (grid = outDim = 2560, 5× more blocks, negligible
+    -- tail) measured 1.322 → 1.246 ms/dec for ffn_down on the
+    -- canonical 10-decode run.  2-row was actually worse than either
+    -- (1.401 ms/dec) — smem sharing of Q8_1 input did not pay for the
+    -- occupancy hit at 4070 Ti's SM count.
+    -- Override with HESPER_Q6K_KERNEL=4row (regression comparison) or
+    -- HESPER_Q6K_KERNEL=2row (rarely wins).
+    let q6kVariant := (← IO.getEnv "HESPER_Q6K_KERNEL").getD "1row"
+    let force1Row := q6kVariant == "1row"
+    let force2Row := q6kVariant == "2row"
+    if force1Row || !(layer.config.outDim % 2 == 0) then
+      GPUBackend.executeWithConfigCached ctx
+        (fusedQ6KLinearDP4AKernel layer.config.inDim layer.config.outDim)
+        [("weights", layer.weightBuf), ("input_q8", q8Buf), ("output", outputBuf)]
+        { numWorkgroups := (layer.config.outDim, 1, 1), workgroupSize := { x := 32, y := 1, z := 1 } }
+        (hash ("q6k-dp4a-matmul", layer.config.inDim, layer.config.outDim))
+        layer.dp4aMatmulPrepared
+    else if !force2Row && layer.config.outDim % 4 == 0 then
       GPUBackend.executeWithConfigCached ctx
         (fusedQ6KLinearDP4A4RowKernel layer.config.inDim layer.config.outDim)
         [("weights", layer.weightBuf), ("input_q8", q8Buf), ("output", outputBuf)]
@@ -3875,20 +3978,13 @@ def forwardDP4A [GPUBackend β] (ctx : β)
           workgroupSize := { x := 128, y := 1, z := 1 } }
         (hash ("q6k-dp4a-matmul-4row", layer.config.inDim, layer.config.outDim))
         layer.dp4aMatmulPrepared
-    else if layer.config.outDim % 2 == 0 then
+    else  -- outDim % 2 == 0
       GPUBackend.executeWithConfigCached ctx
         (fusedQ6KLinearDP4A2RowKernel layer.config.inDim layer.config.outDim)
         [("weights", layer.weightBuf), ("input_q8", q8Buf), ("output", outputBuf)]
         { numWorkgroups := (layer.config.outDim / 2, 1, 1)
           workgroupSize := { x := 64, y := 1, z := 1 } }
         (hash ("q6k-dp4a-matmul-2row", layer.config.inDim, layer.config.outDim))
-        layer.dp4aMatmulPrepared
-    else
-      GPUBackend.executeWithConfigCached ctx
-        (fusedQ6KLinearDP4AKernel layer.config.inDim layer.config.outDim)
-        [("weights", layer.weightBuf), ("input_q8", q8Buf), ("output", outputBuf)]
-        { numWorkgroups := (layer.config.outDim, 1, 1), workgroupSize := { x := 32, y := 1, z := 1 } }
-        (hash ("q6k-dp4a-matmul", layer.config.inDim, layer.config.outDim))
         layer.dp4aMatmulPrepared
 
   if profiling then

@@ -295,7 +295,22 @@ initialize sectionProfilingRef : IO.Ref Bool ← IO.mkRef false
 -- (name, totalNanos, callCount)
 initialize sectionTotalsRef : IO.Ref (Array (String × UInt64 × Nat)) ← IO.mkRef #[]
 
-private def addSectionSample (name : String) (ns : UInt64) : IO Unit := do
+/-- Per-section kernel-dispatch counter.  Populated by `withSection` when
+    `sectionProfilingRef` is on.  The caller must wire `preDispatch` /
+    `postDispatch` (readers of the global dispatch counter) so withSection
+    can compute the dispatches attributed to one section. -/
+initialize sectionDispatchesRef : IO.Ref (Array (String × Nat × Nat)) ← IO.mkRef #[]
+
+/-- Callback to read the global dispatch counter.  Set by the CUDA backend
+    via `registerDispatchCounter`.  When `none`, per-section dispatch
+    counting is disabled. -/
+initialize sectionDispatchReader : IO.Ref (Option (IO Nat)) ← IO.mkRef none
+
+def registerDispatchCounter (reader : IO Nat) : IO Unit :=
+  sectionDispatchReader.set (some reader)
+
+private def addSectionSample (name : String) (ns : UInt64)
+    (dispatchDelta : Nat) : IO Unit := do
   let arr ← sectionTotalsRef.get
   match arr.findIdx? (fun e => e.1 == name) with
   | some i =>
@@ -303,18 +318,43 @@ private def addSectionSample (name : String) (ns : UInt64) : IO Unit := do
     sectionTotalsRef.set (arr.set! i (n, t + ns, c + 1))
   | none =>
     sectionTotalsRef.set (arr.push (name, ns, 1))
+  -- also accumulate dispatch count per section
+  let darr ← sectionDispatchesRef.get
+  match darr.findIdx? (fun e => e.1 == name) with
+  | some i =>
+    let (n, d, c) := darr[i]!
+    sectionDispatchesRef.set (darr.set! i (n, d + dispatchDelta, c + 1))
+  | none =>
+    sectionDispatchesRef.set (darr.push (name, dispatchDelta, 1))
 
-def resetSectionTotals : IO Unit := sectionTotalsRef.set #[]
+def resetSectionTotals : IO Unit := do
+  sectionTotalsRef.set #[]
+  sectionDispatchesRef.set #[]
 
 def getSectionTotals : IO (Array (String × UInt64 × Nat)) := sectionTotalsRef.get
 
+def getSectionDispatches : IO (Array (String × Nat × Nat)) := sectionDispatchesRef.get
+
 /-- Time an IO action under a section name; no-op when profiling disabled. -/
-@[inline] def withSection (name : String) (act : IO α) : IO α := do
+def withSection (name : String) (act : IO α) : IO α := do
+  let traceOn := (← IO.getEnv "HESPER_KERNEL_TRACE").isSome
   if ← sectionProfilingRef.get then
+    let reader ← sectionDispatchReader.get
+    let dBefore ← match reader with | some r => r | none => pure 0
     let t0 ← IO.monoNanosNow
+    if traceOn then IO.eprintln s!"[hs][section begin] {name}"
     let r ← act
+    if traceOn then IO.eprintln s!"[hs][section end  ] {name}"
     let t1 ← IO.monoNanosNow
-    addSectionSample name (t1 - t0).toUInt64
+    let dAfter ← match reader with | some r => r | none => pure 0
+    if name == "embedLookup" || name == "attnNorm" then
+      IO.eprintln s!"[debug-sec {name}] reader={reader.isSome} before={dBefore} after={dAfter}"
+    addSectionSample name (t1 - t0).toUInt64 (dAfter - dBefore)
+    pure r
+  else if traceOn then do
+    IO.eprintln s!"[hs][section begin] {name}"
+    let r ← act
+    IO.eprintln s!"[hs][section end  ] {name}"
     pure r
   else
     act

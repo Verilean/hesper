@@ -60,6 +60,36 @@ inductive Exp : WGSLType → Type where
   -- Array/vector indexing
   | index {elemTy : WGSLType} {n : Nat} : Exp (.array elemTy n) → Exp (.scalar .u32) → Exp elemTy
 
+  /-- Byte-granularity load from a buffer declared as `array<u32, n>`.
+      The buffer is addressed by *byte* index.  On CUDA this lowers to one
+      `ld.global.u8` instruction (zero-extended into a u32 dest); on WGSL
+      (where storage buffers lack byte granularity) it emulates the load
+      via `(buf[byteIdx >> 2] >> ((byteIdx & 3) * 8)) & 0xFF`.
+
+      Used by Q6_K matmul to avoid issuing one u32 load per scale byte. -/
+  | loadByteFromU32Buf {n : Nat}
+      : (bufName : String)
+      → (byteIdx : Exp (.scalar .u32))
+      → Exp (.scalar .u32)
+
+  /-- Halfword (16-bit) load from a buffer declared as `array<u32, n>`.
+      Lowers to one `ld.global.u16` on CUDA; emulated on WGSL via the same
+      shift+mask pattern as `loadByteFromU32Buf`.  Used to read fp16 block
+      scales from Q6_K blocks in a single load. -/
+  | loadU16FromU32Buf {n : Nat}
+      : (bufName : String)
+      → (byteIdx : Exp (.scalar .u32))
+      → Exp (.scalar .u32)
+
+  /-- Two-level indexing into a `bufferArray elemTy n`: pick the `bufIdx`-th
+      buffer, then read element `elemIdx` from it.  On CUDA this lowers to
+      pointer-table load + `ld.global`.  On WGSL to `arr[bufIdx][elemIdx]`. -/
+  | indexBuf {elemTy : WGSLType} {n : Nat}
+      : Exp (.bufferArray elemTy n)
+      → (bufIdx : Exp (.scalar .u32))
+      → (elemIdx : Exp (.scalar .u32))
+      → Exp elemTy
+
   -- Vector component access
   | vecX {st : ScalarType} : Exp (.vec2 st) → Exp (.scalar st)
   | vecY {st : ScalarType} : Exp (.vec2 st) → Exp (.scalar st)
@@ -583,6 +613,13 @@ partial def Exp.toWGSL {t : WGSLType} : Exp t → String
   | toI32 e => s!"i32({toWGSL e})"
   | toU32 e => s!"u32({toWGSL e})"
   | index arr idx => s!"{toWGSL arr}[{toWGSL idx}]"
+  | indexBuf arr bufIdx elemIdx => s!"{toWGSL arr}[{toWGSL bufIdx}][{toWGSL elemIdx}]"
+  | loadByteFromU32Buf name byteIdx =>
+    let bi := toWGSL byteIdx
+    s!"((({name}[({bi} >> 2u)]) >> (({bi} & 3u) * 8u)) & 255u)"
+  | loadU16FromU32Buf name byteIdx =>
+    let bi := toWGSL byteIdx
+    s!"((({name}[({bi} >> 2u)]) >> (({bi} & 3u) * 8u)) & 65535u)"
   | vecX v => s!"{toWGSL v}.x"
   | vecY v => s!"{toWGSL v}.y"
   | vec3X v => s!"{toWGSL v}.x"

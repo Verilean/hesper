@@ -138,6 +138,74 @@ def rmsNormKernel (config : Config) (workgroupSize : Nat := 256) : ShaderM Unit 
   let finalResult := Exp.select inBounds result (Exp.litF32 0.0)
   ShaderM.writeBuffer (ty := .scalar .f32) "output" idx finalResult
 
+/-- Block-wide sum reduction using warp-shuffle then a single cross-warp
+    pass through shared memory.  Returns a value that holds the total
+    sum on every thread.
+
+    Replaces the classic smem tree-reduction (8 `bar.sync` for 256
+    threads) with:
+      1. `subgroupAdd` — 5 `shfl.bfly` inside each warp
+      2. Lane 0 of each warp stores to `shared_sum[warp_id]`
+      3. Single `bar.sync`
+      4. Warp 0 reads the per-warp partials and warp-reduces again
+      5. Lane 0 of warp 0 broadcasts the total via `shared_sum[0]`
+      6. All threads read `shared_sum[0]`
+
+    Total barriers: 2 (one after per-warp write, one after broadcast).
+    Compare: tree reduction = log2(256) = 8 barriers.
+
+    For workgroupSize = 256 (8 warps of 32).  Assumes `shared_sum` is
+    already declared with ≥ max(numWarps, 1) elements. -/
+private def warpBlockSumReduce (partialSum : Exp (.scalar .f32))
+    (localIdx : Exp (.scalar .u32)) (workgroupSize : Nat)
+    : ShaderM (Exp (.scalar .f32)) := do
+  -- Step 1: warp-reduce via subgroupAdd (5 shfl.bfly).  MUST be
+  -- materialised via ShaderM.var before the predicated smem write —
+  -- otherwise codegen sees the subgroupAdd only at the use site (inside
+  -- the lane==0 if) and emits the shfls inside the predicate, which
+  -- deadlocks (only lane 0 of each warp enters shfl.sync with mask
+  -- 0xFFFFFFFF, the other 31 lanes never arrive).
+  let warpSumName ← ShaderM.var (.scalar .f32) (Exp.subgroupAdd partialSum)
+  let warpSum : Exp (.scalar .f32) := Exp.var warpSumName
+  -- Step 2: lane 0 of each warp writes its warp's sum to shared mem.
+  let laneId := Exp.bitAnd localIdx (Exp.litU32 31)
+  let warpId := Exp.shiftRight localIdx (Exp.litU32 5)
+  ShaderM.if_ (Exp.eq laneId (Exp.litU32 0)) (do
+    ShaderM.writeWorkgroup (ty := .scalar .f32) "shared_sum" warpId warpSum
+  ) (pure ())
+  ShaderM.barrier
+  -- Step 3: warp 0's 32 lanes all read shared_sum[lane].  Lanes >=
+  -- numWarps read uninitialised data so we select-guard them to 0 so
+  -- the subsequent warp reduction doesn't corrupt the sum.  Important:
+  -- ALL 32 lanes of warp 0 must enter subgroupAdd; if we wrap it in
+  -- `if localIdx == 0` only lane 0 participates and shfl.sync
+  -- deadlocks waiting for the other 31.
+  --
+  -- To keep all lanes of warp 0 participating, we compute the second
+  -- warp-reduce on the whole block (lanes >= 32 compute it but their
+  -- results are unused) — hesper's `subgroupAdd` lowers to 5 shfl with
+  -- mask 0xFFFFFFFF so every warp independently reduces, cheap.
+  let numWarps := workgroupSize / 32
+  let slotVal ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := workgroupSize) "shared_sum" localIdx
+  -- Out-of-range slots (lane >= numWarps) read zero.  Bind via ShaderM.var
+  -- so the guarded value materialises before the shfl below (same reason
+  -- as step 1 — otherwise codegen emits shfl inside the write predicate).
+  let guardedName ← ShaderM.var (.scalar .f32)
+    (Exp.select (Exp.lt localIdx (Exp.litU32 numWarps)) slotVal (Exp.litF32 0.0))
+  let guarded : Exp (.scalar .f32) := Exp.var guardedName
+  -- Every thread runs the second reduction unconditionally; only warp
+  -- 0's lane 0 has the true block-sum but the shfls are cheap and keep
+  -- the participation mask full (0xFFFFFFFF) across all 8 warps.
+  let totalWarpName ← ShaderM.var (.scalar .f32) (Exp.subgroupAdd guarded)
+  let totalWarp : Exp (.scalar .f32) := Exp.var totalWarpName
+  -- Only thread 0 of the block writes the final total to slot 0.
+  ShaderM.if_ (Exp.eq localIdx (Exp.litU32 0)) (do
+    ShaderM.writeWorkgroup (ty := .scalar .f32) "shared_sum" (Exp.litU32 0) totalWarp
+  ) (pure ())
+  ShaderM.barrier
+  -- Step 4: all threads read the final total from slot 0.
+  ShaderM.readWorkgroup (ty := .scalar .f32) (n := workgroupSize) "shared_sum" (Exp.litU32 0)
+
 /-! ## Fused Single-Pass Kernel (multi-row) -/
 
 /-- Fused RMSNorm kernel: compute RMS + apply normalization in one dispatch.
@@ -154,7 +222,10 @@ def rmsNormFusedKernel (config : Config) (numRows : Nat) (workgroupSize : Nat :=
 
   let totalElements := numRows * config.dim
 
-  -- Declare shared memory for workgroup reduction
+  -- Declare shared memory for workgroup reduction.  Size = workgroupSize
+  -- so the same buffer works for both warp-shuffle (uses first numWarps
+  -- slots) and tree reduction (uses all `workgroupSize` slots).  4 KB
+  -- at workgroupSize=1024 is trivial vs per-SM budget (100 KB+).
   ShaderM.sharedNamed "shared_sum" (.array (.scalar .f32) workgroupSize)
 
   -- Declare buffers
@@ -169,37 +240,34 @@ def rmsNormFusedKernel (config : Config) (numRows : Nat) (workgroupSize : Nat :=
   let partialSum : Exp (.scalar .f32) := Exp.var "partial_sum"
 
   ShaderM.loop localIdx (Exp.litU32 config.dim) (Exp.litU32 workgroupSize) fun loopIdx => do
-    let val ← ShaderM.readBuffer (ty := .scalar .f32) (n := totalElements) "input" (Exp.add rowBase loopIdx)
+    -- Bind `val` so `val * val` doesn't issue two ld.global for the
+    -- same address (readBuffer returns a bare Exp.index, codegen
+    -- emits a fresh load each use).
+    let valName ← ShaderM.var (.scalar .f32)
+      (← ShaderM.readBuffer (ty := .scalar .f32) (n := totalElements) "input" (Exp.add rowBase loopIdx))
+    let val : Exp (.scalar .f32) := Exp.var valName
     ShaderM.assign "partial_sum" (Exp.add partialSum (Exp.mul val val))
 
-  -- Write partial sum to shared memory
-  ShaderM.writeWorkgroup (ty := .scalar .f32) "shared_sum" localIdx partialSum
-  ShaderM.barrier
+  -- Step 2: Block-wide reduction via warp-shuffle (WIP).  Re-enabled
+  -- for PTX inspection; fall back if runtime still hangs.
+  let totalSum ← warpBlockSumReduce partialSum localIdx workgroupSize
 
-  -- Step 2: Tree reduction in shared memory
-  let mut stride := workgroupSize / 2
-  while stride > 0 do
-    ShaderM.if_ (Exp.lt localIdx (Exp.litU32 stride)) (do
-      let a ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := workgroupSize) "shared_sum" localIdx
-      let b ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := workgroupSize) "shared_sum" (Exp.add localIdx (Exp.litU32 stride))
-      ShaderM.writeWorkgroup (ty := .scalar .f32) "shared_sum" localIdx (Exp.add a b)
-    ) (pure ())
-    ShaderM.barrier
-    stride := stride / 2
+  -- Compute RMS: rsqrt(mean(x²) + eps) — bind via ShaderM.var so the
+  -- div+sqrt+rcp chain materialises ONCE before the normalize loop
+  -- below.  Without this, every use of rsqrtRms inside the loop
+  -- re-emits the reciprocal-sqrt, burning cycles per iteration.
+  let rsqrtRmsName ← ShaderM.var (.scalar .f32)
+    (Exp.inverseSqrt (Exp.add
+      (Exp.div totalSum (Exp.litF32 config.dim.toFloat))
+      (Exp.litF32 config.eps)))
+  let rsqrtRms : Exp (.scalar .f32) := Exp.var rsqrtRmsName
 
-  -- All threads read the total sum from shared[0]
-  let totalSum ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := workgroupSize) "shared_sum" (Exp.litU32 0)
-
-  -- Compute RMS: sqrt(mean(x²) + eps)
-  let mean := Exp.div totalSum (Exp.litF32 config.dim.toFloat)
-  let rms := Exp.sqrt (Exp.add mean (Exp.litF32 config.eps))
-
-  -- Step 3: Each thread normalizes its strided elements
+  -- Step 3: Each thread normalizes its strided elements via FMA-like
+  -- (scale * input) * rsqrt_rms.
   ShaderM.loop localIdx (Exp.litU32 config.dim) (Exp.litU32 workgroupSize) fun dimIdx => do
     let inputVal ← ShaderM.readBuffer (ty := .scalar .f32) (n := totalElements) "input" (Exp.add rowBase dimIdx)
     let scaleVal ← ShaderM.readBuffer (ty := .scalar .f32) (n := config.dim) "scale" dimIdx
-    let normalized := Exp.div inputVal rms
-    let result := Exp.mul normalized scaleVal
+    let result := Exp.mul (Exp.mul inputVal rsqrtRms) scaleVal
     ShaderM.writeBuffer (ty := .scalar .f32) "output" (Exp.add rowBase dimIdx) result
 
 /-! ## Fused post-norm (Gemma 4 style): RMSNorm(layer_out) + residual -/
@@ -249,6 +317,50 @@ def rmsNormThenAddKernel (config : Config) (workgroupSize : Nat := 256) : Shader
     let s ← ShaderM.readBuffer (ty := .scalar .f32) (n := config.dim) "scale" i
     let r ← ShaderM.readBuffer (ty := .scalar .f32) (n := config.dim) "residual" i
     let y := Exp.add (Exp.mul (Exp.div v rms) s) r
+    ShaderM.writeBuffer (ty := .scalar .f32) "output" i y
+
+/-- `rmsNormThenAddKernel` with an extra broadcast scalar multiply at
+    the tail: `output[i] = (RMSNorm(layer_out)[i] * scale[i] + residual[i]) * out_scale[0]`.
+
+    Saves a separate `layerOutScale` dispatch when the block has a
+    per-layer output scale (Gemma 4 dense FFN blocks).  Structurally
+    identical to `rmsNormThenAddKernel` except for the tail multiply. -/
+def rmsNormThenAddThenBroadcastScaleKernel (config : Config)
+    (workgroupSize : Nat := 256) : ShaderM Unit := do
+  let lid ← ShaderM.localId
+  let localIdx := Exp.vec3X lid
+  ShaderM.sharedNamed "shared_sum" (.array (.scalar .f32) workgroupSize)
+  let _layerOut ← ShaderM.declareInputBuffer "layer_out" (.array (.scalar .f32) config.dim)
+  let _residual ← ShaderM.declareInputBuffer "residual" (.array (.scalar .f32) config.dim)
+  let _scale    ← ShaderM.declareInputBuffer "scale" (.array (.scalar .f32) config.dim)
+  let _outScale ← ShaderM.declareInputBuffer "out_scale" (.array (.scalar .f32) 1)
+  let _output   ← ShaderM.declareOutputBuffer "output" (.array (.scalar .f32) config.dim)
+
+  ShaderM.varNamed "partial_sum" (.scalar .f32) (Exp.litF32 0.0)
+  let partialSum : Exp (.scalar .f32) := Exp.var "partial_sum"
+  ShaderM.loop localIdx (Exp.litU32 config.dim) (Exp.litU32 workgroupSize) fun i => do
+    let v ← ShaderM.readBuffer (ty := .scalar .f32) (n := config.dim) "layer_out" i
+    ShaderM.assign "partial_sum" (Exp.add partialSum (Exp.mul v v))
+  ShaderM.writeWorkgroup (ty := .scalar .f32) "shared_sum" localIdx partialSum
+  ShaderM.barrier
+  let mut stride := workgroupSize / 2
+  while stride > 0 do
+    ShaderM.if_ (Exp.lt localIdx (Exp.litU32 stride)) (do
+      let a ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := workgroupSize) "shared_sum" localIdx
+      let b ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := workgroupSize) "shared_sum" (Exp.add localIdx (Exp.litU32 stride))
+      ShaderM.writeWorkgroup (ty := .scalar .f32) "shared_sum" localIdx (Exp.add a b)
+    ) (pure ())
+    ShaderM.barrier
+    stride := stride / 2
+  let totalSum ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := workgroupSize) "shared_sum" (Exp.litU32 0)
+  let mean := Exp.div totalSum (Exp.litF32 config.dim.toFloat)
+  let rms := Exp.sqrt (Exp.add mean (Exp.litF32 config.eps))
+  let outSc ← ShaderM.readBuffer (ty := .scalar .f32) (n := 1) "out_scale" (Exp.litU32 0)
+  ShaderM.loop localIdx (Exp.litU32 config.dim) (Exp.litU32 workgroupSize) fun i => do
+    let v ← ShaderM.readBuffer (ty := .scalar .f32) (n := config.dim) "layer_out" i
+    let s ← ShaderM.readBuffer (ty := .scalar .f32) (n := config.dim) "scale" i
+    let r ← ShaderM.readBuffer (ty := .scalar .f32) (n := config.dim) "residual" i
+    let y := Exp.mul (Exp.add (Exp.mul (Exp.div v rms) s) r) outSc
     ShaderM.writeBuffer (ty := .scalar .f32) "output" i y
 
 /-- Batched version of `rmsNormThenAddKernel`: processes `seqLen` rows in
@@ -681,6 +793,22 @@ def forwardNormThenAdd [GPUBackend β] (ctx : β)
   GPUBackend.executeWithConfigCached ctx shader
     [("layer_out", layerOutBuf), ("residual", residualBuf), ("scale", layer.scale),
      ("output", outputBuf)]
+    { workgroupSize := { x := workgroupSize }, numWorkgroups := (1, 1, 1) }
+    cacheKey preparedRef
+
+/-- Variant of `forwardNormThenAdd` that also applies an extra
+    broadcast scalar `outScaleBuf[0]` at the tail.  Saves a separate
+    layerOutScale dispatch. -/
+def forwardNormThenAddThenBroadcastScale [GPUBackend β] (ctx : β)
+    (layer : RMSNorm (GPUBackend.Buf β) (GPUBackend.CachedDispatch β))
+    (layerOutBuf residualBuf outScaleBuf outputBuf : GPUBackend.Buf β)
+    (preparedRef : IO.Ref (Option (GPUBackend.CachedDispatch β)))
+    (workgroupSize : Nat := 256) : IO Unit := do
+  let shader := rmsNormThenAddThenBroadcastScaleKernel layer.config workgroupSize
+  let cacheKey : UInt64 := hash ("rms-then-add-then-bcast-scale", layer.config.dim, workgroupSize)
+  GPUBackend.executeWithConfigCached ctx shader
+    [("layer_out", layerOutBuf), ("residual", residualBuf), ("scale", layer.scale),
+     ("out_scale", outScaleBuf), ("output", outputBuf)]
     { workgroupSize := { x := workgroupSize }, numWorkgroups := (1, 1, 1) }
     cacheKey preparedRef
 
