@@ -406,6 +406,54 @@ def stdLinkArgs : Array String :=
 -- DSL Examples (Pure Lean - Type-safe WGSL DSL demonstration)
 -- ----------------------------------------------------------------------------
 
+lean_exe «circuit-irv2-poc» where
+  root := `Examples.DSL.CircuitIRv2PoC
+  moreLinkArgs := stdLinkArgs ++ #["./.lake/build/native/libhesper_cuda.a", "-lcuda"]
+
+lean_exe «gemma4-qproj-parity» where
+  root := `Examples.DSL.Gemma4QProjParity
+  moreLinkArgs := stdLinkArgs ++ #["./.lake/build/native/libhesper_cuda.a", "-lcuda"]
+
+lean_exe «gemma4-qkv-parity» where
+  root := `Examples.DSL.Gemma4QKVProjParity
+  moreLinkArgs := stdLinkArgs ++ #["./.lake/build/native/libhesper_cuda.a", "-lcuda"]
+
+lean_exe «gemma4-ffn-parity» where
+  root := `Examples.DSL.Gemma4FFNParity
+  moreLinkArgs := stdLinkArgs ++ #["./.lake/build/native/libhesper_cuda.a", "-lcuda"]
+
+lean_exe «gemma4-postffn-parity» where
+  root := `Examples.DSL.Gemma4PostFFNParity
+  moreLinkArgs := stdLinkArgs ++ #["./.lake/build/native/libhesper_cuda.a", "-lcuda"]
+
+lean_exe «gemma4-kv-parity» where
+  root := `Examples.DSL.Gemma4KVWriteParity
+  moreLinkArgs := stdLinkArgs ++ #["./.lake/build/native/libhesper_cuda.a", "-lcuda"]
+
+lean_exe «gemma4-k-parity» where
+  root := `Examples.DSL.Gemma4KWriteParity
+  moreLinkArgs := stdLinkArgs ++ #["./.lake/build/native/libhesper_cuda.a", "-lcuda"]
+
+lean_exe «gemma4-kv-multi-parity» where
+  root := `Examples.DSL.Gemma4KVWriteMultiParity
+  moreLinkArgs := stdLinkArgs ++ #["./.lake/build/native/libhesper_cuda.a", "-lcuda"]
+
+lean_exe «gemma4-ropeq-parity» where
+  root := `Examples.DSL.Gemma4RopeQParity
+  moreLinkArgs := stdLinkArgs ++ #["./.lake/build/native/libhesper_cuda.a", "-lcuda"]
+
+lean_exe «gemma4-dispatch-count» where
+  root := `Examples.DSL.Gemma4DispatchCount
+  moreLinkArgs := stdLinkArgs ++ #["./.lake/build/native/libhesper_cuda.a", "-lcuda"]
+
+lean_exe «gemma4-monolith-layer-parity» where
+  root := `Examples.DSL.Gemma4MonolithLayerParity
+  moreLinkArgs := stdLinkArgs ++ #["./.lake/build/native/libhesper_cuda.a", "-lcuda"]
+
+lean_exe «gemma4-monolith-tps» where
+  root := `Examples.DSL.Gemma4MonolithTPS
+  moreLinkArgs := stdLinkArgs ++ #["./.lake/build/native/libhesper_cuda.a", "-lcuda"]
+
 lean_exe «dsl-basics» where
   root := `Examples.DSL.DSLBasics
 
@@ -770,12 +818,24 @@ lean_exe «cuda-execute-test» where
   root := `Tests.CUDA.CUDAExecuteTest
   moreLinkArgs := cudaLinkArgs
 
+lean_exe «buffer-array-test» where
+  root := `Tests.CUDA.BufferArrayTest
+  moreLinkArgs := stdLinkArgs ++ #["./.lake/build/native/libhesper_cuda.a", "-lcuda"]
+
+lean_exe «multi-layer-q4k-test» where
+  root := `Tests.CUDA.MultiLayerQ4KTest
+  moreLinkArgs := stdLinkArgs ++ #["./.lake/build/native/libhesper_cuda.a", "-lcuda"]
+
 lean_exe «cuda-matmul-test» where
   root := `Tests.CUDA.CUDAMatMulTest
   moreLinkArgs := stdLinkArgs ++ #["./.lake/build/native/libhesper_cuda.a", "-lcuda"]
 
 lean_exe «cuda-matmul-microbench» where
   root := `Tests.CUDA.CUDAMatmulMicrobench
+  moreLinkArgs := stdLinkArgs ++ #["./.lake/build/native/libhesper_cuda.a", "-lcuda"]
+
+lean_exe «cuda-launch-bench» where
+  root := `Tests.CUDA.CUDALaunchBench
   moreLinkArgs := stdLinkArgs ++ #["./.lake/build/native/libhesper_cuda.a", "-lcuda"]
 
 lean_exe «cuda-backend-test» where
@@ -832,6 +892,18 @@ lean_exe «cuda-bitnet-golden-test» where
 
 lean_exe «gemma4-cuda» where
   root := `Examples.Gemma4CUDA
+  moreLinkArgs := stdLinkArgs ++ #["./.lake/build/native/libhesper_cuda.a", "-lcuda"]
+
+lean_exe «mmap-smoke» where
+  root := `Tests.CUDA.MmapSmokeTest
+  moreLinkArgs := stdLinkArgs ++ #["./.lake/build/native/libhesper_cuda.a", "-lcuda"]
+
+lean_exe «gemma4-llama-skeleton» where
+  root := `Examples.Gemma4LlamaSkeleton
+  moreLinkArgs := stdLinkArgs ++ #["./.lake/build/native/libhesper_cuda.a", "-lcuda"]
+
+lean_exe «gemma4-llama-prefill-skeleton» where
+  root := `Examples.Gemma4LlamaPrefillSkeleton
   moreLinkArgs := stdLinkArgs ++ #["./.lake/build/native/libhesper_cuda.a", "-lcuda"]
 
 lean_exe «gemma4-unit-tests» where
