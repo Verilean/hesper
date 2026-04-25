@@ -27,6 +27,12 @@ import Hesper.WebGPU.BufferOps
 import Hesper.Inference.Sampling
 import Hesper.WGSL.FlashAttention
 import Hesper.Layers.Attention
+import Hesper.Models.Gemma4.Config
+import Hesper.Circuit.Dispatch_v2
+import Hesper.Models.Gemma4_v2
+import Hesper.Models.Gemma4.Kernels
+import Hesper.Models.Gemma4.Types
+import Hesper.Models.Gemma4.Loader
 
 /-!
 # Gemma 4 Model Implementation
@@ -63,1644 +69,7 @@ open Hesper.WGSL.Execute (PreparedDispatch CompiledKernel)
 open Hesper.Layers
 open Hesper.Logging (logVerbose)
 
-/-! ## Configuration -/
-
-/-- Attention layer type: full context or sliding window -/
-inductive LayerType where
-  | full   -- Full attention (global context)
-  | swa    -- Sliding Window Attention
-  deriving Repr, BEq, Inhabited
-
-/-- Gemma 4 model configuration -/
-structure Config where
-  vocabSize : Nat              -- 262144 for 31B
-  hiddenSize : Nat             -- 3840 for 31B
-  intermediateSize : Nat       -- GeGLU FFN hidden size
-  numHiddenLayers : Nat        -- 62 for 31B
-  numAttentionHeads : Nat      -- 32
-  numKeyValueHeadsFull : Nat   -- KV heads for full attention layers
-  numKeyValueHeadsSWA : Nat    -- KV heads for SWA layers
-  headDimFull : Nat            -- 128 (global_head_dim)
-  headDimSWA : Nat             -- 128 (head_dim)
-  slidingWindowSize : Nat      -- 512
-  rmsNormEps : Float           -- 1e-6
-  ropeTheta : Float            -- Full-attn freq_base: 1000000.0
-  ropeThetaSWA : Float         -- SWA freq_base: 10000.0  (gemma4.rope.freq_base_swa)
-  partialRotaryFactorSWA : Float -- e.g. 0.5
-  layerTypes : Array LayerType -- per-layer: full or SWA
-  logitSoftcapScale : Float    -- 30.0
-  maxSeqLen : Nat              -- 131072
-  -- MoE config
-  numExperts : Nat             -- 0 for dense-only models
-  numExpertsUsed : Nat         -- top-K routing (e.g., 2)
-  expertFFSize : Nat           -- expert intermediate size
-  -- Per-layer embeddings
-  embdPerLayer : Nat           -- 0 = disabled
-  -- KV cache sharing
-  numKVSharedLayers : Nat      -- last N layers reuse earlier KV cache
-  deriving Repr
-
-/-- Get number of KV heads for a given layer -/
-def Config.numKVHeads (c : Config) (layerIdx : Nat) : Nat :=
-  if layerIdx < c.layerTypes.size then
-    match c.layerTypes[layerIdx]! with
-    | .full => c.numKeyValueHeadsFull
-    | .swa => c.numKeyValueHeadsSWA
-  else c.numKeyValueHeadsSWA
-
-/-- Get head dimension for a given layer -/
-def Config.headDim (c : Config) (layerIdx : Nat) : Nat :=
-  if layerIdx < c.layerTypes.size then
-    match c.layerTypes[layerIdx]! with
-    | .full => c.headDimFull
-    | .swa => c.headDimSWA
-  else c.headDimSWA
-
-/-- Check if a layer uses full attention -/
-def Config.isFullAttention (c : Config) (layerIdx : Nat) : Bool :=
-  if layerIdx < c.layerTypes.size then
-    c.layerTypes[layerIdx]! == .full
-  else false
-
-/-- RoPE freq_base for a given layer.  Gemma 4 uses a different rope
-    base for SWA layers (10000) vs full-attn layers (1000000).  Per
-    `llama.cpp/src/models/gemma4-iswa.cpp:37`:
-      freq_base_l = model.get_rope_freq_base(cparams, il)
-    which resolves to `freq_base_swa` for SWA layers and `freq_base`
-    for full-attn layers.  -/
-def Config.ropeBase (c : Config) (layerIdx : Nat) : Float :=
-  if c.isFullAttention layerIdx then c.ropeTheta else c.ropeThetaSWA
-
-/-- Check if a layer has its own KV cache (not shared) -/
-def Config.hasKV (c : Config) (layerIdx : Nat) : Bool :=
-  layerIdx < c.numHiddenLayers - c.numKVSharedLayers
-
-/-- For KV-shared layers, return the index of the earlier layer whose KV cache is reused.
-    Mirrors llama.cpp's Gemma 4 layer_reuse_cb (see llama-model.cpp:8355):
-      reuse(il) = n_layer_kv_from_start - (is_swa(il) ? 2 : 1)    if il >= n_layer_kv_from_start
-                = il                                              otherwise
-    The reused layer is always in [0, n_layer_kv_from_start), i.e. it has its own KV cache. -/
-def Config.kvCacheLayer (c : Config) (layerIdx : Nat) : Nat :=
-  if c.hasKV layerIdx then layerIdx
-  else
-    let firstShared := c.numHiddenLayers - c.numKVSharedLayers
-    if c.isFullAttention layerIdx then firstShared - 1 else firstShared - 2
-
-/-- Check if per-layer embeddings are enabled -/
-def Config.hasPerLayerEmbeddings (c : Config) : Bool :=
-  c.embdPerLayer > 0
-
-/-! ## GeGLU FFN Kernel -/
-
-/-- Fused GeGLU FFN kernel: hidden = GELU(x @ W_gate) * (x @ W_up)
-    This is the elementwise GELU + multiply step after the gate and up projections.
-
-    @param size Number of elements in the hidden dimension
--/
-def geluMulKernel (size : Nat) : ShaderM Unit := do
-  let gid ← ShaderM.globalId
-  let idx := Exp.vec3X gid
-
-  let _gate ← ShaderM.declareInputBuffer "gate" (.array (.scalar .f32) size)
-  let _up ← ShaderM.declareInputBuffer "up" (.array (.scalar .f32) size)
-  let _output ← ShaderM.declareOutputBuffer "output" (.array (.scalar .f32) size)
-
-  ShaderM.if_ (Exp.lt idx (Exp.litU32 size)) (do
-    let gateVal ← ShaderM.readBuffer (ty := .scalar .f32) (n := size) "gate" idx
-    let upVal ← ShaderM.readBuffer (ty := .scalar .f32) (n := size) "up" idx
-    -- GELU approximation: 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
-    let sqrt2OverPi := Exp.litF32 0.7978845608028654
-    let x3 := Exp.mul (Exp.mul gateVal gateVal) gateVal
-    let inner := Exp.mul sqrt2OverPi (Exp.add gateVal (Exp.mul (Exp.litF32 0.044715) x3))
-    let gelu := Exp.mul (Exp.mul (Exp.litF32 0.5) gateVal) (Exp.add (Exp.litF32 1.0) (Exp.tanh inner))
-    -- output = GELU(gate) * up
-    let result := Exp.mul gelu upVal
-    ShaderM.writeBuffer (ty := .scalar .f32) "output" idx result
-  ) (pure ())
-
-/-! ## Logit Softcapping Kernel -/
-
-/-- Logit softcapping: y = scale * tanh(x / scale)
-    @param size Number of elements
-    @param scale Softcap scale (30.0 for Gemma 4)
--/
-def logitSoftcapKernel (size : Nat) (scale : Float) : ShaderM Unit := do
-  let gid ← ShaderM.globalId
-  let idx := Exp.vec3X gid
-
-  let _input ← ShaderM.declareInputBuffer "input" (.array (.scalar .f32) size)
-  let _output ← ShaderM.declareOutputBuffer "output" (.array (.scalar .f32) size)
-
-  ShaderM.if_ (Exp.lt idx (Exp.litU32 size)) (do
-    let x ← ShaderM.readBuffer (ty := .scalar .f32) (n := size) "input" idx
-    let scaled := Exp.div x (Exp.litF32 scale)
-    let result := Exp.mul (Exp.litF32 scale) (Exp.tanh scaled)
-    ShaderM.writeBuffer (ty := .scalar .f32) "output" idx result
-  ) (pure ())
-
-/-! ## Elementwise Kernels -/
-
-/-- Embedding scale kernel: y = x * sqrt(hiddenSize)
-    Applied after token embedding lookup.
--/
-def embeddingScaleKernel (size : Nat) (hiddenSize : Nat) : ShaderM Unit := do
-  let gid ← ShaderM.globalId
-  let idx := Exp.vec3X gid
-
-  let _input ← ShaderM.declareInputBuffer "input" (.array (.scalar .f32) size)
-  let _output ← ShaderM.declareOutputBuffer "output" (.array (.scalar .f32) size)
-
-  ShaderM.if_ (Exp.lt idx (Exp.litU32 size)) (do
-    let x ← ShaderM.readBuffer (ty := .scalar .f32) (n := size) "input" idx
-    let result := Exp.mul x (Exp.litF32 (Float.sqrt hiddenSize.toFloat))
-    ShaderM.writeBuffer (ty := .scalar .f32) "output" idx result
-  ) (pure ())
-
-/-- In-place batched broadcast multiply: `buf[i] *= scale[0]` for all
-    `i in [0, total)`.  Replaces the per-column
-    `extract → runCachedFused(scaleByBroadcast) → insert` chain used by
-    Gemma 4's per-layer output-scale step.  One dispatch over the whole
-    `[dim, seqLen]` batch tensor; the scale is a single f32. -/
-def batchBroadcastScaleInPlaceKernel (total : Nat) : ShaderM Unit := do
-  let gid ← ShaderM.globalId
-  let idx := Exp.vec3X gid
-  let _buf ← ShaderM.declareStorageBuffer "buf"
-    (.array (.scalar .f32) total) .readWrite
-  let _scale ← ShaderM.declareInputBuffer "scale" (.array (.scalar .f32) 1)
-  ShaderM.if_ (Exp.lt idx (Exp.litU32 total)) (do
-    let s ← ShaderM.readBuffer (ty := .scalar .f32) (n := 1) "scale" (Exp.litU32 0)
-    let v ← ShaderM.readBuffer (ty := .scalar .f32) (n := total) "buf" idx
-    ShaderM.writeBuffer (ty := .scalar .f32) "buf" idx (Exp.mul v s)
-  ) (pure ())
-
-/-- Fused post-norm + residual-add kernel, in place on the residual
-    buffer. Replaces the 3-dispatch chain used by the per-layer
-    embedding:
-
-      norm[i] = plProj[i] * rsqrt(mean(plProj²) + eps) * weight[i]
-      residual[i] = residual[i] + norm[i]    -- written in place
-
-    Implementation: 1 workgroup of 256 threads (= 8 subgroups of 32
-    each on NVIDIA). Phase 1 accumulates `sum(x²)` per lane then
-    reduces via one `subgroupAdd` (intra-subgroup) + one shared-mem
-    stash + one barrier + a final cross-subgroup sum on thread 0 —
-    total 1 barrier, vs 8 barriers in a full tree reduction. Phase 2
-    every thread re-reads its slice, normalises, multiplies by weight,
-    and adds into the residual buffer (bound as read_write) in place.
-
-    Dispatch: `(1, 1, 1)` workgroups × 256 threads. -/
-def fusedPerLayerPostKernel (hiddenSize : Nat) (eps : Float) : ShaderM Unit := do
-  let wgSize := 256
-  let numSubgroups := wgSize / 32
-  let lid ← ShaderM.localId
-  let tid := Exp.vec3X lid
-
-  let _proj ← ShaderM.declareInputBuffer "proj" (.array (.scalar .f32) hiddenSize)
-  let _weight ← ShaderM.declareInputBuffer "weight" (.array (.scalar .f32) hiddenSize)
-  let _residual ← ShaderM.declareOutputBuffer "residual" (.array (.scalar .f32) hiddenSize)
-
-  -- Shared workspace: `numSubgroups` per-subgroup partials + 1 slot
-  -- for the final broadcast `invRms`.
-  ShaderM.sharedNamed "shared_sg" (.array (.scalar .f32) (numSubgroups + 1))
-
-  -- Phase 1: per-thread sum of squares over stride-wgSize slice.
-  ShaderM.varNamed "partialSq" (.scalar .f32) (Exp.litF32 0.0)
-  let partialSq : Exp (.scalar .f32) := Exp.var "partialSq"
-  ShaderM.loop tid (Exp.litU32 hiddenSize) (Exp.litU32 wgSize) fun d => do
-    let v ← ShaderM.readBuffer (ty := .scalar .f32) (n := hiddenSize) "proj" d
-    ShaderM.assign "partialSq" (Exp.add partialSq (Exp.mul v v))
-
-  -- Intra-subgroup reduction: every lane of each subgroup now holds
-  -- the same 32-way sum.
-  ShaderM.varNamed "sgSum" (.scalar .f32) (Exp.subgroupAdd partialSq)
-  let sgSum : Exp (.scalar .f32) := Exp.var "sgSum"
-
-  -- Lane 0 of each subgroup writes its partial into shared memory.
-  let subgroupId := Exp.div tid (Exp.litU32 32)
-  let laneId := Exp.sub tid (Exp.mul subgroupId (Exp.litU32 32))
-  ShaderM.if_ (Exp.eq laneId (Exp.litU32 0)) (do
-    ShaderM.writeWorkgroup (ty := .scalar .f32) "shared_sg" subgroupId sgSum
-  ) (pure ())
-  ShaderM.barrier
-
-  -- Thread 0 sums the per-subgroup partials, computes invRms, and
-  -- stashes it in shared_sg[numSubgroups] for broadcast.
-  ShaderM.if_ (Exp.eq tid (Exp.litU32 0)) (do
-    ShaderM.varNamed "totalSq" (.scalar .f32) (Exp.litF32 0.0)
-    let totalSq : Exp (.scalar .f32) := Exp.var "totalSq"
-    for sg in [0:numSubgroups] do
-      let part ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := numSubgroups + 1) "shared_sg" (Exp.litU32 sg)
-      ShaderM.assign "totalSq" (Exp.add totalSq part)
-    let invRms := Exp.div (Exp.litF32 1.0)
-      (Exp.sqrt (Exp.add (Exp.div totalSq (Exp.litF32 hiddenSize.toFloat))
-                         (Exp.litF32 eps)))
-    ShaderM.writeWorkgroup (ty := .scalar .f32) "shared_sg" (Exp.litU32 numSubgroups) invRms
-  ) (pure ())
-  ShaderM.barrier
-
-  -- Every thread grabs invRms from the shared slot.
-  ShaderM.varNamed "invRms" (.scalar .f32)
-    (← ShaderM.readWorkgroup (ty := .scalar .f32) (n := numSubgroups + 1)
-          "shared_sg" (Exp.litU32 numSubgroups))
-  let invRms : Exp (.scalar .f32) := Exp.var "invRms"
-
-  -- Phase 2: normalise, apply weight, add into residual in place.
-  ShaderM.loop tid (Exp.litU32 hiddenSize) (Exp.litU32 wgSize) fun d => do
-    let pVal ← ShaderM.readBuffer (ty := .scalar .f32) (n := hiddenSize) "proj" d
-    let wVal ← ShaderM.readBuffer (ty := .scalar .f32) (n := hiddenSize) "weight" d
-    let rVal ← ShaderM.readBuffer (ty := .scalar .f32) (n := hiddenSize) "residual" d
-    let normed := Exp.mul (Exp.mul pVal invRms) wVal
-    ShaderM.writeBuffer (ty := .scalar .f32) "residual" d (Exp.add rVal normed)
-
-/-- Residual add kernel: y = a + b -/
-def residualAddKernel (size : Nat) : ShaderM Unit := do
-  let gid ← ShaderM.globalId
-  let idx := Exp.vec3X gid
-
-  let _a ← ShaderM.declareInputBuffer "a" (.array (.scalar .f32) size)
-  let _b ← ShaderM.declareInputBuffer "b" (.array (.scalar .f32) size)
-  let _output ← ShaderM.declareOutputBuffer "output" (.array (.scalar .f32) size)
-
-  ShaderM.if_ (Exp.lt idx (Exp.litU32 size)) (do
-    let aVal ← ShaderM.readBuffer (ty := .scalar .f32) (n := size) "a" idx
-    let bVal ← ShaderM.readBuffer (ty := .scalar .f32) (n := size) "b" idx
-    ShaderM.writeBuffer (ty := .scalar .f32) "output" idx (Exp.add aVal bVal)
-  ) (pure ())
-
-/-! ## RoPE with Frequency Factors -/
-
-/-- RoPE kernel with per-dimension frequency factors.
-    Used by Gemma 4 full-attention layers for "proportional" RoPE.
-    Frequency factors modulate the base frequency per dimension pair:
-    θ[i] = pos * (base^(-2i/d)) / freqFactor[i]
-    Setting freqFactor[i] = 1e30 effectively disables rotation for that dimension.
-
-    @param headDim Per-head dimension
-    @param numHeads Number of attention heads
-    @param ropeBase RoPE frequency base
--/
-def ropeWithFreqFactorsKernel (headDim numHeads : Nat) (ropeBase : Float) : ShaderM Unit := do
-  let gid ← ShaderM.globalId
-  let idx := Exp.vec3X gid
-
-  let dimPairs := headDim / 2
-  let totalElements := numHeads * dimPairs
-
-  let _input ← ShaderM.declareInputBuffer "input" (.array (.scalar .f32) (numHeads * headDim))
-  let _output ← ShaderM.declareOutputBuffer "output" (.array (.scalar .f32) (numHeads * headDim))
-  let _params ← ShaderM.declareInputBuffer "params" (.array (.scalar .u32) 2)
-  let _freqFactors ← ShaderM.declareInputBuffer "freq_factors" (.array (.scalar .f32) dimPairs)
-
-  ShaderM.if_ (Exp.lt idx (Exp.litU32 totalElements)) (do
-    let dimPair := Exp.mod idx (Exp.litU32 dimPairs)
-    let head := Exp.div idx (Exp.litU32 dimPairs)
-
-    -- Read position from params buffer
-    let pos ← ShaderM.readBuffer (ty := .scalar .u32) (n := 2) "params" (Exp.litU32 0)
-    let posF32 := Exp.toF32 pos
-
-    -- Read frequency factor for this dimension pair
-    let freqFactor ← ShaderM.readBuffer (ty := .scalar .f32) (n := dimPairs) "freq_factors" dimPair
-
-    -- Compute theta with frequency factor
-    let dimPairF32 := Exp.toF32 dimPair
-    let exponent := Exp.div (Exp.mul (Exp.litF32 2.0) dimPairF32) (Exp.litF32 headDim.toFloat)
-    let freqInv := Exp.pow (Exp.litF32 ropeBase) (Exp.neg exponent)
-    let theta := Exp.div (Exp.mul posF32 freqInv) freqFactor
-
-    let cosTheta := Exp.cos theta
-    let sinTheta := Exp.sin theta
-
-    -- NeoX split-half: pairs are (x[i], x[i + headDim/2])
-    let halfDim := headDim / 2
-    let headOffset := Exp.mul head (Exp.litU32 headDim)
-    let idx0 := Exp.add headOffset dimPair
-    let idx1 := Exp.add headOffset (Exp.add dimPair (Exp.litU32 halfDim))
-
-    let x0 ← ShaderM.readBuffer (ty := .scalar .f32) (n := numHeads * headDim) "input" idx0
-    let x1 ← ShaderM.readBuffer (ty := .scalar .f32) (n := numHeads * headDim) "input" idx1
-
-    let x0_new := Exp.sub (Exp.mul x0 cosTheta) (Exp.mul x1 sinTheta)
-    let x1_new := Exp.add (Exp.mul x0 sinTheta) (Exp.mul x1 cosTheta)
-
-    ShaderM.writeBuffer (ty := .scalar .f32) "output" idx0 x0_new
-    ShaderM.writeBuffer (ty := .scalar .f32) "output" idx1 x1_new
-  ) (pure ())
-
-/-- Batched RoPE-Q with frequency factors: rotates Q for all `seqLen` query
-    tokens.  Q layout: [seqLen, numHeads, headDim] column-major
-    (`q[col * (numHeads * headDim) + h * headDim + d]`).
-
-    `params[0]` = startPos.  Token at column `col` uses pos = startPos + col.
-    Grid: dispatch1D(numHeads * dimPairs * seqLen). -/
-def ropeWithFreqFactorsBatchKernel (headDim numHeads seqLen : Nat) (ropeBase : Float) : ShaderM Unit := do
-  let gid ← ShaderM.globalId
-  let idx := Exp.vec3X gid
-
-  let dimPairs := headDim / 2
-  let perTokenElems := numHeads * dimPairs
-  let totalElements := perTokenElems * seqLen
-
-  let qDim := numHeads * headDim
-  let _input  ← ShaderM.declareInputBuffer "input"  (.array (.scalar .f32) (qDim * seqLen))
-  let _output ← ShaderM.declareOutputBuffer "output" (.array (.scalar .f32) (qDim * seqLen))
-  let _params ← ShaderM.declareInputBuffer "params" (.array (.scalar .u32) 1)
-  let _freqFactors ← ShaderM.declareInputBuffer "freq_factors" (.array (.scalar .f32) dimPairs)
-
-  ShaderM.if_ (Exp.lt idx (Exp.litU32 totalElements)) (do
-    let col := Exp.div idx (Exp.litU32 perTokenElems)
-    let withinTok := Exp.sub idx (Exp.mul col (Exp.litU32 perTokenElems))
-    let dimPair := Exp.mod withinTok (Exp.litU32 dimPairs)
-    let head    := Exp.div withinTok (Exp.litU32 dimPairs)
-
-    let startPos ← ShaderM.readBuffer (ty := .scalar .u32) (n := 1) "params" (Exp.litU32 0)
-    let pos := Exp.add startPos col
-    let posF32 := Exp.toF32 pos
-
-    let freqFactor ← ShaderM.readBuffer (ty := .scalar .f32) (n := dimPairs) "freq_factors" dimPair
-
-    let dimPairF32 := Exp.toF32 dimPair
-    let exponent := Exp.div (Exp.mul (Exp.litF32 2.0) dimPairF32) (Exp.litF32 headDim.toFloat)
-    let freqInv := Exp.pow (Exp.litF32 ropeBase) (Exp.neg exponent)
-    let theta := Exp.div (Exp.mul posF32 freqInv) freqFactor
-    let cosTheta := Exp.cos theta
-    let sinTheta := Exp.sin theta
-
-    let halfDim := headDim / 2
-    let colBase    := Exp.mul col (Exp.litU32 qDim)
-    let headOffset := Exp.mul head (Exp.litU32 headDim)
-    let idx0 := Exp.add (Exp.add colBase headOffset) dimPair
-    let idx1 := Exp.add (Exp.add colBase headOffset) (Exp.add dimPair (Exp.litU32 halfDim))
-
-    let x0 ← ShaderM.readBuffer (ty := .scalar .f32) (n := qDim * seqLen) "input" idx0
-    let x1 ← ShaderM.readBuffer (ty := .scalar .f32) (n := qDim * seqLen) "input" idx1
-
-    let x0_new := Exp.sub (Exp.mul x0 cosTheta) (Exp.mul x1 sinTheta)
-    let x1_new := Exp.add (Exp.mul x0 sinTheta) (Exp.mul x1 cosTheta)
-
-    ShaderM.writeBuffer (ty := .scalar .f32) "output" idx0 x0_new
-    ShaderM.writeBuffer (ty := .scalar .f32) "output" idx1 x1_new
-  ) (pure ())
-
-/-- Batched RoPE-K + KV cache write: for all `seqLen` tokens, rotate the K row,
-    write rotated K and unmodified V into the KV cache at slot `startPos + col`.
-
-    K/V input layout: [seqLen, numKVHeads, headDim] column-major
-    (`new_k[col * kvDim + kvH * headDim + d]`, kvDim = numKVHeads * headDim).
-    KV cache layout: [numKVHeads, maxSeqLen, headDim] (same as single-token).
-
-    `params[0]` = startPos.  Token at column `col` writes K/V to cache slot
-    `startPos + col`.  Grid: dispatch1D(numKVHeads * dimPairs * seqLen).  Each
-    thread processes one (col, kvHead, dimPair) — emits both rotated K
-    components AND the corresponding V at idx0/idx1. -/
-def fusedRopeKAndCacheWriteBatchKernel (numKVHeads maxSeqLen headDim seqLen : Nat)
-    (ropeBase : Float) : ShaderM Unit := do
-  let gid ← ShaderM.globalId
-  let idx := Exp.vec3X gid
-
-  let dimPairs := headDim / 2
-  let perTokenElems := numKVHeads * dimPairs
-  let totalElements := perTokenElems * seqLen
-  let kvDim := numKVHeads * headDim
-
-  let _newK   ← ShaderM.declareInputBuffer "new_k" (.array (.scalar .f32) (kvDim * seqLen))
-  let _newV   ← ShaderM.declareInputBuffer "new_v" (.array (.scalar .f32) (kvDim * seqLen))
-  let _kCache ← ShaderM.declareOutputBuffer "k_cache" (.array (.scalar .f32) (numKVHeads * maxSeqLen * headDim))
-  let _vCache ← ShaderM.declareOutputBuffer "v_cache" (.array (.scalar .f32) (numKVHeads * maxSeqLen * headDim))
-  let _params ← ShaderM.declareInputBuffer "params" (.array (.scalar .u32) 1)
-  let _freqFactors ← ShaderM.declareInputBuffer "freq_factors" (.array (.scalar .f32) dimPairs)
-
-  ShaderM.if_ (Exp.lt idx (Exp.litU32 totalElements)) (do
-    let col := Exp.div idx (Exp.litU32 perTokenElems)
-    let withinTok := Exp.sub idx (Exp.mul col (Exp.litU32 perTokenElems))
-    let dimPair := Exp.mod withinTok (Exp.litU32 dimPairs)
-    let kvHead  := Exp.div withinTok (Exp.litU32 dimPairs)
-
-    let startPos ← ShaderM.readBuffer (ty := .scalar .u32) (n := 1) "params" (Exp.litU32 0)
-    let pos := Exp.add startPos col
-    let posF32 := Exp.toF32 pos
-
-    let freqFactor ← ShaderM.readBuffer (ty := .scalar .f32) (n := dimPairs) "freq_factors" dimPair
-
-    let dimPairF32 := Exp.toF32 dimPair
-    let exponent := Exp.div (Exp.mul (Exp.litF32 2.0) dimPairF32) (Exp.litF32 headDim.toFloat)
-    let freqInv := Exp.pow (Exp.litF32 ropeBase) (Exp.neg exponent)
-    let theta := Exp.div (Exp.mul posF32 freqInv) freqFactor
-    let cosTheta := Exp.cos theta
-    let sinTheta := Exp.sin theta
-
-    let halfDim := headDim / 2
-    let colBase  := Exp.mul col (Exp.litU32 kvDim)
-    let kvHeadOffset := Exp.mul kvHead (Exp.litU32 headDim)
-    let inIdx0 := Exp.add (Exp.add colBase kvHeadOffset) dimPair
-    let inIdx1 := Exp.add (Exp.add colBase kvHeadOffset) (Exp.add dimPair (Exp.litU32 halfDim))
-
-    let k0 ← ShaderM.readBuffer (ty := .scalar .f32) (n := kvDim * seqLen) "new_k" inIdx0
-    let k1 ← ShaderM.readBuffer (ty := .scalar .f32) (n := kvDim * seqLen) "new_k" inIdx1
-    let v0 ← ShaderM.readBuffer (ty := .scalar .f32) (n := kvDim * seqLen) "new_v" inIdx0
-    let v1 ← ShaderM.readBuffer (ty := .scalar .f32) (n := kvDim * seqLen) "new_v" inIdx1
-
-    let k0_new := Exp.sub (Exp.mul k0 cosTheta) (Exp.mul k1 sinTheta)
-    let k1_new := Exp.add (Exp.mul k0 sinTheta) (Exp.mul k1 cosTheta)
-
-    -- KV cache slot for this token = startPos + col
-    let cacheBase := Exp.add (Exp.mul (Exp.mul kvHead (Exp.litU32 maxSeqLen)) (Exp.litU32 headDim))
-                              (Exp.mul pos (Exp.litU32 headDim))
-    let cIdx0 := Exp.add cacheBase dimPair
-    let cIdx1 := Exp.add cacheBase (Exp.add dimPair (Exp.litU32 halfDim))
-
-    ShaderM.writeBuffer (ty := .scalar .f32) "k_cache" cIdx0 k0_new
-    ShaderM.writeBuffer (ty := .scalar .f32) "k_cache" cIdx1 k1_new
-    ShaderM.writeBuffer (ty := .scalar .f32) "v_cache" cIdx0 v0
-    ShaderM.writeBuffer (ty := .scalar .f32) "v_cache" cIdx1 v1
-  ) (pure ())
-
-/-! ## Per-Head RMSNorm Kernel -/
-
-/-- Per-head RMSNorm: normalize each head independently.
-    Used for Q-norm, K-norm, V-norm in Gemma 4.
-    Input shape: [numHeads, headDim]
-    Each workgroup processes one head.
-
-    @param numHeads Number of heads
-    @param headDim Dimension per head
-    @param eps RMSNorm epsilon
--/
-def perHeadRMSNormKernel (numHeads headDim : Nat) (eps : Float) : ShaderM Unit := do
-  let wid ← ShaderM.workgroupId
-  let lid ← ShaderM.localId
-  let headIdx := Exp.vec3X wid
-  let tid := Exp.vec3X lid
-
-  let totalElements := numHeads * headDim
-
-  let _input ← ShaderM.declareInputBuffer "input" (.array (.scalar .f32) totalElements)
-  let _weight ← ShaderM.declareInputBuffer "weight" (.array (.scalar .f32) headDim)
-  let _output ← ShaderM.declareOutputBuffer "output" (.array (.scalar .f32) totalElements)
-
-  -- Shared memory for sum of squares reduction
-  let wgSize := if headDim < 256 then headDim else 256
-  ShaderM.sharedNamed "shared_sum" (.array (.scalar .f32) wgSize)
-
-  let headBase := Exp.mul headIdx (Exp.litU32 headDim)
-
-  -- Step 1: Compute sum of squares (cooperative)
-  ShaderM.varNamed "local_sum" (.scalar .f32) (Exp.litF32 0.0)
-  let localSum : Exp (.scalar .f32) := Exp.var "local_sum"
-
-  ShaderM.loop tid (Exp.litU32 headDim) (Exp.litU32 wgSize) fun i => do
-    let val ← ShaderM.readBuffer (ty := .scalar .f32) (n := totalElements) "input" (Exp.add headBase i)
-    ShaderM.assign "local_sum" (Exp.add localSum (Exp.mul val val))
-
-  ShaderM.writeWorkgroup (ty := .scalar .f32) "shared_sum" tid localSum
-  ShaderM.barrier
-
-  -- Tree reduction
-  let mut stride := wgSize / 2
-  while stride > 0 do
-    ShaderM.if_ (Exp.lt tid (Exp.litU32 stride)) (do
-      let a ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := wgSize) "shared_sum" tid
-      let b ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := wgSize) "shared_sum" (Exp.add tid (Exp.litU32 stride))
-      ShaderM.writeWorkgroup (ty := .scalar .f32) "shared_sum" tid (Exp.add a b)
-    ) (pure ())
-    ShaderM.barrier
-    stride := stride / 2
-
-  -- Step 2: Normalize and write output
-  let sumSq ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := wgSize) "shared_sum" (Exp.litU32 0)
-  let rms := Exp.inverseSqrt (Exp.add (Exp.div sumSq (Exp.litF32 headDim.toFloat)) (Exp.litF32 eps))
-
-  ShaderM.loop tid (Exp.litU32 headDim) (Exp.litU32 wgSize) fun i => do
-    let val ← ShaderM.readBuffer (ty := .scalar .f32) (n := totalElements) "input" (Exp.add headBase i)
-    let w ← ShaderM.readBuffer (ty := .scalar .f32) (n := headDim) "weight" i
-    let normed := Exp.mul (Exp.mul val rms) w
-    ShaderM.writeBuffer (ty := .scalar .f32) "output" (Exp.add headBase i) normed
-
-/-- Batched per-head RMSNorm: same math as `perHeadRMSNormKernel`, but
-    processes all `seqLen` tokens in one dispatch.
-
-    Input layout: `[numHeads * headDim, seqLen]` column-major.
-    Output layout: same.  Each workgroup handles one (head, token)
-    pair: `wid.x = head`, `wid.y = token`.  In-place is safe (each
-    thread reads and writes its own element). -/
-def perHeadRMSNormBatchKernel (numHeads headDim seqLen : Nat) (eps : Float) : ShaderM Unit := do
-  let wid ← ShaderM.workgroupId
-  let lid ← ShaderM.localId
-  let headIdx := Exp.vec3X wid
-  let tokIdx  := Exp.vec3Y wid
-  let tid := Exp.vec3X lid
-
-  let qDim := numHeads * headDim
-  let totalElements := qDim * seqLen
-
-  let _input ← ShaderM.declareInputBuffer "input" (.array (.scalar .f32) totalElements)
-  let _weight ← ShaderM.declareInputBuffer "weight" (.array (.scalar .f32) headDim)
-  let _output ← ShaderM.declareOutputBuffer "output" (.array (.scalar .f32) totalElements)
-
-  let wgSize := if headDim < 256 then headDim else 256
-  ShaderM.sharedNamed "shared_sum" (.array (.scalar .f32) wgSize)
-
-  -- Offset into the batch buffer for this (token, head): col-major
-  -- column stride = qDim; within the column, head starts at head*headDim.
-  let colBase := Exp.mul tokIdx (Exp.litU32 qDim)
-  let headBase := Exp.add colBase (Exp.mul headIdx (Exp.litU32 headDim))
-
-  ShaderM.varNamed "local_sum" (.scalar .f32) (Exp.litF32 0.0)
-  let localSum : Exp (.scalar .f32) := Exp.var "local_sum"
-
-  ShaderM.loop tid (Exp.litU32 headDim) (Exp.litU32 wgSize) fun i => do
-    let val ← ShaderM.readBuffer (ty := .scalar .f32) (n := totalElements) "input" (Exp.add headBase i)
-    ShaderM.assign "local_sum" (Exp.add localSum (Exp.mul val val))
-
-  ShaderM.writeWorkgroup (ty := .scalar .f32) "shared_sum" tid localSum
-  ShaderM.barrier
-
-  let mut stride := wgSize / 2
-  while stride > 0 do
-    ShaderM.if_ (Exp.lt tid (Exp.litU32 stride)) (do
-      let a ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := wgSize) "shared_sum" tid
-      let b ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := wgSize) "shared_sum" (Exp.add tid (Exp.litU32 stride))
-      ShaderM.writeWorkgroup (ty := .scalar .f32) "shared_sum" tid (Exp.add a b)
-    ) (pure ())
-    ShaderM.barrier
-    stride := stride / 2
-
-  let sumSq ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := wgSize) "shared_sum" (Exp.litU32 0)
-  let rms := Exp.inverseSqrt (Exp.add (Exp.div sumSq (Exp.litF32 headDim.toFloat)) (Exp.litF32 eps))
-
-  ShaderM.loop tid (Exp.litU32 headDim) (Exp.litU32 wgSize) fun i => do
-    let val ← ShaderM.readBuffer (ty := .scalar .f32) (n := totalElements) "input" (Exp.add headBase i)
-    let w ← ShaderM.readBuffer (ty := .scalar .f32) (n := headDim) "weight" i
-    let normed := Exp.mul (Exp.mul val rms) w
-    ShaderM.writeBuffer (ty := .scalar .f32) "output" (Exp.add headBase i) normed
-
-/-! ## Bare RMSNorm Kernels (no learned weights) -/
-
-/-- Per-head bare RMSNorm: normalize each head independently (no learned weights).
-    Used for V-norm in Gemma 4: each KV head's `headDim` elements are normalized
-    by their own RMS. Total input size is `numHeads * headDim`.
-
-    One workgroup per head (numHeads workgroups). Within each workgroup,
-    threads cooperate on a tree reduction over `headDim` elements. -/
-def perHeadBareRMSNormKernel (numHeads headDim : Nat) (eps : Float) (workgroupSize : Nat := 256) : ShaderM Unit := do
-  let wid ← ShaderM.workgroupId
-  let lid ← ShaderM.localId
-  let headIdx := Exp.vec3X wid
-  let tid := Exp.vec3X lid
-
-  let totalElements := numHeads * headDim
-
-  let _input ← ShaderM.declareInputBuffer "input" (.array (.scalar .f32) totalElements)
-  let _output ← ShaderM.declareOutputBuffer "output" (.array (.scalar .f32) totalElements)
-
-  ShaderM.sharedNamed "shared_sum" (.array (.scalar .f32) workgroupSize)
-
-  let headBase := Exp.mul headIdx (Exp.litU32 headDim)
-
-  -- Step 1: sum of squares for this head
-  ShaderM.varNamed "local_sum" (.scalar .f32) (Exp.litF32 0.0)
-  let localSum : Exp (.scalar .f32) := Exp.var "local_sum"
-
-  ShaderM.loop tid (Exp.litU32 headDim) (Exp.litU32 workgroupSize) fun i => do
-    let val ← ShaderM.readBuffer (ty := .scalar .f32) (n := totalElements) "input" (Exp.add headBase i)
-    ShaderM.assign "local_sum" (Exp.add localSum (Exp.mul val val))
-
-  ShaderM.writeWorkgroup (ty := .scalar .f32) "shared_sum" tid localSum
-  ShaderM.barrier
-
-  -- Tree reduction
-  let mut stride := workgroupSize / 2
-  while stride > 0 do
-    ShaderM.if_ (Exp.lt tid (Exp.litU32 stride)) (do
-      let a ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := workgroupSize) "shared_sum" tid
-      let b ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := workgroupSize) "shared_sum" (Exp.add tid (Exp.litU32 stride))
-      ShaderM.writeWorkgroup (ty := .scalar .f32) "shared_sum" tid (Exp.add a b)
-    ) (pure ())
-    ShaderM.barrier
-    stride := stride / 2
-
-  -- Step 2: normalize (no weight multiplication)
-  let sumSq ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := workgroupSize) "shared_sum" (Exp.litU32 0)
-  let rms := Exp.inverseSqrt (Exp.add (Exp.div sumSq (Exp.litF32 headDim.toFloat)) (Exp.litF32 eps))
-
-  ShaderM.loop tid (Exp.litU32 headDim) (Exp.litU32 workgroupSize) fun i => do
-    let val ← ShaderM.readBuffer (ty := .scalar .f32) (n := totalElements) "input" (Exp.add headBase i)
-    ShaderM.writeBuffer (ty := .scalar .f32) "output" (Exp.add headBase i) (Exp.mul val rms)
-
-/-- Fused per-head qNorm + kNorm + vNorm, 3 separate dispatches collapsed
-    into one.
-
-    Dispatch: `(numHeads, 3, 1)`, workgroup size `min headDim 256`.
-    `wg_id.y` multiplexes:
-      0 = qNorm  (learned scale; active for `wg_id.x < numHeads`)
-      1 = kNorm  (learned scale; active for `wg_id.x < numKVHeads`)
-      2 = vNorm  (NO scale;      active for `wg_id.x < numKVHeads`)
-
-    Each WG handles exactly one head's `[headDim]` slice: cooperative
-    sum-of-squares + tree reduction + per-lane normalise-and-write.
-    Identical math to `perHeadRMSNormKernel` / `perHeadBareRMSNormKernel`
-    — just multiplexed by the grid's y dimension.
-
-    WGs outside the valid head range (`wg_id.y in {1,2}` and
-    `wg_id.x >= numKVHeads`) early-return BEFORE touching shared memory
-    or barriers.  That's safe because `wg_id.x/y` are workgroup-uniform:
-    the whole WG takes the same branch so no lane ever reaches a
-    barrier its siblings skipped.
-
-    Saves 2 dispatches per `cfg.hasKV` layer per token (3 → 1). -/
-def fusedPerHeadQKVNormKernel
-    (numHeads numKVHeads headDim : Nat) (eps : Float) : ShaderM Unit := do
-  let wid ← ShaderM.workgroupId
-  let lid ← ShaderM.localId
-  let headIdx := Exp.vec3X wid
-  let yIdx := Exp.vec3Y wid
-  let tid := Exp.vec3X lid
-  let qTotal := numHeads * headDim
-  let kvTotal := numKVHeads * headDim
-  -- Buffer declarations.  All six (q in/scale/out, k in/scale/out, v
-  -- in/out) are bound; the branch picks which ones this WG reads.
-  let _qIn    ← ShaderM.declareInputBuffer  "q_in"    (.array (.scalar .f32) qTotal)
-  let _qScale ← ShaderM.declareInputBuffer  "q_scale" (.array (.scalar .f32) headDim)
-  let _qOut   ← ShaderM.declareOutputBuffer "q_out"   (.array (.scalar .f32) qTotal)
-  let _kIn    ← ShaderM.declareInputBuffer  "k_in"    (.array (.scalar .f32) kvTotal)
-  let _kScale ← ShaderM.declareInputBuffer  "k_scale" (.array (.scalar .f32) headDim)
-  let _kOut   ← ShaderM.declareOutputBuffer "k_out"   (.array (.scalar .f32) kvTotal)
-  let _vIn    ← ShaderM.declareInputBuffer  "v_in"    (.array (.scalar .f32) kvTotal)
-  let _vOut   ← ShaderM.declareOutputBuffer "v_out"   (.array (.scalar .f32) kvTotal)
-  let wgSize := if headDim < 256 then headDim else 256
-  ShaderM.sharedNamed "shared_sum" (.array (.scalar .f32) wgSize)
-  -- Early-return for K/V lanes beyond numKVHeads.  All lanes of the WG
-  -- share `headIdx` and `yIdx`, so the branch is WG-uniform — safe to
-  -- skip the entire body (including barriers).
-  let invalidKV : Exp (.scalar .bool) :=
-    Exp.and (Exp.ne yIdx (Exp.litU32 0))
-            (Exp.ge headIdx (Exp.litU32 numKVHeads))
-  ShaderM.if_ invalidKV (pure ()) (do
-    -- Pick input and output buffer pair per y.  Reads from unused
-    -- buffers are gated by the `ShaderM.if_` tree below so we never
-    -- issue a load against a mismatched size.
-    let headBase := Exp.mul headIdx (Exp.litU32 headDim)
-    ShaderM.varNamed "local_sum" (.scalar .f32) (Exp.litF32 0.0)
-    let localSum : Exp (.scalar .f32) := Exp.var "local_sum"
-    -- ── Phase 1: cooperative sum-of-squares for this head/variant ──
-    ShaderM.loop tid (Exp.litU32 headDim) (Exp.litU32 wgSize) fun i => do
-      let elemIdx := Exp.add headBase i
-      ShaderM.if_ (Exp.eq yIdx (Exp.litU32 0)) (do
-        let v ← ShaderM.readBuffer (ty := .scalar .f32) (n := qTotal) "q_in" elemIdx
-        ShaderM.assign "local_sum" (Exp.add localSum (Exp.mul v v))
-      ) (do
-        ShaderM.if_ (Exp.eq yIdx (Exp.litU32 1)) (do
-          let v ← ShaderM.readBuffer (ty := .scalar .f32) (n := kvTotal) "k_in" elemIdx
-          ShaderM.assign "local_sum" (Exp.add localSum (Exp.mul v v))
-        ) (do
-          let v ← ShaderM.readBuffer (ty := .scalar .f32) (n := kvTotal) "v_in" elemIdx
-          ShaderM.assign "local_sum" (Exp.add localSum (Exp.mul v v)))
-      )
-    ShaderM.writeWorkgroup (ty := .scalar .f32) "shared_sum" tid localSum
-    ShaderM.barrier
-    -- Tree reduction.
-    let mut stride := wgSize / 2
-    while stride > 0 do
-      ShaderM.if_ (Exp.lt tid (Exp.litU32 stride)) (do
-        let a ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := wgSize) "shared_sum" tid
-        let b ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := wgSize) "shared_sum"
-                  (Exp.add tid (Exp.litU32 stride))
-        ShaderM.writeWorkgroup (ty := .scalar .f32) "shared_sum" tid (Exp.add a b)
-      ) (pure ())
-      ShaderM.barrier
-      stride := stride / 2
-    -- ── Phase 2: normalise and write output ──
-    let sumSq ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := wgSize) "shared_sum" (Exp.litU32 0)
-    let rms := Exp.inverseSqrt
-                 (Exp.add (Exp.div sumSq (Exp.litF32 headDim.toFloat))
-                          (Exp.litF32 eps))
-    let rmsName ← ShaderM.var (.scalar .f32) rms
-    let rmsRef : Exp (.scalar .f32) := Exp.var rmsName
-    ShaderM.loop tid (Exp.litU32 headDim) (Exp.litU32 wgSize) fun i => do
-      let elemIdx := Exp.add headBase i
-      ShaderM.if_ (Exp.eq yIdx (Exp.litU32 0)) (do
-        let v ← ShaderM.readBuffer (ty := .scalar .f32) (n := qTotal) "q_in" elemIdx
-        let w ← ShaderM.readBuffer (ty := .scalar .f32) (n := headDim) "q_scale" i
-        let normed := Exp.mul (Exp.mul v rmsRef) w
-        ShaderM.writeBuffer (ty := .scalar .f32) "q_out" elemIdx normed
-      ) (do
-        ShaderM.if_ (Exp.eq yIdx (Exp.litU32 1)) (do
-          let v ← ShaderM.readBuffer (ty := .scalar .f32) (n := kvTotal) "k_in" elemIdx
-          let w ← ShaderM.readBuffer (ty := .scalar .f32) (n := headDim) "k_scale" i
-          let normed := Exp.mul (Exp.mul v rmsRef) w
-          ShaderM.writeBuffer (ty := .scalar .f32) "k_out" elemIdx normed
-        ) (do
-          let v ← ShaderM.readBuffer (ty := .scalar .f32) (n := kvTotal) "v_in" elemIdx
-          ShaderM.writeBuffer (ty := .scalar .f32) "v_out" elemIdx (Exp.mul v rmsRef))
-      )
-  )
-
-/-- Batched fused per-head Q/K/V RMSNorm.  Same algorithm as
-    `fusedPerHeadQKVNormKernel` but processes `seqLen` query tokens in a
-    single dispatch.
-
-    Q/K/V column-major batch layout:
-    - q[col * (numHeads * headDim) + h * headDim + d]
-    - k[col * (numKVHeads * headDim) + kh * headDim + d]
-    - v[col * (numKVHeads * headDim) + kh * headDim + d]
-
-    Grid: (numHeads * seqLen, 3, 1) — wgid.x packs (col * numHeads + head),
-    wgid.y = which variant (0=Q, 1=K, 2=V).  Per-WG decomposes:
-        col  = wgid.x / numHeads
-        head = wgid.x % numHeads
-    (vec3Z is not exposed in Hesper.WGSL.Exp; pack into x instead.) -/
-def fusedPerHeadQKVNormBatchKernel
-    (numHeads numKVHeads headDim seqLen : Nat) (eps : Float) : ShaderM Unit := do
-  let wid ← ShaderM.workgroupId
-  let lid ← ShaderM.localId
-  let packed  := Exp.vec3X wid
-  let yIdx    := Exp.vec3Y wid
-  let colIdx  := Exp.div packed (Exp.litU32 numHeads)
-  let headIdx := Exp.sub packed (Exp.mul colIdx (Exp.litU32 numHeads))
-  let tid     := Exp.vec3X lid
-  let qTotal  := numHeads * headDim
-  let kvTotal := numKVHeads * headDim
-  let _qIn    ← ShaderM.declareInputBuffer  "q_in"    (.array (.scalar .f32) (qTotal * seqLen))
-  let _qScale ← ShaderM.declareInputBuffer  "q_scale" (.array (.scalar .f32) headDim)
-  let _qOut   ← ShaderM.declareOutputBuffer "q_out"   (.array (.scalar .f32) (qTotal * seqLen))
-  let _kIn    ← ShaderM.declareInputBuffer  "k_in"    (.array (.scalar .f32) (kvTotal * seqLen))
-  let _kScale ← ShaderM.declareInputBuffer  "k_scale" (.array (.scalar .f32) headDim)
-  let _kOut   ← ShaderM.declareOutputBuffer "k_out"   (.array (.scalar .f32) (kvTotal * seqLen))
-  let _vIn    ← ShaderM.declareInputBuffer  "v_in"    (.array (.scalar .f32) (kvTotal * seqLen))
-  let _vOut   ← ShaderM.declareOutputBuffer "v_out"   (.array (.scalar .f32) (kvTotal * seqLen))
-  let wgSize := if headDim < 256 then headDim else 256
-  ShaderM.sharedNamed "shared_sum" (.array (.scalar .f32) wgSize)
-  let invalidKV : Exp (.scalar .bool) :=
-    Exp.and (Exp.ne yIdx (Exp.litU32 0))
-            (Exp.ge headIdx (Exp.litU32 numKVHeads))
-  ShaderM.if_ invalidKV (pure ()) (do
-    let qColBase  := Exp.add (Exp.mul colIdx (Exp.litU32 qTotal))
-                              (Exp.mul headIdx (Exp.litU32 headDim))
-    let kvColBase := Exp.add (Exp.mul colIdx (Exp.litU32 kvTotal))
-                              (Exp.mul headIdx (Exp.litU32 headDim))
-    ShaderM.varNamed "local_sum" (.scalar .f32) (Exp.litF32 0.0)
-    let localSum : Exp (.scalar .f32) := Exp.var "local_sum"
-    ShaderM.loop tid (Exp.litU32 headDim) (Exp.litU32 wgSize) fun i => do
-      ShaderM.if_ (Exp.eq yIdx (Exp.litU32 0)) (do
-        let v ← ShaderM.readBuffer (ty := .scalar .f32) (n := qTotal * seqLen) "q_in"
-                  (Exp.add qColBase i)
-        ShaderM.assign "local_sum" (Exp.add localSum (Exp.mul v v))
-      ) (do
-        ShaderM.if_ (Exp.eq yIdx (Exp.litU32 1)) (do
-          let v ← ShaderM.readBuffer (ty := .scalar .f32) (n := kvTotal * seqLen) "k_in"
-                    (Exp.add kvColBase i)
-          ShaderM.assign "local_sum" (Exp.add localSum (Exp.mul v v))
-        ) (do
-          let v ← ShaderM.readBuffer (ty := .scalar .f32) (n := kvTotal * seqLen) "v_in"
-                    (Exp.add kvColBase i)
-          ShaderM.assign "local_sum" (Exp.add localSum (Exp.mul v v)))
-      )
-    ShaderM.writeWorkgroup (ty := .scalar .f32) "shared_sum" tid localSum
-    ShaderM.barrier
-    let mut stride := wgSize / 2
-    while stride > 0 do
-      ShaderM.if_ (Exp.lt tid (Exp.litU32 stride)) (do
-        let a ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := wgSize) "shared_sum" tid
-        let b ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := wgSize) "shared_sum"
-                  (Exp.add tid (Exp.litU32 stride))
-        ShaderM.writeWorkgroup (ty := .scalar .f32) "shared_sum" tid (Exp.add a b)
-      ) (pure ())
-      ShaderM.barrier
-      stride := stride / 2
-    let sumSq ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := wgSize) "shared_sum" (Exp.litU32 0)
-    let rms := Exp.inverseSqrt
-                 (Exp.add (Exp.div sumSq (Exp.litF32 headDim.toFloat))
-                          (Exp.litF32 eps))
-    let rmsName ← ShaderM.var (.scalar .f32) rms
-    let rmsRef : Exp (.scalar .f32) := Exp.var rmsName
-    ShaderM.loop tid (Exp.litU32 headDim) (Exp.litU32 wgSize) fun i => do
-      ShaderM.if_ (Exp.eq yIdx (Exp.litU32 0)) (do
-        let v ← ShaderM.readBuffer (ty := .scalar .f32) (n := qTotal * seqLen) "q_in"
-                  (Exp.add qColBase i)
-        let w ← ShaderM.readBuffer (ty := .scalar .f32) (n := headDim) "q_scale" i
-        ShaderM.writeBuffer (ty := .scalar .f32) "q_out" (Exp.add qColBase i)
-          (Exp.mul (Exp.mul v rmsRef) w)
-      ) (do
-        ShaderM.if_ (Exp.eq yIdx (Exp.litU32 1)) (do
-          let v ← ShaderM.readBuffer (ty := .scalar .f32) (n := kvTotal * seqLen) "k_in"
-                    (Exp.add kvColBase i)
-          let w ← ShaderM.readBuffer (ty := .scalar .f32) (n := headDim) "k_scale" i
-          ShaderM.writeBuffer (ty := .scalar .f32) "k_out" (Exp.add kvColBase i)
-            (Exp.mul (Exp.mul v rmsRef) w)
-        ) (do
-          let v ← ShaderM.readBuffer (ty := .scalar .f32) (n := kvTotal * seqLen) "v_in"
-                    (Exp.add kvColBase i)
-          ShaderM.writeBuffer (ty := .scalar .f32) "v_out" (Exp.add kvColBase i)
-            (Exp.mul v rmsRef)))
-  )
-
-/-- Legacy: bare RMSNorm over a single vector of size `dim`. Kept for backward
-    compatibility; for Gemma 4 V-norm use perHeadBareRMSNormKernel instead. -/
-def bareRMSNormKernel (dim : Nat) (eps : Float) (workgroupSize : Nat := 256) : ShaderM Unit := do
-  let wid ← ShaderM.workgroupId
-  let lid ← ShaderM.localId
-  let _rowIdx := Exp.vec3X wid
-  let tid := Exp.vec3X lid
-
-  let _input ← ShaderM.declareInputBuffer "input" (.array (.scalar .f32) dim)
-  let _output ← ShaderM.declareOutputBuffer "output" (.array (.scalar .f32) dim)
-
-  ShaderM.sharedNamed "shared_sum" (.array (.scalar .f32) workgroupSize)
-
-  -- Step 1: Compute sum of squares
-  ShaderM.varNamed "local_sum" (.scalar .f32) (Exp.litF32 0.0)
-  let localSum : Exp (.scalar .f32) := Exp.var "local_sum"
-
-  ShaderM.loop tid (Exp.litU32 dim) (Exp.litU32 workgroupSize) fun i => do
-    let val ← ShaderM.readBuffer (ty := .scalar .f32) (n := dim) "input" i
-    ShaderM.assign "local_sum" (Exp.add localSum (Exp.mul val val))
-
-  ShaderM.writeWorkgroup (ty := .scalar .f32) "shared_sum" tid localSum
-  ShaderM.barrier
-
-  -- Tree reduction
-  let mut stride := workgroupSize / 2
-  while stride > 0 do
-    ShaderM.if_ (Exp.lt tid (Exp.litU32 stride)) (do
-      let a ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := workgroupSize) "shared_sum" tid
-      let b ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := workgroupSize) "shared_sum" (Exp.add tid (Exp.litU32 stride))
-      ShaderM.writeWorkgroup (ty := .scalar .f32) "shared_sum" tid (Exp.add a b)
-    ) (pure ())
-    ShaderM.barrier
-    stride := stride / 2
-
-  -- Step 2: Normalize (no weight multiplication)
-  let sumSq ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := workgroupSize) "shared_sum" (Exp.litU32 0)
-  let rms := Exp.inverseSqrt (Exp.add (Exp.div sumSq (Exp.litF32 dim.toFloat)) (Exp.litF32 eps))
-
-  ShaderM.loop tid (Exp.litU32 dim) (Exp.litU32 workgroupSize) fun i => do
-    let val ← ShaderM.readBuffer (ty := .scalar .f32) (n := dim) "input" i
-    ShaderM.writeBuffer (ty := .scalar .f32) "output" i (Exp.mul val rms)
-
-/-! ## Per-Layer Embedding Helpers -/
-
-/-- Scaled add: output = (a + b) * scale (avoids aliasing if a/b/output distinct) -/
-def scaledAddKernel (size : Nat) (scale : Float) : ShaderM Unit := do
-  let gid ← ShaderM.globalId
-  let idx := Exp.vec3X gid
-  let _a ← ShaderM.declareInputBuffer "a" (.array (.scalar .f32) size)
-  let _b ← ShaderM.declareInputBuffer "b" (.array (.scalar .f32) size)
-  let _output ← ShaderM.declareOutputBuffer "output" (.array (.scalar .f32) size)
-  ShaderM.if_ (Exp.lt idx (Exp.litU32 size)) (do
-    let aVal ← ShaderM.readBuffer (ty := .scalar .f32) (n := size) "a" idx
-    let bVal ← ShaderM.readBuffer (ty := .scalar .f32) (n := size) "b" idx
-    let result := Exp.mul (Exp.add aVal bVal) (Exp.litF32 scale)
-    ShaderM.writeBuffer (ty := .scalar .f32) "output" idx result
-  ) (pure ())
-
-/-- Per-layer RMSNorm: normalize each `chunkDim`-sized chunk independently with shared weights.
-    Used for per_layer_proj_norm which normalizes [embdPerLayer * numLayers] in chunks of embdPerLayer.
-
-    One workgroup per chunk. Each workgroup computes RMS over its own chunk.
-
-    @param chunkDim Size of each chunk (e.g. embdPerLayer = 256)
-    @param numChunks Number of chunks (e.g. numLayers = 42)
-    @param eps RMSNorm epsilon
--/
-def chunkedRMSNormKernel (chunkDim numChunks : Nat) (eps : Float) (workgroupSize : Nat := 256) : ShaderM Unit := do
-  let wid ← ShaderM.workgroupId
-  let lid ← ShaderM.localId
-  let chunkIdx := Exp.vec3X wid
-  let tid := Exp.vec3X lid
-
-  let totalElements := chunkDim * numChunks
-  let _input ← ShaderM.declareInputBuffer "input" (.array (.scalar .f32) totalElements)
-  let _weight ← ShaderM.declareInputBuffer "weight" (.array (.scalar .f32) chunkDim)
-  let _output ← ShaderM.declareOutputBuffer "output" (.array (.scalar .f32) totalElements)
-
-  ShaderM.sharedNamed "shared_sum" (.array (.scalar .f32) workgroupSize)
-
-  let chunkBase := Exp.mul chunkIdx (Exp.litU32 chunkDim)
-
-  -- Step 1: sum of squares
-  ShaderM.varNamed "local_sum" (.scalar .f32) (Exp.litF32 0.0)
-  let localSum : Exp (.scalar .f32) := Exp.var "local_sum"
-
-  ShaderM.loop tid (Exp.litU32 chunkDim) (Exp.litU32 workgroupSize) fun i => do
-    let val ← ShaderM.readBuffer (ty := .scalar .f32) (n := totalElements) "input" (Exp.add chunkBase i)
-    ShaderM.assign "local_sum" (Exp.add localSum (Exp.mul val val))
-
-  ShaderM.writeWorkgroup (ty := .scalar .f32) "shared_sum" tid localSum
-  ShaderM.barrier
-
-  -- Tree reduction
-  let mut stride := workgroupSize / 2
-  while stride > 0 do
-    ShaderM.if_ (Exp.lt tid (Exp.litU32 stride)) (do
-      let a ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := workgroupSize) "shared_sum" tid
-      let b ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := workgroupSize) "shared_sum" (Exp.add tid (Exp.litU32 stride))
-      ShaderM.writeWorkgroup (ty := .scalar .f32) "shared_sum" tid (Exp.add a b)
-    ) (pure ())
-    ShaderM.barrier
-    stride := stride / 2
-
-  -- Step 2: normalize and apply weight
-  let sumSq ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := workgroupSize) "shared_sum" (Exp.litU32 0)
-  let rms := Exp.inverseSqrt (Exp.add (Exp.div sumSq (Exp.litF32 chunkDim.toFloat)) (Exp.litF32 eps))
-
-  ShaderM.loop tid (Exp.litU32 chunkDim) (Exp.litU32 workgroupSize) fun i => do
-    let val ← ShaderM.readBuffer (ty := .scalar .f32) (n := totalElements) "input" (Exp.add chunkBase i)
-    let w ← ShaderM.readBuffer (ty := .scalar .f32) (n := chunkDim) "weight" i
-    let result := Exp.mul (Exp.mul val rms) w
-    ShaderM.writeBuffer (ty := .scalar .f32) "output" (Exp.add chunkBase i) result
-
-/-- Fused (pre-scale + chunked RMSNorm + weight + residual-add + post-scale)
-    kernel — single dispatch over `chunkDim × numChunks` elements.
-
-    Equivalent to the sequence:
-      scaled[i]  = input[i] * preScale
-      normed[i]  = rmsNorm(scaled, chunk)[i] * weight[i % chunkDim]
-      output[i]  = (normed[i] + residual[i]) * addScale
-
-    Replaces (pleScalePL + chunkedRMSNorm + scaledAdd) — three dispatches
-    over `totalPL = embdPL × numHiddenLayers` elements — with one.
-
-    Math: rmsNorm(x * C) = (x * C) / sqrt(mean((x*C)²) + ε)
-                       = (x * C) / sqrt(C² * mean(x²) + ε)
-    so the kernel computes `meanSq = mean(input²)` then
-    `invRms = 1 / sqrt(C² * meanSq + ε)` and applies
-    `normed[i] = input[i] * C * invRms * weight[i % chunk]`.
-    Exact equivalent to running the 3 kernels in sequence (no
-    approximation in the ε term). -/
-def chunkedRMSNormAddScaledKernel (chunkDim numChunks : Nat)
-    (eps preScale addScale : Float)
-    (workgroupSize : Nat := 256) : ShaderM Unit := do
-  let wid ← ShaderM.workgroupId
-  let lid ← ShaderM.localId
-  let chunkIdx := Exp.vec3X wid
-  let tid := Exp.vec3X lid
-
-  let totalElements := chunkDim * numChunks
-  let _input ← ShaderM.declareInputBuffer "input" (.array (.scalar .f32) totalElements)
-  let _weight ← ShaderM.declareInputBuffer "weight" (.array (.scalar .f32) chunkDim)
-  let _residual ← ShaderM.declareInputBuffer "residual" (.array (.scalar .f32) totalElements)
-  let _output ← ShaderM.declareOutputBuffer "output" (.array (.scalar .f32) totalElements)
-
-  ShaderM.sharedNamed "shared_sum" (.array (.scalar .f32) workgroupSize)
-
-  let chunkBase := Exp.mul chunkIdx (Exp.litU32 chunkDim)
-
-  ShaderM.varNamed "local_sum" (.scalar .f32) (Exp.litF32 0.0)
-  let localSum : Exp (.scalar .f32) := Exp.var "local_sum"
-
-  ShaderM.loop tid (Exp.litU32 chunkDim) (Exp.litU32 workgroupSize) fun i => do
-    let val ← ShaderM.readBuffer (ty := .scalar .f32) (n := totalElements) "input" (Exp.add chunkBase i)
-    ShaderM.assign "local_sum" (Exp.add localSum (Exp.mul val val))
-
-  ShaderM.writeWorkgroup (ty := .scalar .f32) "shared_sum" tid localSum
-  ShaderM.barrier
-
-  let mut stride := workgroupSize / 2
-  while stride > 0 do
-    ShaderM.if_ (Exp.lt tid (Exp.litU32 stride)) (do
-      let a ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := workgroupSize) "shared_sum" tid
-      let b ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := workgroupSize) "shared_sum" (Exp.add tid (Exp.litU32 stride))
-      ShaderM.writeWorkgroup (ty := .scalar .f32) "shared_sum" tid (Exp.add a b)
-    ) (pure ())
-    ShaderM.barrier
-    stride := stride / 2
-
-  let sumSq ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := workgroupSize) "shared_sum" (Exp.litU32 0)
-  -- meanSq(input * preScale) = preScale² * meanSq(input).
-  let preScaleSq : Float := preScale * preScale
-  let scaledMeanSq := Exp.mul (Exp.litF32 preScaleSq)
-                               (Exp.div sumSq (Exp.litF32 chunkDim.toFloat))
-  let rms := Exp.inverseSqrt (Exp.add scaledMeanSq (Exp.litF32 eps))
-
-  ShaderM.loop tid (Exp.litU32 chunkDim) (Exp.litU32 workgroupSize) fun i => do
-    let val ← ShaderM.readBuffer (ty := .scalar .f32) (n := totalElements) "input" (Exp.add chunkBase i)
-    let w ← ShaderM.readBuffer (ty := .scalar .f32) (n := chunkDim) "weight" i
-    let r ← ShaderM.readBuffer (ty := .scalar .f32) (n := totalElements) "residual" (Exp.add chunkBase i)
-    let scaled := Exp.mul val (Exp.litF32 preScale)
-    let normed := Exp.mul (Exp.mul scaled rms) w
-    let result := Exp.mul (Exp.add normed r) (Exp.litF32 addScale)
-    ShaderM.writeBuffer (ty := .scalar .f32) "output" (Exp.add chunkBase i) result
-
-/-! ## CPU Q6_K Row Dequant -/
-
-/-- Dequantize a single Q6_K row to F32 ByteArray on CPU.
-    Used to extract a per-token slice of large Q6_K tables that don't fit in
-    a single WebGPU storage buffer binding (e.g. per_layer_token_embd).
-
-    Each block is 256 elements, 210 bytes:
-    - bytes [0..128):  ql (low 4 bits, 2 vals/byte)
-    - bytes [128..192): qh (high 2 bits, 4 vals/byte)
-    - bytes [192..208): scales[16] (int8)
-    - bytes [208..210): d (FP16)
-
-    @param data Source ByteArray (e.g. full per_layer_token_embd)
-    @param rowOffset Byte offset of the row start within data
-    @param numElements Total elements per row (must be multiple of 256)
-    @return Float array of length numElements
--/
-def dequantQ6KRowCPU (data : ByteArray) (rowOffset numElements : Nat) : Array Float := Id.run do
-  let numBlocks := numElements / 256
-  let blockBytes := 210
-  let mut out : Array Float := (List.replicate numElements (0.0 : Float)).toArray
-  for bi in [0:numBlocks] do
-    let blockBase := rowOffset + bi * blockBytes
-    let outBase := bi * 256
-    -- Read d (FP16) at offset 208
-    let dLo := (data.get! (blockBase + 208)).toUInt32
-    let dHi := (data.get! (blockBase + 209)).toUInt32
-    let dBits := dLo ||| (dHi <<< 8)
-    -- FP16 → F32 (with subnormal support)
-    let sign := (dBits >>> 15) &&& 1
-    let exp5 := (dBits >>> 10) &&& 0x1F
-    let mant := dBits &&& 0x3FF
-    let signF : Float := if sign == 1 then -1.0 else 1.0
-    let d : Float :=
-      if exp5 == 0 then
-        -- Subnormal: (mant / 1024) * 2^(-14)
-        signF * (mant.toNat.toFloat / 1024.0) * 6.103515625e-5
-      else
-        -- Normal: (1 + mant/1024) * 2^(exp - 15)
-        signF * (1.0 + mant.toNat.toFloat / 1024.0) * (2.0 ^ (exp5.toNat.toFloat - 15.0))
-    -- Process 2 chunks of 128 elements (n = 0, 128 in llama.cpp)
-    for chunk in [0:2] do
-      let qlBase := blockBase + chunk * 64       -- ql offset: chunk*64 within block
-      let qhBase := blockBase + 128 + chunk * 32 -- qh offset: 128 + chunk*32
-      let scBase := blockBase + 192 + chunk * 8  -- scales offset: 192 + chunk*8
-      let chunkOutBase := outBase + chunk * 128
-      for l in [0:32] do
-        let isIdx := l / 16  -- 0 or 1, picks scale within sub-block
-        let qlByte0 := (data.get! (qlBase + l)).toNat
-        let qlByte1 := (data.get! (qlBase + 32 + l)).toNat
-        let qhByte := (data.get! (qhBase + l)).toNat
-        -- Sign-extend int8 → Float manually
-        let sc0Raw := (data.get! (scBase + isIdx)).toNat
-        let sc2Raw := (data.get! (scBase + isIdx + 2)).toNat
-        let sc4Raw := (data.get! (scBase + isIdx + 4)).toNat
-        let sc6Raw := (data.get! (scBase + isIdx + 6)).toNat
-        let sc0F : Float := if sc0Raw >= 128 then (sc0Raw.toFloat - 256.0) else sc0Raw.toFloat
-        let sc2F : Float := if sc2Raw >= 128 then (sc2Raw.toFloat - 256.0) else sc2Raw.toFloat
-        let sc4F : Float := if sc4Raw >= 128 then (sc4Raw.toFloat - 256.0) else sc4Raw.toFloat
-        let sc6F : Float := if sc6Raw >= 128 then (sc6Raw.toFloat - 256.0) else sc6Raw.toFloat
-        -- q1..q4 are 6-bit unsigned (0..63), then offset by -32 to get [-32..31]
-        -- Compute as Nat, then convert to Float, then subtract 32.0
-        let q1Raw := (qlByte0 &&& 0xF) ||| (((qhByte >>> 0) &&& 3) <<< 4)
-        let q2Raw := (qlByte1 &&& 0xF) ||| (((qhByte >>> 2) &&& 3) <<< 4)
-        let q3Raw := (qlByte0 >>> 4) ||| (((qhByte >>> 4) &&& 3) <<< 4)
-        let q4Raw := (qlByte1 >>> 4) ||| (((qhByte >>> 6) &&& 3) <<< 4)
-        let q1F : Float := q1Raw.toFloat - 32.0
-        let q2F : Float := q2Raw.toFloat - 32.0
-        let q3F : Float := q3Raw.toFloat - 32.0
-        let q4F : Float := q4Raw.toFloat - 32.0
-        out := out.set! (chunkOutBase + l)      (d * sc0F * q1F)
-        out := out.set! (chunkOutBase + l + 32) (d * sc2F * q2F)
-        out := out.set! (chunkOutBase + l + 64) (d * sc4F * q3F)
-        out := out.set! (chunkOutBase + l + 96) (d * sc6F * q4F)
-  return out
-
-/-- Convert Float Array to F32 ByteArray (little-endian) -/
-def floatArrayToBytes (arr : Array Float) : IO ByteArray := do
-  let mut bytes := ByteArray.empty
-  for f in arr do
-    let fb ← Hesper.Basic.floatToBytes f
-    bytes := bytes ++ fb
-  return bytes
-
-/-! ## GGUF Metadata Parsing -/
-
-/-- Helper: read a u32 value from GGUF metadata raw bytes -/
-private def readMetadataU32 (mv : Hesper.GGUF.MetadataValue) : Option Nat :=
-  if mv.valueType == .MUInt32 && mv.data.size >= 4 then
-    let b0 := mv.data.get! 0 |>.toNat
-    let b1 := mv.data.get! 1 |>.toNat
-    let b2 := mv.data.get! 2 |>.toNat
-    let b3 := mv.data.get! 3 |>.toNat
-    some (b0 ||| (b1 <<< 8) ||| (b2 <<< 16) ||| (b3 <<< 24))
-  else none
-
-/-- Helper: read a bool array from GGUF metadata raw bytes.
-    The Hesper parser strips the type+length header, so mv.data is just the raw element bytes.
-    For bool arrays, each byte is one bool. -/
-private def readMetadataBoolArray (mv : Hesper.GGUF.MetadataValue) : Option (Array Bool) :=
-  if mv.valueType == .MArray then
-    some (Id.run do
-      let mut arr : Array Bool := #[]
-      for i in [0:mv.data.size] do
-        arr := arr.push ((mv.data.get! i) != 0)
-      return arr)
-  else none
-
-/-- Helper: read a f32 value from GGUF metadata raw bytes -/
-private def readMetadataF32 (mv : Hesper.GGUF.MetadataValue) : Option Float :=
-  if mv.valueType == .MFloat32 && mv.data.size >= 4 then
-    let b0 := mv.data.get! 0 |>.toUInt32
-    let b1 := mv.data.get! 1 |>.toUInt32
-    let b2 := mv.data.get! 2 |>.toUInt32
-    let b3 := mv.data.get! 3 |>.toUInt32
-    let bits := b0 ||| (b1 <<< 8) ||| (b2 <<< 16) ||| (b3 <<< 24)
-    some (Hesper.Basic.float32BitsToFloat64 bits)
-  else none
-
-/-- Parse Gemma 4 config from GGUF metadata -/
-def Config.fromGGUF (gguf : Hesper.GGUF.GGUFFile) : Except String Config := do
-  -- Helper to find metadata value
-  let findMeta (key : String) : Option Hesper.GGUF.MetadataValue :=
-    gguf.metadata.find? (·.1 == key) |>.map (·.2)
-
-  let findU32 (key : String) : Except String Nat :=
-    match findMeta key with
-    | some mv => match readMetadataU32 mv with
-      | some v => .ok v
-      | none => .error s!"Metadata key '{key}' is not uint32"
-    | none => .error s!"Metadata key '{key}' not found"
-
-  let findU32Either (key1 key2 : String) : Except String Nat :=
-    match findU32 key1 with
-    | .ok v => .ok v
-    | .error _ => findU32 key2
-
-  let findF32Default (key : String) (default : Float) : Float :=
-    match findMeta key with
-    | some mv => (readMetadataF32 mv).getD default
-    | none => default
-
-  let findF32DefaultEither (key1 key2 : String) (default : Float) : Float :=
-    match findMeta key1 with
-    | some mv => (readMetadataF32 mv).getD default
-    | none => findF32Default key2 default
-
-  -- Support both "gemma4." and "llama." prefixes
-  let vocabSize := (findU32 "general.vocab_size").toOption.getD 262144
-  let hiddenSize ← findU32Either "gemma4.embedding_length" "llama.embedding_length"
-  let intermediateSize ← findU32Either "gemma4.feed_forward_length" "llama.feed_forward_length"
-  let numLayers ← findU32Either "gemma4.block_count" "llama.block_count"
-  let numHeads ← findU32Either "gemma4.attention.head_count" "llama.attention.head_count"
-
-  -- Layer types: parse sliding_window_pattern bool array
-  -- True = SWA, False = full attention (per gemma4-iswa.cpp convention)
-  let layerTypes : Array LayerType :=
-    match findMeta "gemma4.attention.sliding_window_pattern" <|>
-          findMeta "llama.attention.sliding_window_pattern" with
-    | some mv =>
-      match readMetadataBoolArray mv with
-      | some bools => bools.map (fun b => if b then LayerType.swa else LayerType.full)
-      | none => (List.replicate numLayers LayerType.full).toArray
-    | none => (List.replicate numLayers LayerType.full).toArray
-
-  let rmsNormEps := findF32DefaultEither "gemma4.attention.layer_norm_rms_epsilon" "llama.attention.layer_norm_rms_epsilon" 1e-6
-  let ropeTheta := findF32DefaultEither "gemma4.rope.freq_base" "llama.rope.freq_base" 1000000.0
-  let ropeThetaSWA := findF32DefaultEither "gemma4.rope.freq_base_swa" "llama.rope.freq_base_swa" 10000.0
-
-  return {
-    vocabSize
-    hiddenSize
-    intermediateSize
-    numHiddenLayers := numLayers
-    numAttentionHeads := numHeads
-    numKeyValueHeadsFull := (findU32Either "gemma4.attention.head_count_kv" "llama.attention.head_count_kv").toOption.getD 8
-    numKeyValueHeadsSWA := (findU32Either "gemma4.attention.head_count_kv" "llama.attention.head_count_kv").toOption.getD 8
-    headDimFull := (findU32Either "gemma4.attention.key_length" "llama.attention.key_length").toOption.getD 128
-    headDimSWA := (findU32Either "gemma4.attention.key_length_swa" "llama.attention.key_length_swa").toOption.getD 128
-    slidingWindowSize := (findU32Either "gemma4.attention.sliding_window" "llama.attention.sliding_window").toOption.getD 512
-    rmsNormEps
-    ropeTheta
-    ropeThetaSWA
-    partialRotaryFactorSWA := 0.5  -- TODO: read from metadata
-    layerTypes
-    logitSoftcapScale := findF32DefaultEither "gemma4.final_logit_softcapping" "llama.logit_softcapping" 30.0
-    -- Cap maxSeqLen at 4096 to keep KV cache buffers under WebGPU's 256 MiB binding limit.
-    -- Full layers: 8 KV heads × maxSeqLen × 512 head_dim × 4 bytes
-    --   At maxSeqLen=4096: 8 × 4096 × 512 × 4 = 64 MiB per layer ✓
-    -- Real context_length is read but capped here.
-    maxSeqLen := min 4096 ((findU32Either "gemma4.context_length" "llama.context_length").toOption.getD 4096)
-    numExperts := (findU32Either "gemma4.expert_count" "llama.expert_count").toOption.getD 0
-    numExpertsUsed := (findU32Either "gemma4.expert_used_count" "llama.expert_used_count").toOption.getD 0
-    expertFFSize := (findU32Either "gemma4.expert_feed_forward_length" "llama.expert_feed_forward_length").toOption.getD 0
-    embdPerLayer := (findU32Either "gemma4.embedding_length_per_layer_input" "llama.embedding_length_per_layer_input").toOption.getD 0
-    numKVSharedLayers := (findU32Either "gemma4.attention.shared_kv_layers" "llama.attention.shared_kv_layers").toOption.getD 0
-  }
-
-/-! ## Layer Structures -/
-
-/-- Gemma 4 attention layer (single layer) -/
-structure Gemma4Attention (BufT CacheT : Type) where
-  wQ : Linear.LinearLayer BufT CacheT         -- Q projection [hiddenSize → numHeads * headDim]
-  wK : Linear.LinearLayer BufT CacheT         -- K projection [hiddenSize → numKVHeads * headDim]
-  wV : Linear.LinearLayer BufT CacheT         -- V projection [hiddenSize → numKVHeads * headDim]
-  wO : Linear.LinearLayer BufT CacheT         -- Output projection [numHeads * headDim → hiddenSize]
-  qNormWeight : BufT            -- Per-head Q norm [headDim]
-  kNormWeight : BufT            -- Per-head K norm [headDim]
-  -- Fused RMSNorm+Linear cache refs (attnNorm fused into Q/K/V projections)
-  fusedNormQPrepared : IO.Ref (Option CacheT)
-  fusedNormKPrepared : IO.Ref (Option CacheT)
-  fusedNormVPrepared : IO.Ref (Option CacheT)
-
-/-- Gemma 4 dense FFN layer -/
-structure Gemma4FFN (BufT CacheT : Type) where
-  gate : Linear.LinearLayer BufT CacheT
-  up : Linear.LinearLayer BufT CacheT
-  down : Linear.LinearLayer BufT CacheT
-  fusedGateUpPrepared : IO.Ref (Option CacheT)
-  -- Fused RMSNorm+Linear cache refs (ffnNorm fused into gate/up)
-  fusedNormGatePrepared : IO.Ref (Option CacheT)
-  fusedNormUpPrepared : IO.Ref (Option CacheT)
-
-/-- Gemma 4 transformer block (single layer) -/
-structure Gemma4Block (BufT CacheT : Type) where
-  layerIdx : Nat
-  layerType : LayerType
-  -- Norms
-  attnNorm : RMSNorm.RMSNorm BufT CacheT
-  postAttnNorm : RMSNorm.RMSNorm BufT CacheT
-  ffnNorm : RMSNorm.RMSNorm BufT CacheT
-  postFFNNorm : RMSNorm.RMSNorm BufT CacheT
-  -- Attention
-  attention : Gemma4Attention BufT CacheT
-  -- FFN (shared/dense expert)
-  ffn : Gemma4FFN BufT CacheT
-  -- MoE (optional: present only for MoE layers)
-  isMoE : Bool
-  moeRouterWeight : Option BufT
-  moeRouterScale : Option BufT
-  moeGateUpExps : Option BufT
-  moeDownExps : Option BufT
-  moePreNorm2 : Option (RMSNorm.RMSNorm BufT CacheT)
-  moePostNorm1 : Option (RMSNorm.RMSNorm BufT CacheT)
-  moePostNorm2 : Option (RMSNorm.RMSNorm BufT CacheT)
-  -- Optional: RoPE frequency factors (full attention layers only)
-  ropeFreqFactors : Option BufT
-  -- Optional: layer output scale
-  outScale : Option BufT
-
-/-- Per-layer embedding weights for a single block -/
-structure Gemma4PerLayerEmbd (BufT CacheT : Type) where
-  inpGate : Linear.LinearLayer BufT CacheT
-  proj : Linear.LinearLayer BufT CacheT
-  postNorm : RMSNorm.RMSNorm BufT CacheT
-
-/-- Embedding format for token embedding table -/
-inductive EmbdFormat where
-  | F32   -- Pre-dequantized F32 (via Embedding.forward)
-  | F16   -- F16 (via Embedding.forward with f16Table)
-  | Q6_K  -- Q6_K packed (GPU dequant lookup + LM head matmul)
-  | Q4_K  -- Q4_K packed
-  deriving Repr, BEq, Inhabited
-
-/-- Complete Gemma 4 model -/
-structure Gemma4Model (BufT CacheT : Type) where
-  config : Config
-  embedding : Embedding.Embedding BufT
-  embdFormat : EmbdFormat
-  blocks : Array (Gemma4Block BufT CacheT)
-  finalNorm : RMSNorm.RMSNorm BufT CacheT
-  outputWeight : BufT
-  perLayerEmbdTableGPU : Option BufT
-  perLayerEmbdRowBytes : Nat
-  perLayerModelProj : Option BufT
-  perLayerProjNorm : Option (RMSNorm.RMSNorm BufT CacheT)
-  perLayerBlocks : Array (Option (Gemma4PerLayerEmbd BufT CacheT))
-
-/-! ## Helper: Create GPU Buffer from ByteArray -/
-
-private def uploadBuffer [GPUBackend β] (ctx : β) (data : ByteArray) : IO (GPUBackend.Buf β) := do
-  let bufSize := if data.size == 0 then 4 else data.size
-  let buf ← GPUBackend.allocBuffer ctx bufSize.toUSize
-  if data.size > 0 then
-    GPUBackend.writeBuffer ctx buf data
-  return buf
-
-/-! ## GGUF Model Loading -/
-
-/-- Load a single quantized linear layer from GGUF tensor.
-    Detects quant format (Q4_K vs Q6_K) and selects the appropriate fused kernel. -/
-private def loadLinear [GPUBackend β] (ctx : β) (gguf : Hesper.GGUF.GGUFFile)
-    (name : String) (inDim outDim : Nat) : IO (Linear.LinearLayer (GPUBackend.Buf β) (GPUBackend.CachedDispatch β)) := do
-  -- Detect quant format from tensor type
-  let tensorInfo ← match Hesper.GGUF.Loader.findTensor gguf name with
-    | .ok ti => pure ti
-    | .error e => throw $ IO.userError e
-  let quantFormat : Linear.QuantFormat := match tensorInfo.ggmlType with
-    | .Q6_K => .Q6_K
-    | _ => .Q4_K
-  let (_, data) ← match Hesper.GGUF.Loader.getTensorData gguf name with
-    | .ok r => pure r
-    | .error e => throw $ IO.userError e
-  let weightBuf ← uploadBuffer ctx data
-  let prepared ← GPUBackend.newCacheRef (β := β)
-  let splitKBuf ← IO.mkRef none
-  let splitKPartialPrepared ← GPUBackend.newCacheRef (β := β)
-  let splitKReducePrepared ← GPUBackend.newCacheRef (β := β)
-  let dp4aQ8Buf ← IO.mkRef none
-  let dp4aQuantizePrepared ← GPUBackend.newCacheRef (β := β)
-  let dp4aMatmulPrepared ← GPUBackend.newCacheRef (β := β)
-  let dp4aBatchQuantizePrepared ← GPUBackend.newCacheRef (β := β)
-  let dp4aBatchMatmulPrepared ← GPUBackend.newCacheRef (β := β)
-  return {
-    config := { inDim, outDim }
-    weightBuf
-    quantFormat
-    prepared
-    splitKBuf
-    splitKPartialPrepared
-    splitKReducePrepared
-    dp4aQ8Buf
-    dp4aQuantizePrepared
-    dp4aMatmulPrepared
-    dp4aBatchQuantizePrepared
-    dp4aBatchMatmulPrepared
-  }
-
-/-- Load Gemma 4 model from GGUF file -/
-def Gemma4Model.fromGGUFData [GPUBackend β] (ctx : β) (ggufData : ByteArray)
-    (configOverride : Option Config := none) : IO (Gemma4Model (GPUBackend.Buf β) (GPUBackend.CachedDispatch β)) := do
-  IO.println s!"[Gemma4] Parsing GGUF ({ggufData.size} bytes)..."
-  let gguf ← match Hesper.GGUF.Parser.parseGGUF ggufData with
-    | .ok gf => pure gf
-    | .error e => throw $ IO.userError s!"GGUF parse error: {e}"
-
-  IO.println s!"  ✓ GGUF parsed: {gguf.tensors.size} tensors, {gguf.dataBlob.size} bytes data"
-
-  -- Step 2: Extract configuration
-  let cfg ← match configOverride with
-    | some c => pure c
-    | none => match Config.fromGGUF gguf with
-      | .ok c => pure c
-      | .error e => throw $ IO.userError s!"Config parse error: {e}"
-
-  IO.println s!"  Model: {cfg.numHiddenLayers} layers, {cfg.hiddenSize} dim, {cfg.numAttentionHeads} heads"
-  IO.println s!"  Vocab: {cfg.vocabSize}, FFN: {cfg.intermediateSize}, Experts: {cfg.numExperts}"
-
-  -- Step 3: Load embedding
-  IO.println "[Gemma4] Loading embedding..."
-  let embConfig : Embedding.Config := {
-    vocabSize := cfg.vocabSize
-    dim := cfg.hiddenSize
-  }
-  -- Gemma 4 embeddings: Q6_K, Q4_K, or F16
-  let embTensor ← match Hesper.GGUF.Loader.findTensor gguf "token_embd.weight" with
-    | .ok ti => pure ti
-    | .error e => throw $ IO.userError e
-  let (embedding, embdFormat) ← match embTensor.ggmlType with
-    | .F16 =>
-      IO.println "  Using F16 embeddings"
-      let embData ← Hesper.GGUF.Loader.extractF16Tensor gguf "token_embd.weight"
-      let e ← Embedding.createFromF16 ctx embConfig embData
-      pure (e, EmbdFormat.F16)
-    | .Q6_K =>
-      IO.println "  Using Q6_K embeddings (GPU on-the-fly dequant)"
-      let (_, data) ← match Hesper.GGUF.Loader.getTensorData gguf "token_embd.weight" with
-        | .ok r => pure r
-        | .error e => throw $ IO.userError e
-      let buf ← uploadBuffer ctx data
-      pure ({ config := embConfig, embeddingTable := buf, f16Table := none : Embedding.Embedding (GPUBackend.Buf β) }, EmbdFormat.Q6_K)
-    | .Q4_K =>
-      IO.println "  Using Q4_K embeddings (GPU on-the-fly dequant)"
-      let (_, data) ← match Hesper.GGUF.Loader.getTensorData gguf "token_embd.weight" with
-        | .ok r => pure r
-        | .error e => throw $ IO.userError e
-      let buf ← uploadBuffer ctx data
-      pure ({ config := embConfig, embeddingTable := buf, f16Table := none : Embedding.Embedding (GPUBackend.Buf β) }, EmbdFormat.Q4_K)
-    | other =>
-      IO.println s!"  Embedding type: {other} — loading as raw bytes (F32 fallback)"
-      let (_, data) ← match Hesper.GGUF.Loader.getTensorData gguf "token_embd.weight" with
-        | .ok r => pure r
-        | .error e => throw $ IO.userError e
-      let buf ← uploadBuffer ctx data
-      pure ({ config := embConfig, embeddingTable := buf, f16Table := none : Embedding.Embedding (GPUBackend.Buf β) }, EmbdFormat.F32)
-
-  -- Step 4: Load transformer blocks
-  IO.println s!"[Gemma4] Loading {cfg.numHiddenLayers} transformer blocks..."
-  let mut blocks : Array (Gemma4Block (GPUBackend.Buf β) (GPUBackend.CachedDispatch β)) := #[]
-
-  for layerIdx in [0:cfg.numHiddenLayers] do
-    if layerIdx % 10 == 0 then
-      IO.println s!"  Loading layer {layerIdx}/{cfg.numHiddenLayers}..."
-    let li := layerIdx
-
-    let layerType := if li < cfg.layerTypes.size then cfg.layerTypes[li]! else .full
-    let headDim := cfg.headDim li
-    let numKVHeads := cfg.numKVHeads li
-
-    -- Load norms (Float32)
-    let attnNormData ← Hesper.GGUF.Loader.extractFloat32Tensor gguf s!"blk.{li}.attn_norm.weight"
-    let postAttnNormData ← Hesper.GGUF.Loader.extractFloat32Tensor gguf s!"blk.{li}.post_attention_norm.weight"
-    let ffnNormData ← Hesper.GGUF.Loader.extractFloat32Tensor gguf s!"blk.{li}.ffn_norm.weight"
-    let postFFNNormData ← Hesper.GGUF.Loader.extractFloat32Tensor gguf s!"blk.{li}.post_ffw_norm.weight"
-
-    let normConfig : RMSNorm.Config := { dim := cfg.hiddenSize, eps := cfg.rmsNormEps }
-    let attnNorm ← RMSNorm.create ctx normConfig attnNormData
-    let postAttnNorm ← RMSNorm.create ctx normConfig postAttnNormData
-    let ffnNorm ← RMSNorm.create ctx normConfig ffnNormData
-    let postFFNNorm ← RMSNorm.create ctx normConfig postFFNNormData
-
-    -- Load attention projections (Q4_K)
-    let qDim := cfg.numAttentionHeads * headDim
-    let kvDim := numKVHeads * headDim
-    let wQ ← loadLinear ctx gguf s!"blk.{li}.attn_q.weight" cfg.hiddenSize qDim
-    let wK ← loadLinear ctx gguf s!"blk.{li}.attn_k.weight" cfg.hiddenSize kvDim
-    let wV ← loadLinear ctx gguf s!"blk.{li}.attn_v.weight" cfg.hiddenSize kvDim
-    let wO ← loadLinear ctx gguf s!"blk.{li}.attn_output.weight" qDim cfg.hiddenSize
-
-    -- Load Q/K norm weights (Float32, per-head dimension)
-    let qNormData ← Hesper.GGUF.Loader.extractFloat32Tensor gguf s!"blk.{li}.attn_q_norm.weight"
-    let kNormData ← Hesper.GGUF.Loader.extractFloat32Tensor gguf s!"blk.{li}.attn_k_norm.weight"
-    let qNormBuf ← uploadBuffer ctx qNormData
-    let kNormBuf ← uploadBuffer ctx kNormData
-
-    let fusedNormQPrepared ← GPUBackend.newCacheRef (β := β)
-    let fusedNormKPrepared ← GPUBackend.newCacheRef (β := β)
-    let fusedNormVPrepared ← GPUBackend.newCacheRef (β := β)
-    let attention : Gemma4Attention (GPUBackend.Buf β) (GPUBackend.CachedDispatch β) := {
-      wQ, wK, wV, wO
-      qNormWeight := qNormBuf
-      kNormWeight := kNormBuf
-      fusedNormQPrepared, fusedNormKPrepared, fusedNormVPrepared
-    }
-
-    -- Load FFN projections (Q4_K)
-    let ffnGate ← loadLinear ctx gguf s!"blk.{li}.ffn_gate.weight" cfg.hiddenSize cfg.intermediateSize
-    let ffnUp ← loadLinear ctx gguf s!"blk.{li}.ffn_up.weight" cfg.hiddenSize cfg.intermediateSize
-    let ffnDown ← loadLinear ctx gguf s!"blk.{li}.ffn_down.weight" cfg.intermediateSize cfg.hiddenSize
-
-    let fusedGateUpPrepared ← GPUBackend.newCacheRef (β := β)
-    let fusedNormGatePrepared ← GPUBackend.newCacheRef (β := β)
-    let fusedNormUpPrepared ← GPUBackend.newCacheRef (β := β)
-    let ffn : Gemma4FFN (GPUBackend.Buf β) (GPUBackend.CachedDispatch β) :=
-      { gate := ffnGate, up := ffnUp, down := ffnDown, fusedGateUpPrepared,
-        fusedNormGatePrepared, fusedNormUpPrepared }
-
-    -- Load optional RoPE frequency factors
-    -- In the E4B model, rope_freqs is a global tensor, not per-layer
-    let ropeFreqFactors ← if cfg.isFullAttention li then
-      match Hesper.GGUF.Loader.getTensorData gguf "rope_freqs.weight" with
-      | .ok (_, data) =>
-        let buf ← uploadBuffer ctx data
-        pure (some buf)
-      | .error _ =>
-        -- Try per-layer
-        match Hesper.GGUF.Loader.getTensorData gguf s!"blk.{li}.rope_freqs.weight" with
-        | .ok (_, data) =>
-          let buf ← uploadBuffer ctx data
-          pure (some buf)
-        | .error _ => pure none
-    else pure none
-
-    -- Load optional layer output scale
-    let outScale ← match Hesper.GGUF.Loader.getTensorData gguf s!"blk.{li}.layer_output_scale.weight" with
-      | .ok (_, data) =>
-        let buf ← uploadBuffer ctx data
-        pure (some buf)
-      | .error _ => pure none
-
-    -- Load MoE weights (if present for this layer)
-    let isMoE := match Hesper.GGUF.Loader.findTensor gguf s!"blk.{li}.ffn_gate_inp.weight" with
-      | .ok _ => true | .error _ => false
-    let (moeRouterWeight, moeRouterScale, moeGateUpExps, moeDownExps, moePreNorm2, moePostNorm1, moePostNorm2) ←
-      if isMoE then do
-        IO.println s!"    Layer {li}: MoE layer"
-        let routerW ← match Hesper.GGUF.Loader.getTensorData gguf s!"blk.{li}.ffn_gate_inp.weight" with
-          | .ok (_, data) => pure (some (← uploadBuffer ctx data))
-          | .error _ => pure none
-        let routerS ← match Hesper.GGUF.Loader.getTensorData gguf s!"blk.{li}.ffn_gate_inp.scale" with
-          | .ok (_, data) => pure (some (← uploadBuffer ctx data))
-          | .error _ => pure none
-        let gateUpE ← match Hesper.GGUF.Loader.getTensorData gguf s!"blk.{li}.ffn_gate_up_exps.weight" with
-          | .ok (_, data) => pure (some (← uploadBuffer ctx data))
-          | .error _ => pure none
-        let downE ← match Hesper.GGUF.Loader.getTensorData gguf s!"blk.{li}.ffn_down_exps.weight" with
-          | .ok (_, data) => pure (some (← uploadBuffer ctx data))
-          | .error _ => pure none
-        let preN2 ← match Hesper.GGUF.Loader.findTensor gguf s!"blk.{li}.ffn_pre_norm_2.weight" with
-          | .ok _ =>
-            let d ← Hesper.GGUF.Loader.extractFloat32Tensor gguf s!"blk.{li}.ffn_pre_norm_2.weight"
-            pure (some (← RMSNorm.create ctx normConfig d))
-          | .error _ => pure none
-        let postN1 ← match Hesper.GGUF.Loader.findTensor gguf s!"blk.{li}.ffn_post_norm_1.weight" with
-          | .ok _ =>
-            let d ← Hesper.GGUF.Loader.extractFloat32Tensor gguf s!"blk.{li}.ffn_post_norm_1.weight"
-            pure (some (← RMSNorm.create ctx normConfig d))
-          | .error _ => pure none
-        let postN2 ← match Hesper.GGUF.Loader.findTensor gguf s!"blk.{li}.ffn_post_norm_2.weight" with
-          | .ok _ =>
-            let d ← Hesper.GGUF.Loader.extractFloat32Tensor gguf s!"blk.{li}.ffn_post_norm_2.weight"
-            pure (some (← RMSNorm.create ctx normConfig d))
-          | .error _ => pure none
-        pure (routerW, routerS, gateUpE, downE, preN2, postN1, postN2)
-      else
-        pure (none, none, none, none, none, none, none)
-
-    blocks := blocks.push {
-      layerIdx := li
-      layerType
-      attnNorm, postAttnNorm, ffnNorm, postFFNNorm
-      attention, ffn
-      isMoE
-      moeRouterWeight, moeRouterScale, moeGateUpExps, moeDownExps
-      moePreNorm2, moePostNorm1, moePostNorm2
-      ropeFreqFactors, outScale
-    }
-
-  -- Step 5: Final norm
-  IO.println "[Gemma4] Loading final norm and LM head..."
-  let finalNormData ← Hesper.GGUF.Loader.extractFloat32Tensor gguf "output_norm.weight"
-  let finalNormConfig : RMSNorm.Config := { dim := cfg.hiddenSize, eps := cfg.rmsNormEps }
-  let finalNorm ← RMSNorm.create ctx finalNormConfig finalNormData
-
-  -- Step 6: LM head (output.weight or weight-tied with embedding)
-  let outputWeight ← match Hesper.GGUF.Loader.getTensorData gguf "output.weight" with
-    | .ok (_, data) =>
-      IO.println "  Using separate LM head weights"
-      uploadBuffer ctx data
-    | .error _ =>
-      IO.println "  Using weight-tied LM head (reusing embedding)"
-      pure embedding.embeddingTable
-
-  -- Step 7: Load per-layer embeddings (optional)
-  -- per_layer_token_embd: full table uploaded to GPU (like llama.cpp).
-  -- No per-token CPU→GPU transfer needed.
-  let (perLayerEmbdTableGPU, perLayerEmbdRowBytes, perLayerModelProj, perLayerProjNorm) ←
-    if cfg.hasPerLayerEmbeddings then do
-      IO.println "[Gemma4] Loading per-layer embeddings..."
-      let blocksPerRow := (cfg.embdPerLayer * cfg.numHiddenLayers) / 256
-      let rowBytes := blocksPerRow * 210  -- Q6_K block size
-      let tableData ← match Hesper.GGUF.Loader.getTensorData gguf "per_layer_token_embd.weight" with
-        | .ok (_, data) =>
-          IO.println s!"  per_layer_token_embd: {data.size} bytes → GPU ({data.size / 1024 / 1024} MB)"
-          let buf ← GPUBackend.allocBuffer ctx data.size.toUSize
-          GPUBackend.writeBuffer ctx buf data
-          pure (some buf)
-        | .error _ => pure none
-      let proj ← match Hesper.GGUF.Loader.getTensorData gguf "per_layer_model_proj.weight" with
-        | .ok (_, data) => pure (some (← uploadBuffer ctx data))
-        | .error _ => pure none
-      let projNorm ← match Hesper.GGUF.Loader.findTensor gguf "per_layer_proj_norm.weight" with
-        | .ok _ =>
-          let d ← Hesper.GGUF.Loader.extractFloat32Tensor gguf "per_layer_proj_norm.weight"
-          let plNormConfig : RMSNorm.Config := { dim := cfg.embdPerLayer, eps := cfg.rmsNormEps }
-          pure (some (← RMSNorm.create ctx plNormConfig d))
-        | .error _ => pure none
-      pure (tableData, rowBytes, proj, projNorm)
-    else
-      pure (none, 0, none, none)
-
-  -- Per-layer gate/proj/norm per block
-  let mut perLayerBlocks : Array (Option (Gemma4PerLayerEmbd (GPUBackend.Buf β) (GPUBackend.CachedDispatch β))) := #[]
-  for li in [0:cfg.numHiddenLayers] do
-    if cfg.hasPerLayerEmbeddings then
-      -- Load Q4_K linear layers for inp_gate and proj
-      let inpGate ← loadLinear ctx gguf s!"blk.{li}.inp_gate.weight" cfg.hiddenSize cfg.embdPerLayer
-      let proj ← loadLinear ctx gguf s!"blk.{li}.proj.weight" cfg.embdPerLayer cfg.hiddenSize
-      let normConfig : RMSNorm.Config := { dim := cfg.hiddenSize, eps := cfg.rmsNormEps }
-      let postNorm ← match Hesper.GGUF.Loader.findTensor gguf s!"blk.{li}.post_norm.weight" with
-        | .ok _ =>
-          let d ← Hesper.GGUF.Loader.extractFloat32Tensor gguf s!"blk.{li}.post_norm.weight"
-          RMSNorm.create ctx normConfig d
-        | .error _ =>
-          -- Fallback: create with all-ones weights
-          let dummyData : ByteArray ← do
-            let mut bytes := ByteArray.empty
-            for _ in [0:cfg.hiddenSize] do
-              -- Float 1.0 = 0x3f800000 LE: 00 00 80 3f
-              bytes := bytes.push 0
-              bytes := bytes.push 0
-              bytes := bytes.push 0x80
-              bytes := bytes.push 0x3f
-            pure bytes
-          RMSNorm.create ctx normConfig dummyData
-      perLayerBlocks := perLayerBlocks.push (some { inpGate, proj, postNorm : Gemma4PerLayerEmbd (GPUBackend.Buf β) (GPUBackend.CachedDispatch β) })
-    else
-      perLayerBlocks := perLayerBlocks.push none
-
-  IO.println s!"[Gemma4] ✓ Model loaded: {blocks.size} blocks"
-
-  return {
-    config := cfg
-    embedding
-    embdFormat
-    blocks
-    finalNorm
-    outputWeight
-    perLayerEmbdTableGPU
-    perLayerEmbdRowBytes
-    perLayerModelProj
-    perLayerProjNorm
-    perLayerBlocks
-  }
-
-/-! ## GGUF File Loading Helper -/
-
-/-- Load GGUF file from disk -/
-def loadGGUF (path : String) : IO Hesper.GGUF.GGUFFile := do
-  let data ← IO.FS.readBinFile path
-  match Hesper.GGUF.Parser.parseGGUF data with
-  | .ok gf => pure gf
-  | .error e => throw $ IO.userError s!"GGUF parse error: {e}"
-
-/-- Load model from GGUF file path (reads file with IO.FS.readBinFile). -/
-def Gemma4Model.fromGGUF [GPUBackend β] (ctx : β) (ggufPath : String)
-    (configOverride : Option Config := none) : IO (Gemma4Model (GPUBackend.Buf β) (GPUBackend.CachedDispatch β)) := do
-  IO.println s!"[Gemma4] Loading model from {ggufPath}..."
-  let ggufData ← IO.FS.readBinFile ggufPath
-  Gemma4Model.fromGGUFData ctx ggufData configOverride
+set_option maxHeartbeats 400000
 
 /-! ## KV Cache State -/
 
@@ -1768,6 +137,10 @@ structure InferenceState (BufT CacheT : Type) where
   -- and there is zero performance impact.
   preSoftcapBuf : Option BufT := none
   argmaxBuf : BufT              -- [1] u32 for GPU-side argmax result
+  /-- Cached dispatch for the decode-loop argmax kernel.  Without this,
+      `GPUBackend.execute` rebuilds PTX / re-resolves the buffer arg
+      vector on every call (~150 µs/token × 10 tokens = 1.5 ms wasted). -/
+  argmaxCacheRef : IO.Ref (Option CacheT)
   -- Scratch buffer for Q8_1 quantized lmHead input (hiddenSize/32 * 9 u32),
   -- lazily allocated on first dp4a-enabled lmHead call.
   lmHeadQ8Buf : IO.Ref (Option BufT)
@@ -1803,6 +176,16 @@ structure InferenceState (BufT CacheT : Type) where
       needed by the Circuit DSL scatter addrExpr that writes to the
       KV cache inside fusedRopeKAndCacheWrite). -/
   stagingPosF32Ptr  : USize := 0
+  /-- Persistent non-default stream used to avoid implicit synchronous
+      behavior of the legacy null stream.  Allocated once at state init.
+      When set (HESPER_UNIFIED_STREAM=1), all async H2D copies and
+      kernel launches funnel into this stream so they serialise in
+      insertion order *without* host-side stalls from sync
+      `cuMemcpyHtoD_v2`.  Pinned-slot reuse becomes race-free because
+      CUDA's in-stream ordering guarantees the previous copy completes
+      before the next host write visible to the device.  0 = disabled
+      (legacy null-stream behaviour). -/
+  unifiedStream     : USize := 0
 
 /-- Dynamic cache ref store. Lazily creates IO.Ref per unique cacheKey. -/
 structure KernelCacheRefs (CacheT : Type) where
@@ -1886,6 +269,7 @@ def createInferenceState [GPUBackend β] (ctx : β) (cfg : Config) : IO (Inferen
       let rowBytes := blocksPerRow * 210
       GPUBackend.allocBuffer ctx (max rowBytes 4).toUSize
     argmaxBuf := ← GPUBackend.allocBuffer ctx (4 : USize)
+    argmaxCacheRef := ← GPUBackend.newCacheRef (β := β)
     lmHeadQ8Buf := ← IO.mkRef none
     lmHeadQuantizePrepared := ← GPUBackend.newCacheRef (β := β)
     lmHeadDP4APrepared := ← GPUBackend.newCacheRef (β := β)
@@ -1896,24 +280,34 @@ def createInferenceState [GPUBackend β] (ctx : β) (cfg : Config) : IO (Inferen
     prefillCacheLenRef  := ← IO.mkRef none
     prefillColIdxRef    := ← IO.mkRef none
     prefillPLInputAllRef := ← IO.mkRef none
-    -- Pinned-host staging (CUDA only; zero on other backends).  Using
-    -- IO.getEnv as a crude backend check for now — a typeclass method
-    -- `allocPinnedHost` on GPUBackend is the proper extension point.
-    stagingTokenPtr  := ← match ← IO.getEnv "HESPER_CUDA_GRAPHS" with
-                         | some _ => Hesper.CUDA.cuMemAllocHost 4
-                         | none   => pure 0
-    stagingParamsPtr := ← match ← IO.getEnv "HESPER_CUDA_GRAPHS" with
-                         | some _ => Hesper.CUDA.cuMemAllocHost 8
-                         | none   => pure 0
-    stagingPLRowPtr  := ← match ← IO.getEnv "HESPER_CUDA_GRAPHS" with
-                         | some _ => Hesper.CUDA.cuMemAllocHost 4
-                         | none   => pure 0
-    stagingColIdxPtr := ← match ← IO.getEnv "HESPER_CUDA_GRAPHS" with
-                         | some _ => Hesper.CUDA.cuMemAllocHost 4
-                         | none   => pure 0
-    stagingPosF32Ptr := ← match ← IO.getEnv "HESPER_CUDA_GRAPHS" with
-                         | some _ => Hesper.CUDA.cuMemAllocHost 4
-                         | none   => pure 0
+    -- Pinned-host staging + unified stream.  Enabled when either
+    -- HESPER_CUDA_GRAPHS=1 (existing graph-capture path) or
+    -- HESPER_UNIFIED_STREAM=1 (new path that funnels all async H2D and
+    -- kernel launches through a single non-null stream for the
+    -- llama.cpp-style "big call, few ops" pattern).
+    stagingTokenPtr  := ← do
+      if (← IO.getEnv "HESPER_CUDA_GRAPHS").isSome
+         || (← IO.getEnv "HESPER_UNIFIED_STREAM").isSome
+      then Hesper.CUDA.cuMemAllocHost 4 else pure 0
+    stagingParamsPtr := ← do
+      if (← IO.getEnv "HESPER_CUDA_GRAPHS").isSome
+         || (← IO.getEnv "HESPER_UNIFIED_STREAM").isSome
+      then Hesper.CUDA.cuMemAllocHost 8 else pure 0
+    stagingPLRowPtr  := ← do
+      if (← IO.getEnv "HESPER_CUDA_GRAPHS").isSome
+         || (← IO.getEnv "HESPER_UNIFIED_STREAM").isSome
+      then Hesper.CUDA.cuMemAllocHost 4 else pure 0
+    stagingColIdxPtr := ← do
+      if (← IO.getEnv "HESPER_CUDA_GRAPHS").isSome
+         || (← IO.getEnv "HESPER_UNIFIED_STREAM").isSome
+      then Hesper.CUDA.cuMemAllocHost 4 else pure 0
+    stagingPosF32Ptr := ← do
+      if (← IO.getEnv "HESPER_CUDA_GRAPHS").isSome
+         || (← IO.getEnv "HESPER_UNIFIED_STREAM").isSome
+      then Hesper.CUDA.cuMemAllocHost 4 else pure 0
+    unifiedStream    := ← match ← IO.getEnv "HESPER_UNIFIED_STREAM" with
+                         | some _ => Hesper.CUDA.cuStreamCreate
+                         | none   => pure (0 : USize)
   }
 
 /-- Dump a buffer to a file when HESPER_DUMP_DIR env is set.
@@ -1946,23 +340,33 @@ def dumpBuf [GPUBackend β] (ctx : β) (buf : GPUBackend.Buf β) (bytes : USize)
     * `staging`    — `USize` pinned-host pointer allocated at state init
     * `stOffset`   — byte offset inside the staging slot (usually 0)
     * `data`       — the bytes to write
- -/
+
+    Global gate: when `skipStagingWrites` is set, the function is a
+    no-op.  Token-graph capture uses this so per-step pos/token writes
+    don't become memcpy nodes that all read from the same pinned slot
+    (which would race to the last captured value). -/
+initialize skipStagingWrites : IO.Ref Bool ← IO.mkRef false
+
 def writeScalarViaStaging [GPUBackend β] (ctx : β)
     (dstBuf : GPUBackend.Buf β) (dstOffset : USize)
     (staging : USize) (stOffset : USize)
     (data : ByteArray) : IO Unit := do
+  if ← skipStagingWrites.get then
+    return
   if staging == 0 then
-    -- No pinned slot (e.g. WebGPU, or CUDA_GRAPHS disabled) — fall back.
+    -- No pinned slot (e.g. WebGPU, or CUDA_GRAPHS/UNIFIED_STREAM disabled)
+    -- — fall back to sync writeBufferOffset.
     GPUBackend.writeBufferOffset ctx dstBuf dstOffset data
   else
-    Hesper.CUDA.cuWritePinned staging stOffset data data.size.toUSize
     match ← Hesper.cudaCaptureStream.get with
     | some s =>
-      -- Pull the raw device pointer via the backend extension.
       match ← GPUBackend.rawDevicePtr ctx dstBuf with
       | some ptr =>
-        Hesper.CUDA.cuMemcpyHtoDFromPinned
-          (ptr + dstOffset) staging stOffset data.size.toUSize s
+        -- Fused pinned-write + async H2D copy on the stream.  Single
+        -- FFI crossing replaces the 2-call sequence (cuWritePinned +
+        -- cuMemcpyHtoDFromPinned).  Halves per-scalar Lean→C overhead.
+        Hesper.CUDA.cuPinnedWriteAndCopy
+          (ptr + dstOffset) staging stOffset data data.size.toUSize s
       | none =>
         -- Backend can't expose a raw ptr; fall back to the normal path.
         GPUBackend.writeBufferOffset ctx dstBuf dstOffset data
@@ -1998,7 +402,10 @@ def forwardBlock [GPUBackend β] (ctx : β)
     | some k =>
       let key := hash ("gemma4_ce", name, config.numWorkgroups, config.workgroupSize.x, config.workgroupSize.y, config.workgroupSize.z)
       let ref ← k.getRef key
-      GPUBackend.executeWithConfigCached ctx shader namedBufs config key ref
+      -- Tag config.funcName with the call-site name so cacheRef-miss traces
+      -- show the human-readable `ce "..."` name instead of a hex cacheKey.
+      let configNamed : Hesper.ExecConfig := { config with funcName := name }
+      GPUBackend.executeWithConfigCached ctx shader namedBufs configNamed key ref
     | none => GPUBackend.execute ctx shader namedBufs config
 
   -- Step 1+2: Fused attnNorm + Q/K/V projections
@@ -2176,14 +583,22 @@ def forwardBlock [GPUBackend β] (ctx : β)
         (mkNormConfig numHeads)
 
   -- Step 4: RoPE on Q and K
-  -- Upload position to params buffer (u32 for hand-coded kernels)
-  let posBytes := Hesper.WebGPU.BufferOps.uint32ToBytes pos.toUInt32
-  writeScalarViaStaging ctx state.paramsBuf 0 state.stagingParamsPtr 0 posBytes
-  -- Also upload pos as f32 for Circuit DSL scatter addrExpr.  Routed
-  -- through a pinned host slot so CUDA Graph replay picks up the
-  -- current pos (not a stale captured value).
-  let posF32Bytes ← Hesper.Basic.floatToBytes pos.toFloat
-  writeScalarViaStaging ctx state.posF32Buf 0 state.stagingPosF32Ptr 0 posF32Bytes
+  -- Upload position to params buffer (u32 for hand-coded kernels).
+  -- pos is layer-invariant within a single forward pass, so write it
+  -- only on the first block.  Previously this ran 42× per token,
+  -- adding 42 H2D copies / token on the decode critical path.  For
+  -- capture mode (HESPER_CUDA_GRAPHS=1) the graph node records the
+  -- pinned source pointer once; the generate loop overwrites the slot
+  -- before each replay, so the captured node still reads the current
+  -- pos regardless of `li`.
+  if li == 0 then
+    let posBytes := Hesper.WebGPU.BufferOps.uint32ToBytes pos.toUInt32
+    writeScalarViaStaging ctx state.paramsBuf 0 state.stagingParamsPtr 0 posBytes
+    -- Also upload pos as f32 for Circuit DSL scatter addrExpr.  Routed
+    -- through a pinned host slot so CUDA Graph replay picks up the
+    -- current pos (not a stale captured value).
+    let posF32Bytes ← Hesper.Basic.floatToBytes pos.toFloat
+    writeScalarViaStaging ctx state.posF32Buf 0 state.stagingPosF32Ptr 0 posF32Bytes
 
   Hesper.WGSL.Execute.withSection "rope" do
     -- RoPE on Q: qBuf2 → qBuf
@@ -2329,9 +744,12 @@ def forwardBlock [GPUBackend β] (ctx : β)
     -- magnitudes are bounded without the 1/sqrt(headDim) temperature.
     -- See llama.cpp llama-model.cpp:1272 and gemma4-iswa.cpp:94.
     let scale : Float := 1.0
-    -- Write cacheLen to params buffer for FlashAttention (params = [pos, cacheLen])
-    let cacheLenBytes := Hesper.WebGPU.BufferOps.uint32ToBytes cacheLen.toUInt32
-    writeScalarViaStaging ctx state.paramsBuf 4 state.stagingParamsPtr 4 cacheLenBytes
+    -- Write cacheLen to params buffer for FlashAttention (params = [pos, cacheLen]).
+    -- Layer-invariant within a single forward pass — write only on first
+    -- block (same reasoning as pos above; see task #238).
+    if li == 0 then
+      let cacheLenBytes := Hesper.WebGPU.BufferOps.uint32ToBytes cacheLen.toUInt32
+      writeScalarViaStaging ctx state.paramsBuf 4 state.stagingParamsPtr 4 cacheLenBytes
     Hesper.WGSL.Execute.withSection "flashAttn" do
       -- Two kernels:
       --   cacheLen > 32: tiled split-K (phase1 + phase2) — parallel
@@ -2675,28 +1093,40 @@ def forwardBlock [GPUBackend β] (ctx : β)
       Hesper.WGSL.Execute.withSection "ple.proj" do
         Linear.LinearLayer.forward ctx plEmbd.proj state.moeRouterOutBuf state.plProjBuf
       -- Fused post-norm + residual-add, in place on outputBuf.
-      -- Replaces three dispatches (postNorm, copyBack, residAdd) with
-      -- one: `outputBuf[i] += rmsNorm(plProjBuf)[i] * postNorm.scale[i]`.
+      -- When the block has an outScale, fold the layerOutScale tail
+      -- multiply into the same kernel — saves one dispatch per layer.
+      let skipOutScaleSingle := (← IO.getEnv "HESPER_SKIP_OUTSCALE").isSome
+      let outScaleOpt := if skipOutScaleSingle then none else block.outScale
       Hesper.WGSL.Execute.withSection "ple.postNormAdd" do
-        ce "fusedPLPost"
-          (fusedPerLayerPostKernel cfg.hiddenSize cfg.rmsNormEps)
-          [("proj", state.plProjBuf), ("weight", plEmbd.postNorm.scale), ("residual", outputBuf)]
-          { numWorkgroups := (1, 1, 1)
-            workgroupSize := { x := 256, y := 1, z := 1 }
-            extensions := ["subgroups"]
-            : Hesper.ExecConfig }
+        match outScaleOpt with
+        | some scaleBuf =>
+          ce "fusedPLPostScale"
+            (fusedPerLayerPostThenScaleKernel cfg.hiddenSize cfg.rmsNormEps)
+            [("proj", state.plProjBuf), ("weight", plEmbd.postNorm.scale),
+             ("out_scale", scaleBuf), ("residual", outputBuf)]
+            { numWorkgroups := (1, 1, 1)
+              workgroupSize := { x := 256, y := 1, z := 1 }
+              extensions := ["subgroups"]
+              : Hesper.ExecConfig }
+        | none =>
+          ce "fusedPLPost"
+            (fusedPerLayerPostKernel cfg.hiddenSize cfg.rmsNormEps)
+            [("proj", state.plProjBuf), ("weight", plEmbd.postNorm.scale), ("residual", outputBuf)]
+            { numWorkgroups := (1, 1, 1)
+              workgroupSize := { x := 256, y := 1, z := 1 }
+              extensions := ["subgroups"]
+              : Hesper.ExecConfig }
     | _, _ => pure ()
   dumpBuf ctx outputBuf (cfg.hiddenSize * 4).toUSize s!"single_p{pos}_postPLE_L{li}"
 
-  -- Step 9: Layer output scale (optional).  Was two dispatches:
-  --   layerScale: normedBuf2[i] = outputBuf[i] * scale[0]  (broadcast)
-  --   pleScale3:  outputBuf[i]  = normedBuf2[i] * 1.0       (copy-back)
-  -- Now lowered through the Circuit DSL: fusePointwise collapses the
-  -- chain into a single dispatch whose body is `(outputBuf[i] * scale[0]) * 1`.
-  -- The normedBuf2 round-trip is gone; outputBuf is consumed + written
-  -- in one kernel (safe because every lane's read precedes its write).
-  let skipOutScaleSingle := (← IO.getEnv "HESPER_SKIP_OUTSCALE").isSome
-  match if skipOutScaleSingle then none else block.outScale with
+  -- Step 9: Layer output scale — previously its own dispatch, now
+  -- folded into `ple.postNormAdd` when PLE runs (fusedPLPostScale
+  -- kernel).  Fallback dispatch stays below for blocks that DON'T run
+  -- PLE (e.g. non-PLE models).  `block.perLayerBlocks[li]` being None
+  -- means this layer had no PLE — use the standalone layerOutScale.
+  let skipOutScaleFallback := (← IO.getEnv "HESPER_SKIP_OUTSCALE").isSome
+  let pleRan := match perLayerEmbd with | some _ => true | none => false
+  match if skipOutScaleFallback || pleRan then none else block.outScale with
   | some scale =>
     Hesper.WGSL.Execute.withSection "layerOutScale" do
       let key := hash ("circuitLayerOutScale-cuda", cfg.hiddenSize, li)
@@ -2717,6 +1147,241 @@ def forwardBlock [GPUBackend β] (ctx : β)
         -- 3=final (written back to outputBuf).
         [(0, outputBuf), (1, scale), (3, outputBuf)]
   | none => pure ()
+
+/-! ## Monolith hybrid decode (Plan A)
+
+`forwardBlockMonolith` runs the 6-block IRv2 Monolith BlockGraph for
+the transformer body (Attn+wO+PostAttnNorm+FFN+PostFFNNorm) and then
+applies PLE + layerOutScale via production kernels — yielding the same
+final `outputBuf` contract as `forwardBlock` but via the BlockGraph IR
+for the main body.
+
+Eligibility via `blockMonolithEligible`: all-Q4_K QKV+FFN, own-KV
+(not shared), non-MoE, inDim%256==0.
+
+Non-eligible layers fall back to production `forwardBlock`.
+
+The bundle extraction (`extractMonolithBundlesInline`) mirrors
+`Gemma4Bridge.extractMonolithBundles` but lives here to avoid circular
+imports. -/
+
+def blockMonolithEligible
+    {BufT CacheT : Type}
+    (block : Gemma4Block BufT CacheT) (cfg : Config) : Bool :=
+  let li := block.layerIdx
+  block.attention.wQ.quantFormat == .Q4_K
+    && block.attention.wK.quantFormat == .Q4_K
+    && block.attention.wV.quantFormat == .Q4_K
+    && block.attention.wO.quantFormat == .Q4_K
+    && block.ffn.gate.quantFormat == .Q4_K
+    && block.ffn.up.quantFormat == .Q4_K
+    && block.ffn.down.quantFormat == .Q4_K
+    && cfg.hasKV li
+    && !block.isMoE
+    && block.attention.wQ.config.inDim % 256 == 0
+    && block.ffn.gate.config.inDim % 256 == 0
+
+/-- Build Monolith bundles for the whole model.  Mirrors
+    `Gemma4Bridge.extractMonolithBundles` — kept here to avoid pulling
+    Gemma4Bridge's imports into the main Gemma4 namespace. -/
+def extractMonolithBundlesInline [GPUBackend β]
+    (model : Gemma4Model (GPUBackend.Buf β) (GPUBackend.CachedDispatch β))
+    (state : InferenceState (GPUBackend.Buf β) (GPUBackend.CachedDispatch β))
+    (firstLayerKey : UInt64 := 0xCAFE0000) :
+    IO (List (UInt64 × Hesper.Circuit.IRv2.AttnBundle β) ×
+        List (UInt64 × Hesper.Circuit.IRv2.FFNBundle β)) := do
+  let cfg := model.config
+  let mut attnBundles : List (UInt64 × Hesper.Circuit.IRv2.AttnBundle β) := []
+  let mut ffnBundles  : List (UInt64 × Hesper.Circuit.IRv2.FFNBundle β)  := []
+  for h : li in [0:model.blocks.size] do
+    let block := model.blocks[li]
+    let layerKey := firstLayerKey + li.toUInt64
+    let kvLi := cfg.kvCacheLayer li
+    let kvCache ← if h : kvLi < state.kvCaches.size then
+      pure state.kvCaches[kvLi]
+    else
+      throw (IO.userError s!"extractMonolithBundlesInline: kvCacheLayer {kvLi} out of range for layer {li}")
+    let numHeads   := cfg.numAttentionHeads
+    let numKVHeads := cfg.numKVHeads li
+    let headDim    := cfg.headDim li
+    let attnBundle : Hesper.Circuit.IRv2.AttnBundle β :=
+      { attnNorm     := block.attnNorm
+        wQ           := block.attention.wQ
+        wK           := block.attention.wK
+        wV           := block.attention.wV
+        wO           := block.attention.wO
+        qNormScale   := block.attention.qNormWeight
+        kNormScale   := block.attention.kNormWeight
+        postAttnNorm := block.postAttnNorm
+        freqFactors  := block.ropeFreqFactors
+        paramsBuf    := state.paramsBuf
+        kCacheBuf    := kvCache.kBuf
+        vCacheBuf    := kvCache.vBuf
+        qBuf2        := state.qBuf2
+        kBuf2        := state.kBuf2
+        vBuf2        := state.vBuf2
+        numHeads     := numHeads
+        numKVHeads   := numKVHeads
+        headDim      := headDim
+        maxSeqLen    := cfg.maxSeqLen
+        attnScale    := 1.0
+        ropeBase     := cfg.ropeBase li }
+    attnBundles := (layerKey, attnBundle) :: attnBundles
+    let ffnBundle : Hesper.Circuit.IRv2.FFNBundle β :=
+      { ffnNorm     := block.ffnNorm
+        wGate       := block.ffn.gate
+        wUp         := block.ffn.up
+        wDown       := block.ffn.down
+        postFFNNorm := block.postFFNNorm
+        geluScratch := state.geluBuf }
+    ffnBundles := (layerKey, ffnBundle) :: ffnBundles
+  return (attnBundles.reverse, ffnBundles.reverse)
+
+/-- Apply PLE + layerOutScale to `outputBuf` in place.  Matches the tail
+    of production `forwardBlock` (the section after postFFNNormAdd). -/
+def applyPLEAndOutScale [GPUBackend β]
+    (ctx : β)
+    (block : Gemma4Block (GPUBackend.Buf β) (GPUBackend.CachedDispatch β))
+    (cfg : Config)
+    (outputBuf : GPUBackend.Buf β)
+    (state : InferenceState (GPUBackend.Buf β) (GPUBackend.CachedDispatch β))
+    (perLayerEmbd : Option (Gemma4PerLayerEmbd (GPUBackend.Buf β) (GPUBackend.CachedDispatch β)))
+    (perLayerInput : Option (GPUBackend.Buf β))
+    (kcr : Option (KernelCacheRefs (GPUBackend.CachedDispatch β)) := none) : IO Unit := do
+  let li := block.layerIdx
+  let ce := fun (name : String) (shader : Hesper.WGSL.Monad.ShaderM Unit)
+      (namedBufs : List (String × GPUBackend.Buf β)) (config : Hesper.ExecConfig) => do
+    match kcr with
+    | some k =>
+      let key := hash ("gemma4_ce", name, config.numWorkgroups, config.workgroupSize.x, config.workgroupSize.y, config.workgroupSize.z)
+      let ref ← k.getRef key
+      let configNamed : Hesper.ExecConfig := { config with funcName := name }
+      GPUBackend.executeWithConfigCached ctx shader namedBufs configNamed key ref
+    | none => GPUBackend.execute ctx shader namedBufs config
+  Hesper.WGSL.Execute.withSection "perLayerEmbd" do
+    match perLayerEmbd, perLayerInput with
+    | some plEmbd, some plInputAll =>
+      let plOffset := li * cfg.embdPerLayer
+      let plTotalSize := cfg.embdPerLayer * cfg.numHiddenLayers
+      let useFusedPLGate :=
+        plEmbd.inpGate.quantFormat == .Q4_K &&
+        plEmbd.inpGate.config.inDim % 256 == 0
+      if useFusedPLGate then
+        Hesper.WGSL.Execute.withSection "ple.inpGateGeluSlice" do
+          let key := hash ("circuitPLEInpGateGeluSlice",
+            plEmbd.inpGate.config.inDim, plEmbd.inpGate.config.outDim, plOffset)
+          let ccRef ← Hesper.Circuit.getGlobalCircuitRef (β := β) key
+          Hesper.Circuit.runCached ctx ccRef
+            (do
+              let x ← Hesper.Circuit.CircuitM.registerExternal
+                (BufT := GPUBackend.Buf β) (CacheT := GPUBackend.CachedDispatch β)
+                outputBuf #[plEmbd.inpGate.config.inDim] .f32 .Global
+              let plAll ← Hesper.Circuit.CircuitM.registerExternal
+                (BufT := GPUBackend.Buf β) (CacheT := GPUBackend.CachedDispatch β)
+                plInputAll #[plTotalSize] .f32 .Global
+              let x0 : Hesper.Circuit.ScalarExp := .input 0
+              let x3 := .mul (.mul x0 x0) x0
+              let inner :=
+                .mul (.const 0.7978845608028654)
+                     (.add x0 (.mul (.const 0.044715) x3))
+              let gelu :=
+                .mul (.mul (.const 0.5) x0)
+                     (.add (.const 1.0) (.tanh inner))
+              let body : Hesper.Circuit.ScalarExp :=
+                .mul gelu (.input 1)
+              let _out ← Hesper.Circuit.CircuitM.matmulQ4KWithEpilogue
+                x plEmbd.inpGate #[plAll] body (epiReadOffsets := #[plOffset])
+              pure ())
+            [(0, outputBuf), (1, plInputAll), (2, state.moeRouterOutBuf)]
+      else do
+        Hesper.WGSL.Execute.withSection "ple.inpGate" do
+          Linear.LinearLayer.forward ctx plEmbd.inpGate outputBuf state.plGateBuf
+        Hesper.WGSL.Execute.withSection "ple.geluGateMul" do
+          ce s!"pleGeluGateMul_{plOffset}"
+            (PerLayerEmbedding.geluGateMulSliceKernel cfg.embdPerLayer plTotalSize plOffset)
+            [("gate", state.plGateBuf), ("per_layer_input", plInputAll), ("output", state.moeRouterOutBuf)]
+            (.dispatch1D cfg.embdPerLayer)
+      Hesper.WGSL.Execute.withSection "ple.proj" do
+        Linear.LinearLayer.forward ctx plEmbd.proj state.moeRouterOutBuf state.plProjBuf
+      let skipOutScaleSingle := (← IO.getEnv "HESPER_SKIP_OUTSCALE").isSome
+      let outScaleOpt := if skipOutScaleSingle then none else block.outScale
+      Hesper.WGSL.Execute.withSection "ple.postNormAdd" do
+        match outScaleOpt with
+        | some scaleBuf =>
+          ce "fusedPLPostScale"
+            (fusedPerLayerPostThenScaleKernel cfg.hiddenSize cfg.rmsNormEps)
+            [("proj", state.plProjBuf), ("weight", plEmbd.postNorm.scale),
+             ("out_scale", scaleBuf), ("residual", outputBuf)]
+            { numWorkgroups := (1, 1, 1)
+              workgroupSize := { x := 256, y := 1, z := 1 }
+              extensions := ["subgroups"]
+              : Hesper.ExecConfig }
+        | none =>
+          ce "fusedPLPost"
+            (fusedPerLayerPostKernel cfg.hiddenSize cfg.rmsNormEps)
+            [("proj", state.plProjBuf), ("weight", plEmbd.postNorm.scale), ("residual", outputBuf)]
+            { numWorkgroups := (1, 1, 1)
+              workgroupSize := { x := 256, y := 1, z := 1 }
+              extensions := ["subgroups"]
+              : Hesper.ExecConfig }
+    | _, _ => pure ()
+  let skipOutScaleFallback := (← IO.getEnv "HESPER_SKIP_OUTSCALE").isSome
+  let pleRan := match perLayerEmbd with | some _ => true | none => false
+  match if skipOutScaleFallback || pleRan then none else block.outScale with
+  | some scale =>
+    Hesper.WGSL.Execute.withSection "layerOutScale" do
+      let key := hash ("circuitLayerOutScale-cuda", cfg.hiddenSize, li)
+      let ccRef ← Hesper.Circuit.getGlobalCircuitRef (β := β) key
+      Hesper.Circuit.runCachedFused ctx ccRef
+        (do
+          let x ← Hesper.Circuit.CircuitM.registerExternal
+                    (BufT := GPUBackend.Buf β) (CacheT := GPUBackend.CachedDispatch β)
+                    outputBuf #[cfg.hiddenSize] .f32 .Global
+          let s ← Hesper.Circuit.CircuitM.registerExternal
+                    (BufT := GPUBackend.Buf β) (CacheT := GPUBackend.CachedDispatch β)
+                    scale #[1] .f32 .Global
+          let scaled ← Hesper.Circuit.CircuitM.scaleByBroadcast x s
+          let _out   ← Hesper.Circuit.CircuitM.map scaled
+                         (.mul (.input 0) (.const 1.0))
+          pure ())
+        [(0, outputBuf), (1, scale), (3, outputBuf)]
+  | none => pure ()
+
+/-- Monolith-powered per-block forward: runs the 6-block Monolith graph
+    for the body and applies PLE + outScale as a tail. -/
+def forwardBlockMonolith [GPUBackend β]
+    (ctx : β)
+    (block : Gemma4Block (GPUBackend.Buf β) (GPUBackend.CachedDispatch β))
+    (cfg : Config)
+    (inputBuf outputBuf : GPUBackend.Buf β)
+    (state : InferenceState (GPUBackend.Buf β) (GPUBackend.CachedDispatch β))
+    (pos : Nat)
+    (attnBundles : List (UInt64 × Hesper.Circuit.IRv2.AttnBundle β))
+    (ffnBundles  : List (UInt64 × Hesper.Circuit.IRv2.FFNBundle β))
+    (kcr : Option (KernelCacheRefs (GPUBackend.CachedDispatch β)) := none)
+    (perLayerEmbd : Option (Gemma4PerLayerEmbd (GPUBackend.Buf β) (GPUBackend.CachedDispatch β)) := none)
+    (perLayerInput : Option (GPUBackend.Buf β) := none) : IO Unit := do
+  let li := block.layerIdx
+  let bundleBase : UInt64 := 0xCAFE0000
+  let firstLayerKey : UInt64 := bundleBase + li.toUInt64
+  let firstInputId : Nat := 10_000
+  let lastOutputId : Nat := 10_999
+  let baseTensorId : Nat := 20_000
+  let (_, graph) := Hesper.Circuit.IRv2.runBuilder
+    (Hesper.Models.Gemma4_v2.forwardTokenLazyMonolith
+       1 firstInputId lastOutputId baseTensorId firstLayerKey pos)
+  let externalBufs : List (Nat × GPUBackend.Buf β) :=
+    [(firstInputId, inputBuf),
+     (baseTensorId + 0, state.qBuf),
+     (baseTensorId + 1, state.kBuf),
+     (baseTensorId + 2, state.vBuf),
+     (baseTensorId + 3, state.attnOutBuf),
+     (baseTensorId + 4, state.normedBuf),
+     (baseTensorId + 5, state.attnResidualBuf),
+     (baseTensorId + 6, state.ffnOutBuf),
+     (lastOutputId,   outputBuf)]
+  Hesper.Circuit.IRv2.runMonolithicGraph ctx graph externalBufs attnBundles ffnBundles
+  applyPLEAndOutScale ctx block cfg outputBuf state perLayerEmbd perLayerInput (kcr := kcr)
 
 /-! ## Column-major helper kernels for batched prefill -/
 
@@ -2806,7 +1471,8 @@ def forwardPrefillBatch [GPUBackend β] (ctx : β)
       let key := hash ("gemma4_prefill_ce", name, config.numWorkgroups,
                         config.workgroupSize.x, config.workgroupSize.y, config.workgroupSize.z)
       let ref ← k.getRef key
-      GPUBackend.executeWithConfigCached ctx shader namedBufs config key ref
+      let configNamed : Hesper.ExecConfig := { config with funcName := name }
+      GPUBackend.executeWithConfigCached ctx shader namedBufs configNamed key ref
     | none => GPUBackend.execute ctx shader namedBufs config
 
   -- CUDA-Graph-safe write of a u32 into a small device buffer.  In
@@ -2968,9 +1634,18 @@ def forwardPrefillBatch [GPUBackend β] (ctx : β)
   let mut clBytes : ByteArray := ByteArray.empty
   for i in [0:seqLen] do
     clBytes := clBytes ++ Hesper.WebGPU.BufferOps.uint32ToBytes (startPos + i + 1).toUInt32
-  GPUBackend.writeBuffer ctx tokenIdsBuf tokBytes
-  GPUBackend.writeBuffer ctx posBuf posBytes
-  GPUBackend.writeBuffer ctx cacheLenBuf clBytes
+  -- For seqLen=1 (unified decode path), route through pinned+async via
+  -- `writeScalarViaStaging` so the copies land on the unified stream
+  -- alongside subsequent kernel launches.  For seqLen>1 (prefill) this
+  -- is called only a handful of times, so the sync path is acceptable.
+  if seqLen == 1 then
+    writeScalarViaStaging ctx tokenIdsBuf 0 state.stagingTokenPtr  0 tokBytes
+    writeScalarViaStaging ctx posBuf      0 state.stagingParamsPtr 0 posBytes
+    writeScalarViaStaging ctx cacheLenBuf 0 state.stagingParamsPtr 4 clBytes
+  else
+    GPUBackend.writeBuffer ctx tokenIdsBuf tokBytes
+    GPUBackend.writeBuffer ctx posBuf posBytes
+    GPUBackend.writeBuffer ctx cacheLenBuf clBytes
 
   -- ── Step 1: Embedding lookup — per token into batch buffer ──────────
   for i in [0:seqLen] do
@@ -3056,13 +1731,24 @@ def forwardPrefillBatch [GPUBackend β] (ctx : β)
           state.prefillPLInputAllRef.set (some (b, need))
           pure b
     batchPLInputAllOpt := some batchPLInputAll
+    let rowBytesU : USize := model.perLayerEmbdRowBytes.toUSize
     for i in [0:seqLen] do
       let tokenId := promptTokens[i]!
-      -- Pin tokenId and colIdx through the state pinned slots so a CUDA
-      -- Graph can capture this loop (Lean ByteArray host pointers would
-      -- otherwise be baked in and invalidated by GC across captures).
+      -- On-demand path: kernel always reads row 0 of the small row buffer.
+      -- Legacy path: kernel reads tokenId-th row of the full GPU table.
+      let kernelTokenId : Nat := match model.perLayerEmbdMmap with
+        | some _ => 0
+        | none   => tokenId
       writeScalarViaStaging ctx state.plRawRowBuf 0 state.stagingPLRowPtr 0
-        (Hesper.WebGPU.BufferOps.uint32ToBytes tokenId.toUInt32)
+        (Hesper.WebGPU.BufferOps.uint32ToBytes kernelTokenId.toUInt32)
+      match model.perLayerEmbdMmap with
+      | some (mmap, dataSecOff, tensorOff) =>
+        match ← GPUBackend.rawDevicePtr ctx embdTableGPU with
+        | some dstPtr =>
+          let absOff : USize := dataSecOff + tensorOff + tokenId.toUSize * rowBytesU
+          Hesper.CUDA.cuMemcpyHtoDFromMmap dstPtr mmap absOff rowBytesU 0
+        | none => pure ()
+      | none => pure ()
       let scaleFactor : Float := Float.sqrt embdPL.toFloat
       ce "q6kDequantScale_pf"
         (Hesper.Quantization.Q6_K.q6kTableRowDequantScaleKernel totalPL scaleFactor
@@ -3371,17 +2057,17 @@ def forwardPrefillBatch [GPUBackend β] (ctx : β)
       -- Extract Q column i → state.qBuf
       let colIdxBytes := Hesper.WebGPU.BufferOps.uint32ToBytes i.toUInt32
       GPUBackend.writeBufferOffset ctx colIdxBuf 0 colIdxBytes
-      GPUBackend.execute ctx
+      ce s!"colExtractQ_sl{seqLen}_d{qDim}"
         (columnExtractKernel qDim seqLen)
         [("batch", batchQBuf), ("params", colIdxBuf), ("out", state.qBuf)]
         (.dispatch1D qDim)
       -- Extract K, V columns (if this layer has its own KV)
       if cfg.hasKV li then
-        GPUBackend.execute ctx
+        ce s!"colExtractK_sl{seqLen}_d{kvDim}"
           (columnExtractKernel kvDim seqLen)
           [("batch", batchKBuf), ("params", colIdxBuf), ("out", state.kBuf)]
           (.dispatch1D kvDim)
-        GPUBackend.execute ctx
+        ce s!"colExtractV_sl{seqLen}_d{kvDim}"
           (columnExtractKernel kvDim seqLen)
           [("batch", batchVBuf), ("params", colIdxBuf), ("out", state.vBuf)]
           (.dispatch1D kvDim)
@@ -3416,7 +2102,7 @@ def forwardPrefillBatch [GPUBackend β] (ctx : β)
       -- NOTE: colIdxBuf already holds `i` from the Q/K/V extract above
       -- (extracts always run first this iteration, so skip the redundant
       -- 4-byte HtoD write here — 1 HtoD/token/layer × 42 × 9 = 378 saved).
-      GPUBackend.execute ctx
+      ce s!"copyU32Pos_sl{seqLen}"
         (copyU32Kernel seqLen 2 0)
         [("src", posBuf), ("params", colIdxBuf), ("dst", state.paramsBuf)]
         { numWorkgroups := (1, 1, 1), workgroupSize := { x := 1, y := 1, z := 1 } }
@@ -3469,7 +2155,7 @@ def forwardPrefillBatch [GPUBackend β] (ctx : β)
         -- Flash attention
         let scale : Float := 1.0
         -- GPU-side: cacheLenBuf[i] → paramsBuf[1] (offset 4 bytes = u32 index 1)
-        GPUBackend.execute ctx
+        ce s!"copyU32CacheLen_sl{seqLen}"
           (copyU32Kernel seqLen 2 1)
           [("src", cacheLenBuf), ("params", colIdxBuf), ("dst", state.paramsBuf)]
           { numWorkgroups := (1, 1, 1), workgroupSize := { x := 1, y := 1, z := 1 } }
@@ -3488,7 +2174,7 @@ def forwardPrefillBatch [GPUBackend β] (ctx : β)
 
         -- Insert attnOut into batch buffer for later O-projection.
         -- colIdxBuf still holds `i` from the extracts — skip redundant write.
-        GPUBackend.execute ctx
+        ce s!"colInsertAttnOut_sl{seqLen}_d{qDim}"
           (columnInsertKernel qDim seqLen)
           [("src", state.attnOutBuf), ("params", colIdxBuf), ("batch", batchAttnOutBuf)]
           (.dispatch1D qDim)
@@ -3782,7 +2468,7 @@ def forwardPrefillBatch [GPUBackend β] (ctx : β)
   -- shared colIdx slot without value conflict.  For prefill we fall into
   -- the graph-safe helper too but capture doesn't run for prefill.
   writeColIdxU32 colIdxBuf lastCol
-  GPUBackend.execute ctx
+  ce s!"colExtractLast_sl{seqLen}_d{dim}"
     (columnExtractKernel dim seqLen)
     [("batch", currentBuf), ("params", colIdxBuf), ("out", state.buf2)]
     (.dispatch1D dim)
@@ -3887,12 +2573,18 @@ def forwardPrefillBatch [GPUBackend β] (ctx : β)
   -- the entire InferenceState lifetime.
 
 /-- Run full single-token forward pass through the model.
-    Returns logits in state.logitsBuf. -/
+    Returns logits in state.logitsBuf.
+
+    `skipTokenWrite := true` skips the host-seeded
+    `writeScalarViaStaging` for `state.tokenBuf` / `state.plRawRowBuf`.
+    Token-graph mode sets this so argmaxKernel's device-side write
+    from the previous step feeds the next step without host help. -/
 def forwardSingleToken [GPUBackend β] (ctx : β)
     (model : Gemma4Model (GPUBackend.Buf β) (GPUBackend.CachedDispatch β))
     (tokenId : Nat) (pos : Nat)
     (state : InferenceState (GPUBackend.Buf β) (GPUBackend.CachedDispatch β))
-    (kcr : Option (KernelCacheRefs (GPUBackend.CachedDispatch β)) := none) : IO Unit := do
+    (kcr : Option (KernelCacheRefs (GPUBackend.CachedDispatch β)) := none)
+    (skipTokenWrite : Bool := false) : IO Unit := do
   -- Step 1: Embedding lookup (format-dependent)
   -- Cached execute helper (same as forwardBlock's ce)
   let ce := fun (name : String) (shader : ShaderM Unit)
@@ -3903,10 +2595,12 @@ def forwardSingleToken [GPUBackend β] (ctx : β)
     | some k =>
       let key := hash ("gemma4_ce", name, config.numWorkgroups, config.workgroupSize.x, config.workgroupSize.y, config.workgroupSize.z)
       let ref ← k.getRef key
-      GPUBackend.executeWithConfigCached ctx shader namedBufs config key ref
+      let configNamed : Hesper.ExecConfig := { config with funcName := name }
+      GPUBackend.executeWithConfigCached ctx shader namedBufs configNamed key ref
     | none => GPUBackend.execute ctx shader namedBufs config
   let tokenBytes := Hesper.WebGPU.BufferOps.uint32ToBytes tokenId.toUInt32
-  writeScalarViaStaging ctx state.tokenBuf 0 state.stagingTokenPtr 0 tokenBytes
+  if !skipTokenWrite then
+    writeScalarViaStaging ctx state.tokenBuf 0 state.stagingTokenPtr 0 tokenBytes
   Hesper.WGSL.Execute.withSection "embedLookup" do
     match model.embdFormat with
     | .Q6_K =>
@@ -3938,11 +2632,30 @@ def forwardSingleToken [GPUBackend β] (ctx : β)
       let nLayers := model.config.numHiddenLayers
       let totalPL := embdPL * nLayers
 
-      -- 1) Dequant the `tokenId` row from GPU-resident Q6_K table.
-      --    Full table on GPU — no CPU→GPU transfer per token.
+      -- 1) Dequant the `tokenId` row from Q6_K table.
+      --    Two paths:
+      --      (a) Full table in VRAM: kernel reads tokenId-th row directly.
+      --      (b) On-demand mmap: only the active row lives in `embdTableGPU`
+      --          (sized rowBytes); we DMA mmap[tokenId * rowBytes ..] into
+      --          it before each forward, and pass tokenId=0 to the kernel.
       Hesper.WGSL.Execute.withSection "plPre.gpuDequant" do
-        let tokenIdBytes := Hesper.WebGPU.BufferOps.uint32ToBytes tokenId.toUInt32
-        writeScalarViaStaging ctx state.plRawRowBuf 0 state.stagingPLRowPtr 0 tokenIdBytes
+        let rowBytesU : USize := model.perLayerEmbdRowBytes.toUSize
+        let kernelTokenId : Nat := match model.perLayerEmbdMmap with
+          | some _ => 0       -- on-demand: row buffer always reads index 0
+          | none   => tokenId -- legacy: full table indexed by tokenId
+        let tokenIdBytes := Hesper.WebGPU.BufferOps.uint32ToBytes kernelTokenId.toUInt32
+        if !skipTokenWrite then
+          writeScalarViaStaging ctx state.plRawRowBuf 0 state.stagingPLRowPtr 0 tokenIdBytes
+        -- On-demand path: copy this token's row from mmap → row buffer.
+        match model.perLayerEmbdMmap with
+        | some (mmap, dataSecOff, tensorOff) =>
+          match ← GPUBackend.rawDevicePtr ctx embdTableGPU with
+          | some dstPtr =>
+            let absOff : USize :=
+              dataSecOff + tensorOff + tokenId.toUSize * rowBytesU
+            Hesper.CUDA.cuMemcpyHtoDFromMmap dstPtr mmap absOff rowBytesU 0
+          | none => pure ()  -- backend can't expose ptr (e.g. WebGPU); skip
+        | none => pure ()
         let scaleFactor : Float := Float.sqrt embdPL.toFloat
         ce "q6kDequantScale"
           (Hesper.Quantization.Q6_K.q6kTableRowDequantScaleKernel totalPL scaleFactor
@@ -3995,11 +2708,31 @@ def forwardSingleToken [GPUBackend β] (ctx : β)
   let mut blockIdx := 0
   let skipPLE ← do pure (← IO.getEnv "HESPER_SKIP_PLE").isSome
   let plInputBuf := if model.config.hasPerLayerEmbeddings then some state.plInputAll else none
+  -- HESPER_MONOLITH_HYBRID=1: use forwardBlockMonolith for eligible
+  -- blocks (Plan A).  Bundles are extracted lazily on first call —
+  -- subsequent decode tokens reuse the same bundles.  The hybridBundles
+  -- live in a per-β IO.Ref colocated with the model; extract inline
+  -- here to avoid threading another param.
+  let useHybrid := (← IO.getEnv "HESPER_MONOLITH_HYBRID").isSome
+  let hybridBundlesOpt ← if useHybrid then do
+    let (a, f) ← extractMonolithBundlesInline model state
+    pure (some (a, f))
+  else pure none
   for block in model.blocks do
     let plEmbd := if blockIdx < model.perLayerBlocks.size && !skipPLE then
       model.perLayerBlocks[blockIdx]!
     else none
-    forwardBlock ctx block model.config currentBuf nextBuf state pos (kcr := kcr) (perLayerEmbd := plEmbd) (perLayerInput := plInputBuf)
+    match hybridBundlesOpt with
+    | some (attnB, ffnB) =>
+      if blockMonolithEligible block model.config then
+        forwardBlockMonolith ctx block model.config currentBuf nextBuf state pos
+          attnB ffnB (kcr := kcr) (perLayerEmbd := plEmbd) (perLayerInput := plInputBuf)
+      else
+        forwardBlock ctx block model.config currentBuf nextBuf state pos
+          (kcr := kcr) (perLayerEmbd := plEmbd) (perLayerInput := plInputBuf)
+    | none =>
+      forwardBlock ctx block model.config currentBuf nextBuf state pos
+        (kcr := kcr) (perLayerEmbd := plEmbd) (perLayerInput := plInputBuf)
     let oldCb := currentBuf
     currentBuf := nextBuf
     nextBuf := oldCb
@@ -4221,14 +2954,34 @@ def forwardSingleToken [GPUBackend β] (ctx : β)
 
 /-! ## Text Generation -/
 
-/-- GPU argmax: parallel reduction to find token with highest logit. -/
-private def argmaxKernel (vocabSize : Nat) : ShaderM Unit := do
+/-- GPU argmax: parallel reduction to find token with highest logit.
+
+    Writes maxIdx into `result[historySlot]` for host consumption, and
+    mirrors it into both `token[0]` (the single-token lookup buffer
+    used by forwardSingleToken) and `token_ids[0]` (the multi-token
+    lookup buffer used by forwardPrefillBatch when seqLen=1).  The
+    extra writes let the captured decode graph feed the next
+    iteration's embedding lookup with no host round-trip.
+
+    `historySlot` is baked into the kernel at ShaderM compile time so
+    multiple argmaxKernel instances in the same captured graph write
+    to consecutive slots of the same `result` buffer, giving the host
+    the full decode history after one graph launch. -/
+private def argmaxKernel (vocabSize : Nat) (historySlot : Nat := 0) : ShaderM Unit := do
   let tid ← ShaderM.localId
   let tid := Exp.vec3X tid
   ShaderM.sharedNamed "shared_vals" (.array (.scalar .f32) 256)
   ShaderM.sharedNamed "shared_idxs" (.array (.scalar .u32) 256)
   let _logits ← ShaderM.declareInputBuffer "logits" (.array (.scalar .f32) vocabSize)
-  let _result ← ShaderM.declareOutputBuffer "result" (.array (.scalar .u32) 1)
+  -- `result` is sized generously so a single kernel can hit any slot.
+  -- At call time we bind a host-visible history buffer (>= historySlot+1).
+  let _result ← ShaderM.declareOutputBuffer "result" (.array (.scalar .u32) (historySlot + 1))
+  let _token     ← ShaderM.declareOutputBuffer "token"     (.array (.scalar .u32) 1)
+  let _tokenIds  ← ShaderM.declareOutputBuffer "token_ids" (.array (.scalar .u32) 1)
+  -- Per-layer embedding row selector: the PLE dequant kernel reads
+  -- `plRawRow[0]` as the token index, so token-graph replay needs the
+  -- argmax output mirrored here too.
+  let _plRawRow  ← ShaderM.declareOutputBuffer "plRawRow" (.array (.scalar .u32) 1)
   ShaderM.varNamed "local_max" (.scalar .f32) (Exp.litF32 (-1.0e38))
   ShaderM.varNamed "local_idx" (.scalar .u32) (Exp.litU32 0)
   ShaderM.loop tid (Exp.litU32 vocabSize) (Exp.litU32 256) fun i => do
@@ -4255,13 +3008,45 @@ private def argmaxKernel (vocabSize : Nat) : ShaderM Unit := do
     stride := stride / 2
   ShaderM.if_ (Exp.eq tid (Exp.litU32 0)) (do
     let maxIdx ← ShaderM.readWorkgroup (ty := .scalar .u32) (n := 256) "shared_idxs" (Exp.litU32 0)
-    ShaderM.writeBuffer (ty := .scalar .u32) "result" (Exp.litU32 0) maxIdx
+    ShaderM.writeBuffer (ty := .scalar .u32) "result"    (Exp.litU32 historySlot) maxIdx
+    ShaderM.writeBuffer (ty := .scalar .u32) "token"     (Exp.litU32 0) maxIdx
+    ShaderM.writeBuffer (ty := .scalar .u32) "token_ids" (Exp.litU32 0) maxIdx
+    ShaderM.writeBuffer (ty := .scalar .u32) "plRawRow"  (Exp.litU32 0) maxIdx
   ) (pure ())
 
-private def gpuArgmax [GPUBackend β] (ctx : β) (logitsBuf argmaxBuf : GPUBackend.Buf β) (vocabSize : Nat) : IO Nat := do
-  GPUBackend.execute ctx (argmaxKernel vocabSize)
-    [("logits", logitsBuf), ("result", argmaxBuf)]
+/-- Device-side pos/cacheLen/posF32 advance.
+    One thread increments all three scalars in place so the next
+    replay of the captured decode graph consumes position `pos+1`
+    without any host round-trip.
+
+    Bindings:
+      params : u32 × 2   — `[pos, cacheLen]`
+      posF32 : f32 × 1   — same value as `pos`, used by RoPE lookups -/
+private def advancePosKernel : ShaderM Unit := do
+  let tid ← ShaderM.localId
+  let tid := Exp.vec3X tid
+  let _params ← ShaderM.declareOutputBuffer "params" (.array (.scalar .u32) 2)
+  let _posF32 ← ShaderM.declareOutputBuffer "posF32" (.array (.scalar .f32) 1)
+  ShaderM.if_ (Exp.eq tid (Exp.litU32 0)) (do
+    let p ← ShaderM.readBuffer (ty := .scalar .u32) (n := 2) "params" (Exp.litU32 0)
+    let c ← ShaderM.readBuffer (ty := .scalar .u32) (n := 2) "params" (Exp.litU32 1)
+    let pNew := Exp.add p (Exp.litU32 1)
+    let cNew := Exp.add c (Exp.litU32 1)
+    ShaderM.writeBuffer (ty := .scalar .u32) "params" (Exp.litU32 0) pNew
+    ShaderM.writeBuffer (ty := .scalar .u32) "params" (Exp.litU32 1) cNew
+    ShaderM.writeBuffer (ty := .scalar .f32) "posF32" (Exp.litU32 0) (Exp.toF32 pNew)
+  ) (pure ())
+
+private def gpuArgmax [GPUBackend β] (ctx : β)
+    (logitsBuf argmaxBuf tokenBuf tokenIdsBuf plRawRowBuf : GPUBackend.Buf β)
+    (vocabSize : Nat)
+    (cacheRef : IO.Ref (Option (GPUBackend.CachedDispatch β))) : IO Nat := do
+  GPUBackend.executeWithConfigCached ctx (argmaxKernel vocabSize)
+    [ ("logits", logitsBuf), ("result", argmaxBuf)
+    , ("token", tokenBuf), ("token_ids", tokenIdsBuf)
+    , ("plRawRow", plRawRowBuf) ]
     { workgroupSize := { x := 256 }, numWorkgroups := (1, 1, 1) }
+    (hash ("argmaxKernel", vocabSize)) cacheRef
   let bytes ← GPUBackend.readBuffer ctx argmaxBuf (4 : USize)
   return (Hesper.Basic.bytesToUInt32 bytes 0).toNat
 
@@ -4316,6 +3101,12 @@ def generate [GPUBackend β] (ctx : β) (model : Gemma4Model (GPUBackend.Buf β)
   IO.println s!"[Prefill] Done in {prefillMs} ms"
 
   -- Phase 2: Decode (generate new tokens)
+  -- Reset alloc counter + module-load timer so prefill isn't included
+  -- in the decode-only histogram.  `HESPER_ALLOC_TRACE=1` enables
+  -- recording (both alloc and module-load).  Printed at end of generate.
+  Hesper.resetAllocCounter
+  Hesper.resetModuleLoadTimer
+  Hesper.resetExecuteImplTimer
   let genStart ← IO.monoNanosNow
   let mut genCount : Nat := 0
 
@@ -4330,11 +3121,164 @@ def generate [GPUBackend β] (ctx : β) (model : Gemma4Model (GPUBackend.Buf β)
   -- true for Gemma 4's single-token path since all kernels have
   -- compile-time-fixed dispatch shapes (one per-layer set).
   let useCudaGraphs := (← IO.getEnv "HESPER_CUDA_GRAPHS").isSome
+  let tokenGraph   := (← IO.getEnv "HESPER_TOKEN_GRAPH").isSome
+  let pipelinedDecode := (← IO.getEnv "HESPER_PIPELINED_DECODE").isSome
 
   let mut graphExecOpt : Option (Hesper.CUDA.CUgraphExec × Hesper.CUDA.CUstream) := none
 
+  let dispCountEnabled := (← IO.getEnv "HESPER_DISPATCH_COUNT").isSome
+  if dispCountEnabled then
+    Hesper.WGSL.Execute.sectionProfilingRef.set true
+
+  -- HESPER_TOKEN_GRAPH=1: capture the entire N-token decode loop as a
+  -- single CUDA graph and launch it once.  Requires unifiedDecode and
+  -- CUDA graphs.  EOS checks are skipped in favour of generating the
+  -- full maxTokens (host trims after).
+  if tokenGraph && useCudaGraphs then do
+    -- 1-shot history buffer: maxTokens u32 slots.
+    let historyBuf ← GPUBackend.allocBuffer ctx (maxTokens * 4).toUSize
+    -- Pre-capture: put the initial pos / cacheLen / posF32 into the
+    -- state buffers via a normal (outside-capture) write so the first
+    -- captured kernel invocation reads pos = promptTokens.size.
+    let startPos := promptTokens.size
+    let posBytes     := Hesper.WebGPU.BufferOps.uint32ToBytes startPos.toUInt32
+    let cacheLenBytes := Hesper.WebGPU.BufferOps.uint32ToBytes (startPos + 1).toUInt32
+    let posF32Bytes  ← Hesper.Basic.floatToBytes startPos.toFloat
+    GPUBackend.writeBufferOffset ctx state.paramsBuf 0 posBytes
+    GPUBackend.writeBufferOffset ctx state.paramsBuf 4 cacheLenBytes
+    GPUBackend.writeBufferOffset ctx state.posF32Buf 0 posF32Bytes
+    -- Pre-capture: seed tokenBuf / plRawRowBuf with the last prefill
+    -- token so step 0's embedding lookup picks it up.
+    let lastPrefill := promptTokens[promptTokens.size - 1]!
+    let lpBytes := Hesper.WebGPU.BufferOps.uint32ToBytes lastPrefill.toUInt32
+    GPUBackend.writeBufferOffset ctx state.tokenBuf     0 lpBytes
+    GPUBackend.writeBufferOffset ctx state.plRawRowBuf  0 lpBytes
+
+    let stream ← Hesper.CUDA.cuStreamCreate
+    Hesper.cudaCaptureStream.set (some stream)
+    Hesper.CUDA.cuStreamBeginCapture stream
+    skipStagingWrites.set true
+    let dispStart ← Hesper.dispatchCounter.get
+    for k in [0:maxTokens] do
+      let dispBeforeStep ← Hesper.dispatchCounter.get
+      forwardSingleToken ctx model 0 (startPos + k) state
+        (kcr := some kcr) (skipTokenWrite := true)
+      GPUBackend.execute ctx (argmaxKernel model.config.vocabSize k)
+        [ ("logits", state.logitsBuf), ("result", historyBuf)
+        , ("token", state.tokenBuf), ("token_ids", state.tokenBuf)
+        , ("plRawRow", state.plRawRowBuf) ]
+        { workgroupSize := { x := 256 }, numWorkgroups := (1, 1, 1) }
+      GPUBackend.execute ctx advancePosKernel
+        [ ("params", state.paramsBuf), ("posF32", state.posF32Buf) ]
+        { workgroupSize := { x := 1 }, numWorkgroups := (1, 1, 1) }
+      let dispAfterStep ← Hesper.dispatchCounter.get
+      IO.println s!"[token-graph] step {k}: {dispAfterStep - dispBeforeStep} dispatches recorded"
+    let dispEnd ← Hesper.dispatchCounter.get
+    IO.println s!"[token-graph] total captured: {dispEnd - dispStart} dispatches over {maxTokens} steps = {(dispEnd - dispStart).toFloat / maxTokens.toFloat} /token"
+    skipStagingWrites.set false
+    let graph ← Hesper.CUDA.cuStreamEndCapture stream
+    Hesper.cudaCaptureStream.set none
+    let exec ← Hesper.CUDA.cuGraphInstantiate graph
+    Hesper.CUDA.cuGraphDestroy graph
+    IO.println s!"[Graph] captured full {maxTokens}-token decode graph"
+    -- Single launch for the whole decode.
+    Hesper.CUDA.cuGraphLaunch exec stream
+    Hesper.CUDA.cuStreamSynchronize stream
+    -- Read history and append to tokens.  EOS truncation after.
+    let historyBytes ← GPUBackend.readBuffer ctx historyBuf (maxTokens * 4).toUSize
+    for k in [0:maxTokens] do
+      let tok := (Hesper.Basic.bytesToUInt32 historyBytes (k*4)).toNat
+      tokens := tokens.push tok
+      genCount := genCount + 1
+      let mut stop := false
+      match eosToken with
+      | some eos => if tok == eos then stop := true
+      | none => pure ()
+      if extraEosTokens.any (· == tok) then stop := true
+      if stop then break
+    let genEnd ← IO.monoNanosNow
+    let genMs := (genEnd - genStart).toFloat / 1000000.0
+    let msPerToken := if genCount > 0 then genMs / genCount.toFloat else 0.0
+    let tps := if msPerToken > 0 then 1000.0 / msPerToken else 0.0
+    IO.println s!"[Gemma4] Generated {genCount} tokens in {genMs} ms ({tps} tokens/sec)"
+    return tokens
+
+  -- HESPER_PIPELINED_DECODE=1: like HESPER_TOKEN_GRAPH but without CUDA
+  -- Graph capture. Launches argmax + advancePos kernels on the default
+  -- stream after each forward; host never reads token value per step.
+  -- The async pipeline lets the driver submit kernel N+1 while GPU
+  -- still executes kernel N, matching llama.cpp's graphs-OFF behaviour.
+  -- EOS check is done in a final batched readback after the loop.
+  if pipelinedDecode then do
+    let historyBuf ← GPUBackend.allocBuffer ctx (maxTokens * 4).toUSize
+    let startPos := promptTokens.size
+    let posBytes      := Hesper.WebGPU.BufferOps.uint32ToBytes startPos.toUInt32
+    let cacheLenBytes := Hesper.WebGPU.BufferOps.uint32ToBytes (startPos + 1).toUInt32
+    let posF32Bytes   ← Hesper.Basic.floatToBytes startPos.toFloat
+    GPUBackend.writeBufferOffset ctx state.paramsBuf 0 posBytes
+    GPUBackend.writeBufferOffset ctx state.paramsBuf 4 cacheLenBytes
+    GPUBackend.writeBufferOffset ctx state.posF32Buf 0 posF32Bytes
+    let lastPrefill := promptTokens[promptTokens.size - 1]!
+    let lpBytes := Hesper.WebGPU.BufferOps.uint32ToBytes lastPrefill.toUInt32
+    GPUBackend.writeBufferOffset ctx state.tokenBuf    0 lpBytes
+    GPUBackend.writeBufferOffset ctx state.plRawRowBuf 0 lpBytes
+    -- skipStagingWrites must be true so forwardSingleToken's
+    -- writeScalarViaStaging calls become no-ops (otherwise they stamp
+    -- the first tokenId into state.tokenBuf on every iteration,
+    -- defeating the device-side argmax→tokenBuf feedback).
+    skipStagingWrites.set true
+    for k in [0:maxTokens] do
+      forwardSingleToken ctx model 0 (startPos + k) state
+        (kcr := some kcr) (skipTokenWrite := true)
+      GPUBackend.execute ctx (argmaxKernel model.config.vocabSize k)
+        [ ("logits", state.logitsBuf), ("result", historyBuf)
+        , ("token", state.tokenBuf), ("token_ids", state.tokenBuf)
+        , ("plRawRow", state.plRawRowBuf) ]
+        { workgroupSize := { x := 256 }, numWorkgroups := (1, 1, 1) }
+      GPUBackend.execute ctx advancePosKernel
+        [ ("params", state.paramsBuf), ("posF32", state.posF32Buf) ]
+        { workgroupSize := { x := 1 }, numWorkgroups := (1, 1, 1) }
+    skipStagingWrites.set false
+    -- One sync + one readback for all tokens.
+    let historyBytes ← GPUBackend.readBuffer ctx historyBuf (maxTokens * 4).toUSize
+    for k in [0:maxTokens] do
+      let tok := (Hesper.Basic.bytesToUInt32 historyBytes (k*4)).toNat
+      tokens := tokens.push tok
+      genCount := genCount + 1
+      let mut stop := false
+      match eosToken with
+      | some eos => if tok == eos then stop := true
+      | none => pure ()
+      if extraEosTokens.any (· == tok) then stop := true
+      if stop then break
+    let genEnd ← IO.monoNanosNow
+    let genMs := (genEnd - genStart).toFloat / 1_000_000.0
+    let msPerToken := if genCount > 0 then genMs / genCount.toFloat else 0.0
+    let tps := if msPerToken > 0 then 1000.0 / msPerToken else 0.0
+    IO.println s!"[Gemma4] Generated {genCount} tokens in {genMs} ms ({tps} tokens/sec)"
+    return tokens
+
+  let perTokTrace := (← IO.getEnv "HESPER_ALLOC_TRACE").isSome
+  -- HESPER_UNIFIED_STREAM=1: point `cudaCaptureStream` at a persistent
+  -- non-null stream so *all* kernel launches and H2D copies within
+  -- `forwardPrefillBatch` / `forwardSingleToken` funnel into the same
+  -- stream.  This replaces the default (null) stream's synchronous
+  -- semantics: successive ops serialise in stream order without host
+  -- stalls, and the `writeScalarViaStaging` pinned+async path fires
+  -- instead of the sync `cuMemcpyHtoD_v2` fallback.  Decode sync
+  -- happens when generate's argmax reads the result via readBuffer
+  -- (implicit stream sync) so output remains correct. -/
+  if state.unifiedStream != 0 then
+    Hesper.cudaCaptureStream.set (some state.unifiedStream)
+  let decodeSectTrace := (← IO.getEnv "HESPER_DECODE_SECT_TRACE").isSome
   for _ in [0:maxTokens] do
     if tokens.size >= model.config.maxSeqLen then break
+
+    -- Reset dispatch counter at the start of each decode iteration — we
+    -- want the per-token count (from argmax-read through next-forward).
+    let dispBefore ← if dispCountEnabled then Hesper.dispatchCounter.get else pure 0
+    let iterT0 ← if perTokTrace || decodeSectTrace then IO.monoNanosNow else pure 0
+    let modLoadNsBefore ← if perTokTrace then Hesper.cudaModuleLoadWallNs.get else pure 0
 
     -- Sample: GPU-side greedy argmax (download 4 bytes instead of 1 MB).
     -- When a captured decode graph exists, argmax has already run as part
@@ -4344,7 +3288,17 @@ def generate [GPUBackend β] (ctx : β) (model : Gemma4Model (GPUBackend.Buf β)
         let bytes ← GPUBackend.readBuffer ctx state.argmaxBuf (4 : USize)
         pure (Hesper.Basic.bytesToUInt32 bytes 0).toNat
       | none =>
-        gpuArgmax ctx state.logitsBuf state.argmaxBuf model.config.vocabSize
+        -- tokenIdsBuf / plRawRowBuf feedback keeps the captured graph
+        -- self-feeding; when prefillTokenIdsRef isn't allocated (e.g.
+        -- non-unified forwardSingleToken path) reuse state.tokenBuf as
+        -- a harmless dummy.
+        let tokenIdsBuf ← match ← state.prefillTokenIdsRef.get with
+          | some (b, _) => pure b
+          | none        => pure state.tokenBuf
+        gpuArgmax ctx state.logitsBuf state.argmaxBuf state.tokenBuf tokenIdsBuf
+          state.plRawRowBuf model.config.vocabSize state.argmaxCacheRef
+
+    let tArgmaxEnd ← if decodeSectTrace then IO.monoNanosNow else pure 0
 
     if (← IO.getEnv "HESPER_DECODE_TRACE").isSome then
       IO.println s!"[decode] genCount={genCount} tokens.size(before push)={tokens.size} nextToken={nextToken}"
@@ -4360,28 +3314,26 @@ def generate [GPUBackend β] (ctx : β) (model : Gemma4Model (GPUBackend.Buf β)
     if extraEosTokens.any (· == nextToken) then stop := true
     if stop then break
 
+    let tPostPushEnd ← if decodeSectTrace then IO.monoNanosNow else pure 0
+
     -- Forward pass for next token
     let newPos := tokens.size - 1
     if newPos < model.config.maxSeqLen then
       match graphExecOpt with
       | some (exec, stream) =>
-        -- Replay path.  The captured graph contains memcpy nodes whose
-        -- host sources are the pinned buffers at state.stagingTokenPtr /
-        -- stagingParamsPtr / stagingPLRowPtr (see writeScalarViaStaging).
-        -- Update those slots with the new token/pos/cacheLen BEFORE
-        -- launching the graph so the memcpy nodes pick up fresh values.
-        let tokenBytes := Hesper.WebGPU.BufferOps.uint32ToBytes nextToken.toUInt32
-        let posBytes := Hesper.WebGPU.BufferOps.uint32ToBytes newPos.toUInt32
-        let cacheLenBytes := Hesper.WebGPU.BufferOps.uint32ToBytes (newPos + 1).toUInt32
-        let plRowBytes := tokenBytes
-        let posF32Bytes ← Hesper.Basic.floatToBytes newPos.toFloat
-        Hesper.CUDA.cuWritePinned state.stagingTokenPtr  0 tokenBytes 4
-        Hesper.CUDA.cuWritePinned state.stagingParamsPtr 0 posBytes 4
-        Hesper.CUDA.cuWritePinned state.stagingParamsPtr 4 cacheLenBytes 4
-        Hesper.CUDA.cuWritePinned state.stagingPLRowPtr  0 plRowBytes 4
-        Hesper.CUDA.cuWritePinned state.stagingPosF32Ptr 0 posF32Bytes 4
+        -- Replay path.  The captured graph self-feeds via the
+        -- argmax→tokenBuf write and the advancePosKernel tail, so NO
+        -- host-side buffer updates are needed between iterations — we
+        -- just relaunch the same graph.
+        let tg0 ← if decodeSectTrace then IO.monoNanosNow else pure 0
         Hesper.CUDA.cuGraphLaunch exec stream
+        let tg1 ← if decodeSectTrace then IO.monoNanosNow else pure 0
         Hesper.CUDA.cuStreamSynchronize stream
+        let tg2 ← if decodeSectTrace then IO.monoNanosNow else pure 0
+        if decodeSectTrace then
+          let launchMs := (tg1 - tg0).toFloat / 1e6
+          let syncMs   := (tg2 - tg1).toFloat / 1e6
+          IO.println s!"[graph] launch={launchMs}ms sync={syncMs}ms"
       | none =>
         -- HESPER_UNIFIED_DECODE=1: route decode through forwardPrefillBatch
         -- with N=1, startPos=newPos.  This is Phase 3 of the llama.cpp
@@ -4400,33 +3352,57 @@ def generate [GPUBackend β] (ctx : β) (model : Gemma4Model (GPUBackend.Buf β)
           -- gpuArgmax to read stale prefill logits → duplicated first
           -- token (the infamous "TheThe" bug).
           let stream ← Hesper.CUDA.cuStreamCreate
-          Hesper.cudaCaptureStream.set (some stream)
-          -- Before capture starts, seed the pinned slots with the args
-          -- we'll use at replay time so the graph's memcpy nodes snapshot
-          -- correct source bytes during capture.
+          -- BEFORE capture: seed paramsBuf / posF32Buf / tokenBuf / plRawRow
+          -- directly (non-captured), so the first captured forward sees
+          -- pos=newPos.  These must NOT become memcpy nodes in the graph
+          -- because advancePosKernel (at the graph's tail) is the device-
+          -- side source of truth for pos on all subsequent replays — any
+          -- captured memcpy from a pinned host slot would overwrite it.
           let tokenBytes := Hesper.WebGPU.BufferOps.uint32ToBytes nextToken.toUInt32
           let posBytes := Hesper.WebGPU.BufferOps.uint32ToBytes newPos.toUInt32
           let cacheLenBytes := Hesper.WebGPU.BufferOps.uint32ToBytes (newPos + 1).toUInt32
           let posF32Bytes ← Hesper.Basic.floatToBytes newPos.toFloat
-          Hesper.CUDA.cuWritePinned state.stagingTokenPtr  0 tokenBytes 4
-          Hesper.CUDA.cuWritePinned state.stagingParamsPtr 0 posBytes 4
-          Hesper.CUDA.cuWritePinned state.stagingParamsPtr 4 cacheLenBytes 4
-          Hesper.CUDA.cuWritePinned state.stagingPLRowPtr  0 tokenBytes 4
-          Hesper.CUDA.cuWritePinned state.stagingPosF32Ptr 0 posF32Bytes 4
+          GPUBackend.writeBufferOffset ctx state.tokenBuf    0 tokenBytes
+          GPUBackend.writeBufferOffset ctx state.paramsBuf   0 posBytes
+          GPUBackend.writeBufferOffset ctx state.paramsBuf   4 cacheLenBytes
+          GPUBackend.writeBufferOffset ctx state.plRawRowBuf 0 tokenBytes
+          GPUBackend.writeBufferOffset ctx state.posF32Buf   0 posF32Bytes
+          -- Gate staging writes to no-ops for the duration of capture so
+          -- `writeScalarViaStaging` inside forwardSingleToken / forwardBlock
+          -- does NOT emit captured memcpy nodes.
+          skipStagingWrites.set true
+          Hesper.cudaCaptureStream.set (some stream)
           Hesper.CUDA.cuStreamBeginCapture stream
           if unifiedDecode then
             forwardPrefillBatch ctx model #[nextToken] state
               (kcr := some unifiedKcr) (startPos := newPos)
           else
-            forwardSingleToken ctx model nextToken newPos state (kcr := some kcr)
+            forwardSingleToken ctx model nextToken newPos state
+              (kcr := some kcr) (skipTokenWrite := true)
           -- Fold argmax into the captured graph as well — saves one
           -- cuLaunchKernel per token on replay.  Result lands in
           -- `state.argmaxBuf`; the host reads 4 bytes after each replay.
+          -- argmax is part of the captured graph so the token id is
+          -- deposited into `state.tokenBuf`, `prefillTokenIdsBuf`, and
+          -- `state.plRawRowBuf` device-side — no host copy needed
+          -- before the next replay.
+          let tokenIdsBuf ← match ← state.prefillTokenIdsRef.get with
+            | some (b, _) => pure b
+            | none        => pure state.tokenBuf
           GPUBackend.execute ctx (argmaxKernel model.config.vocabSize)
-            [("logits", state.logitsBuf), ("result", state.argmaxBuf)]
+            [ ("logits", state.logitsBuf), ("result", state.argmaxBuf)
+            , ("token", state.tokenBuf), ("token_ids", tokenIdsBuf)
+            , ("plRawRow", state.plRawRowBuf) ]
             { workgroupSize := { x := 256 }, numWorkgroups := (1, 1, 1) }
+          -- Advance pos / cacheLen / posF32 by 1 on the device so the
+          -- NEXT replay automatically consumes `pos+1` without the host
+          -- needing to writeScalarViaStaging them.
+          GPUBackend.execute ctx advancePosKernel
+            [ ("params", state.paramsBuf), ("posF32", state.posF32Buf) ]
+            { workgroupSize := { x := 1 }, numWorkgroups := (1, 1, 1) }
           let graph ← Hesper.CUDA.cuStreamEndCapture stream
           Hesper.cudaCaptureStream.set none
+          skipStagingWrites.set false
           let exec ← Hesper.CUDA.cuGraphInstantiate graph
           Hesper.CUDA.cuGraphDestroy graph
           -- Execute the captured graph once for the current token, so
@@ -4460,6 +3436,47 @@ def generate [GPUBackend β] (ctx : β) (model : Gemma4Model (GPUBackend.Buf β)
               let bytes ← GPUBackend.readBuffer ctx state.logitsBuf (model.config.vocabSize * 4).toUSize
               IO.FS.writeBinFile s!"/tmp/hesper_single_logits_step{genCount}.bin" bytes
 
+    let tForwardEnd ← if decodeSectTrace then IO.monoNanosNow else pure 0
+
+    -- Print per-token dispatch count.  Captures launches through
+    -- `launchKernelMaybeStream` — covers both fresh dispatches and
+    -- cached replays.  For captured graph launches, counts just the
+    -- cuGraphLaunch (kernel nodes inside the graph are NOT re-invoked
+    -- through launchKernelMaybeStream).
+    if perTokTrace then
+      let iterT1 ← IO.monoNanosNow
+      let modLoadNsAfter ← Hesper.cudaModuleLoadWallNs.get
+      let iterMs := (iterT1 - iterT0).toFloat / 1e6
+      let modMs  := (modLoadNsAfter - modLoadNsBefore).toFloat / 1e6
+      IO.println s!"[tok] {genCount}: wall={iterMs} ms, modLoad={modMs} ms"
+    if decodeSectTrace then
+      let argmaxMs    := (tArgmaxEnd - iterT0).toFloat / 1e6
+      let pushEosMs   := (tPostPushEnd - tArgmaxEnd).toFloat / 1e6
+      let forwardMs   := (tForwardEnd - tPostPushEnd).toFloat / 1e6
+      let totalMs     := (tForwardEnd - iterT0).toFloat / 1e6
+      IO.println s!"[sect] tok={genCount} argmax={argmaxMs}ms pushEos={pushEosMs}ms forward={forwardMs}ms total={totalMs}ms"
+    if dispCountEnabled then
+      let dispAfter ← Hesper.dispatchCounter.get
+      IO.println s!"[disp] tok={genCount} dispatches={dispAfter - dispBefore} per-layer={(dispAfter - dispBefore).toFloat / 42}"
+      -- On the very first decode iteration (before graph capture),
+      -- print per-section breakdown.  Afterward the captured graph
+      -- replay doesn't go through withSection so totals stay stable.
+      if genCount == 1 then
+        let sectionDisp ← Hesper.WGSL.Execute.getSectionDispatches
+        -- Sections that wrap other sections (e.g. `perLayerEmbd` wraps
+        -- ple.inpGateGeluSlice + ple.proj + ple.postNormAdd) inflate the
+        -- count via double-counting.  Skip them by name.
+        let wrappers : List String := ["perLayerEmbd", "perLayerInputPre"]
+        IO.println "[disp] per-section dispatches (wrappers hidden):"
+        let mut innerTotal : Nat := 0
+        for (name, count, calls) in sectionDisp do
+          if wrappers.contains name then
+            IO.println s!"  {name} (wrapper, see children): {count} dispatches over {calls} calls"
+          else
+            innerTotal := innerTotal + count
+            IO.println s!"  {name}: {count} dispatches over {calls} calls"
+        IO.println s!"[disp] inner-section sum: {innerTotal}"
+
   -- Clean up graph resources.
   match graphExecOpt with
   | some (exec, stream) =>
@@ -4472,6 +3489,14 @@ def generate [GPUBackend β] (ctx : β) (model : Gemma4Model (GPUBackend.Buf β)
   let msPerToken := if genCount > 0 then genMs / genCount.toFloat else 0.0
   let tps := if msPerToken > 0 then 1000.0 / msPerToken else 0.0
   IO.println s!"[Gemma4] Generated {genCount} tokens in {genMs} ms ({tps} tokens/sec)"
+  -- HESPER_ALLOC_TRACE=1: show sizes of allocBuffer calls during decode.
+  -- A cached call site allocates once; a non-cached one allocates
+  -- N*genCount times.  Entries with count > 1 are the candidates for
+  -- adding an IORef cache.
+  if (← IO.getEnv "HESPER_ALLOC_TRACE").isSome then
+    Hesper.printAllocHistogram
+    Hesper.printModuleLoadStats
+    Hesper.printExecuteImplStats
 
   return tokens
 
