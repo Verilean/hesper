@@ -41,6 +41,54 @@ def loadGGUF (path : String) : IO GGUFFile := do
   | .ok gguf => pure gguf
   | .error msg => throw <| IO.userError s!"Failed to parse GGUF file: {msg}"
 
+/-- Load GGUF with mmap: only the metadata prefix is copied into a
+    Lean ByteArray (for parser); tensor data is referenced directly
+    via the mmap handle attached to the returned `GGUFFile`.
+
+    The returned `GGUFFile` keeps the mmap alive via `.mmap`; tensor
+    body uploads should use `Hesper.CUDA.cuMemcpyHtoDFromMmap` with
+    `gguf.dataSectionOffset + tensor.offset` instead of reading
+    `dataBlob` (which is empty in this mode).  `getTensorData` still
+    works against the prefix copy, but is now a no-op for tensor
+    bodies — callers must handle mmap explicitly. -/
+def loadGGUFMmap (path : String) : IO GGUFFile := do
+  let mmap ← Hesper.CUDA.mmapOpen path
+  let fileSize ← Hesper.CUDA.mmapSize mmap
+  -- Parser traverses metadata + tensor infos, which all live in the
+  -- prefix before the aligned tensor data section.  We don't know
+  -- the exact prefix size until we parse, so copy the full file
+  -- prefix into a ByteArray, parse to discover the data section
+  -- offset, then discard the body portion of the prefix — the Lean
+  -- GC will reclaim it on next collection.
+  --
+  -- Optimisation: a single-pass parser that reads only header / meta
+  -- / tensor-info without slurping the body would save ~200 ms of
+  -- ByteArray alloc, but requires rewriting parseGGUF.  For now,
+  -- loadGGUFMmap still allocates the 5 GB ByteArray once — but the
+  -- tensor body is never re-copied during upload, which was the
+  -- bigger win.
+  let fileData ← Hesper.CUDA.mmapSliceToBytesPersistent mmap 0 fileSize
+  match Parser.parseGGUF fileData with
+  | .ok gguf =>
+    -- `dataSectionOffset` is absolute file offset where tensor bodies
+    -- start.  When dataBlob is populated (non-mmap path) it contains
+    -- the body bytes, so offset = fileSize - dataBlob.size.
+    let dataSectionOffset : USize :=
+      if gguf.dataBlob.size > 0 then
+        (fileSize.toNat - gguf.dataBlob.size).toUSize
+      else
+        0
+    -- Drop dataBlob — tensor uploads now go through mmap (uploadTensor
+    -- + getTensorDataM both check `mmap.isSome`).  The 5 GB ByteArray
+    -- becomes garbage and is collected on next GC pass, freeing the
+    -- Lean-heap copy.
+    pure { gguf with
+      mmap := some mmap
+      dataSectionOffset
+      dataBlob := ByteArray.empty
+    }
+  | .error msg => throw <| IO.userError s!"Failed to parse GGUF file: {msg}"
+
 /-! ## Extended GGUFFile API -/
 
 namespace GGUFFile

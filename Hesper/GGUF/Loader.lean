@@ -256,16 +256,41 @@ def findTensor (gguf : GGUFFile) (name : String) : Except String TensorInfo := d
 -/
 def getTensorData (gguf : GGUFFile) (name : String) : Except String (TensorInfo × ByteArray) := do
   let info ← findTensor gguf name
-
   -- Extract data slice
   let dataStart := info.offset
   let dataEnd := info.offset + info.size
-
   if dataEnd > gguf.dataBlob.size then
     throw s!"Tensor '{name}' data extends beyond file: {dataEnd} > {gguf.dataBlob.size}"
-
   let data := gguf.dataBlob.extract dataStart dataEnd
   return (info, data)
+
+/-- mmap-aware tensor data getter.  When the file was loaded via
+    `loadGGUFMmap` and dataBlob is empty (zero-copy mode), copies the
+    bytes from the mmap region instead.  Otherwise falls back to the
+    pure-byteArray path. -/
+def getTensorDataM (gguf : GGUFFile) (name : String) : IO (TensorInfo × ByteArray) := do
+  let info ← match findTensor gguf name with
+    | .ok i => pure i
+    | .error e => throw (IO.userError e)
+  match gguf.mmap with
+  | some mmap =>
+    if gguf.dataBlob.size > 0 then
+      -- Both available — prefer dataBlob (already extracted, no copy)
+      let dataStart := info.offset
+      let dataEnd := info.offset + info.size
+      let data := gguf.dataBlob.extract dataStart dataEnd
+      pure (info, data)
+    else
+      let absOffset : USize := gguf.dataSectionOffset + info.offset.toUSize
+      let bytes ← Hesper.CUDA.mmapSliceToBytesPersistent mmap absOffset info.size.toUSize
+      pure (info, bytes)
+  | none =>
+    let dataStart := info.offset
+    let dataEnd := info.offset + info.size
+    if dataEnd > gguf.dataBlob.size then
+      throw (IO.userError s!"Tensor '{name}' data extends beyond file: {dataEnd} > {gguf.dataBlob.size}")
+    let data := gguf.dataBlob.extract dataStart dataEnd
+    pure (info, data)
 
 /-- Extract Float32 tensor data
 
@@ -428,17 +453,13 @@ def getTQ2_0Tensor (gguf : GGUFFile) (name : String)
 -/
 def extractFloat32Tensor (gguf : GGUFFile) (name : String) : IO ByteArray := do
   IO.println s!"[Loader] Extracting Float32 tensor: {name}"
-
-  -- Extract raw bytes directly (no need to convert to Float and back)
-  match getTensorData gguf name with
-  | .error e => throw $ IO.userError e
-  | .ok (info, data) =>
-    match info.ggmlType with
-    | .F32 =>
-      let numFloats := data.size / 4
-      IO.println s!"  ✓ Extracted {numFloats} Float32 values ({data.size} bytes)"
-      return data
-    | _ => throw $ IO.userError s!"Tensor '{name}' is not Float32 (type: {toString info.ggmlType})"
+  let (info, data) ← getTensorDataM gguf name
+  match info.ggmlType with
+  | .F32 =>
+    let numFloats := data.size / 4
+    IO.println s!"  ✓ Extracted {numFloats} Float32 values ({data.size} bytes)"
+    return data
+  | _ => throw $ IO.userError s!"Tensor '{name}' is not Float32 (type: {toString info.ggmlType})"
 
 /-- Extract F16 tensor as ByteArray
 
@@ -448,12 +469,12 @@ def extractFloat32Tensor (gguf : GGUFFile) (name : String) : IO ByteArray := do
 -/
 def extractF16Tensor (gguf : GGUFFile) (name : String) : IO ByteArray := do
   IO.println s!"[Loader] Extracting F16 tensor: {name}"
-
-  match getF16Tensor gguf name with
-  | .error e => throw $ IO.userError e
-  | .ok data =>
+  let (info, data) ← getTensorDataM gguf name
+  match info.ggmlType with
+  | .F16 =>
     IO.println s!"  ✓ Extracted F16 tensor ({data.size} bytes)"
     return data
+  | _ => throw $ IO.userError s!"Tensor '{name}' is not F16 (type: {toString info.ggmlType})"
 
 /-- Extract I2_S tensor and dequantize to Float32
 
