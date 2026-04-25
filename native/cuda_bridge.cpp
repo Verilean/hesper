@@ -7,6 +7,13 @@
 #include <cstring>
 #include <cstdio>
 #include <cstdlib>
+#include <cstdint>
+#include <cerrno>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <sys/mman.h>
+#include <fcntl.h>
+#include <unistd.h>
 
 static lean_obj_res cuda_error(CUresult err, const char* func) {
     const char* errName = nullptr;
@@ -83,10 +90,93 @@ extern "C" lean_obj_res lean_hesper_cuda_ctx_destroy(size_t ctx_val) {
 // Module (PTX JIT)
 // ============================================================================
 
+// Simple 64-bit FNV-1a hash for cubin filename key.
+static uint64_t fnv1a64(const char* s, size_t n) {
+    uint64_t h = 0xcbf29ce484222325ULL;
+    for (size_t i = 0; i < n; i++) {
+        h ^= (uint8_t)s[i];
+        h *= 0x100000001b3ULL;
+    }
+    return h;
+}
+
+// Cache directory for cubin artifacts.  Keyed by FNV64(ptx).  Avoids
+// JIT on warm starts — `cuModuleLoadData(cubin)` is O(µs) vs cubin
+// compilation O(200µs) × 259 kernels = 50 ms.
+static const char* hesper_cubin_cache_dir() {
+    static char dir[512] = {0};
+    if (dir[0] == '\0') {
+        const char* env = getenv("HESPER_CUBIN_CACHE");
+        if (env && *env) { snprintf(dir, sizeof(dir), "%s", env); }
+        else {
+            const char* home = getenv("HOME");
+            if (home) snprintf(dir, sizeof(dir), "%s/.cache/hesper/cubin", home);
+            else      snprintf(dir, sizeof(dir), "/tmp/hesper-cubin");
+        }
+    }
+    return dir;
+}
+
+static void hesper_mkdir_p(const char* path) {
+    char buf[512];
+    snprintf(buf, sizeof(buf), "%s", path);
+    for (char* p = buf + 1; *p; p++) {
+        if (*p == '/') {
+            *p = '\0';
+            int r = mkdir(buf, 0755);
+            if (getenv("HESPER_CUBIN_DEBUG")) {
+                fprintf(stderr, "[cubin] mkdir %s rc=%d errno=%d\n", buf, r, errno);
+            }
+            *p = '/';
+        }
+    }
+    int r = mkdir(buf, 0755);
+    if (getenv("HESPER_CUBIN_DEBUG")) {
+        fprintf(stderr, "[cubin] mkdir %s rc=%d errno=%d\n", buf, r, errno);
+    }
+}
+
 extern "C" lean_obj_res lean_hesper_cuda_module_load_data(b_lean_obj_arg ptx_str) {
     const char* ptx = lean_string_cstr(ptx_str);
+    size_t ptx_len = strlen(ptx);
+    uint64_t key = fnv1a64(ptx, ptx_len);
+
+    // 1. Try loading cached cubin from disk.
+    char cubin_path[640];
+    snprintf(cubin_path, sizeof(cubin_path), "%s/%016lx.cubin",
+             hesper_cubin_cache_dir(), (unsigned long)key);
+    FILE* f = fopen(cubin_path, "rb");
+    if (f) {
+        fseek(f, 0, SEEK_END);
+        long sz = ftell(f);
+        fseek(f, 0, SEEK_SET);
+        if (sz > 0 && sz < (1 << 24)) {  // sanity: < 16 MB
+            void* buf = malloc(sz);
+            if (buf) {
+                size_t rd = fread(buf, 1, sz, f);
+                fclose(f);
+                if (rd == (size_t)sz) {
+                    CUmodule mod;
+                    CUresult ferr = cuModuleLoadData(&mod, buf);
+                    free(buf);
+                    if (ferr == CUDA_SUCCESS) {
+                        return lean_io_result_mk_ok(lean_box_usize((size_t)mod));
+                    }
+                    // Fall through to JIT on load failure (possibly
+                    // stale cubin from a different driver/arch).
+                } else {
+                    free(buf);
+                }
+            } else {
+                fclose(f);
+            }
+        } else {
+            fclose(f);
+        }
+    }
+
+    // 2. JIT compile.  Request CU_JIT_TARGET from current device.
     CUmodule mod;
-    // Use cuModuleLoadDataEx with max optimization level (4)
     CUjit_option opts[] = { CU_JIT_OPTIMIZATION_LEVEL };
     void* optVals[] = { (void*)(uintptr_t)4 };
     CUresult err = cuModuleLoadDataEx(&mod, ptx, 1, opts, optVals);
@@ -94,10 +184,46 @@ extern "C" lean_obj_res lean_hesper_cuda_module_load_data(b_lean_obj_arg ptx_str
         const char* errName = nullptr;
         cuGetErrorName(err, &errName);
         char buf[1024];
-        size_t showLen = strlen(ptx); if (showLen > 500) showLen = 500;
+        size_t showLen = ptx_len; if (showLen > 500) showLen = 500;
         snprintf(buf, sizeof(buf), "cuModuleLoadData failed: %s\nPTX (%zu chars):\n%.*s",
                  errName ? errName : "unknown", showLen, (int)showLen, ptx);
         return lean_io_result_mk_error(lean_mk_io_user_error(lean_mk_string(buf)));
+    }
+
+    // 3. Extract cubin and write to disk for future runs.
+    //    cuLinkCreate + cuLinkAddData(PTX) + cuLinkComplete gives us
+    //    cubin bytes without needing to round-trip through module.
+    static int cache_dir_created = 0;
+    if (!cache_dir_created) {
+        hesper_mkdir_p(hesper_cubin_cache_dir());
+        cache_dir_created = 1;
+    }
+    CUlinkState link;
+    CUresult lres = cuLinkCreate(0, nullptr, nullptr, &link);
+    if (lres == CUDA_SUCCESS) {
+        CUresult ares = cuLinkAddData(link, CU_JIT_INPUT_PTX, (void*)ptx, ptx_len + 1,
+                                       "kern", 0, nullptr, nullptr);
+        if (ares == CUDA_SUCCESS) {
+            void* cubin = nullptr;
+            size_t cubin_size = 0;
+            CUresult cres = cuLinkComplete(link, &cubin, &cubin_size);
+            if (cres == CUDA_SUCCESS && cubin && cubin_size > 0) {
+                FILE* fo = fopen(cubin_path, "wb");
+                if (fo) {
+                    fwrite(cubin, 1, cubin_size, fo);
+                    fclose(fo);
+                } else if (getenv("HESPER_CUBIN_DEBUG")) {
+                    fprintf(stderr, "[cubin] fopen write failed: %s\n", cubin_path);
+                }
+            } else if (getenv("HESPER_CUBIN_DEBUG")) {
+                fprintf(stderr, "[cubin] cuLinkComplete rc=%d size=%zu\n", cres, cubin_size);
+            }
+        } else if (getenv("HESPER_CUBIN_DEBUG")) {
+            fprintf(stderr, "[cubin] cuLinkAddData rc=%d\n", ares);
+        }
+        cuLinkDestroy(link);
+    } else if (getenv("HESPER_CUBIN_DEBUG")) {
+        fprintf(stderr, "[cubin] cuLinkCreate rc=%d\n", lres);
     }
     return lean_io_result_mk_ok(lean_box_usize((size_t)mod));
 }
@@ -132,13 +258,24 @@ extern "C" lean_obj_res lean_hesper_cuda_free(size_t ptr_val) {
 extern "C" lean_obj_res lean_hesper_cuda_memcpy_htod(
     size_t dst_val, b_lean_obj_arg src_bytes, size_t offset, size_t size
 ) {
-    CUDA_CHECK(cuMemcpyHtoD((CUdeviceptr)dst_val + offset,
-                             lean_sarray_cptr(src_bytes), size), "cuMemcpyHtoD");
+    // Use cuMemcpyHtoDAsync on stream 0 (legacy default) instead of the
+    // sync cuMemcpyHtoD.  Semantics match: pageable-source HtoDAsync is
+    // synchronous internally, and stream 0 serialises with cuLaunchKernel
+    // on the null stream.  This eliminates the entire `cuMemcpyHtoD_v2`
+    // API row from nsys traces, matching llama.cpp's all-Async profile.
+    CUDA_CHECK(cuMemcpyHtoDAsync((CUdeviceptr)dst_val + offset,
+                                  lean_sarray_cptr(src_bytes), size,
+                                  /* stream = legacy default */ 0),
+               "cuMemcpyHtoDAsync(legacy)");
     return lean_io_result_mk_ok(lean_box(0));
 }
 
 extern "C" lean_obj_res lean_hesper_cuda_memcpy_dtoh(size_t src_val, size_t size) {
-    CUDA_CHECK(cuCtxSynchronize(), "cuCtxSynchronize (before readback)");
+    // cuMemcpyDtoH itself is synchronous (waits for all prior work on the
+    // default stream), so the explicit cuCtxSynchronize is redundant and
+    // was adding an extra host→driver round trip (~8.8 ms × 10 tokens =
+    // 88 ms / decode run observed via nsys).  Removed; cuMemcpyDtoH alone
+    // is correct and waits just as long as needed.
     lean_obj_res arr = lean_alloc_sarray(1, size, size);
     CUDA_CHECK(cuMemcpyDtoH(lean_sarray_cptr(arr), (CUdeviceptr)src_val, size),
                "cuMemcpyDtoH");
@@ -251,6 +388,29 @@ extern "C" lean_obj_res lean_hesper_cuda_launch_kernel_raw(
     return lean_io_result_mk_ok(lean_box(0));
 }
 
+extern "C" lean_obj_res lean_hesper_cuda_launch_kernel_raw_on_stream(
+    size_t func_val,
+    uint32_t gx, uint32_t gy, uint32_t gz,
+    uint32_t bx, uint32_t by, uint32_t bz,
+    uint32_t smem,
+    b_lean_obj_arg arg_bytes,
+    b_lean_obj_arg arg_offsets,
+    size_t stream_val
+) {
+    size_t n = lean_array_size(arg_offsets);
+    uint8_t* base = lean_sarray_cptr(arg_bytes);
+    void** args = (void**)malloc(n * sizeof(void*));
+    for (size_t i = 0; i < n; i++) {
+        size_t off = lean_unbox_usize(lean_array_get_core(arg_offsets, i));
+        args[i] = (void*)(base + off);
+    }
+    CUDA_CHECK(cuLaunchKernel((CUfunction)func_val,
+        gx, gy, gz, bx, by, bz,
+        smem, (CUstream)stream_val, args, nullptr), "cuLaunchKernelRawOnStream");
+    free(args);
+    return lean_io_result_mk_ok(lean_box(0));
+}
+
 // ============================================================================
 // Fast string hash (FNV-1a, ~4 GB/s on modern CPU)
 // ============================================================================
@@ -319,7 +479,156 @@ extern "C" lean_obj_res lean_hesper_mmap_slice_to_bytes(size_t ptr, size_t offse
 
 // Copy a slice of mmapped memory directly to GPU (zero Lean-side copy)
 extern "C" lean_obj_res lean_hesper_mmap_to_gpu(size_t mmap_ptr, size_t offset, size_t gpu_ptr, size_t size) {
-    CUDA_CHECK(cuMemcpyHtoD((CUdeviceptr)gpu_ptr, (const char*)mmap_ptr + offset, size), "mmap_to_gpu");
+    CUDA_CHECK(cuMemcpyHtoDAsync((CUdeviceptr)gpu_ptr,
+                                  (const char*)mmap_ptr + offset, size,
+                                  /* stream = legacy default */ 0),
+               "mmap_to_gpu(async)");
+    return lean_io_result_mk_ok(lean_box(0));
+}
+
+// ============================================================================
+// Persistent mmap with Lean GC-managed lifetime.
+//
+// Unlike `lean_hesper_read_file_fast` (which mmap+memcpy+munmap and returns a
+// Lean ByteArray), this holds the mmap open and exposes a raw `void*` via a
+// Lean external object.  When the last reference is dropped, the finalizer
+// runs `munmap`.  Tensor slices are created as offsets into the mmap; they
+// share a Lean reference to the mmap handle so the region stays live while
+// any slice is in use — this lets us pass `mmap_ptr + offset` directly to
+// `cuMemcpyHtoDAsync` without copying through Lean heap.
+// ============================================================================
+
+struct hesper_mmap_handle {
+    void*  addr;
+    size_t size;
+    bool   pinned;  // true if the region was cuMemHostRegister'd
+};
+
+static void hesper_mmap_finalize(void* obj) {
+    auto* h = static_cast<hesper_mmap_handle*>(obj);
+    if (h && h->addr && h->addr != MAP_FAILED) {
+        if (h->pinned) {
+            // Best-effort unregister; ignore errors (process is exiting).
+            cuMemHostUnregister(h->addr);
+        }
+        munmap(h->addr, h->size);
+    }
+    delete h;
+}
+
+static void hesper_mmap_foreach(void*, b_lean_obj_arg) {
+    // No Lean references owned.
+}
+
+static lean_external_class* hesper_mmap_class = nullptr;
+
+static lean_external_class* get_mmap_class() {
+    if (!hesper_mmap_class) {
+        hesper_mmap_class = lean_register_external_class(
+            hesper_mmap_finalize, hesper_mmap_foreach);
+    }
+    return hesper_mmap_class;
+}
+
+/// Open a file as mmap.  Returns a Lean external object; munmap runs when GC
+/// reclaims it.  MAP_POPULATE prefaults all pages (same as readFileFast) to
+/// avoid page-fault latency on first access.
+extern "C" lean_obj_res lean_hesper_mmap_open_persistent(b_lean_obj_arg path_str) {
+    const char* path = lean_string_cstr(path_str);
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) {
+        return lean_io_result_mk_error(lean_mk_io_user_error(
+            lean_mk_string("mmapOpen: open failed")));
+    }
+    struct stat st;
+    if (fstat(fd, &st) < 0) {
+        close(fd);
+        return lean_io_result_mk_error(lean_mk_io_user_error(
+            lean_mk_string("mmapOpen: fstat failed")));
+    }
+    size_t size = st.st_size;
+    void* addr = mmap(nullptr, size, PROT_READ,
+                      MAP_PRIVATE | MAP_POPULATE, fd, 0);
+    close(fd);
+    if (addr == MAP_FAILED) {
+        return lean_io_result_mk_error(lean_mk_io_user_error(
+            lean_mk_string("mmapOpen: mmap failed")));
+    }
+    // Register the mmap region as pinned host memory so subsequent
+    // cuMemcpyHtoDAsync calls are *truly* asynchronous (not blocked on
+    // pageable-source sync).  CU_MEMHOSTREGISTER_READ_ONLY tells the
+    // driver the file region won't be written by host — matches PROT_READ.
+    // On failure (out of pinnable RAM, kernel limit, etc.) fall back to
+    // unpinned semantics; copies still work, just block host.
+    // Optionally register the mmap region as pinned host memory so subsequent
+    // cuMemcpyHtoDAsync calls actually overlap with kernel work.  This costs
+    // ~200 ms/GB at startup (page locking syscall), but the resulting H2D
+    // becomes truly async (we measured 311 ms → 1.8 ms total transfer time
+    // for 982 calls when pinned).  Disabled by default because the pin
+    // syscall is sequential and not amortised on short sessions.  Set
+    // HESPER_PIN_MMAP=1 to opt in (long-running servers, batch jobs).
+    bool pinned = false;
+    if (getenv("HESPER_PIN_MMAP") != nullptr) {
+        CUresult rc = cuMemHostRegister(addr, size,
+            CU_MEMHOSTREGISTER_PORTABLE | CU_MEMHOSTREGISTER_READ_ONLY);
+        if (rc == CUDA_SUCCESS) {
+            pinned = true;
+            fprintf(stderr, "[mmap] registered %.2f MB as pinned host memory\n",
+                    size / (1024.0 * 1024.0));
+        } else {
+            const char* errStr = nullptr;
+            cuGetErrorString(rc, &errStr);
+            fprintf(stderr, "[mmap] cuMemHostRegister failed (%s); copies will be sync\n",
+                    errStr ? errStr : "unknown");
+        }
+        fflush(stderr);
+    }
+    auto* h = new hesper_mmap_handle{addr, size, pinned};
+    lean_object* ext = lean_alloc_external(get_mmap_class(), h);
+    return lean_io_result_mk_ok(ext);
+}
+
+/// Get the total size of an mmap'd file.
+extern "C" lean_obj_res lean_hesper_mmap_size(b_lean_obj_arg h_obj) {
+    auto* h = static_cast<hesper_mmap_handle*>(lean_get_external_data(h_obj));
+    return lean_io_result_mk_ok(lean_box_usize(h->size));
+}
+
+/// Copy a slice of the mmap to a fresh Lean ByteArray.  Used for metadata
+/// parsing which needs Lean-side operations; tensor bodies should NOT use
+/// this — use the GPU-direct path below.
+extern "C" lean_obj_res lean_hesper_mmap_slice_to_bytes_persistent(
+        b_lean_obj_arg h_obj, size_t offset, size_t size) {
+    auto* h = static_cast<hesper_mmap_handle*>(lean_get_external_data(h_obj));
+    if (offset + size > h->size) {
+        return lean_io_result_mk_error(lean_mk_io_user_error(
+            lean_mk_string("mmapSliceToBytes: out of range")));
+    }
+    lean_obj_res arr = lean_alloc_sarray(1, size, size);
+    memcpy(lean_sarray_cptr(arr), (char*)h->addr + offset, size);
+    return lean_io_result_mk_ok(arr);
+}
+
+/// H2D copy straight from mmap to GPU, async on the given stream.  The Lean
+/// caller must keep the mmap handle live (typically by holding it in the
+/// same structure as the returned GPU buffer handle) until all in-flight
+/// async copies complete — stream-synchronize guarantees that.
+extern "C" lean_obj_res lean_hesper_cuda_memcpy_htod_from_mmap(
+        size_t dst_ptr, b_lean_obj_arg h_obj, size_t offset,
+        size_t size, size_t stream_val) {
+    auto* h = static_cast<hesper_mmap_handle*>(lean_get_external_data(h_obj));
+    if (offset + size > h->size) {
+        return lean_io_result_mk_error(lean_mk_io_user_error(
+            lean_mk_string("cuMemcpyHtoDFromMmap: out of range")));
+    }
+    void* src = (char*)h->addr + offset;
+    // Always use cuMemcpyHtoDAsync.  When stream=0 it goes onto the
+    // legacy default stream — same ordering as cuMemcpyHtoD, but counted
+    // as Async in nsys traces, matching llama.cpp's all-Async profile.
+    CUDA_CHECK(cuMemcpyHtoDAsync((CUdeviceptr)dst_ptr, src, size,
+                                  (CUstream)stream_val),
+               stream_val == 0 ? "cuMemcpyHtoDAsync(mmap, legacy)"
+                                : "cuMemcpyHtoDAsync(mmap)");
     return lean_io_result_mk_ok(lean_box(0));
 }
 
@@ -356,6 +665,17 @@ extern "C" lean_obj_res lean_hesper_read_file_fast(b_lean_obj_arg path_str) {
 extern "C" lean_obj_res lean_hesper_cuda_stream_create() {
     CUstream s;
     CUDA_CHECK(cuStreamCreate(&s, CU_STREAM_NON_BLOCKING), "cuStreamCreate");
+    return lean_io_result_mk_ok(lean_box_usize((size_t)s));
+}
+
+// Create a stream with default (blocking) semantics: synchronises
+// implicitly with the null stream.  Used for `cudaDefaultStream`
+// so that readBuffer / cuMemcpyDtoH on the null stream observes
+// prior H2D + kernel launches submitted on this stream without an
+// explicit `cuStreamSynchronize`.
+extern "C" lean_obj_res lean_hesper_cuda_stream_create_default() {
+    CUstream s;
+    CUDA_CHECK(cuStreamCreate(&s, CU_STREAM_DEFAULT), "cuStreamCreate(default)");
     return lean_io_result_mk_ok(lean_box_usize((size_t)s));
 }
 
@@ -482,5 +802,160 @@ extern "C" lean_obj_res lean_hesper_cuda_memcpy_htod_from_pinned(
                                  (const void*)(host_ptr + offset),
                                  size, (CUstream)stream_val),
                "cuMemcpyHtoDFromPinned");
+    return lean_io_result_mk_ok(lean_box(0));
+}
+
+/*
+ * Fused: write to pinned slot + async H2D copy + stream dispatch, all in a
+ * single FFI crossing.  Reduces Lean→FFI call-count overhead from 3-4
+ * per scalar write to 1.  Pinned slot lifetime is managed by the caller;
+ * this function just writes `size` bytes from `src_bytes` into the slot at
+ * `host_ptr + offset` and immediately queues an async HtoD copy.
+ */
+extern "C" lean_obj_res lean_hesper_cuda_pinned_write_and_copy(
+    size_t dst_ptr,
+    size_t host_ptr,
+    size_t offset,
+    b_lean_obj_arg src_bytes,
+    size_t size,
+    size_t stream_val
+) {
+    const uint8_t* src = lean_sarray_cptr(src_bytes);
+    memcpy((uint8_t*)host_ptr + offset, src, size);
+    CUDA_CHECK(cuMemcpyHtoDAsync((CUdeviceptr)dst_ptr,
+                                 (const void*)((uint8_t*)host_ptr + offset),
+                                 size, (CUstream)stream_val),
+               "cuMemcpyHtoDAsync(pinned_write_and_copy)");
+    return lean_io_result_mk_ok(lean_box(0));
+}
+
+// ============================================================================
+// Launch descriptor table (Option B+ metadata-free forward)
+//
+// Forward metadata (kernel handle, grid/block, argument pointer list) lives
+// in C-owned storage so the Lean hot path between launches allocates nothing.
+// See docs/llama-fusion-analysis/53-metadata-free-forward-design.md.
+// ============================================================================
+
+struct HesperLaunchDescriptor {
+    CUfunction func;
+    uint32_t gx, gy, gz;
+    uint32_t bx, by, bz;
+    uint32_t smem;
+    uint32_t n_args;
+    // Args are stored as an array of CUdeviceptr. For cuLaunchKernel we need
+    // `void**` where each element points at the value storage — so we keep a
+    // parallel `arg_ptrs` array of `void*` each pointing into `arg_storage`.
+    CUdeviceptr* arg_storage;
+    void** arg_ptrs;
+};
+
+// Fixed-capacity global table. Chosen large enough for a single Gemma-4 decode
+// schedule (~900 launches). Grows only at init time; no realloc during forward.
+#define HESPER_DESC_CAPACITY 4096
+static HesperLaunchDescriptor g_descriptors[HESPER_DESC_CAPACITY];
+static uint32_t g_descriptor_count = 0;
+
+// Reset the descriptor pool (call when rebuilding the schedule, e.g. new
+// inference state).
+extern "C" lean_obj_res lean_hesper_desc_reset() {
+    for (uint32_t i = 0; i < g_descriptor_count; i++) {
+        free(g_descriptors[i].arg_storage);
+        free(g_descriptors[i].arg_ptrs);
+    }
+    g_descriptor_count = 0;
+    return lean_io_result_mk_ok(lean_box(0));
+}
+
+// Register a descriptor; returns its id as a boxed USize.
+// `args` is a Lean Array USize (CUdeviceptr values).
+extern "C" lean_obj_res lean_hesper_desc_register(
+    size_t func_val,
+    uint32_t gx, uint32_t gy, uint32_t gz,
+    uint32_t bx, uint32_t by, uint32_t bz,
+    uint32_t smem,
+    b_lean_obj_arg args
+) {
+    if (g_descriptor_count >= HESPER_DESC_CAPACITY) {
+        return lean_io_result_mk_error(lean_mk_io_user_error(
+            lean_mk_string("hesper_desc_register: descriptor pool exhausted")));
+    }
+    size_t n = lean_array_size(args);
+    HesperLaunchDescriptor* d = &g_descriptors[g_descriptor_count];
+    d->func = (CUfunction)func_val;
+    d->gx = gx; d->gy = gy; d->gz = gz;
+    d->bx = bx; d->by = by; d->bz = bz;
+    d->smem = smem;
+    d->n_args = (uint32_t)n;
+    d->arg_storage = (CUdeviceptr*)malloc(n * sizeof(CUdeviceptr));
+    d->arg_ptrs = (void**)malloc(n * sizeof(void*));
+    for (size_t i = 0; i < n; i++) {
+        d->arg_storage[i] = (CUdeviceptr)lean_unbox_usize(lean_array_get_core(args, i));
+        d->arg_ptrs[i] = &d->arg_storage[i];
+    }
+    uint32_t id = g_descriptor_count++;
+    return lean_io_result_mk_ok(lean_box_usize((size_t)id));
+}
+
+// Rebind a single argument slot of an existing descriptor. Used when a buffer
+// pointer changes between calls (rare in hesper's decode path).
+extern "C" lean_obj_res lean_hesper_desc_rebind(
+    size_t desc_id, size_t slot, size_t new_ptr
+) {
+    if (desc_id >= g_descriptor_count) {
+        return lean_io_result_mk_error(lean_mk_io_user_error(
+            lean_mk_string("hesper_desc_rebind: invalid descriptor id")));
+    }
+    HesperLaunchDescriptor* d = &g_descriptors[desc_id];
+    if (slot >= d->n_args) {
+        return lean_io_result_mk_error(lean_mk_io_user_error(
+            lean_mk_string("hesper_desc_rebind: slot out of range")));
+    }
+    d->arg_storage[slot] = (CUdeviceptr)new_ptr;
+    // arg_ptrs[slot] already points at arg_storage[slot], unchanged.
+    return lean_io_result_mk_ok(lean_box(0));
+}
+
+// Fast-path launch: pure C, no Lean heap touched between the FFI entry and
+// cuLaunchKernel. `stream_val=0` means default stream.
+extern "C" lean_obj_res lean_hesper_desc_launch(size_t desc_id, size_t stream_val) {
+    if (desc_id >= g_descriptor_count) {
+        return lean_io_result_mk_error(lean_mk_io_user_error(
+            lean_mk_string("hesper_desc_launch: invalid descriptor id")));
+    }
+    HesperLaunchDescriptor* d = &g_descriptors[desc_id];
+    CUDA_CHECK(cuLaunchKernel(d->func,
+        d->gx, d->gy, d->gz,
+        d->bx, d->by, d->bz,
+        d->smem, (CUstream)stream_val, d->arg_ptrs, nullptr),
+        "cuLaunchKernel(desc)");
+    return lean_io_result_mk_ok(lean_box(0));
+}
+
+// Fused rebind-all-args + launch.  Used when buffer pointers are
+// allowed to change between calls (e.g. same logical call site but
+// different layer weights).  Writes each arg into `arg_storage` in
+// place — still zero Lean heap allocation past the FFI boundary.
+extern "C" lean_obj_res lean_hesper_desc_launch_with_args(
+    size_t desc_id, size_t stream_val, b_lean_obj_arg args
+) {
+    if (desc_id >= g_descriptor_count) {
+        return lean_io_result_mk_error(lean_mk_io_user_error(
+            lean_mk_string("hesper_desc_launch_with_args: invalid descriptor id")));
+    }
+    HesperLaunchDescriptor* d = &g_descriptors[desc_id];
+    size_t n = lean_array_size(args);
+    if (n != d->n_args) {
+        return lean_io_result_mk_error(lean_mk_io_user_error(
+            lean_mk_string("hesper_desc_launch_with_args: arg count mismatch")));
+    }
+    for (size_t i = 0; i < n; i++) {
+        d->arg_storage[i] = (CUdeviceptr)lean_unbox_usize(lean_array_get_core(args, i));
+    }
+    CUDA_CHECK(cuLaunchKernel(d->func,
+        d->gx, d->gy, d->gz,
+        d->bx, d->by, d->bz,
+        d->smem, (CUstream)stream_val, d->arg_ptrs, nullptr),
+        "cuLaunchKernel(desc-rebind)");
     return lean_io_result_mk_ok(lean_box(0));
 }

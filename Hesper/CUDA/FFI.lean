@@ -89,6 +89,48 @@ opaque mmapToGPU (mmapPtr : USize) (offset : USize) (gpuPtr : USize) (size : USi
 @[extern "lean_hesper_read_file_fast"]
 opaque readFileFast (path : @& String) : IO ByteArray
 
+/-! ## Persistent mmap with GC-managed lifetime
+
+`MMappedFile` is an opaque Lean external object backed by a C-side
+`mmap` region.  Its finalizer (registered on the external class at
+registration time) calls `munmap` when the last Lean reference is
+dropped — matching llama.cpp's `unique_ptr<llama_mmap>` RAII pattern.
+
+Unlike the legacy `mmapFile` above, this path never copies the file
+into a `ByteArray`.  Tensor weights are kept as `(mmap, offset, size)`
+triples and uploaded to the GPU via `cuMemcpyHtoDAsync` directly from
+the mmap region — saving ~5 GB of Lean-heap allocation and enabling
+async H2D (the mmap region stays alive until all in-flight copies
+finish, because the stream sync point still holds a Lean reference). -/
+
+/-- Opaque handle to a memory-mapped file.  GC-finalised with
+    `munmap`. -/
+opaque MMappedFileImpl : NonemptyType
+def MMappedFile : Type := MMappedFileImpl.type
+instance : Nonempty MMappedFile := MMappedFileImpl.property
+
+@[extern "lean_hesper_mmap_open_persistent"]
+opaque mmapOpen (path : @& String) : IO MMappedFile
+
+@[extern "lean_hesper_mmap_size"]
+opaque mmapSize (h : @& MMappedFile) : IO USize
+
+/-- Copy a slice of the mmap into a fresh Lean ByteArray.  Use only
+    for metadata / parsing; tensor weights should use
+    `cuMemcpyHtoDFromMmap` instead. -/
+@[extern "lean_hesper_mmap_slice_to_bytes_persistent"]
+opaque mmapSliceToBytesPersistent (h : @& MMappedFile) (offset : USize)
+    (size : USize) : IO ByteArray
+
+/-- H2D copy from mmap region directly to GPU.  When `stream = 0`,
+    issues the sync `cuMemcpyHtoD`; otherwise async on the given
+    stream.  Caller must keep the `MMappedFile` referenced until the
+    stream has synchronised (Lean GC automatically does this via any
+    structure that holds both the GPU buffer handle and the mmap). -/
+@[extern "lean_hesper_cuda_memcpy_htod_from_mmap"]
+opaque cuMemcpyHtoDFromMmap (dst : USize) (h : @& MMappedFile)
+    (offset : USize) (size : USize) (stream : USize) : IO Unit
+
 /-! ## Memory -/
 
 @[extern "lean_hesper_cuda_malloc"]
@@ -117,6 +159,52 @@ opaque cuLaunchKernel
     (args : @& Array USize)  -- device pointers
     : IO Unit
 
+/-! ## Metadata-free launch descriptor table (Option B+)
+
+These register kernel launch metadata (func, grid/block, arg ptrs) in
+C-owned storage, then fire by numeric id.  The Lean side holds only a
+USize id per kernel and makes exactly one FFI call per launch — no
+`Array USize` allocation, no `ByteArray` for params, no closure for
+buffer resolution.  See `docs/llama-fusion-analysis/53-metadata-free-
+forward-design.md`.
+-/
+
+/-- Reset the descriptor pool.  Call once when rebuilding an inference
+    schedule (not per token). -/
+@[extern "lean_hesper_desc_reset"]
+opaque descReset : IO Unit
+
+/-- Register a descriptor with immutable grid/block and a snapshot of
+    buffer pointers.  Returns the descriptor id. -/
+@[extern "lean_hesper_desc_register"]
+opaque descRegister
+    (func : CUfunction)
+    (gridX gridY gridZ : UInt32)
+    (blockX blockY blockZ : UInt32)
+    (sharedMem : UInt32)
+    (args : @& Array USize)
+    : IO USize
+
+/-- Rebind one buffer pointer in an existing descriptor (used only for
+    sites whose buffers genuinely change between calls). -/
+@[extern "lean_hesper_desc_rebind"]
+opaque descRebind (descId : USize) (slot : USize) (newPtr : USize) : IO Unit
+
+/-- Fast launch via descriptor id.  This is the Lean-heap-free hot
+    path.  `stream=0` = default stream. -/
+@[extern "lean_hesper_desc_launch"]
+opaque descLaunch (descId : USize) (stream : USize) : IO Unit
+
+/-- Fused rebind-all-args + launch.  Used when the descriptor's
+    buffer pointers may differ between calls (e.g. same logical call
+    site across 42 layers with per-layer weights).  Writes each arg
+    into the C-owned `arg_storage` in place — still zero Lean heap
+    past the FFI boundary.  `args.size` must equal the descriptor's
+    `n_args`. -/
+@[extern "lean_hesper_desc_launch_with_args"]
+opaque descLaunchWithArgs
+    (descId : USize) (stream : USize) (args : Array USize) : IO Unit
+
 /-- Raw-bytes launch for external PTX (e.g. llama.cpp) whose kernels take
     mixed-type args (uint3 structs, f16 scalars, ...).  `argBytes` holds
     packed arg values; `argOffsets[i]` = byte offset of the i-th arg.
@@ -129,6 +217,22 @@ opaque cuLaunchKernelRaw
     (sharedMem : UInt32)
     (argBytes : @& ByteArray)
     (argOffsets : @& Array USize)
+    : IO Unit
+
+/-- Stream-aware variant of `cuLaunchKernelRaw`.  Required when the caller
+    is inside `cuStreamBeginCapture` — launches on the default stream are
+    NOT captured into the graph, so their execution ordering diverges from
+    the captured hesper kernels on graph replay, producing garbage output.
+    `stream = 0` (default stream) matches the old behaviour. -/
+@[extern "lean_hesper_cuda_launch_kernel_raw_on_stream"]
+opaque cuLaunchKernelRawOnStream
+    (func : CUfunction)
+    (gridX gridY gridZ : UInt32)
+    (blockX blockY blockZ : UInt32)
+    (sharedMem : UInt32)
+    (argBytes : @& ByteArray)
+    (argOffsets : @& Array USize)
+    (stream : CUstream)
     : IO Unit
 
 /-! ## L2 cache persistence (Ampere+ / Ada / Hopper, CC ≥ 8.0) -/
@@ -171,6 +275,13 @@ def CUgraphExec : Type := USize
     can be captured.  Call once at context init. -/
 @[extern "lean_hesper_cuda_stream_create"]
 opaque cuStreamCreate : IO CUstream
+
+/-- Create a blocking (default-synchronising) stream.  Ops on this
+    stream implicitly sync with the null stream, so `readBuffer`
+    (which goes through the null stream) observes prior work
+    without an explicit `cuStreamSynchronize`. -/
+@[extern "lean_hesper_cuda_stream_create_default"]
+opaque cuStreamCreateDefault : IO CUstream
 
 @[extern "lean_hesper_cuda_stream_destroy"]
 opaque cuStreamDestroy (stream : CUstream) : IO Unit
@@ -264,5 +375,15 @@ opaque cuWritePinned (hostPtr : USize) (offset : USize)
 opaque cuMemcpyHtoDFromPinned
     (dst : CUdeviceptr) (hostPtr : USize) (offset : USize)
     (size : USize) (stream : CUstream) : IO Unit
+
+/-- Fused: write `src` bytes to pinned slot `(hostPtr+offset)` then
+    immediately queue an async H2D copy to `(dst)` on `stream`.  One
+    FFI crossing instead of two (cuWritePinned + cuMemcpyHtoDFromPinned),
+    eliminating ~half the Lean→C boundary overhead on hot per-scalar
+    write sites. -/
+@[extern "lean_hesper_cuda_pinned_write_and_copy"]
+opaque cuPinnedWriteAndCopy
+    (dst : CUdeviceptr) (hostPtr : USize) (offset : USize)
+    (src : @& ByteArray) (size : USize) (stream : CUstream) : IO Unit
 
 end Hesper.CUDA
