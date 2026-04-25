@@ -369,6 +369,23 @@ opaque cuMemAllocHost (size : USize) : IO USize
 @[extern "lean_hesper_cuda_mem_free_host"]
 opaque cuMemFreeHost (hostPtr : USize) : IO Unit
 
+/-- Allocate `size` bytes of pinned **host-mapped** memory and return
+    `(hostPtr, devPtr)`.  The device pointer aliases the same physical
+    memory through CUDA's unified VA space, so kernels can `st.global`
+    into it directly and the host can read the result with no driver
+    call once the producing stream has been synchronised.  Used to
+    eliminate the per-token `cuMemcpyDtoH(4 byte)` argmax bubble that
+    drains the stream implicitly (~9.8 ms/tok on graphs-OFF). -/
+@[extern "lean_hesper_cuda_mem_alloc_host_mapped"]
+opaque cuMemAllocHostMapped (size : USize) : IO (USize × USize)
+
+/-- Read a `UInt32` from a pinned host pointer with no driver call.
+    Caller must have synchronised the stream that wrote it
+    (`cuStreamSynchronize` once is enough — independent of how many
+    kernels updated the slot). -/
+@[extern "lean_hesper_cuda_read_pinned_u32"]
+opaque cuReadPinnedU32 (hostPtr : USize) : IO UInt32
+
 /-- Write a small scalar (≤ 8 bytes) into a pinned host buffer.  The
     data is plain Lean bytes; the C++ side memcpys them into the
     pinned region.  No GPU involvement.  Use before every graph

@@ -141,6 +141,17 @@ structure InferenceState (BufT CacheT : Type) where
       `GPUBackend.execute` rebuilds PTX / re-resolves the buffer arg
       vector on every call (~150 µs/token × 10 tokens = 1.5 ms wasted). -/
   argmaxCacheRef : IO.Ref (Option CacheT)
+  /-- Optional **host-mapped** argmax slot (CUDA only, opt-in via
+      `HESPER_DEVICE_ARGMAX=1`).  When set, `(hostPtr, devBuf)`:
+      - `devBuf` aliases the same memory as `argmaxBuf` would, but is
+        `cuMemHostAlloc`'d so it lives in pinned host memory mapped into
+        the device VA.  The argmaxKernel writes the token id to it.
+      - `hostPtr` is the raw host pointer.  After one
+        `cuStreamSynchronize`, the host can read the u32 with a plain
+        memory load — no `cuMemcpyDtoH` (which is implicitly synchronous
+        and currently costs ~9.8 ms/token of GPU drain wait).
+      Matches llama-cli's `cudaMallocHost`-then-direct-read pattern. -/
+  argmaxHostMapped : Option (USize × BufT) := none
   -- Scratch buffer for Q8_1 quantized lmHead input (hiddenSize/32 * 9 u32),
   -- lazily allocated on first dp4a-enabled lmHead call.
   lmHeadQ8Buf : IO.Ref (Option BufT)
@@ -270,6 +281,19 @@ def createInferenceState [GPUBackend β] (ctx : β) (cfg : Config) : IO (Inferen
       GPUBackend.allocBuffer ctx (max rowBytes 4).toUSize
     argmaxBuf := ← GPUBackend.allocBuffer ctx (4 : USize)
     argmaxCacheRef := ← GPUBackend.newCacheRef (β := β)
+    -- HESPER_DEVICE_ARGMAX=1: skip the per-token cuMemcpyDtoH(4 byte) by
+    -- having the argmaxKernel write into a pinned host-mapped slot the
+    -- host can read directly.  Closes the 9.8 ms/tok GPU drain bubble
+    -- (doc 55).  Falls through to `argmaxBuf` when not set.
+    argmaxHostMapped := ← do
+      if (← IO.getEnv "HESPER_DEVICE_ARGMAX").isSome then
+        let (hostPtr, devPtr) ← Hesper.CUDA.cuMemAllocHostMapped 4
+        match ← GPUBackend.bufFromRawDevicePtr ctx devPtr 4 with
+        | some buf => pure (some (hostPtr, buf))
+        | none =>
+          IO.println "[Gemma4] HESPER_DEVICE_ARGMAX requested but backend lacks UVA support; falling back to DtoH"
+          pure none
+      else pure none
     lmHeadQ8Buf := ← IO.mkRef none
     lmHeadQuantizePrepared := ← GPUBackend.newCacheRef (β := β)
     lmHeadDP4APrepared := ← GPUBackend.newCacheRef (β := β)
@@ -3045,15 +3069,34 @@ private def advancePosKernel : ShaderM Unit := do
 private def gpuArgmax [GPUBackend β] (ctx : β)
     (logitsBuf argmaxBuf tokenBuf tokenIdsBuf plRawRowBuf : GPUBackend.Buf β)
     (vocabSize : Nat)
-    (cacheRef : IO.Ref (Option (GPUBackend.CachedDispatch β))) : IO Nat := do
+    (cacheRef : IO.Ref (Option (GPUBackend.CachedDispatch β)))
+    (hostMapped : Option (USize × GPUBackend.Buf β) := none) : IO Nat := do
+  -- Pick the result buffer.  When `hostMapped` is set, the kernel writes
+  -- straight into pinned host memory we can read with no driver call;
+  -- otherwise fall back to the legacy device buffer + cuMemcpyDtoH path.
+  let resultBuf := match hostMapped with
+    | some (_, devBuf) => devBuf
+    | none => argmaxBuf
   GPUBackend.executeWithConfigCached ctx (argmaxKernel vocabSize)
-    [ ("logits", logitsBuf), ("result", argmaxBuf)
+    [ ("logits", logitsBuf), ("result", resultBuf)
     , ("token", tokenBuf), ("token_ids", tokenIdsBuf)
     , ("plRawRow", plRawRowBuf) ]
     { workgroupSize := { x := 256 }, numWorkgroups := (1, 1, 1) }
     (hash ("argmaxKernel", vocabSize)) cacheRef
-  let bytes ← GPUBackend.readBuffer ctx argmaxBuf (4 : USize)
-  return (Hesper.Basic.bytesToUInt32 bytes 0).toNat
+  match hostMapped with
+  | some (hostPtr, _) =>
+    -- Drain the stream so the kernel's `st.global` to the host-mapped
+    -- slot is visible to host loads.  This is the same wait that the
+    -- legacy `cuMemcpyDtoH(4 byte)` performs implicitly, but accounted
+    -- against `cuStreamSynchronize` in nsys traces (matches llama-cli's
+    -- shape) and freed of the per-call driver allocation that
+    -- cuMemcpyDtoH does.
+    Hesper.CUDA.cuStreamSynchronize (0 : USize)
+    let v ← Hesper.CUDA.cuReadPinnedU32 hostPtr
+    return v.toNat
+  | none =>
+    let bytes ← GPUBackend.readBuffer ctx argmaxBuf (4 : USize)
+    return (Hesper.Basic.bytesToUInt32 bytes 0).toNat
 
 /-- Generate tokens from a Gemma 4 model.
 
@@ -3302,6 +3345,7 @@ def generate [GPUBackend β] (ctx : β) (model : Gemma4Model (GPUBackend.Buf β)
           | none        => pure state.tokenBuf
         gpuArgmax ctx state.logitsBuf state.argmaxBuf state.tokenBuf tokenIdsBuf
           state.plRawRowBuf model.config.vocabSize state.argmaxCacheRef
+          (hostMapped := state.argmaxHostMapped)
 
     let tArgmaxEnd ← if decodeSectTrace then IO.monoNanosNow else pure 0
 
