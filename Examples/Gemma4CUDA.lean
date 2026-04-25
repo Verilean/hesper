@@ -133,8 +133,18 @@ unsafe def main (args : List String) : IO Unit := do
   -- Generate
   IO.println "[Generate] Starting CUDA inference..."
   let eosId := tokenizer.vocab.eosToken.getD 1
-  let tokens ← generate ctx model promptTokens maxTokens
-    (eosToken := some eosId) (extraEosTokens := #[106])
+  -- HESPER_IGNORE_EOS=1 forces decoding to run for the full `maxTokens`,
+  -- ignoring EOS / end-of-turn (matches llama-cli's --ignore-eos).  This
+  -- is required by the perf_compare profiling driver so that nsys'
+  -- --duration window has steady-state activity to capture.
+  let ignoreEos := (← IO.getEnv "HESPER_IGNORE_EOS").isSome
+  let tokens ←
+    if ignoreEos then
+      generate ctx model promptTokens maxTokens
+        (eosToken := none) (extraEosTokens := #[])
+    else
+      generate ctx model promptTokens maxTokens
+        (eosToken := some eosId) (extraEosTokens := #[106])
 
   let generated := tokens.extract promptTokens.size tokens.size
   let decoded := Hesper.Tokenizer.SentencePiece.decode tokenizer generated

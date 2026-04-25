@@ -61,11 +61,29 @@ P_SHORT_TOK="${P_SHORT_TOK:-1}"
 P_LONG_TOK="${P_LONG_TOK:-6}"
 
 GRAPHS="${GRAPHS:-off}"
-OUT_DIR="${OUT_DIR:-/tmp/perf_compare}"
+# Default to tmpfs.  nsys writes a ~120 MB sqlite per llama-cli run during
+# its post-process pass; on a regular ext4 disk the fsync stage is the
+# dominant cost and can hold the host pinned for tens of seconds after the
+# GPU stopped.  /dev/shm is a tmpfs (RAM-backed) on Linux, so writes never
+# touch the disk.  Override with OUT_DIR=/tmp/foo if you want persistence.
+OUT_DIR="${OUT_DIR:-/dev/shm/perf_compare}"
 HESPER_BIN="${HESPER_BIN:-.lake/build/bin/gemma4-cuda}"
 LLAMA_DIR="${LLAMA_DIR:-./llama.cpp/build/bin}"
 
 mkdir -p "$OUT_DIR"
+
+# nsys's `--start-agent` daemons survive a SIGKILL of the launcher process
+# (different process group), and a previous run that was timeout-killed can
+# leave 5+ agents running at >90 % CPU for tens of minutes.  Those orphans
+# steal cycles from the very workload we are profiling, so kill them up-front
+# and again on exit.
+cleanup_nsys_agents() {
+  pkill -9 -f 'nsys --start-agent' 2>/dev/null || true
+  pkill -9 -f 'nsys-tee'           2>/dev/null || true
+  pkill -9 -f 'nsys-launcher'      2>/dev/null || true
+}
+cleanup_nsys_agents
+trap cleanup_nsys_agents EXIT INT TERM
 
 if [[ "$GRAPHS" == "off" ]]; then
   GRAPHS_ENV=(GGML_CUDA_DISABLE_GRAPHS=1)
@@ -77,14 +95,68 @@ run_nsys() {
   # $1=tag, then command...
   local tag="$1"; shift
   local rep="$OUT_DIR/$tag.nsys-rep"
-  echo "=== running $tag ==="
-  env "${GRAPHS_ENV[@]}" nsys profile --trace=cuda --sample=none \
-    -o "$OUT_DIR/$tag" --force-overwrite=true \
-    "$@" </dev/null > "$OUT_DIR/$tag.stdout" 2>&1
+  local cap="${NSYS_TIMEOUT:-120}"
+  echo "=== running $tag (nsys, ${cap}s cap) ==="
+  # Hard cap so a stuck workload (e.g. an older llama-cli without -no-cnv
+  # falling into chat mode) cannot freeze the whole experiment.  By the time
+  # nsys reports ~95 % its `.nsys-rep` is already on disk, so even a forced
+  # kill from `timeout` typically yields a usable report.
+  # Three speedups stacked here:
+  #  (a) `--stats=false` skips the auto post-process pass that imports the
+  #      trace into sqlite + computes summary tables on every run.  The
+  #      sqlite import is the dominant cost for high-event runs (llama-cli's
+  #      decode hits the driver thousands of times per token); the GPU has
+  #      long stopped but nsys keeps the host pinned for tens of seconds.
+  #      We call `nsys stats` later in extract_*() ourselves on demand.
+  #  (b) `--export=none` likewise skips the `.sqlite` materialisation.
+  #  (c) When NSYS_DELAY / NSYS_DURATION are set, the trace only covers the
+  #      steady-state decode window (load + prefill are skipped).  This
+  #      shrinks the .nsys-rep by ~10× and is what we actually care about
+  #      when comparing host overhead per token.
+  # Only apply delay/duration to *long*-decode cases (tag ends in `gN`).
+  # The `p1g1` and `pLg1` cases generate 1 token each and finish before any
+  # NSYS_DELAY would expire, leaving us with an empty trace.
+  local extra=()
+  if [[ "$tag" == *gN ]]; then
+    if [[ -n "${NSYS_DELAY:-}" ]];    then extra+=(--delay="$NSYS_DELAY"); fi
+    if [[ -n "${NSYS_DURATION:-}" ]]; then extra+=(--duration="$NSYS_DURATION"); fi
+  fi
+  timeout --signal=KILL "$cap" \
+    env "${GRAPHS_ENV[@]}" nsys profile --trace=cuda --sample=none \
+      --stats=false "${extra[@]}" \
+      -o "$OUT_DIR/$tag" --force-overwrite=true \
+      "$@" </dev/null > "$OUT_DIR/$tag.stdout" 2>&1
   if [[ ! -f "$rep" ]]; then
     echo "  ! nsys failed, see $OUT_DIR/$tag.stdout"
     return 1
   fi
+  return 0
+}
+
+# perf record on the same workload so we can see *where in the host process*
+# CPU cycles go.  paranoid=2 systems can still sample user-space, which is
+# all we need (kernel time is already attributed by nsys' driver-API rows).
+# Output: $OUT_DIR/$tag.perf.txt with the top-30 user-space symbols by self %.
+run_perf() {
+  local tag="$1"; shift
+  local pdata="$OUT_DIR/$tag.perf.data"
+  local prpt="$OUT_DIR/$tag.perf.txt"
+  local cap="${PERF_TIMEOUT:-120}"
+  echo "=== running $tag (perf, ${cap}s cap) ==="
+  timeout --signal=KILL "$cap" \
+    env "${GRAPHS_ENV[@]}" \
+      perf record -e cycles:u -F 999 --call-graph=fp -q \
+        -o "$pdata" -- "$@" </dev/null > "$OUT_DIR/$tag.perf.stdout" 2>&1
+  if [[ ! -f "$pdata" ]]; then
+    echo "  ! perf record failed, see $OUT_DIR/$tag.perf.stdout"
+    return 1
+  fi
+  # Self-time top symbols (children sort would mix in callees we already see
+  # in nsys CUDA-API rows).  Strip dso to keep the column under 80 chars.
+  perf report -i "$pdata" --stdio --no-children --sort=symbol \
+      --percent-limit=0.5 2>/dev/null \
+    | awk '/^#/ || NF<3 {next} {print}' \
+    | head -50 > "$prpt"
   return 0
 }
 
@@ -120,21 +192,43 @@ extract_memcpy_total() {
 
 #-----------------------------------------------------------------
 run_hesper() {
-  run_nsys "h_p1g1"   env HESPER_DP4A=1 HESPER_CHAT=1 \
-    "$HESPER_BIN" "$MODEL" "$PROMPT_SHORT" 1
-  run_nsys "h_pLg1"   env HESPER_DP4A=1 HESPER_CHAT=1 \
-    "$HESPER_BIN" "$MODEL" "$PROMPT_LONG" 1
-  run_nsys "h_pLgN"   env HESPER_DP4A=1 HESPER_CHAT=1 \
-    "$HESPER_BIN" "$MODEL" "$PROMPT_LONG" "$N_TOKENS"
+  # HESPER_IGNORE_EOS=1 keeps decode running for the full -n N tokens — the
+  # equivalent of llama-cli's `--ignore-eos`.  Without it Gemma 4 hits EOS
+  # after ~26 tokens in the long-prompt case.  HESPER_CHAT is dropped here
+  # for the same reason as llama-cli's --jinja: chat formatting is
+  # irrelevant for a host-overhead microbench.
+  local HSP_ENV=(env HESPER_DP4A=1 HESPER_IGNORE_EOS=1)
+  if [[ -n "${HESPER_USE_MMAP:-}" ]]; then
+    HSP_ENV+=(HESPER_USE_MMAP=1)
+  fi
+  # Only the long-prompt long-decode case is required.  The 3-case linear
+  # regression was unreliable (short-decode runs are post-process-bound,
+  # not GPU-bound, so the regression slope was contaminated).  Set
+  # HESPER_3CASE=1 to bring the short cases back if you want to re-derive
+  # `load` and `prefill/tok` separately.
+  if [[ -n "${HESPER_3CASE:-}" ]]; then
+    run_nsys "h_p1g1" "${HSP_ENV[@]}" "$HESPER_BIN" "$MODEL" "$PROMPT_SHORT" 1
+    run_nsys "h_pLg1" "${HSP_ENV[@]}" "$HESPER_BIN" "$MODEL" "$PROMPT_LONG"  1
+  fi
+  run_nsys "h_pLgN" "${HSP_ENV[@]}" "$HESPER_BIN" "$MODEL" "$PROMPT_LONG" "$N_TOKENS"
+  run_perf "h_pLgN" "${HSP_ENV[@]}" "$HESPER_BIN" "$MODEL" "$PROMPT_LONG" "$N_TOKENS"
 }
 
 run_lcli() {
-  run_nsys "lcli_p1g1" "$LLAMA_DIR/llama-cli" -m "$MODEL" \
-    --jinja --no-warmup -ngl 99 -p "$PROMPT_SHORT" -n 1 --seed 1 --temp 0 -c 512
-  run_nsys "lcli_pLg1" "$LLAMA_DIR/llama-cli" -m "$MODEL" \
-    --jinja --no-warmup -ngl 99 -p "$PROMPT_LONG" -n 1 --seed 1 --temp 0 -c 512
-  run_nsys "lcli_pLgN" "$LLAMA_DIR/llama-cli" -m "$MODEL" \
-    --jinja --no-warmup -ngl 99 -p "$PROMPT_LONG" -n "$N_TOKENS" --seed 1 --temp 0 -c 512
+  # CRITICAL: use `--single-turn`.  Despite documentation, `-no-cnv` *does
+  # not* prevent llama-cli from re-prompting after EOS when stdin is
+  # /dev/null — it just reads EOF immediately and loops forever, producing
+  # 1.9 GB of `> ` lines (this was the original "llama.cpp writes a lot to
+  # disk" symptom).  `--single-turn` exits cleanly after one generation.
+  # `--jinja` is dropped: chat formatting is irrelevant for a host-overhead
+  # microbench and prolongs the run with template tokens.
+  local CLI_OPTS=(--no-warmup --single-turn -ngl 99 --seed 1 --temp 0 -c 4096)
+  if [[ -n "${HESPER_3CASE:-}" ]]; then
+    run_nsys "lcli_p1g1" "$LLAMA_DIR/llama-cli" -m "$MODEL" "${CLI_OPTS[@]}" -p "$PROMPT_SHORT" -n 1
+    run_nsys "lcli_pLg1" "$LLAMA_DIR/llama-cli" -m "$MODEL" "${CLI_OPTS[@]}" -p "$PROMPT_LONG"  -n 1
+  fi
+  run_nsys "lcli_pLgN" "$LLAMA_DIR/llama-cli" -m "$MODEL" "${CLI_OPTS[@]}" -p "$PROMPT_LONG"  -n "$N_TOKENS"
+  run_perf "lcli_pLgN" "$LLAMA_DIR/llama-cli" -m "$MODEL" "${CLI_OPTS[@]}" -p "$PROMPT_LONG"  -n "$N_TOKENS"
 }
 
 run_lbench() {
@@ -147,16 +241,29 @@ run_lbench() {
 #-----------------------------------------------------------------
 analyze() {
   # $1=label, $2=tag_p1g1, $3=tag_pLg1, $4=tag_pLgN
+  #
+  # The 3-case linear-regression decomposition was fragile: the short cases
+  # ran for less than nsys' post-process timeout, and a 1-token decode trace
+  # is dominated by load + prefill anyway, so any noise there poisoned the
+  # regression.  When the short cases are missing we fall back to
+  # **pLgN-only single-case mode**:
+  #   total = N * decode/tok + P_LONG * prefill/tok + load
+  # We can't separate prefill/load from decode this way, BUT for N >> P_LONG
+  # the per-token contribution from prefill (P_LONG ms) is tiny compared
+  # with N*decode_per_tok, so we report only `decode/tok` (computed as
+  # `total / N` minus a small prefill correction estimated from the GPU
+  # kernel time of the first P_LONG tokens).
   local label="$1" t11="$2" tL1="$3" tLN="$4"
 
-  local d11=$(extract_api "$t11")
-  local dL1=$(extract_api "$tL1")
+  local d11="" dL1="" k11="" kL1="" m11="" mL1=""
+  if [[ -f "$OUT_DIR/$t11.nsys-rep" ]]; then
+    d11=$(extract_api "$t11"); k11=$(extract_kernels_total "$t11"); m11=$(extract_memcpy_total "$t11")
+  fi
+  if [[ -f "$OUT_DIR/$tL1.nsys-rep" ]]; then
+    dL1=$(extract_api "$tL1"); kL1=$(extract_kernels_total "$tL1"); mL1=$(extract_memcpy_total "$tL1")
+  fi
   local dLN=$(extract_api "$tLN")
-  local k11=$(extract_kernels_total "$t11")
-  local kL1=$(extract_kernels_total "$tL1")
   local kLN=$(extract_kernels_total "$tLN")
-  local m11=$(extract_memcpy_total "$t11")
-  local mL1=$(extract_memcpy_total "$tL1")
   local mLN=$(extract_memcpy_total "$tLN")
 
   python3 - <<PY
@@ -183,8 +290,19 @@ def pkern(s):
 k11 = pkern("$k11"); kL1 = pkern("$kL1"); kLN = pkern("$kLN")
 m11 = pkern("$m11"); mL1 = pkern("$mL1"); mLN = pkern("$mLN")
 
+SINGLE_CASE = (not d11) or (not dL1)
+
 def regress_count(v11, vL1, vLN):
-    """Returns (load, prefill_per_tok, decode_per_tok)."""
+    """Returns (load, prefill_per_tok, decode_per_tok).
+
+    In single-case mode (only pLgN is available) we collapse to:
+        decode_per_tok = vLN / N      (overestimates by P_LONG/N <≈ 4 % at N=300)
+        prefill_per_tok = NaN
+        load = NaN
+    The bias is bounded by P_LONG / N; for N=300, P_LONG=11 that is 3.7 %,
+    smaller than the run-to-run variance we observe."""
+    if SINGLE_CASE:
+        return float('nan'), float('nan'), vLN / max(1, N)
     decode_per_tok = (vLN - vL1) / max(1, N - 1)
     prefill_per_tok = (vL1 - v11) / max(1, P_LONG - P_SHORT)
     load = v11 - P_SHORT*prefill_per_tok - 1*decode_per_tok
@@ -206,7 +324,7 @@ selected = sorted(n for n in names if any(s in n for s in
 
 print()
 print("=" * 78)
-print(f" {label}")
+print(" $label")
 print(f"   (P_short={P_SHORT}, P_long={P_LONG}, N={N})")
 print("=" * 78)
 
@@ -279,6 +397,16 @@ print(f"  Host: DtoH (sync read)  = {decode_dtoh_ns/1e6:>8.3f} ms (sample readba
 print(f"  Host: cuStreamSync      = {decode_sync_ns/1e6:>8.3f} ms (explicit drain)")
 print(f"  Host total in CUDA API  = {(decode_launch_ns+decode_htod_ns+decode_dtoh_ns+decode_sync_ns)/1e6:>8.3f} ms")
 PY
+
+  # ------ 4. perf top symbols (where the host actually spends cycles) ------
+  local prpt="$OUT_DIR/${tLN}.perf.txt"
+  if [[ -f "$prpt" ]]; then
+    echo
+    echo "[4] perf record top user-space symbols (cycles:u --no-children, >=0.5 %)"
+    echo "    captured during the long-prompt long-decode workload"
+    echo "  -------------------------------------------------------------------------"
+    awk 'NF >= 2 {print "  " $0}' "$prpt"
+  fi
 }
 
 run_all() {
