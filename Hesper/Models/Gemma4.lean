@@ -1734,26 +1734,30 @@ def forwardPrefillBatch [GPUBackend β] (ctx : β)
     let rowBytesU : USize := model.perLayerEmbdRowBytes.toUSize
     for i in [0:seqLen] do
       let tokenId := promptTokens[i]!
-      -- On-demand path: kernel always reads row 0 of the small row buffer.
-      -- Legacy path: kernel reads tokenId-th row of the full GPU table.
+      -- UVA on-demand path (HESPER_USE_MMAP=1): table lives in CPU mmap,
+      -- pinned + mapped into device VA at load time.  We bypass the
+      -- Loader-allocated 1-row scratch buffer entirely: the kernel reads
+      -- the row directly from host memory through the unified pointer
+      -- (synthesised as a `Buf` at offset = tokenId × rowBytes), which
+      -- means kernelTokenId is always 0 and no cuMemcpy fires.
+      -- Legacy path: real `tokenId` indexes the full VRAM table.
       let kernelTokenId : Nat := match model.perLayerEmbdMmap with
         | some _ => 0
         | none   => tokenId
       writeScalarViaStaging ctx state.plRawRowBuf 0 state.stagingPLRowPtr 0
         (Hesper.WebGPU.BufferOps.uint32ToBytes kernelTokenId.toUInt32)
-      match model.perLayerEmbdMmap with
-      | some (mmap, dataSecOff, tensorOff) =>
-        match ← GPUBackend.rawDevicePtr ctx embdTableGPU with
-        | some dstPtr =>
-          let absOff : USize := dataSecOff + tensorOff + tokenId.toUSize * rowBytesU
-          Hesper.CUDA.cuMemcpyHtoDFromMmap dstPtr mmap absOff rowBytesU 0
-        | none => pure ()
-      | none => pure ()
+      let tableForKernel ← match model.perLayerEmbdMmap with
+        | some (_, _, _, devPtr) =>
+          let rowDevPtr : USize := devPtr + tokenId.toUSize * rowBytesU
+          match ← GPUBackend.bufFromRawDevicePtr ctx rowDevPtr rowBytesU with
+          | some b => pure b
+          | none   => pure embdTableGPU  -- backend without UVA: fallback
+        | none => pure embdTableGPU
       let scaleFactor : Float := Float.sqrt embdPL.toFloat
       ce "q6kDequantScale_pf"
         (Hesper.Quantization.Q6_K.q6kTableRowDequantScaleKernel totalPL scaleFactor
           cfg.vocabSize)
-        [("table", embdTableGPU), ("params", state.plRawRowBuf), ("output", state.plModelProj)]
+        [("table", tableForKernel), ("params", state.plRawRowBuf), ("output", state.plModelProj)]
         (.dispatch1D totalPL)
       writeColIdxU32 colIdxBuf i
       ce s!"colExtrScaledEmb_sl{seqLen}"
@@ -2640,27 +2644,28 @@ def forwardSingleToken [GPUBackend β] (ctx : β)
       --          it before each forward, and pass tokenId=0 to the kernel.
       Hesper.WGSL.Execute.withSection "plPre.gpuDequant" do
         let rowBytesU : USize := model.perLayerEmbdRowBytes.toUSize
+        -- UVA on-demand path: kernel sees a synthesised row-base device
+        -- pointer at `devPtr + tokenId × rowBytes`, so it dereferences
+        -- the host page through the unified VA mapping with no explicit
+        -- cuMemcpy. Legacy path: real tokenId indexes the full VRAM table.
         let kernelTokenId : Nat := match model.perLayerEmbdMmap with
-          | some _ => 0       -- on-demand: row buffer always reads index 0
-          | none   => tokenId -- legacy: full table indexed by tokenId
+          | some _ => 0
+          | none   => tokenId
         let tokenIdBytes := Hesper.WebGPU.BufferOps.uint32ToBytes kernelTokenId.toUInt32
         if !skipTokenWrite then
           writeScalarViaStaging ctx state.plRawRowBuf 0 state.stagingPLRowPtr 0 tokenIdBytes
-        -- On-demand path: copy this token's row from mmap → row buffer.
-        match model.perLayerEmbdMmap with
-        | some (mmap, dataSecOff, tensorOff) =>
-          match ← GPUBackend.rawDevicePtr ctx embdTableGPU with
-          | some dstPtr =>
-            let absOff : USize :=
-              dataSecOff + tensorOff + tokenId.toUSize * rowBytesU
-            Hesper.CUDA.cuMemcpyHtoDFromMmap dstPtr mmap absOff rowBytesU 0
-          | none => pure ()  -- backend can't expose ptr (e.g. WebGPU); skip
-        | none => pure ()
+        let tableForKernel ← match model.perLayerEmbdMmap with
+          | some (_, _, _, devPtr) =>
+            let rowDevPtr : USize := devPtr + tokenId.toUSize * rowBytesU
+            match ← GPUBackend.bufFromRawDevicePtr ctx rowDevPtr rowBytesU with
+            | some b => pure b
+            | none   => pure embdTableGPU
+          | none => pure embdTableGPU
         let scaleFactor : Float := Float.sqrt embdPL.toFloat
         ce "q6kDequantScale"
           (Hesper.Quantization.Q6_K.q6kTableRowDequantScaleKernel totalPL scaleFactor
             model.config.vocabSize)
-          [("table", embdTableGPU), ("params", state.plRawRowBuf), ("output", state.plModelProj)]
+          [("table", tableForKernel), ("params", state.plRawRowBuf), ("output", state.plModelProj)]
           (.dispatch1D totalPL)
 
       -- 2) per_layer_model_proj @ buf2 → plTokenSelected

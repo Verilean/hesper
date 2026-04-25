@@ -594,6 +594,67 @@ extern "C" lean_obj_res lean_hesper_mmap_size(b_lean_obj_arg h_obj) {
     return lean_io_result_mk_ok(lean_box_usize(h->size));
 }
 
+/// Pin a sub-range of an mmap region as page-locked + map it into the CUDA
+/// unified-VA space, returning the *device-side* pointer that aliases the
+/// host range.  Kernels can dereference that pointer directly via global
+/// loads — the driver pulls pages over PCIe on demand (the same trick
+/// llama.cpp's getrows kernel uses for `tok_embd_per_layer`).
+///
+/// Cost: ~200 ms/GB on first call (mlock + cuMemHostRegister), once at
+/// model load.  No per-token cuMemcpy needed afterwards.
+///
+/// Caller may pass any offset/size; we page-align internally and return
+/// the device pointer corresponding to the *requested* offset (not the
+/// page-aligned region start).  Size is also rounded up to cover the
+/// requested range.
+///
+/// Returns the device pointer (`USize`) on success.  On failure (OOM,
+/// kernel limits, already-registered overlap), returns a Lean IO error.
+extern "C" lean_obj_res lean_hesper_mmap_register_region(
+        b_lean_obj_arg h_obj, size_t offset, size_t size) {
+    auto* h = static_cast<hesper_mmap_handle*>(lean_get_external_data(h_obj));
+    if (offset + size > h->size) {
+        return lean_io_result_mk_error(lean_mk_io_user_error(
+            lean_mk_string("mmapRegisterRegion: out of range")));
+    }
+    constexpr size_t PAGE = 4096;
+    // Snap [offset, offset+size) outward to page boundaries so cuMemHostRegister
+    // sees an aligned region; clamp the upper end to the mmap size to avoid
+    // registering bytes past the file.
+    size_t region_off = offset & ~(PAGE - 1);
+    size_t region_end = ((offset + size + PAGE - 1) & ~(PAGE - 1));
+    if (region_end > h->size) region_end = h->size;
+    size_t region_size = region_end - region_off;
+    void* region_ptr = (char*)h->addr + region_off;
+    CUresult rc = cuMemHostRegister(region_ptr, region_size,
+        CU_MEMHOSTREGISTER_PORTABLE | CU_MEMHOSTREGISTER_READ_ONLY);
+    if (rc != CUDA_SUCCESS) {
+        const char* errStr = nullptr;
+        cuGetErrorString(rc, &errStr);
+        char buf[256];
+        snprintf(buf, sizeof(buf),
+                 "mmapRegisterRegion: cuMemHostRegister failed: %s",
+                 errStr ? errStr : "unknown");
+        return lean_io_result_mk_error(lean_mk_io_user_error(lean_mk_string(buf)));
+    }
+    CUdeviceptr region_dev = 0;
+    rc = cuMemHostGetDevicePointer(&region_dev, region_ptr, 0);
+    if (rc != CUDA_SUCCESS) {
+        cuMemHostUnregister(region_ptr);
+        const char* errStr = nullptr;
+        cuGetErrorString(rc, &errStr);
+        char buf[256];
+        snprintf(buf, sizeof(buf),
+                 "mmapRegisterRegion: cuMemHostGetDevicePointer failed: %s",
+                 errStr ? errStr : "unknown");
+        return lean_io_result_mk_error(lean_mk_io_user_error(lean_mk_string(buf)));
+    }
+    // Shift the returned pointer by the in-page offset so the caller gets
+    // a device pointer that aliases the requested host range exactly.
+    size_t in_page_off = offset - region_off;
+    return lean_io_result_mk_ok(lean_box_usize((size_t)region_dev + in_page_off));
+}
+
 /// Copy a slice of the mmap to a fresh Lean ByteArray.  Used for metadata
 /// parsing which needs Lean-side operations; tensor bodies should NOT use
 /// this — use the GPU-direct path below.

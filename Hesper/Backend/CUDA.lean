@@ -810,5 +810,6 @@ instance : GPUBackend CUDAContext where
   hasShaderF16Support _ctx := pure true  -- sm_89 has native f16
   newCacheRef := IO.mkRef none
   rawDevicePtr _ctx buf := pure (some buf.ptr)
+  bufFromRawDevicePtr _ctx ptr size := pure (some { ptr := ptr, size := size })
 
 end Hesper
