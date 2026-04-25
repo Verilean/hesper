@@ -1,3 +1,5 @@
+import Hesper.CUDA.FFI
+
 /-!
 # GGUF Format Type Definitions
 
@@ -346,6 +348,17 @@ structure GGUFFile where
   tensors   : Array TensorInfo
   dataBlob  : ByteArray  -- Raw tensor data (single allocation)
   alignment : UInt32
+  /-- Optional mmap handle.  When set, `dataBlob` is empty (or holds
+      only a prefix for metadata parsing) and tensor bodies are read
+      from the mmap at `dataSectionOffset + tensor.offset`.  The
+      mmap's lifetime is tied to this Lean object via GC, so any GPU
+      weight upload issued async while the GGUFFile reference is live
+      is safe to complete. -/
+  mmap      : Option Hesper.CUDA.MMappedFile := none
+  /-- Absolute file offset where the aligned tensor-data section
+      starts.  Only meaningful when `mmap.isSome`.  Tensor body at
+      mmap offset = `dataSectionOffset + tensorInfo.offset`. -/
+  dataSectionOffset : USize := 0
   deriving Inhabited
 
 instance : Repr GGUFFile where
