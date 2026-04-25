@@ -109,15 +109,14 @@ private def buildDawnIfNeeded (cwd : FilePath) : IO UInt32 := do
     IO.println "[Hesper] Dawn already built (cached)."
   return 0
 
-/-- Build the Hesper native bridge library. -/
+/-- Build the Hesper native bridge library and (on Linux) the CUDA bridge. -/
 private def buildBridgeIfNeeded (cwd : FilePath) : IO UInt32 := do
   let bridgeBuild := cwd / ".lake/build/native"
-  let libPath := bridgeBuild / "libhesper_native.a"
-  if (← libPath.pathExists) then
-    IO.println "[Hesper] Native bridge already built (cached)."
-    return 0
-  else
-    IO.println "[Hesper] Building Hesper native bridge..."
+  let nativeLib := bridgeBuild / "libhesper_native.a"
+  let cudaLib := bridgeBuild / "libhesper_cuda.a"
+  let needConfigure := !(← (bridgeBuild / "CMakeCache.txt").pathExists)
+  if needConfigure then
+    IO.println "[Hesper] Configuring native bridge..."
     IO.FS.createDirAll bridgeBuild
     let ret ← runCmd "cmake" #[
       "-S", (cwd / "native").toString, "-B", bridgeBuild.toString,
@@ -125,10 +124,21 @@ private def buildBridgeIfNeeded (cwd : FilePath) : IO UInt32 := do
       "-DDAWN_SRC_DIR=" ++ (cwd / ".lake/build/dawn-src").toString,
       "-DDAWN_BUILD_DIR=" ++ (cwd / ".lake/build/dawn-build").toString]
     if ret != 0 then return ret
+  if !(← nativeLib.pathExists) then
+    IO.println "[Hesper] Building Hesper native bridge..."
     let ret ← runCmd "cmake" #["--build", bridgeBuild.toString, "--target", "hesper_native", "-j", "8"]
     if ret != 0 then return ret
-    IO.println "[Hesper] Native bridge built."
-    return 0
+  else
+    IO.println "[Hesper] Native bridge already built (cached)."
+  -- CUDA bridge: only on Linux (cuda_bridge.cpp uses CUDA driver API)
+  if !System.Platform.isOSX then
+    if !(← cudaLib.pathExists) then
+      IO.println "[Hesper] Building Hesper CUDA bridge..."
+      let ret ← runCmd "cmake" #["--build", bridgeBuild.toString, "--target", "hesper_cuda", "-j", "8"]
+      if ret != 0 then return ret
+    else
+      IO.println "[Hesper] CUDA bridge already built (cached)."
+  return 0
 
 /-- Build the SIMD library (Google Highway). -/
 private def buildSimdIfNeeded (cwd : FilePath) : IO UInt32 := do
@@ -354,6 +364,9 @@ script buildNative do
 
 -- Standard linker configuration for all FFI executables (based on glfw-triangle + Google Highway)
 -- Platform-specific: macOS uses frameworks + force_load; Linux uses whole-archive + Vulkan/X11
+-- Note: libhesper_cuda.a is unconditionally linked because Hesper.lean's CUDA FFI
+-- is exported into nearly every Lean module's .c.o.export, making the symbols
+-- live for any exe that imports anything from Hesper.* on Linux.
 def stdLinkArgs : Array String :=
   -- Dawn installs to lib/ on macOS, lib64/ on Linux x86_64
   let dawnLibDir := if System.Platform.isOSX then "lib" else "lib64"
@@ -365,6 +378,9 @@ def stdLinkArgs : Array String :=
     "./.lake/build/simd/libhesper_simd.a",
     "./.lake/build/simd/_deps/highway-build/libhwy.a"
   ]
+  let cudaArgs :=
+    if System.Platform.isOSX then #[]
+    else #["./.lake/build/native/libhesper_cuda.a", "-lcuda"]
   if System.Platform.isOSX then
     #["-Wl,-force_load,./.lake/build/native/libhesper_native.a",
       "-Wl,-force_load,./.lake/build/dawn-build/src/dawn/libdawn_proc.a",
@@ -388,7 +404,7 @@ def stdLinkArgs : Array String :=
       "./.lake/build/dawn-build/src/dawn/libdawn_proc.a",
       "./.lake/build/dawn-build/src/dawn/glfw/libdawn_glfw.a",
       "-Wl,--no-whole-archive"]
-    ++ commonArgs ++
+    ++ commonArgs ++ cudaArgs ++
     #["-lstdc++",
       "-lvulkan",
       "-lX11",
