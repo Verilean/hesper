@@ -208,6 +208,21 @@ def numWorkgroups : ShaderM (Exp (.vec3 .u32)) :=
 def readBuffer {ty : WGSLType} {n : Nat} (bufferName : String) (idx : Exp (.scalar .u32)) : ShaderM (Exp ty) :=
   return Exp.index (Exp.var bufferName : Exp (.array ty n)) idx
 
+/-- Read a single byte (zero-extended to u32) from a buffer declared as
+    `array<u32, n>`, addressed by *byte* index.  Lowers to one `ld.global.u8`
+    on CUDA; emulated via u32-load+shift+mask on WGSL.  Essential for Q6_K
+    scale reads (avoids issuing a full u32 load per byte). -/
+def readBufferByte {n : Nat} (bufferName : String) (byteIdx : Exp (.scalar .u32))
+    : ShaderM (Exp (.scalar .u32)) :=
+  return Exp.loadByteFromU32Buf (n := n) bufferName byteIdx
+
+/-- Read a halfword (16 bits, zero-extended to u32) from a buffer declared
+    as `array<u32, n>`, addressed by *byte* index.  Lowers to `ld.global.u16`
+    on CUDA.  Use for fp16 block scales. -/
+def readBufferU16 {n : Nat} (bufferName : String) (byteIdx : Exp (.scalar .u32))
+    : ShaderM (Exp (.scalar .u32)) :=
+  return Exp.loadU16FromU32Buf (n := n) bufferName byteIdx
+
 /-- Write to a global storage buffer at index -/
 def writeBuffer {ty : WGSLType} (bufferName : String) (idx : Exp (.scalar .u32)) (value : Exp ty) : ShaderM Unit :=
   assignIndex bufferName idx value
@@ -249,6 +264,32 @@ def declareStorageBuffer (name : String) (ty : WGSLType)
 def declareReadOnlyBuffer (name : String) (ty : WGSLType) : ShaderM String := do
   modify fun s => { s with declaredBuffers := s.declaredBuffers ++ [(name, ty, .read)] }
   return name
+
+/-- Declare a read-only *buffer array* binding: N separate runtime-sized
+    storage buffers addressable by runtime layer index.  The host side must
+    pass a device-pointer-table — `N × 8 bytes` holding each layer's
+    `CUdeviceptr` — as the kernel argument bound to `name`.  Inside the
+    kernel, read elements with `readBufferArray name layerIdx elemIdx`.
+
+    This is the primitive that lets a *single* kernel iterate over all 42
+    transformer layers, collapsing 42 dispatches into 1.  The existing
+    per-layer kernels remain; use `bufferArray` only when a kernel actually
+    wants to fuse across layers. -/
+def declareInputBufferArray (name : String) (elemTy : WGSLType) (n : Nat) : ShaderM String := do
+  modify fun s => { s with declaredBuffers :=
+    s.declaredBuffers ++ [(name, .bufferArray elemTy n, .read)] }
+  return name
+
+/-- Read element `elemIdx` from the `bufIdx`-th buffer of a `bufferArray`.
+    Emits a single-indirection load via the pointer table. -/
+def readBufferArray {elemTy : WGSLType} {n : Nat}
+    (name : String) (bufIdx elemIdx : Exp (.scalar .u32)) : ShaderM (Exp elemTy) :=
+  return Exp.indexBuf (elemTy := elemTy) (n := n) (Exp.var name) bufIdx elemIdx
+
+/-- Write `value` to `arr[bufIdx][elemIdx]` where `arr` is a `bufferArray`. -/
+def writeBufferArray {ty : WGSLType}
+    (name : String) (bufIdx elemIdx : Exp (.scalar .u32)) (value : Exp ty) : ShaderM Unit :=
+  emitStmt (Stmt.assignIndexBuf name bufIdx elemIdx ty value)
 
 -- ============================================================================
 -- High-level Helpers

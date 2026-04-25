@@ -1,6 +1,7 @@
 import Hesper.CUDA.FFI
 import Hesper.CUDA.Buffer
 import Hesper.Layers.Linear
+import Hesper.Backend.CUDA
 
 /-!
 # llama.cpp PTX loader (Phase 0 hybrid prototype)
@@ -95,6 +96,25 @@ private def alignTo (buf : ByteArray) (align : Nat) : ByteArray := Id.run do
     b := b.push 0
   return b
 
+/-- Launch a kernel, routing through the CUDA-Graph capture stream when
+    active.  This is the critical fix for the hybrid-PTX garbage: when
+    `HESPER_CUDA_GRAPHS=1` is on and decode is mid-capture, kernel launches
+    on the default stream are NOT captured into the graph.  Such kernels
+    still execute, but they run OUTSIDE the graph's serialized ordering —
+    meaning hesper's (captured, replay-ordered) kernels race with override's
+    (default-stream, always-live) kernels on shared buffers (Q8_1 scratch,
+    per-layer input/output buffers, KV cache).  The race corrupts logits
+    with cumulative error that manifests as garbage tokens.
+
+    Fix: use `cuLaunchKernelRawOnStream` with the capture stream when set,
+    so override launches become graph nodes just like hesper's kernels. -/
+private def launchOnCaptureStream (func : CUfunction)
+    (gx gy gz bx byDim bz : UInt32) (smem : UInt32)
+    (bytes : ByteArray) (offsets : Array USize) : IO Unit := do
+  match ← Hesper.cudaCaptureStream.get with
+  | some s => cuLaunchKernelRawOnStream func gx gy gz bx byDim bz smem bytes offsets s
+  | none   => cuLaunchKernelRaw func gx gy gz bx byDim bz smem bytes offsets
+
 /-! ## Q8_1 quantize launch
 
 Signature (9 params):
@@ -135,7 +155,7 @@ def launchQuantizeQ8_1 (k : Kernels) (xBuf : CUdeviceptr) (yBuf : CUdeviceptr)
   bytes := pushU32 bytes 0
   bytes := pushU32 bytes 1
   let grid := (inDim + 255) / 256
-  cuLaunchKernelRaw k.q8_1Quantize
+  launchOnCaptureStream k.q8_1Quantize
     grid.toUInt32 1 1
     256 1 1
     0
@@ -254,7 +274,7 @@ def launchMulMatVecQ4K (k : Kernels) (weightBuf q8Buf dstBuf : CUdeviceptr)
   let blocksPerRowX := inDim / 256
   let (bytes, offsets) := packMatmulArgs weightBuf q8Buf dstBuf inDim outDim blocksPerRowX
   -- On sm_89 for ncols_dst=1 with inDim ≥ 2048: rows_per_cuda_block = 1.
-  cuLaunchKernelRaw k.q4kMatmul
+  launchOnCaptureStream k.q4kMatmul
     outDim.toUInt32 1 1
     32 4 1
     0
@@ -269,7 +289,7 @@ def launchMulMatVecQ6K (k : Kernels) (weightBuf q8Buf dstBuf : CUdeviceptr)
     throw (IO.userError s!"Q6_K requires inDim % 256 == 0, got {inDim}")
   let blocksPerRowX := inDim / 256
   let (bytes, offsets) := packMatmulArgs weightBuf q8Buf dstBuf inDim outDim blocksPerRowX
-  cuLaunchKernelRaw k.q6kMatmul
+  launchOnCaptureStream k.q6kMatmul
     outDim.toUInt32 1 1
     32 4 1
     0

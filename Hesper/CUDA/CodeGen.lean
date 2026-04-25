@@ -27,6 +27,21 @@ open Hesper.CUDA.PTX
 
 abbrev ExpResult := AnyReg × GenState
 
+/-- log₂ of n if n is a power of two (1, 2, 4, …, 2^31), else none.
+    Used for peephole lowering of `div/mul/mod` by a constant power of two
+    to `shr/shl/and`, which avoids the 20-cycle `div.u32`. -/
+private def log2PowerOfTwo? (n : Nat) : Option Nat :=
+  if n == 0 then none
+  else if n &&& (n - 1) != 0 then none
+  else Id.run do
+    let mut m := n
+    let mut acc := 0
+    for _ in [0:32] do
+      if m <= 1 then break
+      m := m >>> 1
+      acc := acc + 1
+    return some acc
+
 /-- Emit a typed comparison, dispatching by register type. -/
 private def emitSetp (op : CmpOp) (ra rb : AnyReg) (s : GenState) : AnyReg × GenState :=
   let (p, s) := s.freshPred
@@ -46,9 +61,9 @@ partial def expToPTX (e : Exp t) (s : GenState) : ExpResult :=
   | .litF32 f =>
     let (r, s) := s.freshF32; (.f32 r, s.emit (.mov_f32_imm r (F32Imm.ofFloat f)))
   | .litU32 n =>
-    let (r, s) := s.freshU32; (.u32 r, s.emit (.mov_u32_imm r n))
+    let (r, s) := s.readImmU32 n; (.u32 r, s)
   | .litI32 n =>
-    let (r, s) := s.freshU32; (.u32 r, s.emit (.mov_u32_imm r n.toNat))
+    let (r, s) := s.readImmU32 n.toNat; (.u32 r, s)
   | .litBool b =>
     let (r, s) := s.freshPred
     let (t1, s) := s.freshU32; let (t2, s) := s.freshU32
@@ -82,22 +97,86 @@ partial def expToPTX (e : Exp t) (s : GenState) : ExpResult :=
     | .u32 a, .u32 b => let (r, s) := s.freshU32; (.u32 r, s.emit (.sub_u32 r a b))
     | _, _ => (ra, s)
   | .mul a b =>
-    let (ra, s) := expToPTX a s; let (rb, s) := expToPTX b s
-    match ra, rb with
-    | .f32 a, .f32 b => let (r, s) := s.freshF32; (.f32 r, s.emit (.mul_f32 r a b))
-    | .u32 a, .u32 b => let (r, s) := s.freshU32; (.u32 r, s.emit (.mul_lo_u32 r a b))
-    | _, _ => (ra, s)
+    -- Peephole: u32 × 2^k → shl by k (avoids mul.lo.u32 latency + an extra reg).
+    match b with
+    | .litU32 n => match log2PowerOfTwo? n with
+      | some k =>
+        let (ra, s) := expToPTX a s
+        match ra with
+        | .u32 a => let (r, s) := s.freshU32; (.u32 r, s.emit (.shl_u32 r a k))
+        | _ =>
+          let (rb, s) := expToPTX b s
+          match ra, rb with
+          | .f32 a, .f32 b => let (r, s) := s.freshF32; (.f32 r, s.emit (.mul_f32 r a b))
+          | .u32 a, .u32 b => let (r, s) := s.freshU32; (.u32 r, s.emit (.mul_lo_u32 r a b))
+          | _, _ => (ra, s)
+      | none =>
+        let (ra, s) := expToPTX a s; let (rb, s) := expToPTX b s
+        match ra, rb with
+        | .f32 a, .f32 b => let (r, s) := s.freshF32; (.f32 r, s.emit (.mul_f32 r a b))
+        | .u32 a, .u32 b => let (r, s) := s.freshU32; (.u32 r, s.emit (.mul_lo_u32 r a b))
+        | _, _ => (ra, s)
+    | _ =>
+      let (ra, s) := expToPTX a s; let (rb, s) := expToPTX b s
+      match ra, rb with
+      | .f32 a, .f32 b => let (r, s) := s.freshF32; (.f32 r, s.emit (.mul_f32 r a b))
+      | .u32 a, .u32 b => let (r, s) := s.freshU32; (.u32 r, s.emit (.mul_lo_u32 r a b))
+      | _, _ => (ra, s)
   | .div a b =>
-    let (ra, s) := expToPTX a s; let (rb, s) := expToPTX b s
-    match ra, rb with
-    | .f32 a, .f32 b => let (r, s) := s.freshF32; (.f32 r, s.emit (.div_f32 r a b))
-    | .u32 a, .u32 b => let (r, s) := s.freshU32; (.u32 r, s.emit (.div_u32 r a b))
-    | _, _ => (ra, s)
+    -- Peephole: u32 / 2^k → shr by k (avoids 20-cycle div.u32).
+    match b with
+    | .litU32 n => match log2PowerOfTwo? n with
+      | some k =>
+        let (ra, s) := expToPTX a s
+        match ra with
+        | .u32 a =>
+          let (kReg, s) := s.readImmU32 k
+          let (r, s) := s.freshU32
+          (.u32 r, s.emit (.shr_u32 r a kReg))
+        | _ =>
+          let (rb, s) := expToPTX b s
+          match ra, rb with
+          | .f32 a, .f32 b => let (r, s) := s.freshF32; (.f32 r, s.emit (.div_f32 r a b))
+          | .u32 a, .u32 b => let (r, s) := s.freshU32; (.u32 r, s.emit (.div_u32 r a b))
+          | _, _ => (ra, s)
+      | none =>
+        let (ra, s) := expToPTX a s; let (rb, s) := expToPTX b s
+        match ra, rb with
+        | .f32 a, .f32 b => let (r, s) := s.freshF32; (.f32 r, s.emit (.div_f32 r a b))
+        | .u32 a, .u32 b => let (r, s) := s.freshU32; (.u32 r, s.emit (.div_u32 r a b))
+        | _, _ => (ra, s)
+    | _ =>
+      let (ra, s) := expToPTX a s; let (rb, s) := expToPTX b s
+      match ra, rb with
+      | .f32 a, .f32 b => let (r, s) := s.freshF32; (.f32 r, s.emit (.div_f32 r a b))
+      | .u32 a, .u32 b => let (r, s) := s.freshU32; (.u32 r, s.emit (.div_u32 r a b))
+      | _, _ => (ra, s)
   | .mod a b =>
-    let (ra, s) := expToPTX a s; let (rb, s) := expToPTX b s
-    match ra, rb with
-    | .u32 a, .u32 b => let (r, s) := s.freshU32; (.u32 r, s.emit (.rem_u32 r a b))
-    | _, _ => (ra, s)
+    -- Peephole: u32 % 2^k → and with (2^k - 1) (avoids rem.u32 latency).
+    match b with
+    | .litU32 n => match log2PowerOfTwo? n with
+      | some _k =>
+        let (ra, s) := expToPTX a s
+        match ra with
+        | .u32 a =>
+          let (mReg, s) := s.readImmU32 (n - 1)
+          let (r, s) := s.freshU32
+          (.u32 r, s.emit (.and_u32 r a mReg))
+        | _ =>
+          let (rb, s) := expToPTX b s
+          match ra, rb with
+          | .u32 a, .u32 b => let (r, s) := s.freshU32; (.u32 r, s.emit (.rem_u32 r a b))
+          | _, _ => (ra, s)
+      | none =>
+        let (ra, s) := expToPTX a s; let (rb, s) := expToPTX b s
+        match ra, rb with
+        | .u32 a, .u32 b => let (r, s) := s.freshU32; (.u32 r, s.emit (.rem_u32 r a b))
+        | _, _ => (ra, s)
+    | _ =>
+      let (ra, s) := expToPTX a s; let (rb, s) := expToPTX b s
+      match ra, rb with
+      | .u32 a, .u32 b => let (r, s) := s.freshU32; (.u32 r, s.emit (.rem_u32 r a b))
+      | _, _ => (ra, s)
   | .neg e =>
     let (re, s) := expToPTX e s
     match re with
@@ -137,8 +216,32 @@ partial def expToPTX (e : Exp t) (s : GenState) : ExpResult :=
 
   -- Bitwise (u32)
   | .bitAnd a b =>
-    let (ra, s) := expToPTX a s; let (rb, s) := expToPTX b s
-    let (r, s) := s.freshU32; (.u32 r, s.emit (.and_u32 r ra.toU32! rb.toU32!))
+    -- Peephole: `(x >> s) & ((1<<w)-1)` → `bfe.u32 dst, x, s, w`.
+    -- Detects extractScaleMin-style bit slicing; collapses shr+and (2-3
+    -- cycles) into a single-cycle bfe instruction.
+    match a, b with
+    | .shiftRight x (.litU32 startBit), .litU32 mask =>
+      let w := Nat.log2 (mask + 1)
+      if mask + 1 == 1 <<< w && w > 0 && w <= 32 && startBit < 32 then
+        let (rx, s) := expToPTX x s
+        let (r, s) := s.freshU32
+        (.u32 r, s.emit (.bfe_u32 r rx.toU32! startBit w))
+      else
+        let (ra, s) := expToPTX a s; let (rb, s) := expToPTX b s
+        let (r, s) := s.freshU32; (.u32 r, s.emit (.and_u32 r ra.toU32! rb.toU32!))
+    -- Also: `x & ((1<<w)-1)` (no shift) → `bfe.u32 dst, x, 0, w`.
+    | x, .litU32 mask =>
+      let w := Nat.log2 (mask + 1)
+      if mask + 1 == 1 <<< w && w > 0 && w <= 32 then
+        let (rx, s) := expToPTX x s
+        let (r, s) := s.freshU32
+        (.u32 r, s.emit (.bfe_u32 r rx.toU32! 0 w))
+      else
+        let (ra, s) := expToPTX a s; let (rb, s) := expToPTX b s
+        let (r, s) := s.freshU32; (.u32 r, s.emit (.and_u32 r ra.toU32! rb.toU32!))
+    | _, _ =>
+      let (ra, s) := expToPTX a s; let (rb, s) := expToPTX b s
+      let (r, s) := s.freshU32; (.u32 r, s.emit (.and_u32 r ra.toU32! rb.toU32!))
   | .bitOr a b =>
     let (ra, s) := expToPTX a s; let (rb, s) := expToPTX b s
     let (r, s) := s.freshU32; (.u32 r, s.emit (.or_u32 r ra.toU32! rb.toU32!))
@@ -222,9 +325,14 @@ partial def expToPTX (e : Exp t) (s : GenState) : ExpResult :=
   | .ceil e =>
     let (re, s) := expToPTX e s; let (r, s) := s.freshF32; (.f32 r, s.emit (.ceil_f32 r re.toF32!))
   | .inverseSqrt e =>
+    -- Emit a single `rsqrt.approx.f32` (1 PTX instruction) instead of
+    -- `sqrt.rn` + `rcp.approx` (2 instructions).  Matches llama.cpp's
+    -- rms_norm_f32 codegen.  rsqrt.approx.f32 is IEEE-relaxed but the
+    -- precision is sufficient for RMSNorm (and already used by cuBLAS
+    -- / cuDNN for the same purpose).
     let (re, s) := expToPTX e s
-    let (sq, s) := s.freshF32; let s := s.emit (.sqrt_f32 sq re.toF32!)
-    let (r, s) := s.freshF32; (.f32 r, s.emit (.rcp_f32 r sq))
+    let (r, s) := s.freshF32
+    (.f32 r, s.emit (.rsqrt_f32 r re.toF32!))
   | .clamp x lo hi =>
     let (rx, s) := expToPTX x s; let (rlo, s) := expToPTX lo s; let (rhi, s) := expToPTX hi s
     let (t, s) := s.freshF32; let s := s.emit (.max_f32 t rx.toF32! rlo.toF32!)
@@ -353,6 +461,65 @@ partial def expToPTX (e : Exp t) (s : GenState) : ExpResult :=
       let (addr, s) := s.freshU64; let s := s.emit (.add_u64 addr rArr.toU64! off)
       (.f32 r, s.emit (.ld_f32 .global r addr isRO))
 
+  -- Byte-granularity load from a u32-typed global buffer.  The buffer is
+  -- addressed by *byte* index (no ×4 stride).  Emits a single ld.global.u8.
+  | .loadByteFromU32Buf (n := _n) name byteIdx =>
+    let rArr := (s.varMap.find? (·.1 == name)).map (·.2) |>.getD default
+    let (rIdx, s) := expToPTX byteIdx s
+    let isRO := s.isReadOnlyBuffer name
+    -- Widen the u32 byte offset to u64 so we can add it to the 64-bit base.
+    let (off, s) := s.freshU64; let s := s.emit (.mul_wide_u32 off rIdx.toU32! 1)
+    let (addr, s) := s.freshU64; let s := s.emit (.add_u64 addr rArr.toU64! off)
+    let (r, s) := s.freshU32
+    (.u32 r, s.emit (.ld_u8 .global r addr isRO))
+
+  -- Halfword (16-bit) load from a u32-typed global buffer.  Same addressing
+  -- pattern as loadByteFromU32Buf but emits ld.global.u16.
+  | .loadU16FromU32Buf (n := _n) name byteIdx =>
+    let rArr := (s.varMap.find? (·.1 == name)).map (·.2) |>.getD default
+    let (rIdx, s) := expToPTX byteIdx s
+    let isRO := s.isReadOnlyBuffer name
+    let (off, s) := s.freshU64; let s := s.emit (.mul_wide_u32 off rIdx.toU32! 1)
+    let (addr, s) := s.freshU64; let s := s.emit (.add_u64 addr rArr.toU64! off)
+    let (r, s) := s.freshU32
+    (.u32 r, s.emit (.ld_u16 .global r addr isRO))
+
+  -- bufferArray 2-level indexing: arr[bufIdx][elemIdx].
+  -- `arr` is a u64 holding the base of a device-side pointer table
+  -- (N × 8 bytes, each a CUdeviceptr).  On read:
+  --   1. ptrOff = bufIdx * 8
+  --   2. ld.global.u64 bufPtr, [arr + ptrOff]  -- the layer's base
+  --   3. elemOff = elemIdx * 4 (u32/f32 element)
+  --   4. ld.global.u32/f32 val, [bufPtr + elemOff]
+  | .indexBuf (elemTy := elemTy) arr bufIdx elemIdx =>
+    let (rArr, s) := expToPTX arr s
+    let (rBufIdx, s) := expToPTX bufIdx s
+    let (rElemIdx, s) := expToPTX elemIdx s
+    let arrName := match arr with | .var n => some n | _ => none
+    let isRO := match arrName with | some n => s.isReadOnlyBuffer n | none => true
+    let isU32 := match arrName with | some n => s.isU32Buffer n | none => false
+    -- Step 1+2: load the per-layer buffer pointer.
+    let (ptrOff, s) := s.freshU64; let s := s.emit (.mul_wide_u32 ptrOff rBufIdx.toU32! 8)
+    let (ptrAddr, s) := s.freshU64; let s := s.emit (.add_u64 ptrAddr rArr.toU64! ptrOff)
+    let (bufPtr, s) := s.freshU64
+    let s := s.emit (.ld_u64 .global bufPtr ptrAddr isRO)
+    -- Step 3+4: load the element from that buffer.
+    match elemTy with
+    | .scalar .u32 =>
+      let (elemOff, s) := s.freshU64; let s := s.emit (.mul_wide_u32 elemOff rElemIdx.toU32! 4)
+      let (addr, s) := s.freshU64; let s := s.emit (.add_u64 addr bufPtr elemOff)
+      let (r, s) := s.freshU32; (.u32 r, s.emit (.ld_u32 .global r addr isRO))
+    | .scalar .f32 =>
+      let (elemOff, s) := s.freshU64; let s := s.emit (.mul_wide_u32 elemOff rElemIdx.toU32! 4)
+      let (addr, s) := s.freshU64; let s := s.emit (.add_u64 addr bufPtr elemOff)
+      let (r, s) := s.freshF32; (.f32 r, s.emit (.ld_f32 .global r addr isRO))
+    | _ =>
+      -- Fallback: emit as u32 (caller will bitcast).
+      let _ := isU32
+      let (elemOff, s) := s.freshU64; let s := s.emit (.mul_wide_u32 elemOff rElemIdx.toU32! 4)
+      let (addr, s) := s.freshU64; let s := s.emit (.add_u64 addr bufPtr elemOff)
+      let (r, s) := s.freshU32; (.u32 r, s.emit (.ld_u32 .global r addr isRO))
+
   -- Subgroup add (warp butterfly)
   | .subgroupAdd val =>
     let (rv, s) := expToPTX val s; let (r, s) := s.freshF32
@@ -480,6 +647,28 @@ partial def stmtToPTX (stmt : Stmt) (s : GenState) : GenState :=
       let (symR, s) := s.freshU32; let s := s.emit (.mov_shared_addr symR arrName)
       let (addr, s) := s.freshU32; let s := s.emit (.add_u32 addr symR off)
       s.emit (.st_shared_sym rVal.toF32! symR off addr)
+
+  | .assignIndexBuf arrName bufIdx elemIdx ty value =>
+    -- bufferArray write: arr[bufIdx][elemIdx] = value.  `arr` is a u64
+    -- param holding the pointer-table base.  Two-step indirection.
+    let (rBufIdx, s) := expToPTX bufIdx s
+    let (rElemIdx, s) := expToPTX elemIdx s
+    let (rVal, s) := expToPTX value s
+    match s.lookupVar arrName with
+    | some (.u64 tableBase) =>
+      -- Load the per-layer buffer pointer from the table.
+      let (ptrOff, s) := s.freshU64; let s := s.emit (.mul_wide_u32 ptrOff rBufIdx.toU32! 8)
+      let (ptrAddr, s) := s.freshU64; let s := s.emit (.add_u64 ptrAddr tableBase ptrOff)
+      let (bufPtr, s) := s.freshU64
+      -- Pointer table is read-only (nc hint OK).
+      let s := s.emit (.ld_u64 .global bufPtr ptrAddr true)
+      -- Store into that buffer.
+      let (elemOff, s) := s.freshU64; let s := s.emit (.mul_wide_u32 elemOff rElemIdx.toU32! 4)
+      let (addr, s) := s.freshU64; let s := s.emit (.add_u64 addr bufPtr elemOff)
+      match ty with
+      | .scalar .u32 => s.emit (.st_u32 .global addr rVal.toU32!)
+      | _ => s.emit (.st_f32 .global addr rVal.toF32!)
+    | _ => s
 
   | .forLoop varName init cond update body =>
     let (ri, s) := expToPTX init s
