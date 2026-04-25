@@ -525,12 +525,23 @@ def Gemma4Model.fromGGUFDataWithGguf [GPUBackend β] (ctx : β)
         | .ok info =>
           match gguf.mmap with
           | some mh =>
-            -- On-demand path: only allocate one row (~45 KB) in VRAM.
-            IO.println s!"  per_layer_token_embd: {info.size} bytes → kept in CPU mmap, GPU row buffer = {rowBytes} bytes"
-            let rowBuf ← GPUBackend.allocBuffer ctx rowBytes.toUSize
+            -- UVA on-demand path (matches llama.cpp's CPU_Mapped buffer):
+            -- pin the table region in mmap and map it into the device's
+            -- unified VA space.  The kernel reads it via `ld.global` —
+            -- the driver pulls pages over PCIe per access.  Saves 2.2 GiB
+            -- VRAM and avoids the per-token explicit cuMemcpy.
+            --
+            -- We still allocate a small placeholder VRAM buffer for
+            -- backends without UVA (WebGPU); CUDA forward overrides it
+            -- with the UVA dev ptr at dispatch time via perLayerEmbdMmap.
             let dataSecOff := gguf.dataSectionOffset
             let tensorOff := info.offset.toUSize
-            pure (some (mh, dataSecOff, tensorOff), some rowBuf)
+            let absOff := dataSecOff + tensorOff
+            let tableBytes := info.size.toUSize
+            IO.println s!"  per_layer_token_embd: {info.size} bytes → mmap UVA (cuMemHostRegister + cuMemHostGetDevicePointer)"
+            let devPtr ← Hesper.CUDA.mmapRegisterRegion mh absOff tableBytes
+            let placeholderBuf ← GPUBackend.allocBuffer ctx rowBytes.toUSize
+            pure (some (mh, dataSecOff, tensorOff, devPtr), some placeholderBuf)
           | none =>
             -- Legacy path: upload the whole table to VRAM.
             IO.println s!"  per_layer_token_embd: {info.size} bytes → GPU ({info.size / 1024 / 1024} MB)"

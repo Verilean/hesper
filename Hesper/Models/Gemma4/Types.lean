@@ -91,11 +91,14 @@ structure Gemma4Model (BufT CacheT : Type) where
   finalNorm : RMSNorm.RMSNorm BufT CacheT
   outputWeight : BufT
   /-- When `none`, the full Q6_K table was uploaded to VRAM.
-      When `some`, only a 1-row scratch buffer lives in VRAM and the
-      full table stays in CPU mmap; the row is DMA'd on demand from
-      `(mmap, dataSecOff + tensorOff)` per token. Matches llama.cpp's
-      CPU_Mapped buffer pattern, saving ~2.2 GiB VRAM for Gemma 4. -/
-  perLayerEmbdMmap : Option (Hesper.CUDA.MMappedFile × USize × USize) := none
+      When `some`, the full table stays in CPU mmap (saving ~2.2 GiB VRAM)
+      and the kernel reads it via the unified-VA device pointer.  Tuple is
+      `(mmap, dataSecOff, tensorOff, deviceMappedHostPtr)`: the first three
+      keep mmap alive and let us compute file offsets; the fourth is the
+      `cuMemHostGetDevicePointer` result for `(addr + dataSecOff + tensorOff)`,
+      which kernels dereference directly per token.  Same pattern as
+      llama.cpp's getrows kernel reading the CPU_Mapped buffer. -/
+  perLayerEmbdMmap : Option (Hesper.CUDA.MMappedFile × USize × USize × USize) := none
   perLayerEmbdTableGPU : Option BufT
   perLayerEmbdRowBytes : Nat
   perLayerModelProj : Option BufT

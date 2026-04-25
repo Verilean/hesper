@@ -89,6 +89,13 @@ class GPUBackend (β : Type) where
       PTX directly.  Must not be used by portable code. -/
   rawDevicePtr : β → Buf → IO (Option USize) := fun _ _ => pure none
 
+  /-- Wrap an already-device-resident pointer (e.g. from `cuMemHostGetDevicePointer`
+      or an externally-allocated CUdeviceptr) as a `Buf` without copying.  CUDA
+      returns `some buf`; WebGPU returns `none` (no native pointer abstraction).
+      The pointer must remain valid for the buffer's lifetime; the backend will
+      NOT free it (callers handle deregistration externally). -/
+  bufFromRawDevicePtr : β → USize → USize → IO (Option Buf) := fun _ _ _ => pure none
+
   -- ── Batching (optional) ──
   /-- Begin recording dispatches for batch submission. CUDA: no-op. -/
   beginBatch : β → IO Unit := fun _ => pure ()

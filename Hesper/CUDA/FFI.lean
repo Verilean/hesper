@@ -131,6 +131,16 @@ opaque mmapSliceToBytesPersistent (h : @& MMappedFile) (offset : USize)
 opaque cuMemcpyHtoDFromMmap (dst : USize) (h : @& MMappedFile)
     (offset : USize) (size : USize) (stream : USize) : IO Unit
 
+/-- Pin a sub-range of an mmap region and map it into CUDA's unified VA
+    space.  Returns the **device-side pointer** that kernels can `ld.global`
+    directly — the driver pulls pages over PCIe on demand.  Same trick
+    llama.cpp uses for `tok_embd_per_layer` (its getrows kernel reads the
+    host pointer of the CPU_Mapped buffer).  `offset` must be 4 KB-aligned;
+    `size` is rounded up to a multiple of 4 KB.  Cost: ~200 ms/GB on the
+    first call, once at model load — no per-token cuMemcpy afterwards. -/
+@[extern "lean_hesper_mmap_register_region"]
+opaque mmapRegisterRegion (h : @& MMappedFile) (offset : USize) (size : USize) : IO USize
+
 /-! ## Memory -/
 
 @[extern "lean_hesper_cuda_malloc"]
