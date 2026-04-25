@@ -836,6 +836,48 @@ extern "C" lean_obj_res lean_hesper_cuda_mem_alloc_host(size_t size) {
     return lean_io_result_mk_ok(lean_box_usize((size_t)ptr));
 }
 
+// Host-mapped pinned allocation.  Returns a Lean Pair (host_ptr, dev_ptr)
+// where the device pointer aliases the same memory through CUDA's unified
+// VA — kernels can ld/st it directly via global ops, and the host can read
+// the result with no driver call once the producing stream has been
+// synchronised (vs. the cuMemcpyDtoH(4 byte) sync that costs ~9.8 ms/tok
+// on the per-token argmax path because the driver implicitly drains the
+// stream).
+extern "C" lean_obj_res lean_hesper_cuda_mem_alloc_host_mapped(size_t size) {
+    void* host_ptr = nullptr;
+    // PORTABLE | DEVICEMAP: usable from any context, mapped into the
+    // device's VA space.  No WRITECOMBINED — argmax is also read by host,
+    // and WC penalises host reads heavily.
+    CUDA_CHECK(cuMemHostAlloc(&host_ptr, size,
+                CU_MEMHOSTALLOC_PORTABLE | CU_MEMHOSTALLOC_DEVICEMAP),
+               "cuMemHostAlloc(MAPPED)");
+    CUdeviceptr dev_ptr = 0;
+    CUresult rc = cuMemHostGetDevicePointer(&dev_ptr, host_ptr, 0);
+    if (rc != CUDA_SUCCESS) {
+        cuMemFreeHost(host_ptr);
+        const char* errStr = nullptr;
+        cuGetErrorString(rc, &errStr);
+        char buf[256];
+        snprintf(buf, sizeof(buf),
+                 "cuMemAllocHostMapped: cuMemHostGetDevicePointer failed: %s",
+                 errStr ? errStr : "unknown");
+        return lean_io_result_mk_error(lean_mk_io_user_error(lean_mk_string(buf)));
+    }
+    // Pack as a Lean Prod (host_ptr, dev_ptr) — both as USize.
+    lean_object* pair = lean_alloc_ctor(0, 2, 0);
+    lean_ctor_set(pair, 0, lean_box_usize((size_t)host_ptr));
+    lean_ctor_set(pair, 1, lean_box_usize((size_t)dev_ptr));
+    return lean_io_result_mk_ok(pair);
+}
+
+// Read a u32 from a pinned host pointer.  No driver call.  Caller must
+// have synchronised the stream that wrote the value (e.g. via
+// cuStreamSynchronize).
+extern "C" lean_obj_res lean_hesper_cuda_read_pinned_u32(size_t host_ptr) {
+    uint32_t v = *(volatile uint32_t*)host_ptr;
+    return lean_io_result_mk_ok(lean_box_uint32(v));
+}
+
 extern "C" lean_obj_res lean_hesper_cuda_mem_free_host(size_t host_ptr) {
     CUDA_CHECK(cuMemFreeHost((void*)host_ptr), "cuMemFreeHost");
     return lean_io_result_mk_ok(lean_box(0));

@@ -13,7 +13,7 @@ This document fixes the priority order for closing that gap.
 | # | Workstream                                | Budget    | Expected ΔTPS | Status |
 |--:|-------------------------------------------|----------:|--------------:|--------|
 | 1 | Kernel speed (Q4_K matmul → llama.cpp parity, task #47) | -2.5 ms/tok | +18 TPS  | active |
-| 2 | On-device argmax + token feedback (retry of #229)        | -9.8 ms→~3 ms (drain compaction) | +30-40 TPS | active |
+| 2 | On-device argmax + token feedback (retry of #229)        | **0 ms wall (drain just renames itself)** | **+0.2 TPS measured** | **DEAD END — kept as infra only** |
 | 3 | Lean Array overhead in `Hesper.Circuit.CompiledCircuit.replay` | -0.75 ms/tok | +3 TPS | deferred |
 | — | Stretch: skip the `cuMemcpyDtoH(4 byte)` entirely (graphs OFF pipelined) | requires #2 | — | follow-on |
 
@@ -63,7 +63,25 @@ llama.cpp's reference is `ggml/src/ggml-cuda/mmq.cu` template
 
 **Stop condition**: hesper GPU kernel time ≤ 9.0 ms/token.
 
-## Workstream 2 — On-device argmax + token feedback (retry of #229)
+## ⚠️ Workstream 2 retired (2026-04-26)
+
+Implemented as `HESPER_DEVICE_ARGMAX=1` and measured: **wall unchanged
+(59.4 → 59.6 TPS, +0.2)**. nsys shows `cuMemcpyDtoH(4 byte)` going to 0 and
+`cuStreamSynchronize` rising to exactly 9.8 ms — i.e. the same wait, just
+attributed to a different driver row. The `DtoH = 9.8 ms` in doc 55 was
+the GPU drain itself, NOT a copy cost; renaming the API doesn't shorten
+the wait.
+
+llama-cli's `cuStreamSync = 6.8 ms` < hesper's 9.8 ms by exactly the
+kernel-time delta (8.4 vs 10.9 ms). The drain pins itself to the kernel
+finish time. The only knob that actually moves the drain is shrinking
+the kernel: workstream **#1**.
+
+The host-mapped infrastructure stays in tree (clean attribution makes
+nsys traces easier to read, and it's needed for graphs-ON capture
+safety) but it is not on the TPS path. See `feedback_dtoh_is_drain.md`.
+
+## Workstream 2 (retired) — On-device argmax + token feedback (retry of #229)
 
 **The bubble**: nsys shows 9.8 ms/token spent inside `cuMemcpyDtoH_v2`,
 which is hesper reading the 4-byte argmax result back to host so that the
