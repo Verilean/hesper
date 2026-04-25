@@ -1,4 +1,5 @@
 import Hesper.Backend.CUDA
+import Hesper.Backend.LlamaCppPTX
 import Hesper.CUDA.FFI
 import Hesper.Models.Gemma4
 import Hesper.Models.Gemma4.LlamaForwardPrefill
@@ -53,6 +54,11 @@ unsafe def main (args : List String) : IO Unit := do
     IO.println s!"  Mode: dispatch-count (seqLen={prompt})"
 
   let ctx ← CUDAContext.init
+  -- Install llama.cpp PTX override if HESPER_USE_LLAMACPP_PTX=1.  With
+  -- HESPER_LLAMACPP_Q6K=1 (and Q4K=0), Q6_K matmul dispatches route to
+  -- llama.cpp's kernel instead of hesper's, letting us measure the ms
+  -- gap that's attributable to the kernel body alone (vs周辺overhead).
+  let _ ← Hesper.LlamaCppPTX.autoInstall
   IO.println "[Load] Reading GGUF..."
   let ggufData ← Hesper.CUDA.readFileFast ggufPath
   let model ← Gemma4Model.fromGGUFData ctx ggufData

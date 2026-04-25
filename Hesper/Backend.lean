@@ -55,6 +55,20 @@ class GPUBackend (β : Type) where
   executeWithConfig : β → ShaderM Unit → List (String × Buf) → ExecConfig → IO Unit
   executeWithConfigCached : β → ShaderM Unit → List (String × Buf) → ExecConfig →
     UInt64 → IO.Ref (Option CachedDispatch) → IO Unit
+  /-- Variant that accepts *both* single-buffer bindings and buffer-array
+      bindings (for cross-layer kernel fusion).  Each entry in
+      `namedBufferArrays` maps a declared `bufferArray` name to the N
+      underlying buffers; the backend materialises a device-side pointer
+      table and passes its pointer as the kernel argument.  Default impl:
+      falls back to the single-buffer path if there are no array bindings. -/
+  executeWithConfigCachedArrays : β → ShaderM Unit →
+      List (String × Buf) → List (String × List Buf) → ExecConfig →
+      UInt64 → IO.Ref (Option CachedDispatch) → IO Unit :=
+    fun ctx c bufs arrBufs cfg key ref =>
+      if arrBufs.isEmpty then
+        executeWithConfigCached ctx c bufs cfg key ref
+      else
+        throw (IO.userError "backend: bufferArray bindings not supported")
   replayCached : β → CachedDispatch → Nat × Nat × Nat → IO Unit
   allocBuffer : β → USize → IO Buf
   allocBufferUsage : β → USize → List String → IO Buf := fun ctx size _ => allocBuffer ctx size

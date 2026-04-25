@@ -102,8 +102,14 @@ def classify_hs(grid: tuple[int, int, int, int] | None) -> str:
         if gx == 4096:   return f"Q4_K matmul 4096 ({phase})"        # perLayerProj (Q4_K 4-warp)
         if gx == 128:    return f"pointwise/residual ({phase})"
         return f"b=128 other gx={gx} ({phase})"
-    # 1-warp matmul (prefill path), block=32
+    # 1-warp matmul (prefill path + Q6_K 1-row decode ffn_down), block=32
     if bx == 32:
+        # Q6_K 1-row ffn_down (after doc 47 switch): grid=outDim=2560, block=32.
+        # Distinguish from Q4_K 1-warp variant which also uses (2560, 32)
+        # for prefill.  Decode vs prefill phase tag (gy==1 vs gy>1) helps;
+        # in decode, a (2560, 32) kernel IS the Q6_K 1-row ffn_down.
+        if gx == 2560 and phase == "decode":
+          return f"Q6_K matmul ffn_down 1row ({phase})"
         if gx == 10240:  return f"Q4_K matmul 1-warp 10240 ({phase})"
         if gx == 2560:   return f"Q4_K matmul 1-warp 2560 ({phase})"
         if gx == 2048:   return f"Q4_K matmul 1-warp 2048 ({phase})"

@@ -854,10 +854,15 @@ def flashAttentionParamsKernel (numHeads numKVHeads maxSeqLen headDim : Nat)
   ) (pure ())
 
 /-- Execute flash attention with params buffer (dynamic cacheLen, 1 dispatch).
-    Same WGSL source for all cacheLen → 100% pipeline cache hit rate. -/
+    Same WGSL source for all cacheLen → 100% pipeline cache hit rate.
+    Takes an optional `cacheRef` so callers can share a CachedDispatch
+    across decode steps; when `none`, falls back to the throwaway-ref
+    anti-pattern (for first-call/prefill sites). -/
 def executeFlashAttentionWithParams [GPUBackend β] (ctx : β)
     (qBuf kCacheBuf vCacheBuf paramsBuf outputBuf : GPUBackend.Buf β)
-    (numHeads numKVHeads maxSeqLen headDim : Nat) (scale : Float) : IO Unit := do
+    (numHeads numKVHeads maxSeqLen headDim : Nat) (scale : Float)
+    (cacheRef : Option (IO.Ref (Option (GPUBackend.CachedDispatch β))) := none)
+    : IO Unit := do
   let workgroupSize := min 256 (max headDim 32)
   let shader := flashAttentionParamsKernel numHeads numKVHeads maxSeqLen headDim scale workgroupSize
   let namedBuffers := [("q_output", outputBuf), ("k_cache", kCacheBuf), ("v_cache", vCacheBuf), ("params", paramsBuf)]
@@ -867,9 +872,13 @@ def executeFlashAttentionWithParams [GPUBackend β] (ctx : β)
     workgroupSize := {x := workgroupSize, y := 1, z := 1}
     numWorkgroups := (numHeads, 1, 1)
     extensions := ["subgroups"]
+    funcName := "flashAttentionWithParams"
     -- No diagnostic needed: params is var<storage, read> which is uniform
   }
-  GPUBackend.executeWithConfigCached ctx shader namedBuffers execConfig cacheKey (← IO.mkRef none)
+  let ref ← match cacheRef with
+    | some r => pure r
+    | none   => IO.mkRef none
+  GPUBackend.executeWithConfigCached ctx shader namedBuffers execConfig cacheKey ref
 
 /-! ## In-Place Flash Attention (single tile, no merge) -/
 
@@ -1141,7 +1150,9 @@ def createFlashPartialBuffer [GPUBackend β] (ctx : β) (numHeads maxSeqLen head
 def executeFlashAttentionTiled [GPUBackend β] (ctx : β)
     (qBuf kCacheBuf vCacheBuf outputBuf : GPUBackend.Buf β)
     (numHeads numKVHeads maxSeqLen headDim cacheLen : Nat) (scale : Float)
-    (partialBuf : Option (GPUBackend.Buf β) := none) : IO Unit := do
+    (partialBuf : Option (GPUBackend.Buf β) := none)
+    (phase1Ref phase2Ref :
+       Option (IO.Ref (Option (GPUBackend.CachedDispatch β))) := none) : IO Unit := do
   let tileSize := 32
   let numTiles := (cacheLen + tileSize - 1) / tileSize
   let workgroupSize := min 256 (max headDim 32)
@@ -1167,13 +1178,19 @@ def executeFlashAttentionTiled [GPUBackend β] (ctx : β)
       extensions := ["subgroups"]
     }
     let cacheKey1 : UInt64 := hash ("flashT1", numHeads, numKVHeads, maxSeqLen, headDim, cacheLen, tileSize)
-    GPUBackend.executeWithConfigCached ctx shader1 namedBuffers1 execConfig1 cacheKey1 (← IO.mkRef none)
+    let ref1 ← match phase1Ref with
+      | some r => pure r
+      | none   => IO.mkRef none
+    GPUBackend.executeWithConfigCached ctx shader1 namedBuffers1 execConfig1 cacheKey1 ref1
 
     let shader2 := flashAttentionTiledPhase2 numHeads headDim numTiles
     let namedBuffers2 := [("partial", partialBuf), ("output", outputBuf)]
     let execConfig2 := Hesper.ExecConfig.dispatch1D (numHeads * headDim) 256
     let cacheKey2 : UInt64 := hash ("flashT2", numHeads, headDim, numTiles)
-    GPUBackend.executeWithConfigCached ctx shader2 namedBuffers2 execConfig2 cacheKey2 (← IO.mkRef none)
+    let ref2 ← match phase2Ref with
+      | some r => pure r
+      | none   => IO.mkRef none
+    GPUBackend.executeWithConfigCached ctx shader2 namedBuffers2 execConfig2 cacheKey2 ref2
 
 def executeFlashAttentionDynamic [GPUBackend β] (ctx : β)
     (qBuf kCacheBuf vCacheBuf outputBuf : GPUBackend.Buf β)

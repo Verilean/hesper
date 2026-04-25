@@ -17,6 +17,11 @@ inductive Stmt where
   -- Array/variable index assignment
   | assignIndex (arrName : String) (index : Exp (.scalar .u32)) (ty : WGSLType) (value : Exp ty) : Stmt
 
+  -- bufferArray two-level index assignment: `arr[bufIdx][elemIdx] = value`
+  | assignIndexBuf (arrName : String)
+      (bufIdx elemIdx : Exp (.scalar .u32))
+      (ty : WGSLType) (value : Exp ty) : Stmt
+
   -- For loop
   | forLoop
       (varName : String)  -- Loop variable
@@ -120,6 +125,10 @@ partial def Stmt.toWGSL (indent : Nat := 0) : Stmt → String
   | .assignIndex arrName index _ty value =>
     let ind := String.ofList (List.replicate indent ' ')
     s!"{ind}{arrName}[{index.toWGSL}] = {value.toWGSL};\n"
+
+  | .assignIndexBuf arrName bufIdx elemIdx _ty value =>
+    let ind := String.ofList (List.replicate indent ' ')
+    s!"{ind}{arrName}[{bufIdx.toWGSL}][{elemIdx.toWGSL}] = {value.toWGSL};\n"
 
   | .forLoop varName init cond update body =>
     let ind := String.ofList (List.replicate indent ' ')
