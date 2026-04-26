@@ -435,7 +435,9 @@ drain → 15 ms total. If forward overlaps drain, total → 10 ms (= drain)
 | H4 | Forward host work runs sequentially with the drain; pipeline it across iterations | +30 TPS | partially measured (§3b.1) | **active** — root cause of the 4 ms gap is NOT yet identified; need llama.cpp graphs-OFF comparison |
 | H4a | Existing CUDA-graph capture path (HESPER_CUDA_GRAPHS=1) already pipelines host launch via cuGraphLaunch | +20 TPS / steady state +30 TPS | **measured 59 → 80 TPS at 80-token, ~100 TPS steady-state** | **WORKAROUND only** — see §3b.2; hides the host work but does not explain why hesper graphs-OFF needs 4× more host work than llama.cpp graphs-OFF |
 | H4b | FlashAttention's `IO.mkRef none` throwaway is the source of the 4 ms gap | -3.8 ms | **measured: cudaExecuteImpl calls 1599→535 / wall +0 ms** (60.4 vs 59.4 TPS = noise) | ✗ FALSE — fixing the cache misses removed 1064 misses but did not move wall. The cudaExecuteImpl miss path is cheap (~60 µs avg, 1 ms/tok total), so eliminating it has no wall effect. The 4 ms gap is somewhere else; see §3b.5 |
-| H4c | `Hesper.Circuit.CompiledCircuit.replay` (buffers list concat + linear `find?` per op) inflates each Circuit-DSL section to 10-22 µs vs stub's 1.7 µs | -2 to -5 ms | **section profile shows perLayerEmbd 1.70 ms/tok dominant**; replay-bypass A/B not yet run | active — see §3b.6/§3b.7 |
+| H4c | `Hesper.Circuit.CompiledCircuit.replay` (buffers list concat + linear `find?` per op) inflates each Circuit-DSL section to 10-22 µs vs stub's 1.7 µs | -2 to -5 ms | **A/B run on `oProj` 2026-04-25**: `runCached` 11.79 µs → bypass 9.90 µs (-1.9 µs/call ≈ -2.4 ms total, but TPS 55.0→55.4 = noise). Bypass does NOT reach stub-floor 1.7 µs. | ✗ **mostly DEAD** — replay overhead is real but small (~16% of section host time); the remaining ~10 µs/section is shared with the bypass path (Linear.LinearLayer.forward), so it lives in `cudaExecuteImpl` / dispatch building, not in Circuit replay. Refactoring replay would save ≤ 2 ms/tok at most. |
+| H4d | `HESPER_SECTION_PROFILE=1` instrumentation itself inflates the steady-state forward by 3 ms/tok | -3 ms wall | **measured 2026-04-25**: profile-OFF forward steady-state 4.93 ms vs profile-ON forward ~8 ms → ~3 ms is the profile cost. Profile-OFF TPS 56.8 vs profile-ON 55.0 (+0.6 TPS / -0.6 ms wall once argmax overlap is accounted for). | ✓ confirmed — **all section-profile per-call numbers are inflated by ~3 µs/section** (`withSection` wraps each call in `IO.monoNanosNow` × 2 + Std.HashMap update). Real per-section host floor is closer to 7-8 µs/call, not 12 µs. Profile is still a useful relative-ordering tool but not an absolute timing source. |
+| H4e | Real forward 4.93 ms / token = 880 dispatches × 5.6 µs/dispatch (kcr-cached, no profiling) — 3× the stub-bench 1.7 µs/dispatch floor — is dominated by per-launch FFI / cuLaunchKernel cost on real (non-stub) kernel arg lists | -2 ms wall | partial: H4e(b) buffer-resolution lockstep fast-path tried 2026-04-25, **forward 4.93→5.02 ms (no improvement)** | active — `executeWithConfigCached`'s buffer-resolution scan is NOT the dominant per-dispatch cost. Remaining suspects: tryDescLaunch path, PendingLaunch struct alloc, args-Array USize copy on cache-hit |
 | H5 | Lean Array expand in replay loop adds ms | +5 TPS | bounded ≤ 0.7 ms wall | ✗ marginal, deferred |
 | H6 | cuMemAlloc per token (driver alloc) | +5 TPS | already at 1 alloc/tok (pool); driver work is minimal | ✗ DEAD (#246) |
 | H7 | mmap PLE on-demand H2D | -3 TPS regression noted | confirmed | trade-off accepted (#247-248) |
@@ -461,27 +463,81 @@ Every previous session has skipped step 1 or step 6. Don't.
 
 ## 6. Active workstreams (priority order)
 
-1. **H4c — verify Circuit.replay overhead is the dominant cost**.
-   Pick the 1-2 hottest sections in §3b.6 (`perLayerEmbd`, `oProj`,
-   `flashAttn`, `ffnNormGateUp` …) and bypass `runCached` with manual
-   `ce` for one of them. Re-run section profile. If the hot section's
-   avg µs/call drops to ~stub-floor (1.7 µs), H4c is confirmed and we
-   know the fix scope: specialise `CompiledCircuit.replay` for the
-   small-fixed-N op case, drop the list concat + `find?` per op.
+### Re-measurement 2026-04-26 (graphs OFF, both sides, decode steady state)
 
-2. **#47 (kernel speed, paused)** — Q4_K matmul to llama.cpp parity.
-   Predicted -2.5 ms wall. Independent of #1; combined will close most
-   of the remaining gap.
+`scripts/perf_compare.sh both` with `GRAPHS=off`, `N_TOKENS=60`.
+Decode steady-state isolated by taking deciles 2-10 of the kernel
+timeline (skipping first 10% to drop prefill warmup) — the timeline
+is uniform throughout the run since hesper TPS 62.4 / llama TPS
+111.6 means kernel emission rates are steady.
 
-3. **#252 (workaround) — default to CUDA Graphs ON** as a stop-gap so
-   users see 80-100 TPS today while #1 is being investigated. Marked
-   workaround because it hides H4b instead of fixing it; it does not
-   close the *graphs-OFF* gap to llama.cpp.
+| metric | hesper | llama-cli | 比 (h/l) |
+|---|---:|---:|---:|
+| kernel calls | 49953 | 68006 | 0.73× (hesper fewer) |
+| **kernel sum time** | **585.0 ms** | **469.9 ms** | **1.245×** |
+| wall time of decode window | 869.2 ms | 523.2 ms | 1.66× |
+| **GPU busy ratio** (kernel/wall) | **67.3%** | **89.8%** | — |
+| **GPU idle (wall − kernel)** | **284.2 ms** | **53.3 ms** | **5.33×** |
+| top kernel per-call (hesper k_1387 / llama mul_mat_vec_q12) | 68.8 µs | 64.0 µs | 1.07× |
 
-4. **#235 follow-on (deferred)** — Lean Array expand in replay loop.
-   May overlap with #1 once we know which Array expand is hot.
+Per-token decomposition (decode window / 60 tok):
 
-5. **#249 (deferred)** — PLE register-less UVA. Pure VRAM, no TPS.
+| | hesper ms/tok | llama ms/tok | gap/tok |
+|---|---:|---:|---:|
+| total wall | 14.5 | 8.7 | 5.77 |
+| ↳ kernel time | 9.75 | 7.83 | 1.92 |
+| ↳ GPU idle | 4.74 | 0.89 | **3.85** |
+
+**This settles the prior contradiction.** The 5.77 ms/tok wall gap
+splits as:
+
+- **Per-kernel speed: 1.92 ms/tok (33%)** — real but bounded.
+  Top-kernel per-call is 1.07× (hesper 68.8 vs llama 64.0 µs on
+  the busiest matmul); kernel mix difference accounts for the
+  rest of the 1.245× total kernel-time delta. `project_final_tps_80.md`
+  "90% parity" was about hand-tuned individual kernels and still
+  holds; the long tail of pointwise stubs etc. is where the +25%
+  comes from.
+- **GPU idle bubbles: 3.85 ms/tok (67%)** — the dominant lever.
+  hesper's GPU sits idle ~33% of decode wall vs llama.cpp's 10%.
+  This is exactly H4 (forward host work runs sequential with
+  drain instead of overlapping it).
+
+Lever sizing — closing each fully would yield:
+
+- closing kernel-speed gap (1.92 ms/tok recovered): TPS 62 → 71
+- closing idle-bubble gap (3.85 ms/tok recovered): TPS 62 → 92
+- closing both: TPS → ~115 (≈ llama.cpp parity)
+
+So **the dominant lever is the idle-bubble side, by ~2×**. Earlier
+"#47 kernel speed at top priority" claim was wrong: kernel speed
+recovers at most 1.92 ms/tok, not 6.7 ms/tok.
+
+Priority by lever size (from the decomposition above):
+
+1. **GPU idle bubble (3.85 ms/tok lever, 67% of gap)**. hesper GPU
+   busy 67.3% vs llama 89.8% during decode. The 284 ms idle in
+   the 869 ms decode window means host work is delaying kernel
+   submission. Same bucket as H4e but framed as a wall-time
+   target: drive decode-window GPU busy from 67% → 90% to recover
+   ~30 TPS. Concrete experiments still untried:
+   (a) `perf record --call-graph=fp` on the decode loop, attribute
+       cycles to specific Lean callees.
+   (b) Compare hesper trace to llama.cpp trace at the inter-launch
+       gap distribution (we did this for p50/p90/p99 in
+       `project_lean_tail_latency_vs_llama.md`; rerun on the
+       current binary).
+
+2. **#252 (workaround) — default to CUDA Graphs ON**. Stops the
+   bubble (recapture, host overlaps replay). 80-100 TPS today.
+
+3. **Per-kernel speed (1.92 ms/tok lever, 33% of gap)**. Top
+   kernels at 1.07× parity; long tail (pointwise stubs, plus 25%
+   on non-top kernels) accounts for the rest. Closing this gives
+   +9 TPS at most. Q6_K (#216) and Q4_K (#47) are partial
+   contributors.
+
+4. **#249 (deferred)** — PLE register-less UVA. Pure VRAM, no TPS.
 
 ## 7. What 'good enough' looks like
 
