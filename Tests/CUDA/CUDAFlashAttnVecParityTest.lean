@@ -285,6 +285,32 @@ def runCase
     GPUBackend.execute ctx combineShader combineBufs
       { workgroupSize := { x := 128 }, numWorkgroups := (numHeads, 1, 1) }
 
+  -- V11: V9 + V8 sub-warp partition (nthreads_KQ=8).  Reuses V9's partial
+  -- buffers (same partial_out / partial_meta layout) — runs second so they
+  -- get overwritten before V11's combine.
+  let outBufV11 ← GPUBackend.allocBuffer ctx outSize
+  if headDim % 64 == 0 ∧ headDim % 128 == 0 ∧ cacheLen >= numSplits then
+    let v11Shader := Hesper.WGSL.FlashAttention.flashAttentionVecParamsKernelV11
+                       numHeads numKVHeads maxSeqLen headDim numSplits scale
+    let v11Bufs : List (String × GPUBackend.Buf Hesper.CUDAContext) :=
+      [ ("q",             qBuf)
+      , ("k_cache_f16",   kBufF16)
+      , ("v_cache_f16",   vBufF16)
+      , ("partial_out",   partialOutBuf)
+      , ("partial_meta",  partialMetaBuf)
+      , ("params",        paramsBuf) ]
+    GPUBackend.execute ctx v11Shader v11Bufs
+      { workgroupSize := { x := 128 }, numWorkgroups := (numHeads, numSplits, 1),
+        extensions := ["subgroups", "f16"] }
+    let combineShader := Hesper.WGSL.FlashAttention.flashAttentionVecCombineKernel
+                            numHeads headDim numSplits
+    let combineBufs : List (String × GPUBackend.Buf Hesper.CUDAContext) :=
+      [ ("partial_out",   partialOutBuf)
+      , ("partial_meta",  partialMetaBuf)
+      , ("output",        outBufV11) ]
+    GPUBackend.execute ctx combineShader combineBufs
+      { workgroupSize := { x := 128 }, numWorkgroups := (numHeads, 1, 1) }
+
   let legacyResultBytes ← GPUBackend.readBuffer ctx outBufLegacy outSize
   let vecResultBytes    ← GPUBackend.readBuffer ctx outBufVec outSize
   let legacyOut := unpackFloats legacyResultBytes (numHeads * headDim)
@@ -304,12 +330,17 @@ def runCase
                   let v9ResultBytes ← GPUBackend.readBuffer ctx outBufV9 outSize
                   pure (unpackFloats v9ResultBytes (numHeads * headDim))
                 else pure legacyOut  -- skip if precondition not met
+    let v11Out ← if cacheLen >= numSplits then do
+                    let v11ResultBytes ← GPUBackend.readBuffer ctx outBufV11 outSize
+                    pure (unpackFloats v11ResultBytes (numHeads * headDim))
+                 else pure legacyOut
     let mut maxAbsV2 := 0.0
     let mut maxAbsV3 := 0.0
     let mut maxAbsV6 := 0.0
     let mut maxAbsV7 := 0.0
     let mut maxAbsV8 := 0.0
     let mut maxAbsV9 := 0.0
+    let mut maxAbsV11 := 0.0
     for i in [0:legacyOut.size] do
       let d2 := (legacyOut[i]! - v2Out[i]!).abs
       let d3 := (legacyOut[i]! - v3Out[i]!).abs
@@ -317,19 +348,22 @@ def runCase
       let d7 := (legacyOut[i]! - v7Out[i]!).abs
       let d8 := (legacyOut[i]! - v8Out[i]!).abs
       let d9 := (legacyOut[i]! - v9Out[i]!).abs
+      let d11 := (legacyOut[i]! - v11Out[i]!).abs
       if d2 > maxAbsV2 then maxAbsV2 := d2
       if d3 > maxAbsV3 then maxAbsV3 := d3
       if d6 > maxAbsV6 then maxAbsV6 := d6
       if d7 > maxAbsV7 then maxAbsV7 := d7
       if d8 > maxAbsV8 then maxAbsV8 := d8
       if d9 > maxAbsV9 then maxAbsV9 := d9
+      if d11 > maxAbsV11 then maxAbsV11 := d11
     let m2 := if maxAbsV2 < 1e-4 then "✓ V2" else "✗ V2"
     let m3 := if maxAbsV3 < 1e-2 then "✓ V3" else "✗ V3"
     let m6 := if maxAbsV6 < 1e-3 then "✓ V6" else "✗ V6"
     let m7 := if maxAbsV7 < 1e-2 then "✓ V7" else "✗ V7"
     let m8 := if maxAbsV8 < 1e-3 then "✓ V8" else "✗ V8"
     let m9 := if maxAbsV9 < 1e-2 then "✓ V9" else "✗ V9"
-    IO.println s!"      V2={maxAbsV2}[{m2}] V3={maxAbsV3}[{m3}] V6={maxAbsV6}[{m6}] V7={maxAbsV7}[{m7}] V8={maxAbsV8}[{m8}] V9={maxAbsV9}[{m9}]"
+    let m11 := if maxAbsV11 < 1e-2 then "✓ V11" else "✗ V11"
+    IO.println s!"      V2={maxAbsV2}[{m2}] V3={maxAbsV3}[{m3}] V6={maxAbsV6}[{m6}] V7={maxAbsV7}[{m7}] V8={maxAbsV8}[{m8}] V9={maxAbsV9}[{m9}] V11={maxAbsV11}[{m11}]"
 
   GPUBackend.freeBuffer ctx qBuf
   GPUBackend.freeBuffer ctx kBuf
@@ -342,6 +376,7 @@ def runCase
   GPUBackend.freeBuffer ctx outBufV7
   GPUBackend.freeBuffer ctx outBufV8
   GPUBackend.freeBuffer ctx outBufV9
+  GPUBackend.freeBuffer ctx outBufV11
   GPUBackend.freeBuffer ctx partialOutBuf
   GPUBackend.freeBuffer ctx partialMetaBuf
   GPUBackend.freeBuffer ctx kBufF16
