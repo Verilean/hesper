@@ -187,6 +187,25 @@ def runCase
       { workgroupSize := { x := 128 }, numWorkgroups := (numHeads, 1, 1),
         extensions := ["subgroups"] }
 
+  -- V3: V2 + K cache as f16 (Session 3).  Needs separate f16-packed K buffer.
+  let outBufV3 ← GPUBackend.allocBuffer ctx outSize
+  let kBufF16  ← GPUBackend.allocBuffer ctx
+                   ((numKVHeads * maxSeqLen * headDim * 2).toUSize)
+  if headDim % 128 == 0 then
+    -- Convert kData to f16 packed-pair u32 buffer.
+    GPUBackend.writeBuffer ctx kBufF16 (packHalfs kData)
+    let v3Shader := Hesper.WGSL.FlashAttention.flashAttentionVecParamsKernelV3
+                       numHeads numKVHeads maxSeqLen headDim scale
+    let v3Bufs : List (String × GPUBackend.Buf Hesper.CUDAContext) :=
+      [ ("q",            qBuf)
+      , ("k_cache_f16",  kBufF16)
+      , ("v_cache",      vBuf)
+      , ("output",       outBufV3)
+      , ("params",       paramsBuf) ]
+    GPUBackend.execute ctx v3Shader v3Bufs
+      { workgroupSize := { x := 128 }, numWorkgroups := (numHeads, 1, 1),
+        extensions := ["subgroups"] }
+
   let legacyResultBytes ← GPUBackend.readBuffer ctx outBufLegacy outSize
   let vecResultBytes    ← GPUBackend.readBuffer ctx outBufVec outSize
   let legacyOut := unpackFloats legacyResultBytes (numHeads * headDim)
@@ -194,14 +213,18 @@ def runCase
   if headDim % 128 == 0 then
     let v2ResultBytes ← GPUBackend.readBuffer ctx outBufV2 outSize
     let v2Out := unpackFloats v2ResultBytes (numHeads * headDim)
-    -- compareCase below will see vecOut for the legacy/vec compare; we
-    -- print a separate v2 line here so callers see all three.
-    let mut maxAbs := 0.0
+    let v3ResultBytes ← GPUBackend.readBuffer ctx outBufV3 outSize
+    let v3Out := unpackFloats v3ResultBytes (numHeads * headDim)
+    let mut maxAbsV2 := 0.0
+    let mut maxAbsV3 := 0.0
     for i in [0:legacyOut.size] do
-      let d := (legacyOut[i]! - v2Out[i]!).abs
-      if d > maxAbs then maxAbs := d
-    let mark := if maxAbs < 1e-4 then "✓ V2" else "✗ V2"
-    IO.println s!"      [{mark}] V2 max abs diff vs legacy = {maxAbs}"
+      let d2 := (legacyOut[i]! - v2Out[i]!).abs
+      let d3 := (legacyOut[i]! - v3Out[i]!).abs
+      if d2 > maxAbsV2 then maxAbsV2 := d2
+      if d3 > maxAbsV3 then maxAbsV3 := d3
+    let m2 := if maxAbsV2 < 1e-4 then "✓ V2" else "✗ V2"
+    let m3 := if maxAbsV3 < 1e-2 then "✓ V3" else "✗ V3"  -- f16 K → larger tolerance
+    IO.println s!"      [{m2}] V2 max abs vs legacy = {maxAbsV2}  [{m3}] V3 (Kf16) max abs = {maxAbsV3}"
 
   GPUBackend.freeBuffer ctx qBuf
   GPUBackend.freeBuffer ctx kBuf
@@ -209,6 +232,8 @@ def runCase
   GPUBackend.freeBuffer ctx outBufLegacy
   GPUBackend.freeBuffer ctx outBufVec
   GPUBackend.freeBuffer ctx outBufV2
+  GPUBackend.freeBuffer ctx outBufV3
+  GPUBackend.freeBuffer ctx kBufF16
   GPUBackend.freeBuffer ctx paramsBuf
 
   return (legacyOut, vecOut)
