@@ -206,6 +206,22 @@ def runCase
       { workgroupSize := { x := 128 }, numWorkgroups := (numHeads, 1, 1),
         extensions := ["subgroups"] }
 
+  -- V6: K-parallel inner loop (true llama-pattern).  Same buffer layout
+  -- as V2 (f32 K, f32 V).  Pre-condition: D % 32 == 0.
+  let outBufV6 ← GPUBackend.allocBuffer ctx outSize
+  if headDim % 32 == 0 ∧ headDim % 128 == 0 then
+    let v6Shader := Hesper.WGSL.FlashAttention.flashAttentionVecParamsKernelV6
+                       numHeads numKVHeads maxSeqLen headDim scale
+    let v6Bufs : List (String × GPUBackend.Buf Hesper.CUDAContext) :=
+      [ ("q",       qBuf)
+      , ("k_cache", kBuf)
+      , ("v_cache", vBuf)
+      , ("output",  outBufV6)
+      , ("params",  paramsBuf) ]
+    GPUBackend.execute ctx v6Shader v6Bufs
+      { workgroupSize := { x := 128 }, numWorkgroups := (numHeads, 1, 1),
+        extensions := ["subgroups"] }
+
   let legacyResultBytes ← GPUBackend.readBuffer ctx outBufLegacy outSize
   let vecResultBytes    ← GPUBackend.readBuffer ctx outBufVec outSize
   let legacyOut := unpackFloats legacyResultBytes (numHeads * headDim)
@@ -215,16 +231,22 @@ def runCase
     let v2Out := unpackFloats v2ResultBytes (numHeads * headDim)
     let v3ResultBytes ← GPUBackend.readBuffer ctx outBufV3 outSize
     let v3Out := unpackFloats v3ResultBytes (numHeads * headDim)
+    let v6ResultBytes ← GPUBackend.readBuffer ctx outBufV6 outSize
+    let v6Out := unpackFloats v6ResultBytes (numHeads * headDim)
     let mut maxAbsV2 := 0.0
     let mut maxAbsV3 := 0.0
+    let mut maxAbsV6 := 0.0
     for i in [0:legacyOut.size] do
       let d2 := (legacyOut[i]! - v2Out[i]!).abs
       let d3 := (legacyOut[i]! - v3Out[i]!).abs
+      let d6 := (legacyOut[i]! - v6Out[i]!).abs
       if d2 > maxAbsV2 then maxAbsV2 := d2
       if d3 > maxAbsV3 then maxAbsV3 := d3
+      if d6 > maxAbsV6 then maxAbsV6 := d6
     let m2 := if maxAbsV2 < 1e-4 then "✓ V2" else "✗ V2"
     let m3 := if maxAbsV3 < 1e-2 then "✓ V3" else "✗ V3"  -- f16 K → larger tolerance
-    IO.println s!"      [{m2}] V2 max abs vs legacy = {maxAbsV2}  [{m3}] V3 (Kf16) max abs = {maxAbsV3}"
+    let m6 := if maxAbsV6 < 1e-3 then "✓ V6" else "✗ V6"
+    IO.println s!"      [{m2}] V2={maxAbsV2}  [{m3}] V3(Kf16)={maxAbsV3}  [{m6}] V6={maxAbsV6}"
 
   GPUBackend.freeBuffer ctx qBuf
   GPUBackend.freeBuffer ctx kBuf
@@ -233,6 +255,7 @@ def runCase
   GPUBackend.freeBuffer ctx outBufVec
   GPUBackend.freeBuffer ctx outBufV2
   GPUBackend.freeBuffer ctx outBufV3
+  GPUBackend.freeBuffer ctx outBufV6
   GPUBackend.freeBuffer ctx kBufF16
   GPUBackend.freeBuffer ctx paramsBuf
 
@@ -413,12 +436,16 @@ unsafe def main : IO Unit := do
                          nh nkv maxSeq hd scale
     let v2Shader     := Hesper.WGSL.FlashAttention.flashAttentionVecParamsKernelV2
                          nh nkv maxSeq hd scale
+    let v6Shader     := Hesper.WGSL.FlashAttention.flashAttentionVecParamsKernelV6
+                         nh nkv maxSeq hd scale
 
     let (legacyUs, legacyMs) ← benchKernel ctx "legacy" legacyShader bufs 256 nh warmup iters
     let (vecUs,    vecMs)    ← benchKernel ctx "vec"    vecShader    bufs 128 nh warmup iters
     let (v2Us,     v2Ms)     ← benchKernel ctx "v2"     v2Shader     bufs 128 nh warmup iters
+    let (v6Us,     v6Ms)     ← benchKernel ctx "v6"     v6Shader     bufs 128 nh warmup iters
     let speedup := legacyUs / vecUs
     let v2Speedup := vecUs / v2Us
+    let v6Speedup := v2Us / v6Us
 
     -- Raw-launch column: compile vecShader once (cuModuleLoadData +
     -- cuModuleGetFunction), pre-resolve buffer args, then time bare
@@ -482,7 +509,7 @@ unsafe def main : IO Unit := do
         let llamaMs := (t1 - t0).toFloat / 1.0e6
         let vecVsLlama := vecUs / llamaUs
         pure s!"  llama={llamaUs} µs/call ({llamaMs} ms / {iters})  vec/llama={vecVsLlama}×"
-    IO.println s!"  cacheLen={cacheLen}: legacy={legacyUs} vec={vecUs} v2={v2Us} µs/call  legacy/vec={speedup}× vec/v2={v2Speedup}×{rawInfo}{llamaInfo} (v2 {v2Ms}ms/{iters})"
+    IO.println s!"  cacheLen={cacheLen}: legacy={legacyUs} vec={vecUs} v2={v2Us} v6={v6Us} µs/call  legacy/vec={speedup}× v2/v6={v6Speedup}×{rawInfo}{llamaInfo} (v6 {v6Ms}ms/{iters})"
 
     GPUBackend.freeBuffer ctx qBuf
     GPUBackend.freeBuffer ctx kBuf
