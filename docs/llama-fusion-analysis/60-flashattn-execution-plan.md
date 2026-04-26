@@ -517,3 +517,44 @@ multi-element accumulators that llama's CUDA template specialises into.
 highest lever. Renaming to "Session 2′: per-thread accumulators +
 warp-only reduce". Split-K becomes a follow-up if SM utilisation
 turns out to be the residual gap after instruction count is closed.
+
+### Session 2′ first pass — RESULT (2026-04-27)
+
+`flashAttentionVecParamsKernelV2` landed (commit `107619e`). Holds Q
+and VKQ output in per-thread `ShaderM.var` (PTX local vars).
+`shared_q` and `shared_out` removed entirely. Only smem left is 32
+slots for cross-warp KQ reduce.
+
+ncu (cacheLen=128, RTX 4070 Ti):
+
+| metric              | V1 (vec) | V2       | llama  | V1→V2  |
+|---------------------|----------|----------|--------|--------|
+| `gpu_time`          | 184.9 µs | 109.5 µs | 5.8 µs | -40%   |
+| `inst_executed`     | 872,256  | 526,240  | 55,520 | -40%   |
+| `op_shared_ld`      | 41,024   | 16,384   | 1,344  | -60%   |
+| `op_shared_st`      | 16,512   | 8,192    | 448    | -50%   |
+| `pipe_fma`          | 389,472  | 274,784  | 41,184 | -29%   |
+| `shared_mem/block`  | 2.18 KB  | 128 B    | 16.6 KB| -94%   |
+| `registers/thread`  | 21       | 27       | 201    | +6     |
+
+ncu (cacheLen=8): V2 9.3 µs vs V1 14.5 µs vs llama 4.3 µs.
+**V2/llama = 2.2× at short cacheLen** (was 3.4× at V1).
+
+Microbench wall (cacheLen=128): vec 112 µs → v2 119 µs (slightly
+worse in wall — GPUBackend.execute host floor is ~95 µs and doesn't
+shrink with shorter kernel, gets lost in noise here). **Where V2
+shines is cacheLen=200**: vec 159 µs → **v2 119 µs** (-25%).
+
+**Bit-parity ✓** for all 17 cuda-flashattn-vec-parity cases.
+
+**Still 19× slower than llama at cacheLen=128**. Decomposition:
+- `pipe_fma` 6.7× — likely f16x2 packed FMA in llama (not in V2).
+- `op_global_ld` 8.8× — f32 K/V vs llama's f16. Session 3-4 closes this.
+- `shared_mem/block` 128 B vs 16.6 KB — *llama uses MORE smem* but in
+  large cooperative-load tiles, not for ping-pong reduce. Different
+  pattern entirely (KQ tile + VKQ tile cached in smem per loop step).
+
+**Next: Session 3 (K cache f16)** is the natural progression. Drops
+the global load gap from 8.8× to ~4×. Potentially halves the
+remaining 109 µs to ~55 µs. Then Session 4 V f16. Session 5 split-K
+deferred until 3+4 measured.
