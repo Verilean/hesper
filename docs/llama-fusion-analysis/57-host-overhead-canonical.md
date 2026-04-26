@@ -339,6 +339,67 @@ forward only** (sandwich `IO.monoNanosNow` markers around it), filter
 to kernel-time-excluding samples, and look for hot Lean symbols that do
 not show up in the stub bench. Without this we are guessing again.
 
+### 3b.6. Section profile (HESPER_SECTION_PROFILE=1, 2026-04-26)
+
+`Hesper/WGSL/Execute.lean::sectionProfilingRef` was already wired to
+accumulate per-section host wall via the `withSection` instrumentation;
+plumbing it through `Examples/Gemma4CUDA.lean` behind `HESPER_SECTION_PROFILE=1`
+gives a per-section ms breakdown over the full decode. Run on 30 tokens,
+graphs OFF:
+
+| section                | total ms (30 tok) | calls | avg µs/call | per-token ms |
+|---|---:|---:|---:|---:|
+| **perLayerEmbd**       | 51.0 | 1260 (=30×42) | **40** | **1.70** |
+| ple.inpGateGeluSlice    | 27.4 | 1260 | 22 | 0.91 |
+| ffnNormGateUp           | 17.3 | 1260 | 14 | 0.58 |
+| oProj                   | 14.9 | 1260 | 12 | 0.50 |
+| flashAttn               | 14.8 | 1260 | 12 | 0.49 |
+| ffnDown                 | 14.1 | 1260 | 11 | 0.47 |
+| ple.proj                | 12.6 | 1260 | 10 | 0.42 |
+| rope                    |  8.8 | 1260 |  7 | 0.29 |
+| qkvNorm                 |  6.9 | 1260 |  5 | 0.23 |
+| postAttnNorm/postFFNNorm/ple.postNormAdd | ~6.3 each | 1260 | 5 | 0.21 |
+| kvWrite                 |  2.8 |  720 |  4 | 0.09 |
+| (smaller sections sum)  |  ~10 | various | | ~0.3 |
+| **total approx (host wall, includes nested)** | ~196 | | | **~6.5** |
+
+(Sections nest: `perLayerEmbd` includes `ple.inpGateGeluSlice` +
+`ple.proj` + `ple.postNormAdd`. Subtracting nested children, the
+*direct* `perLayerEmbd` body is ~5 ms over 30 tokens = 4 µs/call /
+0.17 ms/tok — small. The big number is dominated by its children.)
+
+### 3b.7. Comparison with stub-bench (H4c)
+
+`Examples/Gemma4StubDecodeBench.lean` with kcr=on hits 1.7 µs / dispatch.
+The real forward's hottest sections sit at **10-22 µs / call** even
+though they go through the same `executeWithConfigCached` path —
+**4-12× the stub floor**. The extra cost is *between* Lean entering
+the section and `executeWithConfigCached` actually running:
+
+- `Hesper.Circuit.runCached` / `runCachedFused` is in every hot
+  section (forwardBlock lines 448, 549, 568, 696, 834, 1032, 1085,
+  1160, 1300, 1361). Each call hits `CompiledCircuit.replay`, which
+  iterates `cc.ops` and rebuilds the (id → buffer) lookup list with
+  `buffers ++ cc.baseBuffers` and `combined.find? ...` per op.
+- `getGlobalCircuitRef` resolves the cacheRef by hashing a key on
+  every call (cheap individually, but 7+ times per layer × 42 layers
+  is ~3000 hash+lookup operations / token).
+- `CircuitM.run` does NOT run on cached path (good), but the lookup
+  list build inside `replay` *does* run every iteration.
+
+**H4c (new active hypothesis)**: the real forward's per-section host
+overhead is concentrated in `Hesper.Circuit.CompiledCircuit.replay`,
+specifically in (a) the `buffers ++ cc.baseBuffers` list concat per
+call and (b) `combined.find?` linear scan per op. Predicted budget:
+collapsing the 4 µs/call gap (real 10-22 µs - stub 1.7 µs ≈ 8-20 µs)
+times ~300 calls / token ≈ 2-5 ms / token. Same order as the gap.
+
+Next experiment (no code change yet): re-run with two of the hottest
+Circuit-using call sites bypassed (replace `runCached` with the
+manual `ce` path) and see whether `perLayerEmbd` host wall drops by
+the predicted amount. If yes → the fix is to specialise `replay` for
+the small-fixed-N op case (no list concat, no `find?`).
+
 ### 3c. Where the host CPU spends those 5 ms
 
 `perf record -e cycles:u --call-graph=fp` during steady-state decode:
@@ -374,6 +435,7 @@ drain → 15 ms total. If forward overlaps drain, total → 10 ms (= drain)
 | H4 | Forward host work runs sequentially with the drain; pipeline it across iterations | +30 TPS | partially measured (§3b.1) | **active** — root cause of the 4 ms gap is NOT yet identified; need llama.cpp graphs-OFF comparison |
 | H4a | Existing CUDA-graph capture path (HESPER_CUDA_GRAPHS=1) already pipelines host launch via cuGraphLaunch | +20 TPS / steady state +30 TPS | **measured 59 → 80 TPS at 80-token, ~100 TPS steady-state** | **WORKAROUND only** — see §3b.2; hides the host work but does not explain why hesper graphs-OFF needs 4× more host work than llama.cpp graphs-OFF |
 | H4b | FlashAttention's `IO.mkRef none` throwaway is the source of the 4 ms gap | -3.8 ms | **measured: cudaExecuteImpl calls 1599→535 / wall +0 ms** (60.4 vs 59.4 TPS = noise) | ✗ FALSE — fixing the cache misses removed 1064 misses but did not move wall. The cudaExecuteImpl miss path is cheap (~60 µs avg, 1 ms/tok total), so eliminating it has no wall effect. The 4 ms gap is somewhere else; see §3b.5 |
+| H4c | `Hesper.Circuit.CompiledCircuit.replay` (buffers list concat + linear `find?` per op) inflates each Circuit-DSL section to 10-22 µs vs stub's 1.7 µs | -2 to -5 ms | **section profile shows perLayerEmbd 1.70 ms/tok dominant**; replay-bypass A/B not yet run | active — see §3b.6/§3b.7 |
 | H5 | Lean Array expand in replay loop adds ms | +5 TPS | bounded ≤ 0.7 ms wall | ✗ marginal, deferred |
 | H6 | cuMemAlloc per token (driver alloc) | +5 TPS | already at 1 alloc/tok (pool); driver work is minimal | ✗ DEAD (#246) |
 | H7 | mmap PLE on-demand H2D | -3 TPS regression noted | confirmed | trade-off accepted (#247-248) |
@@ -399,11 +461,13 @@ Every previous session has skipped step 1 or step 6. Don't.
 
 ## 6. Active workstreams (priority order)
 
-1. **#253 was the wrong fix (verdict 3b.5)**. cudaExecuteImpl misses
-   were real but cheap. Real-forward 4 ms gap is elsewhere. Need:
-   - **`perf record` on the real forward only** with markers, look for
-     hot Lean symbols not present in the stub bench.
-   - Then form a *new* hypothesis (H4c..) before touching code.
+1. **H4c — verify Circuit.replay overhead is the dominant cost**.
+   Pick the 1-2 hottest sections in §3b.6 (`perLayerEmbd`, `oProj`,
+   `flashAttn`, `ffnNormGateUp` …) and bypass `runCached` with manual
+   `ce` for one of them. Re-run section profile. If the hot section's
+   avg µs/call drops to ~stub-floor (1.7 µs), H4c is confirmed and we
+   know the fix scope: specialise `CompiledCircuit.replay` for the
+   small-fixed-N op case, drop the list concat + `find?` per op.
 
 2. **#47 (kernel speed, paused)** — Q4_K matmul to llama.cpp parity.
    Predicted -2.5 ms wall. Independent of #1; combined will close most
