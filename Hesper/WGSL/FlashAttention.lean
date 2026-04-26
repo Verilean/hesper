@@ -1146,13 +1146,31 @@ def createFlashPartialBuffer [GPUBackend β] (ctx : β) (numHeads maxSeqLen head
   let partialSize := numHeads * maxTiles * stride
   GPUBackend.allocBuffer ctx (partialSize * 4).toUSize
 
-/-- Execute tiled flash attention (2 phases) -/
+/-- Execute tiled flash attention (2 phases).
+
+    The `phase1Ref` / `phase2Ref` parameters are the per-call dispatch
+    cache slots.  Earlier code synthesised them via `IO.mkRef none`
+    inside the function body when callers passed `none` — that turned
+    every invocation into a cold cudaExecuteImpl miss because the ref
+    was thrown away at end of call.  Doc 57 §3b.4 traced the 4 ms
+    graphs-OFF host-time gap to that pattern.
+
+    Now, when callers pass `none`, we provide a `kcrLookup` callback
+    that resolves a (cacheKey → IO.Ref) for refs *that survive across
+    calls* — typically routed through `KernelCacheRefs` from the model
+    forward.  As long as the same `cacheLen` recurs across forward
+    invocations (and within a forward, all layers share one `cacheLen`)
+    the dispatches hit the cache.  Pass `kcrLookup := none` only if you
+    want the legacy throwaway behaviour (e.g. a one-shot test). -/
 def executeFlashAttentionTiled [GPUBackend β] (ctx : β)
     (qBuf kCacheBuf vCacheBuf outputBuf : GPUBackend.Buf β)
     (numHeads numKVHeads maxSeqLen headDim cacheLen : Nat) (scale : Float)
     (partialBuf : Option (GPUBackend.Buf β) := none)
     (phase1Ref phase2Ref :
-       Option (IO.Ref (Option (GPUBackend.CachedDispatch β))) := none) : IO Unit := do
+       Option (IO.Ref (Option (GPUBackend.CachedDispatch β))) := none)
+    (kcrLookup :
+       Option (UInt64 → IO (IO.Ref (Option (GPUBackend.CachedDispatch β)))) := none)
+    : IO Unit := do
   let tileSize := 32
   let numTiles := (cacheLen + tileSize - 1) / tileSize
   let workgroupSize := min 256 (max headDim 32)
@@ -1180,7 +1198,10 @@ def executeFlashAttentionTiled [GPUBackend β] (ctx : β)
     let cacheKey1 : UInt64 := hash ("flashT1", numHeads, numKVHeads, maxSeqLen, headDim, cacheLen, tileSize)
     let ref1 ← match phase1Ref with
       | some r => pure r
-      | none   => IO.mkRef none
+      | none   =>
+        match kcrLookup with
+        | some lk => lk cacheKey1
+        | none    => IO.mkRef none  -- legacy throwaway path; opt-out only
     GPUBackend.executeWithConfigCached ctx shader1 namedBuffers1 execConfig1 cacheKey1 ref1
 
     let shader2 := flashAttentionTiledPhase2 numHeads headDim numTiles
@@ -1189,12 +1210,18 @@ def executeFlashAttentionTiled [GPUBackend β] (ctx : β)
     let cacheKey2 : UInt64 := hash ("flashT2", numHeads, headDim, numTiles)
     let ref2 ← match phase2Ref with
       | some r => pure r
-      | none   => IO.mkRef none
+      | none   =>
+        match kcrLookup with
+        | some lk => lk cacheKey2
+        | none    => IO.mkRef none
     GPUBackend.executeWithConfigCached ctx shader2 namedBuffers2 execConfig2 cacheKey2 ref2
 
 def executeFlashAttentionDynamic [GPUBackend β] (ctx : β)
     (qBuf kCacheBuf vCacheBuf outputBuf : GPUBackend.Buf β)
-    (numHeads numKVHeads maxSeqLen headDim cacheLen : Nat) (scale : Float) : IO Unit := do
+    (numHeads numKVHeads maxSeqLen headDim cacheLen : Nat) (scale : Float)
+    (kcrLookup :
+       Option (UInt64 → IO (IO.Ref (Option (GPUBackend.CachedDispatch β)))) := none)
+    : IO Unit := do
   let workgroupSize := min 256 (max headDim 32)
   let shader := flashAttentionDynamicKernel numHeads numKVHeads maxSeqLen headDim cacheLen scale workgroupSize
   let namedBuffers := [("q", qBuf), ("k_cache", kCacheBuf), ("v_cache", vCacheBuf), ("output", outputBuf)]
@@ -1209,7 +1236,10 @@ def executeFlashAttentionDynamic [GPUBackend β] (ctx : β)
   -- Note: shader compilation is cached by pipeline cache (Execute.lean).
   -- First call with a new cacheLen compiles, subsequent calls with same cacheLen reuse.
   -- Over a training run, common cacheLens are cached and recompilation is rare.
-  GPUBackend.executeWithConfigCached ctx shader namedBuffers execConfig cacheKey (← IO.mkRef none)
+  let ref ← match kcrLookup with
+    | some lk => lk cacheKey
+    | none    => IO.mkRef none
+  GPUBackend.executeWithConfigCached ctx shader namedBuffers execConfig cacheKey ref
 
 /-- Execute flash attention with static cacheLen (for testing).
     Uses dynamic kernel with a params buffer containing cacheLen. -/

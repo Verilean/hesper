@@ -288,6 +288,57 @@ This is consistent with H4b's predicted -3.8 ms wall delta in §3b.3.
 The next session attacks the fix; #253 will be reopened with these
 findings.
 
+### 3b.5. H4b refutation — fixing the cache miss did not move wall (2026-04-26)
+
+`Hesper/WGSL/FlashAttention.lean::executeFlashAttentionTiled` was rewired
+to receive an optional `kcrLookup` callback resolving (cacheKey →
+IO.Ref) through the model's `KernelCacheRefs`, replacing the inline
+`(← IO.mkRef none)` throwaway. The `forwardBlock` callers at
+`Gemma4.lean:797` and `Gemma4.lean:2191` now pass `kcr.map (...)`.
+
+Result on graphs-OFF, 80-token decode of "Explain the fall of the
+Roman Empire":
+
+| metric                | before | after  | delta |
+|---|---:|---:|---:|
+| `cudaExecuteImpl calls` (30-tok) | 1599 | **535** | -1064 (-66 %) |
+| `cudaExecuteImpl total` (30-tok) | 33.4 ms | 31.4 ms | -2 ms (-6 %) |
+| TPS (80-tok)          | 59.4 | 60.4 | +1 (noise) |
+
+The cache misses **were** real (counts dropped by 2/3), but the wall
+**did not move**. cudaExecuteImpl's miss path costs only ~60 µs on
+average and adds up to ~1 ms / token total. Fixing it lifts a 1 ms
+floor that we never saw in `forward` host time anyway, because PTX
+module caching at the driver level was already absorbing the
+re-generation cost. The Lean side of the miss path (ShaderM build +
+hash + ref bookkeeping) is microseconds, not milliseconds.
+
+**That kills H4b**: cache-key bookkeeping is not the source of the
+4 ms forward host-time gap.
+
+The stub-bench delta (no-kcr 5.5 ms vs kcr=on 1.2 ms = -4.3 ms) is
+real, but it measures a *different* cost than what the real forward
+pays: `forwardTokenStubPerLayer` deliberately routes through the cold
+path of `cudaExecuteImpl` (no kcr arg) so every dispatch re-runs
+ShaderM + hashes; the real forward avoids that on the *non-FlashAttn*
+path because most call sites correctly pass `kcr` to `executeWithConfigCached`.
+
+The 4 ms gap therefore lives somewhere in the real forward's
+**non-cudaExecuteImpl** host work. Candidates not yet measured:
+- per-block IO.Ref reads on `state.fused*Prepared` slots (6+ refs/block)
+- Lean Array build-up in `Hesper.Layers.Linear.forward` (the dp4a path
+  builds up new buffer-name lists per call)
+- `Hesper.WGSL.Execute.withSection` push/pop (string allocation)
+- `Hesper.Layers.Linear.dp4aEnabled.get` etc. (env-time refs read every
+  layer × every call)
+- `Hesper.Backend.beginBatch` overhead — currently a no-op on CUDA but
+  enters via typeclass dispatch
+
+Next step: `perf record` with `-c 100000 --call-graph=fp` on the **real
+forward only** (sandwich `IO.monoNanosNow` markers around it), filter
+to kernel-time-excluding samples, and look for hot Lean symbols that do
+not show up in the stub bench. Without this we are guessing again.
+
 ### 3c. Where the host CPU spends those 5 ms
 
 `perf record -e cycles:u --call-graph=fp` during steady-state decode:
@@ -322,7 +373,7 @@ drain → 15 ms total. If forward overlaps drain, total → 10 ms (= drain)
 | H3 | Per-kernel GPU time | +18 TPS | not yet attempted | active (#47, on hold) |
 | H4 | Forward host work runs sequentially with the drain; pipeline it across iterations | +30 TPS | partially measured (§3b.1) | **active** — root cause of the 4 ms gap is NOT yet identified; need llama.cpp graphs-OFF comparison |
 | H4a | Existing CUDA-graph capture path (HESPER_CUDA_GRAPHS=1) already pipelines host launch via cuGraphLaunch | +20 TPS / steady state +30 TPS | **measured 59 → 80 TPS at 80-token, ~100 TPS steady-state** | **WORKAROUND only** — see §3b.2; hides the host work but does not explain why hesper graphs-OFF needs 4× more host work than llama.cpp graphs-OFF |
-| H4b | hesper-specific per-block overhead (Circuit.replay args Array expand, kcr.getRef hash, withSection bookkeeping) is the real source of the 4 ms gap | varies | **measured via stub bench** — stub+kcr=1.24ms / stub-no-kcr=5.33ms / real=5ms ⇒ real path runs cache-cold-equivalent work despite kcr being available | ✓ CONFIRMED — see §3b.3; see #253 for the fix |
+| H4b | FlashAttention's `IO.mkRef none` throwaway is the source of the 4 ms gap | -3.8 ms | **measured: cudaExecuteImpl calls 1599→535 / wall +0 ms** (60.4 vs 59.4 TPS = noise) | ✗ FALSE — fixing the cache misses removed 1064 misses but did not move wall. The cudaExecuteImpl miss path is cheap (~60 µs avg, 1 ms/tok total), so eliminating it has no wall effect. The 4 ms gap is somewhere else; see §3b.5 |
 | H5 | Lean Array expand in replay loop adds ms | +5 TPS | bounded ≤ 0.7 ms wall | ✗ marginal, deferred |
 | H6 | cuMemAlloc per token (driver alloc) | +5 TPS | already at 1 alloc/tok (pool); driver work is minimal | ✗ DEAD (#246) |
 | H7 | mmap PLE on-demand H2D | -3 TPS regression noted | confirmed | trade-off accepted (#247-248) |
@@ -348,15 +399,11 @@ Every previous session has skipped step 1 or step 6. Don't.
 
 ## 6. Active workstreams (priority order)
 
-1. **#253 (next, biggest lever)** — find the cache-miss in the real
-   forwardSingleToken / forwardBlock dispatch path that makes it pay
-   cold-path host cost (5 ms) when stub-bench at the same dispatch
-   shape with kcr=ON pays only 1.24 ms. Predicted -3.8 ms wall =
-   60 → 90 TPS for graphs-OFF. Approach:
-   - Add `kcr` hit/miss counters in cudaExecuteImpl + Circuit.replay.
-   - Run gemma4-cuda with `HESPER_KCR_TRACE=1`; expect to see hits but
-     they may be on the wrong key, or the ref may be resetting.
-   - Fix the cache-key / ref ownership; re-bench.
+1. **#253 was the wrong fix (verdict 3b.5)**. cudaExecuteImpl misses
+   were real but cheap. Real-forward 4 ms gap is elsewhere. Need:
+   - **`perf record` on the real forward only** with markers, look for
+     hot Lean symbols not present in the stub bench.
+   - Then form a *new* hypothesis (H4c..) before touching code.
 
 2. **#47 (kernel speed, paused)** — Q4_K matmul to llama.cpp parity.
    Predicted -2.5 ms wall. Independent of #1; combined will close most
