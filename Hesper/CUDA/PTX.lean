@@ -273,6 +273,12 @@ inductive Inst where
   | ld_u16        (space : AddrSpace) (dst : RegU32) (addr : RegU64) (nc : Bool := false)
   -- 64-bit load (used for pointer-table indirection in bufferArray).
   | ld_u64        (space : AddrSpace) (dst : RegU64) (addr : RegU64) (nc : Bool := false)
+  -- 128-bit aligned vec4.u32 load: 4 consecutive u32 read in 1 PTX
+  -- instruction.  Maps to `ld.global.v4.u32 {d0,d1,d2,d3}, [addr];`.
+  -- Used by V10 flashAttn to coalesce 4 packed-half2 reads into 1 load.
+  -- Address must be 16-byte aligned.
+  | ld_v4_u32     (space : AddrSpace) (d0 d1 d2 d3 : RegU32) (addr : RegU64)
+                  (nc : Bool := false)
   -- shared memory via symbol: mov.u32 %r, sym; add.u32 %r, %r, off; ld/st
   | ld_shared_sym (dst : RegF32) (symAddr : RegU32) (offset : RegU32) (addr : RegU32)
   | st_shared_sym (val : RegF32) (symAddr : RegU32) (offset : RegU32) (addr : RegU32)
@@ -398,6 +404,10 @@ partial def Inst.toString : Inst → String
   | .ld_u64 sp d a nc    =>
     let ncStr := if nc && sp matches .global then ".nc" else ""
     s!"  ld.{spStr sp}{ncStr}.u64 {d}, [{a}];"
+  | .ld_v4_u32 sp d0 d1 d2 d3 a nc =>
+    let ncStr := if nc && sp matches .global then ".nc" else ""
+    let dsts := s!"\{{d0}, {d1}, {d2}, {d3}}"
+    s!"  ld.{spStr sp}{ncStr}.v4.u32 {dsts}, [{a}];"
   | .ld_shared_sym d _sa _off addr => s!"  ld.shared.f32 {d}, [{addr}];"
   | .st_shared_sym v _sa _off addr => s!"  st.shared.f32 [{addr}], {v};"
   | .ld_shared_sym_u32 d _sa _off addr => s!"  ld.shared.u32 {d}, [{addr}];"
