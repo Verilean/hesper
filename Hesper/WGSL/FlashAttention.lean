@@ -1412,7 +1412,10 @@ def flashAttentionVecParamsKernelV8
     -- Static unroll over nthreads_KQ = 8 inner iters.  Each iter, warp
     -- processes kPerInnerIter = 4 K positions in parallel: sub-warp w
     -- handles K position (warpId*32 + w*8 + iKQ0).
-    for iKQ0 in [0:nthreadsKQ] do
+    for iKQ0 in [0:nthreadsKQ] do ShaderM.scope do
+      -- All temp vars (partial, s1, s2, s4) declared inside this scope
+      -- live only within { ... } so the WGSL compiler can reuse their
+      -- registers across the 8 unrolled iterations.
       let iKQ := Exp.add (Exp.mul warpId (Exp.litU32 32))
                           (Exp.add (Exp.mul subWarp (Exp.litU32 nthreadsKQ))
                                     (Exp.litU32 iKQ0))
@@ -1421,8 +1424,6 @@ def flashAttentionVecParamsKernelV8
       let kPosSafe := Exp.select inBounds kPos (Exp.litU32 0)
       let kBase := Exp.add kHeadBase (Exp.mul kPosSafe kRowStride)
 
-      -- Per-thread partial dot: 32 dims this lane owns (= sub_lane*32..+32).
-      -- All 8 lanes in this sub-warp share the same K row → coalesced reads.
       let partialVar ← ShaderM.var (.scalar .f32) (Exp.litF32 0.0)
       for k in [0:dimsPerLane] do
         let d := Exp.add dThreadBase (Exp.litU32 k)
@@ -1433,9 +1434,6 @@ def flashAttentionVecParamsKernelV8
         ShaderM.assign partialVar
           (Exp.add (Exp.var partialVar) (Exp.mul qExp kVal))
 
-      -- Sub-warp reduce: subgroupAdd reduces all 32 lanes, but we only
-      -- want to reduce within the 8-thread sub-warp.  Use subgroupShuffleXor
-      -- for log2(8)=3 levels of butterfly reduce.
       let s1Name ← ShaderM.var (.scalar .f32)
                      (Exp.add (Exp.var partialVar)
                               (Exp.subgroupShuffleXor (Exp.var partialVar)
@@ -1449,17 +1447,11 @@ def flashAttentionVecParamsKernelV8
                               (Exp.subgroupShuffleXor (Exp.var s2Name)
                                 (Exp.litU32 4)))
       let sumSubWarp : Exp (.scalar .f32) := Exp.var s4Name
-      -- All 8 lanes in this sub-warp now hold the same sumSubWarp.
 
-      -- Track running max for this sub-warp's K range.
       let scoreGated := Exp.select inBounds sumSubWarp (Exp.litF32 (-1.0e30))
       ShaderM.assign kqMaxNewVar
         (Exp.max (Exp.var kqMaxNewVar) scoreGated)
 
-      -- Store: only sub_lane 0 (the canonical lane of the 8-thread sub-warp
-      -- for this K position) keeps the score in kqRegVar.  The K position
-      -- index this sub-warp owns at iKQ0 maps to lane i_KQ within the warp.
-      -- We want lane laneId == sub_warp*8 + iKQ0 to hold this score.
       ShaderM.if_ (Exp.eq laneId
                     (Exp.add (Exp.mul subWarp (Exp.litU32 nthreadsKQ))
                               (Exp.litU32 iKQ0))) (do
@@ -1510,7 +1502,7 @@ def flashAttentionVecParamsKernelV8
     -- Each iter sub-warp accumulates V from kPerInnerIter=4 K positions
     -- in parallel — but each thread handles its 32 dims, so the loop is
     -- over the 8 K positions per sub-warp (static unroll over iKQ0).
-    for iKQ0 in [0:nthreadsKQ] do
+    for iKQ0 in [0:nthreadsKQ] do ShaderM.scope do
       let iKQ := Exp.add (Exp.mul warpId (Exp.litU32 32))
                           (Exp.add (Exp.mul subWarp (Exp.litU32 nthreadsKQ))
                                     (Exp.litU32 iKQ0))

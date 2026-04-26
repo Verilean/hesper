@@ -171,6 +171,32 @@ def loop (start : Exp (.scalar .u32)) (end_ : Exp (.scalar .u32)) (step : Exp (.
   let update := Exp.add loopVar step
   emitStmt (Stmt.forLoop varName start condition update bodyStmts)
 
+/-- Block scope: emits `{ ... body ... }` so var declared inside the body
+    is **block-scoped** in WGSL, allowing Naga/Tint/Vulkan-driver register
+    allocator to reuse the physical register once the scope exits.
+
+    This is the analog of CUDA `{ ... }` block scope for register-pressure
+    reduction. For example, when a temporary is needed only inside a hot
+    inner loop iteration, putting it in a `scope` instead of at function
+    level lets the compiler reuse its register slot afterwards.
+
+    Usage:
+    ```lean
+    ShaderM.scope do
+      let tmp ← ShaderM.var (.scalar .f32) (Exp.litF32 0.0)
+      -- ... use tmp ...
+      -- tmp's register is released at end of scope
+    ```
+
+    Note: Lean-side `let` bindings to `tmp` outside the do-block can still
+    refer to the var name string, but reading from it via `Exp.var` after
+    scope-exit is **undefined behavior** — the WGSL register is gone.
+    Discipline: only use `tmp` inside the `scope` body. -/
+def scope (body : ShaderM α) : ShaderM α := do
+  let (result, bodyStmts) ← captureStmts body
+  emitStmt (Stmt.block bodyStmts)
+  return result
+
 -- ============================================================================
 -- Synchronization
 -- ============================================================================
