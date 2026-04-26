@@ -886,41 +886,38 @@ def flashAttentionVecParamsKernelV6
     let kqRegVar ← ShaderM.var (.scalar .f32) (Exp.litF32 0.0)
     let kqMaxNewVar ← ShaderM.var (.scalar .f32) kqMax
 
-    -- Phase 1: 32 K positions per warp, lane laneId owns position
-    -- (warpId*32 + laneId) within this kVKQ0..kVKQ0+128 chunk.
-    for iKQ0 in [0:32] do
-      -- i_KQ = warpId * 32 + iKQ0 (broadcast same for every thread in warp)
-      let iKQ := Exp.add (Exp.mul warpId (Exp.litU32 32)) (Exp.litU32 iKQ0)
+    -- Phase 1: 32 K positions per warp, runtime loop (32 iter).  Each iter
+    -- handles ONE K position via warp_reduce of D-axis.  Owning lane
+    -- (iKQ0 == laneId) stores the score for the position it owns.
+    ShaderM.loop (Exp.litU32 0) (Exp.litU32 32) (Exp.litU32 1) fun iKQ0 => do
+      let iKQ := Exp.add (Exp.mul warpId (Exp.litU32 32)) iKQ0
       let kPos := Exp.add kVKQ0 iKQ
-      -- Bounds: skip if kPos >= cacheLen
       let inBounds := Exp.lt kPos cacheLen
       let kBase := Exp.add kHeadBase (Exp.mul kPos kRowStride)
-      -- Per-lane partial dot: D/32 = 8 dims this lane owns.
+      -- Per-lane partial dot: D/32 dims owned by this lane.  Compute
+      -- regardless of inBounds — out-of-bounds reads OK (zero-fill or
+      -- well-formed at this point assuming kPos*headDim < buffer size,
+      -- which holds when maxSeqLen >= cacheLen — caller guarantees).
       let partialVar ← ShaderM.var (.scalar .f32) (Exp.litF32 0.0)
-      ShaderM.if_ inBounds (do
-        for k in [0:dPerLane] do
-          let d := Exp.add (Exp.litU32 (k * 32)) laneId
-          let kVal ← ShaderM.readBuffer (ty := .scalar .f32)
-                       (n := numKVHeads * maxSeqLen * headDim) "k_cache"
-                       (Exp.add kBase d)
-          let qExp : Exp (.scalar .f32) := Exp.var qVars[k]!
-          ShaderM.assign partialVar
-            (Exp.add (Exp.var partialVar) (Exp.mul qExp kVal))
-      ) (pure ())
-      -- Warp reduce: collapses D-axis across the 32 lanes → every lane gets
-      -- the full Q · K[kPos] dot product.
+      for k in [0:dPerLane] do
+        let d := Exp.add (Exp.litU32 (k * 32)) laneId
+        let kVal ← ShaderM.readBuffer (ty := .scalar .f32)
+                     (n := numKVHeads * maxSeqLen * headDim) "k_cache"
+                     (Exp.add kBase d)
+        let qExp : Exp (.scalar .f32) := Exp.var qVars[k]!
+        ShaderM.assign partialVar
+          (Exp.add (Exp.var partialVar) (Exp.mul qExp kVal))
+      -- Warp reduce: collapses D-axis across the 32 lanes.
       let sumWarpName ← ShaderM.var (.scalar .f32)
                           (Exp.subgroupAdd (Exp.var partialVar))
       let sumWarp : Exp (.scalar .f32) := Exp.var sumWarpName
-      -- Track running max for this warp's chunk.  Out-of-bounds lanes
-      -- contribute -inf via select to avoid polluting the max.
-      let scoreOrNegInf := Exp.select inBounds sumWarp (Exp.litF32 (-1.0e30))
+      -- Out-of-bounds → -inf so it doesn't pollute max / sum.
+      let scoreGated := Exp.select inBounds sumWarp (Exp.litF32 (-1.0e30))
       ShaderM.assign kqMaxNewVar
-        (Exp.max (Exp.var kqMaxNewVar) scoreOrNegInf)
-      -- Owning lane stores: laneId == iKQ0 means this lane is the one
-      -- whose K-position-index within the warp matches iKQ0.
-      ShaderM.if_ (Exp.eq laneId (Exp.litU32 iKQ0)) (do
-        ShaderM.assign kqRegVar sumWarp
+        (Exp.max (Exp.var kqMaxNewVar) scoreGated)
+      -- Owning lane stores its score (gated -inf for out-of-bounds).
+      ShaderM.if_ (Exp.eq laneId iKQ0) (do
+        ShaderM.assign kqRegVar scoreGated
       ) (pure ())
 
     -- Phase 2: per-thread softmax-online update.
@@ -929,58 +926,47 @@ def flashAttentionVecParamsKernelV6
                           (Exp.exp (Exp.sub kqMax kqMaxNew))
     let kqMaxScale : Exp (.scalar .f32) := Exp.var kqMaxScaleVar
     ShaderM.assign "kq_max" kqMaxNew
-    -- Apply softmax scaling: kqReg = exp(kqReg - new_max)
-    -- (only meaningful on owning lanes; others have garbage but won't
-    -- be read later because shared_kq is written only by owning lanes
-    -- via the iKQ0 == laneId match below.)
+    -- kqRegVar holds either the lane's own KQ score (if it owns an
+    -- in-bounds K position in this warp's chunk) or -inf (if OOB).
+    -- exp(-inf - finite) = 0 so OOB naturally contributes nothing.
     ShaderM.assign kqRegVar
       (Exp.exp (Exp.sub (Exp.var kqRegVar) kqMaxNew))
-    -- Update kq_sum: only owning lanes contribute their kqReg.  But
-    -- after warp_reduce_sum across the 32 lanes, lanes that didn't own
-    -- a position contributed 0 (rather than valid) — so we need to be
-    -- careful.  Simpler: every lane owns exactly one K position in
-    -- this warp's chunk (because we did 32 inner iters), so kqRegVar
-    -- holds the lane's own valid score for the K position assigned.
-    -- (Lanes for which kPos >= cacheLen never updated kqRegVar past
-    -- 0 — but we set kqMaxNew to -inf for those, so exp(0 - (-inf))
-    -- = inf which is wrong.  Fix: gate kqReg by ownership-in-bounds.)
-    -- Determine if my lane owns an in-bounds K position:
-    let myKPos := Exp.add kVKQ0 (Exp.add (Exp.mul warpId (Exp.litU32 32)) laneId)
-    let myInBounds := Exp.lt myKPos cacheLen
-    let kqRegGated := Exp.select myInBounds (Exp.var kqRegVar) (Exp.litF32 0.0)
+    -- Update kq_sum: per-lane contribution is its own kqReg (= 0 for OOB).
     ShaderM.assign "kq_sum"
-      (Exp.add (Exp.mul kqSum kqMaxScale) kqRegGated)
+      (Exp.add (Exp.mul kqSum kqMaxScale) (Exp.var kqRegVar))
     -- Rescale my-lane's VKQ accumulator dims by kqMaxScale.
     for k in [0:dPerLane] do
       let prev : Exp (.scalar .f32) := Exp.var vkqVars[k]!
       ShaderM.assign vkqVars[k]! (Exp.mul prev kqMaxScale)
-    -- Publish my lane's KQ score into smem so the VKQ-accumulation phase
-    -- can broadcast it.  Slot index: warpId*32 + laneId.
+    -- Publish my lane's KQ score into smem (OOB lanes write 0 naturally).
     let kqSlot := Exp.add (Exp.mul warpId (Exp.litU32 32)) laneId
     ShaderM.writeWorkgroup (ty := .scalar .f32)
-      "shared_kq" kqSlot kqRegGated
+      "shared_kq" kqSlot (Exp.var kqRegVar)
     ShaderM.barrier
 
-    -- Phase 3: VKQ accumulation.  For each of this warp's 32 K positions,
-    -- broadcast its KQ score and add weighted V row to my-lane's VKQ.
-    for kOff in [0:32] do
-      let kPos := Exp.add kVKQ0 (Exp.add (Exp.mul warpId (Exp.litU32 32))
-                                          (Exp.litU32 kOff))
-      let kqScore ← ShaderM.readWorkgroup (ty := .scalar .f32)
-                      (n := workgroupSize) "shared_kq"
-                      (Exp.add (Exp.mul warpId (Exp.litU32 32)) (Exp.litU32 kOff))
+    -- Phase 3: VKQ accumulation.  Runtime loop over 32 K positions in
+    -- this warp's chunk.  Out-of-bounds slots have kqScore=0 (set by
+    -- gated write in Phase 1+2), so we can skip the bounds check.
+    ShaderM.loop (Exp.litU32 0) (Exp.litU32 32) (Exp.litU32 1) fun kOff => do
+      let kPos := Exp.add kVKQ0 (Exp.add (Exp.mul warpId (Exp.litU32 32)) kOff)
+      let kqScoreSlot := Exp.add (Exp.mul warpId (Exp.litU32 32)) kOff
+      let kqScoreRaw ← ShaderM.readWorkgroup (ty := .scalar .f32)
+                        (n := workgroupSize) "shared_kq" kqScoreSlot
+      -- Out-of-bounds kqScore is the exp(-inf - max) = 0, so it's safe.
+      -- Gate V read by inBounds anyway to avoid OOB global access when
+      -- kPos × headDim exceeds the V cache buffer.
       let inBounds := Exp.lt kPos cacheLen
-      ShaderM.if_ inBounds (do
-        let vBase := Exp.add kHeadBase (Exp.mul kPos kRowStride)
-        for k in [0:dPerLane] do
-          let d := Exp.add (Exp.litU32 (k * 32)) laneId
-          let vVal ← ShaderM.readBuffer (ty := .scalar .f32)
-                       (n := numKVHeads * maxSeqLen * headDim) "v_cache"
-                       (Exp.add vBase d)
-          let prev : Exp (.scalar .f32) := Exp.var vkqVars[k]!
-          ShaderM.assign vkqVars[k]!
-            (Exp.add prev (Exp.mul vVal kqScore))
-      ) (pure ())
+      let kPosSafe := Exp.select inBounds kPos (Exp.litU32 0)
+      let vBase := Exp.add kHeadBase (Exp.mul kPosSafe kRowStride)
+      let kqScore := Exp.select inBounds kqScoreRaw (Exp.litF32 0.0)
+      for k in [0:dPerLane] do
+        let d := Exp.add (Exp.litU32 (k * 32)) laneId
+        let vVal ← ShaderM.readBuffer (ty := .scalar .f32)
+                     (n := numKVHeads * maxSeqLen * headDim) "v_cache"
+                     (Exp.add vBase d)
+        let prev : Exp (.scalar .f32) := Exp.var vkqVars[k]!
+        ShaderM.assign vkqVars[k]!
+          (Exp.add prev (Exp.mul vVal kqScore))
     ShaderM.barrier
 
   -- Cross-warp reduce of VKQ + kq_sum: write each warp's VKQ slice into
