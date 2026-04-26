@@ -108,7 +108,7 @@ unsafe def main (argv : List String) : IO Unit := do
   let kvZeros : Array Float := Array.replicate (nkv * maxSeq * hd) 0.0
 
   match tag with
-  | "vec" | "v2" | "v3" | "v6" | "v7" =>
+  | "vec" | "v2" | "v3" | "v6" | "v7" | "v8" =>
     let vBuf ← GPUBackend.allocBuffer ctx kvSizeF32
     GPUBackend.writeBuffer ctx vBuf (packFloats kvZeros)
     -- K storage shape depends on tag
@@ -128,6 +128,8 @@ unsafe def main (argv : List String) : IO Unit := do
                    nh nkv maxSeq hd scale, "v6_ncu", "k_cache", kF32Buf, "v_cache", vBuf)
       | "v7" => (Hesper.WGSL.FlashAttention.flashAttentionVecParamsKernelV7
                    nh nkv maxSeq hd scale, "v7_ncu", "k_cache_f16", kF16Buf, "v_cache_f16", vF16Buf)
+      | "v8" => (Hesper.WGSL.FlashAttention.flashAttentionVecParamsKernelV8
+                   nh nkv maxSeq hd scale, "v8_ncu", "k_cache", kF32Buf, "v_cache", vBuf)
       | _    => (Hesper.WGSL.FlashAttention.flashAttentionVecParamsKernel
                    nh nkv maxSeq hd scale, "vec_ncu", "k_cache", kF32Buf, "v_cache", vBuf)
     let ptx := Hesper.CUDA.CodeGen.generatePTX funcName

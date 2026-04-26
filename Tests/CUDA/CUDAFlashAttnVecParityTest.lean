@@ -240,6 +240,21 @@ def runCase
       { workgroupSize := { x := 128 }, numWorkgroups := (numHeads, 1, 1),
         extensions := ["subgroups", "f16"] }
 
+  -- V8: sub-warp partition (nthreads_KQ=8) + static unroll.  Pre-cond: D % 8 == 0.
+  let outBufV8 ← GPUBackend.allocBuffer ctx outSize
+  if headDim % 8 == 0 ∧ headDim % 128 == 0 then
+    let v8Shader := Hesper.WGSL.FlashAttention.flashAttentionVecParamsKernelV8
+                       numHeads numKVHeads maxSeqLen headDim scale
+    let v8Bufs : List (String × GPUBackend.Buf Hesper.CUDAContext) :=
+      [ ("q",       qBuf)
+      , ("k_cache", kBuf)
+      , ("v_cache", vBuf)
+      , ("output",  outBufV8)
+      , ("params",  paramsBuf) ]
+    GPUBackend.execute ctx v8Shader v8Bufs
+      { workgroupSize := { x := 128 }, numWorkgroups := (numHeads, 1, 1),
+        extensions := ["subgroups"] }
+
   let legacyResultBytes ← GPUBackend.readBuffer ctx outBufLegacy outSize
   let vecResultBytes    ← GPUBackend.readBuffer ctx outBufVec outSize
   let legacyOut := unpackFloats legacyResultBytes (numHeads * headDim)
@@ -253,24 +268,30 @@ def runCase
     let v6Out := unpackFloats v6ResultBytes (numHeads * headDim)
     let v7ResultBytes ← GPUBackend.readBuffer ctx outBufV7 outSize
     let v7Out := unpackFloats v7ResultBytes (numHeads * headDim)
+    let v8ResultBytes ← GPUBackend.readBuffer ctx outBufV8 outSize
+    let v8Out := unpackFloats v8ResultBytes (numHeads * headDim)
     let mut maxAbsV2 := 0.0
     let mut maxAbsV3 := 0.0
     let mut maxAbsV6 := 0.0
     let mut maxAbsV7 := 0.0
+    let mut maxAbsV8 := 0.0
     for i in [0:legacyOut.size] do
       let d2 := (legacyOut[i]! - v2Out[i]!).abs
       let d3 := (legacyOut[i]! - v3Out[i]!).abs
       let d6 := (legacyOut[i]! - v6Out[i]!).abs
       let d7 := (legacyOut[i]! - v7Out[i]!).abs
+      let d8 := (legacyOut[i]! - v8Out[i]!).abs
       if d2 > maxAbsV2 then maxAbsV2 := d2
       if d3 > maxAbsV3 then maxAbsV3 := d3
       if d6 > maxAbsV6 then maxAbsV6 := d6
       if d7 > maxAbsV7 then maxAbsV7 := d7
+      if d8 > maxAbsV8 then maxAbsV8 := d8
     let m2 := if maxAbsV2 < 1e-4 then "✓ V2" else "✗ V2"
     let m3 := if maxAbsV3 < 1e-2 then "✓ V3" else "✗ V3"
     let m6 := if maxAbsV6 < 1e-3 then "✓ V6" else "✗ V6"
-    let m7 := if maxAbsV7 < 1e-2 then "✓ V7" else "✗ V7"  -- f16 K+V → larger
-    IO.println s!"      [{m2}] V2={maxAbsV2}  [{m3}] V3(Kf16)={maxAbsV3}  [{m6}] V6={maxAbsV6}  [{m7}] V7(KVf16)={maxAbsV7}"
+    let m7 := if maxAbsV7 < 1e-2 then "✓ V7" else "✗ V7"
+    let m8 := if maxAbsV8 < 1e-3 then "✓ V8" else "✗ V8"
+    IO.println s!"      V2={maxAbsV2}[{m2}] V3={maxAbsV3}[{m3}] V6={maxAbsV6}[{m6}] V7={maxAbsV7}[{m7}] V8={maxAbsV8}[{m8}]"
 
   GPUBackend.freeBuffer ctx qBuf
   GPUBackend.freeBuffer ctx kBuf
@@ -281,6 +302,7 @@ def runCase
   GPUBackend.freeBuffer ctx outBufV3
   GPUBackend.freeBuffer ctx outBufV6
   GPUBackend.freeBuffer ctx outBufV7
+  GPUBackend.freeBuffer ctx outBufV8
   GPUBackend.freeBuffer ctx kBufF16
   GPUBackend.freeBuffer ctx vBufF16
   GPUBackend.freeBuffer ctx paramsBuf
