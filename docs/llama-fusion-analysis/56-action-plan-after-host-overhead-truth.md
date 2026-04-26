@@ -1,3 +1,6 @@
+**SUPERSEDED by 57-host-overhead-canonical.md** — left for history; do not
+follow conclusions here without cross-checking §3 of doc 57.
+
 # Action plan after the host-overhead breakdown (2026-04-26)
 
 Doc 55 (`55-host-overhead-breakdown-2026-04-25.md`) showed that the 8 ms

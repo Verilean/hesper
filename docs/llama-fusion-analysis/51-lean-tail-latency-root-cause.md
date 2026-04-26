@@ -1,3 +1,6 @@
+**SUPERSEDED by 57-host-overhead-canonical.md** — left for history; do not
+follow conclusions here without cross-checking §3 of doc 57.
+
 # 51 — Lean runtime tail latency is the steady-state TPS gap vs llama.cpp
 
 *Written 2026-04-24. Session end: hesper graphs OFF 60 TPS vs llama.cpp 107 TPS.*

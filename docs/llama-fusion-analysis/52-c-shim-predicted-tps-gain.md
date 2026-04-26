@@ -1,3 +1,6 @@
+**SUPERSEDED by 57-host-overhead-canonical.md** — left for history; do not
+follow conclusions here without cross-checking §3 of doc 57.
+
 # 52 — Predicted TPS gain from C shim (modeled from gap distribution)
 
 *Written 2026-04-24. Before implementing Option B.*

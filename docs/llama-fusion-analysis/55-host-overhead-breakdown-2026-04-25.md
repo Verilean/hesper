@@ -1,3 +1,6 @@
+**SUPERSEDED by 57-host-overhead-canonical.md** — left for history; do not
+follow conclusions here without cross-checking §3 of doc 57.
+
 # Host overhead breakdown — hesper vs llama-cli (2026-04-25)
 
 ## Setup
