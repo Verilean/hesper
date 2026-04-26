@@ -146,3 +146,38 @@ Session 1 の Step 1 (ShaderM 側調査) のみ実施し doc に追記する.
 - dispatcher 切り替え (HESPER_FA_VEC=1) (~10 lines)
 - Lean 側 `executeFlashAttentionVecF32` 関数 (~30 lines)
 - 計 200 行程度
+
+### Session 1 進捗 (2026-04-26)
+
+**WIP commit `0076815`**: skeleton landed but **NOT correct yet**.
+
+- TPS regression: 82.1 → 70.1 (HESPER_FA_VEC=1) — algorithmic bug
+- Output diverges from baseline ⇒ silent correctness regression
+- Suspected root causes (still TBD, no parity test yet to bisect):
+  - `shared_warp_sums` not zeroed between K iterations; cross-warp
+    subgroupAdd may pull stale lanes >= numWarps
+  - cross-warp broadcast: lane 0 of warp 0 produces canonical sum but
+    we publish via `tid==0` write — confirm warp 0 of all heads agrees
+
+### Lesson from Session 1: gemma4 TAT is too long for bisect
+
+End-to-end gemma4 60-token decode is ~6 min per iteration (build 5 min
++ measure 1 min).  Bisecting kernel correctness against the legacy
+kernel via gemma4 is impractical.
+
+**Pivot**: build a **CUDA unit test** that compares
+`flashAttentionVecParamsKernel` against `flashAttentionDynamicParamsKernel`
+on the same Q/K/V/params inputs at multiple sizes (e.g. cacheLen ∈
+{1, 8, 32, 64, 128}, headDim=256, numHeads=2 ish).  Existing pattern:
+`Tests/CUDA/CUDAFlashAttnTest.lean` does this for sub-kernels.
+
+DoD update: **bit-parity unit test passes first, then enable in gemma4**.
+That keeps the iteration cycle <30s instead of 6min.
+
+### Next concrete action (Session 1 continued)
+
+1. Add a new test file `Tests/CUDA/CUDAFlashAttnVecParityTest.lean`
+   that runs both kernels at small sizes and asserts max abs diff <
+   1e-5
+2. Run it to bisect — fix the warp_sums clear / cross-warp issue
+3. Re-enable in gemma4 with confidence
