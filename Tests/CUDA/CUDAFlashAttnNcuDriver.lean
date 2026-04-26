@@ -85,7 +85,7 @@ unsafe def main (argv : List String) : IO Unit := do
     | [t, cl, it] =>
       pure (t, cl.toNat!, it.toNat!)
     | _ =>
-      IO.println "usage: cuda-flashattn-ncu-driver <vec|v2|v3|v6|llama> <cacheLen> <iters>"
+      IO.println "usage: cuda-flashattn-ncu-driver <vec|v2|v3|v6|v7|v8|v9|llama> <cacheLen> <iters>"
       IO.Process.exit 1
 
   let ctx ← Hesper.CUDAContext.init
@@ -108,6 +108,54 @@ unsafe def main (argv : List String) : IO Unit := do
   let kvZeros : Array Float := Array.replicate (nkv * maxSeq * hd) 0.0
 
   match tag with
+  | "v9" =>
+    -- V9 = V7 + split-K.  Two kernels: V9 partial then combine.
+    let numSplits := 8
+    let kF16Buf ← GPUBackend.allocBuffer ctx kvSizeF16
+    let vF16Buf ← GPUBackend.allocBuffer ctx kvSizeF16
+    GPUBackend.writeBuffer ctx kF16Buf (packHalfs kvZeros)
+    GPUBackend.writeBuffer ctx vF16Buf (packHalfs kvZeros)
+    let partialOutSize := (nh * numSplits * hd * 4).toUSize
+    let partialMetaSize := (nh * numSplits * 2 * 4).toUSize
+    let partialOutBuf ← GPUBackend.allocBuffer ctx partialOutSize
+    let partialMetaBuf ← GPUBackend.allocBuffer ctx partialMetaSize
+    let v9Shader := Hesper.WGSL.FlashAttention.flashAttentionVecParamsKernelV9
+                       nh nkv maxSeq hd numSplits scale
+    let combineShader := Hesper.WGSL.FlashAttention.flashAttentionVecCombineKernel
+                            nh hd numSplits
+    let v9Ptx := Hesper.CUDA.CodeGen.generatePTX "v9_ncu"
+                   { x := 128, y := 1, z := 1 } v9Shader
+                   (minnctapersm := some 1)
+    let combPtx := Hesper.CUDA.CodeGen.generatePTX "v9_combine_ncu"
+                     { x := 128, y := 1, z := 1 } combineShader
+                     (minnctapersm := some 1)
+    IO.FS.writeFile "/tmp/v_v9.ptx" v9Ptx
+    IO.FS.writeFile "/tmp/v_v9_combine.ptx" combPtx
+    let v9Mod ← Hesper.CUDA.cuModuleLoadData v9Ptx
+    let combMod ← Hesper.CUDA.cuModuleLoadData combPtx
+    let v9F ← Hesper.CUDA.cuModuleGetFunction v9Mod "v9_ncu"
+    let combF ← Hesper.CUDA.cuModuleGetFunction combMod "v9_combine_ncu"
+    let v9State := Hesper.WGSL.Monad.ShaderM.exec v9Shader
+    let combState := Hesper.WGSL.Monad.ShaderM.exec combineShader
+    let v9Names := v9State.declaredBuffers.map (·.1)
+    let combNames := combState.declaredBuffers.map (·.1)
+    let allBufs : List (String × Hesper.CUDA.CUDABuffer) :=
+      [ ("q", qBuf), ("k_cache_f16", kF16Buf), ("v_cache_f16", vF16Buf)
+      , ("partial_out", partialOutBuf), ("partial_meta", partialMetaBuf)
+      , ("output", outBuf), ("params", paramsBuf) ]
+    let v9Args : Array USize ← v9Names.foldlM (init := #[]) fun acc name => do
+      match allBufs.find? (fun p => p.1 == name) with
+      | some (_, buf) => return acc.push buf.ptr
+      | none => throw (IO.userError s!"v9 missing buffer '{name}'")
+    let combArgs : Array USize ← combNames.foldlM (init := #[]) fun acc name => do
+      match allBufs.find? (fun p => p.1 == name) with
+      | some (_, buf) => return acc.push buf.ptr
+      | none => throw (IO.userError s!"combine missing buffer '{name}'")
+    IO.println s!"[ncu-driver] v9 cacheLen={cacheLen} iters={iters} numSplits={numSplits} (symbols: v9_ncu + v9_combine_ncu)"
+    for _ in [0:iters] do
+      Hesper.CUDA.cuLaunchKernel v9F nh.toUInt32 numSplits.toUInt32 1 128 1 1 0 v9Args
+      Hesper.CUDA.cuLaunchKernel combF nh.toUInt32 1 1 128 1 1 0 combArgs
+    Hesper.CUDA.cuStreamSynchronize (0 : USize)
   | "vec" | "v2" | "v3" | "v6" | "v7" | "v8" =>
     let vBuf ← GPUBackend.allocBuffer ctx kvSizeF32
     GPUBackend.writeBuffer ctx vBuf (packFloats kvZeros)
