@@ -886,6 +886,10 @@ lean_exe «cuda-flashattn-ncu-driver» where
   root := `Tests.CUDA.CUDAFlashAttnNcuDriver
   moreLinkArgs := stdLinkArgs ++ #["./.lake/build/native/libhesper_cuda.a", "-lcuda"]
 
+lean_exe «cuda-fma-f16x2-test» where
+  root := `Tests.CUDA.CUDAFmaF16x2Test
+  moreLinkArgs := stdLinkArgs ++ #["./.lake/build/native/libhesper_cuda.a", "-lcuda"]
+
 lean_exe «cuda-ptx-inst-test» where
   root := `Tests.CUDA.CUDAPTXInstTest
   moreLinkArgs := stdLinkArgs ++ #["./.lake/build/native/libhesper_cuda.a", "-lcuda"]

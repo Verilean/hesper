@@ -150,6 +150,11 @@ inductive Inst where
   | mul_f32     (dst src1 src2 : RegF32)
   | div_f32     (dst src1 src2 : RegF32)
   | fma_f32     (dst a b c : RegF32)
+  /-- Packed half2 fused multiply-add: dst = a*b + c, where each register
+      holds two f16 values packed into one u32 (low half = lane 0, high = 1).
+      Single PTX `fma.rn.f16x2` instruction — half the FMA-throughput cost
+      of two scalar f16 fmas, used in flash-attn vec kernels. -/
+  | fma_rn_f16x2 (dst a b c : RegU32)
   | abs_f32     (dst src : RegF32)
   | neg_f32     (dst src : RegF32)
   | sqrt_f32    (dst src : RegF32)
@@ -281,6 +286,7 @@ def Inst.toString : Inst → String
   | .mul_f32 d a b       => s!"  mul.f32 {d}, {a}, {b};"
   | .div_f32 d a b       => s!"  div.rn.f32 {d}, {a}, {b};"
   | .fma_f32 d a b c     => s!"  fma.rn.f32 {d}, {a}, {b}, {c};"
+  | .fma_rn_f16x2 d a b c => s!"  fma.rn.f16x2 {d}, {a}, {b}, {c};"
   | .abs_f32 d s         => s!"  abs.f32 {d}, {s};"
   | .neg_f32 d s         => s!"  neg.f32 {d}, {s};"
   | .sqrt_f32 d s        => s!"  sqrt.rn.f32 {d}, {s};"
@@ -407,7 +413,10 @@ def Module.render (m : Module) : String := Id.run do
     s := s ++ s!"  .param .u64 param_{m.params[i]!}"
   s := s ++ "\n)\n{\n"
   if m.fRegCount > 0  then s := s ++ s!"  .reg .f32 %f<{m.fRegCount}>;\n"
-  if m.rRegCount > 0  then s := s ++ s!"  .reg .u32 %r<{m.rRegCount}>;\n"
+  -- Declare 32-bit registers as `.b32` (untyped) so they bind to any
+  -- 32-bit instruction including `.u32`/`.s32`/`.b32`/`.f16x2` ops.
+  -- This is what nvcc emits for PTX modules that mix u32 and f16x2.
+  if m.rRegCount > 0  then s := s ++ s!"  .reg .b32 %r<{m.rRegCount}>;\n"
   if m.rdRegCount > 0 then s := s ++ s!"  .reg .u64 %rd<{m.rdRegCount}>;\n"
   if m.pRegCount > 0  then s := s ++ s!"  .reg .pred %p<{m.pRegCount}>;\n"
   if m.hRegCount > 0  then s := s ++ s!"  .reg .b16 %h<{m.hRegCount}>;\n"
