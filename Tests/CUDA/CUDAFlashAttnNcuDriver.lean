@@ -85,7 +85,7 @@ unsafe def main (argv : List String) : IO Unit := do
     | [t, cl, it] =>
       pure (t, cl.toNat!, it.toNat!)
     | _ =>
-      IO.println "usage: cuda-flashattn-ncu-driver <vec|llama> <cacheLen> <iters>"
+      IO.println "usage: cuda-flashattn-ncu-driver <vec|v2|llama> <cacheLen> <iters>"
       IO.Process.exit 1
 
   let ctx ← Hesper.CUDAContext.init
@@ -108,21 +108,23 @@ unsafe def main (argv : List String) : IO Unit := do
   let kvZeros : Array Float := Array.replicate (nkv * maxSeq * hd) 0.0
 
   match tag with
-  | "vec" =>
+  | "vec" | "v2" =>
     let kBuf ← GPUBackend.allocBuffer ctx kvSizeF32
     let vBuf ← GPUBackend.allocBuffer ctx kvSizeF32
     GPUBackend.writeBuffer ctx kBuf (packFloats kvZeros)
     GPUBackend.writeBuffer ctx vBuf (packFloats kvZeros)
-    let vecShader := Hesper.WGSL.FlashAttention.flashAttentionVecParamsKernel
-                       nh nkv maxSeq hd scale
+    let (shader, funcName) := match tag with
+      | "v2" => (Hesper.WGSL.FlashAttention.flashAttentionVecParamsKernelV2
+                   nh nkv maxSeq hd scale, "v2_ncu")
+      | _    => (Hesper.WGSL.FlashAttention.flashAttentionVecParamsKernel
+                   nh nkv maxSeq hd scale, "vec_ncu")
     -- Compile once via raw PTX path so ncu only sees the one target
     -- kernel symbol, not GPUBackend's hash-named wrappers.
-    let funcName := "vec_ncu"
     let ptx := Hesper.CUDA.CodeGen.generatePTX funcName
-                 { x := 128, y := 1, z := 1 } vecShader
+                 { x := 128, y := 1, z := 1 } shader
     let cudaMod ← Hesper.CUDA.cuModuleLoadData ptx
     let f ← Hesper.CUDA.cuModuleGetFunction cudaMod funcName
-    let state := Hesper.WGSL.Monad.ShaderM.exec vecShader
+    let state := Hesper.WGSL.Monad.ShaderM.exec shader
     let declaredNames := state.declaredBuffers.map (·.1)
     let bufs : List (String × Hesper.CUDA.CUDABuffer) :=
       [ ("q", qBuf), ("k_cache", kBuf), ("v_cache", vBuf)
@@ -131,7 +133,7 @@ unsafe def main (argv : List String) : IO Unit := do
       match bufs.find? (fun p => p.1 == name) with
       | some (_, buf) => return acc.push buf.ptr
       | none => throw (IO.userError s!"missing buffer '{name}'")
-    IO.println s!"[ncu-driver] vec cacheLen={cacheLen} iters={iters} (kernel symbol: {funcName})"
+    IO.println s!"[ncu-driver] {tag} cacheLen={cacheLen} iters={iters} (kernel symbol: {funcName})"
     for _ in [0:iters] do
       Hesper.CUDA.cuLaunchKernel f nh.toUInt32 1 1 128 1 1 0 args
     Hesper.CUDA.cuStreamSynchronize (0 : USize)
@@ -148,5 +150,5 @@ unsafe def main (argv : List String) : IO Unit := do
         nh nkv hd cacheLen maxSeq scale
     Hesper.CUDA.cuStreamSynchronize (0 : USize)
   | other =>
-    IO.println s!"[ncu-driver] unknown tag '{other}', expected 'vec' or 'llama'"
+    IO.println s!"[ncu-driver] unknown tag '{other}', expected 'vec', 'v2', or 'llama'"
     IO.Process.exit 1
