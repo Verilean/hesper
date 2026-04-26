@@ -335,12 +335,59 @@ def getSectionTotals : IO (Array (String × UInt64 × Nat)) := sectionTotalsRef.
 
 def getSectionDispatches : IO (Array (String × Nat × Nat)) := sectionDispatchesRef.get
 
+/-- Chrome-trace event log for `withSection` calls.  When
+    `sectionTraceRef` is on, every withSection invocation appends an
+    entry (name, start_ns, dur_ns, depth).  Dumped to a JSON file by
+    `dumpSectionTrace` at end-of-run.  Enabled by env
+    `HESPER_TRACE_OUT=<path>`. -/
+initialize sectionTraceRef : IO.Ref Bool ← IO.mkRef false
+-- Reversed-order list (newest event first) for O(1) prepend.  We
+-- reverse once at dump time.  An Array.push at every withSection call
+-- is O(N) due to immutable copy and turns the run quadratic when
+-- there are 50k+ events.
+initialize sectionTraceEvents : IO.Ref (List (String × UInt64 × UInt64 × Nat))
+  ← IO.mkRef []
+initialize sectionTraceDepth : IO.Ref Nat ← IO.mkRef 0
+
+private def appendSectionTrace (name : String) (startNs durNs : UInt64)
+    (depth : Nat) : IO Unit :=
+  sectionTraceEvents.modify (fun xs => (name, startNs, durNs, depth) :: xs)
+
+/-- Dump accumulated section-trace events to a Chrome-trace-format
+    JSON fragment file (just the `traceEvents` array body — the merger
+    in `scripts/nsys_to_chrome_trace.py` reads it). -/
+def dumpSectionTrace (path : String) : IO Unit := do
+  let revList ← sectionTraceEvents.get
+  let evs := revList.reverse
+  let q : String := "\""
+  let bs : String := "\\"
+  let escQ : String := bs ++ q
+  let mut out : String := "["
+  let mut first := true
+  for (name, ts, dur, depth) in evs do
+    let escName := name.replace q escQ
+    if !first then out := out ++ ","
+    first := false
+    out := out ++
+      "{" ++ q ++ "name" ++ q ++ ":" ++ q ++ escName ++ q ++
+      "," ++ q ++ "ts_ns" ++ q ++ ":" ++ s!"{ts}" ++
+      "," ++ q ++ "dur_ns" ++ q ++ ":" ++ s!"{dur}" ++
+      "," ++ q ++ "depth" ++ q ++ ":" ++ s!"{depth}" ++ "}"
+  out := out ++ "]"
+  IO.FS.writeFile path out
+
 /-- Time an IO action under a section name; no-op when profiling disabled. -/
 def withSection (name : String) (act : IO α) : IO α := do
   let traceOn := (← IO.getEnv "HESPER_KERNEL_TRACE").isSome
-  if ← sectionProfilingRef.get then
+  let chromeTraceOn ← sectionTraceRef.get
+  if (← sectionProfilingRef.get) || chromeTraceOn then
     let reader ← sectionDispatchReader.get
     let dBefore ← match reader with | some r => r | none => pure 0
+    let depth ← if chromeTraceOn then do
+        let d ← sectionTraceDepth.get
+        sectionTraceDepth.set (d + 1)
+        pure d
+      else pure 0
     let t0 ← IO.monoNanosNow
     if traceOn then IO.eprintln s!"[hs][section begin] {name}"
     let r ← act
@@ -349,7 +396,11 @@ def withSection (name : String) (act : IO α) : IO α := do
     let dAfter ← match reader with | some r => r | none => pure 0
     if name == "embedLookup" || name == "attnNorm" then
       IO.eprintln s!"[debug-sec {name}] reader={reader.isSome} before={dBefore} after={dAfter}"
-    addSectionSample name (t1 - t0).toUInt64 (dAfter - dBefore)
+    if (← sectionProfilingRef.get) then
+      addSectionSample name (t1 - t0).toUInt64 (dAfter - dBefore)
+    if chromeTraceOn then do
+      appendSectionTrace name t0.toUInt64 (t1 - t0).toUInt64 depth
+      sectionTraceDepth.set depth
     pure r
   else if traceOn then do
     IO.eprintln s!"[hs][section begin] {name}"

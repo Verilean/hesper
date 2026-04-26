@@ -152,6 +152,15 @@ structure InferenceState (BufT CacheT : Type) where
         and currently costs ~9.8 ms/token of GPU drain wait).
       Matches llama-cli's `cudaMallocHost`-then-direct-read pattern. -/
   argmaxHostMapped : Option (USize × BufT) := none
+  -- doc 58 step B: deferred-argmax-read history buffer.  Each decode
+  -- iteration the historyAppendKernel writes the argmax result into
+  -- argmaxHistoryBuf[historySlotBuf[0]] and increments the slot.
+  -- After the decode loop ends (or every K tokens) we DtoH the whole
+  -- history once and recover the per-token IDs.  This breaks the
+  -- post-argmax → next-forward GPU idle bubble, since host never has
+  -- to wait for the per-iter argmax value.
+  argmaxHistoryBuf : BufT
+  historySlotBuf   : BufT
   -- Scratch buffer for Q8_1 quantized lmHead input (hiddenSize/32 * 9 u32),
   -- lazily allocated on first dp4a-enabled lmHead call.
   lmHeadQ8Buf : IO.Ref (Option BufT)
@@ -294,6 +303,10 @@ def createInferenceState [GPUBackend β] (ctx : β) (cfg : Config) : IO (Inferen
           IO.println "[Gemma4] HESPER_DEVICE_ARGMAX requested but backend lacks UVA support; falling back to DtoH"
           pure none
       else pure none
+    -- doc 58 step B: 64 K u32 history (covers any reasonable maxTokens).
+    -- Slot starts at 0 and is incremented by historyAppendKernel each decode.
+    argmaxHistoryBuf := ← GPUBackend.allocBuffer ctx (65536 * 4 : USize)
+    historySlotBuf   := ← GPUBackend.allocBuffer ctx (4 : USize)
     lmHeadQ8Buf := ← IO.mkRef none
     lmHeadQuantizePrepared := ← GPUBackend.newCacheRef (β := β)
     lmHeadDP4APrepared := ← GPUBackend.newCacheRef (β := β)
@@ -412,7 +425,12 @@ def forwardBlock [GPUBackend β] (ctx : β)
     (state : InferenceState (GPUBackend.Buf β) (GPUBackend.CachedDispatch β)) (pos : Nat)
     (kcr : Option (KernelCacheRefs (GPUBackend.CachedDispatch β)) := none)
     (perLayerEmbd : Option (Gemma4PerLayerEmbd (GPUBackend.Buf β) (GPUBackend.CachedDispatch β)) := none)
-    (perLayerInput : Option (GPUBackend.Buf β) := none) : IO Unit := do
+    (perLayerInput : Option (GPUBackend.Buf β) := none)
+    -- doc 58: when true, skip the writeScalarViaStaging of pos /
+    -- posF32 / cacheLen.  Caller must guarantee paramsBuf and
+    -- posF32Buf already hold the right values (e.g. via
+    -- advancePosKernel at the end of the previous forward).
+    (skipPosWrite : Bool := false) : IO Unit := do
   let li := block.layerIdx
   let headDim := cfg.headDim li
 
@@ -615,7 +633,7 @@ def forwardBlock [GPUBackend β] (ctx : β)
   -- pinned source pointer once; the generate loop overwrites the slot
   -- before each replay, so the captured node still reads the current
   -- pos regardless of `li`.
-  if li == 0 then
+  if li == 0 && !skipPosWrite then
     let posBytes := Hesper.WebGPU.BufferOps.uint32ToBytes pos.toUInt32
     writeScalarViaStaging ctx state.paramsBuf 0 state.stagingParamsPtr 0 posBytes
     -- Also upload pos as f32 for Circuit DSL scatter addrExpr.  Routed
@@ -771,7 +789,7 @@ def forwardBlock [GPUBackend β] (ctx : β)
     -- Write cacheLen to params buffer for FlashAttention (params = [pos, cacheLen]).
     -- Layer-invariant within a single forward pass — write only on first
     -- block (same reasoning as pos above; see task #238).
-    if li == 0 then
+    if li == 0 && !skipPosWrite then
       let cacheLenBytes := Hesper.WebGPU.BufferOps.uint32ToBytes cacheLen.toUInt32
       writeScalarViaStaging ctx state.paramsBuf 4 state.stagingParamsPtr 4 cacheLenBytes
     Hesper.WGSL.Execute.withSection "flashAttn" do
@@ -823,7 +841,12 @@ def forwardBlock [GPUBackend β] (ctx : β)
     -- Equivalent to direct LinearLayer.forward; sets up the IR for later
     -- fusion with the post-attn norm chain.
     Hesper.WGSL.Execute.withSection "oProj" do
-      if disableFusion then
+      -- HESPER_BYPASS_OPROJ=1 short-circuits the Circuit DSL path for this
+      -- section. Used as the H4c A/B test (doc 57 §3b.7): result was
+      -- runCached 11.79 µs vs bypass 9.90 µs (-1.9 µs/call only). Kept
+      -- as a diagnostic toggle since it's behind an env flag.
+      let bypass := (← IO.getEnv "HESPER_BYPASS_OPROJ").isSome
+      if disableFusion || bypass then
         -- HESPER_FUSION_DISABLE=1: plain path so llama.cpp override fires.
         Linear.LinearLayer.forward ctx block.attention.wO
           state.attnOutBuf state.normedBuf
@@ -2616,7 +2639,11 @@ def forwardSingleToken [GPUBackend β] (ctx : β)
     (tokenId : Nat) (pos : Nat)
     (state : InferenceState (GPUBackend.Buf β) (GPUBackend.CachedDispatch β))
     (kcr : Option (KernelCacheRefs (GPUBackend.CachedDispatch β)) := none)
-    (skipTokenWrite : Bool := false) : IO Unit := do
+    (skipTokenWrite : Bool := false)
+    -- doc 58: when true, skip the writeScalarViaStaging of pos / cacheLen
+    -- in forwardBlock.  Caller (e.g. generate's HESPER_DEVICE_FED loop)
+    -- is responsible for advancing paramsBuf via advancePosKernel.
+    (skipPosWrite : Bool := false) : IO Unit := do
   -- HESPER_FWD_SUBSECT_TRACE=1 prints a per-call breakdown of where the
   -- host CPU spends time inside this forward.  Doc 57 §3: total `forward`
   -- section is ~5 ms steady-state and runs sequential with the GPU drain
@@ -2772,9 +2799,11 @@ def forwardSingleToken [GPUBackend β] (ctx : β)
       else
         forwardBlock ctx block model.config currentBuf nextBuf state pos
           (kcr := kcr) (perLayerEmbd := plEmbd) (perLayerInput := plInputBuf)
+          (skipPosWrite := skipPosWrite)
     | none =>
       forwardBlock ctx block model.config currentBuf nextBuf state pos
         (kcr := kcr) (perLayerEmbd := plEmbd) (perLayerInput := plInputBuf)
+        (skipPosWrite := skipPosWrite)
     let oldCb := currentBuf
     currentBuf := nextBuf
     nextBuf := oldCb
@@ -3065,6 +3094,24 @@ private def argmaxKernel (vocabSize : Nat) (historySlot : Nat := 0) : ShaderM Un
     ShaderM.writeBuffer (ty := .scalar .u32) "plRawRow"  (Exp.litU32 0) maxIdx
   ) (pure ())
 
+/-- Device-side history append: copy `src[0]` into `dst[slot[0]]`.
+    Used in HESPER_DEVICE_FED decode to record argmax outputs in
+    `state.argmaxHistoryBuf` without host sync.  Caller must ensure
+    `slot[0]` is a valid index < dst size; we set `slot[0] = pos -
+    promptLen` via a host-side initial seed + advancePos increments. -/
+private def historyAppendKernel : ShaderM Unit := do
+  let tid ← ShaderM.localId
+  let tid := Exp.vec3X tid
+  let _src  ← ShaderM.declareInputBuffer  "src"  (.array (.scalar .u32) 1)
+  let _slot ← ShaderM.declareOutputBuffer "slot" (.array (.scalar .u32) 1)
+  let _dst  ← ShaderM.declareOutputBuffer "dst"  (.array (.scalar .u32) 65536)
+  ShaderM.if_ (Exp.eq tid (Exp.litU32 0)) (do
+    let v ← ShaderM.readBuffer (ty := .scalar .u32) (n := 1) "src" (Exp.litU32 0)
+    let s ← ShaderM.readBuffer (ty := .scalar .u32) (n := 1) "slot" (Exp.litU32 0)
+    ShaderM.writeBuffer (ty := .scalar .u32) "dst" s v
+    ShaderM.writeBuffer (ty := .scalar .u32) "slot" (Exp.litU32 0) (Exp.add s (Exp.litU32 1))
+  ) (pure ())
+
 /-- Device-side pos/cacheLen/posF32 advance.
     One thread increments all three scalars in place so the next
     replay of the captured decode graph consumes position `pos+1`
@@ -3092,7 +3139,13 @@ private def gpuArgmax [GPUBackend β] (ctx : β)
     (logitsBuf argmaxBuf tokenBuf tokenIdsBuf plRawRowBuf : GPUBackend.Buf β)
     (vocabSize : Nat)
     (cacheRef : IO.Ref (Option (GPUBackend.CachedDispatch β)))
-    (hostMapped : Option (USize × GPUBackend.Buf β) := none) : IO Nat := do
+    (hostMapped : Option (USize × GPUBackend.Buf β) := none)
+    -- doc 58: when true, fire the argmax kernel but DO NOT sync the
+    -- stream / read the result.  Returns 0.  Use this when the host
+    -- doesn't need nextToken yet (token-feed is device-side via
+    -- tokenBuf) and only needs to read it later for the EOS / output
+    -- batch.  Closes the argmax→next-forward GPU idle bubble.
+    (deferRead : Bool := false) : IO Nat := do
   -- Pick the result buffer.  When `hostMapped` is set, the kernel writes
   -- straight into pinned host memory we can read with no driver call;
   -- otherwise fall back to the legacy device buffer + cuMemcpyDtoH path.
@@ -3105,6 +3158,8 @@ private def gpuArgmax [GPUBackend β] (ctx : β)
     , ("plRawRow", plRawRowBuf) ]
     { workgroupSize := { x := 256 }, numWorkgroups := (1, 1, 1) }
     (hash ("argmaxKernel", vocabSize)) cacheRef
+  if deferRead then
+    return 0
   match hostMapped with
   | some (hostPtr, _) =>
     -- Drain the stream so the kernel's `st.global` to the host-mapped
@@ -3120,6 +3175,7 @@ private def gpuArgmax [GPUBackend β] (ctx : β)
     let bytes ← GPUBackend.readBuffer ctx argmaxBuf (4 : USize)
     return (Hesper.Basic.bytesToUInt32 bytes 0).toNat
 
+set_option maxHeartbeats 800000 in
 /-- Generate tokens from a Gemma 4 model.
 
     @param device WebGPU device
@@ -3341,6 +3397,32 @@ def generate [GPUBackend β] (ctx : β) (model : Gemma4Model (GPUBackend.Buf β)
   if state.unifiedStream != 0 then
     Hesper.cudaCaptureStream.set (some state.unifiedStream)
   let decodeSectTrace := (← IO.getEnv "HESPER_DECODE_SECT_TRACE").isSome
+  -- HESPER_DEVICE_FED=1 (doc 58): drive forwardSingleToken from device-only
+  -- state.  Each iteration:
+  --   1. argmax kernel writes nextToken to state.tokenBuf / plRawRowBuf
+  --   2. advancePosKernel increments paramsBuf[0,1] / posF32Buf
+  --   3. forwardSingleToken called with skipTokenWrite=true, skipPosWrite=true
+  --      — host doesn't touch any device scalar between iterations
+  -- The host still reads `nextToken` once per iteration for EOS check, but
+  -- that read can be deferred / batched in a follow-up.  Requires:
+  --   * full-VRAM PLE table (not HESPER_USE_MMAP=1).
+  let deviceFed := (← IO.getEnv "HESPER_DEVICE_FED").isSome
+  if deviceFed && model.perLayerEmbdMmap.isSome then
+    IO.println "[Config] HESPER_DEVICE_FED=1 incompatible with HESPER_USE_MMAP=1; falling back to host-fed path"
+  let deviceFedActive := deviceFed && model.perLayerEmbdMmap.isNone
+  if deviceFedActive then
+    IO.println "[Config] HESPER_DEVICE_FED=1: device-fed decode loop active (doc 58)"
+  -- Counts how many forwards have run, separate from genCount which is
+  -- bumped *before* the forward (to push the next token).  We need the
+  -- post-forward count to gate skipPosWrite — the very first forward
+  -- still needs the host write because prefill left paramsBuf at
+  -- startPos=promptLen-1, not the position we need for token 0.
+  let mut decodeForwardsDone : Nat := 0
+  -- doc 58 step B: deferred argmax read.  Seeded once before the loop;
+  -- historyAppendKernel post-increments after each argmax write.
+  if deviceFedActive then do
+    let zeroBytes : ByteArray := ByteArray.mk #[0,0,0,0]
+    GPUBackend.writeBufferOffset ctx state.historySlotBuf 0 zeroBytes
   for _ in [0:maxTokens] do
     if tokens.size >= model.config.maxSeqLen then break
 
@@ -3365,9 +3447,22 @@ def generate [GPUBackend β] (ctx : β) (model : Gemma4Model (GPUBackend.Buf β)
         let tokenIdsBuf ← match ← state.prefillTokenIdsRef.get with
           | some (b, _) => pure b
           | none        => pure state.tokenBuf
-        gpuArgmax ctx state.logitsBuf state.argmaxBuf state.tokenBuf tokenIdsBuf
+        let v ← gpuArgmax ctx state.logitsBuf state.argmaxBuf state.tokenBuf tokenIdsBuf
           state.plRawRowBuf model.config.vocabSize state.argmaxCacheRef
           (hostMapped := state.argmaxHostMapped)
+          (deferRead := deviceFedActive && decodeForwardsDone >= 1)
+        -- doc 58 step B: when deferring, also append the freshly written
+        -- argmax to the per-decode history buffer so the host can recover
+        -- the token sequence after the decode loop ends.  historyAppend
+        -- self-increments historySlotBuf so subsequent calls land at
+        -- slot+1 — no per-iter host bookkeeping needed.
+        if deviceFedActive && decodeForwardsDone >= 1 then
+          GPUBackend.execute ctx historyAppendKernel
+            [ ("src",  state.tokenBuf)
+            , ("slot", state.historySlotBuf)
+            , ("dst",  state.argmaxHistoryBuf) ]
+            { workgroupSize := { x := 1 }, numWorkgroups := (1, 1, 1) }
+        pure v
 
     let tArgmaxEnd ← if decodeSectTrace then IO.monoNanosNow else pure 0
 
@@ -3502,7 +3597,30 @@ def generate [GPUBackend β] (ctx : β) (model : Gemma4Model (GPUBackend.Buf β)
               let bytes ← GPUBackend.readBuffer ctx state.logitsBuf (model.config.vocabSize * 4).toUSize
               IO.FS.writeBinFile s!"/tmp/hesper_unified_logits_step{genCount}.bin" bytes
           else
-            forwardSingleToken ctx model nextToken newPos state (kcr := some kcr)
+            -- doc 58: when HESPER_DEVICE_FED is on, skip the host-seeded
+            -- token / pos writes from genCount=1 onwards — the previous
+            -- iteration's argmax kernel wrote nextToken to state.tokenBuf
+            -- / plRawRowBuf, and advancePosKernel (added below) inc'd
+            -- paramsBuf / posF32Buf.  The very first decode iteration
+            -- (genCount=0) still needs host writes because prefill left
+            -- paramsBuf at startPos=promptLen-1 and tokenBuf at the prompt's
+            -- last token, neither of which match the position we need.
+            -- doc 58: from the *second* forward onwards, skip host writes
+            -- of token / pos; the previous iter's argmax kernel filled
+            -- tokenBuf, and advancePosKernel (below) bumped paramsBuf.
+            let dfThisIter := deviceFedActive && decodeForwardsDone >= 1
+            let dfTokenSkip := dfThisIter
+            let dfPosSkip   := dfThisIter
+            forwardSingleToken ctx model nextToken newPos state (kcr := some kcr) (skipTokenWrite := dfTokenSkip) (skipPosWrite := dfPosSkip)
+            if deviceFedActive then
+              -- Increment pos / cacheLen / posF32 device-side so the *next*
+              -- iteration's forward sees the correct values without any host
+              -- writeScalarViaStaging.  Same kernel the captured decode
+              -- graph uses (line 3081).
+              GPUBackend.execute ctx advancePosKernel
+                [ ("params", state.paramsBuf), ("posF32", state.posF32Buf) ]
+                { workgroupSize := { x := 1 }, numWorkgroups := (1, 1, 1) }
+            decodeForwardsDone := decodeForwardsDone + 1
             if (← IO.getEnv "HESPER_DUMP_LOGITS_SINGLE").isSome then
               let bytes ← GPUBackend.readBuffer ctx state.logitsBuf (model.config.vocabSize * 4).toUSize
               IO.FS.writeBinFile s!"/tmp/hesper_single_logits_step{genCount}.bin" bytes

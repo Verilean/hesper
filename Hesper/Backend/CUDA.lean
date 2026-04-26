@@ -561,9 +561,29 @@ instance : GPUBackend CUDAContext where
       -- Derive a unique PTX entry-point name from the caller's cacheKey so
       -- nsys/ncu can distinguish kernels in profiles. When cacheKey=0 (i.e.
       -- user didn't supply one) fall back to config.funcName.
+      -- Prepend a short human-readable tag from `config.funcName` (when
+      -- present and not already a hash) so nsys traces show e.g.
+      -- `oProj_k1387739930045770` instead of `k_1387739930045770`.
+      let humanTag : String :=
+        if config.funcName == "" || config.funcName == "main"
+           || config.funcName.startsWith "k_"
+        then ""
+        else
+          -- Compress: keep alnum+_ only, drop vowels (except first char) to
+          -- shorten while preserving readability.  Cap at 24 chars so PTX
+          -- entry symbols don't get unwieldy.
+          let raw := config.funcName.toList.filter (fun c =>
+            c.isAlphanum || c == '_')
+          let compressed := match raw with
+            | [] => []
+            | h :: t => h :: t.filter (fun c =>
+                c == '_' || (c.toLower != 'a' && c.toLower != 'e' &&
+                             c.toLower != 'i' && c.toLower != 'o' &&
+                             c.toLower != 'u'))
+          (String.mk compressed).take 24 ++ "_"
       let funcName :=
         if cacheKey == 0 then config.funcName
-        else s!"k_{(toString cacheKey.toNat).take 16}"
+        else s!"{humanTag}k{(toString cacheKey.toNat).take 16}"
       -- For human-readable miss histograms, record under the caller's
       -- `config.funcName` when it was tagged with a `ce "..."` name.  The
       -- PTX module still uses `funcName` (the hex key) so nsys kernel
