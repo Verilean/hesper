@@ -128,6 +128,66 @@ The "other" component on hesper splits in two:
   doesn't, because the host issues `forward (5 ms)` work *after* the
   drain finishes instead of before.
 
+### 3b.1. Forward subsection breakdown (HESPER_FWD_SUBSECT_TRACE=1, 2026-04-26)
+
+Inside the 5 ms `forward` section (steady-state, tok ≥ 4):
+
+| sub-section | host CPU / token | comment |
+|---|---:|---|
+| `prePLE` (embed lookup + embed scale + perLayerInputPre) | **~0.06 ms** | negligible |
+| `blocks` (42 transformer blocks, `forwardBlock`) | **~4.13 ms** | dominant |
+| `post` (finalNorm + lmHead + softcap) | **~0.78 ms** | small but real |
+| total | **~4.96 ms** | |
+
+**4.13 ms ÷ 42 blocks ≈ 98 µs / block** of host CPU per `forwardBlock`.
+A block emits ~20 dispatches (qkvNorm, Q4_K Q/K/V matmul, RoPE, KV scatter,
+FlashAttn, wO, ffn norm, gate+up, GELU, ffn down, post norm), so per-dispatch
+host overhead is **~5 µs**. nsys reports cuLaunchKernel total at 1.12 ms,
+i.e. driver wall ~1.3 µs/call — the remaining 3.7 µs/call is Lean-side
+work in `cudaExecuteImpl`: cacheRef.get, args Array build/expand,
+buffer pointer resolution, refcount management, FFI marshalling. Nothing
+in the trace is a single fat allocation; it's the steady drip of
+microseconds across hundreds of dispatches per token.
+
+**Implication for H4**: the 5 ms forward does not have a single hot
+function we can rewrite. Either we shave the per-dispatch overhead
+broadly (hard; #231/#235 took us this far) or we hide it under the GPU
+drain by reordering `cuStreamSync` so the host queues the next forward
+*before* draining the previous one. The captured-graph path (graphs ON)
+already achieves this; the question is whether we can replicate the
+ordering trick for the graphs-OFF path without recapture cost.
+
+### 3b.2. Graphs ON measurement (H4a verdict, 2026-04-26)
+
+`HESPER_CUDA_GRAPHS=1` captures the entire forward into a single CUDA
+graph and replays it as one `cuGraphLaunch` call per token. This collapses
+all per-dispatch host overhead (the 5 µs × 880 dispatches we just measured)
+into a single driver call, AND lets the host return immediately while the
+GPU works through the graph — which is the exact "host work overlaps with
+GPU drain" structure llama-cli uses.
+
+| metric (steady-state, tok ≥ 4) | graphs OFF | graphs ON | delta |
+|---|---:|---:|---:|
+| `argmax` section wall | ~10 ms | **0.005 ms** | -9.99 ms |
+| `forward` section wall | ~5 ms | **10 ms** | +5 ms |
+| `total` section wall | ~15 ms | **10 ms** | -5 ms |
+| TPS (80-token, prompt "Explain ...") | 59 TPS | **80 TPS** | +21 TPS |
+| TPS (steady-state extrapolation) | ~67 TPS | **~100 TPS** | +33 TPS |
+
+What changed:
+- The `forward` section now contains the cuGraphLaunch + drain wait
+  (cuStreamSynchronize) — these two were separate sections in graphs-OFF.
+- The `argmax` section is just a 5 µs `cuReadPinnedU32` from the
+  host-mapped slot (no driver call), because by the time we reach it the
+  drain has already happened inside `forward`.
+- Total wall ≈ GPU kernel time (10.9 ms), as it should be when host work
+  is fully overlapped with the GPU.
+
+**This invalidates `project_cuda_graphs_status.md` ("0 % speedup on CUDA
+backend")** — that conclusion was either from a buggy capture path or a
+flawed measurement. Doc 57's protocol gives the +20-30 TPS we expect from
+H4 in the canonical decomposition.
+
 ### 3c. Where the host CPU spends those 5 ms
 
 `perf record -e cycles:u --call-graph=fp` during steady-state decode:
@@ -160,7 +220,8 @@ drain → 15 ms total. If forward overlaps drain, total → 10 ms (= drain)
 | H1 | Need more kernel fusion (more ops per launch) | +20 TPS | already at parity | ✗ DEAD |
 | H2 | DtoH(4 byte) of argmax is a copy cost; replace with host-mapped slot | -9.8 ms → +30 TPS | -0.0 ms (renamed to cuStreamSync) | ✗ DEAD (#250) |
 | H3 | Per-kernel GPU time | +18 TPS | not yet attempted | active (#47, on hold) |
-| H4 | Forward host work runs sequentially with the drain; pipeline it across iterations | +30 TPS | not yet attempted | **active (#251) ← next** |
+| H4 | Forward host work runs sequentially with the drain; pipeline it across iterations | +30 TPS | partially measured (§3b.1) | **active (#251)** — subsection trace landed; reorder cuStreamSync next |
+| H4a | Existing CUDA-graph capture path (HESPER_CUDA_GRAPHS=1) already pipelines host launch via cuGraphLaunch | +20 TPS / steady state +30 TPS | **measured 59 → 80 TPS at 80-token, ~100 TPS steady-state** | ✓ CONFIRMED — see §3b.2 |
 | H5 | Lean Array expand in replay loop adds ms | +5 TPS | bounded ≤ 0.7 ms wall | ✗ marginal, deferred |
 | H6 | cuMemAlloc per token (driver alloc) | +5 TPS | already at 1 alloc/tok (pool); driver work is minimal | ✗ DEAD (#246) |
 | H7 | mmap PLE on-demand H2D | -3 TPS regression noted | confirmed | trade-off accepted (#247-248) |

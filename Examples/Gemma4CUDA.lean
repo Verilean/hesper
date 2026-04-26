@@ -20,7 +20,7 @@ open Hesper.Models.Gemma4
 -- Raised from the default 200K because `GPUBackend CUDAContext`'s
 -- instance body has grown large enough that `main` elaboration busts
 -- the budget when the typeclass is resolved across the forward path.
-set_option maxHeartbeats 800000
+set_option maxHeartbeats 1600000
 
 unsafe def main (args : List String) : IO Unit := do
   let ggufPath := args.getD 0 "data/gemma-4-e4b-it-Q4_K_M.gguf"

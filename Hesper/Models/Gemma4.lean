@@ -2613,6 +2613,13 @@ def forwardSingleToken [GPUBackend β] (ctx : β)
     (state : InferenceState (GPUBackend.Buf β) (GPUBackend.CachedDispatch β))
     (kcr : Option (KernelCacheRefs (GPUBackend.CachedDispatch β)) := none)
     (skipTokenWrite : Bool := false) : IO Unit := do
+  -- HESPER_FWD_SUBSECT_TRACE=1 prints a per-call breakdown of where the
+  -- host CPU spends time inside this forward.  Doc 57 §3: total `forward`
+  -- section is ~5 ms steady-state and runs sequential with the GPU drain
+  -- on the previous token, so this is the budget we want to attribute
+  -- before any restructuring.
+  let fwdSubTrace := (← IO.getEnv "HESPER_FWD_SUBSECT_TRACE").isSome
+  let tF0 ← if fwdSubTrace then IO.monoNanosNow else pure 0
   -- Step 1: Embedding lookup (format-dependent)
   -- Cached execute helper (same as forwardBlock's ce)
   let ce := fun (name : String) (shader : ShaderM Unit)
@@ -2718,6 +2725,8 @@ def forwardSingleToken [GPUBackend β] (ctx : β)
           { numWorkgroups := (nLayers, 1, 1), workgroupSize := { x := min embdPL 256, y := 1, z := 1 } : Hesper.ExecConfig }
     | _, _, _ => pure ()
 
+  let tF1_PrePLE ← if fwdSubTrace then IO.monoNanosNow else pure 0
+
   -- Step 2: Process all transformer blocks (starting from buf2 as current).
   -- If the caller has already started a batch (e.g. a batched prefill
   -- wrapper), we nest inside it instead of starting a new one. Callers that
@@ -2767,6 +2776,8 @@ def forwardSingleToken [GPUBackend β] (ctx : β)
     nextBuf := oldCb
     dumpBuf ctx currentBuf (model.config.hiddenSize * 4).toUSize s!"single_p{pos}_afterL{blockIdx}"
     blockIdx := blockIdx + 1
+
+  let tF2_BlocksEnd ← if fwdSubTrace then IO.monoNanosNow else pure 0
 
   -- Step 3: Final norm.  When the Q6_K dp4a lm_head path is available
   -- (Gemma 4's default for embdFormat=Q6_K with dp4a enabled), we defer
@@ -2980,6 +2991,13 @@ def forwardSingleToken [GPUBackend β] (ctx : β)
         (.dispatch1D model.config.vocabSize)
 
   if ownBatch then GPUBackend.endBatch ctx
+
+  if fwdSubTrace then
+    let tF3 ← IO.monoNanosNow
+    let p := (tF1_PrePLE - tF0).toFloat / 1e6
+    let b := (tF2_BlocksEnd - tF1_PrePLE).toFloat / 1e6
+    let q := (tF3 - tF2_BlocksEnd).toFloat / 1e6
+    IO.println s!"[fwdsub] prePLE={p} blocks={b} post={q}"
 
 /-! ## Text Generation -/
 
