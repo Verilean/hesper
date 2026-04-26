@@ -401,6 +401,21 @@ structure Module where
   rdRegCount : Nat
   pRegCount : Nat
   hRegCount : Nat := 0
+  /-- Optional kernel attribute: `.maxnreg N` — caps per-thread register
+      usage at N.  ptxas will spill to stack frame if it exceeds this.
+      Useful for occupancy tuning.  None = no cap (ptxas default). -/
+  maxnreg : Option Nat := none
+  /-- Optional kernel attribute: `.minnctapersm N` — promises ≥ N CTAs per
+      SM, which lets ptxas use **more registers per thread** (since fewer
+      threads share the SM register file).  E.g. with launch_bounds(128, 1)
+      → minnctapersm = 1 → up to 64K reg / 128 thread = 512 reg/thread
+      (capped at 255 by hw).  Combined with low CTA count, allows nvcc-
+      style register allocation. -/
+  minnctapersm : Option Nat := none
+  /-- Optional kernel attribute: `.maxntid X[, Y[, Z]]` — promises max
+      threads per CTA.  Combined with minnctapersm, gives ptxas full
+      occupancy info → `__launch_bounds__` equivalent. -/
+  maxntid : Option (Nat × Nat × Nat) := none
 
 def Module.render (m : Module) : String := Id.run do
   let mut s := s!".version {m.version}\n.target {m.target}\n.address_size 64\n\n"
@@ -411,7 +426,20 @@ def Module.render (m : Module) : String := Id.run do
   for i in [:m.params.size] do
     if i > 0 then s := s ++ ",\n"
     s := s ++ s!"  .param .u64 param_{m.params[i]!}"
-  s := s ++ "\n)\n{\n"
+  s := s ++ "\n)\n"
+  -- Per-kernel performance attributes (analogues of CUDA __launch_bounds__).
+  -- `.maxntid` and `.minnctapersm` together let ptxas know the launch
+  -- config, enabling more aggressive register allocation.
+  match m.maxntid with
+  | some (x, y, z) => s := s ++ s!".maxntid {x}, {y}, {z}\n"
+  | none => pure ()
+  match m.minnctapersm with
+  | some n => s := s ++ s!".minnctapersm {n}\n"
+  | none => pure ()
+  match m.maxnreg with
+  | some n => s := s ++ s!".maxnreg {n}\n"
+  | none => pure ()
+  s := s ++ "{\n"
   if m.fRegCount > 0  then s := s ++ s!"  .reg .f32 %f<{m.fRegCount}>;\n"
   -- Declare 32-bit registers as `.b32` (untyped) so they bind to any
   -- 32-bit instruction including `.u32`/`.s32`/`.b32`/`.f16x2` ops.

@@ -713,11 +713,19 @@ partial def stmtToPTX (stmt : Stmt) (s : GenState) : GenState :=
 /-- Generate a complete PTX module string from a ShaderM computation. -/
 def generatePTX
     (funcName : String := "main")
-    (_workgroupSize : WorkgroupSize := {x := 256, y := 1, z := 1})
+    (workgroupSize : WorkgroupSize := {x := 256, y := 1, z := 1})
     (computation : ShaderM Unit)
     (ptxVersion : String := "8.0")
     (targetArch : String := "sm_89")
+    (maxnreg : Option Nat := none)
+    (minnctapersm : Option Nat := none)
     : String :=
+  -- `__launch_bounds__` analogue: derive maxntid from the user's workgroup
+  -- size so ptxas knows the launch config and can use more registers per
+  -- thread when occupancy is low (see Module.minnctapersm doc).
+  let maxntid : Option (Nat × Nat × Nat) :=
+    if workgroupSize.x > 0 then some (workgroupSize.x, workgroupSize.y, workgroupSize.z)
+    else none
   let state := ShaderM.exec computation
   let sharedDecls := state.sharedVars.foldl (fun (acc : Array SharedDecl) (name, ty) =>
     match ty with
@@ -746,6 +754,7 @@ def generatePTX
     ({ sharedNames, u32BufferNames, u32SharedNames, readOnlyBufferNames } : GenState)
   let finalState := (state.stmts.foldl (fun s st => stmtToPTX st s) initState).emit .ret
   (Module.mk ptxVersion targetArch funcName paramNames sharedDecls
-    finalState.insts finalState.fRegs finalState.rRegs finalState.rdRegs finalState.pRegs finalState.hRegs).render
+    finalState.insts finalState.fRegs finalState.rRegs finalState.rdRegs
+    finalState.pRegs finalState.hRegs maxnreg minnctapersm maxntid).render
 
 end Hesper.CUDA.CodeGen
