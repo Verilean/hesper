@@ -1,5 +1,7 @@
 import Hesper.Backend
 import Hesper.Backend.CUDA
+import Hesper.Backend.LlamaCppPTX
+import Hesper.CUDA.FFI
 import Hesper.WGSL.Monad
 import Hesper.WGSL.Exp
 import Hesper.WGSL.Shader
@@ -48,6 +50,33 @@ private def packFloats (arr : Array Float) : ByteArray :=
        |>.push (bits >>> 8).toUInt8
        |>.push (bits >>> 16).toUInt8
        |>.push (bits >>> 24).toUInt8) ByteArray.empty
+
+/-- Convert f32 bits to IEEE 754 binary16 (half) bits.  Round-to-zero on
+    mantissa truncation; subnormals/Inf/NaN folded to zero / signed inf. -/
+private def f32ToF16Bits (b : UInt32) : UInt16 :=
+  let s : UInt32 := (b >>> 31) &&& 1
+  let e32 : UInt32 := (b >>> 23) &&& 0xFF
+  let m32 : UInt32 := b &&& 0x7FFFFF
+  if e32 == 0 then 0  -- f32 zero/subnormal → half zero
+  else if e32 == 0xFF then
+    -- f32 inf/nan → half inf (preserve sign)
+    (s.toUInt16 <<< 15) ||| (0x7C00 : UInt16)
+  else
+    let e32i : Int := e32.toNat - 127 + 15
+    if e32i <= 0 then 0
+    else if e32i >= 31 then
+      (s.toUInt16 <<< 15) ||| (0x7C00 : UInt16)
+    else
+      let m16 : UInt32 := m32 >>> 13
+      (s.toUInt16 <<< 15) |||
+      (e32i.toNat.toUInt16 <<< 10) |||
+      m16.toUInt16
+
+private def packHalfs (arr : Array Float) : ByteArray :=
+  arr.foldl (fun acc f =>
+    let h := f32ToF16Bits (f64ToF32Bits f)
+    acc.push h.toUInt8
+       |>.push (h >>> 8).toUInt8) ByteArray.empty
 
 private def unpackFloats (ba : ByteArray) (n : Nat) : Array Float := Id.run do
   let mut arr := #[]
@@ -156,6 +185,42 @@ def runCase
 
   return (legacyOut, vecOut)
 
+/-- Benchmark a single kernel by launching it `iters` times in a tight
+    loop, then `cuStreamSynchronize` once at the end.  Returns
+    (avg_us_per_call, total_wall_ms).
+
+    `warmup` calls run before timing to flush JIT / cubin cache.
+
+    We use the CUDA-internal `cuStreamSynchronize` (stream 0) — the
+    legacy / vec kernels both target the default stream when invoked
+    via `GPUBackend.execute`. -/
+def benchKernel
+    (ctx : Hesper.CUDAContext)
+    (kernelName : String)
+    (shader : Hesper.WGSL.Monad.ShaderM Unit)
+    (bufs : List (String × GPUBackend.Buf Hesper.CUDAContext))
+    (workgroupX : Nat) (numHeads : Nat)
+    (warmup iters : Nat) : IO (Float × Float) := do
+  let cfg : Hesper.ExecConfig := {
+    workgroupSize := { x := workgroupX, y := 1, z := 1 }
+    numWorkgroups := (numHeads, 1, 1)
+    extensions := ["subgroups"]
+  }
+  -- Warmup: PTX JIT, cubin cache, pipeline cache all get warm.
+  for _ in [0:warmup] do
+    GPUBackend.execute ctx shader bufs cfg
+  Hesper.CUDA.cuStreamSynchronize (0 : USize)
+  -- Timed loop
+  let t0 ← IO.monoNanosNow
+  for _ in [0:iters] do
+    GPUBackend.execute ctx shader bufs cfg
+  Hesper.CUDA.cuStreamSynchronize (0 : USize)
+  let t1 ← IO.monoNanosNow
+  let totalNs := t1 - t0
+  let totalMs := totalNs.toFloat / 1.0e6
+  let avgUs := totalNs.toFloat / iters.toFloat / 1000.0
+  return (avgUs, totalMs)
+
 def compareCase (label : String) (legacyOut vecOut : Array Float)
     (tolerance : Float := 1e-4) : IO Bool := do
   let mut maxAbs := 0.0
@@ -227,3 +292,108 @@ unsafe def main : IO Unit := do
   else
     IO.println "═══ SOME CASES FAILED — see above ═══"
     IO.Process.exit 1
+
+  -- ────────────────────────────────────────────────────────────────
+  -- Microbenchmark: real Gemma-4 geometry (numHeads=8, headDim=256,
+  -- numKVHeads=1) at a few cacheLen points spanning the decode range.
+  -- 200 iters per kernel after 20 warmup → total wall ~50 ms / point.
+  -- Lets us iterate on kernel design with sub-second TAT.
+  --
+  -- Third column: llama.cpp's flash_attn_ext_vec<D=256, ncols=1, K=f16,
+  -- V=f16> PTX, loaded via Hesper.LlamaCppPTX.  Requires the extracted
+  -- PTX at /tmp/llamacpp_ptx/fattn_vec_f16f16.ptx (see scripts in
+  -- docs/llama-fusion-analysis/60-flashattn-execution-plan.md).  If
+  -- absent, the column is skipped with a one-line note.
+  IO.println ""
+  IO.println "═══ Microbenchmark (Gemma 4 geometry: nH=8, nKV=1, D=256) ═══"
+  let llamaKernelOpt ← try
+      let k ← Hesper.LlamaCppPTX.loadFattnVecF16F16Kernel
+      pure (some k)
+    catch e =>
+      IO.println s!"  (llama.cpp PTX column skipped — {e})"
+      pure none
+  let benchCases : List (Nat × Nat) :=
+    [ (256, 8), (256, 32), (256, 64), (256, 128), (256, 200) ]
+  let warmup := 20
+  let iters := 200
+  for (maxSeq, cacheLen) in benchCases do
+    let nh := 8
+    let nkv := 1
+    let hd := 256
+    let scale : Float := 1.0 / hd.toFloat.sqrt
+    -- Set up buffers once per cacheLen point.  Reuse across kernels
+    -- for fair memory-state comparison.
+    let qSize := (nh * hd * 4).toUSize
+    let kvSize := (nkv * maxSeq * hd * 4).toUSize
+    let kvSizeHalf := (nkv * maxSeq * hd * 2).toUSize
+    let qBuf ← GPUBackend.allocBuffer ctx qSize
+    let kBuf ← GPUBackend.allocBuffer ctx kvSize
+    let vBuf ← GPUBackend.allocBuffer ctx kvSize
+    let outBuf ← GPUBackend.allocBuffer ctx qSize
+    let paramsBuf ← GPUBackend.allocBuffer ctx (8 : USize)
+    -- f16 mirror buffers for llama.cpp's K=f16, V=f16 instantiation.
+    let kBufHalf ← GPUBackend.allocBuffer ctx kvSizeHalf
+    let vBufHalf ← GPUBackend.allocBuffer ctx kvSizeHalf
+    let outBufLlama ← GPUBackend.allocBuffer ctx qSize
+    let qData := Array.range (nh * hd)
+                  |>.map (fun i => 0.1 + (i.toFloat / 64.0).sin)
+    GPUBackend.writeBuffer ctx qBuf (packFloats qData)
+    -- KV: just zero-fill is enough for timing; the kernel reads the
+    -- full row regardless of values.
+    let kvZeros : Array Float := Array.replicate (nkv * maxSeq * hd) 0.0
+    GPUBackend.writeBuffer ctx kBuf (packFloats kvZeros)
+    GPUBackend.writeBuffer ctx vBuf (packFloats kvZeros)
+    GPUBackend.writeBuffer ctx kBufHalf (packHalfs kvZeros)
+    GPUBackend.writeBuffer ctx vBufHalf (packHalfs kvZeros)
+    GPUBackend.writeBuffer ctx paramsBuf (packU32x2 (cacheLen - 1) cacheLen)
+
+    let bufs : List (String × GPUBackend.Buf Hesper.CUDAContext) :=
+      [ ("q",       qBuf)
+      , ("k_cache", kBuf)
+      , ("v_cache", vBuf)
+      , ("output",  outBuf)
+      , ("params",  paramsBuf) ]
+
+    let legacyShader := Hesper.WGSL.FlashAttention.flashAttentionDynamicParamsKernel
+                         nh nkv maxSeq hd scale 256
+    let vecShader    := Hesper.WGSL.FlashAttention.flashAttentionVecParamsKernel
+                         nh nkv maxSeq hd scale
+
+    let (legacyUs, legacyMs) ← benchKernel ctx "legacy" legacyShader bufs 256 nh warmup iters
+    let (vecUs,    vecMs)    ← benchKernel ctx "vec"    vecShader    bufs 128 nh warmup iters
+    let speedup := legacyUs / vecUs
+
+    -- Third column: llama.cpp PTX (only if the PTX module loaded).
+    let llamaInfo ← match llamaKernelOpt with
+      | none => pure ""
+      | some llamaK => do
+        -- Warmup
+        for _ in [0:warmup] do
+          Hesper.LlamaCppPTX.launchFlashAttnVecF16F16D256 llamaK
+            qBuf.ptr kBufHalf.ptr vBufHalf.ptr outBufLlama.ptr
+            nh nkv hd cacheLen maxSeq scale
+        Hesper.CUDA.cuStreamSynchronize (0 : USize)
+        let t0 ← IO.monoNanosNow
+        for _ in [0:iters] do
+          Hesper.LlamaCppPTX.launchFlashAttnVecF16F16D256 llamaK
+            qBuf.ptr kBufHalf.ptr vBufHalf.ptr outBufLlama.ptr
+            nh nkv hd cacheLen maxSeq scale
+        Hesper.CUDA.cuStreamSynchronize (0 : USize)
+        let t1 ← IO.monoNanosNow
+        let llamaUs := (t1 - t0).toFloat / iters.toFloat / 1000.0
+        let llamaMs := (t1 - t0).toFloat / 1.0e6
+        let vecVsLlama := vecUs / llamaUs
+        pure s!"  llama={llamaUs} µs/call ({llamaMs} ms / {iters})  vec/llama={vecVsLlama}×"
+    IO.println s!"  cacheLen={cacheLen}: legacy={legacyUs} µs/call  vec={vecUs} µs/call  legacy/vec={speedup}×{llamaInfo}"
+
+    GPUBackend.freeBuffer ctx qBuf
+    GPUBackend.freeBuffer ctx kBuf
+    GPUBackend.freeBuffer ctx vBuf
+    GPUBackend.freeBuffer ctx outBuf
+    GPUBackend.freeBuffer ctx paramsBuf
+    GPUBackend.freeBuffer ctx kBufHalf
+    GPUBackend.freeBuffer ctx vBufHalf
+    GPUBackend.freeBuffer ctx outBufLlama
+
+  IO.println ""
+  IO.println "═══ DONE ═══"
