@@ -594,6 +594,14 @@ partial def expToPTX (e : Exp t) (s : GenState) : ExpResult :=
     let (ra, s) := expToPTX a s; let (rb, s) := expToPTX b s; let (rc, s) := expToPTX c s
     let (r, s) := s.freshF32; (.f32 r, s.emit (.fma_f32 r ra.toF32! rb.toF32! rc.toF32!))
 
+  -- Packed half2 FMA: dst = a*b + c, each u32 holds two f16.  Single PTX
+  -- `fma.rn.f16x2` instruction → half the FMA-throughput cost vs two
+  -- scalar f16 fmas.
+  | .fmaF16x2 a b c =>
+    let (ra, s) := expToPTX a s; let (rb, s) := expToPTX b s; let (rc, s) := expToPTX c s
+    let (r, s) := s.freshU32
+    (.u32 r, s.emit (.fma_rn_f16x2 r ra.toU32! rb.toU32! rc.toU32!))
+
   -- Fallback
   | _ => let (r, s) := s.freshU32; (.u32 r, s)
 

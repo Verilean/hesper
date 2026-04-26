@@ -523,6 +523,13 @@ inductive Exp : WGSLType → Type where
   | pack2x16unorm : Exp (.vec2 .f32) → Exp (.scalar .u32)
   | pack2x16float : Exp (.vec2 .f32) → Exp (.scalar .u32)
 
+  /-- Packed half2 fused multiply-add: dst = a*b + c, where each operand
+      holds two f16 values packed into one u32 (low half = lane 0, high = 1).
+      CUDA backend lowers to a single `fma.rn.f16x2` PTX instruction.
+      WGSL backend uses native vec2<f16> fma (requires `enable f16;`). -/
+  | fmaF16x2 : Exp (.scalar .u32) → Exp (.scalar .u32) → Exp (.scalar .u32)
+              → Exp (.scalar .u32)
+
   -- Data unpacking functions (extract from packed format)
   | unpack4x8snorm : Exp (.scalar .u32) → Exp (.vec4 .f32)
   | unpack4x8unorm : Exp (.scalar .u32) → Exp (.vec4 .f32)
@@ -899,6 +906,12 @@ partial def Exp.toWGSL {t : WGSLType} : Exp t → String
     s!"pack2x16unorm({toWGSL v})"
   | pack2x16float v =>
     s!"pack2x16float({toWGSL v})"
+  | fmaF16x2 a b c =>
+    -- Native packed half2 fma via WGSL `enable f16;`: each u32 holds two
+    -- f16 values, bitcast to vec2<f16>, fma, bitcast back.  Compiles to
+    -- a single packed-fma on backends supporting fp16 (Vulkan
+    -- VK_KHR_shader_float16_int8).
+    s!"bitcast<u32>(fma(bitcast<vec2<f16>>({toWGSL a}), bitcast<vec2<f16>>({toWGSL b}), bitcast<vec2<f16>>({toWGSL c})))"
   | unpack4x8snorm v =>
     s!"unpack4x8snorm({toWGSL v})"
   | unpack4x8unorm v =>
