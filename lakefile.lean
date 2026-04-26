@@ -922,6 +922,10 @@ lean_exe «gemma4-llama-prefill-skeleton» where
   root := `Examples.Gemma4LlamaPrefillSkeleton
   moreLinkArgs := stdLinkArgs ++ #["./.lake/build/native/libhesper_cuda.a", "-lcuda"]
 
+lean_exe «gemma4-stub-decode-bench» where
+  root := `Examples.Gemma4StubDecodeBench
+  moreLinkArgs := stdLinkArgs ++ #["./.lake/build/native/libhesper_cuda.a", "-lcuda"]
+
 lean_exe «gemma4-unit-tests» where
   root := `Tests.GoldenUnit.Main
   moreLinkArgs := stdLinkArgs ++ #["./.lake/build/native/libhesper_cuda.a", "-lcuda"]
