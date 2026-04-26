@@ -1749,9 +1749,17 @@ def flashAttentionVecParamsKernelV9
       -- inBounds against splitEnd (not cacheLen) so the last tile within
       -- this split is correctly truncated when cacheLen / numSplits is not
       -- a multiple of workgroupSize.
-      let inBounds := Exp.lt kPos splitEnd
-      let kPosSafe := Exp.select inBounds kPos (Exp.litU32 0)
-      let kRowBaseU32 := Exp.add kHeadBaseU32 (Exp.mul kPosSafe kRowStrideU32)
+      -- ShaderM.let' materialises an Exp as a PTX register so the inner
+      -- pk-loop (4 pairs × 2 dims = 8 uses per K position) reads one
+      -- register instead of re-inlining the AST 8 times — see
+      -- Hesper/WGSL/Monad.lean's let' docstring for the V9 17×
+      -- instruction-bloat case study that motivated this helper.
+      let inBoundsU32 ← ShaderM.let' (.scalar .u32)
+                          (Exp.select (Exp.lt kPos splitEnd) (Exp.litU32 1) (Exp.litU32 0))
+      let inBounds := Exp.eq inBoundsU32 (Exp.litU32 1)
+      let kPosSafe ← ShaderM.let' (.scalar .u32) (Exp.select inBounds kPos (Exp.litU32 0))
+      let kRowBaseU32 ← ShaderM.let' (.scalar .u32)
+                          (Exp.add kHeadBaseU32 (Exp.mul kPosSafe kRowStrideU32))
       let partialVar ← ShaderM.var (.scalar .f32) (Exp.litF32 0.0)
       for pk in [0:dPerLanePair] do
         let wordOff := Exp.add (Exp.litU32 (pk * 32)) laneId
@@ -1804,10 +1812,14 @@ def flashAttentionVecParamsKernelV9
       let kqScoreSlot := Exp.add (Exp.mul warpId (Exp.litU32 32)) kOff
       let kqScoreRaw ← ShaderM.readWorkgroup (ty := .scalar .f32)
                         (n := workgroupSize) "shared_kq" kqScoreSlot
-      let inBounds := Exp.lt kPos splitEnd
-      let kPosSafe := Exp.select inBounds kPos (Exp.litU32 0)
-      let kqScore := Exp.select inBounds kqScoreRaw (Exp.litF32 0.0)
-      let vRowBaseU32 := Exp.add kHeadBaseU32 (Exp.mul kPosSafe kRowStrideU32)
+      -- See Phase 1 for the let' rationale.
+      let inBoundsU32 ← ShaderM.let' (.scalar .u32)
+                          (Exp.select (Exp.lt kPos splitEnd) (Exp.litU32 1) (Exp.litU32 0))
+      let inBounds := Exp.eq inBoundsU32 (Exp.litU32 1)
+      let kPosSafe ← ShaderM.let' (.scalar .u32) (Exp.select inBounds kPos (Exp.litU32 0))
+      let kqScore ← ShaderM.let' (.scalar .f32) (Exp.select inBounds kqScoreRaw (Exp.litF32 0.0))
+      let vRowBaseU32 ← ShaderM.let' (.scalar .u32)
+                          (Exp.add kHeadBaseU32 (Exp.mul kPosSafe kRowStrideU32))
       for pk in [0:dPerLanePair] do
         let wordOff := Exp.add (Exp.litU32 (pk * 32)) laneId
         let vWordIdx := Exp.add vRowBaseU32 wordOff

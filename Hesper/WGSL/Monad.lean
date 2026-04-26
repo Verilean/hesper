@@ -112,6 +112,30 @@ def varRef (ty : WGSLType) (init : Exp ty) : ShaderM (String × Exp ty) := do
   emitStmt (Stmt.varDecl name ty (some ⟨ty, init⟩))
   return (name, Exp.var name)
 
+/-- Bind a sub-expression to a named PTX register and return an `Exp.var`
+    referring to it.  Use this when an `Exp` is referenced multiple times
+    inside an unrolled loop body or fan-out: without it, each reference is
+    inlined as a fresh AST traversal and the CodeGen emits the same
+    arithmetic at every use site (causing the 17× instruction inflation
+    seen in V9 vs llama.cpp).  Wrapping the value with `let'` materialises
+    it as one PTX register that all uses share.
+
+    Example:
+    ```
+    let kRowBase ← ShaderM.let' (.scalar .u32) (Exp.add base offset)
+    for pk in [0:4] do
+      -- `kRowBase` is a single Exp.var, so the four iterations all
+      -- read the same register instead of recomputing `base + offset`.
+      let idx := Exp.add kRowBase (Exp.litU32 (pk * 32))
+      ...
+    ```
+    Functionally equivalent to `do let n ← var ty e; pure (Exp.var n)`,
+    but the intent is clearer at the call site. -/
+def let' (ty : WGSLType) (init : Exp ty) : ShaderM (Exp ty) := do
+  let name ← freshVar "v"
+  emitStmt (Stmt.varDecl name ty (some ⟨ty, init⟩))
+  return Exp.var name
+
 /-- Declare shared memory (workgroup-scoped) with fresh name -/
 def shared (ty : WGSLType) : ShaderM String := do
   let name ← freshVar "shared"
