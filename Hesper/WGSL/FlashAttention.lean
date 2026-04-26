@@ -1764,11 +1764,16 @@ def flashAttentionVecParamsKernelV9
       for pk in [0:dPerLanePair] do
         let wordOff := Exp.add (Exp.litU32 (pk * 32)) laneId
         let kWordIdx := Exp.add kRowBaseU32 wordOff
-        let kPacked ← ShaderM.readBuffer (ty := .scalar .u32) (n := kvWords)
-                        "k_cache_f16" kWordIdx
+        let kPackedRaw ← ShaderM.readBuffer (ty := .scalar .u32) (n := kvWords)
+                           "k_cache_f16" kWordIdx
+        -- Pin kPacked to a register so CodeGen lowers vecX + vecY of the
+        -- same packed half2 into ONE ld.global, not two.  Without this,
+        -- the AST traversal for `unpack.x` and `unpack.y` each emits a
+        -- fresh load → doubles the load count in the K loop.
+        let kPacked ← ShaderM.let' (.scalar .u32) kPackedRaw
         let unpacked := Exp.unpack2x16float kPacked
-        let k0 := Exp.vecX unpacked
-        let k1 := Exp.vecY unpacked
+        let k0 ← ShaderM.let' (.scalar .f32) (Exp.vecX unpacked)
+        let k1 ← ShaderM.let' (.scalar .f32) (Exp.vecY unpacked)
         let q0Exp : Exp (.scalar .f32) := Exp.var q0Vars[pk]!
         let q1Exp : Exp (.scalar .f32) := Exp.var q1Vars[pk]!
         ShaderM.assign partialVar
@@ -1823,11 +1828,12 @@ def flashAttentionVecParamsKernelV9
       for pk in [0:dPerLanePair] do
         let wordOff := Exp.add (Exp.litU32 (pk * 32)) laneId
         let vWordIdx := Exp.add vRowBaseU32 wordOff
-        let vPacked ← ShaderM.readBuffer (ty := .scalar .u32) (n := kvWords)
-                        "v_cache_f16" vWordIdx
+        let vPackedRaw ← ShaderM.readBuffer (ty := .scalar .u32) (n := kvWords)
+                           "v_cache_f16" vWordIdx
+        let vPacked ← ShaderM.let' (.scalar .u32) vPackedRaw
         let unpacked := Exp.unpack2x16float vPacked
-        let v0 := Exp.vecX unpacked
-        let v1 := Exp.vecY unpacked
+        let v0 ← ShaderM.let' (.scalar .f32) (Exp.vecX unpacked)
+        let v1 ← ShaderM.let' (.scalar .f32) (Exp.vecY unpacked)
         let prev0 : Exp (.scalar .f32) := Exp.var vkq0Vars[pk]!
         let prev1 : Exp (.scalar .f32) := Exp.var vkq1Vars[pk]!
         ShaderM.assign vkq0Vars[pk]! (Exp.add prev0 (Exp.mul v0 kqScore))
