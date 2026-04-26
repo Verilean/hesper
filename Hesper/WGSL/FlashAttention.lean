@@ -320,6 +320,163 @@ def flashAttentionDynamicParamsKernel (numHeads numKVHeads maxSeqLen headDim : N
       let outIdx := Exp.add (Exp.mul head (Exp.litU32 headDim)) d
       ShaderM.writeBuffer (ty := .scalar .f32) "output" outIdx v
 
+/-- doc 60 Session 1: warp-shuffle vec kernel.
+
+    Like flashAttentionDynamicParamsKernel but reduces the q·K[s] dot
+    product via `subgroupAdd` (warp shuffle) instead of a shared-memory
+    tree reduce.  workgroupSize is fixed at 128 (4 warps × 32 lanes).
+
+    ## why this is faster
+
+    The legacy 256-thread tree reduce inside the cacheLen-step loop has
+    log2(256)=8 barriers per K position.  For Gemma 4 (head_dim=256,
+    cacheLen up to ~200) that is **8 × cacheLen ≈ 1600 barriers per head
+    per token**.  Replacing the tree with subgroupAdd cuts each K-step
+    reduce to:
+
+      warp-shuffle sum    : 5 shfl.bfly, 0 barriers
+      lane-0 → smem write : 1 barrier
+      warp-0 cross-warp   : 1 subgroupAdd over numWarps=4 lanes (cheap)
+      barrier             : 1
+      ──────────────────────
+      per-K total         : 2 barriers (vs the old 8)
+
+    so we expect ~4× fewer barriers in the inner loop, plus subgroupAdd
+    is a register-level shuffle that does not touch shared memory.
+
+    ## algorithm (unchanged from the legacy dynamic kernel)
+
+    Same online softmax over a serial K loop; workgroups are still per
+    head (gridX = numHeads, gridY = 1).  This is the *conservative*
+    Option B (doc 60): we keep cacheLen-serial, just switch the reduce
+    primitive.  A future revision can re-shape to llama.cpp's K-parallel
+    layout (multiple warps each processing a distinct K position) for
+    the remaining gap. -/
+def flashAttentionVecParamsKernel (numHeads numKVHeads maxSeqLen headDim : Nat)
+    (scale : Float) : ShaderM Unit := do
+  let workgroupSize : Nat := 128
+  let numWarps : Nat := workgroupSize / 32
+
+  let wgid ← ShaderM.workgroupId
+  let lid ← ShaderM.localId
+  let head := Exp.vec3X wgid
+  let tid := Exp.vec3X lid
+
+  let headsPerKV := numHeads / numKVHeads
+  let kvHead := Exp.div head (Exp.litU32 headsPerKV)
+
+  let _q ← ShaderM.declareInputBuffer "q" (.array (.scalar .f32) (numHeads * headDim))
+  let _kCache ← ShaderM.declareInputBuffer "k_cache" (.array (.scalar .f32) (numKVHeads * maxSeqLen * headDim))
+  let _vCache ← ShaderM.declareInputBuffer "v_cache" (.array (.scalar .f32) (numKVHeads * maxSeqLen * headDim))
+  let _output ← ShaderM.declareOutputBuffer "output" (.array (.scalar .f32) (numHeads * headDim))
+  let _params ← ShaderM.declareStorageBuffer "params" (.array (.scalar .u32) 2) .read
+
+  ShaderM.sharedNamed "shared_q" (.array (.scalar .f32) headDim)
+  -- One slot per warp for warpBlock-style sum gather.  Sized to numWarps
+  -- (4) but rounded up to 32 so warp 0's cross-warp subgroupAdd has a
+  -- fixed-shape array to read.
+  ShaderM.sharedNamed "shared_warp_sums" (.array (.scalar .f32) 32)
+  -- Online softmax accumulators live in shared memory because the
+  -- per-K rescale must be visible to every thread that contributes to
+  -- the per-dim out_acc array (the 256 threads each own a portion of
+  -- shared_out below).
+  ShaderM.sharedNamed "shared_out" (.array (.scalar .f32) headDim)
+
+  -- Staged Q load
+  let qBase := Exp.mul head (Exp.litU32 headDim)
+  ShaderM.loop tid (Exp.litU32 headDim) (Exp.litU32 workgroupSize) fun d => do
+    let qVal ← ShaderM.readBuffer (ty := .scalar .f32) (n := numHeads * headDim) "q" (Exp.add qBase d)
+    ShaderM.writeWorkgroup (ty := .scalar .f32) "shared_q" d qVal
+    ShaderM.writeWorkgroup (ty := .scalar .f32) "shared_out" d (Exp.litF32 0.0)
+  ShaderM.barrier
+
+  ShaderM.varNamed "max_score" (.scalar .f32) (Exp.litF32 (-1.0e30))
+  ShaderM.varNamed "sum_exp" (.scalar .f32) (Exp.litF32 0.0)
+  let maxScore := Exp.var "max_score"
+  let sumExp := Exp.var "sum_exp"
+
+  let cacheLen ← ShaderM.readBuffer (ty := .scalar .u32) (n := 2) "params" (Exp.litU32 1)
+
+  let laneId := Exp.bitAnd tid (Exp.litU32 31)
+  let warpId := Exp.shiftRight tid (Exp.litU32 5)
+
+  ShaderM.loop (Exp.litU32 0) cacheLen (Exp.litU32 1) fun s => do
+    let kBase := Exp.add (Exp.mul (Exp.mul kvHead (Exp.litU32 maxSeqLen)) (Exp.litU32 headDim))
+                          (Exp.mul s (Exp.litU32 headDim))
+
+    -- Each thread accumulates the partial dot product across its slice
+    -- of the head dimension.  For workgroupSize=128 and headDim=256 each
+    -- thread covers 2 dims.
+    let partialVar ← ShaderM.var (.scalar .f32) (Exp.litF32 0.0)
+    ShaderM.loop tid (Exp.litU32 headDim) (Exp.litU32 workgroupSize) fun d => do
+      let qVal ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := headDim) "shared_q" d
+      let kVal ← ShaderM.readBuffer (ty := .scalar .f32) (n := numKVHeads * maxSeqLen * headDim) "k_cache" (Exp.add kBase d)
+      ShaderM.assign partialVar (Exp.add (Exp.var partialVar) (Exp.mul qVal kVal))
+
+    -- Warp-level reduce (5 shfl.bfly, 0 barriers).  Materialise via
+    -- ShaderM.var so the shfls are emitted before the subsequent
+    -- predicated smem write — same trick as warpBlockSumReduce.
+    let warpSumName ← ShaderM.var (.scalar .f32) (Exp.subgroupAdd (Exp.var partialVar))
+    let warpSum : Exp (.scalar .f32) := Exp.var warpSumName
+
+    -- Lane 0 of each warp publishes its warp's sum.
+    ShaderM.if_ (Exp.eq laneId (Exp.litU32 0)) (do
+      ShaderM.writeWorkgroup (ty := .scalar .f32) "shared_warp_sums" warpId warpSum
+    ) (pure ())
+    ShaderM.barrier
+
+    -- Warp-0 lane-i reads slot i.  Lanes >= numWarps read 0 so the
+    -- subsequent subgroupAdd doesn't pick up uninitialised values.
+    -- We let *all* 32 lanes in warp 0 participate (mask = 0xFFFFFFFF)
+    -- to keep shfl.sync from deadlocking.
+    let slotVal ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := 32) "shared_warp_sums" laneId
+    let guardedName ← ShaderM.var (.scalar .f32)
+      (Exp.select (Exp.lt laneId (Exp.litU32 numWarps)) slotVal (Exp.litF32 0.0))
+    let guarded : Exp (.scalar .f32) := Exp.var guardedName
+    let totalWarpName ← ShaderM.var (.scalar .f32) (Exp.subgroupAdd guarded)
+    let totalScoreLane0 : Exp (.scalar .f32) := Exp.var totalWarpName
+    -- Broadcast lane 0's value into a single shared slot so every thread
+    -- can read the same final score without needing per-thread shfls
+    -- across warp boundaries.
+    ShaderM.if_ (Exp.eq tid (Exp.litU32 0)) (do
+      ShaderM.writeWorkgroup (ty := .scalar .f32) "shared_warp_sums" (Exp.litU32 0) totalScoreLane0
+    ) (pure ())
+    ShaderM.barrier
+
+    let scoreFromShared ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := 32) "shared_warp_sums" (Exp.litU32 0)
+    let scaledScore := Exp.mul (Exp.litF32 scale) scoreFromShared
+
+    -- Capture the old max/sum *before* `assign` overwrites them.  Using
+    -- `Exp.var` directly would re-read the shared name on each use and
+    -- pick up the partially-updated value mid-iteration (matches the
+    -- existing flashAttentionDynamicParamsKernel pattern).
+    let oldMaxVar ← ShaderM.var (.scalar .f32) maxScore
+    let oldSumVar ← ShaderM.var (.scalar .f32) sumExp
+    let oldMax := Exp.var oldMaxVar
+    let oldSum := Exp.var oldSumVar
+    let newMax := Exp.max oldMax scaledScore
+    let expOld := Exp.exp (Exp.sub oldMax newMax)
+    let expNew := Exp.exp (Exp.sub scaledScore newMax)
+    let newSum := Exp.add (Exp.mul oldSum expOld) expNew
+    let rescaleFactor := Exp.div (Exp.mul oldSum expOld) newSum
+    let contribFactor := Exp.div expNew newSum
+
+    -- All threads scan their slice of headDim and update shared_out.
+    ShaderM.loop tid (Exp.litU32 headDim) (Exp.litU32 workgroupSize) fun d => do
+      let vVal ← ShaderM.readBuffer (ty := .scalar .f32) (n := numKVHeads * maxSeqLen * headDim) "v_cache" (Exp.add kBase d)
+      let prev ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := headDim) "shared_out" d
+      let updated := Exp.add (Exp.mul prev rescaleFactor) (Exp.mul vVal contribFactor)
+      ShaderM.writeWorkgroup (ty := .scalar .f32) "shared_out" d updated
+
+    ShaderM.assign "max_score" newMax
+    ShaderM.assign "sum_exp" newSum
+    ShaderM.barrier
+
+  ShaderM.loop tid (Exp.litU32 headDim) (Exp.litU32 workgroupSize) fun d => do
+    let v ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := headDim) "shared_out" d
+    let outIdx := Exp.add (Exp.mul head (Exp.litU32 headDim)) d
+    ShaderM.writeBuffer (ty := .scalar .f32) "output" outIdx v
+
 /-- Batched flash-attention for prefill: processes `seqLen` query tokens in
     one dispatch, attending each over its own causal prefix of the K/V cache.
 
@@ -1215,6 +1372,38 @@ def executeFlashAttentionTiled [GPUBackend β] (ctx : β)
         | some lk => lk cacheKey2
         | none    => IO.mkRef none
     GPUBackend.executeWithConfigCached ctx shader2 namedBuffers2 execConfig2 cacheKey2 ref2
+
+/-- doc 60 Session 1: launcher for flashAttentionVecParamsKernel.
+
+    Same call shape as `executeFlashAttentionDynamic` — single-token Q,
+    cacheLen lives in `state.paramsBuf[1]` (so the PTX is fully cacheable
+    and CUDA-Graph friendly).  The only difference vs the legacy launcher
+    is the workgroup size (128 instead of `min 256 headDim`) and the
+    use of the new shader. -/
+def executeFlashAttentionVecParams [GPUBackend β] (ctx : β)
+    (qBuf kCacheBuf vCacheBuf outputBuf paramsBuf : GPUBackend.Buf β)
+    (numHeads numKVHeads maxSeqLen headDim : Nat) (scale : Float)
+    (kcrLookup :
+       Option (UInt64 → IO (IO.Ref (Option (GPUBackend.CachedDispatch β)))) := none)
+    : IO Unit := do
+  let workgroupSize := 128
+  let shader := flashAttentionVecParamsKernel numHeads numKVHeads maxSeqLen headDim scale
+  let namedBuffers :=
+    [ ("q",       qBuf)
+    , ("k_cache", kCacheBuf)
+    , ("v_cache", vCacheBuf)
+    , ("output",  outputBuf)
+    , ("params",  paramsBuf) ]
+  let cacheKey : UInt64 := hash ("flashVecParams", numHeads, numKVHeads, maxSeqLen, headDim)
+  let execConfig : Hesper.ExecConfig := {
+    workgroupSize := { x := workgroupSize, y := 1, z := 1 }
+    numWorkgroups := (numHeads, 1, 1)
+    extensions := ["subgroups"]
+  }
+  let ref ← match kcrLookup with
+    | some lk => lk cacheKey
+    | none    => IO.mkRef none
+  GPUBackend.executeWithConfigCached ctx shader namedBuffers execConfig cacheKey ref
 
 def executeFlashAttentionDynamic [GPUBackend β] (ctx : β)
     (qBuf kCacheBuf vCacheBuf outputBuf : GPUBackend.Buf β)

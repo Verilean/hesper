@@ -811,7 +811,17 @@ def forwardBlock [GPUBackend β] (ctx : β)
       --
       -- SWA masking isn't needed: cacheLen is already clamped to
       -- ≤ windowSize for SWA layers upstream.
-      if cacheLen > 32 then
+      if (← IO.getEnv "HESPER_FA_VEC").isSome then
+        -- doc 60 Session 1: warp-shuffle vec kernel.  Same shape as the
+        -- legacy dynamic kernel (gridX=numHeads), reduces dot products
+        -- with subgroupAdd instead of a smem tree.  Keeps cacheLen
+        -- serial; future sessions add gridY split-K + f16 KV.
+        let kcrLk := kcr.map (fun k key => k.getRef key)
+        FlashAttention.executeFlashAttentionVecParams ctx
+          state.qBuf kvCache.kBuf kvCache.vBuf state.attnOutBuf state.paramsBuf
+          numHeads numKVHeads cfg.maxSeqLen headDim scale
+          (kcrLookup := kcrLk)
+      else if cacheLen > 32 then
         let kcrLk := kcr.map (fun k key => k.getRef key)
         FlashAttention.executeFlashAttentionTiled ctx
           state.qBuf kvCache.kBuf kvCache.vBuf state.attnOutBuf
