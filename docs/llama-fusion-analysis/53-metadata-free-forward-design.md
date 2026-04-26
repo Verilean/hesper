@@ -1,3 +1,6 @@
+**SUPERSEDED by 57-host-overhead-canonical.md** — left for history; do not
+follow conclusions here without cross-checking §3 of doc 57.
+
 # 53 — Metadata-free forward design (Option B+)
 
 *Written 2026-04-24. Proposed next major work-item.*

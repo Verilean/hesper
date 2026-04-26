@@ -1,3 +1,6 @@
+**SUPERSEDED by 57-host-overhead-canonical.md** — left for history; do not
+follow conclusions here without cross-checking §3 of doc 57.
+
 # 54 — Option B+ implementation findings and next steps
 
 *Written 2026-04-24. Continuation of docs 51-53.*
