@@ -236,6 +236,58 @@ Predicted budget for fixing this:
 - This is independent of the kernel-speed gap (#47, ~+18 TPS) and the
   graphs-ON workaround (#252).
 
+### 3b.4. Cache-miss localisation (#253 instrumentation, 2026-04-26)
+
+`HESPER_ALLOC_TRACE=1` enables the existing throwaway-ref detector +
+miss histogram in `Hesper/Backend/CUDA.lean`.  Run on 30 decode tokens:
+
+```
+[execImpl] cudaExecuteImpl calls=1599, total=33.4 ms
+[cacheMiss] executeWithConfigCached cacheRef miss histogram (top 10):
+  [throwaway?] key=11590943693958497111 × 455
+  [throwaway?] key=3871721250815197703  ×  91
+  [throwaway?] key=13014778072997566101 ×  73
+  [throwaway?] key=8447589405719129130  ×  64
+  ...
+[cacheMissFirst] main-nwg=(8,2,1) wg=(256,1,1) (k_xxx) bufs=#[q, k_cache, v_cache, partial]   (×42 distinct keys)
+[throwaway-ref] cacheKey=…  seen twice with none-Ref — caller uses IO.mkRef none
+```
+
+53 cache misses per token (1599 / 30) attributed to a single call
+shape: `bufs=#[q, k_cache, v_cache, partial]`.  That is the
+**FlashAttention tiled phase-1 kernel**.  42 layers × 2 phases
+(phase-1 + phase-2) = 84 per token would be the worst case, and we
+see ~53 — consistent with FlashAttn dominating the misses.
+
+Source confirms it: `Hesper/WGSL/FlashAttention.lean::executeFlashAttentionTiled`
+(line 1150) takes optional `phase1Ref / phase2Ref` parameters but the
+two callers in `Hesper/Models/Gemma4.lean::forwardBlock` (lines 797 and
+2191) do not pass them.  When omitted, the function constructs a fresh
+`IO.mkRef none` *inside the function body* and uses it as the
+`cacheRef` for `executeWithConfigCached` (line 1183, 1192).  That ref
+is dropped at the end of the call ⇒ every iteration is a cold miss.
+
+`executeFlashAttentionDynamic` (line 1212) has the same problem
+hard-coded: `(← IO.mkRef none)` is the cacheRef argument with no way to
+override it.
+
+**Fix scope** (#253):
+- Thread `phase1Ref / phase2Ref` from the call sites in
+  `forwardBlock` through `executeFlashAttentionTiled`. The refs should
+  live on the model's `KernelCacheRefs` (one pair per layer), so the
+  dispatch is stable per (layer, cacheLen-bucket) across decode tokens.
+- Drop the `(← IO.mkRef none)` in `executeFlashAttentionDynamic` for an
+  optional ref param (or drop the function if forwardBlock no longer
+  uses it).
+- Re-run with `HESPER_ALLOC_TRACE=1`; expect the FlashAttn rows to
+  vanish from the throwaway histogram.
+- Re-run perf_compare: `forward` section should drop from ~5 ms to
+  ~1.5 ms, wall ~15 ms → ~11 ms, TPS 60 → ~90.
+
+This is consistent with H4b's predicted -3.8 ms wall delta in §3b.3.
+The next session attacks the fix; #253 will be reopened with these
+findings.
+
 ### 3c. Where the host CPU spends those 5 ms
 
 `perf record -e cycles:u --call-graph=fp` during steady-state decode:
