@@ -85,7 +85,7 @@ unsafe def main (argv : List String) : IO Unit := do
     | [t, cl, it] =>
       pure (t, cl.toNat!, it.toNat!)
     | _ =>
-      IO.println "usage: cuda-flashattn-ncu-driver <vec|v2|llama> <cacheLen> <iters>"
+      IO.println "usage: cuda-flashattn-ncu-driver <vec|v2|v3|v6|llama> <cacheLen> <iters>"
       IO.Process.exit 1
 
   let ctx ← Hesper.CUDAContext.init
@@ -108,7 +108,7 @@ unsafe def main (argv : List String) : IO Unit := do
   let kvZeros : Array Float := Array.replicate (nkv * maxSeq * hd) 0.0
 
   match tag with
-  | "vec" | "v2" | "v3" =>
+  | "vec" | "v2" | "v3" | "v6" =>
     let vBuf ← GPUBackend.allocBuffer ctx kvSizeF32
     GPUBackend.writeBuffer ctx vBuf (packFloats kvZeros)
     -- K storage shape depends on tag
@@ -121,6 +121,8 @@ unsafe def main (argv : List String) : IO Unit := do
                    nh nkv maxSeq hd scale, "v2_ncu", "k_cache", kF32Buf)
       | "v3" => (Hesper.WGSL.FlashAttention.flashAttentionVecParamsKernelV3
                    nh nkv maxSeq hd scale, "v3_ncu", "k_cache_f16", kF16Buf)
+      | "v6" => (Hesper.WGSL.FlashAttention.flashAttentionVecParamsKernelV6
+                   nh nkv maxSeq hd scale, "v6_ncu", "k_cache", kF32Buf)
       | _    => (Hesper.WGSL.FlashAttention.flashAttentionVecParamsKernel
                    nh nkv maxSeq hd scale, "vec_ncu", "k_cache", kF32Buf)
     let ptx := Hesper.CUDA.CodeGen.generatePTX funcName
@@ -153,5 +155,5 @@ unsafe def main (argv : List String) : IO Unit := do
         nh nkv hd cacheLen maxSeq scale
     Hesper.CUDA.cuStreamSynchronize (0 : USize)
   | other =>
-    IO.println s!"[ncu-driver] unknown tag '{other}', expected 'vec', 'v2', or 'llama'"
+    IO.println s!"[ncu-driver] unknown tag '{other}', expected vec/v2/v3/v6/llama"
     IO.Process.exit 1
