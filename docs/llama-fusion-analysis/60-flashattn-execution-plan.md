@@ -558,3 +558,41 @@ shines is cacheLen=200**: vec 159 µs → **v2 119 µs** (-25%).
 the global load gap from 8.8× to ~4×. Potentially halves the
 remaining 109 µs to ~55 µs. Then Session 4 V f16. Session 5 split-K
 deferred until 3+4 measured.
+
+### V6/V7 vs llama: deeper inst breakdown (2026-04-27)
+
+After the structural rewrite (V6 K-parallel + V7 K/V f16) the FMA count
+finally matches llama (44.7k vs 41.2k = 1.09×). But gpu_time is still
+8× off. Root cause uncovered by extra ncu metrics:
+
+| metric         | V6      | llama   | ratio  | dominant cause                                                              |
+|----------------|---------|---------|--------|-----------------------------------------------------------------------------|
+| pipe_fma       | 48,224  | 41,184  | 1.17×  | structurally close (V6 done its job here)                                   |
+| **op_branch**  | **6,048**  | **416**     | **14.5×**  | runtime `ShaderM.loop` for 32 inner iters → 32 branch decisions per outer  |
+| **pipe_alu**   | **53,888** | **6,848**   | **7.9×**   | runtime loop emits `iKQ`, `kPos`, `kBase` recomputation each iter           |
+| pipe_lsu       | 25,920  | 5,600   | 4.6×   | non-vectorised loads (4-byte each) vs llama 16-byte memcpy                  |
+| op_global_ld   | 17,696  | 2,336   | 7.6×   | same — fewer wider loads at llama side                                      |
+
+### V8 plan (the real lever)
+
+llama's inner loop is `for (int i_KQ_0 = 0; i_KQ_0 < nthreads_KQ; ++i_KQ_0)`
+with `nthreads_KQ = 8` (for K=f16, sm_89, cpy_nb=16) and `#pragma unroll`.
+This means:
+1. Only 8 inner iters (not 32) — warp processes 4 K positions per iter
+   in parallel via 8-thread sub-warps (`warp_reduce_sum<8>`).
+2. Loop is fully unrolled — branch and ALU index calculations vanish.
+3. Each thread does 32 dim per K position (vs 8 in V6) → wider per-thread
+   work, fewer outer iters.
+4. Memcpy uses 16-byte instructions (`ggml_cuda_memcpy_1<16>`) → 4× wider
+   loads.
+
+V8 = V6 with all of:
+- nthreads_KQ = 8 (8-way warp_reduce_sum, 4 K-positions parallel per inner iter)
+- 32-dim/thread per K position (Q_reg array sized D/nthreads_KQ = 32)
+- Inner loop static-unrolled (Lean for) over 8 iter, NOT 32
+- 16-byte vectorised loads (4 × half2 packed)
+
+Expected: gpu_time 48 µs → 10-15 µs (close to llama 5.8 µs).
+
+This is a 200+ line rewrite. Same algorithm structure as V6 but with
+correct sub-warp partitioning. Defer until after current commits.
