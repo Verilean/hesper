@@ -1425,7 +1425,12 @@ def flashAttentionVecParamsKernelV8
       let kBase := Exp.add kHeadBase (Exp.mul kPosSafe kRowStride)
 
       let partialVar ← ShaderM.var (.scalar .f32) (Exp.litF32 0.0)
-      for k in [0:dimsPerLane] do
+      for k in [0:dimsPerLane] do ShaderM.scope do
+        -- Per-k scope releases kVal + temp regs to next iter.  Measured net
+        -- effect on registers/thread = 0 (still 255) because qVars[32] +
+        -- vkqVars[32] at function scope dominate the live-range budget;
+        -- f16x2 packing of qVars/vkqVars (matching llama.cpp's half2 path)
+        -- is the real lever.  Kept for hygiene and codegen-pass exercise.
         let d := Exp.add dThreadBase (Exp.litU32 k)
         let kVal ← ShaderM.readBuffer (ty := .scalar .f32)
                      (n := numKVHeads * maxSeqLen * headDim) "k_cache"
@@ -1514,7 +1519,10 @@ def flashAttentionVecParamsKernelV8
                         (n := workgroupSize) "shared_kq" kqScoreSlot
       let kqScore := Exp.select inBounds kqScoreRaw (Exp.litF32 0.0)
       let vBase := Exp.add kHeadBase (Exp.mul kPosSafe kRowStride)
-      for k in [0:dimsPerLane] do
+      for k in [0:dimsPerLane] do ShaderM.scope do
+        -- Per-k scope: same caveat as Phase 1 — function-scope vkqVars[32]
+        -- still bound at 255 reg/thread.  See Phase 1 comment for the real
+        -- lever (f16x2 packing matching llama.cpp's half2 path).
         let d := Exp.add dThreadBase (Exp.litU32 k)
         let vVal ← ShaderM.readBuffer (ty := .scalar .f32)
                      (n := numKVHeads * maxSeqLen * headDim) "v_cache"
