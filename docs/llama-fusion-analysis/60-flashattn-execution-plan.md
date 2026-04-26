@@ -248,3 +248,167 @@ opt-in env), no perf gain yet**.
 - `Hesper/WGSL/FlashAttention.lean`: `flashAttentionVecParamsKernel` +
   `executeFlashAttentionVecParams`
 - `Hesper/Models/Gemma4.lean`: `HESPER_FA_VEC=1` dispatcher gate
+
+### Microbench (added at end of Session 1, 2026-04-26)
+
+Extended `cuda-flashattn-vec-parity` exe with a micro-benchmark mode
+that loops each kernel 200× under Gemma-4 geometry (nH=8, nKV=1,
+D=256), syncs once, prints avg µs/call.  Total exe runtime ~30 s.
+
+Results (200 iters/case):
+
+| cacheLen | legacy µs | vec µs | speedup |
+|---:|---:|---:|---:|
+| 8   | 152.6 | 106.0 | **1.44×** |
+| 32  | 147.1 | 101.5 | 1.45× |
+| 64  | 151.1 | 106.5 | 1.42× |
+| 128 | 152.4 | 112.7 | 1.35× |
+| 200 | 152.3 | 174.7 | **0.87× (slower!)** |
+
+Findings:
+- vec is **1.4× faster than legacy** for cacheLen ≤ 128 (the entire
+  Gemma 4 decode range up to ~100)
+- vec **regresses at cacheLen 200** — the K-serial loop becomes
+  expensive when the loop has many iterations and the warp-shuffle
+  cross-warp gather doesn't amortise
+- Absolute Lean-bench numbers (152 µs vs nsys 32.6 µs) include host
+  per-launch overhead; only the **ratio** is comparable
+
+Why the 1.4× microbench speedup didn't show up as TPS gain in Gemma 4:
+flashAttn is only 14% of decode wall (1.12 ms/tok of 7.92 ms).  A
+1.4× kernel speedup gives ~0.34 ms/tok savings ≈ +3-4 TPS, which is
+within run-to-run noise on the e2e benchmark and was masked by some
+Gemma-4-specific interaction (likely occupancy / smem usage hitting
+neighbouring kernels under graph capture).
+
+Implication for Session 2 design:
+- Need **K-parallel** layout that wins also at long cacheLen (current
+  vec is K-serial, regresses at cacheLen=200)
+- Microbench will continue to give 30s TAT iteration on raw kernel
+  speed, decoupled from Gemma-4 wall-time noise
+
+## After Session 5: PTX-level closure (post-doc-60)
+
+Sessions 1-5 are **ShaderM-level** — we mirror llama.cpp's algorithm
+(K-parallel, K/V f16, online softmax with split-K combine) in the
+high-level DSL.  After all 5 land, we close the gap at the PTX layer.
+Same pattern as `project_q6k_ncu_session.md` /
+`project_ptx_codegen_improvements.md`:
+
+1. Dump hesper's generated PTX:
+   `HESPER_DUMP_PTX=1 lake exe cuda-flashattn-vec-parity` →
+   `/tmp/hesper-flashattn.ptx`
+2. Extract llama.cpp's flash_attn_ext_vec cubin/PTX
+   (`cuobjdump --dump-ptx` from llama-cli's loaded module)
+3. **Diff at instruction level**: ld.global.nc usage (cache hint),
+   register count, ldmatrix/cp.async if available, smem bank-conflict
+   stride, fp16x2 packing
+4. Patch ShaderM codegen for any missing PTX optimisation
+   (BufferHint .readOnly already done, doc 55), or fall back to a
+   hand-written PTX module wired through `LlamaCppPTX` (see
+   `Hesper/Backend/LlamaCppPTX.lean` for the loader pattern)
+5. Re-bench microbench → confirm hesper µs/call ≤ llama.cpp µs/call
+
+Don't start (1) until Sessions 1-5 produce a kernel that's
+**algorithmically** equivalent to llama.cpp's vec kernel.  Optimising
+PTX of an inferior algorithm wastes time.
+
+### Running llama.cpp's PTX in our microbench (idea, no code yet)
+
+Hesper already has a llama.cpp PTX loader (`Hesper/Backend/LlamaCppPTX.lean`)
+that reads `mmvq.ptx` / `quantize.ptx`, calls `cuModuleLoadData`,
+resolves `cuModuleGetFunction` by mangled symbol, and provides typed
+launch helpers.  **The same machinery can host
+`flash_attn_ext_vec`** as soon as we have:
+1. The mangled symbol of the desired template instantiation
+   (D=256, ncols=1, K=GGML_TYPE_F16, V=GGML_TYPE_F16, no_softcap)
+2. A `flash.ptx` file, obtained one of:
+   - `nvcc -ptx llama.cpp/ggml/src/ggml-cuda/fattn-vec.cu -...` (need
+     to fix include paths)
+   - `cuobjdump --dump-ptx llama.cpp/build/ggml/src/ggml-cuda/CMakeFiles/ggml-cuda.dir/fattn-vec.cu.o`
+   - or extract from the loaded shared object at runtime
+
+Once both are in place, extend `cuda-flashattn-vec-parity` with a
+**third bench column** (`llama_us`) that runs llama.cpp's PTX with
+the same Q/K/V/params buffers.  Resulting table:
+
+```
+cacheLen=N: legacy=A µs   vec=B µs   llama_ptx=C µs
+                 ratio_legacy_vs_llama=A/C   ratio_vec_vs_llama=B/C
+```
+
+This lets us measure the **algorithmic-only delta** (vec vs llama
+both running on the same GPU through cuLaunchKernel, so launch
+overhead cancels) and gives a hard ceiling for what hesper kernel
+work can achieve.  If even the ShaderM-equivalent algorithm runs at
+> 1.2× of llama.cpp's PTX, the residual is PTX codegen — start
+Section "After Session 5".
+
+This is a simple ~50-line addition to the test file once the PTX
+file and symbol are in hand.  Adding to Session 5 (final
+measurement) deliverables.
+
+### llama.cpp PTX in microbench — RESULT (2026-04-26)
+
+Implemented (#262).  PTX extracted via:
+```bash
+cuobjdump --extract-ptx fattn-vec-instance-f16-f16.cu.5.sm_80.ptx \
+  llama.cpp/build/ggml/src/ggml-cuda/CMakeFiles/ggml-cuda.dir/template-instances/fattn-vec-instance-f16-f16.cu.o
+sed -i 's/^\.version 8\.7/.version 8.6/' fattn_vec_f16f16.ptx  # driver 565.77 caps at PTX 8.6
+mv fattn_vec_f16f16.ptx /tmp/llamacpp_ptx/
+```
+
+Mangled symbol: `_Z18flash_attn_ext_vecILi256ELi1EL9ggml_type1ELS0_1ELb0EE...`
+(D=256, ncols=1, K=f16, V=f16, no_softcap — `Hesper.LlamaCppPTX.fattnVecF16F16D256Symbol`).
+
+Launch from Lean: `Hesper.LlamaCppPTX.launchFlashAttnVecF16F16D256` packs
+the 38-param signature; uses `cuLaunchKernelRaw` directly (no ShaderM /
+PTX-hash / module-cache path).
+
+Result table (Gemma 4 geometry, nH=8, nKV=1, D=256, RTX 4070 Ti, 200 iters):
+
+```
+cacheLen | legacy µs | vec µs  | llama µs | vec/llama
+   8     |  150.5    | 103.7   |   4.2    |   24.8×
+  32     |  150.5    | 104.2   |   4.2    |   24.7×
+  64     |  150.4    | 104.5   |   4.2    |   25.0×
+ 128     |  150.7    | 112.6   |   4.2    |   26.6×
+ 200     |  155.2    | 174.7   |   6.2    |   28.3×
+```
+
+**Interpretation**:
+- llama.cpp PTX is **24–28× faster** than hesper's vec kernel measured as
+  wall-clock per call. The doc 59 "5.4× gap" estimate (from
+  kernel_compare graphs-ON) was a different measurement — that one looks
+  only at graph-ON GPU kernel time, while this one is per-call wall
+  including the GPUBackend.execute path on the launch side.
+- llama_us is roughly flat across cacheLen 8–128 (~4.2 µs) — kernel work
+  fits in a single 256-thread block reading ≤ 128 K positions. At
+  cacheLen=200 it grows to 6.2 µs (one extra warp wave through the K loop).
+- hesper vec is roughly flat 8–128 (~104 µs) too. The absolute *delta*
+  between hesper and llama is roughly constant (~100 µs) across cacheLen,
+  while llama itself only changes by ~2 µs (8→200). So the constant 100 µs
+  is **not pure GPU** — if it were, hesper would scale similarly with
+  cacheLen. It's most likely a mix of:
+  - GPUBackend.execute host path (PTX hash, cache lookup, arg pack)
+  - Kernel launch+sync overhead amortised differently than llama's raw
+    cuLaunchKernel
+  - Some genuinely slower kernel time
+  Need follow-up: per-call sync, or HESPER_KERNEL_TRACE to break out
+  cuLaunchKernel time vs GPU time.
+- At cacheLen=200, hesper vec degrades to 174 µs while legacy stays at
+  155 µs (the cross-over noted in earlier microbench runs). Likely cause:
+  vec's 128-thread block doesn't cover all K positions in one warp wave
+  past cacheLen=192, so the inner K loop runs multiple iterations on the
+  same 32-thread axis. Session 2 (split-K, multiple blocks per head) is
+  the natural fix.
+
+**Action items unblocked by this measurement**:
+1. The PTX-level closure work (post-Session 5) now has a working harness.
+   The same path can host any other llama.cpp kernel for direct timing.
+2. Session 2 split-K gates on closing the cacheLen=200 regression.
+3. Session 3-4 f16 K/V conversion will be measured against the now-loaded
+   llama.cpp kernel as a stable upper-bound reference.
+4. Real Gemma 4 decode TPS comparison after Session 5 remains the final
+   verdict, since microbench wall-clock includes per-call host costs that
+   aren't always present in the captured-graph decode path.

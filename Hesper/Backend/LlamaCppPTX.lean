@@ -392,4 +392,210 @@ def autoInstall : IO Bool := do
   else
     return false
 
+/-! ## flash_attn_ext_vec<D=256, ncols=1, K=f16, V=f16, false>
+
+Single-token decode path with f16 K/V cache.  Used by Gemma 4 (head_dim=256).
+
+Mangled symbol (from cuobjdump on `fattn-vec-instance-f16-f16.cu.o`):
+  `_Z18flash_attn_ext_vecILi256ELi1EL9ggml_type1ELS0_1ELb0EE...`
+
+Launch (from `launch_fattn` in `fattn-common.cuh` line 1048):
+  block_dim = (32, 4, 1) = 128 threads
+  blocks_num = (ntiles_x, parallel_blocks, ntiles_z_gqa * K->ne[2] * Q->ne[3])
+             = (1, 1, numHeads)  for ncols=1, single sequence, parallel_blocks=1
+  smem = 0 (kernel uses internal __shared__ arrays)
+
+Kernel signature: 38 params (8 ptrs, then float×4 + u32 + float + i32 + uint3 +
+22 i32/i64 strides).  Mangling tail `iiiiiiiiiiiliiliiiiil` decodes:
+  i32 ne00, uint3 ne01, i32 ne02, i32 ne03,
+       i32 nb01, i32 nb02, i32 nb03,
+  i32 ne10, i32 ne11, i32 ne12, i32 ne13,
+       i32 nb11, i32 nb12, i64 nb13,
+       i32 nb21, i32 nb22, i64 nb23,
+       i32 ne31, i32 ne32, i32 ne33,
+       i32 nb31, i32 nb32, i64 nb33
+
+For decode at single-block tile (cacheLen ≤ 256), parallel_blocks=1 → no
+combine kernel needed and dst_meta is unused.  We pass null for mask, sinks,
+KV_max, dst_meta. -/
+def fattnVecF16F16D256Symbol : String :=
+  "_Z18flash_attn_ext_vecILi256ELi1EL9ggml_type1ELS0_1ELb0EEvPKcS2_S2_S2_S2_PKiPfP6float2ffffjfi5uint3iiiiiiiiiiiliiliiiiil"
+
+def defaultFattnVecF16F16Path : String := "/tmp/llamacpp_ptx/fattn_vec_f16f16.ptx"
+
+initialize fattnKernelRef : IO.Ref (Option CUfunction) ← IO.mkRef none
+
+def loadFattnVecF16F16Kernel
+    (path : String := defaultFattnVecF16F16Path) : IO CUfunction := do
+  match ← fattnKernelRef.get with
+  | some k => return k
+  | none =>
+    let src ← IO.FS.readFile path
+    let m ← cuModuleLoadData src
+    let f ← cuModuleGetFunction m fattnVecF16F16D256Symbol
+    fattnKernelRef.set (some f)
+    return f
+
+/-- Pack args + launch `flash_attn_ext_vec<D=256, ncols=1, K=f16, V=f16, false>`.
+
+  qBuf      f32 [numHeads × headDim]                Q for single token
+  kBuf      f16 [numKVHeads × maxSeqLen × headDim]  K cache (f16!)
+  vBuf      f16 [numKVHeads × maxSeqLen × headDim]  V cache (f16!)
+  outBuf    f32 [numHeads × headDim]                attention output
+  numHeads, numKVHeads, headDim (=256), cacheLen, maxSeqLen, scale
+
+Strides (bytes):
+  nb01 = numHeads * headDim * 4  (Q is one row of all heads, ne01=1 so unused)
+  nb02 = headDim * 4
+  nb03 = nb02 * numHeads
+  nb11 = headDim * 2  (sizeof half)
+  nb12 = maxSeqLen * nb11
+  nb13 = numKVHeads * nb12
+  nb21 = nb11
+  nb22 = nb12
+  nb23 = nb13
+-/
+def launchFlashAttnVecF16F16D256
+    (k : CUfunction)
+    (qBuf : CUdeviceptr) (kBuf : CUdeviceptr) (vBuf : CUdeviceptr)
+    (outBuf : CUdeviceptr)
+    (numHeads numKVHeads headDim cacheLen maxSeqLen : Nat)
+    (scale : Float) : IO Unit := do
+  if headDim != 256 then
+    throw (IO.userError s!"launchFlashAttnVecF16F16D256: headDim must be 256, got {headDim}")
+  if cacheLen > 256 then
+    throw (IO.userError s!"launchFlashAttnVecF16F16D256: cacheLen {cacheLen} > 256 (nbatch_fa). Single-block path only; need combine for longer.")
+  let mut bytes : ByteArray := ByteArray.empty
+  let mut offsets : Array USize := #[]
+  -- 0: const char *Q
+  offsets := offsets.push bytes.size.toUSize
+  bytes := pushU64 bytes qBuf.toUInt64
+  -- 1: const char *K
+  offsets := offsets.push bytes.size.toUSize
+  bytes := pushU64 bytes kBuf.toUInt64
+  -- 2: const char *V
+  offsets := offsets.push bytes.size.toUSize
+  bytes := pushU64 bytes vBuf.toUInt64
+  -- 3: const char *mask = NULL
+  offsets := offsets.push bytes.size.toUSize
+  bytes := pushU64 bytes 0
+  -- 4: const char *sinks = NULL
+  offsets := offsets.push bytes.size.toUSize
+  bytes := pushU64 bytes 0
+  -- 5: const int *KV_max = NULL
+  offsets := offsets.push bytes.size.toUSize
+  bytes := pushU64 bytes 0
+  -- 6: float *dst
+  offsets := offsets.push bytes.size.toUSize
+  bytes := pushU64 bytes outBuf.toUInt64
+  -- 7: float2 *dst_meta = NULL  (parallel_blocks=1 path, gridDim.y=1)
+  offsets := offsets.push bytes.size.toUSize
+  bytes := pushU64 bytes 0
+  -- 8: float scale
+  bytes := alignTo bytes 4
+  offsets := offsets.push bytes.size.toUSize
+  bytes := pushU32 bytes scale.toFloat32.toBits
+  -- 9: float max_bias = 0
+  offsets := offsets.push bytes.size.toUSize
+  bytes := pushU32 bytes 0
+  -- 10: float m0 = 1
+  offsets := offsets.push bytes.size.toUSize
+  bytes := pushU32 bytes (1.0 : Float).toFloat32.toBits
+  -- 11: float m1 = 1
+  offsets := offsets.push bytes.size.toUSize
+  bytes := pushU32 bytes (1.0 : Float).toFloat32.toBits
+  -- 12: uint32_t n_head_log2 = 1 (max_bias=0 → 2^0)
+  offsets := offsets.push bytes.size.toUSize
+  bytes := pushU32 bytes 1
+  -- 13: float logit_softcap = 0
+  offsets := offsets.push bytes.size.toUSize
+  bytes := pushU32 bytes 0
+  -- 14: int32_t ne00 = headDim
+  offsets := offsets.push bytes.size.toUSize
+  bytes := pushU32 bytes headDim.toUInt32
+  -- 15: uint3 ne01 = init_fastdiv_values(Q->ne[1]=1) = (mp=1, L=0, d=1)
+  bytes := alignTo bytes 4
+  offsets := offsets.push bytes.size.toUSize
+  bytes := pushU32 bytes 1  -- mp
+  bytes := pushU32 bytes 0  -- L
+  bytes := pushU32 bytes 1  -- divisor
+  -- 16: int32_t ne02 = numHeads
+  offsets := offsets.push bytes.size.toUSize
+  bytes := pushU32 bytes numHeads.toUInt32
+  -- 17: int32_t ne03 = 1
+  offsets := offsets.push bytes.size.toUSize
+  bytes := pushU32 bytes 1
+  let nb01 := numHeads * headDim * 4  -- Q row stride (unused since ne01=1)
+  let nb02 := headDim * 4              -- Q per-head stride
+  let nb03 := numHeads * nb02
+  -- 18: i32 nb01
+  offsets := offsets.push bytes.size.toUSize
+  bytes := pushU32 bytes nb01.toUInt32
+  -- 19: i32 nb02
+  offsets := offsets.push bytes.size.toUSize
+  bytes := pushU32 bytes nb02.toUInt32
+  -- 20: i32 nb03
+  offsets := offsets.push bytes.size.toUSize
+  bytes := pushU32 bytes nb03.toUInt32
+  -- 21: i32 ne10 = headDim
+  offsets := offsets.push bytes.size.toUSize
+  bytes := pushU32 bytes headDim.toUInt32
+  -- 22: i32 ne11 = cacheLen (K positions)
+  offsets := offsets.push bytes.size.toUSize
+  bytes := pushU32 bytes cacheLen.toUInt32
+  -- 23: i32 ne12 = numKVHeads
+  offsets := offsets.push bytes.size.toUSize
+  bytes := pushU32 bytes numKVHeads.toUInt32
+  -- 24: i32 ne13 = 1
+  offsets := offsets.push bytes.size.toUSize
+  bytes := pushU32 bytes 1
+  let nb11 := headDim * 2          -- f16 row stride
+  let nb12 := maxSeqLen * nb11
+  let nb13 := numKVHeads * nb12
+  -- 25: i32 nb11
+  offsets := offsets.push bytes.size.toUSize
+  bytes := pushU32 bytes nb11.toUInt32
+  -- 26: i32 nb12
+  offsets := offsets.push bytes.size.toUSize
+  bytes := pushU32 bytes nb12.toUInt32
+  -- 27: i64 nb13
+  bytes := alignTo bytes 8
+  offsets := offsets.push bytes.size.toUSize
+  bytes := pushU64 bytes nb13.toUInt64
+  -- 28: i32 nb21 = nb11
+  offsets := offsets.push bytes.size.toUSize
+  bytes := pushU32 bytes nb11.toUInt32
+  -- 29: i32 nb22 = nb12
+  offsets := offsets.push bytes.size.toUSize
+  bytes := pushU32 bytes nb12.toUInt32
+  -- 30: i64 nb23 = nb13
+  bytes := alignTo bytes 8
+  offsets := offsets.push bytes.size.toUSize
+  bytes := pushU64 bytes nb13.toUInt64
+  -- 31: i32 ne31 = 0 (no mask)
+  offsets := offsets.push bytes.size.toUSize
+  bytes := pushU32 bytes 0
+  -- 32: i32 ne32 = 0
+  offsets := offsets.push bytes.size.toUSize
+  bytes := pushU32 bytes 0
+  -- 33: i32 ne33 = 0
+  offsets := offsets.push bytes.size.toUSize
+  bytes := pushU32 bytes 0
+  -- 34: i32 nb31 = 0
+  offsets := offsets.push bytes.size.toUSize
+  bytes := pushU32 bytes 0
+  -- 35: i32 nb32 = 0
+  offsets := offsets.push bytes.size.toUSize
+  bytes := pushU32 bytes 0
+  -- 36: i64 nb33 = 0
+  bytes := alignTo bytes 8
+  offsets := offsets.push bytes.size.toUSize
+  bytes := pushU64 bytes 0
+  -- Launch: blocks=(1, 1, numHeads), block_dim=(32, 4, 1), smem=0
+  launchOnCaptureStream k
+    1 1 numHeads.toUInt32
+    32 4 1
+    0
+    bytes offsets
+
 end Hesper.LlamaCppPTX
