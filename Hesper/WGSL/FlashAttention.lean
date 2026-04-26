@@ -1052,6 +1052,244 @@ def flashAttentionVecParamsKernelV6
     ShaderM.writeBuffer (ty := .scalar .f32) "output" outIdx
       (Exp.div (Exp.var accVar) globalSum)
 
+/-- Vec-params V7 (doc 60): V6 K-parallel + K cache f16 + V cache f16.
+
+    Per-thread layout differs from V6 because we read K/V as packed half2
+    (1 u32 = 2 f16):
+      lane laneId owns dim *pairs* (2*laneId, 2*laneId + 1) shifted by
+      pairBase = pair_k * 64 for pair_k in [0, dPerLanePair).
+      With D=256, ws=128: dPerLanePair = (D/2) / 32 = 4 pairs = 8 dims.
+
+    K read: 1 u32 read per K row per pair → 2 f16 → unpack to 2 f32
+    → 2 fmas into partialVar (D-axis dot product).
+
+    V read: same — 1 u32 → 2 f32 → 2 weighted accums into vkq[2*pair_k]
+    and vkq[2*pair_k + 1].
+
+    Buffers (different from V6):
+      k_cache_f16: array<u32, numKV * maxSeq * D / 2>  (each u32 = 2 f16)
+      v_cache_f16: array<u32, numKV * maxSeq * D / 2>  (each u32 = 2 f16)
+
+    Pre-condition: D % 64 == 0 (D=256 ✓), ws=128, headDim/2 % 32 == 0. -/
+def flashAttentionVecParamsKernelV7
+    (numHeads numKVHeads maxSeqLen headDim : Nat) (scale : Float) :
+    ShaderM Unit := do
+  let workgroupSize : Nat := 128
+  let numWarps : Nat := workgroupSize / 32
+  let dPerLanePair : Nat := (headDim / 2) / 32   -- 4 pairs/lane for D=256
+
+  let wgid ← ShaderM.workgroupId
+  let lid ← ShaderM.localId
+  let head := Exp.vec3X wgid
+  let tid := Exp.vec3X lid
+  let headsPerKV := numHeads / numKVHeads
+  let kvHead := Exp.div head (Exp.litU32 headsPerKV)
+
+  let _q ← ShaderM.declareInputBuffer "q" (.array (.scalar .f32) (numHeads * headDim))
+  let kvWords : Nat := (numKVHeads * maxSeqLen * headDim) / 2
+  let _kCache ← ShaderM.declareInputBuffer "k_cache_f16"
+                  (.array (.scalar .u32) kvWords)
+  let _vCache ← ShaderM.declareInputBuffer "v_cache_f16"
+                  (.array (.scalar .u32) kvWords)
+  let _output ← ShaderM.declareOutputBuffer "output"
+                  (.array (.scalar .f32) (numHeads * headDim))
+  let _params ← ShaderM.declareStorageBuffer "params" (.array (.scalar .u32) 2) .read
+
+  ShaderM.sharedNamed "shared_kq" (.array (.scalar .f32) workgroupSize)
+  ShaderM.sharedNamed "shared_vkq" (.array (.scalar .f32) (numWarps * headDim))
+  ShaderM.sharedNamed "shared_warp_meta" (.array (.scalar .f32) (numWarps * 2))
+
+  let laneId := Exp.bitAnd tid (Exp.litU32 31)
+  let warpId := Exp.shiftRight tid (Exp.litU32 5)
+
+  -- Pre-load Q (already scaled).  Q stays f32 — only K/V are f16.
+  -- Lane owns dim pairs (2*laneId + 64*k, 2*laneId + 1 + 64*k).
+  let qBase := Exp.mul head (Exp.litU32 headDim)
+  let mut q0Vars : Array String := #[]  -- Q at even dim of pair
+  let mut q1Vars : Array String := #[]  -- Q at odd dim of pair
+  let mut vkq0Vars : Array String := #[]
+  let mut vkq1Vars : Array String := #[]
+  for pk in [0:dPerLanePair] do
+    let d0 := Exp.add (Exp.litU32 (pk * 64)) (Exp.mul laneId (Exp.litU32 2))
+    let d1 := Exp.add d0 (Exp.litU32 1)
+    let q0Val ← ShaderM.readBuffer (ty := .scalar .f32) (n := numHeads * headDim)
+                  "q" (Exp.add qBase d0)
+    let q1Val ← ShaderM.readBuffer (ty := .scalar .f32) (n := numHeads * headDim)
+                  "q" (Exp.add qBase d1)
+    let q0Name ← ShaderM.var (.scalar .f32) (Exp.mul q0Val (Exp.litF32 scale))
+    let q1Name ← ShaderM.var (.scalar .f32) (Exp.mul q1Val (Exp.litF32 scale))
+    let vkq0Name ← ShaderM.var (.scalar .f32) (Exp.litF32 0.0)
+    let vkq1Name ← ShaderM.var (.scalar .f32) (Exp.litF32 0.0)
+    q0Vars := q0Vars.push q0Name
+    q1Vars := q1Vars.push q1Name
+    vkq0Vars := vkq0Vars.push vkq0Name
+    vkq1Vars := vkq1Vars.push vkq1Name
+
+  ShaderM.varNamed "kq_max" (.scalar .f32) (Exp.litF32 (-1.0e30))
+  ShaderM.varNamed "kq_sum" (.scalar .f32) (Exp.litF32 0.0)
+  let kqMax := Exp.var "kq_max"
+  let kqSum := Exp.var "kq_sum"
+
+  let cacheLen ← ShaderM.readBuffer (ty := .scalar .u32) (n := 2)
+                   "params" (Exp.litU32 1)
+  -- K row stride in u32 words = headDim / 2.
+  let kRowStrideU32 := Exp.litU32 (headDim / 2)
+  let kHeadBaseU32 := Exp.mul kvHead
+                        (Exp.mul (Exp.litU32 maxSeqLen) kRowStrideU32)
+
+  ShaderM.loop (Exp.litU32 0) cacheLen (Exp.litU32 workgroupSize) fun kVKQ0 => do
+    let kqRegVar ← ShaderM.var (.scalar .f32) (Exp.litF32 0.0)
+    let kqMaxNewVar ← ShaderM.var (.scalar .f32) kqMax
+
+    -- Phase 1: 32 K positions per warp, runtime loop.
+    ShaderM.loop (Exp.litU32 0) (Exp.litU32 32) (Exp.litU32 1) fun iKQ0 => do
+      let iKQ := Exp.add (Exp.mul warpId (Exp.litU32 32)) iKQ0
+      let kPos := Exp.add kVKQ0 iKQ
+      let inBounds := Exp.lt kPos cacheLen
+      -- Per-K-row word base in K f16 buffer (rounded to in-bounds row).
+      let kPosSafe := Exp.select inBounds kPos (Exp.litU32 0)
+      let kRowBaseU32 := Exp.add kHeadBaseU32 (Exp.mul kPosSafe kRowStrideU32)
+      let partialVar ← ShaderM.var (.scalar .f32) (Exp.litF32 0.0)
+      for pk in [0:dPerLanePair] do
+        -- Word offset within K row: pair index = pk*32 + laneId (since
+        -- 2*laneId / 2 = laneId; pk*64 / 2 = pk*32).
+        let wordOff := Exp.add (Exp.litU32 (pk * 32)) laneId
+        let kWordIdx := Exp.add kRowBaseU32 wordOff
+        let kPacked ← ShaderM.readBuffer (ty := .scalar .u32) (n := kvWords)
+                        "k_cache_f16" kWordIdx
+        let unpacked := Exp.unpack2x16float kPacked
+        let k0 := Exp.vecX unpacked
+        let k1 := Exp.vecY unpacked
+        let q0Exp : Exp (.scalar .f32) := Exp.var q0Vars[pk]!
+        let q1Exp : Exp (.scalar .f32) := Exp.var q1Vars[pk]!
+        ShaderM.assign partialVar
+          (Exp.add (Exp.var partialVar) (Exp.mul q0Exp k0))
+        ShaderM.assign partialVar
+          (Exp.add (Exp.var partialVar) (Exp.mul q1Exp k1))
+
+      let sumWarpName ← ShaderM.var (.scalar .f32)
+                          (Exp.subgroupAdd (Exp.var partialVar))
+      let sumWarp : Exp (.scalar .f32) := Exp.var sumWarpName
+      let scoreGated := Exp.select inBounds sumWarp (Exp.litF32 (-1.0e30))
+      ShaderM.assign kqMaxNewVar
+        (Exp.max (Exp.var kqMaxNewVar) scoreGated)
+      ShaderM.if_ (Exp.eq laneId iKQ0) (do
+        ShaderM.assign kqRegVar scoreGated
+      ) (pure ())
+
+    -- Phase 2: per-thread softmax-online update.  Q is already scaled
+    -- so kqReg here = Q·K (unscaled in V6 but scaled here since Q is pre-scaled).
+    let kqMaxNew := Exp.var kqMaxNewVar
+    let kqMaxScaleVar ← ShaderM.var (.scalar .f32)
+                          (Exp.exp (Exp.sub kqMax kqMaxNew))
+    let kqMaxScale : Exp (.scalar .f32) := Exp.var kqMaxScaleVar
+    ShaderM.assign "kq_max" kqMaxNew
+    ShaderM.assign kqRegVar
+      (Exp.exp (Exp.sub (Exp.var kqRegVar) kqMaxNew))
+    ShaderM.assign "kq_sum"
+      (Exp.add (Exp.mul kqSum kqMaxScale) (Exp.var kqRegVar))
+    for pk in [0:dPerLanePair] do
+      let prev0 : Exp (.scalar .f32) := Exp.var vkq0Vars[pk]!
+      let prev1 : Exp (.scalar .f32) := Exp.var vkq1Vars[pk]!
+      ShaderM.assign vkq0Vars[pk]! (Exp.mul prev0 kqMaxScale)
+      ShaderM.assign vkq1Vars[pk]! (Exp.mul prev1 kqMaxScale)
+    let kqSlot := Exp.add (Exp.mul warpId (Exp.litU32 32)) laneId
+    ShaderM.writeWorkgroup (ty := .scalar .f32)
+      "shared_kq" kqSlot (Exp.var kqRegVar)
+    ShaderM.barrier
+
+    -- Phase 3: VKQ accumulation.  Read V as packed f16, unpack, accumulate.
+    ShaderM.loop (Exp.litU32 0) (Exp.litU32 32) (Exp.litU32 1) fun kOff => do
+      let kPos := Exp.add kVKQ0 (Exp.add (Exp.mul warpId (Exp.litU32 32)) kOff)
+      let kqScoreSlot := Exp.add (Exp.mul warpId (Exp.litU32 32)) kOff
+      let kqScoreRaw ← ShaderM.readWorkgroup (ty := .scalar .f32)
+                        (n := workgroupSize) "shared_kq" kqScoreSlot
+      let inBounds := Exp.lt kPos cacheLen
+      let kPosSafe := Exp.select inBounds kPos (Exp.litU32 0)
+      let kqScore := Exp.select inBounds kqScoreRaw (Exp.litF32 0.0)
+      let vRowBaseU32 := Exp.add kHeadBaseU32 (Exp.mul kPosSafe kRowStrideU32)
+      for pk in [0:dPerLanePair] do
+        let wordOff := Exp.add (Exp.litU32 (pk * 32)) laneId
+        let vWordIdx := Exp.add vRowBaseU32 wordOff
+        let vPacked ← ShaderM.readBuffer (ty := .scalar .u32) (n := kvWords)
+                        "v_cache_f16" vWordIdx
+        let unpacked := Exp.unpack2x16float vPacked
+        let v0 := Exp.vecX unpacked
+        let v1 := Exp.vecY unpacked
+        let prev0 : Exp (.scalar .f32) := Exp.var vkq0Vars[pk]!
+        let prev1 : Exp (.scalar .f32) := Exp.var vkq1Vars[pk]!
+        ShaderM.assign vkq0Vars[pk]! (Exp.add prev0 (Exp.mul v0 kqScore))
+        ShaderM.assign vkq1Vars[pk]! (Exp.add prev1 (Exp.mul v1 kqScore))
+    ShaderM.barrier
+
+  -- Cross-warp softmax merge (same as V6, adapted for paired vkq).
+  let warpKqSumName ← ShaderM.var (.scalar .f32) (Exp.subgroupAdd kqSum)
+  ShaderM.if_ (Exp.eq laneId (Exp.litU32 0)) (do
+    let metaIdx := Exp.mul warpId (Exp.litU32 2)
+    ShaderM.writeWorkgroup (ty := .scalar .f32) "shared_warp_meta"
+      metaIdx kqMax
+    ShaderM.writeWorkgroup (ty := .scalar .f32) "shared_warp_meta"
+      (Exp.add metaIdx (Exp.litU32 1)) (Exp.var warpKqSumName)
+  ) (pure ())
+
+  -- Each warp writes its per-lane VKQ slice (paired) to shared_vkq.
+  for pk in [0:dPerLanePair] do
+    let d0 := Exp.add (Exp.litU32 (pk * 64)) (Exp.mul laneId (Exp.litU32 2))
+    let d1 := Exp.add d0 (Exp.litU32 1)
+    let slot0 := Exp.add (Exp.mul warpId (Exp.litU32 headDim)) d0
+    let slot1 := Exp.add (Exp.mul warpId (Exp.litU32 headDim)) d1
+    ShaderM.writeWorkgroup (ty := .scalar .f32) "shared_vkq" slot0
+      (Exp.var vkq0Vars[pk]!)
+    ShaderM.writeWorkgroup (ty := .scalar .f32) "shared_vkq" slot1
+      (Exp.var vkq1Vars[pk]!)
+  ShaderM.barrier
+
+  -- Compute global max/sum across warps.
+  let globalMaxName ← ShaderM.var (.scalar .f32) (Exp.litF32 (-1.0e30))
+  for w in [0:numWarps] do
+    let m ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := numWarps * 2)
+              "shared_warp_meta" (Exp.litU32 (w * 2))
+    ShaderM.assign globalMaxName (Exp.max (Exp.var globalMaxName) m)
+  let globalMax : Exp (.scalar .f32) := Exp.var globalMaxName
+
+  let globalSumName ← ShaderM.var (.scalar .f32) (Exp.litF32 0.0)
+  let mut weightVars : Array String := #[]
+  for w in [0:numWarps] do
+    let m ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := numWarps * 2)
+              "shared_warp_meta" (Exp.litU32 (w * 2))
+    let s ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := numWarps * 2)
+              "shared_warp_meta" (Exp.litU32 (w * 2 + 1))
+    let weight := Exp.exp (Exp.sub m globalMax)
+    let weightName ← ShaderM.var (.scalar .f32) weight
+    weightVars := weightVars.push weightName
+    ShaderM.assign globalSumName
+      (Exp.add (Exp.var globalSumName) (Exp.mul s (Exp.var weightName)))
+  let globalSum : Exp (.scalar .f32) := Exp.var globalSumName
+
+  -- Final write: sum across warps, divide, write paired dims.
+  for pk in [0:dPerLanePair] do
+    let d0 := Exp.add (Exp.litU32 (pk * 64)) (Exp.mul laneId (Exp.litU32 2))
+    let d1 := Exp.add d0 (Exp.litU32 1)
+    let acc0Var ← ShaderM.var (.scalar .f32) (Exp.litF32 0.0)
+    let acc1Var ← ShaderM.var (.scalar .f32) (Exp.litF32 0.0)
+    for w in [0:numWarps] do
+      let slot0 := Exp.add (Exp.litU32 (w * headDim)) d0
+      let slot1 := Exp.add (Exp.litU32 (w * headDim)) d1
+      let v0 ← ShaderM.readWorkgroup (ty := .scalar .f32)
+                (n := numWarps * headDim) "shared_vkq" slot0
+      let v1 ← ShaderM.readWorkgroup (ty := .scalar .f32)
+                (n := numWarps * headDim) "shared_vkq" slot1
+      ShaderM.assign acc0Var
+        (Exp.add (Exp.var acc0Var) (Exp.mul v0 (Exp.var weightVars[w]!)))
+      ShaderM.assign acc1Var
+        (Exp.add (Exp.var acc1Var) (Exp.mul v1 (Exp.var weightVars[w]!)))
+    let outIdx0 := Exp.add qBase d0
+    let outIdx1 := Exp.add qBase d1
+    ShaderM.writeBuffer (ty := .scalar .f32) "output" outIdx0
+      (Exp.div (Exp.var acc0Var) globalSum)
+    ShaderM.writeBuffer (ty := .scalar .f32) "output" outIdx1
+      (Exp.div (Exp.var acc1Var) globalSum)
+
 /-- Vec-params V5 (Session 5, doc 60): V2 + split-K parallelism.
 
     Splits the K range across `numSplits` blocks per head.  Grid is
