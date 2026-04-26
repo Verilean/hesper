@@ -132,8 +132,13 @@ unsafe def main (argv : List String) : IO Unit := do
                    nh nkv maxSeq hd scale, "v8_ncu", "k_cache", kF32Buf, "v_cache", vBuf)
       | _    => (Hesper.WGSL.FlashAttention.flashAttentionVecParamsKernel
                    nh nkv maxSeq hd scale, "vec_ncu", "k_cache", kF32Buf, "v_cache", vBuf)
+    -- minnctapersm := 1 tells ptxas this kernel uses ≥ 1 CTA per SM, so
+    -- it can use up to 64K reg / 128 thread = 512 reg/thread (capped at 255
+    -- by hardware).  Without this, ptxas defaults to higher CTA-per-SM
+    -- assumption → tighter register budget → spill in V6/V8.
     let ptx := Hesper.CUDA.CodeGen.generatePTX funcName
                  { x := 128, y := 1, z := 1 } shader
+                 (minnctapersm := some 1)
     -- Dump for inspection
     IO.FS.writeFile s!"/tmp/v_{tag}.ptx" ptx
     let cudaMod ← Hesper.CUDA.cuModuleLoadData ptx
