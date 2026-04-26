@@ -108,18 +108,21 @@ unsafe def main (argv : List String) : IO Unit := do
   let kvZeros : Array Float := Array.replicate (nkv * maxSeq * hd) 0.0
 
   match tag with
-  | "vec" | "v2" =>
-    let kBuf ← GPUBackend.allocBuffer ctx kvSizeF32
+  | "vec" | "v2" | "v3" =>
     let vBuf ← GPUBackend.allocBuffer ctx kvSizeF32
-    GPUBackend.writeBuffer ctx kBuf (packFloats kvZeros)
     GPUBackend.writeBuffer ctx vBuf (packFloats kvZeros)
-    let (shader, funcName) := match tag with
+    -- K storage shape depends on tag
+    let kF32Buf ← GPUBackend.allocBuffer ctx kvSizeF32
+    let kF16Buf ← GPUBackend.allocBuffer ctx kvSizeF16
+    GPUBackend.writeBuffer ctx kF32Buf (packFloats kvZeros)
+    GPUBackend.writeBuffer ctx kF16Buf (packHalfs kvZeros)
+    let (shader, funcName, kBufName, kBuf) := match tag with
       | "v2" => (Hesper.WGSL.FlashAttention.flashAttentionVecParamsKernelV2
-                   nh nkv maxSeq hd scale, "v2_ncu")
+                   nh nkv maxSeq hd scale, "v2_ncu", "k_cache", kF32Buf)
+      | "v3" => (Hesper.WGSL.FlashAttention.flashAttentionVecParamsKernelV3
+                   nh nkv maxSeq hd scale, "v3_ncu", "k_cache_f16", kF16Buf)
       | _    => (Hesper.WGSL.FlashAttention.flashAttentionVecParamsKernel
-                   nh nkv maxSeq hd scale, "vec_ncu")
-    -- Compile once via raw PTX path so ncu only sees the one target
-    -- kernel symbol, not GPUBackend's hash-named wrappers.
+                   nh nkv maxSeq hd scale, "vec_ncu", "k_cache", kF32Buf)
     let ptx := Hesper.CUDA.CodeGen.generatePTX funcName
                  { x := 128, y := 1, z := 1 } shader
     let cudaMod ← Hesper.CUDA.cuModuleLoadData ptx
@@ -127,7 +130,7 @@ unsafe def main (argv : List String) : IO Unit := do
     let state := Hesper.WGSL.Monad.ShaderM.exec shader
     let declaredNames := state.declaredBuffers.map (·.1)
     let bufs : List (String × Hesper.CUDA.CUDABuffer) :=
-      [ ("q", qBuf), ("k_cache", kBuf), ("v_cache", vBuf)
+      [ ("q", qBuf), (kBufName, kBuf), ("v_cache", vBuf)
       , ("output", outBuf), ("params", paramsBuf) ]
     let args : Array USize ← declaredNames.foldlM (init := #[]) fun acc name => do
       match bufs.find? (fun p => p.1 == name) with

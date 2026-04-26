@@ -634,6 +634,168 @@ def flashAttentionVecParamsKernelV2
     ShaderM.writeBuffer (ty := .scalar .f32)
       "output" outIdx (Exp.var vkqVars[ep]!)
 
+/-- Vec-params V3 (Session 3, doc 60): V2 + K cache stored as f16.
+    V cache stays f32 (Session 4 will switch).
+
+    K buffer is declared as `array<u32, N/2>` where each u32 holds 2
+    packed f16 values (low half = even index, high half = odd index).
+    Layout: K[kvHead × maxSeqLen × headDim + s × headDim + d] is the
+    f16 value at the same logical (kvHead, s, d) coordinate as the V2
+    f32 layout.  Strides match: f16 row stride = headDim × 2 bytes.
+
+    Pre-condition: headDim must be even (Gemma 4 D=256 ✓) and the
+    per-thread elemsPerThread must be even (epT=2 for ws=128 ✓), so
+    each thread reads exactly 1 u32 = 2 f16 = 2 dims per K iter. -/
+def flashAttentionVecParamsKernelV3
+    (numHeads numKVHeads maxSeqLen headDim : Nat) (scale : Float) :
+    ShaderM Unit := do
+  let workgroupSize : Nat := 128
+  let _numWarps : Nat := workgroupSize / 32
+  let elemsPerThread : Nat := headDim / workgroupSize
+
+  let wgid ← ShaderM.workgroupId
+  let lid ← ShaderM.localId
+  let head := Exp.vec3X wgid
+  let tid := Exp.vec3X lid
+  let headsPerKV := numHeads / numKVHeads
+  let kvHead := Exp.div head (Exp.litU32 headsPerKV)
+
+  let _q ← ShaderM.declareInputBuffer "q" (.array (.scalar .f32) (numHeads * headDim))
+  -- K is f16: total f16 elements = numKVHeads × maxSeqLen × headDim,
+  -- packed as half that many u32 words.
+  let kF16Words : Nat := (numKVHeads * maxSeqLen * headDim) / 2
+  let _kCache ← ShaderM.declareInputBuffer "k_cache_f16"
+                  (.array (.scalar .u32) kF16Words)
+  let _vCache ← ShaderM.declareInputBuffer "v_cache"
+                  (.array (.scalar .f32) (numKVHeads * maxSeqLen * headDim))
+  let _output ← ShaderM.declareOutputBuffer "output"
+                  (.array (.scalar .f32) (numHeads * headDim))
+  let _params ← ShaderM.declareStorageBuffer "params" (.array (.scalar .u32) 2) .read
+
+  ShaderM.sharedNamed "shared_warp_sums" (.array (.scalar .f32) 32)
+
+  let qBase := Exp.mul head (Exp.litU32 headDim)
+  let dBase := Exp.mul tid (Exp.litU32 elemsPerThread)
+
+  let mut qVars : Array String := #[]
+  let mut vkqVars : Array String := #[]
+  for ep in [0:elemsPerThread] do
+    let d := Exp.add dBase (Exp.litU32 ep)
+    let qVal ← ShaderM.readBuffer (ty := .scalar .f32) (n := numHeads * headDim)
+                 "q" (Exp.add qBase d)
+    let qName ← ShaderM.var (.scalar .f32) qVal
+    let vkqName ← ShaderM.var (.scalar .f32) (Exp.litF32 0.0)
+    qVars := qVars.push qName
+    vkqVars := vkqVars.push vkqName
+
+  ShaderM.varNamed "max_score" (.scalar .f32) (Exp.litF32 (-1.0e30))
+  ShaderM.varNamed "sum_exp" (.scalar .f32) (Exp.litF32 0.0)
+  let maxScore := Exp.var "max_score"
+  let sumExp := Exp.var "sum_exp"
+
+  let cacheLen ← ShaderM.readBuffer (ty := .scalar .u32) (n := 2)
+                   "params" (Exp.litU32 1)
+  let laneId := Exp.bitAnd tid (Exp.litU32 31)
+  let warpId := Exp.shiftRight tid (Exp.litU32 5)
+
+  -- Pre-compute the per-thread *u32 word* offset within a K row.  Each
+  -- thread owns elemsPerThread=2 dims, packed in 1 u32.  Word index is
+  -- floor(d / 2).  Since dBase = tid * 2, dBase/2 = tid, so the word
+  -- offset within a K row is just `tid`.
+  let dBaseWordU32 := tid
+  -- K row stride in u32 words: headDim / 2.
+  let kRowStrideU32 := Exp.litU32 (headDim / 2)
+  -- K base for this kvHead row: kvHead * maxSeqLen * (headDim/2) words
+  let kHeadBaseU32 := Exp.mul kvHead
+                        (Exp.mul (Exp.litU32 maxSeqLen) kRowStrideU32)
+
+  ShaderM.loop (Exp.litU32 0) cacheLen (Exp.litU32 1) fun s => do
+    -- 1) Per-thread partial dot product: 1 u32 read = 2 f16 = 2 FMAs.
+    let partialVar ← ShaderM.var (.scalar .f32) (Exp.litF32 0.0)
+    let kRowBaseU32 := Exp.add kHeadBaseU32 (Exp.mul s kRowStrideU32)
+    let kWordIdx := Exp.add kRowBaseU32 dBaseWordU32
+    let packedName ← ShaderM.var (.scalar .u32)
+                       (← ShaderM.readBuffer (ty := .scalar .u32)
+                            (n := kF16Words) "k_cache_f16" kWordIdx)
+    -- unpack2x16float gives a vec2<f32>: (low f16 → x, high f16 → y).
+    -- Layout: word holds f16[d_even] in low bits, f16[d_odd] in high bits.
+    let unpacked := Exp.unpack2x16float (Exp.var packedName)
+    let kVal0Var ← ShaderM.var (.scalar .f32) (Exp.vecX unpacked)
+    let kVal1Var ← ShaderM.var (.scalar .f32) (Exp.vecY unpacked)
+    let q0 : Exp (.scalar .f32) := Exp.var qVars[0]!
+    let q1 : Exp (.scalar .f32) := Exp.var qVars[1]!
+    -- Two FMAs per thread per K iter.
+    ShaderM.assign partialVar
+      (Exp.add (Exp.var partialVar) (Exp.mul q0 (Exp.var kVal0Var)))
+    ShaderM.assign partialVar
+      (Exp.add (Exp.var partialVar) (Exp.mul q1 (Exp.var kVal1Var)))
+
+    -- 2) Warp reduce.
+    let warpSumName ← ShaderM.var (.scalar .f32)
+                        (Exp.subgroupAdd (Exp.var partialVar))
+    let warpSum : Exp (.scalar .f32) := Exp.var warpSumName
+
+    -- 3) Cross-warp reduce.
+    ShaderM.if_ (Exp.eq laneId (Exp.litU32 0)) (do
+      ShaderM.writeWorkgroup (ty := .scalar .f32)
+        "shared_warp_sums" warpId warpSum
+    ) (pure ())
+    ShaderM.barrier
+
+    let slotVal ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := 32)
+                    "shared_warp_sums" laneId
+    let guardedName ← ShaderM.var (.scalar .f32)
+      (Exp.select (Exp.lt laneId (Exp.litU32 _numWarps))
+                  slotVal (Exp.litF32 0.0))
+    let totalName ← ShaderM.var (.scalar .f32)
+                      (Exp.subgroupAdd (Exp.var guardedName))
+    ShaderM.if_ (Exp.eq tid (Exp.litU32 0)) (do
+      ShaderM.writeWorkgroup (ty := .scalar .f32)
+        "shared_warp_sums" (Exp.litU32 0) (Exp.var totalName)
+    ) (pure ())
+    ShaderM.barrier
+
+    let scoreFromShared ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := 32)
+                            "shared_warp_sums" (Exp.litU32 0)
+    let scaledScore := Exp.mul (Exp.litF32 scale) scoreFromShared
+
+    -- 4) Online softmax update.
+    let oldMaxVar ← ShaderM.var (.scalar .f32) maxScore
+    let oldSumVar ← ShaderM.var (.scalar .f32) sumExp
+    let oldMax := Exp.var oldMaxVar
+    let oldSum := Exp.var oldSumVar
+    let newMax := Exp.max oldMax scaledScore
+    let expOld := Exp.exp (Exp.sub oldMax newMax)
+    let expNew := Exp.exp (Exp.sub scaledScore newMax)
+    let newSum := Exp.add (Exp.mul oldSum expOld) expNew
+    let rescaleVar ← ShaderM.var (.scalar .f32)
+                       (Exp.div (Exp.mul oldSum expOld) newSum)
+    let contribVar ← ShaderM.var (.scalar .f32)
+                       (Exp.div expNew newSum)
+
+    -- 5) Update VKQ from f32 V cache (Session 4 will switch this to f16 too).
+    let vRowBase := Exp.add (Exp.mul (Exp.mul kvHead (Exp.litU32 maxSeqLen))
+                                     (Exp.litU32 headDim))
+                            (Exp.mul s (Exp.litU32 headDim))
+    for ep in [0:elemsPerThread] do
+      let d := Exp.add dBase (Exp.litU32 ep)
+      let vVal ← ShaderM.readBuffer (ty := .scalar .f32)
+                   (n := numKVHeads * maxSeqLen * headDim) "v_cache"
+                   (Exp.add vRowBase d)
+      let prevExp : Exp (.scalar .f32) := Exp.var vkqVars[ep]!
+      ShaderM.assign vkqVars[ep]!
+        (Exp.add (Exp.mul prevExp (Exp.var rescaleVar))
+                 (Exp.mul vVal   (Exp.var contribVar)))
+
+    ShaderM.assign "max_score" newMax
+    ShaderM.assign "sum_exp" newSum
+
+  for ep in [0:elemsPerThread] do
+    let d := Exp.add dBase (Exp.litU32 ep)
+    let outIdx := Exp.add qBase d
+    ShaderM.writeBuffer (ty := .scalar .f32)
+      "output" outIdx (Exp.var vkqVars[ep]!)
+
 /-- Batched flash-attention for prefill: processes `seqLen` query tokens in
     one dispatch, attending each over its own causal prefix of the K/V cache.
 
