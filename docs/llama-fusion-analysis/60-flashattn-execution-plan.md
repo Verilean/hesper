@@ -412,3 +412,108 @@ cacheLen | legacy µs | vec µs  | llama µs | vec/llama
 4. Real Gemma 4 decode TPS comparison after Session 5 remains the final
    verdict, since microbench wall-clock includes per-call host costs that
    aren't always present in the captured-graph decode path.
+
+### Raw-launch column + ncu profile (2026-04-27, #263 + #264)
+
+Added a 4th microbench column ("raw") that compiles the vec ShaderM once,
+takes the resulting CUfunction, pre-resolves buffer args, and times bare
+`cuLaunchKernel` in the iteration loop — bypassing GPUBackend.execute's
+ShaderM-exec / preHash / cache-lookup / buffer-name resolution path. Also
+added `cuda-flashattn-ncu-driver` (slim single-kernel driver, easier to
+target with `ncu --kernel-name`).
+
+Result table (Gemma 4 geometry, RTX 4070 Ti, 200 iters, microbench):
+
+```
+cacheLen | legacy | vec   | raw    | llama | vec/raw  | raw/llama
+   8     | 149.9  | 103.7 |   8.4  |   4.3 |  12.3×   |   2.0×
+  32     | 149.9  | 103.9 |  29.4  |   4.3 |   3.5×   |   6.8×
+  64     | 149.8  | 104.1 |  57.0  |   4.3 |   1.8×   |  13.2×
+ 128     | 151.2  | 112.7 | 107.5  |   3.9 |   1.05×  |  27.5×
+ 200     | 151.2  | 158.8 | 158.3  |   5.8 |   1.00×  |  27.3×
+```
+
+**Decomposition**:
+- **`vec − raw` ≈ 95 µs at short cacheLen, → 0 at cacheLen=128+**: pure
+  GPUBackend.execute host-path overhead (ShaderM eval ×2, preHash, name
+  resolve). Vanishes once GPU work exceeds it. NOT the bottleneck for the
+  long-cacheLen decode regime, but a fixed tax for short-cacheLen calls.
+- **`raw − llama`**: pure GPU kernel-time gap. Scales linearly with K
+  (8→158 µs over cacheLen 8→200) while llama is flat (3.9→5.8 µs).
+  **27× at cacheLen=128.** This is the algorithm/implementation gap.
+
+### ncu metrics (cacheLen=128, 30 launches, last 3 averaged)
+
+| Metric | hesper raw | llama.cpp | h/l |
+|---|---|---|---|
+| `gpu__time_duration` | 184.9 µs | 5.82 µs | **31.8×** |
+| `sm__throughput.pct` | 0.93% | 1.73% | 0.5× |
+| `gpu__compute_memory_throughput.pct` | 0.93% | 7.23% | 7.8× |
+| `smsp__warps_active.pct` | 8.33% | 8.30% | ~1× |
+| `launch__waves_per_multiprocessor` | 0.01 | 0.07 | 7× |
+| `launch__registers_per_thread` | 21 | 201 | 9.6× |
+| `launch__shared_mem_per_block_static` | 2.18 KB | 16.64 KB | 7.6× |
+| `launch__grid_size` | 8 | 8 | 1× |
+
+Both kernels launch 8 blocks (one per Q-head, matching `numHeads=8`,
+`numKVHeads=1`). RTX 4070 Ti has **80 SMs**, so both are deeply
+under-occupied (waves 0.07 means ~6 SMs busy, 74 idle). **Increasing
+SM utilisation = Session 2 (split-K) — same on both kernels in
+principle.**
+
+But the bigger surprise is the instruction count:
+
+| Metric | hesper | llama | h/l |
+|---|---|---|---|
+| `inst_executed.sum` | 872,256 | 55,520 | **15.7×** |
+| `pipe_fma.sum` | 389,472 | 41,184 | **9.5×** |
+| `op_global_ld.sum` | 20,576 | 2,336 | **8.8×** |
+| `op_shared_ld.sum` | 41,024 | 1,344 | **30.5×** |
+| `op_shared_st.sum` | 16,512 | 448 | **36.9×** |
+| `pipe_lsu.sum` | 119,168 | 5,600 | **21.3×** |
+
+**Conclusion**: the gap is *NOT* primarily SM utilisation (both run 8
+blocks). It's that hesper's vec kernel **executes 16× more
+instructions** to compute the same result:
+- 30× more shared-memory traffic — hesper round-trips through smem to
+  reduce across warps; llama keeps results in registers and uses warp
+  shuffle.
+- 9× more FMA — likely no CSE, no loop unroll, redundant rsqrt /
+  rescale / max recomputation per K iteration.
+- 9× more global load — f32 K/V instead of f16 (Session 3-4), plus
+  not vectorising loads.
+
+**Per-thread register count** is also revealing: hesper 21 vs llama
+**201**. llama's kernel keeps a huge VKQ accumulator + KQ_max/KQ_sum
+per-thread in registers, never spilling to smem. hesper's kernel leans
+on smem because Lean ShaderM doesn't naturally express per-thread
+multi-element accumulators that llama's CUDA template specialises into.
+
+**Implication for Sessions 2–5**:
+- Session 2 (split-K) helps SM utilisation, but both hesper and llama
+  start at the same 8-block / 0.07-wave point — **split-K alone won't
+  close the 32× gap**, because the per-thread instruction-count gap
+  multiplies on top.
+- The real lever is **register-resident accumulators + warp-shuffle
+  reduce** (currently hidden in the kernel as smem ping-pong). That's
+  partly Session 1's intent but didn't go deep enough — the Session 1
+  vec kernel still uses `ShaderM.writeWorkgroup` cross-warp gather
+  (line "shared_warp_sums" smem write) which the metrics catch as 30×
+  shared traffic.
+- f32 → f16 K/V (Sessions 3-4) only addresses the 8.8× global-load gap.
+
+**Updated session priorities**:
+1. **Session 2′ (revised)**: refactor vec inner loop to keep
+   `KQ_max`/`KQ_sum`/`VKQ[]` in `ShaderM.var` (PTX register) only,
+   and reduce across warps via *only* `Exp.subgroupAdd`/`subgroupMax`
+   (no smem gather). This shifts work from LSU to ALU and is the main
+   instruction-count lever — could give 10× or more on its own.
+   Verify with ncu re-run that `op_shared_*` drops 10×+.
+2. **Session 3 (K f16) + 4 (V f16)**: addresses the 8.8× global-load
+   gap. Less impactful than Session 2′ but cumulative.
+3. **Session 5**: split-K + final TPS measurement.
+
+**Decision**: Session 2 (split-K) as originally planned is *not* the
+highest lever. Renaming to "Session 2′: per-thread accumulators +
+warp-only reduce". Split-K becomes a follow-up if SM utilisation
+turns out to be the residual gap after instruction count is closed.
