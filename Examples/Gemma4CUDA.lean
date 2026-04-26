@@ -138,6 +138,14 @@ unsafe def main (args : List String) : IO Unit := do
   -- is required by the perf_compare profiling driver so that nsys'
   -- --duration window has steady-state activity to capture.
   let ignoreEos := (← IO.getEnv "HESPER_IGNORE_EOS").isSome
+  -- HESPER_SECTION_PROFILE=1 enables per-section host-wall accumulation
+  -- in `Hesper.WGSL.Execute.withSection`. Drains the timer before
+  -- decode so prefill noise is excluded; prints a sorted summary on
+  -- exit. Used for #251 follow-on (locating the 4 ms host gap inside
+  -- forwardBlock without resorting to perf record).
+  let secProfile := (← IO.getEnv "HESPER_SECTION_PROFILE").isSome
+  if secProfile then
+    Hesper.WGSL.Execute.sectionProfilingRef.set true
   let tokens ←
     if ignoreEos then
       generate ctx model promptTokens maxTokens
@@ -149,3 +157,20 @@ unsafe def main (args : List String) : IO Unit := do
   let generated := tokens.extract promptTokens.size tokens.size
   let decoded := Hesper.Tokenizer.SentencePiece.decode tokenizer generated
   IO.println s!"[Result] Decoded: {decoded}"
+
+  if secProfile then do
+    Hesper.WGSL.Execute.sectionProfilingRef.set false
+    let totals ← Hesper.WGSL.Execute.getSectionTotals
+    let sorted := totals.qsort (fun a b => a.2.1 > b.2.1)
+    let n := sorted.size
+    IO.println s!"[secprof] section totals (host wall, sorted by total ns) — N={n}"
+    let limit := min n 30
+    let mut i := 0
+    while i < limit do
+      match sorted[i]? with
+      | some (name, ns, calls) =>
+        let ms := ns.toFloat / 1.0e6
+        let avgUs := if calls > 0 then (ns.toFloat / calls.toFloat / 1000.0) else 0.0
+        IO.println s!"  {name} : total={ms} ms, calls={calls}, avg={avgUs} µs"
+      | none => pure ()
+      i := i + 1
