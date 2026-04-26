@@ -703,12 +703,60 @@ partial def stmtToPTX (stmt : Stmt) (s : GenState) : GenState :=
 
   | .exprStmt e => (expToPTX e s).2
   | .block stmts =>
-    -- Inline the block contents.  Ideally we'd emit `{ ... }` PTX braces
-    -- to give ptxas a hint about live range boundaries, but our PTX
-    -- backend stores all register declarations at function scope so the
-    -- braces wouldn't actually restrict anything.  The WGSL backend does
-    -- emit `{ ... }` for register reuse hints to Naga / Tint.
-    stmts.foldl (fun s st => stmtToPTX st s) s
+    -- Enter a new PTX scope: assign a fresh scopeId, save outer reg
+    -- counters and inst array, run inner stmts with reset counters
+    -- (so inner regs get IDs 0..N-1 within the scope), then wrap the
+    -- inner instructions in `Inst.scopeBlock` and append to the outer
+    -- inst array.  The inner-scope regs use prefix `%bf{scopeId}_<id>`
+    -- so they don't collide with outer-scope `%f<id>` regs.
+    --
+    -- This way:
+    --   * function-top declares `.reg .f32 %f<outerCount>;` etc.
+    --   * inside `{ ... }`, declares `.reg .f32 %bf{N}_0, %bf{N}_1, ...;`
+    --   * ptxas treats inner regs as block-local → physical SASS register
+    --     reuse → register pressure goes down.
+    let outerScope := s.scopeId
+    let outerInsts := s.insts
+    let outerF := s.fRegs; let outerR := s.rRegs; let outerRd := s.rdRegs
+    let outerP := s.pRegs; let outerH := s.hRegs
+    let myScopeId := s.scopeIdNext
+    -- Switch to inner scope: reset reg counters, clear inst buffer, bump
+    -- scope id, reserve next scope id for any nested scope.
+    let s := { s with
+      scopeId := myScopeId
+      scopeIdNext := myScopeId + 1
+      insts := #[]
+      fRegs := 0
+      rRegs := 0
+      rdRegs := 0
+      pRegs := 0
+      hRegs := 0
+      -- Clear sreg / imm caches: outer-scope reg refs aren't visible inside.
+      sregCache := []
+      immCache := []
+    }
+    let s := stmts.foldl (fun s st => stmtToPTX st s) s
+    -- Capture inner state before restoring outer.
+    let innerInsts := s.insts
+    let numF := s.fRegs
+    let numR := s.rRegs
+    let numRd := s.rdRegs
+    let numP := s.pRegs
+    let numH := s.hRegs
+    -- Restore outer scope: reg counters and inst array as they were.
+    -- scopeIdNext keeps the bumped value (we used myScopeId already).
+    let s := { s with
+      scopeId := outerScope
+      insts := outerInsts
+      fRegs := outerF
+      rRegs := outerR
+      rdRegs := outerRd
+      pRegs := outerP
+      hRegs := outerH
+      sregCache := []
+      immCache := []
+    }
+    s.emit (.scopeBlock myScopeId numF numR numRd numP numH innerInsts)
 
 /-- Generate a complete PTX module string from a ShaderM computation. -/
 def generatePTX

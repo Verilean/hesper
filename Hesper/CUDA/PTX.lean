@@ -21,17 +21,40 @@ namespace Hesper.CUDA.PTX
 -- Typed registers
 -- ============================================================================
 
-structure RegF32  where id : Nat deriving BEq, Repr, Inhabited
-structure RegU32  where id : Nat deriving BEq, Repr, Inhabited
-structure RegU64  where id : Nat deriving BEq, Repr, Inhabited
-structure RegPred where id : Nat deriving BEq, Repr, Inhabited
-structure RegB16  where id : Nat deriving BEq, Repr, Inhabited  -- 16-bit (f16/b16)
+/-- 32-bit float register.  `scopeId = 0` for function-scope (outer)
+    registers — printed as `%f{id}`.  `scopeId > 0` for block-scope
+    registers (allocated inside a `scopeBlock`) — printed as
+    `%bf{scopeId}_{id}` to avoid ID collision with outer regs while
+    keeping each scope's name space distinct. -/
+structure RegF32 where
+  id : Nat
+  scopeId : Nat := 0
+  deriving BEq, Repr, Inhabited
+structure RegU32 where
+  id : Nat
+  scopeId : Nat := 0
+  deriving BEq, Repr, Inhabited
+structure RegU64 where
+  id : Nat
+  scopeId : Nat := 0
+  deriving BEq, Repr, Inhabited
+structure RegPred where
+  id : Nat
+  scopeId : Nat := 0
+  deriving BEq, Repr, Inhabited
+structure RegB16 where
+  id : Nat
+  scopeId : Nat := 0
+  deriving BEq, Repr, Inhabited
 
-instance : ToString RegF32  where toString r := s!"%f{r.id}"
-instance : ToString RegU32  where toString r := s!"%r{r.id}"
-instance : ToString RegU64  where toString r := s!"%rd{r.id}"
-instance : ToString RegPred where toString r := s!"%p{r.id}"
-instance : ToString RegB16  where toString r := s!"%h{r.id}"
+private def regName (typ : String) (id scopeId : Nat) : String :=
+  if scopeId = 0 then s!"%{typ}{id}" else s!"%b{typ}{scopeId}_{id}"
+
+instance : ToString RegF32  where toString r := regName "f"  r.id r.scopeId
+instance : ToString RegU32  where toString r := regName "r"  r.id r.scopeId
+instance : ToString RegU64  where toString r := regName "rd" r.id r.scopeId
+instance : ToString RegPred where toString r := regName "p"  r.id r.scopeId
+instance : ToString RegB16  where toString r := regName "h"  r.id r.scopeId
 
 /-- Untyped register for varMap (bridges Exp's erased types to typed PTX). -/
 inductive AnyReg where
@@ -269,6 +292,17 @@ inductive Inst where
   | bra_not      (pred : RegPred) (target : Label)
   | label        (l : Label)
   | ret
+  /-- PTX `{ ... }` block scope with **block-local** `.reg` declarations.
+      Inside this scope, fresh registers were allocated against a private
+      counter (starting at 0 for each scope) and use the prefix
+      `%bf{scopeId}_<id>` (and analogous for r, rd, p, h).
+      `numF/R/Rd/P/H` count how many registers of each type the inner body
+      allocated.  Declared inside the `{ ... }` so ptxas knows their live
+      range ends at `}`, enabling physical SASS register reuse. -/
+  | scopeBlock
+      (scopeId : Nat)
+      (numF numR numRd numP numH : Nat)
+      (insts : Array Inst)
   deriving Repr
 
 -- ============================================================================
@@ -278,7 +312,7 @@ inductive Inst where
 private def spStr : AddrSpace → String
   | .global => "global" | .shared => "shared" | .param => "param"
 
-def Inst.toString : Inst → String
+partial def Inst.toString : Inst → String
   | .mov_f32 d s         => s!"  mov.f32 {d}, {s};"
   | .mov_f32_imm d imm   => s!"  mov.f32 {d}, {imm};"
   | .add_f32 d a b       => s!"  add.f32 {d}, {a}, {b};"
@@ -377,6 +411,28 @@ def Inst.toString : Inst → String
   | .bra_not p target    => s!"  @!{p} bra {target};"
   | .label l             => s!"{l}:"
   | .ret                 => "  ret;"
+  | .scopeBlock scopeId numF numR numRd numP numH insts => Id.run do
+    -- Inner regs use prefix `%bf{scopeId}_<id>`, `%br{scopeId}_<id>`, etc.
+    -- to avoid name collision with outer-scope regs (which use `%f<id>`).
+    -- IDs run 0..num-1 within the scope.  Declared inside the brace so
+    -- ptxas treats live range as bounded by `}`.
+    let regRange (typ : String) (ptype : String) (n : Nat) : String := Id.run do
+      if n = 0 then return ""
+      let mut s := s!"  .reg {ptype} "
+      for i in [0:n] do
+        if i > 0 then s := s ++ ", "
+        s := s ++ s!"%b{typ}{scopeId}_{i}"
+      s := s ++ ";\n"
+      return s
+    let mut s := "  {\n"
+    s := s ++ regRange "f"  ".f32"  numF
+    s := s ++ regRange "r"  ".b32"  numR
+    s := s ++ regRange "rd" ".u64"  numRd
+    s := s ++ regRange "p"  ".pred" numP
+    s := s ++ regRange "h"  ".b16"  numH
+    for inst in insts do s := s ++ "  " ++ inst.toString ++ "\n"
+    s := s ++ "  }"
+    return s
 
 instance : ToString Inst where toString := Inst.toString
 
@@ -465,6 +521,13 @@ structure GenState where
   hRegs : Nat := 0   -- b16 (f16) registers
   labels : Nat := 0
   insts : Array Inst := #[]
+  /-- Current PTX scope id.  0 = function body (outer scope).  > 0 = inside
+      a `Stmt.block` whose codegen wraps the inner instructions in a
+      `Inst.scopeBlock` and gives those inner regs a private prefix.
+      Pushed/popped by `enterScope` / `leaveScope` in CodeGen. -/
+  scopeId : Nat := 0
+  /-- Monotonic counter for assigning a unique scopeId to each new scope. -/
+  scopeIdNext : Nat := 1
   varMap : List (String × AnyReg) := []
   sharedNames : List String := []
   /-- Buffer names declared with u32 element type (for ld.global.u32) -/
@@ -490,19 +553,19 @@ structure GenState where
 namespace GenState
 
 def freshF32 (s : GenState) : RegF32 × GenState :=
-  (⟨s.fRegs⟩, { s with fRegs := s.fRegs + 1 })
+  (⟨s.fRegs, s.scopeId⟩, { s with fRegs := s.fRegs + 1 })
 
 def freshU32 (s : GenState) : RegU32 × GenState :=
-  (⟨s.rRegs⟩, { s with rRegs := s.rRegs + 1 })
+  (⟨s.rRegs, s.scopeId⟩, { s with rRegs := s.rRegs + 1 })
 
 def freshU64 (s : GenState) : RegU64 × GenState :=
-  (⟨s.rdRegs⟩, { s with rdRegs := s.rdRegs + 1 })
+  (⟨s.rdRegs, s.scopeId⟩, { s with rdRegs := s.rdRegs + 1 })
 
 def freshPred (s : GenState) : RegPred × GenState :=
-  (⟨s.pRegs⟩, { s with pRegs := s.pRegs + 1 })
+  (⟨s.pRegs, s.scopeId⟩, { s with pRegs := s.pRegs + 1 })
 
 def freshB16 (s : GenState) : RegB16 × GenState :=
-  (⟨s.hRegs⟩, { s with hRegs := s.hRegs + 1 })
+  (⟨s.hRegs, s.scopeId⟩, { s with hRegs := s.hRegs + 1 })
 
 def freshLabel (s : GenState) : Label × GenState :=
   (⟨s.labels⟩, { s with labels := s.labels + 1 })
