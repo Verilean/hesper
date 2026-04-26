@@ -199,6 +199,43 @@ backend")** — that conclusion was either from a buggy capture path or a
 flawed measurement. Doc 57's protocol gives the +20-30 TPS we expect from
 H4 in the canonical decomposition.
 
+### 3b.3. Stub-forward bench result (H4b verdict, 2026-04-26)
+
+`Examples/Gemma4StubDecodeBench.lean` runs `forwardTokenStubPerLayer` —
+714 dispatches/token of **no-op stub kernels** (1×1×1 workgroup with a
+trivial body), in a 200-token loop. The shape (number of dispatches per
+token) matches the real `forwardSingleToken` to within 20 %, but the
+GPU side contributes essentially zero. The wall is therefore the
+**host-side floor** for hesper's current dispatch path.
+
+| run                                        | dispatches / tok | wall / tok | "TPS" |
+|---|---:|---:|---:|
+| stub forward, **no-kcr** (cold path each time) | 714 | **5.33 ms** | 188 |
+| stub forward, **kcr** (cache-hit path)      | 714 | **1.24 ms** | 808 |
+| real forwardSingleToken (HESPER_DECODE_SECT_TRACE 'forward') | 880 | ~5.0 ms | (~60 TPS overall) |
+
+Two facts the bench exposes:
+
+1. **The host floor with the cache hit (1.24 ms) is ~4× lower than the
+   real forward's 5 ms.** The real forward has the same 880 dispatches
+   on the same machine, yet pays cold-path cost. **Something in the real
+   path is missing the cache.** That ~3.8 ms is recoverable without
+   any GPU work.
+
+2. **The cold-path cost (5.33 ms) is essentially identical to the real
+   forward's 5 ms.** This eliminates dispatch *count* as the cause —
+   the per-dispatch host work itself is comparable when not cached.
+   The gap to llama.cpp graphs-OFF is therefore not "dispatch rate"
+   but "we're not actually using our cache".
+
+Predicted budget for fixing this:
+- If the real forward's `cacheRef` lookups miss for any reason
+  (cacheKey collision, ref reset between calls, IR rebuild on every
+  iteration), bringing it to the kcr-cached path reduces forward host
+  time from ~5 ms → ~1.2 ms ⇒ wall 15 ms → 11 ms ⇒ ~90 TPS.
+- This is independent of the kernel-speed gap (#47, ~+18 TPS) and the
+  graphs-ON workaround (#252).
+
 ### 3c. Where the host CPU spends those 5 ms
 
 `perf record -e cycles:u --call-graph=fp` during steady-state decode:
@@ -233,7 +270,7 @@ drain → 15 ms total. If forward overlaps drain, total → 10 ms (= drain)
 | H3 | Per-kernel GPU time | +18 TPS | not yet attempted | active (#47, on hold) |
 | H4 | Forward host work runs sequentially with the drain; pipeline it across iterations | +30 TPS | partially measured (§3b.1) | **active** — root cause of the 4 ms gap is NOT yet identified; need llama.cpp graphs-OFF comparison |
 | H4a | Existing CUDA-graph capture path (HESPER_CUDA_GRAPHS=1) already pipelines host launch via cuGraphLaunch | +20 TPS / steady state +30 TPS | **measured 59 → 80 TPS at 80-token, ~100 TPS steady-state** | **WORKAROUND only** — see §3b.2; hides the host work but does not explain why hesper graphs-OFF needs 4× more host work than llama.cpp graphs-OFF |
-| H4b | hesper-specific per-block overhead (Circuit.replay args Array expand, kcr.getRef hash, withSection bookkeeping) is the real source of the 4 ms gap | varies | **not yet measured** | **next** — measure llama-cli graphs-OFF forward host time, take the difference |
+| H4b | hesper-specific per-block overhead (Circuit.replay args Array expand, kcr.getRef hash, withSection bookkeeping) is the real source of the 4 ms gap | varies | **measured via stub bench** — stub+kcr=1.24ms / stub-no-kcr=5.33ms / real=5ms ⇒ real path runs cache-cold-equivalent work despite kcr being available | ✓ CONFIRMED — see §3b.3; see #253 for the fix |
 | H5 | Lean Array expand in replay loop adds ms | +5 TPS | bounded ≤ 0.7 ms wall | ✗ marginal, deferred |
 | H6 | cuMemAlloc per token (driver alloc) | +5 TPS | already at 1 alloc/tok (pool); driver work is minimal | ✗ DEAD (#246) |
 | H7 | mmap PLE on-demand H2D | -3 TPS regression noted | confirmed | trade-off accepted (#247-248) |
@@ -259,12 +296,15 @@ Every previous session has skipped step 1 or step 6. Don't.
 
 ## 6. Active workstreams (priority order)
 
-1. **NEXT — find the per-block hesper-specific overhead (H4b)**.
-   Measure llama-cli graphs-OFF forward host time / token under the same
-   protocol; subtract from hesper's 4.13 ms. The remainder is the real
-   gap. Suspects (in order of plausibility): Circuit.replay args Array
-   expand, kcr.getRef hash chain, withSection bookkeeping. Verify by
-   stubbing each in turn.
+1. **#253 (next, biggest lever)** — find the cache-miss in the real
+   forwardSingleToken / forwardBlock dispatch path that makes it pay
+   cold-path host cost (5 ms) when stub-bench at the same dispatch
+   shape with kcr=ON pays only 1.24 ms. Predicted -3.8 ms wall =
+   60 → 90 TPS for graphs-OFF. Approach:
+   - Add `kcr` hit/miss counters in cudaExecuteImpl + Circuit.replay.
+   - Run gemma4-cuda with `HESPER_KCR_TRACE=1`; expect to see hits but
+     they may be on the wrong key, or the ref may be resetting.
+   - Fix the cache-key / ref ownership; re-bench.
 
 2. **#47 (kernel speed, paused)** — Q4_K matmul to llama.cpp parity.
    Predicted -2.5 ms wall. Independent of #1; combined will close most
