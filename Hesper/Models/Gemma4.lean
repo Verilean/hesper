@@ -794,10 +794,12 @@ def forwardBlock [GPUBackend β] (ctx : β)
       -- SWA masking isn't needed: cacheLen is already clamped to
       -- ≤ windowSize for SWA layers upstream.
       if cacheLen > 32 then
+        let kcrLk := kcr.map (fun k key => k.getRef key)
         FlashAttention.executeFlashAttentionTiled ctx
           state.qBuf kvCache.kBuf kvCache.vBuf state.attnOutBuf
           numHeads numKVHeads cfg.maxSeqLen headDim cacheLen scale
           (partialBuf := some state.flashPartialBuf)
+          (kcrLookup := kcrLk)
       else
         let useSubgroupFA := (match ← IO.getEnv "HESPER_FA_SUBGROUP" with
                              | some "1" => true
@@ -2188,10 +2190,12 @@ def forwardPrefillBatch [GPUBackend β] (ctx : β)
           [("src", cacheLenBuf), ("params", colIdxBuf), ("dst", state.paramsBuf)]
           { numWorkgroups := (1, 1, 1), workgroupSize := { x := 1, y := 1, z := 1 } }
         if cacheLen > 32 then
+          let kcrLk := kcr.map (fun k key => k.getRef key)
           FlashAttention.executeFlashAttentionTiled ctx
             state.qBuf kvCache.kBuf kvCache.vBuf state.attnOutBuf
             numHeads numKVHeads cfg.maxSeqLen headDim cacheLen scale
             (partialBuf := some state.flashPartialBuf)
+            (kcrLookup := kcrLk)
         else
           ce s!"flashAttnP_pf_{headDim}_{numKVHeads}"
             (FlashAttention.flashAttentionDynamicParamsKernel numHeads numKVHeads cfg.maxSeqLen headDim scale)
