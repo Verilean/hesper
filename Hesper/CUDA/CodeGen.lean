@@ -702,7 +702,13 @@ partial def stmtToPTX (stmt : Stmt) (s : GenState) : GenState :=
     else s.emit (.label elseL)
 
   | .exprStmt e => (expToPTX e s).2
-  | .block stmts => stmts.foldl (fun s st => stmtToPTX st s) s
+  | .block stmts =>
+    -- Inline the block contents.  Ideally we'd emit `{ ... }` PTX braces
+    -- to give ptxas a hint about live range boundaries, but our PTX
+    -- backend stores all register declarations at function scope so the
+    -- braces wouldn't actually restrict anything.  The WGSL backend does
+    -- emit `{ ... }` for register reuse hints to Naga / Tint.
+    stmts.foldl (fun s st => stmtToPTX st s) s
 
 /-- Generate a complete PTX module string from a ShaderM computation. -/
 def generatePTX

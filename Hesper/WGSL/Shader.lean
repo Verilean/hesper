@@ -149,7 +149,13 @@ partial def Stmt.toWGSL (indent : Nat := 0) : Stmt → String
     s!"{ind}{e.toWGSL};\n"
 
   | .block stmts =>
-    String.join (stmts.map (·.toWGSL indent))
+    -- Emit a real `{ ... }` scope so var declared inside is block-scoped.
+    -- This lets Naga/Tint/Vulkan-driver register allocator reuse the
+    -- physical register once the scope exits — same behavior as nvcc
+    -- for CUDA `{ ... }` block scope (live range ends at `}`).
+    let ind := String.ofList (List.replicate indent ' ')
+    let bodyStr := String.join (stmts.map (·.toWGSL (indent + 2)))
+    s!"{ind}" ++ "{\n" ++ bodyStr ++ s!"{ind}" ++ "}\n"
 
 /-- Generate WGSL struct definition -/
 def StructDef.toWGSL (structDef : StructDef) : String :=

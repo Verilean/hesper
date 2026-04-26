@@ -134,6 +134,8 @@ unsafe def main (argv : List String) : IO Unit := do
                    nh nkv maxSeq hd scale, "vec_ncu", "k_cache", kF32Buf, "v_cache", vBuf)
     let ptx := Hesper.CUDA.CodeGen.generatePTX funcName
                  { x := 128, y := 1, z := 1 } shader
+    -- Dump for inspection
+    IO.FS.writeFile s!"/tmp/v_{tag}.ptx" ptx
     let cudaMod ← Hesper.CUDA.cuModuleLoadData ptx
     let f ← Hesper.CUDA.cuModuleGetFunction cudaMod funcName
     let state := Hesper.WGSL.Monad.ShaderM.exec shader
