@@ -171,16 +171,44 @@ def runCase
     { workgroupSize := { x := 128 }, numWorkgroups := (numHeads, 1, 1),
       extensions := ["subgroups"] }
 
+  -- V2: per-thread accumulator + warp-only reduce (Session 2′).  Skipped
+  -- for headDim < workgroupSize (V2 requires headDim % 128 == 0).
+  let outBufV2 ← GPUBackend.allocBuffer ctx outSize
+  if headDim % 128 == 0 then
+    let v2Shader := Hesper.WGSL.FlashAttention.flashAttentionVecParamsKernelV2
+                       numHeads numKVHeads maxSeqLen headDim scale
+    let v2Bufs : List (String × GPUBackend.Buf Hesper.CUDAContext) :=
+      [ ("q",       qBuf)
+      , ("k_cache", kBuf)
+      , ("v_cache", vBuf)
+      , ("output",  outBufV2)
+      , ("params",  paramsBuf) ]
+    GPUBackend.execute ctx v2Shader v2Bufs
+      { workgroupSize := { x := 128 }, numWorkgroups := (numHeads, 1, 1),
+        extensions := ["subgroups"] }
+
   let legacyResultBytes ← GPUBackend.readBuffer ctx outBufLegacy outSize
   let vecResultBytes    ← GPUBackend.readBuffer ctx outBufVec outSize
   let legacyOut := unpackFloats legacyResultBytes (numHeads * headDim)
   let vecOut    := unpackFloats vecResultBytes (numHeads * headDim)
+  if headDim % 128 == 0 then
+    let v2ResultBytes ← GPUBackend.readBuffer ctx outBufV2 outSize
+    let v2Out := unpackFloats v2ResultBytes (numHeads * headDim)
+    -- compareCase below will see vecOut for the legacy/vec compare; we
+    -- print a separate v2 line here so callers see all three.
+    let mut maxAbs := 0.0
+    for i in [0:legacyOut.size] do
+      let d := (legacyOut[i]! - v2Out[i]!).abs
+      if d > maxAbs then maxAbs := d
+    let mark := if maxAbs < 1e-4 then "✓ V2" else "✗ V2"
+    IO.println s!"      [{mark}] V2 max abs diff vs legacy = {maxAbs}"
 
   GPUBackend.freeBuffer ctx qBuf
   GPUBackend.freeBuffer ctx kBuf
   GPUBackend.freeBuffer ctx vBuf
   GPUBackend.freeBuffer ctx outBufLegacy
   GPUBackend.freeBuffer ctx outBufVec
+  GPUBackend.freeBuffer ctx outBufV2
   GPUBackend.freeBuffer ctx paramsBuf
 
   return (legacyOut, vecOut)
@@ -358,10 +386,14 @@ unsafe def main : IO Unit := do
                          nh nkv maxSeq hd scale 256
     let vecShader    := Hesper.WGSL.FlashAttention.flashAttentionVecParamsKernel
                          nh nkv maxSeq hd scale
+    let v2Shader     := Hesper.WGSL.FlashAttention.flashAttentionVecParamsKernelV2
+                         nh nkv maxSeq hd scale
 
     let (legacyUs, legacyMs) ← benchKernel ctx "legacy" legacyShader bufs 256 nh warmup iters
     let (vecUs,    vecMs)    ← benchKernel ctx "vec"    vecShader    bufs 128 nh warmup iters
+    let (v2Us,     v2Ms)     ← benchKernel ctx "v2"     v2Shader     bufs 128 nh warmup iters
     let speedup := legacyUs / vecUs
+    let v2Speedup := vecUs / v2Us
 
     -- Raw-launch column: compile vecShader once (cuModuleLoadData +
     -- cuModuleGetFunction), pre-resolve buffer args, then time bare
@@ -425,7 +457,7 @@ unsafe def main : IO Unit := do
         let llamaMs := (t1 - t0).toFloat / 1.0e6
         let vecVsLlama := vecUs / llamaUs
         pure s!"  llama={llamaUs} µs/call ({llamaMs} ms / {iters})  vec/llama={vecVsLlama}×"
-    IO.println s!"  cacheLen={cacheLen}: legacy={legacyUs} µs/call  vec={vecUs} µs/call  legacy/vec={speedup}×{rawInfo}{llamaInfo}"
+    IO.println s!"  cacheLen={cacheLen}: legacy={legacyUs} vec={vecUs} v2={v2Us} µs/call  legacy/vec={speedup}× vec/v2={v2Speedup}×{rawInfo}{llamaInfo} (v2 {v2Ms}ms/{iters})"
 
     GPUBackend.freeBuffer ctx qBuf
     GPUBackend.freeBuffer ctx kBuf

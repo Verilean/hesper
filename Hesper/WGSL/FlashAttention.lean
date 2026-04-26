@@ -477,6 +477,163 @@ def flashAttentionVecParamsKernel (numHeads numKVHeads maxSeqLen headDim : Nat)
     let outIdx := Exp.add (Exp.mul head (Exp.litU32 headDim)) d
     ShaderM.writeBuffer (ty := .scalar .f32) "output" outIdx v
 
+/-- Vec-params V2 (Session 2′, doc 60): keeps Q + VKQ accumulator in
+    per-thread registers (PTX local vars) instead of round-tripping
+    through shared memory.  Targets the 30× shared-memory traffic gap
+    identified by ncu vs llama.cpp.
+
+    Layout:
+      block_dim = (128, 1, 1) = 4 warps
+      grid      = (numHeads, 1, 1)
+      headDim must be a multiple of 128 (=workgroupSize).  For Gemma 4
+      D=256, each thread owns elemsPerThread=2 contiguous dims.
+
+    Differences vs V1:
+      - Q is read once per thread into per-thread registers (no shared_q).
+      - VKQ accumulator is per-thread registers (no shared_out).
+      - Cross-warp KQ reduce: 1 smem write per warp + 1 broadcast slot
+        + 1 barrier — total ≤ 8 smem ops/iter (vs V1's 256+).
+      - V is read directly from gmem and applied to per-thread VKQ
+        without an intermediate smem stage.
+    Pre-condition: headDim % workgroupSize == 0. -/
+def flashAttentionVecParamsKernelV2
+    (numHeads numKVHeads maxSeqLen headDim : Nat) (scale : Float) :
+    ShaderM Unit := do
+  let workgroupSize : Nat := 128
+  let _numWarps : Nat := workgroupSize / 32
+  let elemsPerThread : Nat := headDim / workgroupSize
+  -- contiguous-per-thread layout: thread t owns dims [t*epT .. (t+1)*epT)
+
+  let wgid ← ShaderM.workgroupId
+  let lid ← ShaderM.localId
+  let head := Exp.vec3X wgid
+  let tid := Exp.vec3X lid
+  let headsPerKV := numHeads / numKVHeads
+  let kvHead := Exp.div head (Exp.litU32 headsPerKV)
+
+  let _q ← ShaderM.declareInputBuffer "q" (.array (.scalar .f32) (numHeads * headDim))
+  let _kCache ← ShaderM.declareInputBuffer "k_cache"
+                  (.array (.scalar .f32) (numKVHeads * maxSeqLen * headDim))
+  let _vCache ← ShaderM.declareInputBuffer "v_cache"
+                  (.array (.scalar .f32) (numKVHeads * maxSeqLen * headDim))
+  let _output ← ShaderM.declareOutputBuffer "output"
+                  (.array (.scalar .f32) (numHeads * headDim))
+  let _params ← ShaderM.declareStorageBuffer "params" (.array (.scalar .u32) 2) .read
+
+  -- Only smem: 32 slots for cross-warp reduce.  Sized to 32 so warp 0's
+  -- subgroupAdd-over-lane has a fixed-shape array.
+  ShaderM.sharedNamed "shared_warp_sums" (.array (.scalar .f32) 32)
+
+  -- Per-thread Q (preloaded once) and VKQ accumulator (updated per K).
+  -- Lean static loop unrolls these into elemsPerThread independent vars.
+  let qBase := Exp.mul head (Exp.litU32 headDim)
+  let dBase := Exp.mul tid (Exp.litU32 elemsPerThread)
+
+  let mut qVars : Array String := #[]
+  let mut vkqVars : Array String := #[]
+  for ep in [0:elemsPerThread] do
+    let d := Exp.add dBase (Exp.litU32 ep)
+    let qVal ← ShaderM.readBuffer (ty := .scalar .f32) (n := numHeads * headDim)
+                 "q" (Exp.add qBase d)
+    let qName ← ShaderM.var (.scalar .f32) qVal
+    let vkqName ← ShaderM.var (.scalar .f32) (Exp.litF32 0.0)
+    qVars := qVars.push qName
+    vkqVars := vkqVars.push vkqName
+
+  ShaderM.varNamed "max_score" (.scalar .f32) (Exp.litF32 (-1.0e30))
+  ShaderM.varNamed "sum_exp" (.scalar .f32) (Exp.litF32 0.0)
+  let maxScore := Exp.var "max_score"
+  let sumExp := Exp.var "sum_exp"
+
+  let cacheLen ← ShaderM.readBuffer (ty := .scalar .u32) (n := 2)
+                   "params" (Exp.litU32 1)
+  let laneId := Exp.bitAnd tid (Exp.litU32 31)
+  let warpId := Exp.shiftRight tid (Exp.litU32 5)
+
+  ShaderM.loop (Exp.litU32 0) cacheLen (Exp.litU32 1) fun s => do
+    -- 1) Per-thread partial dot product over the elemsPerThread dims.
+    let partialVar ← ShaderM.var (.scalar .f32) (Exp.litF32 0.0)
+    let kBase := Exp.add (Exp.mul (Exp.mul kvHead (Exp.litU32 maxSeqLen))
+                                  (Exp.litU32 headDim))
+                          (Exp.mul s (Exp.litU32 headDim))
+    for ep in [0:elemsPerThread] do
+      let d := Exp.add dBase (Exp.litU32 ep)
+      let qExp : Exp (.scalar .f32) := Exp.var qVars[ep]!
+      let kVal ← ShaderM.readBuffer (ty := .scalar .f32)
+                   (n := numKVHeads * maxSeqLen * headDim) "k_cache"
+                   (Exp.add kBase d)
+      ShaderM.assign partialVar
+        (Exp.add (Exp.var partialVar) (Exp.mul qExp kVal))
+
+    -- 2) Warp reduce (5 shfl, no barrier).
+    let warpSumName ← ShaderM.var (.scalar .f32)
+                        (Exp.subgroupAdd (Exp.var partialVar))
+    let warpSum : Exp (.scalar .f32) := Exp.var warpSumName
+
+    -- 3) Cross-warp reduce: 4 smem writes (lane 0 of each warp), 1 barrier,
+    -- then warp 0 does subgroupAdd over the 4 slots and broadcasts via
+    -- slot 0.  Total smem ops: 4 writes + 32 reads + 1 broadcast write
+    -- + 128 reads of slot 0 = ~165 ops/iter (vs V1's >256 per smem array).
+    ShaderM.if_ (Exp.eq laneId (Exp.litU32 0)) (do
+      ShaderM.writeWorkgroup (ty := .scalar .f32)
+        "shared_warp_sums" warpId warpSum
+    ) (pure ())
+    ShaderM.barrier
+
+    -- Warp 0 collapses the per-warp slots, lane 0 broadcasts back.
+    let slotVal ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := 32)
+                    "shared_warp_sums" laneId
+    let guardedName ← ShaderM.var (.scalar .f32)
+      (Exp.select (Exp.lt laneId (Exp.litU32 _numWarps))
+                  slotVal (Exp.litF32 0.0))
+    let totalName ← ShaderM.var (.scalar .f32)
+                      (Exp.subgroupAdd (Exp.var guardedName))
+    -- Lane 0 of warp 0 broadcasts the total back via slot 0.
+    ShaderM.if_ (Exp.eq tid (Exp.litU32 0)) (do
+      ShaderM.writeWorkgroup (ty := .scalar .f32)
+        "shared_warp_sums" (Exp.litU32 0) (Exp.var totalName)
+    ) (pure ())
+    ShaderM.barrier
+
+    let scoreFromShared ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := 32)
+                            "shared_warp_sums" (Exp.litU32 0)
+    let scaledScore := Exp.mul (Exp.litF32 scale) scoreFromShared
+
+    -- 4) Online softmax update (per-thread, no smem).
+    let oldMaxVar ← ShaderM.var (.scalar .f32) maxScore
+    let oldSumVar ← ShaderM.var (.scalar .f32) sumExp
+    let oldMax := Exp.var oldMaxVar
+    let oldSum := Exp.var oldSumVar
+    let newMax := Exp.max oldMax scaledScore
+    let expOld := Exp.exp (Exp.sub oldMax newMax)
+    let expNew := Exp.exp (Exp.sub scaledScore newMax)
+    let newSum := Exp.add (Exp.mul oldSum expOld) expNew
+    let rescaleVar ← ShaderM.var (.scalar .f32)
+                       (Exp.div (Exp.mul oldSum expOld) newSum)
+    let contribVar ← ShaderM.var (.scalar .f32)
+                       (Exp.div expNew newSum)
+
+    -- 5) Update per-thread VKQ accumulator from gmem V.  No smem.
+    for ep in [0:elemsPerThread] do
+      let d := Exp.add dBase (Exp.litU32 ep)
+      let vVal ← ShaderM.readBuffer (ty := .scalar .f32)
+                   (n := numKVHeads * maxSeqLen * headDim) "v_cache"
+                   (Exp.add kBase d)
+      let prevExp : Exp (.scalar .f32) := Exp.var vkqVars[ep]!
+      ShaderM.assign vkqVars[ep]!
+        (Exp.add (Exp.mul prevExp (Exp.var rescaleVar))
+                 (Exp.mul vVal   (Exp.var contribVar)))
+
+    ShaderM.assign "max_score" newMax
+    ShaderM.assign "sum_exp" newSum
+
+  -- Write per-thread VKQ to global output.  No final smem read.
+  for ep in [0:elemsPerThread] do
+    let d := Exp.add dBase (Exp.litU32 ep)
+    let outIdx := Exp.add qBase d
+    ShaderM.writeBuffer (ty := .scalar .f32)
+      "output" outIdx (Exp.var vkqVars[ep]!)
+
 /-- Batched flash-attention for prefill: processes `seqLen` query tokens in
     one dispatch, attending each over its own causal prefix of the K/V cache.
 
