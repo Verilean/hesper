@@ -139,23 +139,34 @@ Inside the 5 ms `forward` section (steady-state, tok ≥ 4):
 | `post` (finalNorm + lmHead + softcap) | **~0.78 ms** | small but real |
 | total | **~4.96 ms** | |
 
-**4.13 ms ÷ 42 blocks ≈ 98 µs / block** of host CPU per `forwardBlock`.
-A block emits ~20 dispatches (qkvNorm, Q4_K Q/K/V matmul, RoPE, KV scatter,
-FlashAttn, wO, ffn norm, gate+up, GELU, ffn down, post norm), so per-dispatch
-host overhead is **~5 µs**. nsys reports cuLaunchKernel total at 1.12 ms,
-i.e. driver wall ~1.3 µs/call — the remaining 3.7 µs/call is Lean-side
-work in `cudaExecuteImpl`: cacheRef.get, args Array build/expand,
-buffer pointer resolution, refcount management, FFI marshalling. Nothing
-in the trace is a single fat allocation; it's the steady drip of
-microseconds across hundreds of dispatches per token.
+4.13 ms ÷ 42 blocks ≈ 98 µs / block of host CPU per `forwardBlock`.
+A block emits ~20 dispatches, so a naive split gives "5 µs / dispatch".
 
-**Implication for H4**: the 5 ms forward does not have a single hot
-function we can rewrite. Either we shave the per-dispatch overhead
-broadly (hard; #231/#235 took us this far) or we hide it under the GPU
-drain by reordering `cuStreamSync` so the host queues the next forward
-*before* draining the previous one. The captured-graph path (graphs ON)
-already achieves this; the question is whether we can replicate the
-ordering trick for the graphs-OFF path without recapture cost.
+**That naive split was wrong.** Dispatch counts on hesper and llama.cpp
+are within a few percent of each other (per doc 240); if "5 µs / dispatch"
+were the dispatch-rate cost, llama.cpp would also pay 5 ms / token of
+forward host time and we would not see it run graphs-OFF at >100 TPS.
+It does. So the per-dispatch share is similar between the two engines —
+something **hesper-specific**, not present (or not as large) in llama.cpp,
+sits inside the 4.13 ms of `blocks`. Candidates worth measuring before
+acting on any of them:
+
+- `Hesper.Circuit.CompiledCircuit.replay` builds/expands an args Array
+  per dispatch even on cache hits; the pattern is hesper-specific.
+- `forwardBlock` does per-layer `kcr.getRef` (hash + IO.Ref lookup) in
+  ~20 places; the cumulative cost per block is plausibly several µs and
+  has no llama.cpp analogue.
+- `withSection` push/pop bookkeeping adds string-keyed work per section.
+- Lean refcount slow paths (`lean_dec_ref_cold`) hit when shared `Array`
+  values cross IO boundaries; perf shows ~7.6 % of *cycles* but the
+  question is which fraction of *wall* lands inside `blocks` vs the
+  overlapping argmax drain.
+
+**Implication for H4**: do NOT decompose the 5 ms again as "X dispatches
+× Y µs each" without first taking the same `forward host time / token`
+on llama-cli for comparison. Comparable per-dispatch counts force the
+conclusion that the gap is per-block work that hesper does and llama.cpp
+doesn't.
 
 ### 3b.2. Graphs ON measurement (H4a verdict, 2026-04-26)
 
@@ -220,8 +231,9 @@ drain → 15 ms total. If forward overlaps drain, total → 10 ms (= drain)
 | H1 | Need more kernel fusion (more ops per launch) | +20 TPS | already at parity | ✗ DEAD |
 | H2 | DtoH(4 byte) of argmax is a copy cost; replace with host-mapped slot | -9.8 ms → +30 TPS | -0.0 ms (renamed to cuStreamSync) | ✗ DEAD (#250) |
 | H3 | Per-kernel GPU time | +18 TPS | not yet attempted | active (#47, on hold) |
-| H4 | Forward host work runs sequentially with the drain; pipeline it across iterations | +30 TPS | partially measured (§3b.1) | **active (#251)** — subsection trace landed; reorder cuStreamSync next |
-| H4a | Existing CUDA-graph capture path (HESPER_CUDA_GRAPHS=1) already pipelines host launch via cuGraphLaunch | +20 TPS / steady state +30 TPS | **measured 59 → 80 TPS at 80-token, ~100 TPS steady-state** | ✓ CONFIRMED — see §3b.2 |
+| H4 | Forward host work runs sequentially with the drain; pipeline it across iterations | +30 TPS | partially measured (§3b.1) | **active** — root cause of the 4 ms gap is NOT yet identified; need llama.cpp graphs-OFF comparison |
+| H4a | Existing CUDA-graph capture path (HESPER_CUDA_GRAPHS=1) already pipelines host launch via cuGraphLaunch | +20 TPS / steady state +30 TPS | **measured 59 → 80 TPS at 80-token, ~100 TPS steady-state** | **WORKAROUND only** — see §3b.2; hides the host work but does not explain why hesper graphs-OFF needs 4× more host work than llama.cpp graphs-OFF |
+| H4b | hesper-specific per-block overhead (Circuit.replay args Array expand, kcr.getRef hash, withSection bookkeeping) is the real source of the 4 ms gap | varies | **not yet measured** | **next** — measure llama-cli graphs-OFF forward host time, take the difference |
 | H5 | Lean Array expand in replay loop adds ms | +5 TPS | bounded ≤ 0.7 ms wall | ✗ marginal, deferred |
 | H6 | cuMemAlloc per token (driver alloc) | +5 TPS | already at 1 alloc/tok (pool); driver work is minimal | ✗ DEAD (#246) |
 | H7 | mmap PLE on-demand H2D | -3 TPS regression noted | confirmed | trade-off accepted (#247-248) |
@@ -247,18 +259,26 @@ Every previous session has skipped step 1 or step 6. Don't.
 
 ## 6. Active workstreams (priority order)
 
-1. **#251 (active)** — pipeline forward host work over the drain.
-   Predicted -3.5 ms wall (66 → 95 TPS). Plan: have the host queue the
-   *next* forward's kernels onto the same stream *before* calling
-   cuStreamSynchronize. Token-dependent buffers (`tokenBuf`, `posBuf`)
-   need to be set after argmax read; everything else (the kernels'
-   captured args) can be queued ahead.
-2. **#47 (paused)** — kernel speed. Predicted -2.5 ms wall (66 → 80 TPS
-   independent of #251; combined with #251, would target 110 TPS).
-   Re-prioritise after #251 measurement.
-3. **#235 follow-on (deferred)** — Lean Array expand in replay loop.
-   Bounded benefit ≤ 0.7 ms.
-4. **#249 (deferred)** — PLE register-less UVA. Pure VRAM, no TPS.
+1. **NEXT — find the per-block hesper-specific overhead (H4b)**.
+   Measure llama-cli graphs-OFF forward host time / token under the same
+   protocol; subtract from hesper's 4.13 ms. The remainder is the real
+   gap. Suspects (in order of plausibility): Circuit.replay args Array
+   expand, kcr.getRef hash chain, withSection bookkeeping. Verify by
+   stubbing each in turn.
+
+2. **#47 (kernel speed, paused)** — Q4_K matmul to llama.cpp parity.
+   Predicted -2.5 ms wall. Independent of #1; combined will close most
+   of the remaining gap.
+
+3. **#252 (workaround) — default to CUDA Graphs ON** as a stop-gap so
+   users see 80-100 TPS today while #1 is being investigated. Marked
+   workaround because it hides H4b instead of fixing it; it does not
+   close the *graphs-OFF* gap to llama.cpp.
+
+4. **#235 follow-on (deferred)** — Lean Array expand in replay loop.
+   May overlap with #1 once we know which Array expand is hot.
+
+5. **#249 (deferred)** — PLE register-less UVA. Pure VRAM, no TPS.
 
 ## 7. What 'good enough' looks like
 
