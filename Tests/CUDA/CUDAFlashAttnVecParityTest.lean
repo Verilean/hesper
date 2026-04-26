@@ -363,7 +363,48 @@ unsafe def main : IO Unit := do
     let (vecUs,    vecMs)    ← benchKernel ctx "vec"    vecShader    bufs 128 nh warmup iters
     let speedup := legacyUs / vecUs
 
-    -- Third column: llama.cpp PTX (only if the PTX module loaded).
+    -- Raw-launch column: compile vecShader once (cuModuleLoadData +
+    -- cuModuleGetFunction), pre-resolve buffer args, then time bare
+    -- cuLaunchKernel in a tight loop. Excludes ShaderM.exec, preHash,
+    -- cudaModuleCache.get, and buffer-name resolution from the per-call
+    -- path — same kernel as the "vec" column but without
+    -- GPUBackend.execute machinery.
+    let rawInfo ← do
+      let funcName : String := "vec_raw_kernel"
+      let ptx := Hesper.CUDA.CodeGen.generatePTX funcName
+                   { x := 128, y := 1, z := 1 } vecShader
+      let cudaMod ← Hesper.CUDA.cuModuleLoadData ptx
+      let f ← Hesper.CUDA.cuModuleGetFunction cudaMod funcName
+      -- Resolve buffer arg order from the ShaderM exec to match what
+      -- GPUBackend.execute would have built.
+      let state := Hesper.WGSL.Monad.ShaderM.exec vecShader
+      let declaredNames := state.declaredBuffers.map (·.1)
+      let args : Array USize ← declaredNames.foldlM (init := #[]) fun acc name => do
+        match bufs.find? (fun p => p.1 == name) with
+        | some (_, buf) => return acc.push buf.ptr
+        | none => throw (IO.userError s!"raw-launch: missing buffer '{name}'")
+      -- Warmup
+      for _ in [0:warmup] do
+        Hesper.CUDA.cuLaunchKernel f
+          nh.toUInt32 1 1
+          128 1 1
+          0
+          args
+      Hesper.CUDA.cuStreamSynchronize (0 : USize)
+      let t0 ← IO.monoNanosNow
+      for _ in [0:iters] do
+        Hesper.CUDA.cuLaunchKernel f
+          nh.toUInt32 1 1
+          128 1 1
+          0
+          args
+      Hesper.CUDA.cuStreamSynchronize (0 : USize)
+      let t1 ← IO.monoNanosNow
+      let rawUs := (t1 - t0).toFloat / iters.toFloat / 1000.0
+      let vecVsRaw := vecUs / rawUs
+      pure s!"  raw={rawUs} µs/call  vec/raw={vecVsRaw}×"
+
+    -- Fourth column: llama.cpp PTX (only if the PTX module loaded).
     let llamaInfo ← match llamaKernelOpt with
       | none => pure ""
       | some llamaK => do
@@ -384,7 +425,7 @@ unsafe def main : IO Unit := do
         let llamaMs := (t1 - t0).toFloat / 1.0e6
         let vecVsLlama := vecUs / llamaUs
         pure s!"  llama={llamaUs} µs/call ({llamaMs} ms / {iters})  vec/llama={vecVsLlama}×"
-    IO.println s!"  cacheLen={cacheLen}: legacy={legacyUs} µs/call  vec={vecUs} µs/call  legacy/vec={speedup}×{llamaInfo}"
+    IO.println s!"  cacheLen={cacheLen}: legacy={legacyUs} µs/call  vec={vecUs} µs/call  legacy/vec={speedup}×{rawInfo}{llamaInfo}"
 
     GPUBackend.freeBuffer ctx qBuf
     GPUBackend.freeBuffer ctx kBuf
