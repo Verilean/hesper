@@ -181,3 +181,70 @@ That keeps the iteration cycle <30s instead of 6min.
    1e-5
 2. Run it to bisect — fix the warp_sums clear / cross-warp issue
 3. Re-enable in gemma4 with confidence
+
+### Session 1 continued (2026-04-26 part 2)
+
+**Unit test landed** (`Tests/CUDA/CUDAFlashAttnVecParityTest.lean`,
+exe `cuda-flashattn-vec-parity`, ~30 s): 17 cases
+covering Gemma 4 geometry (numHeads=8, numKVHeads=1, headDim=256,
+cacheLen 5-100). **All PASS, max abs diff < 1e-5**.
+
+**Conclusion**: the vec kernel is bit-parity with the legacy
+`flashAttentionDynamicParamsKernel` — the suspected
+shared_warp_sums / cross-warp bug from the earlier WIP commit was
+NOT the issue.  Earlier `oldMax := maxScore` → `oldMaxVar ←
+ShaderM.var maxScore` fix already corrected it.
+
+**Re-tested in Gemma 4**:
+
+| variant | graphs OFF (60 tok) | graphs ON (30 tok) | output |
+|---|---:|---:|---|
+| baseline | 60.5 TPS | 77.3 TPS | "looking that world how are world..." |
+| HESPER_FA_VEC=1 | 58.6 TPS | 73.8 TPS | (graphs OFF) **identical** to baseline; (graphs ON) **DIVERGES at token 2+** |
+
+So:
+1. **graphs OFF** : output identical to baseline; minor TPS regression
+   (60.5 → 58.6, -3%) — conservative warp-shuffle reduce isn't
+   actually faster than the 256-thread tree reduce on this kernel
+2. **graphs ON**  : output **diverges at token 2+** despite the kernel
+   being bit-parity — points at a CUDA-Graph capture / replay
+   interaction, **not** a kernel-correctness bug.  Token 0 (prefill
+   path, no graph) and token 1 (capture pass) match; token 2+ is
+   replay and that's where the divergence appears.
+
+### Open issue for next session: Graph-capture divergence
+
+Symptom: vec kernel runs correctly outside CUDA Graph capture, but
+graph replay produces wrong output.  Hypotheses (untested):
+- Buffer binding ordering vs the legacy `ce`-based dispatch was
+  recorded differently, so the graph node's bound pointer table is
+  permuted
+- `flashAttentionDynamicParamsKernel` declares `params` as
+  `declareStorageBuffer ... .read`, vec kernel as the same — should
+  be equivalent
+- workgroupSize 128 vs 256 affects something about the capture's
+  shared-memory plan
+- The `sharedNamed "shared_q"` / `"shared_warp_sums"` / `"shared_out"`
+  shared allocations differ in size from the legacy kernel's set;
+  CUDA Graphs may capture a static smem-size attribute that mismatches
+  on replay
+
+### Verdict on Session 1 — call it: kernel correct, perf flat
+
+Conservative warp-shuffle reduce (Option B Phase 0) **does not move
+the needle** even when working correctly: -3% on graphs-OFF.  The K-
+serial structure remains and the per-K barrier count drops only
+modestly (8→2) — the kernel was **memory-bound**, not barrier-bound.
+
+The actual win will require Session 2's **K-parallel** layout
+(multiple warps process different K positions simultaneously, llama.cpp
+style).  Session 1 is closed as **infrastructure landed (test +
+opt-in env), no perf gain yet**.
+
+### Files
+
+- `Tests/CUDA/CUDAFlashAttnVecParityTest.lean` (new)
+- `lakefile.lean` registers `lean_exe «cuda-flashattn-vec-parity»`
+- `Hesper/WGSL/FlashAttention.lean`: `flashAttentionVecParamsKernel` +
+  `executeFlashAttentionVecParams`
+- `Hesper/Models/Gemma4.lean`: `HESPER_FA_VEC=1` dispatcher gate
