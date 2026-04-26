@@ -146,6 +146,13 @@ unsafe def main (args : List String) : IO Unit := do
   let secProfile := (← IO.getEnv "HESPER_SECTION_PROFILE").isSome
   if secProfile then
     Hesper.WGSL.Execute.sectionProfilingRef.set true
+  -- HESPER_TRACE_OUT=<path> enables Chrome-trace JSON for Lean
+  -- `withSection` events; merged with the nsys CUDA trace by
+  -- `scripts/nsys_to_chrome_trace.py`.
+  let traceOut ← IO.getEnv "HESPER_TRACE_OUT"
+  if traceOut.isSome then
+    Hesper.WGSL.Execute.sectionTraceRef.set true
+    IO.println s!"[Config] Lean section trace -> {traceOut.get!}"
   let tokens ←
     if ignoreEos then
       generate ctx model promptTokens maxTokens
@@ -157,6 +164,13 @@ unsafe def main (args : List String) : IO Unit := do
   let generated := tokens.extract promptTokens.size tokens.size
   let decoded := Hesper.Tokenizer.SentencePiece.decode tokenizer generated
   IO.println s!"[Result] Decoded: {decoded}"
+
+  match traceOut with
+  | some path => do
+    Hesper.WGSL.Execute.sectionTraceRef.set false
+    Hesper.WGSL.Execute.dumpSectionTrace path
+    IO.println s!"[traceOut] Lean section trace dumped to {path}"
+  | none => pure ()
 
   if secProfile then do
     Hesper.WGSL.Execute.sectionProfilingRef.set false
