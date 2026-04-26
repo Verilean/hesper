@@ -851,6 +851,9 @@ def flashAttentionVecParamsKernelV6
   ShaderM.sharedNamed "shared_kq" (.array (.scalar .f32) workgroupSize)
   -- Cross-warp VKQ reduce uses 4 warps × headDim entries (D=256 → 1024).
   ShaderM.sharedNamed "shared_vkq" (.array (.scalar .f32) (numWarps * headDim))
+  -- Per-warp (kq_max, kq_sum) for cross-warp softmax merge.  Slot 2*w+0
+  -- holds warp w's max, slot 2*w+1 holds warp w's sum.  numWarps × 2 = 8.
+  ShaderM.sharedNamed "shared_warp_meta" (.array (.scalar .f32) (numWarps * 2))
 
   let laneId := Exp.bitAnd tid (Exp.litU32 31)
   let warpId := Exp.shiftRight tid (Exp.litU32 5)
@@ -969,50 +972,85 @@ def flashAttentionVecParamsKernelV6
           (Exp.add prev (Exp.mul vVal kqScore))
     ShaderM.barrier
 
-  -- Cross-warp reduce of VKQ + kq_sum: write each warp's VKQ slice into
-  -- shared_vkq (warpId * D + d), barrier, then warp 0 sums and writes
-  -- to output.  Also need cross-warp reduce of kq_sum — use shared_kq
-  -- slot 0..numWarps for that.
+  -- ============================================================
+  -- Cross-warp softmax merge (the missing piece in V6 wip2)
+  -- ============================================================
+  --
+  -- Each warp processed a disjoint K range and now holds:
+  --   kq_max    — max score over its K range
+  --   kq_sum    — Σ exp(score_k - kq_max) over its K range
+  --   vkq[k]    — Σ V_k * exp(score_k - kq_max) over its K range
+  --              (per-lane, owns dims k*32 + laneId for k in [0,dPerLane))
+  --
+  -- To merge into a global softmax over all K positions:
+  --   global_max = max over warps of warp's kq_max
+  --   weight_w = exp(warp_w.kq_max - global_max)
+  --   global_sum = Σ_w warp_w.kq_sum * weight_w
+  --   output = (Σ_w warp_w.vkq * weight_w) / global_sum
+  --
+  -- Note: kq_sum differs across lanes within a warp (each lane owned a
+  -- different K position over the outer loop), so first warp_reduce
+  -- across lanes to get the warp-level sum.
+
+  -- Step 1: each warp's lane 0 writes (kq_max, warp_kq_sum) to smem.
+  let warpKqSumName ← ShaderM.var (.scalar .f32) (Exp.subgroupAdd kqSum)
+  ShaderM.if_ (Exp.eq laneId (Exp.litU32 0)) (do
+    let metaIdx := Exp.mul warpId (Exp.litU32 2)
+    ShaderM.writeWorkgroup (ty := .scalar .f32) "shared_warp_meta"
+      metaIdx kqMax
+    ShaderM.writeWorkgroup (ty := .scalar .f32) "shared_warp_meta"
+      (Exp.add metaIdx (Exp.litU32 1)) (Exp.var warpKqSumName)
+  ) (pure ())
+
+  -- Step 2: each warp also writes its per-lane VKQ slice to shared_vkq
+  -- (warpId * D + d slot).  Indexed by my-lane's owned dims.
   for k in [0:dPerLane] do
     let d := Exp.add (Exp.litU32 (k * 32)) laneId
     let slot := Exp.add (Exp.mul warpId (Exp.litU32 headDim)) d
     ShaderM.writeWorkgroup (ty := .scalar .f32) "shared_vkq" slot
       (Exp.var vkqVars[k]!)
-  -- Per-warp kq_sum aggregate: lane 0 of each warp writes its lane's
-  -- kq_sum (which differs across lanes since each lane owned different
-  -- K positions across the outer loop).  We need a per-warp warp_reduce
-  -- of kq_sum across all 32 lanes.
-  let warpKqSumName ← ShaderM.var (.scalar .f32) (Exp.subgroupAdd kqSum)
-  ShaderM.if_ (Exp.eq laneId (Exp.litU32 0)) (do
-    ShaderM.writeWorkgroup (ty := .scalar .f32) "shared_kq" warpId
-      (Exp.var warpKqSumName)
-  ) (pure ())
   ShaderM.barrier
 
-  -- Final reduction in warp 0 only: sum 4 warp-sums and 4 warp-VKQ slices.
-  ShaderM.if_ (Exp.eq warpId (Exp.litU32 0)) (do
-    -- Total kq_sum across all 4 warps (each lane reads slot[lane] then
-    -- subgroupAdd, but only first 4 lanes have valid data → mask).
-    let slotVal ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := workgroupSize)
-                    "shared_kq" laneId
-    let guarded := Exp.select (Exp.lt laneId (Exp.litU32 numWarps))
-                              slotVal (Exp.litF32 0.0)
-    let totalKqSumName ← ShaderM.var (.scalar .f32) (Exp.subgroupAdd guarded)
-    let totalKqSum : Exp (.scalar .f32) := Exp.var totalKqSumName
+  -- Step 3: every thread reads all 4 warps' (max, sum) from smem and
+  -- computes global_max, global_sum, and per-warp weights.  Cheap to
+  -- replicate across all threads — only 8 smem reads.
+  let globalMaxName ← ShaderM.var (.scalar .f32) (Exp.litF32 (-1.0e30))
+  for w in [0:numWarps] do
+    let m ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := numWarps * 2)
+              "shared_warp_meta" (Exp.litU32 (w * 2))
+    ShaderM.assign globalMaxName (Exp.max (Exp.var globalMaxName) m)
+  let globalMax : Exp (.scalar .f32) := Exp.var globalMaxName
 
-    -- Sum VKQ across the 4 warps for my-lane's dPerLane dims.
-    for k in [0:dPerLane] do
-      let d := Exp.add (Exp.litU32 (k * 32)) laneId
-      let accVar ← ShaderM.var (.scalar .f32) (Exp.litF32 0.0)
-      for w in [0:numWarps] do
-        let slot := Exp.add (Exp.litU32 (w * headDim)) d
-        let v ← ShaderM.readWorkgroup (ty := .scalar .f32)
-                  (n := numWarps * headDim) "shared_vkq" slot
-        ShaderM.assign accVar (Exp.add (Exp.var accVar) v)
-      let outIdx := Exp.add qBase d
-      ShaderM.writeBuffer (ty := .scalar .f32) "output" outIdx
-        (Exp.div (Exp.var accVar) totalKqSum)
-  ) (pure ())
+  let globalSumName ← ShaderM.var (.scalar .f32) (Exp.litF32 0.0)
+  let mut weightVars : Array String := #[]
+  for w in [0:numWarps] do
+    let m ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := numWarps * 2)
+              "shared_warp_meta" (Exp.litU32 (w * 2))
+    let s ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := numWarps * 2)
+              "shared_warp_meta" (Exp.litU32 (w * 2 + 1))
+    let weight := Exp.exp (Exp.sub m globalMax)
+    let weightName ← ShaderM.var (.scalar .f32) weight
+    weightVars := weightVars.push weightName
+    ShaderM.assign globalSumName
+      (Exp.add (Exp.var globalSumName) (Exp.mul s (Exp.var weightName)))
+  let globalSum : Exp (.scalar .f32) := Exp.var globalSumName
+
+  -- Step 4: each thread combines all 4 warps' VKQ slices for its owned dims,
+  -- weighted by per-warp weight, divided by globalSum.  Single-pass write
+  -- to global output.  This pattern lets ALL threads contribute to the
+  -- final write (not just warp 0), keeping bandwidth higher.
+  for k in [0:dPerLane] do
+    let d := Exp.add (Exp.litU32 (k * 32)) laneId
+    let accVar ← ShaderM.var (.scalar .f32) (Exp.litF32 0.0)
+    for w in [0:numWarps] do
+      let slot := Exp.add (Exp.litU32 (w * headDim)) d
+      let v ← ShaderM.readWorkgroup (ty := .scalar .f32)
+                (n := numWarps * headDim) "shared_vkq" slot
+      ShaderM.assign accVar
+        (Exp.add (Exp.var accVar) (Exp.mul v (Exp.var weightVars[w]!)))
+    let outIdx := Exp.add qBase d
+    ShaderM.writeBuffer (ty := .scalar .f32) "output" outIdx
+      (Exp.div (Exp.var accVar) globalSum)
 
 /-- Vec-params V5 (Session 5, doc 60): V2 + split-K parallelism.
 

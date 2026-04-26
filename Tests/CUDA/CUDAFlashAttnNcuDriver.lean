@@ -108,7 +108,7 @@ unsafe def main (argv : List String) : IO Unit := do
   let kvZeros : Array Float := Array.replicate (nkv * maxSeq * hd) 0.0
 
   match tag with
-  | "vec" | "v2" | "v3" | "v6" =>
+  | "vec" | "v2" | "v3" | "v6" | "v7" =>
     let vBuf ← GPUBackend.allocBuffer ctx kvSizeF32
     GPUBackend.writeBuffer ctx vBuf (packFloats kvZeros)
     -- K storage shape depends on tag
