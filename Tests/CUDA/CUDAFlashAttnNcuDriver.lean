@@ -116,15 +116,20 @@ unsafe def main (argv : List String) : IO Unit := do
     let kF16Buf ← GPUBackend.allocBuffer ctx kvSizeF16
     GPUBackend.writeBuffer ctx kF32Buf (packFloats kvZeros)
     GPUBackend.writeBuffer ctx kF16Buf (packHalfs kvZeros)
-    let (shader, funcName, kBufName, kBuf) := match tag with
+    -- For V7, we'll reuse the V/K f16 path by also creating an f16 V buffer.
+    let vF16Buf ← GPUBackend.allocBuffer ctx kvSizeF16
+    GPUBackend.writeBuffer ctx vF16Buf (packHalfs kvZeros)
+    let (shader, funcName, kBufName, kBuf, vBufName, vBufActive) := match tag with
       | "v2" => (Hesper.WGSL.FlashAttention.flashAttentionVecParamsKernelV2
-                   nh nkv maxSeq hd scale, "v2_ncu", "k_cache", kF32Buf)
+                   nh nkv maxSeq hd scale, "v2_ncu", "k_cache", kF32Buf, "v_cache", vBuf)
       | "v3" => (Hesper.WGSL.FlashAttention.flashAttentionVecParamsKernelV3
-                   nh nkv maxSeq hd scale, "v3_ncu", "k_cache_f16", kF16Buf)
+                   nh nkv maxSeq hd scale, "v3_ncu", "k_cache_f16", kF16Buf, "v_cache", vBuf)
       | "v6" => (Hesper.WGSL.FlashAttention.flashAttentionVecParamsKernelV6
-                   nh nkv maxSeq hd scale, "v6_ncu", "k_cache", kF32Buf)
+                   nh nkv maxSeq hd scale, "v6_ncu", "k_cache", kF32Buf, "v_cache", vBuf)
+      | "v7" => (Hesper.WGSL.FlashAttention.flashAttentionVecParamsKernelV7
+                   nh nkv maxSeq hd scale, "v7_ncu", "k_cache_f16", kF16Buf, "v_cache_f16", vF16Buf)
       | _    => (Hesper.WGSL.FlashAttention.flashAttentionVecParamsKernel
-                   nh nkv maxSeq hd scale, "vec_ncu", "k_cache", kF32Buf)
+                   nh nkv maxSeq hd scale, "vec_ncu", "k_cache", kF32Buf, "v_cache", vBuf)
     let ptx := Hesper.CUDA.CodeGen.generatePTX funcName
                  { x := 128, y := 1, z := 1 } shader
     let cudaMod ← Hesper.CUDA.cuModuleLoadData ptx
@@ -132,7 +137,7 @@ unsafe def main (argv : List String) : IO Unit := do
     let state := Hesper.WGSL.Monad.ShaderM.exec shader
     let declaredNames := state.declaredBuffers.map (·.1)
     let bufs : List (String × Hesper.CUDA.CUDABuffer) :=
-      [ ("q", qBuf), (kBufName, kBuf), ("v_cache", vBuf)
+      [ ("q", qBuf), (kBufName, kBuf), (vBufName, vBufActive)
       , ("output", outBuf), ("params", paramsBuf) ]
     let args : Array USize ← declaredNames.foldlM (init := #[]) fun acc name => do
       match bufs.find? (fun p => p.1 == name) with
