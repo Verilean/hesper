@@ -1,6 +1,35 @@
 # V11 parity debug — progress notes
 
-## Status (this session)
+## Status: ✅ RESOLVED (commit c5d0f0b)
+
+**Root cause**: PTX CodeGen had no case for `Exp.subgroupShuffleXor`.
+Default fallthrough returned an undefined u32 register; surrounding
+`add`'s type-mismatch fallback silently dropped the shuffle. So
+`acc + subgroupShuffleXor(acc, mask)` lowered to just `acc`.
+warpReduceSum 8's 3-step butterfly became a no-op.
+
+**Fix**: add `.subgroupShuffleXor` case in CUDA/CodeGen.lean (after
+`.subgroupShuffle`) lowering to `shfl.sync.bfly.b32 dst, src, mask, 31, 0xFFFFFFFF`.
+Mask is extracted from the `Exp.litU32 mask` operand (PTX bfly encodes
+the offset as an instruction immediate, not a register).
+
+**Verification**:
+- vec parity: ALL CASES PASS, V11 max abs diff = 0.0006 (matches V7/V9
+  noise level)
+- shader-monad unit tests: 73/73 pass
+- Hand-computed score for K=0: -1.282, V11 was reporting +0.665 before
+  the fix, now matches.
+
+The "12.2× systematic ratio" was lane 0's 32-dim partial dot product
+vs the full 256-dim sum; ratio happened to be ~12.2 for this test
+data, not anything fundamental.
+
+V8 still fails parity at cacheLen ≥ 33 — separate slot collision bug
+from the earlier V8 sub-warp partition attempt, untouched.
+
+---
+
+## Original status (pre-fix, kept for reference)
 
 V11 fails parity at cacheLen ≥ 33 (max abs diff scales with cacheLen,
 saturating ~0.45). Bug localized to **Phase 1+2 of V11**, before the
