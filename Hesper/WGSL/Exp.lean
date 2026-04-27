@@ -997,4 +997,17 @@ instance : HShiftLeft (Exp (.scalar .u32)) Nat (Exp (.scalar .u32)) where
 instance : HShiftRight (Exp (.scalar .u32)) Nat (Exp (.scalar .u32)) where
   hShiftRight x n := Exp.shiftRight x (Exp.litU32 n)
 
+/-- Comparison operators on `Exp`. Cannot reuse Lean's `<` / `==` because
+    those resolve to `Bool`, not `Exp (.scalar .bool)`. Unicode suffix
+    `ᵉ` ("e" for Exp) keeps the operator visually similar to CUDA C++
+    while signalling that the result is an Exp Bool, not a Lean Bool.
+
+    Usage: `kPos <ᵉ splitEnd` instead of `Exp.lt kPos splitEnd`. -/
+infixl:50 " <ᵉ "  => Exp.lt
+infixl:50 " ≤ᵉ "  => Exp.le
+infixl:50 " >ᵉ "  => Exp.gt
+infixl:50 " ≥ᵉ "  => Exp.ge
+infixl:50 " ==ᵉ " => Exp.eq
+infixl:50 " !=ᵉ " => Exp.ne
+
 end Hesper.WGSL

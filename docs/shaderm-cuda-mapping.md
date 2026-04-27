@@ -11,8 +11,8 @@ llama.cpp などの CUDA C++ カーネルを ShaderM に port するときの対
 | u32 リテラル | `(uint32_t)5` | ✅ `(5 : Exp _)` (OfNat) | 同じ |
 | ビット | `x & 0xFF`, `x \| y` | ✅ `x &&& 0xFF`, `x ||| y` | 同じ |
 | シフト | `x >> 3` | ✅ `x >>> 3` | 同じ |
-| 比較 | `x < y` | `Exp.lt x y` | `x <ᵉ y` (← TODO Step 8) |
-| 等号 | `x == y` | `Exp.eq x y` | `x =ᵉ y` (← TODO Step 8) |
+| 比較 | `x < y` | ✅ `x <ᵉ y` (Step 8) | 同じ |
+| 等号 | `x == y` | ✅ `x ==ᵉ y` (Step 8) | 同じ |
 | 三項 | `c ? a : b` | `Exp.select c a b` | 同じ (Lean は ternary なし) |
 | `if (cond)` | `if (...) { ... }` | `ShaderM.if_ cond then_ else_` | `whenE cond do ...` (← TODO) |
 | 変数宣言 (mut) | `float acc = 0;` | `let acc ← ShaderM.var (.scalar .f32) 0` | ✅ `let acc ← ShaderM.mutVar (.scalar .f32) 0` (Step 2) |
@@ -78,9 +78,14 @@ llama.cpp などの CUDA C++ カーネルを ShaderM に port するときの対
 - 既定の `ShaderM.loop` は変更なし — LICM は意図して呼ぶときのみ
 - 4-test ユニット (`Tests/ShaderMonadTests.lean`): hoist invariant / keep loop-variant / keep reassigned / default loop unchanged
 
+### Step 8: 比較演算子 `<ᵉ` `==ᵉ` 他
+- `<ᵉ` `≤ᵉ` `>ᵉ` `≥ᵉ` `==ᵉ` `!=ᵉ` を `Exp.lt/le/gt/ge/eq/ne` の infix として定義
+- Lean 既定の `<` / `==` は `Bool` を返すため再利用不可 → unicode 接尾辞 `ᵉ` で区別
+- V9 の `Exp.lt kPos splitEnd` → `kPos <ᵉ splitEnd` で `Exp.select` 句が CUDA に近づく
+
 ## 3. 残り TODO (優先度順)
 
-### 高 ROI (Step 8+ 候補)
+### 高 ROI
 - `← ShaderM.warpId` (`tid >>> 5`)
 - `← ShaderM.subWarpSplit 8` returns `(subWarp, subLane)` という pair
 - 効果: V11 のような sub-warp partition kernel を書くときの index 計算ミスを排除
