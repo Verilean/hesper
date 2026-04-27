@@ -564,6 +564,17 @@ partial def expToPTX (e : Exp t) (s : GenState) : ExpResult :=
     let (r, s) := s.freshF32
     (.f32 r, s.emit (.shfl_bfly_f32 r rv.toF32! maskLit))
 
+  -- Subgroup broadcast from lane 0 to all lanes.  Lowers to
+  -- `shfl.sync.idx.b32 dst, src, 0, 31, 0xFFFFFFFF`.  Used by Circuit
+  -- DSL's `warpBroadcast` lowering — silently broken on CUDA before
+  -- this case existed (same `_ => freshU32` fallback as
+  -- subgroupShuffleXor; bug found 2026-04-27 by audit after V11 fix).
+  | .subgroupBroadcastFirst val =>
+    let (rv, s) := expToPTX val s
+    let (rZero, s) := s.readImmU32 0
+    let (r, s) := s.freshF32
+    (.f32 r, s.emit (.shfl_idx_f32 r rv.toF32! rZero))
+
   -- Barrier
   | .workgroupBarrier => let (r, s) := s.freshU32; (.u32 r, s.emit (.bar_sync 0))
   | .warpBarrier      => let (r, s) := s.freshU32; (.u32 r, s.emit .bar_warp_sync)
