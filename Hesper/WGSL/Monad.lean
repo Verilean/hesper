@@ -277,6 +277,141 @@ def workgroupId : ShaderM (Exp (.vec3 .u32)) :=
 def numWorkgroups : ShaderM (Exp (.vec3 .u32)) :=
   return Exp.var "num_workgroups"
 
+/-! ## Thread index helpers (CUDA-style shortcuts)
+
+These mirror CUDA's `threadIdx.x`, `blockIdx.x`, etc. for the common
+1D case so kernel code reads close to the CUDA original.  The vec3
+versions (`localId`, `workgroupId`) are still available when 2D/3D
+index components are needed.
+-/
+
+/-- `threadIdx.x` — local invocation X coordinate (= "tid" in CUDA kernels). -/
+@[inline] def tidX : ShaderM (Exp (.scalar .u32)) := do
+  return Exp.vec3X (← localId)
+
+/-- `threadIdx.y` -/
+@[inline] def tidY : ShaderM (Exp (.scalar .u32)) := do
+  return Exp.vec3Y (← localId)
+
+/-- `threadIdx.z` -/
+@[inline] def tidZ : ShaderM (Exp (.scalar .u32)) := do
+  return Exp.vecZ (← localId)
+
+/-- `blockIdx.x` — workgroup X coordinate. -/
+@[inline] def bidX : ShaderM (Exp (.scalar .u32)) := do
+  return Exp.vec3X (← workgroupId)
+
+/-- `blockIdx.y` -/
+@[inline] def bidY : ShaderM (Exp (.scalar .u32)) := do
+  return Exp.vec3Y (← workgroupId)
+
+/-- `blockIdx.z` -/
+@[inline] def bidZ : ShaderM (Exp (.scalar .u32)) := do
+  return Exp.vecZ (← workgroupId)
+
+/-! ### Warp / sub-warp index decomposition
+
+NVIDIA warps are 32 lanes.  These helpers compute `laneId` (`tid & 31`)
+and `warpId` (`tid >>> 5`) once and return them as `Exp` values, so
+kernel code that uses them many times shares one PTX register.  The
+inner expressions are simple enough that lean codegen folds the
+extraction efficiently — no `let'` needed at the use site.
+
+Sub-warp partition (used in V8/V11 attention vec kernels) splits a
+warp into N-lane groups via `subWarpSplit n`.
+-/
+
+/-- Lane index within the warp (0..31).  Equivalent to CUDA's
+    `threadIdx.x & 31` when threads are 1D, or `threadIdx.x % WARP_SIZE`. -/
+@[inline] def laneId : ShaderM (Exp (.scalar .u32)) := do
+  return (← tidX) &&& (Exp.litU32 31)
+
+/-- Warp index within the workgroup.  Equivalent to CUDA's
+    `threadIdx.x / WARP_SIZE` (= `>> 5`).  For 2D blocks where
+    `threadIdx.y` selects warps, use `tidY` directly. -/
+@[inline] def warpId : ShaderM (Exp (.scalar .u32)) := do
+  return (← tidX) >>> (Exp.litU32 5)
+
+/-- Split a warp's lane into `(subWarp, subLane)` for `nthreads_KQ`-style
+    sub-warp partitioning where each sub-warp handles a different K
+    position in parallel.  Returns `(laneId / n, laneId % n)`.
+
+    Example (V11 sub-warp partition with `n = 8`):
+    ```
+    let (sw, sl) ← ShaderM.subWarpSplit 8
+    -- sw ∈ [0, 4), sl ∈ [0, 8)
+    let kPos := warpBase + sw * 8 + iKQ0    -- this sub-warp's K
+    let dimBase := sl * 32                  -- this lane's D slice
+    ```
+
+    Mirrors llama.cpp's
+    `(threadIdx.x & ~(nthreads_KQ-1), threadIdx.x % nthreads_KQ)`. -/
+@[inline] def subWarpSplit (n : Nat) :
+    ShaderM (Exp (.scalar .u32) × Exp (.scalar .u32)) := do
+  let lane ← laneId
+  let sw := lane / (Exp.litU32 n)
+  let sl := lane &&& (Exp.litU32 (n - 1))   -- assumes n is power of 2
+  return (sw, sl)
+
+/-! ### Warp-level reductions
+
+`warpReduceSum n e` reduces `e` across the `n`-lane group within the warp:
+- `n = 32` (full warp) → emits a single `subgroupAdd` (5-shfl on PTX, hardware
+  wide reduction on WGSL).
+- `n = 8` (sub-warp, eg. nthreads_KQ from llama.cpp) → emits 3 shfl-xor
+  by 1, 2, 4.  All 8 lanes end with the sum of their 8-lane group.
+- Other `n` (must be power of 2, ≤ 32) → log2(n) shfl-xor butterflies.
+
+After the call, every lane in the n-lane group holds the same reduced
+value.  Mirrors llama.cpp's `warp_reduce_sum<nthreads>` template.
+
+Example (V11-like sub-warp dot product):
+```
+let partialVar ← ShaderM.mutVar (.scalar .f32) 0
+ShaderM.unrollFor dimsPerLane fun k => partialVar +↦ q[k]! * kVec[k]!
+let sum ← ShaderM.warpReduceSum 8 partialVar.read   -- 3 shfl
+```
+-/
+
+/-- Sum-reduce `e` across an n-lane group within the warp.  Uses
+    `Exp.subgroupAdd` when `n = 32`, otherwise emits `log2(n)` butterfly
+    shuffles via `Exp.subgroupShuffleXor`.
+
+    Pre: `n` is a power of 2 and `1 ≤ n ≤ 32`.
+
+    Each lane in the n-lane group receives the same sum.  Cost: log2(n)
+    shfl + n−1 add per lane (so a sub-warp reduce of 8 lanes is 3 shfl
+    + 3 add — half the cost of the full 32-lane reduce, useful when only
+    8-lane groups need to coordinate). -/
+def warpReduceSum (n : Nat) (e : Exp ty) : ShaderM (Exp ty) := do
+  if n = 32 then
+    -- Full warp: one subgroup primitive.
+    let v ← let' ty (Exp.subgroupAdd e)
+    return v
+  else
+    -- Butterfly via xor 1, 2, 4, ... up to n/2.
+    let mut acc ← let' ty e
+    let mut step := 1
+    while step < n do
+      let next ← let' ty (acc + Exp.subgroupShuffleXor acc (Exp.litU32 step))
+      acc := next
+      step := step * 2
+    return acc
+
+/-- Max-reduce variant: `warpReduceMax n e`.  Same shfl-xor butterfly,
+    using `Exp.max` instead of `+`.  After the call, every lane in the
+    group holds the same max. -/
+def warpReduceMax (n : Nat) (e : Exp (.scalar .f32)) :
+    ShaderM (Exp (.scalar .f32)) := do
+  let mut acc ← let' (.scalar .f32) e
+  let mut step := 1
+  while step < n do
+    let next ← let' (.scalar .f32)
+                  (Exp.max acc (Exp.subgroupShuffleXor acc (Exp.litU32 step)))
+    acc := next
+    step := step * 2
+  return acc
+
 -- ============================================================================
 -- Buffer Operations
 -- ============================================================================
