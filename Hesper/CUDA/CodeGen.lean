@@ -548,6 +548,22 @@ partial def expToPTX (e : Exp t) (s : GenState) : ExpResult :=
     let (rl, s) := expToPTX laneIdx s
     let (r, s) := s.freshF32; (.f32 r, s.emit (.shfl_idx_f32 r rv.toF32! rl.toU32!))
 
+  -- Subgroup shuffle XOR (butterfly, single step at given mask).
+  -- Used by `warpReduceSum n` for n < 32.  Without this case, the
+  -- default fallback returned an undefined u32 register and the
+  -- subsequent `add` silently dropped the shuffle (returns first
+  -- operand on f32×u32 mismatch) — V11's parity bug 2026-04-27.
+  | .subgroupShuffleXor val mask =>
+    let (rv, s) := expToPTX val s
+    let (_rm, s) := expToPTX mask s  -- mask must be a compile-time literal
+    -- Try to extract the literal mask from the original Exp.  shfl.bfly's
+    -- offset is encoded in the instruction, not a register.
+    let maskLit : Nat := match mask with
+      | .litU32 n => n
+      | _ => 1  -- best-effort: caller should pass a literal
+    let (r, s) := s.freshF32
+    (.f32 r, s.emit (.shfl_bfly_f32 r rv.toF32! maskLit))
+
   -- Barrier
   | .workgroupBarrier => let (r, s) := s.freshU32; (.u32 r, s.emit (.bar_sync 0))
   | .warpBarrier      => let (r, s) := s.freshU32; (.u32 r, s.emit .bar_warp_sync)

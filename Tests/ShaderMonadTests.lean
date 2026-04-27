@@ -329,6 +329,18 @@ def testWarpBarrier : TestSeq :=
   let state := exec computation
   test "warpBarrier emits one statement" (state.stmts.length == 1)
 
+/-- Test: warpReduceSum 8 emits 4 var decls (initial seed + 3 butterfly).
+    Catches a regression where the meta `while step < n` loop fails to
+    iterate (eg. step never advances). -/
+def testWarpReduceSum8Emits : TestSeq :=
+  let computation := do
+    let v ← ShaderM.let' (.scalar .f32) (Exp.litF32 1.0)
+    let _ ← ShaderM.warpReduceSum 8 v
+    pure ()
+  let state := exec computation
+  -- 1 (outer let') + 1 (warpReduceSum's `acc ← let' e`) + 3 butterfly let' = 5
+  test "warpReduceSum 8 emits 5 varDecls" (state.stmts.length == 5)
+
 /-- Test: MutPtr.advance emits a u32 var decl + an assign. -/
 def testMutPtrAdvance : TestSeq :=
   let computation := do
@@ -612,6 +624,7 @@ def allTests : IO (List (String × List TestSeq)) := do
     ("Control Flow: Nested", [testNestedControlFlow]),
     ("Synchronization: Barrier", [testBarrier]),
     ("Synchronization: warpBarrier", [testWarpBarrier]),
+    ("warpReduceSum 8: emits 5 decls", [testWarpReduceSum8Emits]),
     ("MutPtr: advance emits assign", [testMutPtrAdvance]),
     ("Softmax: online update", [testSoftmaxOnlineUpdate]),
     ("Built-ins: Global ID", [testGlobalId]),
