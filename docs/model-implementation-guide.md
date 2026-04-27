@@ -126,7 +126,7 @@ let result := Exp.select inBounds val (Exp.litF32 0.0)
 writeBuffer "output" idx result
 
 -- GOOD: guard all reads/writes with if_
-ShaderM.if_ (Exp.lt idx (Exp.litU32 totalElements)) (do
+ShaderM.if_ (idx <ᵉ Exp.litU32 totalElements) (do
   let val ← readBuffer "input" idx
   writeBuffer "output" idx val
 ) (pure ())
@@ -146,7 +146,36 @@ Exp.select condition (Exp.litF32 1.0) (Exp.litF32 0.0) -- → selp.f32
 
 Any kernel using `Exp.subgroupAdd` requires `extensions := ["subgroups"]` in the ExecConfig. The WGSL codegen auto-detects this, but CUDA ignores extensions. Always include for WebGPU compatibility.
 
-## 4. PTX CodeGen Pitfalls
+## 5. ShaderM ergonomics primitives (Step 1-9)
+
+When writing new kernels, prefer the ergonomics layer over raw `Exp.add` /
+`Exp.lt` / `Array String`. See `docs/shaderm-cuda-mapping.md` for the full
+catalog. Quick reference:
+
+| Pattern | Use this | Not this |
+|---|---|---|
+| Arithmetic | `q + k * scale` | `Exp.add q (Exp.mul k scale)` |
+| Comparison | `kPos <ᵉ splitEnd` | `Exp.lt kPos splitEnd` |
+| Equality | `inBoundsU32 ==ᵉ 1` | `Exp.eq inBoundsU32 1` |
+| Bit ops | `x &&& 0xFF`, `x \|\|\| y`, `x >>> 3` | `Exp.bitAnd`, `Exp.bitOr`, `Exp.shiftRight` |
+| Mutable accum | `acc +↦ q * k` | `ShaderM.assign acc (Exp.add (Exp.var acc) ...)` |
+| Lane / warp index | `← ShaderM.laneId`, `← ShaderM.warpId` | `Exp.bitAnd tid 31`, `tid >>> 5` |
+| Sub-warp split | `← ShaderM.subWarpSplit 8` | `(tid & ~7, tid & 7)` 手書き |
+| Warp reduce | `← ShaderM.warpReduceSum 8 x` | 3 × `subgroupShuffleXor` 手書き |
+| Static unroll + register scope | `ShaderM.unrollForScoped n fun i => ...` | `for i in [0:n] do ShaderM.scope do ...` |
+| Pointer (immut) | `← ShaderM.ptr ty buf len base` + `.atOffset` | absolute index 計算 |
+| Pointer (mut, advance) | `← ShaderM.mutPtr` + `.advance delta` | re-compute index per iter |
+| Register array | `← ShaderM.regArray ty n init` + `.get pk` / `.set pk v` | `Array String` + `q0Vars.push` + `Exp.var q0Vars[pk]!` |
+| Sentinels | `Exp.negInf30`, `Exp.f32Zero`, `Exp.f32One` | `Exp.litF32 (-1.0e30)` etc |
+| Online softmax step | `← ShaderM.softmaxOnlineUpdate maxNm sumNm score` | 7-line max/scale/exp/sum 手書き |
+| Warp barrier | `ShaderM.warpBarrier` (PTX `bar.warp.sync`) | `ShaderM.barrier` (block barrier) |
+
+Why it matters: shrinks kernel size 30-60% (V11 study), reduces typo
+surface (manual `Array String` index calculations are a known bug
+source), and gets PTX-level wins for free (`bar.warp.sync` is much
+cheaper than block barrier).
+
+## 6. PTX CodeGen Pitfalls
 
 ### Silent fallbacks
 
@@ -175,7 +204,7 @@ All these have PTX instruction-level tests (Tests/CUDA/CUDAPTXInstTest.lean):
 4. **Add a test** in `Tests/CUDA/CUDAPTXInstTest.lean`
 5. Verify: `lake exe cuda-ptx-inst-test`
 
-## 5. Testing Strategy
+## 7. Testing Strategy
 
 ### Three-tier testing
 
@@ -207,7 +236,7 @@ compareArrays "CPU↔CUDA" cpuOut cOut
 compareArrays "WebGPU↔CUDA" wOut cOut
 ```
 
-## 6. Performance Checklist
+## 8. Performance Checklist
 
 Before claiming TPS numbers:
 
@@ -226,13 +255,13 @@ Before claiming TPS numbers:
 | `replayCached` | ~3μs | 2.3ms (>130 TPS) |
 | `dispatchCompiledKernel` | ~5μs | 3.8ms (>100 TPS) |
 
-## 7. Model Loading Performance
+## 9. Model Loading Performance
 
 - Use `GPUBackend.allocBuffer` + `GPUBackend.writeBuffer` (not `IO.FS.readBinFile` into ByteArray)
 - Future: mmap GGUF + direct GPU upload (eliminates 5GB copy)
 - Token embedding: F16→F32 unpack on GPU, not CPU
 
-## 8. Common Type Signatures
+## 10. Common Type Signatures
 
 ```lean
 -- Model structure

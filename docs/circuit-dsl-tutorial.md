@@ -282,7 +282,7 @@ def myCustomKernel : ShaderM Unit := do
   let _ ← ShaderM.declareOutputBuffer "y" (.array (.scalar .f32) 1024)
   let gid ← ShaderM.globalId
   let idx := Exp.vec3X gid
-  ShaderM.if_ (Exp.lt idx (Exp.litU32 1024)) (do
+  ShaderM.if_ (idx <ᵉ Exp.litU32 1024) (do
     let v ← ShaderM.readBuffer (ty := .scalar .f32) (n := 1024) "x" idx
     -- ... whatever ...
     ShaderM.writeBuffer (ty := .scalar .f32) "y" idx v
