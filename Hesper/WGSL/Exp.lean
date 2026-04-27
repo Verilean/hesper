@@ -936,4 +936,65 @@ partial def Exp.toWGSL {t : WGSLType} : Exp t → String
   | workgroupBarrier =>
     "workgroupBarrier()"
 
+/-! ## Operator overloading for ergonomic Exp construction
+
+These instances let kernel code use `+`, `-`, `*`, `/`, `%`, `<`, `==`,
+`&&&` (bit-and), `|||` (bit-or), `<<<` (shift-left), `>>>` (shift-right)
+on `Exp ty` values directly, instead of `Exp.add`, `Exp.mul`, etc.
+Closes one of the major cognitive gaps when porting kernels from CUDA C++:
+`q + k * scale` reads the same in CUDA and ShaderM.
+
+`Exp.add q k` style still works — the operator is sugar, not a replacement.
+-/
+
+instance instHAddExp {t : WGSLType} : HAdd (Exp t) (Exp t) (Exp t) where
+  hAdd := Exp.add
+
+instance instHSubExp {t : WGSLType} : HSub (Exp t) (Exp t) (Exp t) where
+  hSub := Exp.sub
+
+instance instHMulExp {t : WGSLType} : HMul (Exp t) (Exp t) (Exp t) where
+  hMul := Exp.mul
+
+instance instHDivExp {t : WGSLType} : HDiv (Exp t) (Exp t) (Exp t) where
+  hDiv := Exp.div
+
+instance instHModExp {t : WGSLType} : HMod (Exp t) (Exp t) (Exp t) where
+  hMod := Exp.mod
+
+/-- Numeric literals in Exp context: `(0 : Exp (.scalar .u32))` becomes
+    `Exp.litU32 0`, `(0 : Exp (.scalar .i32))` becomes `Exp.litI32 0`.
+    For f32 / f16 literals use `Exp.litF32 0.0` directly (Lean's OfScientific
+    interaction with Float-typed Exp is fragile; explicit wrapper avoids
+    surprises). -/
+instance : OfNat (Exp (.scalar .u32)) n where
+  ofNat := Exp.litU32 n
+
+instance : OfNat (Exp (.scalar .i32)) n where
+  ofNat := Exp.litI32 (Int.ofNat n)
+
+/-- Bit ops: `&&&` = bitwise AND, `|||` = bitwise OR.
+    Names match Lean's standard `&&&` / `|||` for u32/i32. -/
+instance : AndOp (Exp (.scalar .u32)) where
+  and := Exp.bitAnd
+
+instance : OrOp (Exp (.scalar .u32)) where
+  or := Exp.bitOr
+
+/-- Shift operators using Lean's `HShiftLeft`/`HShiftRight` so `x <<< n`
+    and `x >>> n` work uniformly with u32 expressions. -/
+instance : HShiftLeft (Exp (.scalar .u32)) (Exp (.scalar .u32)) (Exp (.scalar .u32)) where
+  hShiftLeft := Exp.shiftLeft
+
+instance : HShiftRight (Exp (.scalar .u32)) (Exp (.scalar .u32)) (Exp (.scalar .u32)) where
+  hShiftRight := Exp.shiftRight
+
+/-- Allow shifting by a Lean Nat literal: `x >>> 3` instead of
+    `x >>> Exp.litU32 3`.  Same for `<<<`. -/
+instance : HShiftLeft (Exp (.scalar .u32)) Nat (Exp (.scalar .u32)) where
+  hShiftLeft x n := Exp.shiftLeft x (Exp.litU32 n)
+
+instance : HShiftRight (Exp (.scalar .u32)) Nat (Exp (.scalar .u32)) where
+  hShiftRight x n := Exp.shiftRight x (Exp.litU32 n)
+
 end Hesper.WGSL
