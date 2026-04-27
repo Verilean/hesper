@@ -69,7 +69,9 @@ def matMulTransposeF16RowBlockKernel (config : Config) (bs : Nat) : ShaderM Unit
     let kf := Exp.mul k (Exp.litU32 2)
     let a0 ← ShaderM.readBuffer (ty := .scalar .f32) (n := config.K) "a" kf
     let a1 ← ShaderM.readBuffer (ty := .scalar .f32) (n := config.K) "a" (Exp.add kf (Exp.litU32 1))
-    ShaderM.assign "acc" (Exp.add acc (Exp.add (Exp.mul a0 b0) (Exp.mul a1 b1)))
+    -- Two chained fmas — matches llama.cpp's mmvf.cu inner loop.
+    ShaderM.assign "acc" (Exp.fma a0 b0 acc)
+    ShaderM.assign "acc" (Exp.fma a1 b1 (Exp.var "acc" : Exp (.scalar .f32)))
 
   -- Reduction.
   if bs ≤ 32 then
