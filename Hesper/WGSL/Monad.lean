@@ -385,11 +385,14 @@ let sum ← ShaderM.warpReduceSum 8 partialVar.read   -- 3 shfl
     8-lane groups need to coordinate). -/
 def warpReduceSum (n : Nat) (e : Exp ty) : ShaderM (Exp ty) := do
   if n = 32 then
-    -- Full warp: one subgroup primitive.
-    let v ← let' ty (Exp.subgroupAdd e)
-    return v
+    -- Full warp: one subgroup primitive.  Don't `let'` — caller can pin
+    -- if they want, but for one-shot consumers (eg. `Exp.select inBounds
+    -- (warpReduceSum ...) ...`) the extra register hop is wasteful.
+    return Exp.subgroupAdd e
   else
-    -- Butterfly via xor 1, 2, 4, ... up to n/2.
+    -- Butterfly via xor 1, 2, 4, ... up to n/2.  Each step IS pinned
+    -- because the result of step k feeds into step k+1's operands twice
+    -- (acc + shfl(acc, mask)) — without let' the AST gets re-traversed.
     let mut acc ← let' ty e
     let mut step := 1
     while step < n do
@@ -766,6 +769,108 @@ def mutVar (ty : WGSLType) (init : Exp ty) : ShaderM (MutVar ty) := do
   let name ← freshVar "v"
   emitStmt (Stmt.varDecl name ty (some ⟨ty, init⟩))
   return ⟨name⟩
+
+end ShaderM
+
+/-! ## Buffer pointers (`Ptr ty`)
+
+`Ptr ty` is a `(bufferName, offset)` pair carrying its element type so
+the `load` / `store` calls don't need explicit `(ty := ...)` annotations
+each time.  Mirrors CUDA C++ `T *p` arithmetic — particularly the common
+attention/matmul pattern:
+
+```cpp
+const float *K = K_base + kvHead * maxSeq * D;
+for (int k = 0; k < cacheLen; ++k) {
+    sum += *K * q;
+    K += D;
+}
+```
+
+In ShaderM:
+```
+let K ← ShaderM.ptr (.scalar .f32) "k_cache" (kvHead * maxSeqLen * D)
+ShaderM.runtimeFor 0 cacheLen 1 fun _ => do
+  let v ← K.load
+  acc +↦ v * q
+  K := K.advance D    -- value-level advance (Ptr is immutable)
+```
+
+For mutating advance inside a runtime loop, use `MutPtr` (declared
+below).  For pure pointer arithmetic at meta-time, use `Ptr.atOffset`.
+
+`Ptr` is intentionally pure (no ShaderM effect).  The constructor
+`ShaderM.ptr` only computes a `let'`-bound base offset for safety,
+which is the common case.
+-/
+
+/-- Buffer pointer: typed (buffer name, current u32 offset, declared
+    array size) triple.
+
+    - `buf`: buffer name registered via `declareInputBuffer` etc.
+    - `offset`: current element index (NOT byte) into that buffer.
+    - `bufLen`: the buffer's declared array length (passed to
+      `readBuffer`'s `{n}` for the WGSL `array<ty, n>` type).  Set this
+      to the same value used at `declareInputBuffer` time.
+
+    `Ptr` is value-level (no ShaderM effect needed for arithmetic).
+    Use `ShaderM.ptr` to construct one with a `let'`-stored base. -/
+structure Ptr (ty : WGSLType) where
+  buf : String
+  offset : Exp (.scalar .u32)
+  bufLen : Nat
+
+namespace Ptr
+
+/-- Element-wise read at the current pointer offset.  Mirrors CUDA `*p`. -/
+@[inline] def load (p : Ptr ty) : ShaderM (Exp ty) :=
+  ShaderM.readBuffer (n := p.bufLen) p.buf p.offset
+
+/-- Element-wise write at the current pointer offset.  Mirrors CUDA `*p = x`. -/
+@[inline] def store (p : Ptr ty) (x : Exp ty) : ShaderM Unit :=
+  ShaderM.writeBuffer p.buf p.offset x
+
+/-- Advance the pointer by `delta` elements, returning a new `Ptr`.
+    Mirrors CUDA `p + delta` (or `p += delta` if you reassign).  Pure
+    — no shader-side effect. -/
+@[inline] def advance (p : Ptr ty) (delta : Exp (.scalar .u32)) : Ptr ty :=
+  ⟨p.buf, p.offset + delta, p.bufLen⟩
+
+/-- Read at `p[k]` without permanently advancing.  Mirrors CUDA `p[k]`.
+    Composes well with `unrollFor`:
+    ```
+    ShaderM.unrollFor n fun k =>
+      let v ← (p.atOffset (Exp.litU32 k)).load
+      ...
+    ```
+-/
+@[inline] def atOffset (p : Ptr ty) (extra : Exp (.scalar .u32)) : Ptr ty :=
+  ⟨p.buf, p.offset + extra, p.bufLen⟩
+
+end Ptr
+
+namespace ShaderM
+
+/-- Construct a `Ptr` with a base offset materialised in a register
+    (via `let'`).  Use when the base offset is computed once (eg.
+    `kvHead * maxSeqLen * D`) and the resulting pointer is then
+    walked many times in inner loops.
+
+    `bufLen` must match the array size declared via
+    `declareInputBuffer` for `buf`.
+
+    Example:
+    ```
+    let K ← ShaderM.ptr (.scalar .u32) "k_cache_f16" kvWords
+              (kvHead * maxSeqLen * (D/2))
+    -- K.offset is a single PTX register; subsequent advance/atOffset
+    -- only emit `add` against this register.
+    ```
+-/
+def ptr (ty : WGSLType) (buf : String) (bufLen : Nat)
+    (baseOffset : Exp (.scalar .u32)) : ShaderM (Ptr ty) := do
+  let off ← let' (.scalar .u32) baseOffset
+  return ⟨buf, off, bufLen⟩
 
 end ShaderM
 
