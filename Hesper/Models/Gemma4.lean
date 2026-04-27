@@ -350,29 +350,34 @@ def createInferenceState [GPUBackend β] (ctx : β) (cfg : Config) : IO (Inferen
     prefillColIdxRef    := ← IO.mkRef none
     prefillPLInputAllRef := ← IO.mkRef none
     -- Pinned-host staging + unified stream.  Enabled when either
-    -- HESPER_CUDA_GRAPHS=1 (existing graph-capture path) or
-    -- HESPER_UNIFIED_STREAM=1 (new path that funnels all async H2D and
-    -- kernel launches through a single non-null stream for the
-    -- llama.cpp-style "big call, few ops" pattern).
+    -- HESPER_CUDA_GRAPHS != "0" (graphs are ON by default, see
+    -- forwardLoop's useCudaGraphs decision) or HESPER_UNIFIED_STREAM=1
+    -- (single non-null stream for the llama.cpp-style "big call, few ops"
+    -- pattern).
     stagingTokenPtr  := ← do
-      if (← IO.getEnv "HESPER_CUDA_GRAPHS").isSome
-         || (← IO.getEnv "HESPER_UNIFIED_STREAM").isSome
+      let graphsOn := match ← IO.getEnv "HESPER_CUDA_GRAPHS" with
+        | some "0" => false | _ => true
+      if graphsOn || (← IO.getEnv "HESPER_UNIFIED_STREAM").isSome
       then Hesper.CUDA.cuMemAllocHost 4 else pure 0
     stagingParamsPtr := ← do
-      if (← IO.getEnv "HESPER_CUDA_GRAPHS").isSome
-         || (← IO.getEnv "HESPER_UNIFIED_STREAM").isSome
+      let graphsOn := match ← IO.getEnv "HESPER_CUDA_GRAPHS" with
+        | some "0" => false | _ => true
+      if graphsOn || (← IO.getEnv "HESPER_UNIFIED_STREAM").isSome
       then Hesper.CUDA.cuMemAllocHost 8 else pure 0
     stagingPLRowPtr  := ← do
-      if (← IO.getEnv "HESPER_CUDA_GRAPHS").isSome
-         || (← IO.getEnv "HESPER_UNIFIED_STREAM").isSome
+      let graphsOn := match ← IO.getEnv "HESPER_CUDA_GRAPHS" with
+        | some "0" => false | _ => true
+      if graphsOn || (← IO.getEnv "HESPER_UNIFIED_STREAM").isSome
       then Hesper.CUDA.cuMemAllocHost 4 else pure 0
     stagingColIdxPtr := ← do
-      if (← IO.getEnv "HESPER_CUDA_GRAPHS").isSome
-         || (← IO.getEnv "HESPER_UNIFIED_STREAM").isSome
+      let graphsOn := match ← IO.getEnv "HESPER_CUDA_GRAPHS" with
+        | some "0" => false | _ => true
+      if graphsOn || (← IO.getEnv "HESPER_UNIFIED_STREAM").isSome
       then Hesper.CUDA.cuMemAllocHost 4 else pure 0
     stagingPosF32Ptr := ← do
-      if (← IO.getEnv "HESPER_CUDA_GRAPHS").isSome
-         || (← IO.getEnv "HESPER_UNIFIED_STREAM").isSome
+      let graphsOn := match ← IO.getEnv "HESPER_CUDA_GRAPHS" with
+        | some "0" => false | _ => true
+      if graphsOn || (← IO.getEnv "HESPER_UNIFIED_STREAM").isSome
       then Hesper.CUDA.cuMemAllocHost 4 else pure 0
     unifiedStream    := ← match ← IO.getEnv "HESPER_UNIFIED_STREAM" with
                          | some _ => Hesper.CUDA.cuStreamCreate
@@ -2945,7 +2950,12 @@ def generate [GPUBackend β] (ctx : β) (model : Gemma4Model (GPUBackend.Buf β)
   -- IMPORTANT: this relies on the decode forward being shape-stable —
   -- true for Gemma 4's single-token path since all kernels have
   -- compile-time-fixed dispatch shapes (one per-layer set).
-  let useCudaGraphs := (← IO.getEnv "HESPER_CUDA_GRAPHS").isSome
+  -- CUDA Graphs are now ON by default — empirically +20% TPS at decode time
+  -- (memory: project_q6k_lmhead_f16_landed.md, project_115tps_root_cause_2026_04_28.md).
+  -- Override with HESPER_CUDA_GRAPHS=0 to opt out (e.g. when debugging dispatch-by-dispatch).
+  let useCudaGraphs := match ← IO.getEnv "HESPER_CUDA_GRAPHS" with
+    | some "0" => false
+    | _        => true
   let tokenGraph   := (← IO.getEnv "HESPER_TOKEN_GRAPH").isSome
   let pipelinedDecode := (← IO.getEnv "HESPER_PIPELINED_DECODE").isSome
 
