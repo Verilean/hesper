@@ -90,6 +90,12 @@ structure Gemma4Model (BufT CacheT : Type) where
   blocks : Array (Gemma4Block BufT CacheT)
   finalNorm : RMSNorm.RMSNorm BufT CacheT
   outputWeight : BufT
+  /-- When `output.weight` was loaded as Q6_K, we pre-dequantize it to
+      a packed half2 (f16) buffer at load time and use the f16 matmul
+      kernel for lm_head — matches llama.cpp's CUDA backend, which keeps
+      the LM head in f16.  Reduces Q6_K dispatch from 1140 µs/call to
+      ~114 µs/call (matches `mul_mat_vec_f<half,half>`). -/
+  outputWeightF16 : Option BufT
   /-- When `none`, the full Q6_K table was uploaded to VRAM.
       When `some`, the full table stays in CPU mmap (saving ~2.2 GiB VRAM)
       and the kernel reads it via the unified-VA device pointer.  Tuple is

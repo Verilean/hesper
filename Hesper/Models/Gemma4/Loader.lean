@@ -10,6 +10,7 @@ import Hesper.Layers.MoE
 import Hesper.Layers.PerLayerEmbedding
 import Hesper.Layers.Attention
 import Hesper.Quantization.Q4_K_M
+import Hesper.Quantization.Q6KDequant
 import Hesper.GGUF.Parser
 import Hesper.GGUF.Loader
 import Hesper.GGUF.Reader
@@ -500,13 +501,38 @@ def Gemma4Model.fromGGUFDataWithGguf [GPUBackend β] (ctx : β)
   let finalNorm ← RMSNorm.create ctx finalNormConfig finalNormData
 
   -- Step 6: LM head (output.weight or weight-tied with embedding)
-  let outputWeight ← match Hesper.GGUF.Loader.findTensor gguf "output.weight" with
-    | .ok _ =>
-      IO.println "  Using separate LM head weights"
-      uploadTensor ctx gguf "output.weight"
+  let (outputWeight, outputWeightFormat) ← match Hesper.GGUF.Loader.findTensor gguf "output.weight" with
+    | .ok ti =>
+      IO.println s!"  Using separate LM head weights ({repr ti.ggmlType})"
+      let buf ← uploadTensor ctx gguf "output.weight"
+      pure (buf, ti.ggmlType)
     | .error _ =>
       IO.println "  Using weight-tied LM head (reusing embedding)"
-      pure embedding.embeddingTable
+      -- Tied embeddings: format follows the embedding tensor.
+      let embTi ← match Hesper.GGUF.Loader.findTensor gguf "token_embd.weight" with
+        | .ok ti => pure ti
+        | .error e => throw $ IO.userError e
+      pure (embedding.embeddingTable, embTi.ggmlType)
+
+  -- If the LM head is Q6_K, pre-dequantize it to packed half2 (f16) so
+  -- the lm_head matmul can use the much-faster `matMulTransposeF16BlockCoop`
+  -- path (matches llama.cpp's CUDA backend, which keeps output.weight in f16
+  -- when the source is Q6_K).
+  let isQ6K := match outputWeightFormat with | .Q6_K => true | _ => false
+  let outputWeightF16 ← if isQ6K then do
+      IO.println s!"  Pre-dequantising Q6_K lm_head → packed f16 ({(cfg.vocabSize * cfg.hiddenSize * 2) / (1024*1024)} MiB)"
+      let totalU32 := cfg.vocabSize * (cfg.hiddenSize / 2)
+      let f16Buf ← GPUBackend.allocBuffer ctx (4 * totalU32).toUSize
+      let blocksPerRow := cfg.hiddenSize / 256
+      let totalBlocks := cfg.vocabSize * blocksPerRow
+      let dequantKernel := Hesper.Quantization.Q6_K.q6kToF16Kernel cfg.hiddenSize cfg.vocabSize
+      GPUBackend.execute ctx dequantKernel
+        [("weights", outputWeight), ("output", f16Buf)]
+        { numWorkgroups := (totalBlocks, 1, 1), workgroupSize := { x := 64, y := 1, z := 1 }
+          extensions := [] }
+      pure (some f16Buf)
+    else
+      pure none
 
   -- Step 7: Load per-layer embeddings (optional)
   -- Two paths for per_layer_token_embd (the 2.2 GiB Q6_K table):
@@ -597,6 +623,7 @@ def Gemma4Model.fromGGUFDataWithGguf [GPUBackend β] (ctx : β)
     blocks
     finalNorm
     outputWeight
+    outputWeightF16
     perLayerEmbdMmap
     perLayerEmbdTableGPU
     perLayerEmbdRowBytes

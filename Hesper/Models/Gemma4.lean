@@ -2235,6 +2235,16 @@ def forwardPrefillBatch [GPUBackend β] (ctx : β)
   -- VRAM round-trip (the f32 normed hidden state).  For the fallback
   -- paths (f32 matmul etc.) still run the standalone RMSNorm because
   -- they don't consume Q8_1.
+  match model.outputWeightF16 with
+  | some f16W =>
+    -- Pre-dequantized f16 lm_head — single dispatch, no Q8_1 quantize.
+    RMSNorm.forward ctx model.finalNorm state.buf2 state.buf1
+    let lmHeadConfig : Hesper.WGSL.MatMul.Config := {
+      M := 1, N := cfg.vocabSize, K := cfg.hiddenSize
+    }
+    Hesper.WGSL.MatMul.executeMatMulTransposeF16BlockCoop ctx state.buf1 f16W state.logitsBuf lmHeadConfig
+    dumpGolden "prefill_logits_raw" state.logitsBuf cfg.vocabSize
+  | none =>
   match model.embdFormat with
   | .Q6_K =>
     let useSubgroups ← GPUBackend.hasSubgroupSupport ctx
@@ -2494,7 +2504,12 @@ def forwardSingleToken [GPUBackend β] (ctx : β)
   -- standalone Circuit-DSL norm so the f32 matmul fallback has a
   -- valid `nextBuf` to read.
   let useFusedNormLmHead ← do
-    match model.embdFormat with
+    -- The pre-dequantised f16 lm_head path consumes a finalNorm-output
+    -- f32 vector directly — it does not benefit from fusing finalNorm
+    -- with Q8_1 quantize.  Use the standalone finalNorm path in that
+    -- case so `nextBuf` holds the normed input for `executeMatMulTransposeF16BlockCoop`.
+    if model.outputWeightF16.isSome then pure false
+    else match model.embdFormat with
     | .Q6_K =>
       let useSubgroups ← GPUBackend.hasSubgroupSupport ctx
       let a ← Hesper.Layers.Linear.dp4aEnabled.get
@@ -2519,6 +2534,15 @@ def forwardSingleToken [GPUBackend β] (ctx : β)
 
   -- Step 4: LM head matmul (1 × hiddenSize @ hiddenSize × vocabSize)
   Hesper.WGSL.Execute.withSection "lmHead" do
+    -- Fast path: pre-dequantized f16 weights → f16 matmul (single dispatch,
+    -- no Q8_1 quantize, ~10× speedup over Q6_K dp4a for vocab=262144).
+    match model.outputWeightF16 with
+    | some f16W =>
+      let lmHeadConfig : Hesper.WGSL.MatMul.Config := {
+        M := 1, N := model.config.vocabSize, K := model.config.hiddenSize
+      }
+      Hesper.WGSL.MatMul.executeMatMulTransposeF16BlockCoop ctx nextBuf f16W state.logitsBuf lmHeadConfig
+    | none =>
     match model.embdFormat with
     | .Q6_K =>
       let useSubgroups ← GPUBackend.hasSubgroupSupport ctx
