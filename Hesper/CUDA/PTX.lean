@@ -571,6 +571,14 @@ structure GenState where
       used many times in one basic block reuses the same register instead of
       re-issuing `mov.u32` for each reference.  Cleared at barriers/labels. -/
   immCache : List (Nat × RegU32) := []
+  /-- CSE cache for arbitrary Exp tree → AnyReg.  Key is `Exp.toWGSL` of
+      the (algebraic-only) sub-expression; value is the register holding
+      its value in the current scope.  Hit: skip re-lowering and return
+      the cached register.  Cleared at scope boundaries / barriers along
+      with sregCache + immCache.  Only populated for pure-arithmetic
+      constructors (add/sub/mul/shl/shr/bitAnd etc.) — not for loads,
+      shuffles, var refs, or anything with side effects on the inst stream. -/
+  expCache : List (String × AnyReg) := []
   deriving Inhabited
 
 namespace GenState
@@ -630,7 +638,7 @@ def readSReg (s : GenState) (sreg : SReg) : RegU32 × GenState :=
     Called when emitting a label/branch target so cached registers (which may
     have been SSA-defined before the branch) are re-materialised afterwards. -/
 def clearSregCache (s : GenState) : GenState :=
-  { s with sregCache := [], immCache := [] }
+  { s with sregCache := [], immCache := [], expCache := [] }
 
 /-- CSE entry point for loading a u32 immediate.  Reuses the same register
     if the same literal has already been materialised in this basic block;
