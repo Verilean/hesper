@@ -1299,18 +1299,17 @@ def flashAttentionVecParamsKernelV9
                           (Exp.select (Exp.lt kPos splitEnd) 1 0)
       let inBounds := Exp.eq inBoundsU32 1
       let kPosSafe ← ShaderM.let' (.scalar .u32) (Exp.select inBounds kPos 0)
-      let kRowBaseU32 ← ShaderM.let' (.scalar .u32)
-                          (kHeadBaseU32 + kPosSafe * kRowStrideU32)
+      -- Step 6: Ptr abstraction.  K row pointer in u32 words; per-pair
+      -- offset is `pk*32` from this thread's base (which already includes
+      -- `+ laneId`).  Mirrors `K = K_base + kPos * stride` + `*K[k]` from
+      -- llama.cpp.  K's offset is materialised once via let'.
+      let kRowPtr ← ShaderM.ptr (.scalar .u32) "k_cache_f16" kvWords
+                      (kHeadBaseU32 + kPosSafe * kRowStrideU32 + laneId)
       let partialVar ← ShaderM.var (.scalar .f32) (Exp.litF32 0.0)
       for pk in [0:dPerLanePair] do
-        let wordOff := (Exp.litU32 (pk * 32)) + laneId
-        let kWordIdx := kRowBaseU32 + wordOff
-        let kPackedRaw ← ShaderM.readBuffer (ty := .scalar .u32) (n := kvWords)
-                           "k_cache_f16" kWordIdx
+        let kPackedRaw ← (kRowPtr.atOffset (Exp.litU32 (pk * 32))).load
         -- Pin kPacked to a register so CodeGen lowers vecX + vecY of the
-        -- same packed half2 into ONE ld.global, not two.  Without this,
-        -- the AST traversal for `unpack.x` and `unpack.y` each emits a
-        -- fresh load → doubles the load count in the K loop.
+        -- same packed half2 into ONE ld.global, not two.
         let kPacked ← ShaderM.let' (.scalar .u32) kPackedRaw
         let unpacked := Exp.unpack2x16float kPacked
         let k0 ← ShaderM.let' (.scalar .f32) (Exp.vecX unpacked)
@@ -1368,13 +1367,10 @@ def flashAttentionVecParamsKernelV9
       let inBounds := Exp.eq inBoundsU32 (Exp.litU32 1)
       let kPosSafe ← ShaderM.let' (.scalar .u32) (Exp.select inBounds kPos (Exp.litU32 0))
       let kqScore ← ShaderM.let' (.scalar .f32) (Exp.select inBounds kqScoreRaw (Exp.litF32 0.0))
-      let vRowBaseU32 ← ShaderM.let' (.scalar .u32)
-                          (Exp.add kHeadBaseU32 (Exp.mul kPosSafe kRowStrideU32))
+      let vRowPtr ← ShaderM.ptr (.scalar .u32) "v_cache_f16" kvWords
+                       (kHeadBaseU32 + kPosSafe * kRowStrideU32 + laneId)
       for pk in [0:dPerLanePair] do
-        let wordOff := Exp.add (Exp.litU32 (pk * 32)) laneId
-        let vWordIdx := Exp.add vRowBaseU32 wordOff
-        let vPackedRaw ← ShaderM.readBuffer (ty := .scalar .u32) (n := kvWords)
-                           "v_cache_f16" vWordIdx
+        let vPackedRaw ← (vRowPtr.atOffset (Exp.litU32 (pk * 32))).load
         let vPacked ← ShaderM.let' (.scalar .u32) vPackedRaw
         let unpacked := Exp.unpack2x16float vPacked
         let v0 ← ShaderM.let' (.scalar .f32) (Exp.vecX unpacked)
