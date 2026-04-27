@@ -587,6 +587,133 @@ def flashAttentionBatchKernel (numHeads numKVHeads maxSeqLen headDim seqLen : Na
       let v ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := headDim) "shared_out" d
       ShaderM.writeBuffer (ty := .scalar .f32) "output" (Exp.add outBase d) v
 
+/-- f16 K/V cache version of `flashAttentionBatchKernel`.  Reads K and V
+    from the packed half2 cache (u32 per word holding 2 f16 values for
+    consecutive dims) instead of f32.  Same I/O contract for q/output/
+    params — only the cache buffers differ.
+
+    Cache layout (matches V11 + RopeKF16):
+      cache[kvHead * maxSeqLen * (headDim/2) + pos * (headDim/2) + dPair]
+        = pack2x16float(K[kvHead, pos, 2*dPair], K[kvHead, pos, 2*dPair+1])
+
+    Each thread loops 2 dims per inner iter (one u32 read covers a pair).
+    Otherwise the algorithm is identical to the f32 version. -/
+def flashAttentionBatchKernelF16 (numHeads numKVHeads maxSeqLen headDim seqLen : Nat)
+    (scale : Float) (workgroupSize : Nat := 256) : ShaderM Unit := do
+  let wgid ← ShaderM.workgroupId
+  let lid ← ShaderM.localId
+  let head := Exp.vec3X wgid
+  let col  := Exp.vec3Y wgid           -- query token index
+  let tid  := Exp.vec3X lid
+
+  let headsPerKV := numHeads / numKVHeads
+  let kvHead := Exp.div head (Exp.litU32 headsPerKV)
+  let qDim := numHeads * headDim
+  let halfDim := headDim / 2
+  let kvWords := numKVHeads * maxSeqLen * halfDim
+
+  let _q ← ShaderM.declareInputBuffer "q" (.array (.scalar .f32) (qDim * seqLen))
+  let _kCache ← ShaderM.declareInputBuffer "k_cache_f16" (.array (.scalar .u32) kvWords)
+  let _vCache ← ShaderM.declareInputBuffer "v_cache_f16" (.array (.scalar .u32) kvWords)
+  let _output ← ShaderM.declareOutputBuffer "output" (.array (.scalar .f32) (qDim * seqLen))
+  let _params ← ShaderM.declareStorageBuffer "params" (.array (.scalar .u32) 1) .read
+
+  ShaderM.sharedNamed "shared_q" (.array (.scalar .f32) headDim)
+  ShaderM.sharedNamed "shared_reduce" (.array (.scalar .f32) workgroupSize)
+  ShaderM.sharedNamed "shared_out" (.array (.scalar .f32) headDim)
+
+  do
+    -- Load Q row (f32) for (col, head) into shared memory; zero accumulator.
+    let qBase := Exp.add (Exp.mul col (Exp.litU32 qDim)) (Exp.mul head (Exp.litU32 headDim))
+    ShaderM.loop tid (Exp.litU32 headDim) (Exp.litU32 workgroupSize) fun d => do
+      let qVal ← ShaderM.readBuffer (ty := .scalar .f32) (n := qDim * seqLen) "q" (Exp.add qBase d)
+      ShaderM.writeWorkgroup (ty := .scalar .f32) "shared_q" d qVal
+      ShaderM.writeWorkgroup (ty := .scalar .f32) "shared_out" d (Exp.litF32 0.0)
+    ShaderM.barrier
+
+    ShaderM.varNamed "max_score" (.scalar .f32) (Exp.negInf30)
+    ShaderM.varNamed "sum_exp"   (.scalar .f32) (Exp.litF32 0.0)
+    let maxScore := Exp.var "max_score"
+    let sumExp   := Exp.var "sum_exp"
+
+    let startPos ← ShaderM.readBuffer (ty := .scalar .u32) (n := 1) "params" (Exp.litU32 0)
+    let cacheLen := Exp.add startPos (Exp.add col (Exp.litU32 1))
+
+    ShaderM.loop (Exp.litU32 0) cacheLen (Exp.litU32 1) fun s => do
+      -- Each thread iterates over dPair (= halfDim word indices) instead of
+      -- d (= headDim f32 indices).  Stride workgroupSize.
+      let kRowBase :=
+        Exp.add (Exp.mul (Exp.mul kvHead (Exp.litU32 maxSeqLen)) (Exp.litU32 halfDim))
+                (Exp.mul s (Exp.litU32 halfDim))
+
+      let partialVar ← ShaderM.var (.scalar .f32) (Exp.litF32 0.0)
+      ShaderM.loop tid (Exp.litU32 halfDim) (Exp.litU32 workgroupSize) fun dPair => do
+        let q0 ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := headDim) "shared_q"
+                  (Exp.mul (Exp.litU32 2) dPair)
+        let q1 ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := headDim) "shared_q"
+                  (Exp.add (Exp.mul (Exp.litU32 2) dPair) (Exp.litU32 1))
+        let kPacked ← ShaderM.readBuffer (ty := .scalar .u32) (n := kvWords)
+                       "k_cache_f16" (Exp.add kRowBase dPair)
+        let kUnpacked := Exp.unpack2x16float kPacked
+        let k0 := Exp.vecX kUnpacked
+        let k1 := Exp.vecY kUnpacked
+        ShaderM.assign partialVar
+          (Exp.add (Exp.var partialVar)
+                   (Exp.add (Exp.mul q0 k0) (Exp.mul q1 k1)))
+
+      ShaderM.writeWorkgroup (ty := .scalar .f32) "shared_reduce" tid (Exp.var partialVar)
+      ShaderM.barrier
+
+      let numSteps := Nat.log2 workgroupSize
+      ShaderM.staticLoop numSteps fun step => do
+        let stride := workgroupSize >>> (step + 1)
+        ShaderM.if_ (Exp.lt tid (Exp.litU32 stride)) (do
+          let other ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := workgroupSize) "shared_reduce" (Exp.add tid (Exp.litU32 stride))
+          let cur ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := workgroupSize) "shared_reduce" tid
+          ShaderM.writeWorkgroup (ty := .scalar .f32) "shared_reduce" tid (Exp.add cur other)
+        ) (pure ())
+        ShaderM.barrier
+
+      let scoreFromShared ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := workgroupSize) "shared_reduce" (Exp.litU32 0)
+      let scaledScore := Exp.mul (Exp.litF32 scale) scoreFromShared
+
+      let oldMaxVar ← ShaderM.var (.scalar .f32) maxScore
+      let oldSumVar ← ShaderM.var (.scalar .f32) sumExp
+      let oldMax := Exp.var oldMaxVar
+      let oldSum := Exp.var oldSumVar
+
+      let newMax := Exp.max oldMax scaledScore
+      let expOld := Exp.exp (Exp.sub oldMax newMax)
+      let expNew := Exp.exp (Exp.sub scaledScore newMax)
+      let newSum := Exp.add (Exp.mul oldSum expOld) expNew
+
+      let rescaleFactor := Exp.div (Exp.mul oldSum expOld) newSum
+      let contribFactor := Exp.div expNew newSum
+
+      ShaderM.loop tid (Exp.litU32 halfDim) (Exp.litU32 workgroupSize) fun dPair => do
+        let vPacked ← ShaderM.readBuffer (ty := .scalar .u32) (n := kvWords)
+                       "v_cache_f16" (Exp.add kRowBase dPair)
+        let vUnpacked := Exp.unpack2x16float vPacked
+        let v0 := Exp.vecX vUnpacked
+        let v1 := Exp.vecY vUnpacked
+        let dLo := Exp.mul (Exp.litU32 2) dPair
+        let dHi := Exp.add dLo (Exp.litU32 1)
+        let prev0 ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := headDim) "shared_out" dLo
+        let prev1 ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := headDim) "shared_out" dHi
+        let upd0 := Exp.add (Exp.mul prev0 rescaleFactor) (Exp.mul v0 contribFactor)
+        let upd1 := Exp.add (Exp.mul prev1 rescaleFactor) (Exp.mul v1 contribFactor)
+        ShaderM.writeWorkgroup (ty := .scalar .f32) "shared_out" dLo upd0
+        ShaderM.writeWorkgroup (ty := .scalar .f32) "shared_out" dHi upd1
+
+      ShaderM.assign "max_score" newMax
+      ShaderM.assign "sum_exp"   newSum
+      ShaderM.barrier
+
+    let outBase := Exp.add (Exp.mul col (Exp.litU32 qDim)) (Exp.mul head (Exp.litU32 headDim))
+    ShaderM.loop tid (Exp.litU32 headDim) (Exp.litU32 workgroupSize) fun d => do
+      let v ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := headDim) "shared_out" d
+      ShaderM.writeBuffer (ty := .scalar .f32) "output" (Exp.add outBase d) v
+
 /-! ## Subgroup Flash Attention (M=1 decode, no barriers, no shared mem) -/
 
 /-- Subgroup-based M=1 flash attention kernel. Replaces
