@@ -47,6 +47,13 @@ inductive Stmt where
   | varDeclLdV4U32 (n0 n1 n2 n3 : String) (bufName : String)
       (u32Idx : Exp (.scalar .u32)) : Stmt
 
+  -- 128-bit aligned vec4.f32 shared-memory load: declares 4 fresh f32 vars
+  -- and populates them from one workgroup-buffer read.  CUDA lowers to one
+  -- `ld.shared.v4.f32`; WGSL emits 4 scalar reads.  `f32Idx` is the starting
+  -- *f32* index (must be 4-aligned by caller).
+  | varDeclLdV4F32Shared (n0 n1 n2 n3 : String) (sharedName : String)
+      (f32Idx : Exp (.scalar .u32)) : Stmt
+
 /-- Storage buffer binding -/
 structure StorageBuffer where
   group : Nat
@@ -173,6 +180,15 @@ partial def Stmt.toWGSL (indent : Nat := 0) : Stmt → String
     s!"{ind}var {n1}: u32 = {bufName}[({i})+1u];\n" ++
     s!"{ind}var {n2}: u32 = {bufName}[({i})+2u];\n" ++
     s!"{ind}var {n3}: u32 = {bufName}[({i})+3u];\n"
+
+  | .varDeclLdV4F32Shared n0 n1 n2 n3 sharedName f32Idx =>
+    -- WGSL: emit four scalar shared-mem reads.  CUDA: one ld.shared.v4.f32.
+    let ind := String.ofList (List.replicate indent ' ')
+    let i := f32Idx.toWGSL
+    s!"{ind}var {n0}: f32 = {sharedName}[{i}];\n" ++
+    s!"{ind}var {n1}: f32 = {sharedName}[({i})+1u];\n" ++
+    s!"{ind}var {n2}: f32 = {sharedName}[({i})+2u];\n" ++
+    s!"{ind}var {n3}: f32 = {sharedName}[({i})+3u];\n"
 
 /-- Generate WGSL struct definition -/
 def StructDef.toWGSL (structDef : StructDef) : String :=
