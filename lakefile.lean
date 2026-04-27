@@ -882,6 +882,10 @@ lean_exe «cuda-flashattn-vec-parity» where
   root := `Tests.CUDA.CUDAFlashAttnVecParityTest
   moreLinkArgs := stdLinkArgs ++ #["./.lake/build/native/libhesper_cuda.a", "-lcuda"]
 
+lean_exe «cuda-flashattn-v11-debug» where
+  root := `Tests.CUDA.CUDAFlashAttnV11Debug
+  moreLinkArgs := stdLinkArgs ++ #["./.lake/build/native/libhesper_cuda.a", "-lcuda"]
+
 lean_exe «cuda-flashattn-ncu-driver» where
   root := `Tests.CUDA.CUDAFlashAttnNcuDriver
   moreLinkArgs := stdLinkArgs ++ #["./.lake/build/native/libhesper_cuda.a", "-lcuda"]
