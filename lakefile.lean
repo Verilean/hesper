@@ -918,6 +918,10 @@ lean_exe «cuda-fa-golden-test» where
   root := `Tests.CUDA.CUDAFlashAttnGoldenTest
   moreLinkArgs := stdLinkArgs ++ #["./.lake/build/native/libhesper_cuda.a", "-lcuda"]
 
+lean_exe «cuda-cse-assign-bug-test» where
+  root := `Tests.CUDA.CSEAssignBugTest
+  moreLinkArgs := stdLinkArgs ++ #["./.lake/build/native/libhesper_cuda.a", "-lcuda"]
+
 lean_exe «cuda-bitnet-golden-test» where
   root := `Tests.CUDA.CUDABitNetGoldenTest
   moreLinkArgs := stdLinkArgs ++ #["./.lake/build/native/libhesper_cuda.a", "-lcuda"]

@@ -54,8 +54,43 @@ private def emitSetp (op : CmpOp) (ra rb : AnyReg) (s : GenState) : AnyReg × Ge
     | _ => (.pred p, s)
   | _ => (.pred p, s)
 
+/-- Should this Exp constructor be memoized?  Pure-arithmetic constructors
+    (whose lowering depends only on operand AnyRegs and the GenState's
+    fresh-counter) are safe at the constructor level.  Loads/shuffles/var
+    refs are NOT cseable: var values can change via `assign`, loads have
+    ordering with surrounding writes, shuffles read other lanes' regs.
+
+    NOTE: even though this returns true for `.add`, the CSE *cache itself*
+    is invalidated whenever `Stmt.assign` runs (see stmtToPTX).  This is
+    the safety belt: a cseable expression like `Exp.var "x" + 1` returns
+    the same register on cache hit, but if `x` was assigned between the
+    two evaluations, the cached register holds the *old* x + 1.  Clearing
+    the cache at every assign avoids this stale-cache hazard. -/
+def Exp.cseable {t : WGSLType} : Exp t → Bool
+  | _ => false  -- temporarily disabled: see project_cse_assign_bug.md
+  -- Original safe-list (re-enable after fixing the production hazard):
+  -- | .add _ _ | .sub _ _ | .mul _ _ | .div _ _ | .mod _ _
+  -- | .shiftLeft _ _ | .shiftRight _ _
+  -- | .bitAnd _ _ | .bitOr _ _ | .bitXor _ _
+  -- | .min _ _ | .max _ _
+  -- | .neg _ | .toF32 _ | .toI32 _ | .toU32 _ | .toF16 _
+  -- | .mulhiU32 _ _ => true
+  -- | _ => false
+
 /-- Generate PTX for an Exp, returning AnyReg + state. -/
 partial def expToPTX (e : Exp t) (s : GenState) : ExpResult :=
+  if Exp.cseable e then
+    let key := Exp.toWGSL e
+    match s.expCache.find? (·.1 == key) with
+    | some (_, r) => (r, s)
+    | none =>
+      let (r, s) := expToPTX' e s
+      (r, { s with expCache := (key, r) :: s.expCache })
+  else
+    expToPTX' e s
+
+where
+  expToPTX' (e : Exp t) (s : GenState) : ExpResult :=
   match e with
   -- Literals
   | .litF32 f =>
@@ -651,6 +686,12 @@ partial def stmtToPTX (stmt : Stmt) (s : GenState) : GenState :=
 
   | .assign name _ty value =>
     let (rv, s) := expToPTX value s
+    -- Invalidate exp CSE cache: any cached result that depended on `name`
+    -- (directly or transitively via another var that was already in cache)
+    -- now holds a stale register.  Clearing the entire cache is conservative
+    -- but correct; assign is rare enough in straight-line PTX that the
+    -- per-block CSE benefit between assigns is preserved.
+    let s := { s with expCache := [] }
     match s.lookupVar name with
     | some (.f32 r) => s.emit (.mov_f32 r rv.toF32!)
     | some (.u32 r) => s.emit (.mov_u32 r rv.toU32!)
@@ -803,9 +844,10 @@ partial def stmtToPTX (stmt : Stmt) (s : GenState) : GenState :=
       rdRegs := 0
       pRegs := 0
       hRegs := 0
-      -- Clear sreg / imm caches: outer-scope reg refs aren't visible inside.
+      -- Clear sreg / imm / exp caches: outer-scope reg refs aren't visible inside.
       sregCache := []
       immCache := []
+      expCache := []
     }
     let s := stmts.foldl (fun s st => stmtToPTX st s) s
     -- Capture inner state before restoring outer.
@@ -827,6 +869,7 @@ partial def stmtToPTX (stmt : Stmt) (s : GenState) : GenState :=
       hRegs := outerH
       sregCache := []
       immCache := []
+      expCache := []
     }
     s.emit (.scopeBlock myScopeId numF numR numRd numP numH innerInsts)
 
