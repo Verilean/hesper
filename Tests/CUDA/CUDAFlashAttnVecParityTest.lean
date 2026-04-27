@@ -634,6 +634,11 @@ unsafe def main : IO Unit := do
                   (gx gy : Nat) (bx : UInt32) : IO Float := do
       let ptx := Hesper.CUDA.CodeGen.generatePTX label
                    { x := bx.toNat, y := 1, z := 1 } shader
+      match ← IO.getEnv "HESPER_PTX_DUMP" with
+      | some dir => do
+        IO.FS.createDirAll dir
+        IO.FS.writeFile s!"{dir}/{label}.ptx" ptx
+      | none => pure ()
       let cudaMod ← Hesper.CUDA.cuModuleLoadData ptx
       let f ← Hesper.CUDA.cuModuleGetFunction cudaMod label
       let state := Hesper.WGSL.Monad.ShaderM.exec shader
