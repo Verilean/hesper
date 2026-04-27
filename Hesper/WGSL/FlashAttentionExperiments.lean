@@ -1296,8 +1296,8 @@ def flashAttentionVecParamsKernelV9
       -- Hesper/WGSL/Monad.lean's let' docstring for the V9 17×
       -- instruction-bloat case study that motivated this helper.
       let inBoundsU32 ← ShaderM.let' (.scalar .u32)
-                          (Exp.select (Exp.lt kPos splitEnd) 1 0)
-      let inBounds := Exp.eq inBoundsU32 1
+                          (Exp.select (kPos <ᵉ splitEnd) 1 0)
+      let inBounds := inBoundsU32 ==ᵉ 1
       let kPosSafe ← ShaderM.let' (.scalar .u32) (Exp.select inBounds kPos 0)
       -- Step 6: Ptr abstraction.  K row pointer in u32 words; per-pair
       -- offset is `pk*32` from this thread's base (which already includes
