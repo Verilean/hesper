@@ -3477,6 +3477,207 @@ def fusedQ6KLinearDP4A4RowKernel (inDim outDim : Nat) (gridX : Nat := 0) : Shade
     ShaderM.writeBuffer (ty := .scalar .f32) "output" outIdx total
   ) (pure ())
 
+/-- 4-warp / **1 row** cooperative variant of `fusedQ6KLinearDP4AKernel`.
+
+    Matches llama.cpp's `mul_mat_vec_q<Q6_K, ncols_dst=1>` exactly:
+    `block = (32, 4, 1)` = 128 thread = 4 warps; `rows_per_cuda_block = 1`;
+    `blocks_per_iter = vdr * nwarps * warp_size / qi = 1 * 4 * 32 / 32 = 4`.
+
+    Each warp covers 1/4 of the K blocks (kbx = warpId, warpId+4, warpId+8,
+    ...).  At K=10240 (40 blocks/row) each thread runs **10 iter** vs the
+    1-warp variant's 40 — 4× per-row issue parallelism, faster DRAM
+    saturation.  Per-warp partial sum reduces via `subgroupAdd`; warps
+    1..3 publish to smem and warp 0 merges + writes the single output.
+
+    Different from `fusedQ6KLinearDP4A4RowKernel` (4 rows / 1 warp each):
+    that one trades cooperative parallelism for output count.  This one
+    takes the llama.cpp shape (1 row, 4 warps cooperative on K).
+
+    Dispatch: `outDim` workgroups × 128 threads. Same `inBounds` mask.
+
+    @param inDim  Input dimension (must be multiple of 256 for Q6_K blocks)
+    @param outDim Output dimension
+    @param gridX  Grid X dimension for 2D grid; 0 for 1D. -/
+def fusedQ6KLinearDP4A4WarpKernel (inDim outDim : Nat) (gridX : Nat := 0) : ShaderM Unit := do
+  let wid ← ShaderM.workgroupId
+  let lid ← ShaderM.localId
+  let outIdx :=
+    if gridX == 0 then Exp.vec3X wid
+    else Exp.add (Exp.vec3X wid) (Exp.mul (Exp.vec3Y wid) (Exp.litU32 gridX))
+  -- block = (32, 4, 1): localId.x = lane (0..31), localId.y = warpId (0..3).
+  let laneId  := Exp.vec3X lid
+  let warpId  := Exp.vec3Y lid
+
+  let blocksPerRow := inDim / 256
+  let blockSizeBytes : Nat := 210
+  let totalWeightBytes := outDim * blocksPerRow * blockSizeBytes
+  let totalWeightU32 := (totalWeightBytes + 3) / 4
+  let q8BlocksPerRow := inDim / 32
+  let q8InputU32Size := q8BlocksPerRow * 9
+
+  let _weights ← ShaderM.declareReadOnlyBuffer "weights" (.array (.scalar .u32) totalWeightU32)
+  let _input ← ShaderM.declareReadOnlyBuffer "input_q8" (.array (.scalar .u32) q8InputU32Size)
+  let _output ← ShaderM.declareOutputBuffer "output" (.array (.scalar .f32) outDim)
+
+  let inBounds := Exp.lt outIdx (Exp.litU32 outDim)
+
+  -- iqs is the lane-only address (0..31). Same DP4A indexing as the 1-row
+  -- kernel; warpId is *not* part of `iqs` — warpId only shifts the kbx
+  -- starting point along K.
+  let iqsName       ← ShaderM.var (.scalar .u32) laneId
+  let iqs           : Exp (.scalar .u32) := Exp.var iqsName
+  let iqsDiv16Name  ← ShaderM.var (.scalar .u32) (Exp.shiftRight iqs (Exp.litU32 4))
+  let iqsMod16Name  ← ShaderM.var (.scalar .u32) (Exp.bitAnd iqs (Exp.litU32 15))
+  let iqsMod8Name   ← ShaderM.var (.scalar .u32) (Exp.bitAnd iqs (Exp.litU32 7))
+  let iqsDiv16      : Exp (.scalar .u32) := Exp.var iqsDiv16Name
+  let iqsMod16      : Exp (.scalar .u32) := Exp.var iqsMod16Name
+  let iqsMod8       : Exp (.scalar .u32) := Exp.var iqsMod8Name
+  let bq8OffName    ← ShaderM.var (.scalar .u32)
+    (Exp.add (Exp.mul iqsDiv16 (Exp.litU32 4)) (Exp.shiftRight iqsMod16 (Exp.litU32 3)))
+  let scaleOffName  ← ShaderM.var (.scalar .u32)
+    (Exp.add (Exp.mul iqsDiv16 (Exp.litU32 8)) (Exp.shiftRight iqsMod16 (Exp.litU32 2)))
+  let vhShiftName   ← ShaderM.var (.scalar .u32)
+    (Exp.mul (Exp.shiftRight iqsMod16 (Exp.litU32 3)) (Exp.litU32 2))
+  let vhIdxName     ← ShaderM.var (.scalar .u32)
+    (Exp.add (Exp.mul iqsDiv16 (Exp.litU32 8)) iqsMod8)
+  let bq8Off    : Exp (.scalar .u32) := Exp.var bq8OffName
+  let scaleOff  : Exp (.scalar .u32) := Exp.var scaleOffName
+  let vhShift   : Exp (.scalar .u32) := Exp.var vhShiftName
+  let vhIdx     : Exp (.scalar .u32) := Exp.var vhIdxName
+  let q8ElemOff : Exp (.scalar .u32) := iqsMod8
+
+  ShaderM.varNamed "acc" (.scalar .f32) (Exp.litF32 0.0)
+  let acc : Exp (.scalar .f32) := Exp.var "acc"
+
+  ShaderM.varNamed "rowByteBase" (.scalar .u32)
+    (Exp.mul outIdx (Exp.litU32 (blocksPerRow * blockSizeBytes)))
+  let rowByteBase : Exp (.scalar .u32) := Exp.var "rowByteBase"
+
+  -- Same byte/u16/u32 readers as the 1-row variant.
+  let readByte (blockBase : Exp (.scalar .u32)) (offset : Exp (.scalar .u32)) : ShaderM (Exp (.scalar .u32)) := do
+    let byteIdx := Exp.add blockBase offset
+    ShaderM.readBufferByte (n := totalWeightU32) "weights" byteIdx
+
+  let readU16 (blockBase : Exp (.scalar .u32)) (offset : Exp (.scalar .u32)) : ShaderM (Exp (.scalar .u32)) := do
+    let byteIdx := Exp.add blockBase offset
+    ShaderM.readBufferU16 (n := totalWeightU32) "weights" byteIdx
+
+  let read4Bytes (blockBase : Exp (.scalar .u32)) (offset : Exp (.scalar .u32)) : ShaderM (Exp (.scalar .u32)) := do
+    let byteIdxName ← ShaderM.var (.scalar .u32) (Exp.add blockBase offset)
+    let byteIdx : Exp (.scalar .u32) := Exp.var byteIdxName
+    let u32IdxName ← ShaderM.var (.scalar .u32) (Exp.shiftRight byteIdx (Exp.litU32 2))
+    let u32Idx : Exp (.scalar .u32) := Exp.var u32IdxName
+    let byteOffName ← ShaderM.var (.scalar .u32) (Exp.bitAnd byteIdx (Exp.litU32 3))
+    let byteOff : Exp (.scalar .u32) := Exp.var byteOffName
+    let shiftLo := Exp.mul byteOff (Exp.litU32 8)
+    let shiftHi := Exp.mul (Exp.sub (Exp.litU32 4) byteOff) (Exp.litU32 8)
+    let w0 ← ShaderM.readBuffer (ty := .scalar .u32) (n := totalWeightU32) "weights" u32Idx
+    let w1 ← ShaderM.readBuffer (ty := .scalar .u32) (n := totalWeightU32) "weights"
+              (Exp.add u32Idx (Exp.litU32 1))
+    let lo := Exp.shiftRight w0 shiftLo
+    let hi := Exp.select (Exp.eq byteOff (Exp.litU32 0))
+                (Exp.litU32 0) (Exp.shiftLeft w1 shiftHi)
+    pure (Exp.bitOr lo hi)
+
+  let sub32PerByte (x : Exp (.scalar .u32)) : Exp (.scalar .u32) :=
+    Exp.bitXor
+      (Exp.sub (Exp.bitOr x (Exp.litU32 0x80808080)) (Exp.litU32 0x20202020))
+      (Exp.litU32 0x80808080)
+
+  -- Per-warp K-stride loop: warpId 0..3 covers blocks {warpId, warpId+4, ...}.
+  -- Inner loop count = blocksPerRow / 4 (10 at K=10240) — 4× shorter chain
+  -- than the 1-warp variant's blocksPerRow.
+  --
+  -- We use a regular `ShaderM.loop` with a starting offset = warpId.  ptxas
+  -- unrolls reliably when blocksPerRow is a compile-time multiple of 4.
+  ShaderM.loop warpId (Exp.litU32 blocksPerRow) (Exp.litU32 4) fun blockIdx => do
+    let blockByteBaseName ← ShaderM.var (.scalar .u32)
+      (Exp.add rowByteBase (Exp.mul blockIdx (Exp.litU32 blockSizeBytes)))
+    let blockByteBase : Exp (.scalar .u32) := Exp.var blockByteBaseName
+
+    let dBitsName ← ShaderM.var (.scalar .u32) (← readU16 blockByteBase (Exp.litU32 208))
+    let dBits : Exp (.scalar .u32) := Exp.var dBitsName
+    let d := Exp.vecX (Exp.unpack2x16float dBits)
+
+    let vlOffset := Exp.mul iqs (Exp.litU32 4)
+    let vlName ← ShaderM.var (.scalar .u32) (← read4Bytes blockByteBase vlOffset)
+    let vl : Exp (.scalar .u32) := Exp.var vlName
+    let vhOffset := Exp.add (Exp.litU32 128) (Exp.mul vhIdx (Exp.litU32 4))
+    let vhRaw ← read4Bytes blockByteBase vhOffset
+    let vhName ← ShaderM.var (.scalar .u32) (Exp.shiftRight vhRaw vhShift)
+    let vh : Exp (.scalar .u32) := Exp.var vhName
+
+    let sc0ByteName ← ShaderM.var (.scalar .u32)
+      (← readByte blockByteBase (Exp.add (Exp.litU32 192) scaleOff))
+    let sc1ByteName ← ShaderM.var (.scalar .u32)
+      (← readByte blockByteBase (Exp.add (Exp.litU32 192) (Exp.add scaleOff (Exp.litU32 4))))
+    let sc0Byte : Exp (.scalar .u32) := Exp.var sc0ByteName
+    let sc1Byte : Exp (.scalar .u32) := Exp.var sc1ByteName
+    let signExtI8 (b : Exp (.scalar .u32)) : Exp (.scalar .u32) :=
+      Exp.select (Exp.ge b (Exp.litU32 128))
+        (Exp.bitOr b (Exp.litU32 0xFFFFFF00)) b
+    let sc0I : Exp (.scalar .i32) := Exp.toI32 (signExtI8 sc0Byte)
+    let sc1I : Exp (.scalar .i32) := Exp.toI32 (signExtI8 sc1Byte)
+
+    let q8BlockIdx i :=
+      Exp.add (Exp.mul blockIdx (Exp.litU32 (8 * 9)))
+              (Exp.mul (Exp.add bq8Off (Exp.mul (Exp.litU32 i) (Exp.litU32 2))) (Exp.litU32 9))
+    let q8Sub0 := q8BlockIdx 0
+    let q8Sub1 := q8BlockIdx 1
+    let u0 ← ShaderM.readBuffer (ty := .scalar .u32) (n := q8InputU32Size) "input_q8"
+              (Exp.add q8Sub0 (Exp.add (Exp.litU32 1) q8ElemOff))
+    let u1 ← ShaderM.readBuffer (ty := .scalar .u32) (n := q8InputU32Size) "input_q8"
+              (Exp.add q8Sub1 (Exp.add (Exp.litU32 1) q8ElemOff))
+    let q8Hdr0 ← ShaderM.readBuffer (ty := .scalar .u32) (n := q8InputU32Size) "input_q8" q8Sub0
+    let q8Hdr1 ← ShaderM.readBuffer (ty := .scalar .u32) (n := q8InputU32Size) "input_q8" q8Sub1
+    let d8AName ← ShaderM.var (.scalar .f32) (Exp.vecX (Exp.unpack2x16float q8Hdr0))
+    let d8BName ← ShaderM.var (.scalar .f32) (Exp.vecX (Exp.unpack2x16float q8Hdr1))
+    let d8A : Exp (.scalar .f32) := Exp.var d8AName
+    let d8B : Exp (.scalar .f32) := Exp.var d8BName
+
+    let vil_0 := Exp.bitAnd vl (Exp.litU32 0x0F0F0F0F)
+    let vih_0 := Exp.bitAnd (Exp.shiftLeft vh (Exp.litU32 4)) (Exp.litU32 0x30303030)
+    let vi_0 := sub32PerByte (Exp.bitOr vil_0 vih_0)
+    let dot_0 := Exp.dot4I8Packed vi_0 u0
+    let dotSc_0 := Exp.mul dot_0 sc0I
+    let sumf_0 := Exp.mul d8A (Exp.toF32 dotSc_0)
+
+    let vil_1 := Exp.bitAnd (Exp.shiftRight vl (Exp.litU32 4)) (Exp.litU32 0x0F0F0F0F)
+    let vih_1 := Exp.bitAnd (Exp.shiftLeft (Exp.shiftRight vh (Exp.litU32 4)) (Exp.litU32 4))
+                            (Exp.litU32 0x30303030)
+    let vi_1 := sub32PerByte (Exp.bitOr vil_1 vih_1)
+    let dot_1 := Exp.dot4I8Packed vi_1 u1
+    let dotSc_1 := Exp.mul dot_1 sc1I
+    let sumf_1 := Exp.mul d8B (Exp.toF32 dotSc_1)
+
+    ShaderM.assign "acc" (Exp.fma d (Exp.add sumf_0 sumf_1) acc)
+
+  -- Stage 1: per-warp lane reduction (32 lanes → 1 partial per warp).
+  ShaderM.varNamed "warpSum" (.scalar .f32) (Exp.subgroupAdd acc)
+  let warpSum : Exp (.scalar .f32) := Exp.var "warpSum"
+
+  -- Stage 2: cross-warp merge via smem.  Warps 1..3 publish their warp
+  -- partial; barrier; warp 0 reads and adds.  llama.cpp does the same with
+  -- `tmp_shared[nwarps-1][lane]` then warp 0 combines.  We only need 4
+  -- entries (one per warp), not nwarps-1 × warp_size, because we already
+  -- finished the within-warp reduction in stage 1.
+  ShaderM.sharedNamed "s_warp_partials" (.array (.scalar .f32) 4)
+  ShaderM.if_ (Exp.eq laneId (Exp.litU32 0)) (do
+    ShaderM.writeWorkgroup (ty := .scalar .f32) "s_warp_partials" warpId warpSum
+  ) (pure ())
+  ShaderM.barrier
+
+  ShaderM.if_ (Exp.and (Exp.eq warpId (Exp.litU32 0)) (Exp.eq laneId (Exp.litU32 0))) (do
+    let p0 ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := 4) "s_warp_partials" (Exp.litU32 0)
+    let p1 ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := 4) "s_warp_partials" (Exp.litU32 1)
+    let p2 ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := 4) "s_warp_partials" (Exp.litU32 2)
+    let p3 ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := 4) "s_warp_partials" (Exp.litU32 3)
+    let total := Exp.add (Exp.add p0 p1) (Exp.add p2 p3)
+    ShaderM.if_ inBounds (do
+      ShaderM.writeBuffer (ty := .scalar .f32) "output" outIdx total
+    ) (pure ())
+  ) (pure ())
+
 /-! ## Fused RMSNorm + Q4_K_M MatVec -/
 
 /-- Fused RMSNorm + Q4_K_M mat-vec kernel.
@@ -4142,12 +4343,30 @@ def forwardDP4A [GPUBackend β] (ctx : β)
     -- canonical 10-decode run.  2-row was actually worse than either
     -- (1.401 ms/dec) — smem sharing of Q8_1 input did not pay for the
     -- occupancy hit at 4070 Ti's SM count.
-    -- Override with HESPER_Q6K_KERNEL=4row (regression comparison) or
-    -- HESPER_Q6K_KERNEL=2row (rarely wins).
+    -- Override with HESPER_Q6K_KERNEL=4warp (1 row, 4 warps coop on K —
+    -- llama.cpp's `mul_mat_vec_q<Q6_K, nwarps=4>` shape; 4× per-row
+    -- issue parallelism), HESPER_Q6K_KERNEL=4row (4 rows / WG, smem
+    -- input share), or HESPER_Q6K_KERNEL=2row (rarely wins).
     let q6kVariant := (← IO.getEnv "HESPER_Q6K_KERNEL").getD "1row"
-    let force1Row := q6kVariant == "1row"
-    let force2Row := q6kVariant == "2row"
-    if force1Row || !(layer.config.outDim % 2 == 0) then
+    let force1Row  := q6kVariant == "1row"
+    let force2Row  := q6kVariant == "2row"
+    let force4Warp := q6kVariant == "4warp"
+    if force4Warp then
+      GPUBackend.executeWithConfigCached ctx
+        (fusedQ6KLinearDP4A4WarpKernel layer.config.inDim layer.config.outDim)
+        [("weights", layer.weightBuf), ("input_q8", q8Buf), ("output", outputBuf)]
+        { numWorkgroups := (layer.config.outDim, 1, 1)
+          workgroupSize := { x := 32, y := 4, z := 1 }
+          -- preHash is keyed on (funcName, stmts.length, buffer-count, wg).
+          -- The ShaderM AST embeds `inDim`/`outDim` as literals but they
+          -- don't change `stmts.length`, so two distinct dispatches (e.g.
+          -- ffn_down at outDim=2560 and lm_head at outDim=262144) collide
+          -- in the cache and the second hits the first's compiled cubin.
+          -- Distinguish via funcName.
+          funcName := s!"q6k_dp4a_4warp_{layer.config.inDim}_{layer.config.outDim}" }
+        (hash ("q6k-dp4a-matmul-4warp", layer.config.inDim, layer.config.outDim))
+        layer.dp4aMatmulPrepared
+    else if force1Row || !(layer.config.outDim % 2 == 0) then
       GPUBackend.executeWithConfigCached ctx
         (fusedQ6KLinearDP4AKernel layer.config.inDim layer.config.outDim)
         [("weights", layer.weightBuf), ("input_q8", q8Buf), ("output", outputBuf)]
