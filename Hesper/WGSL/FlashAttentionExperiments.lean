@@ -709,9 +709,8 @@ def flashAttentionVecParamsKernelV7
         ShaderM.assign partialVar
           (Exp.add (Exp.var partialVar) (Exp.mul q1Exp k1))
 
-      let sumWarpName ← ShaderM.var (.scalar .f32)
-                          (Exp.subgroupAdd (Exp.var partialVar))
-      let sumWarp : Exp (.scalar .f32) := Exp.var sumWarpName
+      -- Step 5 helper: warp-wide sum reduce (1 subgroupAdd, fully warp-merged).
+      let sumWarp ← ShaderM.warpReduceSum 32 (Exp.var partialVar : Exp (.scalar .f32))
       let scoreGated := Exp.select inBounds sumWarp (Exp.litF32 (-1.0e30))
       ShaderM.assign kqMaxNewVar
         (Exp.max (Exp.var kqMaxNewVar) scoreGated)
@@ -1323,9 +1322,8 @@ def flashAttentionVecParamsKernelV9
         let p1 : Exp (.scalar .f32) := Exp.var partialVar
         ShaderM.assign partialVar (p1 + q1Exp * k1)
 
-      let sumWarpName ← ShaderM.var (.scalar .f32)
-                          (Exp.subgroupAdd (Exp.var partialVar))
-      let sumWarp : Exp (.scalar .f32) := Exp.var sumWarpName
+      -- Step 5 helper: warp-wide sum reduce (1 subgroupAdd, fully warp-merged).
+      let sumWarp ← ShaderM.warpReduceSum 32 (Exp.var partialVar : Exp (.scalar .f32))
       let scoreGated := Exp.select inBounds sumWarp (Exp.litF32 (-1.0e30))
       ShaderM.assign kqMaxNewVar
         (Exp.max (Exp.var kqMaxNewVar) scoreGated)
