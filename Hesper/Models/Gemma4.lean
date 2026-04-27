@@ -714,122 +714,30 @@ def forwardBlock [GPUBackend β] (ctx : β)
     -- saving the separate ropeK dispatch above.
     if cfg.hasKV li then
       Hesper.WGSL.Execute.withSection "kvWrite" do
-        let useScatter ← match ← IO.getEnv "HESPER_SCATTER_KV" with
-                        | some "1" => pure true
-                        | _        => pure false
-        let useFAV11 ← match ← IO.getEnv "HESPER_FA_V11" with
-                        | some "1" => pure true
-                        | _        => pure false
-        match block.ropeFreqFactors, useScatter with
-        | some freqFactors, false =>
-          -- Default path: single fused hand-coded RoPE-K + KV-write kernel.
-          ce s!"ropeKAndKvWrite_{headDim}_{numKVHeads}_base{cfg.ropeBase li}"
-            (Attention.fusedRopeKAndCacheWriteKernel numKVHeads cfg.maxSeqLen headDim kvDim (cfg.ropeBase li))
+        match block.ropeFreqFactors with
+        | some freqFactors =>
+          -- Single fused RoPE-K + KV-write kernel writing the f16 packed cache.
+          -- Uses fusedRopeKAndCacheWriteBatchKernelF16 with seqLen=1 so the
+          -- prefill batched path and the decode path share one kernel
+          -- definition (different shape only).
+          ce s!"ropeKAndKvWriteF16_{headDim}_{numKVHeads}_base{cfg.ropeBase li}"
+            (Attention.fusedRopeKAndCacheWriteBatchKernelF16
+               numKVHeads cfg.maxSeqLen headDim 1 (cfg.ropeBase li))
             [("new_k", state.kBuf2), ("new_v", state.vBuf2),
-             ("k_cache", kvCache.kBuf), ("v_cache", kvCache.vBuf),
+             ("k_cache_f16", kvCache.kBufF16), ("v_cache_f16", kvCache.vBufF16),
              ("params", state.paramsBuf), ("freq_factors", freqFactors)]
-            (.dispatch1D kvDim)
-          -- V11 mirror: pack the just-written K (with RoPE) and V into f16
-          -- caches.  Two extra dispatches (K-mirror reads from kBuf2 + RoPE,
-          -- V-mirror reads from vCache).  Cost: ~0.5 µs/layer in unrolled
-          -- ShaderM dispatches; eliminated entirely once we fully migrate to
-          -- f16 cache and stop doing f32 writes.
-          if useFAV11 then
-            ce s!"ropeKWriteF16_{headDim}_{numKVHeads}_base{cfg.ropeBase li}"
-              (Attention.fusedRopeKAndCacheWriteKernelF16 numKVHeads cfg.maxSeqLen headDim kvDim (cfg.ropeBase li))
-              [("new_k", state.kBuf2), ("k_cache_f16", kvCache.kBufF16),
-               ("params", state.paramsBuf), ("freq_factors", freqFactors)]
-              (.dispatch1D (kvDim / 2))
-            ce s!"vPackF16_{headDim}_{numKVHeads}"
-              (Attention.packVCacheF32ToF16Kernel numKVHeads cfg.maxSeqLen headDim)
-              [("v_cache", kvCache.vBuf), ("v_cache_f16", kvCache.vBufF16),
-               ("params", state.paramsBuf)]
-              (.dispatch1D (numKVHeads * (headDim / 2)))
-        | some freqFactors, true =>
-          -- Circuit DSL path: ONE scatterMulti dispatch writes K (with NeoX RoPE)
-          -- AND V (plain copy) into the cache.  Same semantics and same kernel
-          -- count as the hand-coded fusedRopeKAndCacheWriteKernel.
-          --
-          -- Inputs (4 data + 2 dst):
-          --   inputs[0] = state.kBuf2   (lane-local, [kvDim])
-          --   inputs[1] = freqFactors    (gather-only, [halfDim])
-          --   inputs[2] = state.posF32Buf (broadcast scalar, [1])
-          --   inputs[3] = state.vBuf2   (lane-local, [kvDim])
-          --   inputs[4] = kvCache.kBuf  (dst 0)
-          --   inputs[5] = kvCache.vBuf  (dst 1)
-          let halfDim := headDim / 2
-          let cacheSize := numKVHeads * cfg.maxSeqLen * headDim
-          let key := hash ("gemma4-scatter-multi-kv",
-                            li, numKVHeads, cfg.maxSeqLen, headDim)
-          let ccRef ← Hesper.Circuit.getGlobalCircuitRef (β := β) key
-          Hesper.Circuit.runCachedFused ctx ccRef
-            (do
-              let kT ← Hesper.Circuit.CircuitM.registerExternal
-                         (BufT := GPUBackend.Buf β) (CacheT := GPUBackend.CachedDispatch β)
-                         state.kBuf2 #[kvDim] .f32 .Global
-              let ffT ← Hesper.Circuit.CircuitM.registerExternal
-                          (BufT := GPUBackend.Buf β) (CacheT := GPUBackend.CachedDispatch β)
-                          freqFactors #[halfDim] .f32 .Global
-              let posT ← Hesper.Circuit.CircuitM.registerExternal
-                           (BufT := GPUBackend.Buf β) (CacheT := GPUBackend.CachedDispatch β)
-                           state.posF32Buf #[1] .f32 .Global
-              let vT ← Hesper.Circuit.CircuitM.registerExternal
-                         (BufT := GPUBackend.Buf β) (CacheT := GPUBackend.CachedDispatch β)
-                         state.vBuf2 #[kvDim] .f32 .Global
-              let kDst ← Hesper.Circuit.CircuitM.registerExternal
-                           (BufT := GPUBackend.Buf β) (CacheT := GPUBackend.CachedDispatch β)
-                           kvCache.kBuf #[cacheSize] .f32 .Global
-              let vDst ← Hesper.Circuit.CircuitM.registerExternal
-                           (BufT := GPUBackend.Buf β) (CacheT := GPUBackend.CachedDispatch β)
-                           kvCache.vBuf #[cacheSize] .f32 .Global
-              -- Shared addr arithmetic.
-              let i        : Hesper.Circuit.ScalarExp := .laneIdx
-              let headSE   : Hesper.Circuit.ScalarExp := .idiv i (.const headDim.toFloat)
-              let d        : Hesper.Circuit.ScalarExp := .mod  i (.const headDim.toFloat)
-              let posSE    : Hesper.Circuit.ScalarExp := .input 2
-              let addrExpr : Hesper.Circuit.ScalarExp :=
-                headSE * .const (cfg.maxSeqLen * headDim).toFloat
-                + posSE * .const headDim.toFloat
-                + d
-              -- K value: NeoX RoPE.
-              let dLow     : Hesper.Circuit.ScalarExp := .lt d (.const halfDim.toFloat)
-              let pairD    : Hesper.Circuit.ScalarExp :=
-                .select dLow (d + .const halfDim.toFloat) (d - .const halfDim.toFloat)
-              let pairIdx  : Hesper.Circuit.ScalarExp :=
-                headSE * .const headDim.toFloat + pairD
-              let xSelf    : Hesper.Circuit.ScalarExp := .input 0
-              let xPair    : Hesper.Circuit.ScalarExp := .indexed 0 pairIdx
-              let dimPair  : Hesper.Circuit.ScalarExp :=
-                .select dLow d (d - .const halfDim.toFloat)
-              let freqFac  : Hesper.Circuit.ScalarExp := .indexed 1 dimPair
-              let exponent : Hesper.Circuit.ScalarExp :=
-                .const 2.0 * dimPair / .const headDim.toFloat
-              let freqInv  : Hesper.Circuit.ScalarExp := .pow (.const (cfg.ropeBase li)) (.neg exponent)
-              let theta    : Hesper.Circuit.ScalarExp := posSE * freqInv / freqFac
-              let cosT     : Hesper.Circuit.ScalarExp := .cos theta
-              let sinT     : Hesper.Circuit.ScalarExp := .sin theta
-              let x0       : Hesper.Circuit.ScalarExp := .select dLow xSelf xPair
-              let x1       : Hesper.Circuit.ScalarExp := .select dLow xPair xSelf
-              let x0new    : Hesper.Circuit.ScalarExp := x0 * cosT - x1 * sinT
-              let x1new    : Hesper.Circuit.ScalarExp := x0 * sinT + x1 * cosT
-              let kValue   : Hesper.Circuit.ScalarExp := .select dLow x0new x1new
-              -- V value: plain copy from inputs[3].
-              let vValue   : Hesper.Circuit.ScalarExp := .input 3
-              let _ ← Hesper.Circuit.CircuitM.scatterMulti #[kvDim]
-                        #[kT, ffT, posT, vT]
-                        #[kDst, vDst]
-                        #[(kValue, addrExpr), (vValue, addrExpr)]
-              pure ())
-            [(0, state.kBuf2), (1, freqFactors), (2, state.posF32Buf),
-             (3, state.vBuf2), (4, kvCache.kBuf), (5, kvCache.vBuf)]
-        | none, _ =>
-          -- No freqFactors: fall back to the plain K+V copy hand-coded kernel.
-          ce s!"kvWrite_{headDim}_{numKVHeads}"
-            (Attention.fusedCacheWriteKVKernel numKVHeads cfg.maxSeqLen headDim kvDim)
-            [("new_k", state.kBuf), ("new_v", state.vBuf2),
-             ("k_cache", kvCache.kBuf), ("v_cache", kvCache.vBuf),
+            (.dispatch1D (numKVHeads * (headDim / 2)))
+        | none =>
+          -- SWA layers: K is already RoPE'd into state.kBuf upstream (the
+          -- `if cfg.hasKV li && block.ropeFreqFactors.isNone` branch around
+          -- line 696 emits ropeKernelDynamic into state.kBuf).  Just pack
+          -- K + V into the f16 cache.
+          ce s!"kvWriteF16NoRope_{headDim}_{numKVHeads}"
+            (Attention.kvWriteBatchKernelF16 numKVHeads cfg.maxSeqLen headDim 1)
+            [("new_k_roped", state.kBuf), ("new_v", state.vBuf2),
+             ("k_cache_f16", kvCache.kBufF16), ("v_cache_f16", kvCache.vBufF16),
              ("params", state.paramsBuf)]
-            (.dispatch1D kvDim)
+            (.dispatch1D (numKVHeads * (headDim / 2)))
 
     -- Flash attention: Q @ K_cache^T → softmax → @ V_cache → output
     -- Gemma 4 uses hparams.f_attention_scale = 1.0 (NOT the usual 1/sqrt(headDim)),
@@ -844,69 +752,19 @@ def forwardBlock [GPUBackend β] (ctx : β)
       let cacheLenBytes := Hesper.WebGPU.BufferOps.uint32ToBytes cacheLen.toUInt32
       writeScalarViaStaging ctx state.paramsBuf 4 state.stagingParamsPtr 4 cacheLenBytes
     Hesper.WGSL.Execute.withSection "flashAttn" do
-      -- Two kernels:
-      --   cacheLen > 32: tiled split-K (phase1 + phase2) — parallel
-      --     accumulation across KV dimension wins for long caches.
-      --   cacheLen ≤ 32: subgroup params kernel (HESPER_FA_SUBGROUP=1)
-      --     or the 256-thread tree-reduce `Dynamic` kernel (default).
-      --     The subgroup kernel uses 32 threads with a single
-      --     `subgroupAdd` per position — no shared memory, no
-      --     barriers — and reads cacheLen from `params` so the PTX is
-      --     cacheable (works correctly under CUDA Graph capture +
-      --     replay past the initial ≤32 capture boundary).
-      --
-      -- Measured on Gemma 4 E4B Q4_K_M + RTX 4070 Ti: both ≤32 kernels
-      -- land within noise for typical 100-tok decode.  Keeping the
-      -- older default to avoid touching the long-context path; opt-in
-      -- via env for benchmarking / future tuning.
+      -- doc 60 Session 5 (V11): split-K + sub-warp partition + f16 K/V cache.
+      -- Two-kernel pipeline (partial → combine).  This is the only decode
+      -- FlashAttention path now — legacy f32-cache kernels (Dynamic / Tiled
+      -- / Vec / Subgroup) were removed when the cache went f16-only.
       --
       -- SWA masking isn't needed: cacheLen is already clamped to
       -- ≤ windowSize for SWA layers upstream.
-      if (← IO.getEnv "HESPER_FA_V11").isSome then
-        -- doc 60 Session 5 (V11): split-K + sub-warp partition + f16 K/V cache.
-        -- Two-kernel pipeline (partial → combine).  Reads f16 K/V caches
-        -- mirrored from f32 caches above.  Highest hesper FlashAttn variant
-        -- (24.3 µs partial + 1.7 µs combine at cacheLen=128 microbench).
-        let kcrLk := kcr.map (fun k key => k.getRef key)
-        FlashAttention.executeFlashAttentionV11 ctx
-          state.qBuf kvCache.kBufF16 kvCache.vBufF16 state.paramsBuf
-          state.flashPartialOutV11 state.flashPartialMetaV11 state.attnOutBuf
-          numHeads numKVHeads cfg.maxSeqLen headDim scale
-          (kcrLookup := kcrLk)
-      else if (← IO.getEnv "HESPER_FA_VEC").isSome then
-        -- doc 60 Session 1: warp-shuffle vec kernel.  Same shape as the
-        -- legacy dynamic kernel (gridX=numHeads), reduces dot products
-        -- with subgroupAdd instead of a smem tree.  Keeps cacheLen
-        -- serial; future sessions add gridY split-K + f16 KV.
-        let kcrLk := kcr.map (fun k key => k.getRef key)
-        FlashAttention.executeFlashAttentionVecParams ctx
-          state.qBuf kvCache.kBuf kvCache.vBuf state.attnOutBuf state.paramsBuf
-          numHeads numKVHeads cfg.maxSeqLen headDim scale
-          (kcrLookup := kcrLk)
-      else if cacheLen > 32 then
-        let kcrLk := kcr.map (fun k key => k.getRef key)
-        FlashAttention.executeFlashAttentionTiled ctx
-          state.qBuf kvCache.kBuf kvCache.vBuf state.attnOutBuf
-          numHeads numKVHeads cfg.maxSeqLen headDim cacheLen scale
-          (partialBuf := some state.flashPartialBuf)
-          (kcrLookup := kcrLk)
-      else
-        let useSubgroupFA := (match ← IO.getEnv "HESPER_FA_SUBGROUP" with
-                             | some "1" => true
-                             | _        => false)
-        if useSubgroupFA then
-          ce s!"flashAttnS_{headDim}_{numKVHeads}"
-            (FlashAttention.flashAttentionSubgroupParamsKernel numHeads numKVHeads cfg.maxSeqLen headDim scale)
-            [("q", state.qBuf), ("k_cache", kvCache.kBuf), ("v_cache", kvCache.vBuf),
-             ("output", state.attnOutBuf), ("params", state.paramsBuf)]
-            ({ numWorkgroups := (numHeads, 1, 1), workgroupSize := { x := 32, y := 1, z := 1 }
-               extensions := ["subgroups"] : Hesper.ExecConfig })
-        else
-          ce s!"flashAttnP_{headDim}_{numKVHeads}"
-            (FlashAttention.flashAttentionDynamicParamsKernel numHeads numKVHeads cfg.maxSeqLen headDim scale)
-            [("q", state.qBuf), ("k_cache", kvCache.kBuf), ("v_cache", kvCache.vBuf),
-             ("output", state.attnOutBuf), ("params", state.paramsBuf)]
-            ({ numWorkgroups := (numHeads, 1, 1) : Hesper.ExecConfig })
+      let kcrLk := kcr.map (fun k key => k.getRef key)
+      FlashAttention.executeFlashAttentionV11 ctx
+        state.qBuf kvCache.kBufF16 kvCache.vBufF16 state.paramsBuf
+        state.flashPartialOutV11 state.flashPartialMetaV11 state.attnOutBuf
+        numHeads numKVHeads cfg.maxSeqLen headDim scale
+        (kcrLookup := kcrLk)
 
     -- Output projection: attnOut [numHeads * headDim] → normedBuf [hiddenSize]
     -- Circuit-DSL: single matmulQ4K op via runCached (build once, replay).
@@ -1877,26 +1735,25 @@ def forwardPrefillBatch [GPUBackend β] (ctx : β)
         -- Golden dump: post-RoPE Q (matches llama.cpp's `Qcur_pos-<li>`).
         dumpGolden s!"Qcur_pos-{li}" batchQRopedBuf (qDim * seqLen)
 
-        -- Batched RoPE-K + KV cache write.
-        ce s!"ropeKKvWBatch_{headDim}_{numKVHeads}_base{cfg.ropeBase li}"
-          (fusedRopeKAndCacheWriteBatchKernel numKVHeads cfg.maxSeqLen headDim seqLen (cfg.ropeBase li))
+        -- Batched RoPE-K + KV cache write — f16 packed half2 cache.
+        -- Single dispatch writes both K (with NeoX RoPE) and V into the
+        -- f16 cache used by V11 in decode.
+        ce s!"ropeKKvWBatchF16_{headDim}_{numKVHeads}_base{cfg.ropeBase li}"
+          (Attention.fusedRopeKAndCacheWriteBatchKernelF16
+             numKVHeads cfg.maxSeqLen headDim seqLen (cfg.ropeBase li))
           [("new_k", batchKBuf), ("new_v", batchVBuf),
-           ("k_cache", kvCache.kBuf), ("v_cache", kvCache.vBuf),
+           ("k_cache_f16", kvCache.kBufF16), ("v_cache_f16", kvCache.vBufF16),
            ("params", state.paramsBuf), ("freq_factors", freqFactors)]
-          (.dispatch1D (numKVHeads * headDim / 2 * seqLen))
-        -- K cache layout is [numKVHeads, maxSeqLen, headDim]; slot 0 for
-        -- every KV head means byte range [kvH * maxSeqLen * headDim + 0,
-        -- ... + headDim) — not contiguous.  For a simple sanity dump,
-        -- snapshot the whole cache slab (numKVHeads * maxSeqLen * headDim)
-        -- and let the diff tool pick out the right slices.
-        dumpStage s!"Kcache_L{li}" kvCache.kBuf (numKVHeads * cfg.maxSeqLen * headDim) stageActive
-        dumpStage s!"Vcache_L{li}" kvCache.vBuf (numKVHeads * cfg.maxSeqLen * headDim) stageActive
+          (.dispatch1D (numKVHeads * (headDim / 2) * seqLen))
+        dumpStage s!"Kcache_L{li}" kvCache.kBufF16 (numKVHeads * cfg.maxSeqLen * (headDim / 2)) stageActive
+        dumpStage s!"Vcache_L{li}" kvCache.vBufF16 (numKVHeads * cfg.maxSeqLen * (headDim / 2)) stageActive
 
-        -- Batched flash-attention.  Grid (numHeads, seqLen, 1).
+        -- Batched flash-attention reading f16 K/V cache.
         let scale : Float := 1.0
-        ce s!"flashAttnBatch_{headDim}_{numKVHeads}"
-          (FlashAttention.flashAttentionBatchKernel numHeads numKVHeads cfg.maxSeqLen headDim seqLen scale)
-          [("q", batchQRopedBuf), ("k_cache", kvCache.kBuf), ("v_cache", kvCache.vBuf),
+        ce s!"flashAttnBatchF16_{headDim}_{numKVHeads}"
+          (FlashAttention.flashAttentionBatchKernelF16 numHeads numKVHeads cfg.maxSeqLen headDim seqLen scale)
+          [("q", batchQRopedBuf),
+           ("k_cache_f16", kvCache.kBufF16), ("v_cache_f16", kvCache.vBufF16),
            ("output", batchAttnOutBuf), ("params", state.paramsBuf)]
           ({ numWorkgroups := (numHeads, seqLen, 1) : Hesper.ExecConfig })
         dumpStage s!"attnOut_L{li}" batchAttnOutBuf (qDim * seqLen) stageActive
@@ -1928,11 +1785,12 @@ def forwardPrefillBatch [GPUBackend β] (ctx : β)
         -- Golden dump: post-RoPE Q (matches llama.cpp's `Qcur_pos-<li>`).
         dumpGolden s!"Qcur_pos-{li}" batchQRopedBuf (qDim * seqLen)
         -- No K/V writes — cache was populated by the layer at kvLi.
-        -- Batched FA.
+        -- Batched FA reading f16 K/V cache.
         let scale : Float := 1.0
-        ce s!"flashAttnBatch_{headDim}_{numKVHeads}"
-          (FlashAttention.flashAttentionBatchKernel numHeads numKVHeads cfg.maxSeqLen headDim seqLen scale)
-          [("q", batchQRopedBuf), ("k_cache", kvCache.kBuf), ("v_cache", kvCache.vBuf),
+        ce s!"flashAttnBatchF16_{headDim}_{numKVHeads}"
+          (FlashAttention.flashAttentionBatchKernelF16 numHeads numKVHeads cfg.maxSeqLen headDim seqLen scale)
+          [("q", batchQRopedBuf),
+           ("k_cache_f16", kvCache.kBufF16), ("v_cache_f16", kvCache.vBufF16),
            ("output", batchAttnOutBuf), ("params", state.paramsBuf)]
           ({ numWorkgroups := (numHeads, seqLen, 1) : Hesper.ExecConfig })
         dumpStage s!"attnOut_L{li}" batchAttnOutBuf (qDim * seqLen) stageActive
