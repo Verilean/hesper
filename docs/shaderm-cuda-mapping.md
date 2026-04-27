@@ -109,6 +109,12 @@ llama.cpp などの CUDA C++ カーネルを ShaderM に port するときの対
 - WGSL backend: `workgroupBarrier()` フォールバック (仕方なく block barrier)
 - flash-attn vec の Phase 1→2a 間で使用
 
+### Step 9e: `softmaxOnlineUpdate` (online softmax helper)
+- `softmaxOnlineUpdate kqMaxName kqSumName kqScore` で 1 行
+- 7 行の Milakov & Gimelshein online softmax (max更新 + scale計算 + exp + sum更新) を内部に隠蔽
+- 戻り値 `(kqMaxNew, scale, kqExp)` で VKQ 累積側の rescale が書ける
+- domain-specific だが flash-attn 系全部で同パターンなので価値あり
+
 ## 3. 残り TODO (優先度順)
 
 ### 高 ROI

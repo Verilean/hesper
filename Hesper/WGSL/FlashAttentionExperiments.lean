@@ -82,7 +82,7 @@ def flashAttentionVecParamsKernelV2
     qVars := qVars.push qName
     vkqVars := vkqVars.push vkqName
 
-  ShaderM.varNamed "max_score" (.scalar .f32) (Exp.litF32 (-1.0e30))
+  ShaderM.varNamed "max_score" (.scalar .f32) (Exp.negInf30)
   ShaderM.varNamed "sum_exp" (.scalar .f32) (Exp.litF32 0.0)
   let maxScore := Exp.var "max_score"
   let sumExp := Exp.var "sum_exp"
@@ -230,7 +230,7 @@ def flashAttentionVecParamsKernelV3
     qVars := qVars.push qName
     vkqVars := vkqVars.push vkqName
 
-  ShaderM.varNamed "max_score" (.scalar .f32) (Exp.litF32 (-1.0e30))
+  ShaderM.varNamed "max_score" (.scalar .f32) (Exp.negInf30)
   ShaderM.varNamed "sum_exp" (.scalar .f32) (Exp.litF32 0.0)
   let maxScore := Exp.var "max_score"
   let sumExp := Exp.var "sum_exp"
@@ -415,7 +415,7 @@ def flashAttentionVecParamsKernelV6
     qVars := qVars.push qName
     vkqVars := vkqVars.push vkqName
 
-  ShaderM.varNamed "kq_max" (.scalar .f32) (Exp.litF32 (-1.0e30))
+  ShaderM.varNamed "kq_max" (.scalar .f32) (Exp.negInf30)
   ShaderM.varNamed "kq_sum" (.scalar .f32) (Exp.litF32 0.0)
   let kqMax := Exp.var "kq_max"
   let kqSum := Exp.var "kq_sum"
@@ -457,7 +457,7 @@ def flashAttentionVecParamsKernelV6
                           (Exp.subgroupAdd (Exp.var partialVar))
       let sumWarp : Exp (.scalar .f32) := Exp.var sumWarpName
       -- Out-of-bounds → -inf so it doesn't pollute max / sum.
-      let scoreGated := Exp.select inBounds sumWarp (Exp.litF32 (-1.0e30))
+      let scoreGated := Exp.select inBounds sumWarp (Exp.negInf30)
       ShaderM.assign kqMaxNewVar
         (Exp.max (Exp.var kqMaxNewVar) scoreGated)
       -- Owning lane stores its score (gated -inf for out-of-bounds).
@@ -556,7 +556,7 @@ def flashAttentionVecParamsKernelV6
   -- Step 3: every thread reads all 4 warps' (max, sum) from smem and
   -- computes global_max, global_sum, and per-warp weights.  Cheap to
   -- replicate across all threads — only 8 smem reads.
-  let globalMaxName ← ShaderM.var (.scalar .f32) (Exp.litF32 (-1.0e30))
+  let globalMaxName ← ShaderM.var (.scalar .f32) (Exp.negInf30)
   for w in [0:numWarps] do
     let m ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := numWarps * 2)
               "shared_warp_meta" (Exp.litU32 (w * 2))
@@ -667,7 +667,7 @@ def flashAttentionVecParamsKernelV7
     vkq0Vars := vkq0Vars.push vkq0Name
     vkq1Vars := vkq1Vars.push vkq1Name
 
-  ShaderM.varNamed "kq_max" (.scalar .f32) (Exp.litF32 (-1.0e30))
+  ShaderM.varNamed "kq_max" (.scalar .f32) (Exp.negInf30)
   ShaderM.varNamed "kq_sum" (.scalar .f32) (Exp.litF32 0.0)
   let kqMax := Exp.var "kq_max"
   let kqSum := Exp.var "kq_sum"
@@ -711,7 +711,7 @@ def flashAttentionVecParamsKernelV7
 
       -- Step 5 helper: warp-wide sum reduce (1 subgroupAdd, fully warp-merged).
       let sumWarp ← ShaderM.warpReduceSum 32 (Exp.var partialVar : Exp (.scalar .f32))
-      let scoreGated := Exp.select inBounds sumWarp (Exp.litF32 (-1.0e30))
+      let scoreGated := Exp.select inBounds sumWarp (Exp.negInf30)
       ShaderM.assign kqMaxNewVar
         (Exp.max (Exp.var kqMaxNewVar) scoreGated)
       ShaderM.if_ (Exp.eq laneId iKQ0) (do
@@ -786,7 +786,7 @@ def flashAttentionVecParamsKernelV7
   ShaderM.barrier
 
   -- Compute global max/sum across warps.
-  let globalMaxName ← ShaderM.var (.scalar .f32) (Exp.litF32 (-1.0e30))
+  let globalMaxName ← ShaderM.var (.scalar .f32) (Exp.negInf30)
   for w in [0:numWarps] do
     let m ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := numWarps * 2)
               "shared_warp_meta" (Exp.litU32 (w * 2))
@@ -932,7 +932,7 @@ def flashAttentionVecParamsKernelV8
     qVars := qVars.push qName
     vkqVars := vkqVars.push vkqName
 
-  ShaderM.varNamed "kq_max" (.scalar .f32) (Exp.litF32 (-1.0e30))
+  ShaderM.varNamed "kq_max" (.scalar .f32) (Exp.negInf30)
   ShaderM.varNamed "kq_sum" (.scalar .f32) (Exp.litF32 0.0)
   let kqMax := Exp.var "kq_max"
   let kqSum := Exp.var "kq_sum"
@@ -994,7 +994,7 @@ def flashAttentionVecParamsKernelV8
                                 (Exp.litU32 4)))
       let sumSubWarp : Exp (.scalar .f32) := Exp.var s4Name
 
-      let scoreGated := Exp.select inBounds sumSubWarp (Exp.litF32 (-1.0e30))
+      let scoreGated := Exp.select inBounds sumSubWarp (Exp.negInf30)
       ShaderM.assign kqMaxNewVar
         (Exp.max (Exp.var kqMaxNewVar) scoreGated)
 
@@ -1141,7 +1141,7 @@ def flashAttentionVecParamsKernelV8
   ShaderM.barrier
 
   -- Compute global max/sum across warps.
-  let globalMaxName ← ShaderM.var (.scalar .f32) (Exp.litF32 (-1.0e30))
+  let globalMaxName ← ShaderM.var (.scalar .f32) (Exp.negInf30)
   for w in [0:numWarps] do
     let m ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := numWarps * 2)
               "shared_warp_meta" (Exp.litU32 (w * 2))
@@ -1258,7 +1258,7 @@ def flashAttentionVecParamsKernelV9
     vkq0Vars := vkq0Vars.push vkq0Name
     vkq1Vars := vkq1Vars.push vkq1Name
 
-  ShaderM.varNamed "kq_max" (.scalar .f32) (Exp.litF32 (-1.0e30))
+  ShaderM.varNamed "kq_max" (.scalar .f32) (Exp.negInf30)
   ShaderM.varNamed "kq_sum" (.scalar .f32) (Exp.litF32 0.0)
   let kqMax := Exp.var "kq_max"
   let kqSum := Exp.var "kq_sum"
@@ -1323,7 +1323,7 @@ def flashAttentionVecParamsKernelV9
 
       -- Step 5 helper: warp-wide sum reduce (1 subgroupAdd, fully warp-merged).
       let sumWarp ← ShaderM.warpReduceSum 32 (Exp.var partialVar : Exp (.scalar .f32))
-      let scoreGated := Exp.select inBounds sumWarp (Exp.litF32 (-1.0e30))
+      let scoreGated := Exp.select inBounds sumWarp (Exp.negInf30)
       ShaderM.assign kqMaxNewVar
         (Exp.max (Exp.var kqMaxNewVar) scoreGated)
       ShaderM.if_ (Exp.eq laneId iKQ0) (do
@@ -1406,7 +1406,7 @@ def flashAttentionVecParamsKernelV9
   ShaderM.barrier
 
   -- Compute block-local global max/sum across warps.
-  let blockMaxName ← ShaderM.var (.scalar .f32) (Exp.litF32 (-1.0e30))
+  let blockMaxName ← ShaderM.var (.scalar .f32) (Exp.negInf30)
   for w in [0:numWarps] do
     let m ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := numWarps * 2)
               "shared_warp_meta" (Exp.litU32 (w * 2))
@@ -1662,7 +1662,7 @@ def flashAttentionVecParamsKernelV11
       -- subgroupShuffleXor xor 1, 2, 4 by hand.
       let sumSubWarp ← ShaderM.warpReduceSum 8 (Exp.var partialVar)
 
-      let scoreGated := Exp.select inBounds sumSubWarp (Exp.litF32 (-1.0e30))
+      let scoreGated := Exp.select inBounds sumSubWarp (Exp.negInf30)
       ShaderM.assign kqMaxNewVar
         (Exp.max (Exp.var kqMaxNewVar) scoreGated)
 
@@ -1802,7 +1802,7 @@ def flashAttentionVecParamsKernelV11
 
   -- Block-local global max/sum across warps (NOT sub-warps; sub-warps within
   -- a warp share the same kqMax via Phase 2a).
-  let blockMaxName ← ShaderM.var (.scalar .f32) (Exp.litF32 (-1.0e30))
+  let blockMaxName ← ShaderM.var (.scalar .f32) (Exp.negInf30)
   for w in [0:numWarps] do
     let m ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := numWarps * 2)
               "shared_warp_meta" (Exp.litU32 (w * 2))
@@ -1926,7 +1926,7 @@ def flashAttentionVecParamsKernelV5
     qVars := qVars.push qName
     vkqVars := vkqVars.push vkqName
 
-  ShaderM.varNamed "max_score" (.scalar .f32) (Exp.litF32 (-1.0e30))
+  ShaderM.varNamed "max_score" (.scalar .f32) (Exp.negInf30)
   ShaderM.varNamed "sum_exp" (.scalar .f32) (Exp.litF32 0.0)
   let maxScore := Exp.var "max_score"
   let sumExp := Exp.var "sum_exp"
@@ -2063,7 +2063,7 @@ def flashAttentionVecCombineKernel
   let metaBase := Exp.mul head (Exp.mul (Exp.litU32 numSplits) (Exp.litU32 2))
 
   -- Pass 1: find global max across splits.
-  let globalMaxVar ← ShaderM.var (.scalar .f32) (Exp.litF32 (-1.0e30))
+  let globalMaxVar ← ShaderM.var (.scalar .f32) (Exp.negInf30)
   for split in [0:numSplits] do
     let m ← ShaderM.readBuffer (ty := .scalar .f32) (n := numHeads * numSplits * 2)
               "partial_meta"

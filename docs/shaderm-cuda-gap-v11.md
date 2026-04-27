@@ -355,7 +355,7 @@ S9 で扱う話ではない (Session #266 で `Exp.fmaF16x2` 導入済 → kerne
 | **S9b** | `MutPtr` (ポインタ進行) | outer K loop, weight 移動系 | ✅ 完了 | 50 行 | **中** |
 | **S9c** | `RegArray ty n` | V8/V11 の `q0Vars` 系 | ✅ 完了 | 80 行 | **高** |
 | S9d | smem alias view | flash-attn-vec 系のみ | 未着手 | 150 行 | 低 |
-| S9e | `SoftmaxOnline.update` | flash-attn-vec 系のみ | 未着手 | 30 行 | 低 |
+| S9e | `softmaxOnlineUpdate` | flash-attn-vec 系のみ | ✅ 完了 | 25 行 | 低 |
 | S9f | `Exp.negInfHalf` 定数集 | 全部 | ✅ 完了 | 20 行 | 低 |
 | S9g | `ShaderM.warpBarrier` | flash-attn 系 | ✅ 完了 | 30 行 | 中 |
 

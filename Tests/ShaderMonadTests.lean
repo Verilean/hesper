@@ -341,6 +341,19 @@ def testMutPtrAdvance : TestSeq :=
   -- 1 varDecl (the offset register) + 1 assign (advance) = 2 stmts.
   test "MutPtr.mk + advance emits 2 stmts" (state.stmts.length == 2)
 
+/-- Test: softmaxOnlineUpdate emits 3 let' (max, scale, exp) + 2 assigns. -/
+def testSoftmaxOnlineUpdate : TestSeq :=
+  let computation := do
+    Monad.ShaderM.varNamed "kq_max" (.scalar .f32) Exp.negInf30
+    Monad.ShaderM.varNamed "kq_sum" (.scalar .f32) Exp.f32Zero
+    let _ ← ShaderM.softmaxOnlineUpdate "kq_max" "kq_sum" (Exp.litF32 1.5)
+    pure ()
+  let state := exec computation
+  -- 2 named varDecls (kq_max, kq_sum) + 3 fresh let' (max, scale, exp)
+  --  + 2 assigns (kq_max, kq_sum) = 7 stmts.
+  test "softmaxOnlineUpdate emits 7 stmts (2 init + 3 let' + 2 assign)"
+    (state.stmts.length == 7)
+
 -- ============================================================================
 -- Built-in Variable Tests
 -- ============================================================================
@@ -600,6 +613,7 @@ def allTests : IO (List (String × List TestSeq)) := do
     ("Synchronization: Barrier", [testBarrier]),
     ("Synchronization: warpBarrier", [testWarpBarrier]),
     ("MutPtr: advance emits assign", [testMutPtrAdvance]),
+    ("Softmax: online update", [testSoftmaxOnlineUpdate]),
     ("Built-ins: Global ID", [testGlobalId]),
     ("Built-ins: Local ID", [testLocalId]),
     ("Built-ins: Workgroup ID", [testWorkgroupId]),
