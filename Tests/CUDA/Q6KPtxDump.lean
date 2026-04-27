@@ -32,4 +32,7 @@ def main (args : List String) : IO Unit := do
   -- 4-warp 1-row variant: 2-D workgroup (32, 4, 1) = 128 thread.  Matches
   -- llama.cpp's `mul_mat_vec_q<Q6_K>` dispatch shape exactly.
   dumpKernel2D "q6k_dp4a_4warp_b32x4" 32 4 (Hesper.Layers.Linear.fusedQ6KLinearDP4A4WarpKernel inDim outDim 0)
+  -- Also dump 4-warp at PLE shape (works under graphs ON in production)
+  -- to diff against ffn_down shape (broken under graphs ON).
+  dumpKernel2D "q6k_dp4a_4warp_PLE_b32x4" 32 4 (Hesper.Layers.Linear.fusedQ6KLinearDP4A4WarpKernel 2560 512 0)
   IO.println "done."

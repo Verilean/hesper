@@ -203,11 +203,10 @@ def main : IO Unit := do
   let graph ← Hesper.CUDA.cuStreamEndCapture stream
   let exec ← Hesper.CUDA.cuGraphInstantiate graph
   Hesper.CUDA.cuGraphDestroy graph
-  -- Launch the captured graph TWICE (mimicking production decode replay).
-  Hesper.CUDA.cuGraphLaunch exec stream
-  Hesper.CUDA.cuStreamSynchronize stream
-  Hesper.CUDA.cuGraphLaunch exec stream
-  Hesper.CUDA.cuStreamSynchronize stream
+  -- Launch the captured graph N=10 times.
+  for _ in [0:10] do
+    Hesper.CUDA.cuGraphLaunch exec stream
+    Hesper.CUDA.cuStreamSynchronize stream
   Hesper.CUDA.cuGraphExecDestroy exec
   Hesper.CUDA.cuStreamDestroy stream
 
