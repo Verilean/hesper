@@ -11,8 +11,8 @@ llama.cpp などの CUDA C++ カーネルを ShaderM に port するときの対
 | u32 リテラル | `(uint32_t)5` | ✅ `(5 : Exp _)` (OfNat) | 同じ |
 | ビット | `x & 0xFF`, `x \| y` | ✅ `x &&& 0xFF`, `x ||| y` | 同じ |
 | シフト | `x >> 3` | ✅ `x >>> 3` | 同じ |
-| 比較 | `x < y` | `Exp.lt x y` | `x <ᵉ y` (← TODO) |
-| 等号 | `x == y` | `Exp.eq x y` | `x =ᵉ y` (← TODO) |
+| 比較 | `x < y` | `Exp.lt x y` | `x <ᵉ y` (← TODO Step 8) |
+| 等号 | `x == y` | `Exp.eq x y` | `x =ᵉ y` (← TODO Step 8) |
 | 三項 | `c ? a : b` | `Exp.select c a b` | 同じ (Lean は ternary なし) |
 | `if (cond)` | `if (...) { ... }` | `ShaderM.if_ cond then_ else_` | `whenE cond do ...` (← TODO) |
 | 変数宣言 (mut) | `float acc = 0;` | `let acc ← ShaderM.var (.scalar .f32) 0` | ✅ `let acc ← ShaderM.mutVar (.scalar .f32) 0` (Step 2) |
@@ -40,30 +40,47 @@ llama.cpp などの CUDA C++ カーネルを ShaderM に port するときの対
 | **f32 FMA** | `fmaf(a, b, c)` | (なし — mul + add 別命令) | `Exp.fma a b c` (← TODO) |
 | ポインタ進める | `K += stride;` | (なし — index 計算で代用) | `ptr.advance stride` (← TODO) |
 
-## 2. 完了したステップ (Step 1-3)
+## 2. 完了したステップ (Step 1-7)
 
 ### Step 1: Operator overloading on Exp (commit c82c81b)
 - `HAdd/HSub/HMul/HDiv/HMod/AndOp/OrOp/HShiftLeft/HShiftRight/OfNat`
 - V9 inner loop ported, parity preserved
 - **caveat**: `Exp.var name + x` は `(Exp.var name : Exp _)` の型注釈が必要
 
-### Step 2: Typed mutable variables (`MutVar`)
+### Step 2: Typed mutable variables (`MutVar`) (commit e00d222)
 - `structure MutVar (ty : WGSLType)` + `read` / `write` / `addAssign` / `mulAssign` / `subAssign`
 - 演算子: `v +↦ x`, `v *↦ x`, `v ↦= x`
 - **これで Step 1 の caveat 解消**: `acc +↦ q * k` で型注釈不要
 
-### Step 3: `unrollFor` / `runtimeFor`
+### Step 3: `unrollFor` / `runtimeFor` (commit e00d222)
 - `unrollFor n body`: meta-time, `body : Nat → ShaderM Unit`, n 個 inline 展開
 - `runtimeFor start end_ step body`: runtime, `body : Exp (.scalar .u32) → ShaderM Unit`
 - 既存の `for i in [0:n]` と `ShaderM.loop` も使える、新名前で意図を明示
 
+### Step 4: Lane / warp helpers (commit 4b648fe)
+- `ShaderM.tidX` / `tidY` / `tidZ`, `bidX` / `bidY` / `bidZ`
+- `ShaderM.laneId` (`tid & 31`), `ShaderM.warpId` (`tid >>> 5`)
+- `ShaderM.subWarpSplit n` returns `(subWarp, subLane)`
+
+### Step 5: Warp reductions (commit 53c06ac)
+- `ShaderM.warpReduceSum n x`, `ShaderM.warpReduceMax n x`
+- Butterfly via `subgroupShuffleXor` for n ∈ {2, 4, 8, 16, 32}
+
+### Step 6: `Ptr ty` abstraction (commit 7b1a3e7)
+- `structure Ptr (ty : WGSLType)` + `load` / `store` / `advance` / `atOffset`
+- `ShaderM.ptr ty buf bufLen offset` — material once, advance per use
+- llama.cpp の `K += stride; *K[k]` パターンに対応
+
+### Step 7: Loop Invariant Code Motion (LICM) — opt-in
+- `ShaderM.loopWithLICM` automatically hoists `varDecl`s whose init expression is loop-invariant
+- 実装: `Exp.toWGSL` でシリアライズして名前ベースで free-var 検査
+- 安全条件: 同名 reassign / loop-var 依存 / 内部 mutation がある場合は hoist しない
+- 既定の `ShaderM.loop` は変更なし — LICM は意図して呼ぶときのみ
+- 4-test ユニット (`Tests/ShaderMonadTests.lean`): hoist invariant / keep loop-variant / keep reassigned / default loop unchanged
+
 ## 3. 残り TODO (優先度順)
 
-### 高 ROI (Step 4-7 候補)
-
-**Step 4: Lane / warp 慣用句**
-- `← ShaderM.tidX` `← ShaderM.bidX` (vec3X workgroupId/localId のヘルパ)
-- `← ShaderM.laneId` (`tid & 31`)
+### 高 ROI (Step 8+ 候補)
 - `← ShaderM.warpId` (`tid >>> 5`)
 - `← ShaderM.subWarpSplit 8` returns `(subWarp, subLane)` という pair
 - 効果: V11 のような sub-warp partition kernel を書くときの index 計算ミスを排除

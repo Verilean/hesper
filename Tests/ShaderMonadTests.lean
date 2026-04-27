@@ -197,6 +197,62 @@ def testLoop : TestSeq :=
   test "Loop emits one stmt" (state.stmts.length == 1) ++
   test "Loop creates fresh loop var" (state.varCounter == 1)
 
+/-- Helper: count statements emitted at top level vs inside the (single)
+    forLoop. Returns (outside, inside). -/
+private def splitTopAndLoopBody (stmts : List Stmt) : Nat × Nat :=
+  let body := stmts.foldl (init := []) fun acc s =>
+    match s with | .forLoop _ _ _ _ b => b ++ acc | _ => acc
+  (stmts.length - 1, body.length)
+
+/-- Test: loopWithLICM hoists a loop-invariant `let'` outside the loop. -/
+def testLicmHoistInvariant : TestSeq :=
+  let computation := do
+    let _x ← ShaderM.var (.scalar .u32) (Exp.litU32 7)
+    loopWithLICM (Exp.litU32 0) (Exp.litU32 8) (Exp.litU32 1) fun _i => do
+      let _y ← ShaderM.let' (.scalar .u32) (Exp.litU32 42)  -- invariant
+      emitStmt (Stmt.exprStmt Exp.workgroupBarrier)
+  let state := exec computation
+  let (outside, inside) := splitTopAndLoopBody state.stmts
+  -- Top-level: `_x` decl + hoisted `_y` decl + forLoop = 3 stmts.
+  -- Loop body should retain only the barrier (1 stmt).
+  test "Hoisted let' moves outside loop" (outside == 2) ++
+  test "Loop body has only the non-hoistable stmt" (inside == 1)
+
+/-- Test: loopWithLICM does NOT hoist a stmt that depends on the loop var. -/
+def testLicmKeepVariant : TestSeq :=
+  let computation :=
+    loopWithLICM (Exp.litU32 0) (Exp.litU32 8) (Exp.litU32 1) fun i => do
+      let _y ← ShaderM.let' (.scalar .u32) i  -- variant: uses loop var
+      emitStmt (Stmt.exprStmt Exp.workgroupBarrier)
+  let state := exec computation
+  let (outside, inside) := splitTopAndLoopBody state.stmts
+  test "No hoist when init uses loop var" (outside == 0) ++
+  test "Loop-variant let' stays in body" (inside == 2)
+
+/-- Test: loopWithLICM does NOT hoist a decl whose name is reassigned. -/
+def testLicmKeepReassigned : TestSeq :=
+  let computation :=
+    loopWithLICM (Exp.litU32 0) (Exp.litU32 8) (Exp.litU32 1) fun _i => do
+      let acc ← ShaderM.var (.scalar .u32) (Exp.litU32 0)  -- candidate
+      ShaderM.assign (ty := .scalar .u32) acc
+        (Exp.add (Exp.var acc) (Exp.litU32 1))
+      emitStmt (Stmt.exprStmt Exp.workgroupBarrier)
+  let state := exec computation
+  let (outside, inside) := splitTopAndLoopBody state.stmts
+  test "No hoist when var is reassigned in body" (outside == 0) ++
+  test "Reassigned-target stays in body with assign + barrier" (inside == 3)
+
+/-- Test: default `loop` is unchanged (does NOT apply LICM). -/
+def testDefaultLoopNoLicm : TestSeq :=
+  let computation :=
+    loop (Exp.litU32 0) (Exp.litU32 8) (Exp.litU32 1) fun _i => do
+      let _y ← ShaderM.let' (.scalar .u32) (Exp.litU32 42)  -- invariant but kept
+      emitStmt (Stmt.exprStmt Exp.workgroupBarrier)
+  let state := exec computation
+  let (outside, inside) := splitTopAndLoopBody state.stmts
+  test "Default loop does not hoist anything" (outside == 0) ++
+  test "Default loop body keeps invariant let'" (inside == 2)
+
 /-- Test: Nested control flow -/
 def testNestedControlFlow : TestSeq :=
   let computation := do
@@ -468,6 +524,10 @@ def allTests : IO (List (String × List TestSeq)) := do
     ("Control Flow: If Statement", [testIfStatement]),
     ("Control Flow: For Loop", [testForLoop]),
     ("Control Flow: Loop", [testLoop]),
+    ("Control Flow: LICM hoists invariant", [testLicmHoistInvariant]),
+    ("Control Flow: LICM keeps loop-variant", [testLicmKeepVariant]),
+    ("Control Flow: LICM keeps reassigned", [testLicmKeepReassigned]),
+    ("Control Flow: Default loop no LICM", [testDefaultLoopNoLicm]),
     ("Control Flow: Nested", [testNestedControlFlow]),
     ("Synchronization: Barrier", [testBarrier]),
     ("Built-ins: Global ID", [testGlobalId]),
