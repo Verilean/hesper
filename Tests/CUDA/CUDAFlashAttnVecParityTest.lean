@@ -526,8 +526,13 @@ unsafe def main : IO Unit := do
     catch e =>
       IO.println s!"  (llama.cpp PTX column skipped — {e})"
       pure none
-  let benchCases : List (Nat × Nat) :=
-    [ (256, 8), (256, 32), (256, 64), (256, 128), (256, 200) ]
+  let benchCases : List (Nat × Nat) ← do
+    match ← IO.getEnv "HESPER_BENCH_ONLY_CL" with
+    | some s =>
+      match s.toNat? with
+      | some cl => pure [(256, cl)]
+      | none => pure [(256, 8), (256, 32), (256, 64), (256, 128), (256, 200)]
+    | none => pure [(256, 8), (256, 32), (256, 64), (256, 128), (256, 200)]
   let warmup := 20
   let iters := 200
   for (maxSeq, cacheLen) in benchCases do

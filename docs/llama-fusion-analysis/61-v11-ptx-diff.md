@@ -180,3 +180,63 @@ The 26 → 6 µs target needs a cumulative ~4.3× from steps 2+3+4. Step 2 alone
 should validate the direction; if step 2 doesn't yield ≥1.6× we need to
 reassess (likely something else is the real bottleneck — re-profile with ncu
 to localize).
+
+## ncu profile (2026-04-27, cacheLen=128, raw-launch path)
+
+| metric | V11 | llama | note |
+|---|---|---|---|
+| Duration | 27,936 ns | 6,240 ns | 4.5× (matches 5.9× wall after profiling overhead) |
+| **L1/TEX Cache Throughput** | **85.95%** | 34.27% | V11 saturates L1 pipe |
+| **L1/TEX Hit Rate** | **95.47%** | 5.11% | V11 has great locality... |
+| L2 Hit Rate | 93.20% | 84.34% | both fit L2 |
+| DRAM Throughput | 1.41% | 6.58% | both DRAM-light |
+| Compute (SM) Throughput | 12.28% | 1.64% | both compute-light |
+| Mem Pipes Busy | 12.28% | 1.31% | V11 = mem pipe bound |
+| Executed IPC Active | 0.42 | 0.58 | similar low IPC |
+| Achieved Occupancy | 8.94% | 8.17% | similar low occupancy |
+| Registers Per Thread | 241 | 202 | V11 +19% |
+| Theoretical Occupancy | 16.67% | 16.67% | same |
+
+**Stall reason breakdown** (warp samples; higher = worse):
+
+| stall | V11 | llama | ratio |
+|---|---|---|---|
+| **mio_throttle** | **1,022** | **0** | ∞ |
+| long_scoreboard | 340 | 29 | 12× |
+| wait | 161 | 16 | 10× |
+| short_scoreboard | 128 | 6 | 21× |
+| barrier | 56 | 0 | ∞ |
+| Avg warp latency | 10.30 cyc/inst | 6.80 cyc/inst | 1.5× |
+
+## Bottleneck identified
+
+V11's primary stall is **`mio_throttle` (1022 samples vs llama 0)** — the
+memory I/O instruction queue is saturated. Combined with L1/TEX Cache Throughput
+at 85.95% and DRAM Throughput at only 1.4%, this paints a clear picture:
+
+**V11 is memory-pipe-bound on instruction count, not bandwidth.**
+
+L1 hit rate is excellent (95%), but each scalar `LDG.E` / `LDS` instruction
+moves only 4 bytes. V11 issues so many of them per K element that the MIO
+pipe can't keep up — warps stall waiting for the queue to drain. llama emits
+~4× fewer memory instructions for the same data by using `LDG.E.128` and
+`LDS.128`, so its MIO pipe never saturates (mio_throttle = 0).
+
+This fully explains the 4.5× Duration ratio:
+- bandwidth not the issue (V11 1.41% DRAM vs llama 6.58%)
+- compute not the issue (V11 12% SM vs llama 1.6%)
+- **memory instruction count IS the issue** (V11's mio_throttle dominates)
+
+## Confirmed plan
+
+Step 2 (vec4 K/V global load) is now confirmed as the right lever — it
+directly reduces the LDG instruction count by 4× and should bring
+`mio_throttle` close to zero. Expected: V11 26 → ~10 µs (memory pipe work
+quartered, but with some serial residual from address arith and softmax).
+
+Stretch: also widen smem path (LDS.128 instead of LDS.32) for the input
+tile re-reads. Combined target: 26 → ~6 µs.
+
+If step 2 lands and we still see significant `mio_throttle`, then ld.shared
+is the next target (smem reads via LDS.32 are likely the residual MIO
+saturator).
