@@ -1560,27 +1560,40 @@ def flashAttentionVecParamsKernelV11
   -- Each thread loads 16 word-pairs of Q (32 dims).
   -- Word offset within Q row for thread = subLane*16 + j.
   -- Each word holds dims (2*(subLane*16+j), 2*(subLane*16+j)+1).
+  -- Step 9c: RegArray ty n replaces 4 manual `Array String` arrays.
   let qBase := Exp.mul head (Exp.litU32 headDim)
   let dThreadBase := Exp.mul subLane (Exp.litU32 dimsPerLane)  -- f32 dim base
-  let mut q0Vars : Array String := #[]    -- even-dim Q (scaled)
-  let mut q1Vars : Array String := #[]    -- odd-dim Q (scaled)
-  let mut vkq0Vars : Array String := #[]  -- even-dim VKQ accumulator
-  let mut vkq1Vars : Array String := #[]  -- odd-dim VKQ accumulator
+  -- Pre-load Q values then scale-init the registers.  Has to be 2 passes
+  -- because RegArray.mk's init function is pure (Nat → Exp), it can't
+  -- itself perform `readBuffer` (a ShaderM action).
+  let mut q0Vals : Array (Exp (.scalar .f32)) := #[]
+  let mut q1Vals : Array (Exp (.scalar .f32)) := #[]
   for pk in [0:dPerLanePair] do
     let d0 := Exp.add dThreadBase (Exp.litU32 (pk * 2))
     let d1 := Exp.add d0 (Exp.litU32 1)
-    let q0Val ← ShaderM.readBuffer (ty := .scalar .f32) (n := numHeads * headDim)
-                  "q" (Exp.add qBase d0)
-    let q1Val ← ShaderM.readBuffer (ty := .scalar .f32) (n := numHeads * headDim)
-                  "q" (Exp.add qBase d1)
-    let q0Name ← ShaderM.var (.scalar .f32) (Exp.mul q0Val (Exp.litF32 scale))
-    let q1Name ← ShaderM.var (.scalar .f32) (Exp.mul q1Val (Exp.litF32 scale))
-    let vkq0Name ← ShaderM.var (.scalar .f32) (Exp.litF32 0.0)
-    let vkq1Name ← ShaderM.var (.scalar .f32) (Exp.litF32 0.0)
-    q0Vars := q0Vars.push q0Name
-    q1Vars := q1Vars.push q1Name
-    vkq0Vars := vkq0Vars.push vkq0Name
-    vkq1Vars := vkq1Vars.push vkq1Name
+    let v0 ← ShaderM.readBuffer (ty := .scalar .f32) (n := numHeads * headDim)
+              "q" (Exp.add qBase d0)
+    let v1 ← ShaderM.readBuffer (ty := .scalar .f32) (n := numHeads * headDim)
+              "q" (Exp.add qBase d1)
+    q0Vals := q0Vals.push v0
+    q1Vals := q1Vals.push v1
+  let q0   ← ShaderM.regArray (.scalar .f32) dPerLanePair
+               (fun pk => Exp.mul (q0Vals[pk]?.getD (Exp.litF32 0.0))
+                                  (Exp.litF32 scale))
+  let q1   ← ShaderM.regArray (.scalar .f32) dPerLanePair
+               (fun pk => Exp.mul (q1Vals[pk]?.getD (Exp.litF32 0.0))
+                                  (Exp.litF32 scale))
+  let vkq0 ← ShaderM.regArray (.scalar .f32) dPerLanePair
+               (fun _ => Exp.litF32 0.0)
+  let vkq1 ← ShaderM.regArray (.scalar .f32) dPerLanePair
+               (fun _ => Exp.litF32 0.0)
+  -- Back-compat shims: existing call sites still reference the old
+  -- `Array String` names, so expose `q0.names`/etc until the rest of
+  -- V11 is migrated.  (Phase 1 inner pk-loop, etc.)
+  let q0Vars   := q0.names
+  let q1Vars   := q1.names
+  let vkq0Vars := vkq0.names
+  let vkq1Vars := vkq1.names
 
   ShaderM.varNamed "kq_max" (.scalar .f32) (Exp.litF32 (-1.0e30))
   ShaderM.varNamed "kq_sum" (.scalar .f32) (Exp.litF32 0.0)
@@ -1609,53 +1622,43 @@ def flashAttentionVecParamsKernelV11
     -- Phase 1: 8 inner iters static-unrolled.  Each iter, 4 sub-warps in
     -- parallel handle 4 K-positions: sub-warp s handles K-position
     --   warpId*32 + s*nthreadsKQ + iKQ0
-    for iKQ0 in [0:nthreadsKQ] do ShaderM.scope do
+    -- Step 9a: `unrollForScoped` collapses `for ... do ShaderM.scope do`
+    -- into one call, mirroring CUDA C++ `#pragma unroll for ...`.
+    -- Step 8: comparison operators `<ᵉ` / `==ᵉ` (instead of Exp.lt/eq).
+    ShaderM.unrollForScoped nthreadsKQ fun iKQ0 => do
       let iKQ ← ShaderM.let' (.scalar .u32)
-                   (Exp.add (Exp.mul warpId (Exp.litU32 32))
-                            (Exp.add (Exp.mul subWarp (Exp.litU32 nthreadsKQ))
-                                     (Exp.litU32 iKQ0)))
-      let kPos ← ShaderM.let' (.scalar .u32) (Exp.add kVKQ0 iKQ)
+                   (warpId * 32 + (subWarp * (Exp.litU32 nthreadsKQ)
+                                   + (Exp.litU32 iKQ0)))
+      let kPos ← ShaderM.let' (.scalar .u32) (kVKQ0 + iKQ)
       let inBoundsU32 ← ShaderM.let' (.scalar .u32)
-                          (Exp.select (Exp.lt kPos splitEnd) (Exp.litU32 1) (Exp.litU32 0))
-      let inBounds := Exp.eq inBoundsU32 (Exp.litU32 1)
-      let kPosSafe ← ShaderM.let' (.scalar .u32) (Exp.select inBounds kPos (Exp.litU32 0))
+                          (Exp.select (kPos <ᵉ splitEnd) 1 0)
+      let inBounds := inBoundsU32 ==ᵉ 1
+      let kPosSafe ← ShaderM.let' (.scalar .u32) (Exp.select inBounds kPos 0)
       let kRowBaseU32 ← ShaderM.let' (.scalar .u32)
-                          (Exp.add kHeadBaseU32 (Exp.mul kPosSafe kRowStrideU32))
+                          (kHeadBaseU32 + kPosSafe * kRowStrideU32)
 
       let partialVar ← ShaderM.var (.scalar .f32) (Exp.litF32 0.0)
       for pk in [0:dPerLanePair] do
         -- Word offset within K row: each thread reads 16 consecutive words.
         -- subLane*16 + pk gives the absolute word index within the K row.
-        let wordOff := Exp.add (Exp.mul subLane (Exp.litU32 dPerLanePair))
-                                (Exp.litU32 pk)
-        let kWordIdx := Exp.add kRowBaseU32 wordOff
+        let wordOff := subLane * (Exp.litU32 dPerLanePair) + (Exp.litU32 pk)
+        let kWordIdx := kRowBaseU32 + wordOff
         let kPackedRaw ← ShaderM.readBuffer (ty := .scalar .u32) (n := kvWords)
                            "k_cache_f16" kWordIdx
         let kPacked ← ShaderM.let' (.scalar .u32) kPackedRaw
         let unpacked := Exp.unpack2x16float kPacked
         let k0 ← ShaderM.let' (.scalar .f32) (Exp.vecX unpacked)
         let k1 ← ShaderM.let' (.scalar .f32) (Exp.vecY unpacked)
-        let q0Exp : Exp (.scalar .f32) := Exp.var q0Vars[pk]!
-        let q1Exp : Exp (.scalar .f32) := Exp.var q1Vars[pk]!
-        ShaderM.assign partialVar
-          (Exp.add (Exp.var partialVar) (Exp.mul q0Exp k0))
-        ShaderM.assign partialVar
-          (Exp.add (Exp.var partialVar) (Exp.mul q1Exp k1))
+        let q0Exp := q0.get pk     -- Step 9c: typed register array
+        let q1Exp := q1.get pk
+        let p0 : Exp (.scalar .f32) := Exp.var partialVar
+        ShaderM.assign partialVar (p0 + q0Exp * k0)
+        let p1 : Exp (.scalar .f32) := Exp.var partialVar
+        ShaderM.assign partialVar (p1 + q1Exp * k1)
 
-      -- 8-way warp_reduce_sum (3 shfl): xor 1, 2, 4.
-      let s1Name ← ShaderM.var (.scalar .f32)
-                     (Exp.add (Exp.var partialVar)
-                              (Exp.subgroupShuffleXor (Exp.var partialVar)
-                                (Exp.litU32 1)))
-      let s2Name ← ShaderM.var (.scalar .f32)
-                     (Exp.add (Exp.var s1Name)
-                              (Exp.subgroupShuffleXor (Exp.var s1Name)
-                                (Exp.litU32 2)))
-      let s4Name ← ShaderM.var (.scalar .f32)
-                     (Exp.add (Exp.var s2Name)
-                              (Exp.subgroupShuffleXor (Exp.var s2Name)
-                                (Exp.litU32 4)))
-      let sumSubWarp : Exp (.scalar .f32) := Exp.var s4Name
+      -- 8-way warp_reduce_sum: Step 5 helper replaces 12 lines of
+      -- subgroupShuffleXor xor 1, 2, 4 by hand.
+      let sumSubWarp ← ShaderM.warpReduceSum 8 (Exp.var partialVar)
 
       let scoreGated := Exp.select inBounds sumSubWarp (Exp.litF32 (-1.0e30))
       ShaderM.assign kqMaxNewVar

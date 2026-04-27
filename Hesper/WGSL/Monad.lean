@@ -365,6 +365,7 @@ def loopWithLICM (start end_ step : Exp (.scalar .u32))
     (bodyFn : Exp (.scalar .u32) → ShaderM Unit) : ShaderM Unit :=
   loop start end_ step bodyFn
 
+
 /-- Block scope: emits `{ ... body ... }` so var declared inside the body
     is **block-scoped** in WGSL, allowing Naga/Tint/Vulkan-driver register
     allocator to reuse the physical register once the scope exits.
@@ -390,6 +391,30 @@ def scope (body : ShaderM α) : ShaderM α := do
   let (result, bodyStmts) ← captureStmts body
   emitStmt (Stmt.block bodyStmts)
   return result
+
+/-- `unrollFor` + per-iter `scope`. Each of the `n` inline copies of the
+    body lives in its own `{ ... }` block, so any `ShaderM.var` declared
+    inside is block-scoped and the WGSL→PTX backend can reuse the
+    physical register across iters.
+
+    Collapses the V8/V9/V11 idiom
+
+    ```lean
+    for i in [0:n] do ShaderM.scope do
+      ...
+    ```
+
+    into
+
+    ```lean
+    ShaderM.unrollForScoped n fun i => do
+      ...
+    ```
+
+    Mirrors CUDA C++ `#pragma unroll for (int i = ...)` where each
+    unrolled body is implicitly its own register-allocation scope. -/
+@[inline] def unrollForScoped (n : Nat) (body : Nat → ShaderM Unit) : ShaderM Unit :=
+  (List.range n).forM fun i => scope (body i)
 
 -- ============================================================================
 -- Synchronization
@@ -1013,6 +1038,63 @@ def ptr (ty : WGSLType) (buf : String) (bufLen : Nat)
     (baseOffset : Exp (.scalar .u32)) : ShaderM (Ptr ty) := do
   let off ← let' (.scalar .u32) baseOffset
   return ⟨buf, off, bufLen⟩
+
+end ShaderM
+
+/-- Typed register array — `n` named ShaderM vars that share a type and
+    can be indexed by a meta-time `Nat`. Replaces the V8/V11 idiom
+
+    ```lean
+    let mut q0Vars : Array String := #[]
+    for pk in [0:n] do
+      let v ← ShaderM.var ty (init pk)
+      q0Vars := q0Vars.push v
+    -- later:
+    let q0 : Exp _ := Exp.var q0Vars[pk]!
+    ```
+
+    with
+
+    ```lean
+    let q0 ← RegArray.mk ty n init
+    -- later:
+    let q0Exp := q0.get pk
+    q0.set pk newVal
+    ```
+
+    The `Array String` field stays in Lean meta land — at codegen time
+    it materialises as `n` separate `varDecl` stmts (one per slot).
+    Mirrors CUDA's `T arr[N];` register array. -/
+structure RegArray (ty : WGSLType) (n : Nat) where
+  names : Array String
+deriving Repr
+
+namespace RegArray
+
+/-- Read slot `i` as an `Exp`. Returns `Exp.litU32 0` if out-of-range
+    (shouldn't happen in well-typed code; the bounds check is a safety
+    net against meta-time index typos). -/
+@[inline] def get {ty : WGSLType} {n : Nat} (a : RegArray ty n) (i : Nat) : Exp ty :=
+  Exp.var (a.names[i]?.getD "RegArray.get/oob")
+
+/-- Assign a new value to slot `i`. -/
+@[inline] def set {ty : WGSLType} {n : Nat} (a : RegArray ty n) (i : Nat)
+    (v : Exp ty) : ShaderM Unit :=
+  ShaderM.assign (a.names[i]?.getD "RegArray.set/oob") v
+
+end RegArray
+
+namespace ShaderM
+
+/-- Construct a `RegArray ty n` by emitting `n` `var` declarations.
+    `init i` produces the initial value for slot `i`. -/
+def regArray (ty : WGSLType) (n : Nat) (init : Nat → Exp ty) :
+    ShaderM (RegArray ty n) := do
+  let mut names : Array String := Array.empty
+  for i in [0:n] do
+    let nm ← var ty (init i)
+    names := names.push nm
+  return ⟨names⟩
 
 end ShaderM
 
