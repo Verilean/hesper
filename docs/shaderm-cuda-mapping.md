@@ -22,16 +22,17 @@ llama.cpp などの CUDA C++ カーネルを ShaderM に port するときの対
 | 累積 (*=) | `acc *= x` | (手書き) | ✅ `acc *↦ x` (Step 2) |
 | **unroll for** | `#pragma unroll for (int i=0;i<8;++i)` | `for i in [0:8] do` | ✅ `ShaderM.unrollFor 8 fun i => ...` (Step 3) |
 | **runtime for** | `for (int i=0; i<n; ++i)` | `ShaderM.loop 0 n 1 fun i => ...` | ✅ `ShaderM.runtimeFor 0 n 1 fun i => ...` (Step 3) |
-| `threadIdx.x` | `threadIdx.x` | `← ShaderM.localId` の `.x` | `← ShaderM.tidX` (← TODO) |
-| `blockIdx.x` | `blockIdx.x` | `← ShaderM.workgroupId` の `.x` | `← ShaderM.bidX` (← TODO) |
-| **lane index** | `threadIdx.x & 31` | `tid & 31` (手書き) | `← ShaderM.laneId` (← TODO) |
-| **warp index** | `threadIdx.x >> 5` | `tid >>> 5` (手書き) | `← ShaderM.warpId` (← TODO) |
-| sub-warp split | `(tid & ~7, tid & 7)` | 手書き | `← ShaderM.subWarpSplit 8` (← TODO) |
+| `threadIdx.x` | `threadIdx.x` | `← ShaderM.localId` の `.x` | ✅ `← ShaderM.tidX` (Step 4) |
+| `blockIdx.x` | `blockIdx.x` | `← ShaderM.workgroupId` の `.x` | ✅ `← ShaderM.bidX` (Step 4) |
+| **lane index** | `threadIdx.x & 31` | `tid & 31` (手書き) | ✅ `← ShaderM.laneId` (Step 4) |
+| **warp index** | `threadIdx.x >> 5` | `tid >>> 5` (手書き) | ✅ `← ShaderM.warpId` (Step 4) |
+| sub-warp split | `(tid & ~7, tid & 7)` | 手書き | ✅ `← ShaderM.subWarpSplit 8` (Step 4) |
 | `__syncthreads()` | `__syncthreads();` | ✅ `ShaderM.barrier` | 同じ |
-| `__syncwarp()` | `__syncwarp();` | (なし — block barrier で代用) | `ShaderM.warpBarrier` (← TODO) |
+| `__syncwarp()` | `__syncwarp();` | (なし — block barrier で代用) | `ShaderM.warpBarrier` (← TODO Step 6) |
 | `__shfl_xor_sync(.., off, 32)` | `__shfl_xor_sync(0xFFFFFFFF, x, off, 32)` | `Exp.subgroupShuffleXor x off` | 同じ |
-| `warp_reduce_sum<32>` | `__reduce_add_sync(...)` or 5-shfl loop | `Exp.subgroupAdd x` | 同じ |
-| `warp_reduce_sum<8>` | 3-shfl xor 1,2,4 ループ | 手書き 3 行 | ✅ `ShaderM.warpReduceSum 8 x` (← TODO) |
+| `warp_reduce_sum<32>` | `__reduce_add_sync(...)` or 5-shfl loop | `Exp.subgroupAdd x` | ✅ `← ShaderM.warpReduceSum 32 x` (Step 5) |
+| `warp_reduce_sum<8>` | 3-shfl xor 1,2,4 ループ | 手書き 3 行 | ✅ `← ShaderM.warpReduceSum 8 x` (Step 5) |
+| `warp_reduce_max<n>` | shfl-xor max butterfly | 手書き | ✅ `← ShaderM.warpReduceMax n x` (Step 5) |
 | `ld.global.u32` | `*K_ptr` (after offset) | `← ShaderM.readBuffer ... idx` | 同じ |
 | **vec4 load** | `ggml_cuda_memcpy_1<16>(&dst, &K)` | (まだなし — `ld_v4_u32` PTX infra のみ) | `← ShaderM.readBufferVec4 ...` (← TODO) |
 | `__half2half2(x)` | `__half2half2(x)` | (手書き or pack2x16float) | `Exp.broadcastH2 x` (← TODO) |
