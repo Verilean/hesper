@@ -5,6 +5,7 @@ import Hesper.CUDA.FFI
 import Hesper.CUDA.CodeGen
 import Hesper.WGSL.Monad
 import Hesper.WGSL.FlashAttention
+import Hesper.WGSL.FlashAttentionExperiments
 import Hesper
 
 /-!

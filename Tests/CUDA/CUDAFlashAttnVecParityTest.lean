@@ -6,6 +6,7 @@ import Hesper.WGSL.Monad
 import Hesper.WGSL.Exp
 import Hesper.WGSL.Shader
 import Hesper.WGSL.FlashAttention
+import Hesper.WGSL.FlashAttentionExperiments
 import Hesper
 
 /-!
