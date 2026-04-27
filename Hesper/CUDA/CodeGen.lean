@@ -54,39 +54,8 @@ private def emitSetp (op : CmpOp) (ra rb : AnyReg) (s : GenState) : AnyReg × Ge
     | _ => (.pred p, s)
   | _ => (.pred p, s)
 
-/-- Should this Exp constructor be memoized?  Pure-arithmetic constructors
-    (whose lowering depends only on operand AnyRegs and the GenState's
-    fresh-counter) are safe; loads/shuffles/var refs are not (var values
-    can change via `assign`, loads have ordering with surrounding writes,
-    shuffles read other lanes' regs that may have changed). -/
-def Exp.cseable {t : WGSLType} : Exp t → Bool
-  | .add _ _ | .sub _ _ | .mul _ _ | .div _ _ | .mod _ _
-  | .shiftLeft _ _ | .shiftRight _ _
-  | .bitAnd _ _ | .bitOr _ _ | .bitXor _ _
-  | .min _ _ | .max _ _
-  | .neg _ | .toF32 _ | .toI32 _ | .toU32 _ | .toF16 _
-  | .mulhiU32 _ _ => true
-  | _ => false
-
 /-- Generate PTX for an Exp, returning AnyReg + state. -/
 partial def expToPTX (e : Exp t) (s : GenState) : ExpResult :=
-  -- CSE: if this is a pure-arithmetic Exp tree we've already lowered in
-  -- this scope, return the cached register.  Hits are common in unrolled
-  -- bodies where indices like `subLane * 32 + 2*pk + 1` recur 50× with
-  -- identical sub-trees — without this each unroll iter re-emits the
-  -- multiplications.  Key is Exp.toWGSL (structural string).
-  if Exp.cseable e then
-    let key := Exp.toWGSL e
-    match s.expCache.find? (·.1 == key) with
-    | some (_, r) => (r, s)
-    | none =>
-      let (r, s) := expToPTX' e s
-      (r, { s with expCache := (key, r) :: s.expCache })
-  else
-    expToPTX' e s
-
-where
-  expToPTX' (e : Exp t) (s : GenState) : ExpResult :=
   match e with
   -- Literals
   | .litF32 f =>
@@ -834,10 +803,9 @@ partial def stmtToPTX (stmt : Stmt) (s : GenState) : GenState :=
       rdRegs := 0
       pRegs := 0
       hRegs := 0
-      -- Clear sreg / imm / exp caches: outer-scope reg refs aren't visible inside.
+      -- Clear sreg / imm caches: outer-scope reg refs aren't visible inside.
       sregCache := []
       immCache := []
-      expCache := []
     }
     let s := stmts.foldl (fun s st => stmtToPTX st s) s
     -- Capture inner state before restoring outer.
@@ -859,7 +827,6 @@ partial def stmtToPTX (stmt : Stmt) (s : GenState) : GenState :=
       hRegs := outerH
       sregCache := []
       immCache := []
-      expCache := []
     }
     s.emit (.scopeBlock myScopeId numF numR numRd numP numH innerInsts)
 
