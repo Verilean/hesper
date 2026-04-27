@@ -880,6 +880,59 @@ def fusedRopeKAndCacheWriteBatchKernelF16
     ShaderM.writeBuffer (ty := .scalar .u32) "v_cache_f16" cacheU32Idx vPacked
   ) (pure ())
 
+/-- No-RoPE batched f16 KV-write.  Used by SWA layers in forwardBlock /
+    forwardPrefillBatch: K is already RoPE'd into `new_k_roped` upstream
+    (because the SWA layers don't have `freq_factors`).  Each thread
+    handles one (col, kvHead, dPair) → reads 2 K dims + 2 V dims, packs
+    each pair into a u32, writes to the f16 cache. -/
+def kvWriteBatchKernelF16
+    (numKVHeads maxSeqLen headDim seqLen : Nat) : ShaderM Unit := do
+  let gid ← ShaderM.globalId
+  let idx := Exp.vec3X gid
+
+  let halfDim := headDim / 2
+  let kvDim := numKVHeads * headDim
+  let perTokenPairs := numKVHeads * halfDim
+  let totalPairs := perTokenPairs * seqLen
+  let kCacheU32Size := (numKVHeads * maxSeqLen * headDim) / 2
+
+  let _newK ← ShaderM.declareReadOnlyBuffer "new_k_roped"
+                (.array (.scalar .f32) (kvDim * seqLen))
+  let _newV ← ShaderM.declareReadOnlyBuffer "new_v"
+                (.array (.scalar .f32) (kvDim * seqLen))
+  let _kCache ← ShaderM.declareOutputBuffer "k_cache_f16"
+                  (.array (.scalar .u32) kCacheU32Size)
+  let _vCache ← ShaderM.declareOutputBuffer "v_cache_f16"
+                  (.array (.scalar .u32) kCacheU32Size)
+  let _params ← ShaderM.declareReadOnlyBuffer "params" (.array (.scalar .u32) 1)
+
+  ShaderM.if_ (Exp.lt idx (Exp.litU32 totalPairs)) (do
+    let col := idx / perTokenPairs
+    let withinTok := idx - col * perTokenPairs
+    let kvHead := withinTok / halfDim
+    let dPair := withinTok % halfDim
+
+    let startPos ← ShaderM.readBuffer (ty := .scalar .u32) (n := 1) "params" (Exp.litU32 0)
+    let pos := startPos + col
+
+    let dLo : Exp (.scalar .u32) := 2 * dPair
+    let dHi : Exp (.scalar .u32) := dLo + 1
+    let kvHeadBase := col * kvDim + kvHead * headDim
+
+    let kFromN : Exp (.array (.scalar .f32) (kvDim * seqLen)) := Exp.var "new_k_roped"
+    let vFromN : Exp (.array (.scalar .f32) (kvDim * seqLen)) := Exp.var "new_v"
+    let kLo := Exp.index kFromN (kvHeadBase + dLo)
+    let kHi := Exp.index kFromN (kvHeadBase + dHi)
+    let vLo := Exp.index vFromN (kvHeadBase + dLo)
+    let vHi := Exp.index vFromN (kvHeadBase + dHi)
+
+    let cacheU32Idx := kvHead * (maxSeqLen * halfDim) + pos * halfDim + dPair
+    ShaderM.writeBuffer (ty := .scalar .u32) "k_cache_f16" cacheU32Idx
+      (Exp.pack2x16float (Exp.vec2 kLo kHi))
+    ShaderM.writeBuffer (ty := .scalar .u32) "v_cache_f16" cacheU32Idx
+      (Exp.pack2x16float (Exp.vec2 vLo vHi))
+  ) (pure ())
+
 /-- f32→f16 packed copy kernel for V cache.  Each thread reads 2 f32
     consecutive elements, packs them into one u32, writes to the f16 V
     cache.  Used to mirror f32 V cache writes (which already happened
