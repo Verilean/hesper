@@ -185,6 +185,22 @@ def for_ (varName : String) (start : Exp (.scalar .u32)) (end_ : Exp (.scalar .u
   let update := Exp.add loopVar step
   emitStmt (Stmt.forLoop varName start condition update bodyStmts)
 
+/-- Compile-time unrolled loop: emits `n` copies of the body inline,
+    with `i` bound to a Lean `Nat` (0, 1, ..., n-1).  Use when iteration
+    count is statically known and the unroll is desired (eg. dot-product
+    over a fixed dim count, sub-warp partition iters).
+
+    The Nat `i` is a meta value — to use it in an Exp context, lift via
+    `Exp.litU32 i` or simply `(i : Exp _)` (the Exp OfNat instance).
+
+    Equivalent to writing `for i in [0:n] do body i`, but the helper name
+    documents intent: "this is meta-time unrolled, not a runtime loop".
+    Mirrors CUDA C++ `#pragma unroll for (int i = 0; i < N; ++i)`.
+
+    For runtime loops use `ShaderM.loop` (or its alias `runtimeFor`). -/
+@[inline] def unrollFor (n : Nat) (body : Nat → ShaderM Unit) : ShaderM Unit :=
+  (List.range n).forM body
+
 /-- Higher-order loop: pass loop variable as Exp
     Usage: loop start end step fun i => do { ... use i ... } -/
 def loop (start : Exp (.scalar .u32)) (end_ : Exp (.scalar .u32)) (step : Exp (.scalar .u32)) (bodyFn : Exp (.scalar .u32) → ShaderM Unit) : ShaderM Unit := do
@@ -194,6 +210,18 @@ def loop (start : Exp (.scalar .u32)) (end_ : Exp (.scalar .u32)) (step : Exp (.
   let condition := Exp.lt loopVar end_
   let update := Exp.add loopVar step
   emitStmt (Stmt.forLoop varName start condition update bodyStmts)
+
+/-- Runtime loop alias for `loop`, named to pair with `unrollFor` so the
+    meta-vs-runtime distinction is explicit at the call site:
+    ```
+    ShaderM.unrollFor 8 fun i => ...               -- meta-time, 8 inline copies
+    ShaderM.runtimeFor 0 cacheLen 1 fun i => ...   -- runtime for-loop
+    ```
+    Mirrors CUDA C++ `for (int i = 0; ...)` (no `#pragma unroll`). -/
+@[inline] def runtimeFor
+    (start end_ step : Exp (.scalar .u32))
+    (bodyFn : Exp (.scalar .u32) → ShaderM Unit) : ShaderM Unit :=
+  loop start end_ step bodyFn
 
 /-- Block scope: emits `{ ... body ... }` so var declared inside the body
     is **block-scoped** in WGSL, allowing Naga/Tint/Vulkan-driver register
@@ -525,6 +553,84 @@ def staticLoop2D (rows cols : Nat) (body : Nat → Nat → ShaderM Unit) : Shade
   for i in [0:rows] do
     for j in [0:cols] do
       body i j
+
+end ShaderM
+
+/-! ## Typed mutable variables
+
+`MutVar ty` wraps a private (PTX-register / WGSL `var`) variable with its
+type carried in Lean.  This closes the second cognitive gap from porting
+CUDA C++ — operator overloading in Step 1 still needed `(Exp.var name : Exp _)`
+type annotations everywhere.  With `MutVar`, `v.read + x` and `v +↦ x`
+type-check directly because `read` returns a typed `Exp ty`.
+
+Idiomatic use:
+```
+let acc ← ShaderM.mutVar (.scalar .f32) 0
+for k in [0:8] do
+  acc +↦ qVec[k]! * kVec[k]!     -- in-place +=
+let final := acc.read
+```
+-/
+
+/-- Mutable shader-side variable carrying its type in Lean.  Construct via
+    `ShaderM.mutVar` — never by hand (the contained name must be one
+    emitted by `ShaderM.var` so PTX/WGSL codegen sees a declaration). -/
+structure MutVar (ty : WGSLType) where
+  name : String
+  deriving Repr
+
+namespace MutVar
+
+/-- Read the current value as a typed `Exp ty`. -/
+@[inline] def read (v : MutVar ty) : Exp ty := Exp.var v.name
+
+/-- Overwrite the variable with `x`. -/
+@[inline] def write (v : MutVar ty) (x : Exp ty) : ShaderM Unit :=
+  ShaderM.assign v.name x
+
+/-- In-place add: `v += x`.  Sugar for `v.write (v.read + x)`. -/
+@[inline] def addAssign (v : MutVar ty) [HAdd (Exp ty) (Exp ty) (Exp ty)]
+    (x : Exp ty) : ShaderM Unit :=
+  ShaderM.assign v.name (v.read + x)
+
+/-- In-place multiply: `v *= x`. -/
+@[inline] def mulAssign (v : MutVar ty) [HMul (Exp ty) (Exp ty) (Exp ty)]
+    (x : Exp ty) : ShaderM Unit :=
+  ShaderM.assign v.name (v.read * x)
+
+/-- In-place subtract: `v -= x`. -/
+@[inline] def subAssign (v : MutVar ty) [HSub (Exp ty) (Exp ty) (Exp ty)]
+    (x : Exp ty) : ShaderM Unit :=
+  ShaderM.assign v.name (v.read - x)
+
+end MutVar
+
+/-- Mutating-add operator.  `v +↦ x` ≡ `MutVar.addAssign v x`. -/
+infixl:55 " +↦ " => MutVar.addAssign
+
+/-- Mutating-multiply operator. -/
+infixl:60 " *↦ " => MutVar.mulAssign
+
+/-- Mutating-write operator (≡ `MutVar.write`).  `v ↦= x`. -/
+infix:55 " ↦= " => MutVar.write
+
+namespace ShaderM
+
+/-- Declare a typed mutable variable.  Use `v.read` / `v.write` /
+    `v +↦ x` / `v ↦= x`.  The successor to `ShaderM.var`.
+
+    Example:
+    ```
+    let acc ← ShaderM.mutVar (.scalar .f32) 0
+    for k in [0:dimsPerLane] do
+      acc +↦ qVec[k]! * kVec[k]!
+    ```
+-/
+def mutVar (ty : WGSLType) (init : Exp ty) : ShaderM (MutVar ty) := do
+  let name ← freshVar "v"
+  emitStmt (Stmt.varDecl name ty (some ⟨ty, init⟩))
+  return ⟨name⟩
 
 end ShaderM
 
