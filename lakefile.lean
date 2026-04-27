@@ -462,14 +462,6 @@ lean_exe «gemma4-dispatch-count» where
   root := `Examples.DSL.Gemma4DispatchCount
   moreLinkArgs := stdLinkArgs ++ #["./.lake/build/native/libhesper_cuda.a", "-lcuda"]
 
-lean_exe «gemma4-monolith-layer-parity» where
-  root := `Examples.DSL.Gemma4MonolithLayerParity
-  moreLinkArgs := stdLinkArgs ++ #["./.lake/build/native/libhesper_cuda.a", "-lcuda"]
-
-lean_exe «gemma4-monolith-tps» where
-  root := `Examples.DSL.Gemma4MonolithTPS
-  moreLinkArgs := stdLinkArgs ++ #["./.lake/build/native/libhesper_cuda.a", "-lcuda"]
-
 lean_exe «dsl-basics» where
   root := `Examples.DSL.DSLBasics
 
@@ -876,18 +868,6 @@ lean_exe «cuda-bitlinear-test» where
 
 lean_exe «cuda-flash-test» where
   root := `Tests.CUDA.CUDAFlashAttnTest
-  moreLinkArgs := stdLinkArgs ++ #["./.lake/build/native/libhesper_cuda.a", "-lcuda"]
-
-lean_exe «cuda-flashattn-vec-parity» where
-  root := `Tests.CUDA.CUDAFlashAttnVecParityTest
-  moreLinkArgs := stdLinkArgs ++ #["./.lake/build/native/libhesper_cuda.a", "-lcuda"]
-
-lean_exe «cuda-flashattn-v11-debug» where
-  root := `Tests.CUDA.CUDAFlashAttnV11Debug
-  moreLinkArgs := stdLinkArgs ++ #["./.lake/build/native/libhesper_cuda.a", "-lcuda"]
-
-lean_exe «cuda-flashattn-ncu-driver» where
-  root := `Tests.CUDA.CUDAFlashAttnNcuDriver
   moreLinkArgs := stdLinkArgs ++ #["./.lake/build/native/libhesper_cuda.a", "-lcuda"]
 
 lean_exe «cuda-fma-f16x2-test» where
