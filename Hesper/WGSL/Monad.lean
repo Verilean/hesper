@@ -672,6 +672,23 @@ def readBufferU32x4 (bufferName : String) (u32Idx : Exp (.scalar .u32))
   emitStmt (Stmt.varDeclLdV4U32 n0 n1 n2 n3 bufferName u32Idx)
   return (Exp.var n0, Exp.var n1, Exp.var n2, Exp.var n3)
 
+/-- 128-bit (4× f32) wide read from shared memory.  `f32Idx` must be
+    4-aligned.  CUDA lowers to one `ld.shared.v4.f32`; WGSL emulates as
+    four scalar reads.
+
+    Used to relieve MIO-pipe saturation on shared-memory traffic
+    (FlashAttn V11 partial aggregation: 4× LDS instruction count
+    reduction). -/
+def readWorkgroupF32x4 (sharedName : String) (f32Idx : Exp (.scalar .u32))
+    : ShaderM (Exp (.scalar .f32) × Exp (.scalar .f32) ×
+               Exp (.scalar .f32) × Exp (.scalar .f32)) := do
+  let n0 ← freshVar "lds4_0"
+  let n1 ← freshVar "lds4_1"
+  let n2 ← freshVar "lds4_2"
+  let n3 ← freshVar "lds4_3"
+  emitStmt (Stmt.varDeclLdV4F32Shared n0 n1 n2 n3 sharedName f32Idx)
+  return (Exp.var n0, Exp.var n1, Exp.var n2, Exp.var n3)
+
 /-- Write to a global storage buffer at index -/
 def writeBuffer {ty : WGSLType} (bufferName : String) (idx : Exp (.scalar .u32)) (value : Exp ty) : ShaderM Unit :=
   assignIndex bufferName idx value

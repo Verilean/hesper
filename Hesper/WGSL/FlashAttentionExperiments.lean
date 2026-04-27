@@ -1487,30 +1487,42 @@ def flashAttentionVecParamsKernelV11
   let partialBase := Exp.add (Exp.mul head
                                        (Exp.mul (Exp.litU32 numSplits) (Exp.litU32 headDim)))
                               (Exp.mul splitIdx (Exp.litU32 headDim))
-  for pk in [0:dPerLanePair] do
-    let d0 := Exp.add dThreadBase (Exp.litU32 (pk * 2))
-    let d1 := Exp.add d0 (Exp.litU32 1)
+  -- LDS.128 vec4 path: each thread aggregates 4 consecutive dims at a time
+  -- via one ld.shared.v4.f32 per (w, s).  Reduces LDS instruction count
+  -- 4× from 256 → 64 per thread, relieving MIO-pipe saturation that ncu
+  -- attributed to shared-memory traffic, not global LDG.
+  --
+  -- Slot layout for shared_vkq:
+  --   (warpId * numSubWarps + subWarp) * D + (subLane*32 + 4*quad + j)
+  -- where quad in [0:8] groups 4 consecutive dims, j in [0:4].
+  -- dThreadBase = subLane * 32 is 4-aligned, bigBase is 4-aligned, so
+  -- slot = bigBase + dThreadBase + 4*quad is 4-aligned.
+  let numQuads := dPerLanePair / 2  -- = 8 (16 pk pairs / 2 = 8 quads of 4 dims)
+  for quad in [0:numQuads] do
+    let dBase := Exp.add dThreadBase (Exp.litU32 (quad * 4))
     let acc0Var ← ShaderM.var (.scalar .f32) (Exp.litF32 0.0)
     let acc1Var ← ShaderM.var (.scalar .f32) (Exp.litF32 0.0)
+    let acc2Var ← ShaderM.var (.scalar .f32) (Exp.litF32 0.0)
+    let acc3Var ← ShaderM.var (.scalar .f32) (Exp.litF32 0.0)
     for w in [0:numWarps] do
       for s in [0:numSubWarps] do
         let bigBase := (w * numSubWarps + s) * headDim
-        let slot0 := Exp.add (Exp.litU32 bigBase) d0
-        let slot1 := Exp.add (Exp.litU32 bigBase) d1
-        let v0 ← ShaderM.readWorkgroup (ty := .scalar .f32)
-                  (n := numWarps * numSubWarps * headDim) "shared_vkq" slot0
-        let v1 ← ShaderM.readWorkgroup (ty := .scalar .f32)
-                  (n := numWarps * numSubWarps * headDim) "shared_vkq" slot1
-        ShaderM.assign acc0Var
-          (Exp.add (Exp.var acc0Var) (Exp.mul v0 (Exp.var weightVars[w]!)))
-        ShaderM.assign acc1Var
-          (Exp.add (Exp.var acc1Var) (Exp.mul v1 (Exp.var weightVars[w]!)))
-    let outIdx0 := Exp.add partialBase d0
-    let outIdx1 := Exp.add partialBase d1
-    ShaderM.writeBuffer (ty := .scalar .f32) "partial_out" outIdx0
-      (Exp.var acc0Var)
-    ShaderM.writeBuffer (ty := .scalar .f32) "partial_out" outIdx1
-      (Exp.var acc1Var)
+        let slotBase := Exp.add (Exp.litU32 bigBase) dBase
+        let (v0, v1, v2, v3) ← ShaderM.readWorkgroupF32x4 "shared_vkq" slotBase
+        let weight := Exp.var weightVars[w]!
+        ShaderM.assign acc0Var (Exp.add (Exp.var acc0Var) (Exp.mul v0 weight))
+        ShaderM.assign acc1Var (Exp.add (Exp.var acc1Var) (Exp.mul v1 weight))
+        ShaderM.assign acc2Var (Exp.add (Exp.var acc2Var) (Exp.mul v2 weight))
+        ShaderM.assign acc3Var (Exp.add (Exp.var acc3Var) (Exp.mul v3 weight))
+    let outBase := Exp.add partialBase dBase
+    ShaderM.writeBuffer (ty := .scalar .f32) "partial_out"
+      outBase (Exp.var acc0Var)
+    ShaderM.writeBuffer (ty := .scalar .f32) "partial_out"
+      (Exp.add outBase (Exp.litU32 1)) (Exp.var acc1Var)
+    ShaderM.writeBuffer (ty := .scalar .f32) "partial_out"
+      (Exp.add outBase (Exp.litU32 2)) (Exp.var acc2Var)
+    ShaderM.writeBuffer (ty := .scalar .f32) "partial_out"
+      (Exp.add outBase (Exp.litU32 3)) (Exp.var acc3Var)
 
   -- Thread 0 writes (blockMax, blockSum) for this split.
   ShaderM.if_ (Exp.eq tid (Exp.litU32 0)) (do

@@ -284,6 +284,12 @@ inductive Inst where
   | st_shared_sym (val : RegF32) (symAddr : RegU32) (offset : RegU32) (addr : RegU32)
   | ld_shared_sym_u32 (dst : RegU32) (symAddr : RegU32) (offset : RegU32) (addr : RegU32)
   | st_shared_sym_u32 (val : RegU32) (symAddr : RegU32) (offset : RegU32) (addr : RegU32)
+  -- 128-bit aligned vec4.f32 shared-memory load: 4 consecutive f32 read
+  -- in 1 PTX instruction.  Maps to `ld.shared.v4.f32 {d0,d1,d2,d3}, [addr];`.
+  -- Address must be 16-byte aligned.  Used to reduce LDS instruction count
+  -- 4× in MIO-pipe-saturated kernels (FlashAttn V11 partial aggregation).
+  | ld_shared_sym_v4_f32 (d0 d1 d2 d3 : RegF32) (symAddr : RegU32)
+                           (offset : RegU32) (addr : RegU32)
   | mov_shared_addr (dst : RegU32) (symName : String)  -- mov.u32 %r, symbol
   | ld_param_u64  (dst : RegU64) (paramName : String)
 
@@ -416,6 +422,8 @@ partial def Inst.toString : Inst → String
   | .st_shared_sym v _sa _off addr => s!"  st.shared.f32 [{addr}], {v};"
   | .ld_shared_sym_u32 d _sa _off addr => s!"  ld.shared.u32 {d}, [{addr}];"
   | .st_shared_sym_u32 v _sa _off addr => s!"  st.shared.u32 [{addr}], {v};"
+  | .ld_shared_sym_v4_f32 d0 d1 d2 d3 _sa _off addr =>
+    s!"  ld.shared.v4.f32 \{{d0}, {d1}, {d2}, {d3}}, [{addr}];"
   | .mov_shared_addr d sym         => s!"  mov.u32 {d}, {sym};"
   | .ld_param_u64 d name => s!"  ld.param.u64 {d}, [param_{name}];"
   | .shfl_bfly_f32 d s off => s!"  shfl.sync.bfly.b32 {d}, {s}, {off}, 31, 0xFFFFFFFF;"

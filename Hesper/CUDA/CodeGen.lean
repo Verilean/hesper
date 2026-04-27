@@ -751,6 +751,28 @@ partial def stmtToPTX (stmt : Stmt) (s : GenState) : GenState :=
     let s := s.bindVar n2 (.u32 r2)
     s.bindVar n3 (.u32 r3)
 
+  | .varDeclLdV4F32Shared n0 n1 n2 n3 sharedName f32Idx =>
+    -- Lower to one ld.shared.v4.f32 instruction, binding 4 fresh f32 regs
+    -- to the named vars.  Caller guarantees f32Idx is 4-aligned (so the
+    -- byte offset is 16-aligned).  Mirrors ld_shared_sym addressing.
+    let (rIdx, s) := expToPTX f32Idx s
+    -- byte offset = f32Idx * 4
+    let (off, s) := s.freshU32
+    let s := s.emit (.shl_u32 off rIdx.toU32! 2)
+    let (symR, s) := s.freshU32
+    let s := s.emit (.mov_shared_addr symR sharedName)
+    let (addr, s) := s.freshU32
+    let s := s.emit (.add_u32 addr symR off)
+    let (r0, s) := s.freshF32
+    let (r1, s) := s.freshF32
+    let (r2, s) := s.freshF32
+    let (r3, s) := s.freshF32
+    let s := s.emit (.ld_shared_sym_v4_f32 r0 r1 r2 r3 symR off addr)
+    let s := s.bindVar n0 (.f32 r0)
+    let s := s.bindVar n1 (.f32 r1)
+    let s := s.bindVar n2 (.f32 r2)
+    s.bindVar n3 (.f32 r3)
+
   | .exprStmt e => (expToPTX e s).2
   | .block stmts =>
     -- Enter a new PTX scope: assign a fresh scopeId, save outer reg
