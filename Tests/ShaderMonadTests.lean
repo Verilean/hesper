@@ -253,6 +253,53 @@ def testDefaultLoopNoLicm : TestSeq :=
   test "Default loop does not hoist anything" (outside == 0) ++
   test "Default loop body keeps invariant let'" (inside == 2)
 
+/-- Helper: count outer + total `block` statements (one per scope). -/
+private def countBlocks (stmts : List Stmt) : Nat × Nat :=
+  let rec go : Stmt → Nat
+    | .block inner => 1 + (inner.foldl (init := 0) (fun a s => a + go s))
+    | .forLoop _ _ _ _ inner => inner.foldl (init := 0) (fun a s => a + go s)
+    | .ifStmt _ t e =>
+      t.foldl (init := 0) (fun a s => a + go s) +
+      e.foldl (init := 0) (fun a s => a + go s)
+    | _ => 0
+  let outer := stmts.filter (fun s => match s with | .block _ => true | _ => false)
+  let total := stmts.foldl (init := 0) (fun a s => a + go s)
+  (outer.length, total)
+
+/-- Test: unrollForScoped emits N block scopes, one per iteration. -/
+def testUnrollForScoped : TestSeq :=
+  let computation :=
+    ShaderM.unrollForScoped 4 fun _i => do
+      let _v ← ShaderM.var (.scalar .u32) (Exp.litU32 0)
+      pure ()
+  let state := exec computation
+  let (outerBlocks, _) := countBlocks state.stmts
+  test "unrollForScoped emits 4 top-level block scopes" (outerBlocks == 4) ++
+  test "Each block contains the unrolled var" (state.varCounter == 4)
+
+/-- Test: RegArray.mk emits N varDecls and get/set hit those names. -/
+def testRegArrayMk : TestSeq :=
+  let computation := do
+    let _arr ← ShaderM.regArray (.scalar .f32) 3
+                 (fun i => Exp.litF32 i.toFloat)
+    pure ()
+  let state := exec computation
+  test "regArray emits 3 varDecls" (state.stmts.length == 3) ++
+  test "regArray uses 3 fresh var names" (state.varCounter == 3)
+
+/-- Test: RegArray round-trip — set then get returns the assigned value. -/
+def testRegArrayGetSet : TestSeq :=
+  let computation := do
+    let arr ← ShaderM.regArray (.scalar .u32) 2 (fun _ => Exp.litU32 0)
+    arr.set 0 (Exp.litU32 42)
+    let _v0 := arr.get 0
+    pure ()
+  let state := exec computation
+  -- 2 varDecls + 1 assign = 3 stmts.  Counts only what was emitted, not
+  -- the meta-time `arr.get` (which doesn't emit anything — it just
+  -- returns an Exp).
+  test "RegArray emits 2 decls + 1 assign" (state.stmts.length == 3)
+
 /-- Test: Nested control flow -/
 def testNestedControlFlow : TestSeq :=
   let computation := do
@@ -528,6 +575,9 @@ def allTests : IO (List (String × List TestSeq)) := do
     ("Control Flow: LICM keeps loop-variant", [testLicmKeepVariant]),
     ("Control Flow: LICM keeps reassigned", [testLicmKeepReassigned]),
     ("Control Flow: Default loop no LICM", [testDefaultLoopNoLicm]),
+    ("Control Flow: unrollForScoped", [testUnrollForScoped]),
+    ("RegArray: mk emits N decls", [testRegArrayMk]),
+    ("RegArray: get/set round-trip", [testRegArrayGetSet]),
     ("Control Flow: Nested", [testNestedControlFlow]),
     ("Synchronization: Barrier", [testBarrier]),
     ("Built-ins: Global ID", [testGlobalId]),
