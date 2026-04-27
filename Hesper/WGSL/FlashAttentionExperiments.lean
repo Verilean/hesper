@@ -1286,8 +1286,8 @@ def flashAttentionVecParamsKernelV9
 
     -- Phase 1: 32 K positions per warp, runtime loop.
     ShaderM.loop (Exp.litU32 0) (Exp.litU32 32) (Exp.litU32 1) fun iKQ0 => do
-      let iKQ := Exp.add (Exp.mul warpId (Exp.litU32 32)) iKQ0
-      let kPos := Exp.add kVKQ0 iKQ
+      let iKQ : Exp (.scalar .u32) := warpId * 32 + iKQ0
+      let kPos := kVKQ0 + iKQ
       -- inBounds against splitEnd (not cacheLen) so the last tile within
       -- this split is correctly truncated when cacheLen / numSplits is not
       -- a multiple of workgroupSize.
@@ -1297,15 +1297,15 @@ def flashAttentionVecParamsKernelV9
       -- Hesper/WGSL/Monad.lean's let' docstring for the V9 17×
       -- instruction-bloat case study that motivated this helper.
       let inBoundsU32 ← ShaderM.let' (.scalar .u32)
-                          (Exp.select (Exp.lt kPos splitEnd) (Exp.litU32 1) (Exp.litU32 0))
-      let inBounds := Exp.eq inBoundsU32 (Exp.litU32 1)
-      let kPosSafe ← ShaderM.let' (.scalar .u32) (Exp.select inBounds kPos (Exp.litU32 0))
+                          (Exp.select (Exp.lt kPos splitEnd) 1 0)
+      let inBounds := Exp.eq inBoundsU32 1
+      let kPosSafe ← ShaderM.let' (.scalar .u32) (Exp.select inBounds kPos 0)
       let kRowBaseU32 ← ShaderM.let' (.scalar .u32)
-                          (Exp.add kHeadBaseU32 (Exp.mul kPosSafe kRowStrideU32))
+                          (kHeadBaseU32 + kPosSafe * kRowStrideU32)
       let partialVar ← ShaderM.var (.scalar .f32) (Exp.litF32 0.0)
       for pk in [0:dPerLanePair] do
-        let wordOff := Exp.add (Exp.litU32 (pk * 32)) laneId
-        let kWordIdx := Exp.add kRowBaseU32 wordOff
+        let wordOff := (Exp.litU32 (pk * 32)) + laneId
+        let kWordIdx := kRowBaseU32 + wordOff
         let kPackedRaw ← ShaderM.readBuffer (ty := .scalar .u32) (n := kvWords)
                            "k_cache_f16" kWordIdx
         -- Pin kPacked to a register so CodeGen lowers vecX + vecY of the
@@ -1318,10 +1318,10 @@ def flashAttentionVecParamsKernelV9
         let k1 ← ShaderM.let' (.scalar .f32) (Exp.vecY unpacked)
         let q0Exp : Exp (.scalar .f32) := Exp.var q0Vars[pk]!
         let q1Exp : Exp (.scalar .f32) := Exp.var q1Vars[pk]!
-        ShaderM.assign partialVar
-          (Exp.add (Exp.var partialVar) (Exp.mul q0Exp k0))
-        ShaderM.assign partialVar
-          (Exp.add (Exp.var partialVar) (Exp.mul q1Exp k1))
+        let p0 : Exp (.scalar .f32) := Exp.var partialVar
+        ShaderM.assign partialVar (p0 + q0Exp * k0)
+        let p1 : Exp (.scalar .f32) := Exp.var partialVar
+        ShaderM.assign partialVar (p1 + q1Exp * k1)
 
       let sumWarpName ← ShaderM.var (.scalar .f32)
                           (Exp.subgroupAdd (Exp.var partialVar))
