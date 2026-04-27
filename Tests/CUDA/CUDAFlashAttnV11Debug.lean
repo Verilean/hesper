@@ -106,8 +106,8 @@ unsafe def main : IO Unit := do
   let numKVHeads := 1
   let headDim := 256
   let maxSeqLen := 64
-  let cacheLen := 8  -- a passing case (V11=0.006 ✓)
-  let numSplits : Nat := 8
+  let cacheLen := 33   -- the failing case
+  let numSplits : Nat := 1   -- single split for simpler analysis
   let scale : Float := 1.0 / headDim.toFloat.sqrt
 
   let qSize := (numHeads * headDim * 4).toUSize
@@ -153,21 +153,7 @@ unsafe def main : IO Unit := do
 
   IO.println s!"=== Setup: nH={numHeads} nKV={numKVHeads} D={headDim} maxSeq={maxSeqLen} cacheLen={cacheLen} numSplits={numSplits} ==="
 
-  -- Run V9
-  let v9Shader := Hesper.WGSL.FlashAttention.flashAttentionVecParamsKernelV9
-                     numHeads numKVHeads maxSeqLen headDim numSplits scale
-  let v9Bufs : List (String × GPUBackend.Buf Hesper.CUDAContext) :=
-    [ ("q",             qBuf)
-    , ("k_cache_f16",   kBufF16)
-    , ("v_cache_f16",   vBufF16)
-    , ("partial_out",   v9PartialOut)
-    , ("partial_meta",  v9PartialMeta)
-    , ("params",        paramsBuf) ]
-  GPUBackend.execute ctx v9Shader v9Bufs
-    { workgroupSize := { x := 128 }, numWorkgroups := (numHeads, numSplits, 1),
-      extensions := ["subgroups", "f16"] }
-
-  -- Run V11
+  -- Run V11 first (then V9), to ensure both see fresh data.
   let v11Shader := Hesper.WGSL.FlashAttention.flashAttentionVecParamsKernelV11
                        numHeads numKVHeads maxSeqLen headDim numSplits scale
   let v11Bufs : List (String × GPUBackend.Buf Hesper.CUDAContext) :=
@@ -178,6 +164,19 @@ unsafe def main : IO Unit := do
     , ("partial_meta",  v11PartialMeta)
     , ("params",        paramsBuf) ]
   GPUBackend.execute ctx v11Shader v11Bufs
+    { workgroupSize := { x := 128 }, numWorkgroups := (numHeads, numSplits, 1),
+      extensions := ["subgroups", "f16"] }
+
+  let v9Shader := Hesper.WGSL.FlashAttention.flashAttentionVecParamsKernelV9
+                     numHeads numKVHeads maxSeqLen headDim numSplits scale
+  let v9Bufs : List (String × GPUBackend.Buf Hesper.CUDAContext) :=
+    [ ("q",             qBuf)
+    , ("k_cache_f16",   kBufF16)
+    , ("v_cache_f16",   vBufF16)
+    , ("partial_out",   v9PartialOut)
+    , ("partial_meta",  v9PartialMeta)
+    , ("params",        paramsBuf) ]
+  GPUBackend.execute ctx v9Shader v9Bufs
     { workgroupSize := { x := 128 }, numWorkgroups := (numHeads, numSplits, 1),
       extensions := ["subgroups", "f16"] }
 
