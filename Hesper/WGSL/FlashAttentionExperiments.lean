@@ -1293,23 +1293,26 @@ def flashAttentionVecParamsKernelV11
                           (kHeadBaseU32 + kPosSafe * kRowStrideU32)
 
       let partialVar ← ShaderM.var (.scalar .f32) (Exp.litF32 0.0)
-      for pk in [0:dPerLanePair] do
-        -- Word offset within K row: each thread reads 16 consecutive words.
-        -- subLane*16 + pk gives the absolute word index within the K row.
-        let wordOff := subLane * (Exp.litU32 dPerLanePair) + (Exp.litU32 pk)
-        let kWordIdx := kRowBaseU32 + wordOff
-        let kPackedRaw ← ShaderM.readBuffer (ty := .scalar .u32) (n := kvWords)
-                           "k_cache_f16" kWordIdx
-        let kPacked ← ShaderM.let' (.scalar .u32) kPackedRaw
-        let unpacked := Exp.unpack2x16float kPacked
-        let k0 ← ShaderM.let' (.scalar .f32) (Exp.vecX unpacked)
-        let k1 ← ShaderM.let' (.scalar .f32) (Exp.vecY unpacked)
-        let q0Exp := q0.get pk     -- Step 9c: typed register array
-        let q1Exp := q1.get pk
-        let p0 : Exp (.scalar .f32) := Exp.var partialVar
-        ShaderM.assign partialVar (p0 + q0Exp * k0)
-        let p1 : Exp (.scalar .f32) := Exp.var partialVar
-        ShaderM.assign partialVar (p1 + q1Exp * k1)
+      -- Vec4 load: each thread reads 16 consecutive u32 words in groups of 4
+      -- via one ld.global.nc.v4.u32 (LDG.E.128) per group.  Reduces global
+      -- load instruction count 4× → relieves MIO-pipe saturation that ncu
+      -- identified as V11's #1 stall (mio_throttle).
+      for grp in [0:dPerLanePair / 4] do
+        let wordOff := subLane * (Exp.litU32 dPerLanePair) +
+                       (Exp.litU32 (grp * 4))
+        let baseIdx := kRowBaseU32 + wordOff
+        let (kw0, kw1, kw2, kw3) ← ShaderM.readBufferU32x4 "k_cache_f16" baseIdx
+        for (j, kPacked) in [(0, kw0), (1, kw1), (2, kw2), (3, kw3)] do
+          let pk := grp * 4 + j
+          let unpacked := Exp.unpack2x16float kPacked
+          let k0 ← ShaderM.let' (.scalar .f32) (Exp.vecX unpacked)
+          let k1 ← ShaderM.let' (.scalar .f32) (Exp.vecY unpacked)
+          let q0Exp := q0.get pk
+          let q1Exp := q1.get pk
+          let p0 : Exp (.scalar .f32) := Exp.var partialVar
+          ShaderM.assign partialVar (p0 + q0Exp * k0)
+          let p1 : Exp (.scalar .f32) := Exp.var partialVar
+          ShaderM.assign partialVar (p1 + q1Exp * k1)
 
       -- 8-way warp_reduce_sum: Step 5 helper replaces 12 lines of
       -- subgroupShuffleXor xor 1, 2, 4 by hand.
@@ -1404,20 +1407,22 @@ def flashAttentionVecParamsKernelV11
                        (Exp.select inBounds kqScoreRaw (Exp.litF32 0.0))
       let vRowBaseU32 ← ShaderM.let' (.scalar .u32)
                            (Exp.add kHeadBaseU32 (Exp.mul kPosSafe kRowStrideU32))
-      for pk in [0:dPerLanePair] do
+      -- Vec4 load: 16 V-words per thread → 4 ld.global.nc.v4.u32 instructions
+      -- instead of 16 scalar ld.global.u32 (same MIO-pipe relief as Phase 1).
+      for grp in [0:dPerLanePair / 4] do
         let wordOff := Exp.add (Exp.mul subLane (Exp.litU32 dPerLanePair))
-                                (Exp.litU32 pk)
-        let vWordIdx := Exp.add vRowBaseU32 wordOff
-        let vPackedRaw ← ShaderM.readBuffer (ty := .scalar .u32) (n := kvWords)
-                           "v_cache_f16" vWordIdx
-        let vPacked ← ShaderM.let' (.scalar .u32) vPackedRaw
-        let unpacked := Exp.unpack2x16float vPacked
-        let v0 ← ShaderM.let' (.scalar .f32) (Exp.vecX unpacked)
-        let v1 ← ShaderM.let' (.scalar .f32) (Exp.vecY unpacked)
-        let prev0 : Exp (.scalar .f32) := Exp.var vkq0Vars[pk]!
-        let prev1 : Exp (.scalar .f32) := Exp.var vkq1Vars[pk]!
-        ShaderM.assign vkq0Vars[pk]! (Exp.add prev0 (Exp.mul v0 kqScore))
-        ShaderM.assign vkq1Vars[pk]! (Exp.add prev1 (Exp.mul v1 kqScore))
+                                (Exp.litU32 (grp * 4))
+        let baseIdx := Exp.add vRowBaseU32 wordOff
+        let (vw0, vw1, vw2, vw3) ← ShaderM.readBufferU32x4 "v_cache_f16" baseIdx
+        for (j, vPacked) in [(0, vw0), (1, vw1), (2, vw2), (3, vw3)] do
+          let pk := grp * 4 + j
+          let unpacked := Exp.unpack2x16float vPacked
+          let v0 ← ShaderM.let' (.scalar .f32) (Exp.vecX unpacked)
+          let v1 ← ShaderM.let' (.scalar .f32) (Exp.vecY unpacked)
+          let prev0 : Exp (.scalar .f32) := Exp.var vkq0Vars[pk]!
+          let prev1 : Exp (.scalar .f32) := Exp.var vkq1Vars[pk]!
+          ShaderM.assign vkq0Vars[pk]! (Exp.add prev0 (Exp.mul v0 kqScore))
+          ShaderM.assign vkq1Vars[pk]! (Exp.add prev1 (Exp.mul v1 kqScore))
     ShaderM.barrier
 
   -- After the K loop: each lane holds its partial VKQ for dims
