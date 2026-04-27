@@ -3048,7 +3048,8 @@ def fusedQ6KLinearDP4AKernel (inDim outDim : Nat) (gridX : Nat := 0) : ShaderM U
     let dotSc_1 := Exp.mul dot_1 sc1I
     let sumf_1 := Exp.mul d8B (Exp.toF32 dotSc_1)
 
-    ShaderM.assign "acc" (Exp.add acc (Exp.mul d (Exp.add sumf_0 sumf_1)))
+    -- acc = d * (sumf_0 + sumf_1) + acc → one fma.rn.f32 instead of mul + add.
+    ShaderM.assign "acc" (Exp.fma d (Exp.add sumf_0 sumf_1) acc)
 
   -- All 32 lanes contribute unique partials (iqs=tid). Standard subgroupAdd.
   ShaderM.varNamed "total" (.scalar .f32) (Exp.subgroupAdd acc)
@@ -3247,7 +3248,8 @@ def fusedQ6KLinearDP4A2RowKernel (inDim outDim : Nat) (gridX : Nat := 0) : Shade
     let dot_1 := Exp.dot4I8Packed vi_1 u1
     let sumf_1 := Exp.mul d8B (Exp.mul (Exp.toF32 dot_1) sc1)
 
-    ShaderM.assign "acc" (Exp.add acc (Exp.mul d (Exp.add sumf_0 sumf_1)))
+    -- acc = d * (sumf_0 + sumf_1) + acc → one fma.rn.f32 instead of mul + add.
+    ShaderM.assign "acc" (Exp.fma d (Exp.add sumf_0 sumf_1) acc)
 
   -- Each warp reduces its 32 lanes' accumulators independently; lane 0
   -- of each warp writes one output row.
@@ -3464,7 +3466,8 @@ def fusedQ6KLinearDP4A4RowKernel (inDim outDim : Nat) (gridX : Nat := 0) : Shade
     let dot_1 := Exp.dot4I8Packed vi_1 u1
     let sumf_1 := Exp.mul d8B (Exp.mul (Exp.toF32 dot_1) sc1)
 
-    ShaderM.assign "acc" (Exp.add acc (Exp.mul d (Exp.add sumf_0 sumf_1)))
+    -- acc = d * (sumf_0 + sumf_1) + acc → one fma.rn.f32 instead of mul + add.
+    ShaderM.assign "acc" (Exp.fma d (Exp.add sumf_0 sumf_1) acc)
 
   -- Per-warp reduction: each of the 4 warps independently reduces its
   -- 32 lanes.  Lane 0 of each warp writes one output row.
