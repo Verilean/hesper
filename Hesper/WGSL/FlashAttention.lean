@@ -161,7 +161,7 @@ def flashAttentionDynamicKernel (numHeads numKVHeads maxSeqLen headDim cacheLen 
 
     -- Online softmax state (per-thread, but identical across threads after the
     -- score reduction since every thread reads the same scoreFromShared).
-    ShaderM.varNamed "max_score" (.scalar .f32) (Exp.litF32 (-1.0e30))
+    ShaderM.varNamed "max_score" (.scalar .f32) (Exp.negInf30)
     ShaderM.varNamed "sum_exp" (.scalar .f32) (Exp.litF32 0.0)
     let maxScore := Exp.var "max_score"
     let sumExp := Exp.var "sum_exp"
@@ -258,7 +258,7 @@ def flashAttentionDynamicParamsKernel (numHeads numKVHeads maxSeqLen headDim : N
       ShaderM.writeWorkgroup (ty := .scalar .f32) "shared_out" d (Exp.litF32 0.0)
     ShaderM.barrier
 
-    ShaderM.varNamed "max_score" (.scalar .f32) (Exp.litF32 (-1.0e30))
+    ShaderM.varNamed "max_score" (.scalar .f32) (Exp.negInf30)
     ShaderM.varNamed "sum_exp" (.scalar .f32) (Exp.litF32 0.0)
     let maxScore := Exp.var "max_score"
     let sumExp := Exp.var "sum_exp"
@@ -390,7 +390,7 @@ def flashAttentionVecParamsKernel (numHeads numKVHeads maxSeqLen headDim : Nat)
     ShaderM.writeWorkgroup (ty := .scalar .f32) "shared_out" d (Exp.litF32 0.0)
   ShaderM.barrier
 
-  ShaderM.varNamed "max_score" (.scalar .f32) (Exp.litF32 (-1.0e30))
+  ShaderM.varNamed "max_score" (.scalar .f32) (Exp.negInf30)
   ShaderM.varNamed "sum_exp" (.scalar .f32) (Exp.litF32 0.0)
   let maxScore := Exp.var "max_score"
   let sumExp := Exp.var "sum_exp"
@@ -523,7 +523,7 @@ def flashAttentionBatchKernel (numHeads numKVHeads maxSeqLen headDim seqLen : Na
       ShaderM.writeWorkgroup (ty := .scalar .f32) "shared_out" d (Exp.litF32 0.0)
     ShaderM.barrier
 
-    ShaderM.varNamed "max_score" (.scalar .f32) (Exp.litF32 (-1.0e30))
+    ShaderM.varNamed "max_score" (.scalar .f32) (Exp.negInf30)
     ShaderM.varNamed "sum_exp"   (.scalar .f32) (Exp.litF32 0.0)
     let maxScore := Exp.var "max_score"
     let sumExp   := Exp.var "sum_exp"
@@ -648,7 +648,7 @@ def flashAttentionSubgroupKernel (numHeads numKVHeads maxSeqLen headDim cacheLen
 
   -- Online-softmax running state. Every lane holds the same values
   -- because `subgroupAdd` broadcasts the score to all lanes.
-  ShaderM.varNamed "max_score" (.scalar .f32) (Exp.litF32 (-1.0e30))
+  ShaderM.varNamed "max_score" (.scalar .f32) (Exp.negInf30)
   ShaderM.varNamed "sum_exp" (.scalar .f32) (Exp.litF32 0.0)
   let maxScore : Exp (.scalar .f32) := Exp.var "max_score"
   let sumExp : Exp (.scalar .f32) := Exp.var "sum_exp"
@@ -755,7 +755,7 @@ def flashAttentionSubgroupParamsKernel (numHeads numKVHeads maxSeqLen headDim : 
   for slice in [0:dimsPerLane] do
     ShaderM.varNamed s!"o{slice}" (.scalar .f32) (Exp.litF32 0.0)
 
-  ShaderM.varNamed "max_score" (.scalar .f32) (Exp.litF32 (-1.0e30))
+  ShaderM.varNamed "max_score" (.scalar .f32) (Exp.negInf30)
   ShaderM.varNamed "sum_exp" (.scalar .f32) (Exp.litF32 0.0)
   let maxScore : Exp (.scalar .f32) := Exp.var "max_score"
   let sumExp : Exp (.scalar .f32) := Exp.var "sum_exp"
@@ -853,7 +853,7 @@ def flashAttentionSWASubgroupKernel (numHeads numKVHeads maxSeqLen headDim
   for slice in [0:dimsPerLane] do
     ShaderM.varNamed s!"o{slice}" (.scalar .f32) (Exp.litF32 0.0)
 
-  ShaderM.varNamed "max_score" (.scalar .f32) (Exp.litF32 (-1.0e30))
+  ShaderM.varNamed "max_score" (.scalar .f32) (Exp.negInf30)
   ShaderM.varNamed "sum_exp" (.scalar .f32) (Exp.litF32 0.0)
   let maxScore : Exp (.scalar .f32) := Exp.var "max_score"
   let sumExp : Exp (.scalar .f32) := Exp.var "sum_exp"
@@ -880,7 +880,7 @@ def flashAttentionSWASubgroupKernel (numHeads numKVHeads maxSeqLen headDim
     ShaderM.varNamed "dot" (.scalar .f32) (Exp.subgroupAdd partialDot)
     let dot : Exp (.scalar .f32) := Exp.var "dot"
     ShaderM.varNamed "score" (.scalar .f32)
-      (Exp.select inWindow (Exp.mul (Exp.litF32 scale) dot) (Exp.litF32 (-1.0e30)))
+      (Exp.select inWindow (Exp.mul (Exp.litF32 scale) dot) (Exp.negInf30))
     let score : Exp (.scalar .f32) := Exp.var "score"
 
     ShaderM.varNamed "newMax" (.scalar .f32) (Exp.max maxScore score)
@@ -949,7 +949,7 @@ def flashAttentionParamsKernel (numHeads numKVHeads maxSeqLen headDim : Nat)
     ShaderM.writeWorkgroup (ty := .scalar .f32) "shared_q" d qVal
   ShaderM.barrier
 
-  ShaderM.varNamed "max_score" (.scalar .f32) (Exp.litF32 (-1.0e30))
+  ShaderM.varNamed "max_score" (.scalar .f32) (Exp.negInf30)
   ShaderM.varNamed "sum_exp" (.scalar .f32) (Exp.litF32 0.0)
   ShaderM.varNamed "out_acc" (.scalar .f32) (Exp.litF32 0.0)
   let maxScore := Exp.var "max_score"
@@ -1068,7 +1068,7 @@ def flashAttentionInPlaceKernel (numHeads numKVHeads maxSeqLen headDim cacheLen 
   ShaderM.barrier
 
   -- Step 2: Online softmax (same as v1)
-  ShaderM.varNamed "max_score" (.scalar .f32) (Exp.litF32 (-1.0e30))
+  ShaderM.varNamed "max_score" (.scalar .f32) (Exp.negInf30)
   ShaderM.varNamed "sum_exp" (.scalar .f32) (Exp.litF32 0.0)
   ShaderM.varNamed "out_acc" (.scalar .f32) (Exp.litF32 0.0)
   let maxScore := Exp.var "max_score"
@@ -1166,7 +1166,7 @@ def flashAttentionTiledPhase1 (numHeads numKVHeads maxSeqLen headDim cacheLen ti
   -- Online softmax for this tile's range
   let tileStart := Exp.mul tileIdx (Exp.litU32 tileSize)
 
-  ShaderM.varNamed "max_score" (.scalar .f32) (Exp.litF32 (-1.0e30))
+  ShaderM.varNamed "max_score" (.scalar .f32) (Exp.negInf30)
   ShaderM.varNamed "sum_exp" (.scalar .f32) (Exp.litF32 0.0)
   ShaderM.varNamed "out_acc" (.scalar .f32) (Exp.litF32 0.0)
   let maxScore := Exp.var "max_score"
@@ -1260,7 +1260,7 @@ def flashAttentionTiledPhase2 (numHeads headDim numTiles : Nat) : ShaderM Unit :
     let d := Exp.mod idx (Exp.litU32 headDim)
 
     -- Merge partial results using online softmax merge
-    ShaderM.varNamed "merged_max" (.scalar .f32) (Exp.litF32 (-1.0e30))
+    ShaderM.varNamed "merged_max" (.scalar .f32) (Exp.negInf30)
     ShaderM.varNamed "merged_sum" (.scalar .f32) (Exp.litF32 0.0)
     ShaderM.varNamed "merged_out" (.scalar .f32) (Exp.litF32 0.0)
     let mergedMax := Exp.var "merged_max"
@@ -1486,7 +1486,7 @@ def flashAttentionSWAKernel (numHeads numKVHeads maxSeqLen headDim cacheLen wind
     ShaderM.barrier
 
     -- Online softmax state
-    ShaderM.varNamed "max_score" (.scalar .f32) (Exp.litF32 (-1.0e30))
+    ShaderM.varNamed "max_score" (.scalar .f32) (Exp.negInf30)
     ShaderM.varNamed "sum_exp" (.scalar .f32) (Exp.litF32 0.0)
     let maxScore := Exp.var "max_score"
     let sumExp := Exp.var "sum_exp"

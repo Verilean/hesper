@@ -591,6 +591,41 @@ def warpReduceMax (n : Nat) (e : Exp (.scalar .f32)) :
     step := step * 2
   return acc
 
+/-- One step of online softmax (Milakov & Gimelshein 2018 / FlashAttention).
+    Given the running max `kqMax`, running sum `kqSum`, and a new score
+    `kqScore`, computes:
+
+    ```
+    kqMaxNew  = max(kqMax, kqScore)
+    scale     = exp(kqMax - kqMaxNew)        -- multiplier for old VKQ accumulator
+    kqExp     = exp(kqScore - kqMaxNew)      -- per-thread weight for current K
+    kqSumNew  = kqSum * scale + kqExp
+    kqMax := kqMaxNew                        -- updated in-place
+    kqSum := kqSumNew                        -- updated in-place
+    ```
+
+    Returns `(kqMaxNew, scale, kqExp)`. The caller rescales their VKQ
+    accumulators by `scale` and accumulates `kqExp * V` for this K
+    position.
+
+    `kqMaxName`/`kqSumName` are the **names** of the running registers
+    so we can `assign` them in place.  The new max is also returned as
+    an `Exp` so the caller can use it without an extra `Exp.var` lookup.
+
+    Mirrors the inner-loop accumulation in llama.cpp's
+    `flash_attn_ext_vec` (lines 273, 287-291 in fattn-vec.cuh). -/
+def softmaxOnlineUpdate
+    (kqMaxName kqSumName : String) (kqScore : Exp (.scalar .f32)) :
+    ShaderM (Exp (.scalar .f32) × Exp (.scalar .f32) × Exp (.scalar .f32)) := do
+  let kqMax : Exp (.scalar .f32) := Exp.var kqMaxName
+  let kqSum : Exp (.scalar .f32) := Exp.var kqSumName
+  let kqMaxNew ← let' (.scalar .f32) (Exp.max kqMax kqScore)
+  let scale    ← let' (.scalar .f32) (Exp.exp (Exp.sub kqMax kqMaxNew))
+  let kqExp    ← let' (.scalar .f32) (Exp.exp (Exp.sub kqScore kqMaxNew))
+  assign kqMaxName kqMaxNew
+  assign kqSumName (Exp.add (Exp.mul kqSum scale) kqExp)
+  return (kqMaxNew, scale, kqExp)
+
 -- ============================================================================
 -- Buffer Operations
 -- ============================================================================
