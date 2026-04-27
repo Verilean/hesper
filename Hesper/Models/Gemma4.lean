@@ -26,6 +26,7 @@ import Hesper.WGSL.MatMul
 import Hesper.WebGPU.BufferOps
 import Hesper.Inference.Sampling
 import Hesper.WGSL.FlashAttention
+import Hesper.WGSL.FlashAttentionExperiments
 import Hesper.Layers.Attention
 import Hesper.Models.Gemma4.Config
 import Hesper.Circuit.Dispatch_v2
@@ -137,6 +138,11 @@ structure InferenceState (BufT CacheT : Type) where
   -- Partial buffer for tiled (split-K) flash attention. Pre-allocated
   -- at createInferenceState with size for the maximum tile count.
   flashPartialBuf : BufT
+  -- V11 split-K partial output: [numHeads, numSplits, headDim] f32.
+  -- numSplits = 8.  Sized for max numHeads * 8 * 256.
+  flashPartialOutV11 : BufT
+  -- V11 split-K partial meta: [numHeads, numSplits, 2] f32 (max, sum).
+  flashPartialMetaV11 : BufT
   -- Small GPU-side scratch for the raw Q6_K bytes of one per-layer
   -- embedding row (~33 KB for Gemma 4 e4b). The full per-layer
   -- embedding table lives on CPU (> WebGPU single-buffer limit); at
@@ -302,6 +308,11 @@ def createInferenceState [GPUBackend β] (ctx : β) (cfg : Config) : IO (Inferen
     plInputAll := ← mkBuf (max (cfg.embdPerLayer * cfg.numHiddenLayers) 1)
     flashPartialBuf := ← FlashAttention.createFlashPartialBuffer ctx
                           cfg.numAttentionHeads cfg.maxSeqLen (max cfg.headDimFull cfg.headDimSWA)
+    -- V11 split-K: numHeads * 8 * D * 4 bytes for partial_out, numHeads * 8 * 2 * 4 for meta.
+    flashPartialOutV11 := ← GPUBackend.allocBuffer ctx
+      (cfg.numAttentionHeads * 8 * (max cfg.headDimFull cfg.headDimSWA) * 4).toUSize
+    flashPartialMetaV11 := ← GPUBackend.allocBuffer ctx
+      (cfg.numAttentionHeads * 8 * 2 * 4).toUSize
     plRawRowBuf := ← do
       -- Raw Q6_K bytes for one per-layer-embd row:
       --   blocksPerRow = ceil((embdPerLayer * numLayers) / 256)
@@ -707,6 +718,9 @@ def forwardBlock [GPUBackend β] (ctx : β)
         let useScatter ← match ← IO.getEnv "HESPER_SCATTER_KV" with
                         | some "1" => pure true
                         | _        => pure false
+        let useFAV11 ← match ← IO.getEnv "HESPER_FA_V11" with
+                        | some "1" => pure true
+                        | _        => pure false
         match block.ropeFreqFactors, useScatter with
         | some freqFactors, false =>
           -- Default path: single fused hand-coded RoPE-K + KV-write kernel.
@@ -716,6 +730,22 @@ def forwardBlock [GPUBackend β] (ctx : β)
              ("k_cache", kvCache.kBuf), ("v_cache", kvCache.vBuf),
              ("params", state.paramsBuf), ("freq_factors", freqFactors)]
             (.dispatch1D kvDim)
+          -- V11 mirror: pack the just-written K (with RoPE) and V into f16
+          -- caches.  Two extra dispatches (K-mirror reads from kBuf2 + RoPE,
+          -- V-mirror reads from vCache).  Cost: ~0.5 µs/layer in unrolled
+          -- ShaderM dispatches; eliminated entirely once we fully migrate to
+          -- f16 cache and stop doing f32 writes.
+          if useFAV11 then
+            ce s!"ropeKWriteF16_{headDim}_{numKVHeads}_base{cfg.ropeBase li}"
+              (Attention.fusedRopeKAndCacheWriteKernelF16 numKVHeads cfg.maxSeqLen headDim kvDim (cfg.ropeBase li))
+              [("new_k", state.kBuf2), ("k_cache_f16", kvCache.kBufF16),
+               ("params", state.paramsBuf), ("freq_factors", freqFactors)]
+              (.dispatch1D (kvDim / 2))
+            ce s!"vPackF16_{headDim}_{numKVHeads}"
+              (Attention.packVCacheF32ToF16Kernel numKVHeads cfg.maxSeqLen headDim)
+              [("v_cache", kvCache.vBuf), ("v_cache_f16", kvCache.vBufF16),
+               ("params", state.paramsBuf)]
+              (.dispatch1D (numKVHeads * (headDim / 2)))
         | some freqFactors, true =>
           -- Circuit DSL path: ONE scatterMulti dispatch writes K (with NeoX RoPE)
           -- AND V (plain copy) into the cache.  Same semantics and same kernel
@@ -833,7 +863,18 @@ def forwardBlock [GPUBackend β] (ctx : β)
       --
       -- SWA masking isn't needed: cacheLen is already clamped to
       -- ≤ windowSize for SWA layers upstream.
-      if (← IO.getEnv "HESPER_FA_VEC").isSome then
+      if (← IO.getEnv "HESPER_FA_V11").isSome then
+        -- doc 60 Session 5 (V11): split-K + sub-warp partition + f16 K/V cache.
+        -- Two-kernel pipeline (partial → combine).  Reads f16 K/V caches
+        -- mirrored from f32 caches above.  Highest hesper FlashAttn variant
+        -- (24.3 µs partial + 1.7 µs combine at cacheLen=128 microbench).
+        let kcrLk := kcr.map (fun k key => k.getRef key)
+        FlashAttention.executeFlashAttentionV11 ctx
+          state.qBuf kvCache.kBufF16 kvCache.vBufF16 state.paramsBuf
+          state.flashPartialOutV11 state.flashPartialMetaV11 state.attnOutBuf
+          numHeads numKVHeads cfg.maxSeqLen headDim scale
+          (kcrLookup := kcrLk)
+      else if (← IO.getEnv "HESPER_FA_VEC").isSome then
         -- doc 60 Session 1: warp-shuffle vec kernel.  Same shape as the
         -- legacy dynamic kernel (gridX=numHeads), reduces dot products
         -- with subgroupAdd instead of a smem tree.  Keeps cacheLen
