@@ -1199,8 +1199,12 @@ def flashAttentionVecParamsKernelV11
   --     collision fix.  Size = numWarps * numSubWarps * headDim
   --   shared_warp_meta: (max, sum) per warp for cross-warp merge
   ShaderM.sharedNamed "shared_kq" (.array (.scalar .f32) workgroupSize)
+  -- B-path: shared_vkq holds per-warp partials only (numSubWarps fan-in
+  -- collapsed via warp shuffle).  Size = numWarps * headDim, 4× smaller
+  -- than V11's numWarps * numSubWarps * headDim.  Cuts the cross-warp
+  -- aggregation LDS+FFMA count from 256/thread → 64/thread.
   ShaderM.sharedNamed "shared_vkq"
-    (.array (.scalar .f32) (numWarps * numSubWarps * headDim))
+    (.array (.scalar .f32) (numWarps * headDim))
   ShaderM.sharedNamed "shared_warp_meta" (.array (.scalar .f32) (numWarps * 2))
 
   let laneId := Exp.bitAnd tid (Exp.litU32 31)
@@ -1215,7 +1219,11 @@ def flashAttentionVecParamsKernelV11
   -- Each word holds dims (2*(subLane*16+j), 2*(subLane*16+j)+1).
   -- Step 9c: RegArray ty n replaces 4 manual `Array String` arrays.
   let qBase := Exp.mul head (Exp.litU32 headDim)
-  let dThreadBase := Exp.mul subLane (Exp.litU32 dimsPerLane)  -- f32 dim base
+  -- Materialise dThreadBase via let' so it's a single PTX register, not
+  -- recomputed at each of the ~50 use sites in the unrolled body.  This
+  -- alone removes ~50 mul.lo.u32 / shl.b32 instructions.
+  let dThreadBase ← ShaderM.let' (.scalar .u32)
+                       (Exp.mul subLane (Exp.litU32 dimsPerLane))  -- f32 dim base
   -- Pre-load Q values then scale-init the registers.  Has to be 2 passes
   -- because RegArray.mk's init function is pure (Nat → Exp), it can't
   -- itself perform `readBuffer` (a ShaderM action).
@@ -1440,22 +1448,41 @@ def flashAttentionVecParamsKernelV11
       (Exp.add metaIdx (Exp.litU32 1)) (Exp.var warpKqSumName)
   ) (pure ())
 
-  -- Each thread writes its VKQ partial to a distinct slot.
-  -- Slot index: ((warpId * numSubWarps) + subWarp) * D + (subLane*32 + 2*pk + {0,1})
-  --           = (warpId * numSubWarps + subWarp) * D + dThreadBase + 2*pk + {0,1}
-  let bigSlotBase ← ShaderM.let' (.scalar .u32)
-                       (Exp.mul (Exp.add (Exp.mul warpId (Exp.litU32 numSubWarps))
-                                          subWarp)
-                                 (Exp.litU32 headDim))
+  -- B-path Phase 4a: cross-sub-warp aggregation via warp shuffle xor 8, 16.
+  -- Each thread's vkq[pk] is a partial over its sub-warp's 8 K-positions.
+  -- The 4 sub-warps (s ∈ [0:4]) within a warp processed different K-ranges
+  -- but contribute partials for the SAME dim slice [subLane*32, +32).  Sum
+  -- them with butterfly xor 8 (sub-warp 0↔1, 2↔3) and xor 16 (cross-pair).
+  -- After this, each thread holds the warp-total for its dim slice — same
+  -- value across all 4 sub-warps within the warp (broadcast outcome).
   for pk in [0:dPerLanePair] do
-    let d0 := Exp.add dThreadBase (Exp.litU32 (pk * 2))
-    let d1 := Exp.add d0 (Exp.litU32 1)
-    let slot0 := Exp.add bigSlotBase d0
-    let slot1 := Exp.add bigSlotBase d1
-    ShaderM.writeWorkgroup (ty := .scalar .f32) "shared_vkq" slot0
-      (Exp.var vkq0Vars[pk]!)
-    ShaderM.writeWorkgroup (ty := .scalar .f32) "shared_vkq" slot1
-      (Exp.var vkq1Vars[pk]!)
+    let v0 : Exp (.scalar .f32) := Exp.var vkq0Vars[pk]!
+    let v1 : Exp (.scalar .f32) := Exp.var vkq1Vars[pk]!
+    -- xor 8: combine sub-warps (0,1) and (2,3)
+    let v0a := Exp.add v0 (Exp.subgroupShuffleXor v0 (Exp.litU32 8))
+    let v1a := Exp.add v1 (Exp.subgroupShuffleXor v1 (Exp.litU32 8))
+    -- xor 16: combine the two pairs
+    let v0b := Exp.add v0a (Exp.subgroupShuffleXor v0a (Exp.litU32 16))
+    let v1b := Exp.add v1a (Exp.subgroupShuffleXor v1a (Exp.litU32 16))
+    ShaderM.assign vkq0Vars[pk]! v0b
+    ShaderM.assign vkq1Vars[pk]! v1b
+
+  -- Phase 4b: write the per-warp totals to smem.  All 4 sub-warps in a warp
+  -- now hold the SAME value, so only sub-warp 0 needs to write (saves
+  -- 3× redundant smem writes).  Layout: shared_vkq[warpId * D + d].
+  let warpSlotBase ← ShaderM.let' (.scalar .u32)
+                       (Exp.mul warpId (Exp.litU32 headDim))
+  ShaderM.if_ (Exp.eq subWarp (Exp.litU32 0)) (do
+    for pk in [0:dPerLanePair] do
+      let d0 := Exp.add dThreadBase (Exp.litU32 (pk * 2))
+      let d1 := Exp.add d0 (Exp.litU32 1)
+      let slot0 := Exp.add warpSlotBase d0
+      let slot1 := Exp.add warpSlotBase d1
+      ShaderM.writeWorkgroup (ty := .scalar .f32) "shared_vkq" slot0
+        (Exp.var vkq0Vars[pk]!)
+      ShaderM.writeWorkgroup (ty := .scalar .f32) "shared_vkq" slot1
+        (Exp.var vkq1Vars[pk]!)
+  ) (pure ())
   ShaderM.barrier
 
   -- Block-local global max/sum across warps (NOT sub-warps; sub-warps within
@@ -1487,16 +1514,12 @@ def flashAttentionVecParamsKernelV11
   let partialBase := Exp.add (Exp.mul head
                                        (Exp.mul (Exp.litU32 numSplits) (Exp.litU32 headDim)))
                               (Exp.mul splitIdx (Exp.litU32 headDim))
-  -- LDS.128 vec4 path: each thread aggregates 4 consecutive dims at a time
-  -- via one ld.shared.v4.f32 per (w, s).  Reduces LDS instruction count
-  -- 4× from 256 → 64 per thread, relieving MIO-pipe saturation that ncu
-  -- attributed to shared-memory traffic, not global LDG.
+  -- B-path: cross-warp aggregation reads only numWarps partials per dim
+  -- (sub-warp dimension already collapsed via shuffle).  LDS count per
+  -- thread: numWarps * numQuads = 4 * 8 = 32 LDS.128 = 8× fewer than V11.
   --
-  -- Slot layout for shared_vkq:
-  --   (warpId * numSubWarps + subWarp) * D + (subLane*32 + 4*quad + j)
-  -- where quad in [0:8] groups 4 consecutive dims, j in [0:4].
-  -- dThreadBase = subLane * 32 is 4-aligned, bigBase is 4-aligned, so
-  -- slot = bigBase + dThreadBase + 4*quad is 4-aligned.
+  -- Slot layout for shared_vkq (B):
+  --   warpId * D + (subLane*32 + 4*quad + j)
   let numQuads := dPerLanePair / 2  -- = 8 (16 pk pairs / 2 = 8 quads of 4 dims)
   for quad in [0:numQuads] do
     let dBase := Exp.add dThreadBase (Exp.litU32 (quad * 4))
@@ -1505,15 +1528,14 @@ def flashAttentionVecParamsKernelV11
     let acc2Var ← ShaderM.var (.scalar .f32) (Exp.litF32 0.0)
     let acc3Var ← ShaderM.var (.scalar .f32) (Exp.litF32 0.0)
     for w in [0:numWarps] do
-      for s in [0:numSubWarps] do
-        let bigBase := (w * numSubWarps + s) * headDim
-        let slotBase := Exp.add (Exp.litU32 bigBase) dBase
-        let (v0, v1, v2, v3) ← ShaderM.readWorkgroupF32x4 "shared_vkq" slotBase
-        let weight := Exp.var weightVars[w]!
-        ShaderM.assign acc0Var (Exp.add (Exp.var acc0Var) (Exp.mul v0 weight))
-        ShaderM.assign acc1Var (Exp.add (Exp.var acc1Var) (Exp.mul v1 weight))
-        ShaderM.assign acc2Var (Exp.add (Exp.var acc2Var) (Exp.mul v2 weight))
-        ShaderM.assign acc3Var (Exp.add (Exp.var acc3Var) (Exp.mul v3 weight))
+      let warpBase := w * headDim
+      let slotBase := Exp.add (Exp.litU32 warpBase) dBase
+      let (v0, v1, v2, v3) ← ShaderM.readWorkgroupF32x4 "shared_vkq" slotBase
+      let weight := Exp.var weightVars[w]!
+      ShaderM.assign acc0Var (Exp.add (Exp.var acc0Var) (Exp.mul v0 weight))
+      ShaderM.assign acc1Var (Exp.add (Exp.var acc1Var) (Exp.mul v1 weight))
+      ShaderM.assign acc2Var (Exp.add (Exp.var acc2Var) (Exp.mul v2 weight))
+      ShaderM.assign acc3Var (Exp.add (Exp.var acc3Var) (Exp.mul v3 weight))
     let outBase := Exp.add partialBase dBase
     ShaderM.writeBuffer (ty := .scalar .f32) "partial_out"
       outBase (Exp.var acc0Var)
