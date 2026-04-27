@@ -295,7 +295,13 @@ def matMulTransposeF16BlockCoopKernel (config : Config) : ShaderM Unit := do
     let a0 ← ShaderM.readBuffer (ty := .scalar .f32) (n := config.K) "a" kIdx0
     let a1 ← ShaderM.readBuffer (ty := .scalar .f32) (n := config.K) "a" kIdx1
 
-    ShaderM.assign "acc" (Exp.add acc (Exp.add (Exp.mul a0 b0) (Exp.mul a1 b1)))
+    -- Two chained fmas: acc = a0 * b0 + acc; acc = a1 * b1 + acc.
+    -- Maps to two `fma.rn.f32` PTX inst (vs the previous mul + add chain
+    -- that emitted 4 inst when ptxas didn't fold them).  Matches
+    -- llama.cpp's `mul_mat_vec_f<half,float>` inner loop (mmvf.cu:175-177)
+    -- which uses `ggml_cuda_mad` = `__fmaf_rn` for both lanes.
+    ShaderM.assign "acc" (Exp.fma a0 b0 acc)
+    ShaderM.assign "acc" (Exp.fma a1 b1 (Exp.var "acc" : Exp (.scalar .f32)))
 
   ShaderM.varNamed "totalSum" (.scalar .f32) (Exp.subgroupAdd acc)
   let totalSum : Exp (.scalar .f32) := Exp.var "totalSum"
