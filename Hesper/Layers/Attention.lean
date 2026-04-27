@@ -824,62 +824,56 @@ def fusedRopeKAndCacheWriteBatchKernelF16
                        (.array (.scalar .f32) halfDim)
 
   ShaderM.if_ (Exp.lt idx (Exp.litU32 totalPairs)) (do
-    let col := Exp.div idx (Exp.litU32 perTokenPairs)
-    let withinTok := Exp.sub idx (Exp.mul col (Exp.litU32 perTokenPairs))
-    let kvHead := Exp.div withinTok (Exp.litU32 halfDim)
-    let dPair := Exp.mod withinTok (Exp.litU32 halfDim)
+    let col := idx / perTokenPairs
+    let withinTok := idx - col * perTokenPairs
+    let kvHead := withinTok / halfDim
+    let dPair := withinTok % halfDim
 
     let startPos ← ShaderM.readBuffer (ty := .scalar .u32) (n := 1) "params" (Exp.litU32 0)
-    let pos := Exp.add startPos col
+    let pos := startPos + col
     let posF32 := Exp.toF32 pos
 
-    let dLo : Exp (.scalar .u32) := Exp.mul (Exp.litU32 2) dPair
-    let dHi : Exp (.scalar .u32) := Exp.add dLo (Exp.litU32 1)
+    let dLo : Exp (.scalar .u32) := 2 * dPair
+    let dHi : Exp (.scalar .u32) := dLo + 1
 
     -- Input row base for this token: col * kvDim + kvHead * headDim
-    let colBase := Exp.mul col (Exp.litU32 kvDim)
-    let kvHeadBase := Exp.add colBase (Exp.mul kvHead (Exp.litU32 headDim))
+    let kvHeadBase := col * kvDim + kvHead * headDim
 
     let dLoInLow := Exp.lt dLo (Exp.litU32 halfDim)
     let dHiInLow := Exp.lt dHi (Exp.litU32 halfDim)
-    let dLoPartner : Exp (.scalar .u32) := Exp.select dLoInLow
-      (Exp.add dLo (Exp.litU32 halfDim)) (Exp.sub dLo (Exp.litU32 halfDim))
-    let dHiPartner : Exp (.scalar .u32) := Exp.select dHiInLow
-      (Exp.add dHi (Exp.litU32 halfDim)) (Exp.sub dHi (Exp.litU32 halfDim))
+    let dLoPartner : Exp (.scalar .u32) :=
+      Exp.select dLoInLow (dLo + halfDim) (dLo - halfDim)
+    let dHiPartner : Exp (.scalar .u32) :=
+      Exp.select dHiInLow (dHi + halfDim) (dHi - halfDim)
 
     let kFromN : Exp (.array (.scalar .f32) (kvDim * seqLen)) := Exp.var "new_k"
     let vFromN : Exp (.array (.scalar .f32) (kvDim * seqLen)) := Exp.var "new_v"
-    let xLoSelf := Exp.index kFromN (Exp.add kvHeadBase dLo)
-    let xLoPair := Exp.index kFromN (Exp.add kvHeadBase dLoPartner)
-    let xHiSelf := Exp.index kFromN (Exp.add kvHeadBase dHi)
-    let xHiPair := Exp.index kFromN (Exp.add kvHeadBase dHiPartner)
-    let vLo     := Exp.index vFromN (Exp.add kvHeadBase dLo)
-    let vHi     := Exp.index vFromN (Exp.add kvHeadBase dHi)
+    let xLoSelf := Exp.index kFromN (kvHeadBase + dLo)
+    let xLoPair := Exp.index kFromN (kvHeadBase + dLoPartner)
+    let xHiSelf := Exp.index kFromN (kvHeadBase + dHi)
+    let xHiPair := Exp.index kFromN (kvHeadBase + dHiPartner)
+    let vLo     := Exp.index vFromN (kvHeadBase + dLo)
+    let vHi     := Exp.index vFromN (kvHeadBase + dHi)
 
     let computeRotated (d : Exp (.scalar .u32)) (dInLow : Exp (.scalar .bool))
                        (xSelf xPair : Exp (.scalar .f32))
         : Exp (.scalar .f32) := Id.run do
-      let dimPair := Exp.select dInLow d (Exp.sub d (Exp.litU32 halfDim))
-      let freqFactor := Exp.index (Exp.var "freq_factors" : Exp (.array (.scalar .f32) halfDim)) dimPair
-      let dimPairF32 := Exp.toF32 dimPair
-      let exponent := Exp.div (Exp.mul (Exp.litF32 2.0) dimPairF32) (Exp.litF32 headDim.toFloat)
-      let freqInv := Exp.pow (Exp.litF32 ropeBase) (Exp.neg exponent)
-      let theta := Exp.div (Exp.mul posF32 freqInv) freqFactor
+      let dimPair := Exp.select dInLow d (d - halfDim)
+      let freqFactor :=
+        Exp.index (Exp.var "freq_factors" : Exp (.array (.scalar .f32) halfDim)) dimPair
+      let exponent := 2.0 * Exp.toF32 dimPair / headDim.toFloat
+      let theta := posF32 * Exp.pow (Exp.litF32 ropeBase) (Exp.neg exponent) / freqFactor
       let cosTheta := Exp.cos theta
       let sinTheta := Exp.sin theta
       let x0 := Exp.select dInLow xSelf xPair
       let x1 := Exp.select dInLow xPair xSelf
-      let x0_new := Exp.sub (Exp.mul x0 cosTheta) (Exp.mul x1 sinTheta)
-      let x1_new := Exp.add (Exp.mul x0 sinTheta) (Exp.mul x1 cosTheta)
-      Exp.select dInLow x0_new x1_new
+      Exp.select dInLow (x0 * cosTheta - x1 * sinTheta) (x0 * sinTheta + x1 * cosTheta)
 
     let yLo := computeRotated dLo dLoInLow xLoSelf xLoPair
     let yHi := computeRotated dHi dHiInLow xHiSelf xHiPair
 
     -- f16 cache layout: kvHead * maxSeqLen * halfDim + pos * halfDim + dPair
-    let cacheU32Idx := Exp.add
-      (Exp.mul kvHead (Exp.litU32 (maxSeqLen * halfDim)))
-      (Exp.add (Exp.mul pos (Exp.litU32 halfDim)) dPair)
+    let cacheU32Idx := kvHead * (maxSeqLen * halfDim) + pos * halfDim + dPair
     let kPacked := Exp.pack2x16float (Exp.vec2 yLo yHi)
     let vPacked := Exp.pack2x16float (Exp.vec2 vLo vHi)
     ShaderM.writeBuffer (ty := .scalar .u32) "k_cache_f16" cacheU32Idx kPacked

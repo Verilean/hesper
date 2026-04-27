@@ -999,6 +999,51 @@ instance : HShiftLeft (Exp (.scalar .u32)) (Exp (.scalar .u32)) (Exp (.scalar .u
 instance : HShiftRight (Exp (.scalar .u32)) (Exp (.scalar .u32)) (Exp (.scalar .u32)) where
   hShiftRight := Exp.shiftRight
 
+/-- Mixed-arity arithmetic with Lean literals.  Allows
+    `pos + 1` instead of `Exp.add pos (Exp.litU32 1)`,
+    `2 * dPair` instead of `Exp.mul (Exp.litU32 2) dPair`,
+    `x * 0.5` (f32) instead of `Exp.mul x (Exp.litF32 0.5)`, etc.
+    Available for u32 + Nat (both directions) and f32 + Float (both
+    directions).  Matches the Hesper convention that kernel arithmetic
+    keeps the typed `Exp _` wrapper visible at every site so PTX lowering
+    can pick the right instruction. -/
+
+-- u32 ↔ Nat
+instance : HAdd (Exp (.scalar .u32)) Nat (Exp (.scalar .u32)) where
+  hAdd x n := Exp.add x (Exp.litU32 n)
+instance : HAdd Nat (Exp (.scalar .u32)) (Exp (.scalar .u32)) where
+  hAdd n x := Exp.add (Exp.litU32 n) x
+instance : HSub (Exp (.scalar .u32)) Nat (Exp (.scalar .u32)) where
+  hSub x n := Exp.sub x (Exp.litU32 n)
+instance : HSub Nat (Exp (.scalar .u32)) (Exp (.scalar .u32)) where
+  hSub n x := Exp.sub (Exp.litU32 n) x
+instance : HMul (Exp (.scalar .u32)) Nat (Exp (.scalar .u32)) where
+  hMul x n := Exp.mul x (Exp.litU32 n)
+instance : HMul Nat (Exp (.scalar .u32)) (Exp (.scalar .u32)) where
+  hMul n x := Exp.mul (Exp.litU32 n) x
+instance : HDiv (Exp (.scalar .u32)) Nat (Exp (.scalar .u32)) where
+  hDiv x n := Exp.div x (Exp.litU32 n)
+instance : HMod (Exp (.scalar .u32)) Nat (Exp (.scalar .u32)) where
+  hMod x n := Exp.mod x (Exp.litU32 n)
+
+-- f32 ↔ Float
+instance : HAdd (Exp (.scalar .f32)) Float (Exp (.scalar .f32)) where
+  hAdd x f := Exp.add x (Exp.litF32 f)
+instance : HAdd Float (Exp (.scalar .f32)) (Exp (.scalar .f32)) where
+  hAdd f x := Exp.add (Exp.litF32 f) x
+instance : HSub (Exp (.scalar .f32)) Float (Exp (.scalar .f32)) where
+  hSub x f := Exp.sub x (Exp.litF32 f)
+instance : HSub Float (Exp (.scalar .f32)) (Exp (.scalar .f32)) where
+  hSub f x := Exp.sub (Exp.litF32 f) x
+instance : HMul (Exp (.scalar .f32)) Float (Exp (.scalar .f32)) where
+  hMul x f := Exp.mul x (Exp.litF32 f)
+instance : HMul Float (Exp (.scalar .f32)) (Exp (.scalar .f32)) where
+  hMul f x := Exp.mul (Exp.litF32 f) x
+instance : HDiv (Exp (.scalar .f32)) Float (Exp (.scalar .f32)) where
+  hDiv x f := Exp.div x (Exp.litF32 f)
+instance : HDiv Float (Exp (.scalar .f32)) (Exp (.scalar .f32)) where
+  hDiv f x := Exp.div (Exp.litF32 f) x
+
 /-- Allow shifting by a Lean Nat literal: `x >>> 3` instead of
     `x >>> Exp.litU32 3`.  Same for `<<<`. -/
 instance : HShiftLeft (Exp (.scalar .u32)) Nat (Exp (.scalar .u32)) where
