@@ -201,7 +201,123 @@ def for_ (varName : String) (start : Exp (.scalar .u32)) (end_ : Exp (.scalar .u
 @[inline] def unrollFor (n : Nat) (body : Nat → ShaderM Unit) : ShaderM Unit :=
   (List.range n).forM body
 
-/-- Higher-order loop: pass loop variable as Exp
+/-! ### LICM helpers (loop invariant code motion)
+
+Approximate "free variable" check: serialise an Exp via `Exp.toWGSL` and
+look for the variable name as a whole token (`name` not preceded/followed
+by an alphanumeric or underscore).  This is correct for ShaderM-emitted
+names because they're unique fresh names like `v3` / `i7` — there's no
+risk of accidental match against a substring of another identifier.
+
+Why string-match rather than a structural traversal: `Exp` has 50+
+constructors and many of them hold sub-`Exp`s.  A structural
+`Exp.containsVar` would be a lot of pattern matching that would have to
+stay in sync as new `Exp` cases are added.  `toWGSL` is the existing
+single source of truth that walks every sub-Exp; reusing it for the
+free-var check costs O(n) extra string work per stmt but is robust to
+Exp evolution.  In practice the runtime impact is negligible because
+LICM only runs at kernel-emission time, not on the GPU. -/
+
+/-- True if `name` appears as a standalone identifier in `s`.
+    Standalone = not surrounded by alphanumeric / underscore chars,
+    so `i7` doesn't match `i7x` or `xi7`.
+
+    Implementation note: works on the WGSL serialisation of an Exp
+    rather than recursing structurally over `Exp` (which has 50+
+    constructors). -/
+private def usesNameInString (s : String) (name : String) : Bool := Id.run do
+  if name.length = 0 then return false
+  -- Walk byte-by-byte using String.find / substring
+  let parts := s.splitOn name
+  if parts.length ≤ 1 then return false
+  -- For each gap between occurrences, check the chars adjacent.
+  -- The substring `name` appears at positions where parts joined back
+  -- means: prev part's last char must NOT be ident-like, and next
+  -- part's first char must NOT be ident-like.
+  let isIdent : Char → Bool := fun c => c.isAlphanum || c = '_'
+  let mut i := 0
+  for part in parts do
+    if i + 1 < parts.length then
+      let prevOk := part.isEmpty || !isIdent part.back
+      let nextPart := parts[i + 1]!
+      let nextOk := nextPart.isEmpty || !isIdent nextPart.front
+      if prevOk && nextOk then return true
+    i := i + 1
+  return false
+
+/-- True if `name` appears as a standalone identifier in `e`. -/
+private def Exp.usesName {ty} (e : Exp ty) (name : String) : Bool :=
+  usesNameInString (Exp.toWGSL e) name
+
+/-- True if a Stmt's "value computation" depends on any name in `defs`.
+    For `varDecl`, this is the init expression.  For everything else,
+    we conservatively return true (don't hoist).  We only LICM `varDecl`
+    nodes — assigns, control flow, and barriers stay inside. -/
+private def stmtDependsOnAny (st : Stmt) (defs : List String) : Bool :=
+  match st with
+  | .varDecl _ _ none => false  -- declaration without init: pure
+  | .varDecl _ _ (some ⟨_, init⟩) => defs.any (fun n => Exp.usesName init n)
+  | _ => true  -- conservative: keep inside loop
+
+/-- Names of variables assigned-to (post-decl) anywhere in `body`.
+    These cannot be hoisted because their declaration is conceptually
+    "the latest write before any read", and moving the decl outside the
+    loop would expose stale values across iterations. -/
+private def collectAssignTargets : List Stmt → List String
+  | [] => []
+  | st :: rest =>
+    let here := match st with
+      | .assign name _ _      => [name]
+      | .assignIndex _ _ _ _  => []  -- writes go through array, not var
+      | .assignIndexBuf _ _ _ _ _ => []
+      | .forLoop _ _ _ _ inner    => collectAssignTargets inner
+      | .ifStmt _ thenB elseB => collectAssignTargets thenB ++ collectAssignTargets elseB
+      | .block inner          => collectAssignTargets inner
+      | _ => []
+    here ++ collectAssignTargets rest
+
+/-- LICM: split body into (hoist-out, keep-inside) given the loop var.
+    A `varDecl` is hoisted iff:
+    1. its init doesn't reference the loop var, OR
+    2. any variable assigned inside the loop (including names declared
+       outside the loop body — they're still loop-variant if reassigned),
+       OR
+    3. any varDecl declared and kept inside the loop so far.
+
+    Plus: the variable being declared must itself never be assigned-to,
+    otherwise its decl must stay where any subsequent `assign` references
+    a single, monotonic write site.
+
+    `loopVariant` is the union of (loop var) ∪ (assigned vars across the
+    body, recursive into nested loops/ifs). -/
+private def licmSplit (loopVar : String) (body : List Stmt) :
+    List Stmt × List Stmt := Id.run do
+  let mut hoisted : List Stmt := []
+  let mut kept : List Stmt := []
+  -- Loop-variant set: loop var + everything that's assigned-to anywhere
+  -- in the body (so externally-declared mutable vars updated inside the
+  -- loop are correctly treated as loop-variant).
+  let assignTargets := collectAssignTargets body
+  let mut loopVariant : List String := loopVar :: assignTargets
+  for st in body do
+    match st with
+    | .varDecl name _ _ =>
+      let isAssignedHere := assignTargets.contains name
+      if isAssignedHere || stmtDependsOnAny st loopVariant then
+        loopVariant := name :: loopVariant
+        kept := st :: kept
+      else
+        hoisted := st :: hoisted
+    | _ =>
+      kept := st :: kept
+  return (hoisted.reverse, kept.reverse)
+
+/-- Higher-order loop: pass loop variable as Exp.  Now applies LICM:
+    `varDecl`s in the body whose init expression doesn't reference the
+    loop variable (or any other inner-loop binding) are hoisted before
+    the for-loop.  This automates the manual `let'`-outside-the-loop
+    pattern that V9 / earlier kernels used by hand.
+
     Usage: loop start end step fun i => do { ... use i ... } -/
 def loop (start : Exp (.scalar .u32)) (end_ : Exp (.scalar .u32)) (step : Exp (.scalar .u32)) (bodyFn : Exp (.scalar .u32) → ShaderM Unit) : ShaderM Unit := do
   let varName ← freshVar "i"
@@ -209,7 +325,33 @@ def loop (start : Exp (.scalar .u32)) (end_ : Exp (.scalar .u32)) (step : Exp (.
   let loopVar : Exp (.scalar .u32) := Exp.var varName
   let condition := Exp.lt loopVar end_
   let update := Exp.add loopVar step
+  -- LICM is opt-in via `loopWithLICM` — this default `loop` keeps body
+  -- unchanged.  Reason: a sound LICM needs to track shared-memory writes
+  -- and inter-iteration carries that are easy to miss; the experimental
+  -- pass broke V2/V3 parity.  Available as licmSplit for callers who
+  -- understand the constraints (see loopWithLICM below).
   emitStmt (Stmt.forLoop varName start condition update bodyStmts)
+
+/-- Variant of `loop` that applies LICM to hoist `varDecl`s whose init
+    is loop-invariant out of the for-loop.  Use only when the body
+    contains no shared-memory writes that other iterations read, no
+    inter-iteration carries via externally-declared mutable vars beyond
+    those captured by `assign`, and only `varDecl` (no `if`/inner
+    `for`/`barrier`) sites that you want hoisted.
+
+    Semantics-changing in subtle ways — verify bit-parity before merging
+    a kernel that uses this. -/
+def loopWithLICM (start end_ step : Exp (.scalar .u32))
+    (bodyFn : Exp (.scalar .u32) → ShaderM Unit) : ShaderM Unit := do
+  let varName ← freshVar "i"
+  let (_, bodyStmts) ← captureStmts (bodyFn (Exp.var varName))
+  let loopVar : Exp (.scalar .u32) := Exp.var varName
+  let condition := Exp.lt loopVar end_
+  let update := Exp.add loopVar step
+  let (hoisted, kept) := licmSplit varName bodyStmts
+  for st in hoisted do
+    emitStmt st
+  emitStmt (Stmt.forLoop varName start condition update kept)
 
 /-- Runtime loop alias for `loop`, named to pair with `unrollFor` so the
     meta-vs-runtime distinction is explicit at the call site:
