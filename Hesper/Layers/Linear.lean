@@ -1908,6 +1908,165 @@ def fusedQ4KMGateUpDP4A4RowKernel (config : Config) : ShaderM Unit := do
     ShaderM.writeBuffer (ty := .scalar .f32) "output" outIdx (Exp.mul gelu totalU)
   ) (pure ())
 
+/-- Single-Linear 4-row Q4_K dp4a kernel.
+
+    Same workgroup layout as `fusedQ4KMGateUpDP4A4RowKernel` (4 rows per
+    WG, 1 warp per row, 128 threads, smem-shared Q8_1 input) but with a
+    single weight buffer and no GELU/Mul epilogue.  Used for wO,
+    postLinear, PLE inpGate/proj, perLayer projection — every Q4_K
+    Linear that is NOT the fused gate+up FFN.
+
+    Compared to `fusedQ4KMLinearDP4A4WarpKernel` (the previous default,
+    which uses 4 warps cooperatively on a SINGLE row):
+      - 4× fewer workgroups dispatched (outDim/4 vs outDim)
+      - 4× fewer threads launched (same 128/WG but 4 useful rows each)
+      - input Q8_1 reused 4× across the 4 rows in smem (instead of 4×
+        global re-reads)
+      - matches llama.cpp's `mul_mat_vec_q<Q4_K, 1, nwarps=4>` pattern.
+
+    Dispatch: (⌈outDim / 4⌉, 1, 1) workgroups × 128 threads. -/
+def fusedQ4KMLinearDP4A4RowKernel (config : Config) : ShaderM Unit := do
+  let wid ← ShaderM.workgroupId
+  let lid ← ShaderM.localId
+  let quadIdx := Exp.vec3X wid
+  let tid := Exp.vec3X lid                           -- 0..127
+  let subgroupId := Exp.shiftRight tid (Exp.litU32 5) -- 0..3 (row in quad)
+  let laneId := Exp.bitAnd tid (Exp.litU32 31)        -- 0..31 (dp4a lane)
+  let outIdx := Exp.add (Exp.mul quadIdx (Exp.litU32 4)) subgroupId
+
+  let blocksPerRow := config.inDim / 256
+  let totalWeightU32 := config.outDim * blocksPerRow * 36
+  let q8BlocksPerRow := config.inDim / 32
+  let q8InputU32Size := q8BlocksPerRow * 9
+
+  let _weights ← ShaderM.declareReadOnlyBuffer "weights" (.array (.scalar .u32) totalWeightU32)
+  let _input   ← ShaderM.declareReadOnlyBuffer "input_q8" (.array (.scalar .u32) q8InputU32Size)
+  let _output  ← ShaderM.declareOutputBuffer "output"     (.array (.scalar .f32) config.outDim)
+
+  -- Cooperative smem staging of Q8_1 input — same pattern as the
+  -- gate+up 4-row kernel.  All 4 rows in the WG read the same input,
+  -- so loading once into smem cuts global input traffic by 4×.
+  ShaderM.sharedNamed "s_input_q8" (.array (.scalar .u32) q8InputU32Size)
+  let perThread : Nat := (q8InputU32Size + 127) / 128
+  for i in [0 : perThread] do
+    let idx := Exp.add tid (Exp.litU32 (i * 128))
+    ShaderM.if_ (Exp.lt idx (Exp.litU32 q8InputU32Size)) (do
+      let v ← ShaderM.readBuffer (ty := .scalar .u32) (n := q8InputU32Size) "input_q8" idx
+      ShaderM.writeWorkgroup (ty := .scalar .u32) "s_input_q8" idx v
+    ) (pure ())
+  ShaderM.barrier
+
+  let inBounds := Exp.lt outIdx (Exp.litU32 config.outDim)
+
+  ShaderM.varNamed "acc" (.scalar .f32) (Exp.litF32 0.0)
+  let acc : Exp (.scalar .f32) := Exp.var "acc"
+
+  let rowBaseU32 := Exp.mul outIdx (Exp.litU32 (blocksPerRow * 36))
+
+  -- Lane decomposition (lanes 0..15 + 16..31 process 2 blocks per outer iter).
+  let laneLow := Exp.bitAnd laneId (Exp.litU32 15)
+  let blockOff := Exp.shiftRight laneId (Exp.litU32 4)  -- 0 or 1
+  let pairIdx := Exp.div laneLow (Exp.litU32 4)
+  let elemOff := Exp.sub laneLow (Exp.mul pairIdx (Exp.litU32 4))
+  let bq8Off := Exp.mul pairIdx (Exp.litU32 2)
+
+  let halvedTrip := (blocksPerRow + 1) / 2
+  for iterNat in [0 : halvedTrip] do
+    let iterU32 := Exp.litU32 iterNat
+    let blockIdx := Exp.add (Exp.mul iterU32 (Exp.litU32 2)) blockOff
+    let blockInRange :=
+      if 2 * iterNat + 1 < blocksPerRow then
+        Exp.litBool true
+      else
+        Exp.lt blockIdx (Exp.litU32 blocksPerRow)
+    let safeBlockIdx := Exp.select blockInRange blockIdx (Exp.litU32 0)
+    let blockU32Base := Exp.add rowBaseU32 (Exp.mul safeBlockIdx (Exp.litU32 36))
+
+    let dmU32 ← ShaderM.readBuffer (ty := .scalar .u32) (n := totalWeightU32) "weights" blockU32Base
+    let dF := fp16ToF32 (Exp.bitAnd dmU32 (Exp.litU32 0xFFFF))
+    let dminF := fp16ToF32 (Exp.shiftRight dmU32 (Exp.litU32 16))
+
+    let sc0 ← ShaderM.readBuffer (ty := .scalar .u32) (n := totalWeightU32) "weights" (Exp.add blockU32Base (Exp.litU32 1))
+    let sc1 ← ShaderM.readBuffer (ty := .scalar .u32) (n := totalWeightU32) "weights" (Exp.add blockU32Base (Exp.litU32 2))
+    let sc2 ← ShaderM.readBuffer (ty := .scalar .u32) (n := totalWeightU32) "weights" (Exp.add blockU32Base (Exp.litU32 3))
+
+    let extractScaleMin (is : Exp (.scalar .u32)) : Exp (.scalar .f32) × Exp (.scalar .f32) :=
+      let isLow := Exp.lt is (Exp.litU32 4)
+      let shift4 := Exp.mul is (Exp.litU32 8)
+      let scaleLow := Exp.bitAnd (Exp.shiftRight sc0 shift4) (Exp.litU32 0x3F)
+      let minLow   := Exp.bitAnd (Exp.shiftRight sc1 shift4) (Exp.litU32 0x3F)
+      let isHi := Exp.sub is (Exp.litU32 4)
+      let shiftHi := Exp.mul isHi (Exp.litU32 8)
+      let scaleHiLo := Exp.bitAnd (Exp.shiftRight sc2 shiftHi) (Exp.litU32 0x0F)
+      let scaleHiHi := Exp.shiftLeft
+        (Exp.bitAnd (Exp.shiftRight sc0 (Exp.add shiftHi (Exp.litU32 6))) (Exp.litU32 0x03))
+        (Exp.litU32 4)
+      let scaleHigh := Exp.bitOr scaleHiLo scaleHiHi
+      let minHiLo := Exp.bitAnd (Exp.shiftRight sc2 (Exp.add shiftHi (Exp.litU32 4))) (Exp.litU32 0x0F)
+      let minHiHi := Exp.shiftLeft
+        (Exp.bitAnd (Exp.shiftRight sc1 (Exp.add shiftHi (Exp.litU32 6))) (Exp.litU32 0x03))
+        (Exp.litU32 4)
+      let minHigh := Exp.bitOr minHiLo minHiHi
+      let scaleU := Exp.select isLow scaleLow scaleHigh
+      let minU   := Exp.select isLow minLow   minHigh
+      (Exp.toF32 scaleU, Exp.toF32 minU)
+
+    let (scA, mA) := extractScaleMin bq8Off
+    let (scB, mB) := extractScaleMin (Exp.add bq8Off (Exp.litU32 1))
+
+    let q4BaseIdx := Exp.add blockU32Base
+      (Exp.add (Exp.litU32 4) (Exp.add (Exp.mul bq8Off (Exp.litU32 4)) elemOff))
+    let v0 ← ShaderM.readBuffer (ty := .scalar .u32) (n := totalWeightU32) "weights" q4BaseIdx
+    let v1 ← ShaderM.readBuffer (ty := .scalar .u32) (n := totalWeightU32) "weights" (Exp.add q4BaseIdx (Exp.litU32 4))
+
+    -- Q8_1 input from smem.
+    let q8Sub0Base := Exp.add (Exp.mul safeBlockIdx (Exp.litU32 (8 * 9))) (Exp.mul bq8Off (Exp.litU32 9))
+    let q8Sub1Base := Exp.add q8Sub0Base (Exp.litU32 9)
+    let u0 ← ShaderM.readWorkgroup (ty := .scalar .u32) (n := q8InputU32Size) "s_input_q8" (Exp.add q8Sub0Base (Exp.add (Exp.litU32 1) elemOff))
+    let u1 ← ShaderM.readWorkgroup (ty := .scalar .u32) (n := q8InputU32Size) "s_input_q8" (Exp.add q8Sub0Base (Exp.add (Exp.litU32 5) elemOff))
+    let u2 ← ShaderM.readWorkgroup (ty := .scalar .u32) (n := q8InputU32Size) "s_input_q8" (Exp.add q8Sub1Base (Exp.add (Exp.litU32 1) elemOff))
+    let u3 ← ShaderM.readWorkgroup (ty := .scalar .u32) (n := q8InputU32Size) "s_input_q8" (Exp.add q8Sub1Base (Exp.add (Exp.litU32 5) elemOff))
+    let q8Hdr0 ← ShaderM.readWorkgroup (ty := .scalar .u32) (n := q8InputU32Size) "s_input_q8" q8Sub0Base
+    let q8Hdr1 ← ShaderM.readWorkgroup (ty := .scalar .u32) (n := q8InputU32Size) "s_input_q8" q8Sub1Base
+    let d8AName ← ShaderM.var (.scalar .f32) (Exp.vecX (Exp.unpack2x16float q8Hdr0))
+    let d8BName ← ShaderM.var (.scalar .f32) (Exp.vecX (Exp.unpack2x16float q8Hdr1))
+    let d8A : Exp (.scalar .f32) := Exp.var d8AName
+    let d8B : Exp (.scalar .f32) := Exp.var d8BName
+
+    let v0i0 := Exp.bitAnd v0 (Exp.litU32 0x0F0F0F0F)
+    let v1i0 := Exp.bitAnd v1 (Exp.litU32 0x0F0F0F0F)
+    let acc0 := Exp.dot4I8Packed v0i0 u0
+    let dot1_0 := Exp.dot4I8Packed v1i0 u1
+    let dot1_0Combined := Exp.add acc0 dot1_0
+    let sumU_0 := Exp.add (Exp.dot4I8Packed (Exp.litU32 0x01010101) u0)
+                          (Exp.dot4I8Packed (Exp.litU32 0x01010101) u1)
+    let sumfD_0 := Exp.mul d8A (Exp.mul (Exp.toF32 dot1_0Combined) scA)
+    let sumfM_0 := Exp.mul d8A (Exp.mul (Exp.toF32 sumU_0) mA)
+
+    let v0i1 := Exp.bitAnd (Exp.shiftRight v0 (Exp.litU32 4)) (Exp.litU32 0x0F0F0F0F)
+    let v1i1 := Exp.bitAnd (Exp.shiftRight v1 (Exp.litU32 4)) (Exp.litU32 0x0F0F0F0F)
+    let acc1 := Exp.dot4I8Packed v0i1 u2
+    let dot1_1 := Exp.dot4I8Packed v1i1 u3
+    let dot1_1Combined := Exp.add acc1 dot1_1
+    let sumU_1 := Exp.add (Exp.dot4I8Packed (Exp.litU32 0x01010101) u2)
+                          (Exp.dot4I8Packed (Exp.litU32 0x01010101) u3)
+    let sumfD_1 := Exp.mul d8B (Exp.mul (Exp.toF32 dot1_1Combined) scB)
+    let sumfM_1 := Exp.mul d8B (Exp.mul (Exp.toF32 sumU_1) mB)
+
+    let blockSumfD := Exp.add sumfD_0 sumfD_1
+    let blockSumfM := Exp.add sumfM_0 sumfM_1
+    let blockContrib := Exp.sub (Exp.mul dF blockSumfD) (Exp.mul dminF blockSumfM)
+    let gatedContrib := Exp.select blockInRange blockContrib (Exp.litF32 0.0)
+    ShaderM.assign "acc" (Exp.add acc gatedContrib)
+
+  -- Per-warp subgroup reduction (no cross-warp smem needed: each warp owns 1 row).
+  ShaderM.varNamed "total" (.scalar .f32) (Exp.subgroupAdd acc)
+  let total : Exp (.scalar .f32) := Exp.var "total"
+
+  ShaderM.if_ (Exp.and (Exp.eq laneId (Exp.litU32 0)) inBounds) (do
+    ShaderM.writeBuffer (ty := .scalar .f32) "output" outIdx total
+  ) (pure ())
+
 /-! ## Q4_K × Q8_1 dp4a, 2 rows per workgroup (high occupancy for ffnDown) -/
 
 /-- 2-rows-per-workgroup variant of `fusedQ4KMLinearDP4AKernel`.
@@ -3926,7 +4085,29 @@ def forwardDP4A [GPUBackend β] (ctx : β)
                             | some "0" => false
                             | _        => true)
     let use4Warp := allow4Warp && (layer.config.outDim ≤ 5120 || allow4WarpWide)
-    if use4Warp then
+    -- 4-row kernel exists (`fusedQ4KMLinearDP4A4RowKernel`, opt-in via
+    -- HESPER_Q4K_4ROW=1) but A/B testing showed -3 to -5 TPS at the hot
+    -- production shape (outDim=2560).  Reason: cutting dispatched WGs
+    -- 4× also cuts the wave count (2560 WGs → 640 WGs = ~10 waves on
+    -- RTX 4070 Ti's 60 SMs vs ~42 waves for the 4-warp variant), which
+    -- starves the SM scheduler of warps to swap when memory-stalled.
+    -- The smem input-sharing benefit only pays off at outDim ≥ ~10000.
+    -- The 4-row kernel is kept for opt-in testing / future tuning at
+    -- larger outDim shapes.
+    let allow4Row := (match ← IO.getEnv "HESPER_Q4K_4ROW" with
+                      | some "1" => true
+                      | _        => false)
+    let use4Row := allow4Row && layer.config.outDim % 4 == 0
+    if use4Row then
+      GPUBackend.executeWithConfigCached ctx
+        (fusedQ4KMLinearDP4A4RowKernel layer.config)
+        [("weights", layer.weightBuf), ("input_q8", q8Buf), ("output", outputBuf)]
+        { numWorkgroups := (layer.config.outDim / 4, 1, 1)
+          workgroupSize := { x := 128, y := 1, z := 1 }
+          extensions := ["subgroups"] }
+        (hash ("q4k-dp4a-matmul-4row", layer.config.inDim, layer.config.outDim))
+        layer.dp4aMatmulPrepared
+    else if use4Warp then
       GPUBackend.executeWithConfigCached ctx
         (fusedQ4KMLinearDP4A4WarpKernel layer.config)
         [("weights", layer.weightBuf), ("input_q8", q8Buf), ("output", outputBuf)]
