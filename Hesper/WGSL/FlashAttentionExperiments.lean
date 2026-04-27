@@ -1168,10 +1168,17 @@ def flashAttentionVecParamsKernelV11
     ShaderM Unit := do
   let workgroupSize : Nat := 128
   let numWarps : Nat := workgroupSize / 32
-  let nthreadsKQ : Nat := 8 -- experiment-edit-marker
-  let numSubWarps : Nat := 32 / nthreadsKQ          -- = 4
-  let dimsPerLane : Nat := headDim / nthreadsKQ     -- = 32 dims/lane
-  let dPerLanePair : Nat := dimsPerLane / 2         -- = 16 word-pairs/lane
+  let nthreadsKQ : Nat := 16 -- experiment-edit-marker (was 8; C-path)
+  let numSubWarps : Nat := 32 / nthreadsKQ          -- = 2 (was 4)
+  let dimsPerLane : Nat := headDim / nthreadsKQ     -- = 16 dims/lane (was 32)
+  let dPerLanePair : Nat := dimsPerLane / 2         -- = 8 word-pairs/lane (was 16)
+  -- Mask = nthreadsKQ - 1 (assumes power-of-2): selects within-sub-warp lane.
+  let subLaneMask : Nat := nthreadsKQ - 1
+  -- Shift = log2(nthreadsKQ) for subWarp extraction.
+  let subWarpShift : Nat :=
+    if nthreadsKQ == 8 then 3
+    else if nthreadsKQ == 16 then 4
+    else 5  -- nthreadsKQ == 32 (no sub-warp partition)
 
   let wgid ← ShaderM.workgroupId
   let lid ← ShaderM.localId
@@ -1211,8 +1218,8 @@ def flashAttentionVecParamsKernelV11
   let warpId := Exp.shiftRight tid (Exp.litU32 5)
   -- subLane and subWarp are referenced 100s of times in the unrolled body —
   -- materialise once via ShaderM.let' so PTX gets one register, not N copies.
-  let subLane ← ShaderM.let' (.scalar .u32) (Exp.bitAnd laneId (Exp.litU32 7))
-  let subWarp ← ShaderM.let' (.scalar .u32) (Exp.shiftRight laneId (Exp.litU32 3))
+  let subLane ← ShaderM.let' (.scalar .u32) (Exp.bitAnd laneId (Exp.litU32 subLaneMask))
+  let subWarp ← ShaderM.let' (.scalar .u32) (Exp.shiftRight laneId (Exp.litU32 subWarpShift))
 
   -- Each thread loads 16 word-pairs of Q (32 dims).
   -- Word offset within Q row for thread = subLane*16 + j.
@@ -1322,9 +1329,11 @@ def flashAttentionVecParamsKernelV11
           let p1 : Exp (.scalar .f32) := Exp.var partialVar
           ShaderM.assign partialVar (p1 + q1Exp * k1)
 
-      -- 8-way warp_reduce_sum: Step 5 helper replaces 12 lines of
-      -- subgroupShuffleXor xor 1, 2, 4 by hand.
-      let sumSubWarp ← ShaderM.warpReduceSum 8 (Exp.var partialVar)
+      -- nthreadsKQ-way warp_reduce_sum (sub-warp dot product reduce).
+      -- For nthreadsKQ=8: butterfly xor 1, 2, 4 (3 steps).
+      -- For nthreadsKQ=16: butterfly xor 1, 2, 4, 8 (4 steps).
+      -- For nthreadsKQ=32: full warp reduce (xor 1..16).
+      let sumSubWarp ← ShaderM.warpReduceSum nthreadsKQ (Exp.var partialVar)
 
       let scoreGated := Exp.select inBounds sumSubWarp (Exp.negInf30)
       ShaderM.assign kqMaxNewVar
@@ -1345,16 +1354,30 @@ def flashAttentionVecParamsKernelV11
     -- barrier (correct, slightly over-syncs).
     ShaderM.warpBarrier
     -- Phase 2a: cross-sub-warp max-reduce so all 32 lanes share the same
-    -- per-warp kqMaxNew (4 sub-warps each had different max over their 8 K).
-    let kqMaxNewS8Name ← ShaderM.var (.scalar .f32)
-                           (Exp.max (Exp.var kqMaxNewVar)
-                                    (Exp.subgroupShuffleXor (Exp.var kqMaxNewVar)
-                                      (Exp.litU32 8)))
-    let kqMaxNewS16Name ← ShaderM.var (.scalar .f32)
-                            (Exp.max (Exp.var kqMaxNewS8Name)
-                                     (Exp.subgroupShuffleXor (Exp.var kqMaxNewS8Name)
-                                       (Exp.litU32 16)))
-    let kqMaxNew : Exp (.scalar .f32) := Exp.var kqMaxNewS16Name
+    -- per-warp kqMaxNew (numSubWarps each had different max over their
+    -- nthreadsKQ K).  For numSubWarps=4 (nthreadsKQ=8): xor 8, then xor 16.
+    -- For numSubWarps=2 (nthreadsKQ=16): xor 16 only.
+    -- For numSubWarps=1 (nthreadsKQ=32): no cross-sub-warp shuffle needed.
+    let kqMaxNew : Exp (.scalar .f32) ← do
+      if numSubWarps = 1 then
+        pure (Exp.var kqMaxNewVar)
+      else if numSubWarps = 2 then
+        let n ← ShaderM.var (.scalar .f32)
+                  (Exp.max (Exp.var kqMaxNewVar)
+                           (Exp.subgroupShuffleXor (Exp.var kqMaxNewVar)
+                             (Exp.litU32 nthreadsKQ)))
+        pure (Exp.var n)
+      else
+        -- numSubWarps = 4
+        let n8 ← ShaderM.var (.scalar .f32)
+                   (Exp.max (Exp.var kqMaxNewVar)
+                            (Exp.subgroupShuffleXor (Exp.var kqMaxNewVar)
+                              (Exp.litU32 nthreadsKQ)))
+        let n16 ← ShaderM.var (.scalar .f32)
+                    (Exp.max (Exp.var n8)
+                             (Exp.subgroupShuffleXor (Exp.var n8)
+                               (Exp.litU32 (2 * nthreadsKQ))))
+        pure (Exp.var n16)
 
     -- Phase 2b: per-thread softmax-online update with warp-global max.
     let kqMaxScaleVar ← ShaderM.var (.scalar .f32)
@@ -1448,24 +1471,27 @@ def flashAttentionVecParamsKernelV11
       (Exp.add metaIdx (Exp.litU32 1)) (Exp.var warpKqSumName)
   ) (pure ())
 
-  -- B-path Phase 4a: cross-sub-warp aggregation via warp shuffle xor 8, 16.
-  -- Each thread's vkq[pk] is a partial over its sub-warp's 8 K-positions.
-  -- The 4 sub-warps (s ∈ [0:4]) within a warp processed different K-ranges
-  -- but contribute partials for the SAME dim slice [subLane*32, +32).  Sum
-  -- them with butterfly xor 8 (sub-warp 0↔1, 2↔3) and xor 16 (cross-pair).
-  -- After this, each thread holds the warp-total for its dim slice — same
-  -- value across all 4 sub-warps within the warp (broadcast outcome).
-  for pk in [0:dPerLanePair] do
-    let v0 : Exp (.scalar .f32) := Exp.var vkq0Vars[pk]!
-    let v1 : Exp (.scalar .f32) := Exp.var vkq1Vars[pk]!
-    -- xor 8: combine sub-warps (0,1) and (2,3)
-    let v0a := Exp.add v0 (Exp.subgroupShuffleXor v0 (Exp.litU32 8))
-    let v1a := Exp.add v1 (Exp.subgroupShuffleXor v1 (Exp.litU32 8))
-    -- xor 16: combine the two pairs
-    let v0b := Exp.add v0a (Exp.subgroupShuffleXor v0a (Exp.litU32 16))
-    let v1b := Exp.add v1a (Exp.subgroupShuffleXor v1a (Exp.litU32 16))
-    ShaderM.assign vkq0Vars[pk]! v0b
-    ShaderM.assign vkq1Vars[pk]! v1b
+  -- B-path Phase 4a: cross-sub-warp aggregation via warp shuffle.
+  -- Each thread's vkq[pk] is a partial over its sub-warp's nthreadsKQ K-pos.
+  -- numSubWarps sub-warps within a warp contribute partials for the SAME
+  -- dim slice; sum them with butterfly shuffles.
+  --   numSubWarps=4: xor nthreadsKQ, xor 2*nthreadsKQ
+  --   numSubWarps=2: xor nthreadsKQ only
+  --   numSubWarps=1: no shuffle
+  if numSubWarps != 1 then
+    for pk in [0:dPerLanePair] do
+      let v0 : Exp (.scalar .f32) := Exp.var vkq0Vars[pk]!
+      let v1 : Exp (.scalar .f32) := Exp.var vkq1Vars[pk]!
+      let v0a := Exp.add v0 (Exp.subgroupShuffleXor v0 (Exp.litU32 nthreadsKQ))
+      let v1a := Exp.add v1 (Exp.subgroupShuffleXor v1 (Exp.litU32 nthreadsKQ))
+      if numSubWarps = 4 then
+        let v0b := Exp.add v0a (Exp.subgroupShuffleXor v0a (Exp.litU32 (2 * nthreadsKQ)))
+        let v1b := Exp.add v1a (Exp.subgroupShuffleXor v1a (Exp.litU32 (2 * nthreadsKQ)))
+        ShaderM.assign vkq0Vars[pk]! v0b
+        ShaderM.assign vkq1Vars[pk]! v1b
+      else
+        ShaderM.assign vkq0Vars[pk]! v0a
+        ShaderM.assign vkq1Vars[pk]! v1a
 
   -- Phase 4b: write the per-warp totals to smem.  All 4 sub-warps in a warp
   -- now hold the SAME value, so only sub-warp 0 needs to write (saves
