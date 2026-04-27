@@ -729,6 +729,28 @@ partial def stmtToPTX (stmt : Stmt) (s : GenState) : GenState :=
       s.emit (.label endL)
     else s.emit (.label elseL)
 
+  | .varDeclLdV4U32 n0 n1 n2 n3 bufName u32Idx =>
+    -- Lower to one ld.global.nc.v4.u32 instruction, binding 4 fresh u32
+    -- regs to the named vars.  Caller guarantees u32Idx is 4-aligned and
+    -- the buffer pointer is 16-byte aligned.
+    let rArr := (s.varMap.find? (·.1 == bufName)).map (·.2) |>.getD default
+    let (rIdx, s) := expToPTX u32Idx s
+    let isRO := s.isReadOnlyBuffer bufName
+    -- byte offset = u32Idx * 4
+    let (off, s) := s.freshU64
+    let s := s.emit (.mul_wide_u32 off rIdx.toU32! 4)
+    let (addr, s) := s.freshU64
+    let s := s.emit (.add_u64 addr rArr.toU64! off)
+    let (r0, s) := s.freshU32
+    let (r1, s) := s.freshU32
+    let (r2, s) := s.freshU32
+    let (r3, s) := s.freshU32
+    let s := s.emit (.ld_v4_u32 .global r0 r1 r2 r3 addr isRO)
+    let s := s.bindVar n0 (.u32 r0)
+    let s := s.bindVar n1 (.u32 r1)
+    let s := s.bindVar n2 (.u32 r2)
+    s.bindVar n3 (.u32 r3)
+
   | .exprStmt e => (expToPTX e s).2
   | .block stmts =>
     -- Enter a new PTX scope: assign a fresh scopeId, save outer reg

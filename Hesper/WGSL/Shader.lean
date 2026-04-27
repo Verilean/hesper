@@ -40,6 +40,13 @@ inductive Stmt where
   -- Block (sequence of statements)
   | block (stmts : List Stmt) : Stmt
 
+  -- 128-bit aligned vec4.u32 global load: declares 4 fresh u32 vars and
+  -- populates them from one buffer read.  CUDA backend lowers to a single
+  -- `ld.global.nc.v4.u32`; WGSL emits 4 scalar reads.  `u32Idx` is the
+  -- starting *u32* index (must be 4-aligned by caller).
+  | varDeclLdV4U32 (n0 n1 n2 n3 : String) (bufName : String)
+      (u32Idx : Exp (.scalar .u32)) : Stmt
+
 /-- Storage buffer binding -/
 structure StorageBuffer where
   group : Nat
@@ -156,6 +163,16 @@ partial def Stmt.toWGSL (indent : Nat := 0) : Stmt → String
     let ind := String.ofList (List.replicate indent ' ')
     let bodyStr := String.join (stmts.map (·.toWGSL (indent + 2)))
     s!"{ind}" ++ "{\n" ++ bodyStr ++ s!"{ind}" ++ "}\n"
+
+  | .varDeclLdV4U32 n0 n1 n2 n3 bufName u32Idx =>
+    -- WGSL has no native 128-bit load; emit four scalar reads.  CUDA
+    -- backend folds these into one ld.global.nc.v4.u32 instruction.
+    let ind := String.ofList (List.replicate indent ' ')
+    let i := u32Idx.toWGSL
+    s!"{ind}var {n0}: u32 = {bufName}[{i}];\n" ++
+    s!"{ind}var {n1}: u32 = {bufName}[({i})+1u];\n" ++
+    s!"{ind}var {n2}: u32 = {bufName}[({i})+2u];\n" ++
+    s!"{ind}var {n3}: u32 = {bufName}[({i})+3u];\n"
 
 /-- Generate WGSL struct definition -/
 def StructDef.toWGSL (structDef : StructDef) : String :=

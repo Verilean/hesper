@@ -650,6 +650,28 @@ def readBufferU16 {n : Nat} (bufferName : String) (byteIdx : Exp (.scalar .u32))
     : ShaderM (Exp (.scalar .u32)) :=
   return Exp.loadU16FromU32Buf (n := n) bufferName byteIdx
 
+/-- 128-bit (4× u32) wide read from a buffer declared `array<u32, n>`,
+    addressed by *u32* index.  The starting index must be 4-aligned and the
+    buffer pointer 16-byte aligned (caller's responsibility — typical
+    callers iterate by `pk * 4`).
+
+    On CUDA this lowers to a single `ld.global.nc.v4.u32` instruction
+    (one MIO op delivering 16 bytes), 4× more efficient than four scalar
+    `ld.global.u32` reads in MIO-pipe-saturated kernels (FlashAttn V11).
+    On WGSL it emulates as four scalar reads.
+
+    Returns four `Exp (.scalar .u32)` referring to fresh declared vars.
+    Each value can be used independently with `Exp.unpack2x16float` etc. -/
+def readBufferU32x4 (bufferName : String) (u32Idx : Exp (.scalar .u32))
+    : ShaderM (Exp (.scalar .u32) × Exp (.scalar .u32) ×
+               Exp (.scalar .u32) × Exp (.scalar .u32)) := do
+  let n0 ← freshVar "v4_0"
+  let n1 ← freshVar "v4_1"
+  let n2 ← freshVar "v4_2"
+  let n3 ← freshVar "v4_3"
+  emitStmt (Stmt.varDeclLdV4U32 n0 n1 n2 n3 bufferName u32Idx)
+  return (Exp.var n0, Exp.var n1, Exp.var n2, Exp.var n3)
+
 /-- Write to a global storage buffer at index -/
 def writeBuffer {ty : WGSLType} (bufferName : String) (idx : Exp (.scalar .u32)) (value : Exp ty) : ShaderM Unit :=
   assignIndex bufferName idx value
