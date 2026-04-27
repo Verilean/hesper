@@ -686,6 +686,142 @@ def fusedRopeKAndCacheWriteKernel
     ShaderM.writeBuffer (ty := .scalar .f32) "k_cache" cacheIdx myNew
   ) (pure ())
 
+/-- f16 variant of `fusedRopeKAndCacheWriteKernel` for the V11 attention
+    path.  Each thread processes ONE pair of dims (2 elements) and packs
+    them into one u32 (`pack2x16float`) to write the f16 cache.
+
+    Grid: kvDim/2 threads.  Each thread handles dim pair (2*idx, 2*idx+1)
+    within its kvHead.  The RoPE rotation needs the partner at
+    `dim ± halfDim` (not `dim ± 1`), so each thread reads 4 source elements
+    (xSelf for both dims of the pair, and xPair for both dims of the pair). -/
+def fusedRopeKAndCacheWriteKernelF16
+    (numKVHeads maxSeqLen headDim kvDim : Nat) (ropeBase : Float) : ShaderM Unit := do
+  let gid ← ShaderM.globalId
+  let pairIdx := Exp.vec3X gid  -- one thread = one (dim_lo, dim_hi) pair
+
+  let halfDim := headDim / 2
+  let halfKvDim := kvDim / 2  -- == numKVHeads * halfDim
+  let kCacheU32Size := (numKVHeads * maxSeqLen * headDim) / 2  -- 2 elem per u32
+
+  let _newK ← ShaderM.declareReadOnlyBuffer "new_k" (.array (.scalar .f32) kvDim)
+  let _kCache ← ShaderM.declareOutputBuffer "k_cache_f16"
+                  (.array (.scalar .u32) kCacheU32Size)
+  let _params ← ShaderM.declareReadOnlyBuffer "params" (.array (.scalar .u32) 2)
+  let _freqFactors ← ShaderM.declareReadOnlyBuffer "freq_factors"
+                       (.array (.scalar .f32) halfDim)
+
+  let inBounds := Exp.lt pairIdx (Exp.litU32 halfKvDim)
+  ShaderM.if_ inBounds (do
+    let pos ← ShaderM.readBuffer (ty := .scalar .u32) (n := 2) "params" (Exp.litU32 0)
+    let posF32 := Exp.toF32 pos
+    -- pairIdx covers (kvHead, dim_pair).  dim_pair in [0, halfDim).
+    -- We write the pair (2*pairIdx, 2*pairIdx+1) within K row.
+    -- But each thread's *output pair* is two consecutive dims, NOT a
+    -- RoPE rotation pair.  RoPE pairs `dim` with `dim+halfDim`.
+    -- So this thread does TWO independent RoPE rotations:
+    --   d_lo = 2*(pairIdx % halfDim) within its kvHead
+    --   d_hi = d_lo + 1
+    -- For each, partner is at d ± halfDim.
+    --
+    -- Layout: pairIdx = kvHead * halfDim + (d_lo / 2)... hmm, getting
+    -- confused.  Simplify: re-decompose pairIdx as
+    --   kvHead = pairIdx / halfDim
+    --   dPair  = pairIdx % halfDim   (i.e. one of [0, halfDim))
+    -- Output dims = (2 * dPair, 2 * dPair + 1) in this kvHead's row.
+    let kvHead := Exp.div pairIdx (Exp.litU32 halfDim)
+    let dPair := Exp.mod pairIdx (Exp.litU32 halfDim)
+    let dLo : Exp (.scalar .u32) := Exp.mul (Exp.litU32 2) dPair       -- 0,2,4,...,headDim-2
+    let dHi : Exp (.scalar .u32) := Exp.add dLo (Exp.litU32 1)         -- 1,3,5,...,headDim-1
+
+    -- Indices into new_k (linear, kvHead*headDim + d).
+    let kvHeadBase := Exp.mul kvHead (Exp.litU32 headDim)
+    let idxLo := Exp.add kvHeadBase dLo
+    let idxHi := Exp.add kvHeadBase dHi
+
+    -- RoPE partner for each: dim < halfDim → +halfDim; else → -halfDim.
+    let dLoInLow := Exp.lt dLo (Exp.litU32 halfDim)
+    let dHiInLow := Exp.lt dHi (Exp.litU32 halfDim)
+    let dLoPartner : Exp (.scalar .u32) := Exp.select dLoInLow
+      (Exp.add dLo (Exp.litU32 halfDim)) (Exp.sub dLo (Exp.litU32 halfDim))
+    let dHiPartner : Exp (.scalar .u32) := Exp.select dHiInLow
+      (Exp.add dHi (Exp.litU32 halfDim)) (Exp.sub dHi (Exp.litU32 halfDim))
+    let idxLoPartner := Exp.add kvHeadBase dLoPartner
+    let idxHiPartner := Exp.add kvHeadBase dHiPartner
+
+    let xLoSelf ← ShaderM.readBuffer (ty := .scalar .f32) (n := kvDim) "new_k" idxLo
+    let xLoPair ← ShaderM.readBuffer (ty := .scalar .f32) (n := kvDim) "new_k" idxLoPartner
+    let xHiSelf ← ShaderM.readBuffer (ty := .scalar .f32) (n := kvDim) "new_k" idxHi
+    let xHiPair ← ShaderM.readBuffer (ty := .scalar .f32) (n := kvDim) "new_k" idxHiPartner
+
+    -- Per-dim RoPE rotation.  freq_factors indexed by dimPair (0..halfDim-1).
+    let computeRotated (d : Exp (.scalar .u32)) (dInLow : Exp (.scalar .bool))
+                       (xSelf xPair : Exp (.scalar .f32))
+        : Exp (.scalar .f32) := Id.run do
+      let dimPair := Exp.select dInLow d (Exp.sub d (Exp.litU32 halfDim))
+      let freqFactor := Exp.index (Exp.var "freq_factors" : Exp (.array (.scalar .f32) halfDim)) dimPair
+      let dimPairF32 := Exp.toF32 dimPair
+      let exponent := Exp.div (Exp.mul (Exp.litF32 2.0) dimPairF32) (Exp.litF32 headDim.toFloat)
+      let freqInv := Exp.pow (Exp.litF32 ropeBase) (Exp.neg exponent)
+      let theta := Exp.div (Exp.mul posF32 freqInv) freqFactor
+      let cosTheta := Exp.cos theta
+      let sinTheta := Exp.sin theta
+      let x0 := Exp.select dInLow xSelf xPair
+      let x1 := Exp.select dInLow xPair xSelf
+      let x0_new := Exp.sub (Exp.mul x0 cosTheta) (Exp.mul x1 sinTheta)
+      let x1_new := Exp.add (Exp.mul x0 sinTheta) (Exp.mul x1 cosTheta)
+      Exp.select dInLow x0_new x1_new
+
+    let yLo := computeRotated dLo dLoInLow xLoSelf xLoPair
+    let yHi := computeRotated dHi dHiInLow xHiSelf xHiPair
+
+    -- Pack (yLo, yHi) into u32, write to f16 cache.
+    -- f16 cache layout: kvHead * maxSeqLen * (headDim/2) + pos * (headDim/2) + dPair.
+    let cacheU32Idx := Exp.add
+      (Exp.mul kvHead (Exp.litU32 (maxSeqLen * halfDim)))
+      (Exp.add (Exp.mul pos (Exp.litU32 halfDim)) dPair)
+    let packed := Exp.pack2x16float (Exp.vec2 yLo yHi)
+    ShaderM.writeBuffer (ty := .scalar .u32) "k_cache_f16" cacheU32Idx packed
+  ) (pure ())
+
+/-- f32→f16 packed copy kernel for V cache.  Each thread reads 2 f32
+    consecutive elements, packs them into one u32, writes to the f16 V
+    cache.  Used to mirror f32 V cache writes (which already happened
+    via existing V-projection or `fusedRopeKAndCacheWriteKernel`'s V
+    branch) into the f16 cache for V11 reads. -/
+def packVCacheF32ToF16Kernel
+    (numKVHeads maxSeqLen headDim : Nat) : ShaderM Unit := do
+  let gid ← ShaderM.globalId
+  let pairIdx := Exp.vec3X gid
+
+  let halfDim := headDim / 2
+  let halfKvDim := numKVHeads * halfDim
+  let f32Size := numKVHeads * maxSeqLen * headDim
+  let f16U32Size := f32Size / 2
+
+  let _vCache ← ShaderM.declareReadOnlyBuffer "v_cache"
+                  (.array (.scalar .f32) f32Size)
+  let _vCacheF16 ← ShaderM.declareOutputBuffer "v_cache_f16"
+                     (.array (.scalar .u32) f16U32Size)
+  let _params ← ShaderM.declareReadOnlyBuffer "params" (.array (.scalar .u32) 2)
+
+  let inBounds := Exp.lt pairIdx (Exp.litU32 halfKvDim)
+  ShaderM.if_ inBounds (do
+    let pos ← ShaderM.readBuffer (ty := .scalar .u32) (n := 2) "params" (Exp.litU32 0)
+    let kvHead := Exp.div pairIdx (Exp.litU32 halfDim)
+    let dPair := Exp.mod pairIdx (Exp.litU32 halfDim)
+    let kvHeadBase := Exp.mul kvHead (Exp.litU32 (maxSeqLen * headDim))
+    let posBase := Exp.add kvHeadBase (Exp.mul pos (Exp.litU32 headDim))
+    let idxLo := Exp.add posBase (Exp.mul (Exp.litU32 2) dPair)
+    let idxHi := Exp.add idxLo (Exp.litU32 1)
+    let vLo ← ShaderM.readBuffer (ty := .scalar .f32) (n := f32Size) "v_cache" idxLo
+    let vHi ← ShaderM.readBuffer (ty := .scalar .f32) (n := f32Size) "v_cache" idxHi
+    let cacheU32Idx := Exp.add
+      (Exp.mul kvHead (Exp.litU32 (maxSeqLen * halfDim)))
+      (Exp.add (Exp.mul pos (Exp.litU32 halfDim)) dPair)
+    let packed := Exp.pack2x16float (Exp.vec2 vLo vHi)
+    ShaderM.writeBuffer (ty := .scalar .u32) "v_cache_f16" cacheU32Idx packed
+  ) (pure ())
+
 def fusedCacheWriteKVKernel (numKVHeads maxSeqLen headDim kvDim : Nat) : ShaderM Unit := do
   let gid ← ShaderM.globalId
   let idx := Exp.vec3X gid

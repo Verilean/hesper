@@ -75,8 +75,22 @@ set_option maxHeartbeats 400000
 
 /-- Per-layer KV cache for Gemma 4 -/
 structure Gemma4KVCache (BufT : Type) where
-  kBuf : BufT    -- [numKVHeads, maxSeqLen, headDim]
-  vBuf : BufT    -- [numKVHeads, maxSeqLen, headDim]
+  kBuf : BufT    -- [numKVHeads, maxSeqLen, headDim] f32 — used by legacy
+                 -- FA + Tiled FA + existing batched RoPE-K paths.
+  vBuf : BufT    -- [numKVHeads, maxSeqLen, headDim] f32 — same.
+  /-- f16-packed K cache (half byte size).  Byte size = `cacheSize * 2`
+      (vs `cacheSize * 4` for kBuf).  Stores u32 with two f16 packed:
+      lo = elem at even index, hi = elem at odd index.
+      Populated by `fusedRopeKAndCacheWriteKernelF16` when the V11 path
+      is enabled (HESPER_FA_V11=1).  Read directly by V11 partial kernel
+      via `unpack2x16float`.  Stays zero-init when V11 is off. -/
+  kBufF16 : BufT
+  /-- f16-packed V cache (half byte size).  Same layout as kBufF16.
+      Populated by f32→f16 pack kernel (one extra dispatch per layer
+      per token) immediately after V projection writes vBuf, since V
+      doesn't go through RoPE so we can't fuse the pack inside a
+      transformation kernel. -/
+  vBufF16 : BufT
 
 /-- Full inference state -/
 structure InferenceState (BufT CacheT : Type) where
@@ -238,7 +252,15 @@ def createInferenceState [GPUBackend β] (ctx : β) (cfg : Config) : IO (Inferen
     let cacheSize := numKVHeads * cfg.maxSeqLen * headDim
     let kBuf ← mkBuf cacheSize
     let vBuf ← mkBuf cacheSize
-    kvCaches := kvCaches.push ({ kBuf, vBuf } : Gemma4KVCache (GPUBackend.Buf β))
+    -- f16 mirrors for V11 — half the byte size (u16 per element, packed
+    -- 2× per u32).  Total: kBuf+vBuf = 8B/elem, +kBufF16+vBufF16 = 4B/elem.
+    -- Net VRAM cost: +50% over f32-only path, since both stay live during
+    -- the V11 transition.  Once everything moves to f16-only (later
+    -- session), the f32 buffers are deleted and net VRAM is -50%.
+    let kBufF16 ← GPUBackend.allocBuffer ctx (cacheSize * 2).toUSize
+    let vBufF16 ← GPUBackend.allocBuffer ctx (cacheSize * 2).toUSize
+    kvCaches := kvCaches.push
+      ({ kBuf, vBuf, kBufF16, vBufF16 } : Gemma4KVCache (GPUBackend.Buf β))
 
   return {
     kvCaches
