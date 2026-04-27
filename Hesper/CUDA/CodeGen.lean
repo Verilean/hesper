@@ -550,6 +550,7 @@ partial def expToPTX (e : Exp t) (s : GenState) : ExpResult :=
 
   -- Barrier
   | .workgroupBarrier => let (r, s) := s.freshU32; (.u32 r, s.emit (.bar_sync 0))
+  | .warpBarrier      => let (r, s) := s.freshU32; (.u32 r, s.emit .bar_warp_sync)
 
   -- Round-to-nearest-even f32 → i32 (matches llama.cpp's roundf semantics).
   | .roundToI32 v =>

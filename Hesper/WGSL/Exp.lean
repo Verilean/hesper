@@ -553,6 +553,13 @@ inductive Exp : WGSLType → Type where
   -- Workgroup barrier (duplicate, already defined above - will be removed from toWGSL)
   | workgroupBarrier : Exp (.scalar .u32)  -- Returns unit
 
+  /-- Warp-level barrier (CUDA `__syncwarp()`). On PTX backends lowers
+      to `bar.warp.sync 0xFFFFFFFF` (much cheaper than block barrier).
+      On WGSL backends falls back to `workgroupBarrier()` since WGSL
+      lacks a dedicated warp-sync primitive — slightly over-syncs but
+      preserves correctness. -/
+  | warpBarrier : Exp (.scalar .u32)
+
 /-- Convert Float to WGSL literal string with full precision.
     Uses scientific notation (e.g. `1.0e-7`) when needed to preserve
     significant digits. FP32 has ~7 significant decimal digits. -/
@@ -935,6 +942,9 @@ partial def Exp.toWGSL {t : WGSLType} : Exp t → String
     s!"dot4U8Packed({toWGSL a}, {toWGSL b})"
   | workgroupBarrier =>
     "workgroupBarrier()"
+  | warpBarrier =>
+    -- WGSL has no warp-sync primitive; fall back to block barrier.
+    "workgroupBarrier()"
 
 /-! ## Operator overloading for ergonomic Exp construction
 
@@ -996,6 +1006,28 @@ instance : HShiftLeft (Exp (.scalar .u32)) Nat (Exp (.scalar .u32)) where
 
 instance : HShiftRight (Exp (.scalar .u32)) Nat (Exp (.scalar .u32)) where
   hShiftRight x n := Exp.shiftRight x (Exp.litU32 n)
+
+/-! ## Sentinel constants (Step 9f)
+
+Common literals that appear repeatedly in attention / softmax kernels.
+Centralising them makes intent explicit and prevents typos like
+`-1.0e30` vs `-3.4e38` differing across files.
+
+Two negInf flavours are exposed:
+- `negInf30` = `-1.0e30`. The hesper convention; matches existing V2-V11
+  call sites. Drop-in replacement for the existing literal.
+- `negInfHalf` = `-FLT_MAX / 2.0f` ≈ `-1.7e38`. llama.cpp's convention.
+  The "/2" leaves head-room so `expf(x - max)` doesn't overflow when
+  `max == -FLT_MAX`. Use when porting from llama.cpp to keep arithmetic
+  bit-identical. -/
+def Exp.f32Zero    : Exp (.scalar .f32) := Exp.litF32 0.0
+def Exp.f32One     : Exp (.scalar .f32) := Exp.litF32 1.0
+def Exp.negInf30   : Exp (.scalar .f32) := Exp.litF32 (-1.0e30)
+def Exp.negInfHalf : Exp (.scalar .f32) := Exp.litF32 (-1.7014117e38)
+/-- u32 literal helpers — for slot-index and lane-mask constants
+    that show up at every call site. -/
+def Exp.u32Zero    : Exp (.scalar .u32) := Exp.litU32 0
+def Exp.u32One     : Exp (.scalar .u32) := Exp.litU32 1
 
 /-- Comparison operators on `Exp`. Cannot reuse Lean's `<` / `==` because
     those resolve to `Bool`, not `Exp (.scalar .bool)`. Unicode suffix

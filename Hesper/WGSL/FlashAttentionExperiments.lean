@@ -1595,8 +1595,10 @@ def flashAttentionVecParamsKernelV11
   let vkq0Vars := vkq0.names
   let vkq1Vars := vkq1.names
 
-  ShaderM.varNamed "kq_max" (.scalar .f32) (Exp.litF32 (-1.0e30))
-  ShaderM.varNamed "kq_sum" (.scalar .f32) (Exp.litF32 0.0)
+  -- Step 9f: named sentinels — same numeric values as before, but the
+  -- intent ("min-finite-score" / "zero accumulator") is explicit.
+  ShaderM.varNamed "kq_max" (.scalar .f32) Exp.negInf30
+  ShaderM.varNamed "kq_sum" (.scalar .f32) Exp.f32Zero
   let kqMax := Exp.var "kq_max"
   let kqSum := Exp.var "kq_sum"
 
@@ -1672,6 +1674,12 @@ def flashAttentionVecParamsKernelV11
         ShaderM.assign kqRegVar scoreGated
       ) (pure ())
 
+    -- Step 9g: warp-only barrier between Phase 1 (per-sub-warp `kqMaxNew`
+    -- writes via the `if laneId == ...` branch) and Phase 2a's
+    -- cross-sub-warp shuffle.  PTX emits `bar.warp.sync 0xFFFFFFFF`,
+    -- much cheaper than a block barrier; WGSL falls back to block
+    -- barrier (correct, slightly over-syncs).
+    ShaderM.warpBarrier
     -- Phase 2a: cross-sub-warp max-reduce so all 32 lanes share the same
     -- per-warp kqMaxNew (4 sub-warps each had different max over their 8 K).
     let kqMaxNewS8Name ← ShaderM.var (.scalar .f32)

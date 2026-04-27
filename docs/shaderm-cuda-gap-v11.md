@@ -347,17 +347,17 @@ S9 で扱う話ではない (Session #266 で `Exp.fmaF16x2` 導入済 → kerne
 
 ---
 
-## 4. 提案 Step 9: 優先度順
+## 4. 提案 Step 9: 優先度順 (完了状況込み)
 
-| # | 名前 | 効果範囲 | 実装サイズ | ROI |
-|---|---|---|---|---|
-| **S9a** | `unrollForScoped` | V8/V9/V11 全部 | 5 行 | **高** |
-| **S9b** | `MutPtr` (ポインタ進行) | outer K loop, weight 移動系 | 50 行 | **中** |
-| **S9c** | `RegArray ty n` | V8/V11 の `q0Vars` 系 | 80 行 | **高** |
-| S9d | smem alias view | flash-attn-vec 系のみ | 150 行 | 低 |
-| S9e | `SoftmaxOnline.update` | flash-attn-vec 系のみ | 30 行 | 低 |
-| S9f | `Exp.negInfHalf` 定数集 | 全部 | 20 行 | 低 |
-| S9g | `ShaderM.warpBarrier` | flash-attn 系 | 30 行 | 中 |
+| # | 名前 | 効果範囲 | 状態 | 実装サイズ | ROI |
+|---|---|---|---|---|---|
+| **S9a** | `unrollForScoped` | V8/V9/V11 全部 | ✅ 完了 | 5 行 | **高** |
+| **S9b** | `MutPtr` (ポインタ進行) | outer K loop, weight 移動系 | ✅ 完了 | 50 行 | **中** |
+| **S9c** | `RegArray ty n` | V8/V11 の `q0Vars` 系 | ✅ 完了 | 80 行 | **高** |
+| S9d | smem alias view | flash-attn-vec 系のみ | 未着手 | 150 行 | 低 |
+| S9e | `SoftmaxOnline.update` | flash-attn-vec 系のみ | 未着手 | 30 行 | 低 |
+| S9f | `Exp.negInfHalf` 定数集 | 全部 | ✅ 完了 | 20 行 | 低 |
+| S9g | `ShaderM.warpBarrier` | flash-attn 系 | ✅ 完了 | 30 行 | 中 |
 
 **最初に着手すべきは S9c (RegArray) と S9a (unrollForScoped)**。
 両方とも V11 のコード量を 30% 削れて、認知ギャップの「数の暴力」(同じ

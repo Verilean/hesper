@@ -28,7 +28,7 @@ llama.cpp などの CUDA C++ カーネルを ShaderM に port するときの対
 | **warp index** | `threadIdx.x >> 5` | `tid >>> 5` (手書き) | ✅ `← ShaderM.warpId` (Step 4) |
 | sub-warp split | `(tid & ~7, tid & 7)` | 手書き | ✅ `← ShaderM.subWarpSplit 8` (Step 4) |
 | `__syncthreads()` | `__syncthreads();` | ✅ `ShaderM.barrier` | 同じ |
-| `__syncwarp()` | `__syncwarp();` | (なし — block barrier で代用) | `ShaderM.warpBarrier` (← TODO Step 6) |
+| `__syncwarp()` | `__syncwarp();` | ✅ `ShaderM.warpBarrier` (Step 9g) | 同じ |
 | `__shfl_xor_sync(.., off, 32)` | `__shfl_xor_sync(0xFFFFFFFF, x, off, 32)` | `Exp.subgroupShuffleXor x off` | 同じ |
 | `warp_reduce_sum<32>` | `__reduce_add_sync(...)` or 5-shfl loop | `Exp.subgroupAdd x` | ✅ `← ShaderM.warpReduceSum 32 x` (Step 5) |
 | `warp_reduce_sum<8>` | 3-shfl xor 1,2,4 ループ | 手書き 3 行 | ✅ `← ShaderM.warpReduceSum 8 x` (Step 5) |
@@ -38,7 +38,7 @@ llama.cpp などの CUDA C++ カーネルを ShaderM に port するときの対
 | `__half2half2(x)` | `__half2half2(x)` | (手書き or pack2x16float) | `Exp.broadcastH2 x` (← TODO) |
 | `fma.rn.f16x2` | `__hfma2(a, b, c)` | ✅ `Exp.fmaF16x2 a b c` | 同じ |
 | **f32 FMA** | `fmaf(a, b, c)` | (なし — mul + add 別命令) | `Exp.fma a b c` (← TODO) |
-| ポインタ進める | `K += stride;` | (なし — index 計算で代用) | `ptr.advance stride` (← TODO) |
+| ポインタ進める | `K += stride;` | ✅ `MutPtr.advance stride` (Step 9b) | 同じ |
 
 ## 2. 完了したステップ (Step 1-7)
 
@@ -82,6 +82,32 @@ llama.cpp などの CUDA C++ カーネルを ShaderM に port するときの対
 - `<ᵉ` `≤ᵉ` `>ᵉ` `≥ᵉ` `==ᵉ` `!=ᵉ` を `Exp.lt/le/gt/ge/eq/ne` の infix として定義
 - Lean 既定の `<` / `==` は `Bool` を返すため再利用不可 → unicode 接尾辞 `ᵉ` で区別
 - V9 の `Exp.lt kPos splitEnd` → `kPos <ᵉ splitEnd` で `Exp.select` 句が CUDA に近づく
+
+### Step 9a: `unrollForScoped` (集約版 unroll)
+- `for ... in [0:n] do ShaderM.scope do` を `ShaderM.unrollForScoped n` 1 行に
+- meta 展開＋per-iter register scope を 1 つのコンセプトとして扱える
+- CUDA `#pragma unroll for ...` に直接対応
+
+### Step 9b: `MutPtr` (mutable pointer advance)
+- `Ptr` の `offset` フィールドを mutable u32 register 化、`advance` で更新可
+- CUDA `K += stride; *K[k]` 慣用句に対応 (outer loop で進行 / inner で `loadAt`)
+- `Ptr.atOffset` (純粋オフセット) と組み合わせて 2 段ポインタ操作が書ける
+
+### Step 9c: `RegArray ty n` (typed register array)
+- `Array String` + `Exp.var` の手動管理を撲滅
+- `arr.get pk` / `arr.set pk v` で typed access
+- `ShaderM.regArray ty n init` で n 個の `var` を一括宣言
+
+### Step 9f: 標準 sentinel 定数
+- `Exp.negInf30` (= `-1.0e30`、hesper 既定) / `Exp.negInfHalf` (= `-FLT_MAX/2`、llama.cpp 互換)
+- `Exp.f32Zero`, `Exp.f32One`, `Exp.u32Zero`, `Exp.u32One`
+- 重複リテラルの撲滅、意図 (out-of-bounds gating か単なる zero か) が明示される
+
+### Step 9g: `ShaderM.warpBarrier`
+- CUDA `__syncwarp()` 相当
+- PTX backend: `bar.warp.sync 0xFFFFFFFF` (block barrier より大幅に軽い)
+- WGSL backend: `workgroupBarrier()` フォールバック (仕方なく block barrier)
+- flash-attn vec の Phase 1→2a 間で使用
 
 ## 3. 残り TODO (優先度順)
 

@@ -323,6 +323,24 @@ def testBarrier : TestSeq :=
 
   test "Barrier emits statement" (state.stmts.length == 1)
 
+/-- Test: warpBarrier emits a single stmt (lowering is backend-specific). -/
+def testWarpBarrier : TestSeq :=
+  let computation := ShaderM.warpBarrier
+  let state := exec computation
+  test "warpBarrier emits one statement" (state.stmts.length == 1)
+
+/-- Test: MutPtr.advance emits a u32 var decl + an assign. -/
+def testMutPtrAdvance : TestSeq :=
+  let computation := do
+    -- Buffer must be declared so writes/reads type-check downstream.
+    let _ ← Monad.ShaderM.declareInputBuffer "buf"
+              (.array (.scalar .u32) 256)
+    let p ← ShaderM.mutPtr (.scalar .u32) "buf" 256 (Exp.litU32 0)
+    p.advance (Exp.litU32 8)
+  let state := exec computation
+  -- 1 varDecl (the offset register) + 1 assign (advance) = 2 stmts.
+  test "MutPtr.mk + advance emits 2 stmts" (state.stmts.length == 2)
+
 -- ============================================================================
 -- Built-in Variable Tests
 -- ============================================================================
@@ -580,6 +598,8 @@ def allTests : IO (List (String × List TestSeq)) := do
     ("RegArray: get/set round-trip", [testRegArrayGetSet]),
     ("Control Flow: Nested", [testNestedControlFlow]),
     ("Synchronization: Barrier", [testBarrier]),
+    ("Synchronization: warpBarrier", [testWarpBarrier]),
+    ("MutPtr: advance emits assign", [testMutPtrAdvance]),
     ("Built-ins: Global ID", [testGlobalId]),
     ("Built-ins: Local ID", [testLocalId]),
     ("Built-ins: Workgroup ID", [testWorkgroupId]),
