@@ -424,6 +424,15 @@ def scope (body : ShaderM α) : ShaderM α := do
 def barrier : ShaderM Unit :=
   emitStmt (Stmt.exprStmt Exp.workgroupBarrier)
 
+/-- Warp-level barrier (CUDA `__syncwarp()`).  PTX backend emits the
+    cheap `bar.warp.sync 0xFFFFFFFF`; WGSL backend falls back to
+    `workgroupBarrier()`. Use when only intra-warp ordering is needed
+    — eg. between Phase 1 (KQ dot) and Phase 2a (cross-sub-warp max
+    reduce) in the flash-attn vec kernel where all 32 lanes of a warp
+    must finish writing before reading. -/
+def warpBarrier : ShaderM Unit :=
+  emitStmt (Stmt.exprStmt Exp.warpBarrier)
+
 -- ============================================================================
 -- Built-in Variables
 -- ============================================================================
@@ -1038,6 +1047,89 @@ def ptr (ty : WGSLType) (buf : String) (bufLen : Nat)
     (baseOffset : Exp (.scalar .u32)) : ShaderM (Ptr ty) := do
   let off ← let' (.scalar .u32) baseOffset
   return ⟨buf, off, bufLen⟩
+
+end ShaderM
+
+/-- Mutable pointer — like `Ptr` but `offset` is a `var` (read/write
+    register) instead of an `Exp`, so `advance` actually updates the
+    register in-place rather than constructing a new value.
+
+    Mirrors the CUDA outer-loop idiom
+
+    ```cpp
+    K += blockIdx.y * nthreads * nb11;          // initial
+    for (int k = ...; k < kmax; k += step,
+         K += step * nb11, V += step * nb21) {  // advance per iter
+        sum += vec_dot_KQ(K + i_KQ * nb11, ...);// inner per-iter offset
+    }
+    ```
+
+    Step 6's `Ptr` only handles the inner per-iter offset; `MutPtr`
+    handles the outer per-iter pointer advance. -/
+structure MutPtr (ty : WGSLType) where
+  buf : String
+  /-- Name of the u32 register that holds the current offset. Mutable —
+      gets reassigned by `MutPtr.advance`. -/
+  offsetVar : String
+  bufLen : Nat
+deriving Repr
+
+namespace MutPtr
+
+/-- Current offset as an `Exp.var` so it can be used in index
+    arithmetic without materialising another register. -/
+@[inline] def offset {ty : WGSLType} (p : MutPtr ty) : Exp (.scalar .u32) :=
+  Exp.var p.offsetVar
+
+/-- Read at the current offset. -/
+@[inline] def load {ty : WGSLType} (p : MutPtr ty) : ShaderM (Exp ty) :=
+  ShaderM.readBuffer (ty := ty) (n := p.bufLen) p.buf p.offset
+
+/-- Read at `p.offset + extra` without advancing.  Mirrors CUDA `p[k]`
+    inside an unrolled inner loop. -/
+@[inline] def loadAt {ty : WGSLType} (p : MutPtr ty)
+    (extra : Exp (.scalar .u32)) : ShaderM (Exp ty) :=
+  ShaderM.readBuffer (ty := ty) (n := p.bufLen) p.buf (p.offset + extra)
+
+/-- Advance the pointer by `delta`. The next `load` / `loadAt` reads
+    from the new offset. Mirrors CUDA `p += delta`. -/
+@[inline] def advance {ty : WGSLType} (p : MutPtr ty)
+    (delta : Exp (.scalar .u32)) : ShaderM Unit :=
+  ShaderM.assign p.offsetVar (p.offset + delta)
+
+/-- Store at the current offset. -/
+@[inline] def store {ty : WGSLType} (p : MutPtr ty) (value : Exp ty) :
+    ShaderM Unit :=
+  ShaderM.writeBuffer (ty := ty) p.buf p.offset value
+
+/-- Snapshot to an immutable `Ptr` at the current offset.  Useful when
+    handing the pointer to a helper that doesn't need `advance`. -/
+@[inline] def freeze {ty : WGSLType} (p : MutPtr ty) : Ptr ty :=
+  ⟨p.buf, p.offset, p.bufLen⟩
+
+end MutPtr
+
+namespace ShaderM
+
+/-- Construct a `MutPtr` whose offset register is initialised from
+    `baseOffset`. The resulting pointer can be `advance`d in-place
+    inside an outer loop, matching CUDA's `K += stride` idiom.
+
+    Example (V11 outer K loop):
+    ```
+    let K ← ShaderM.mutPtr (.scalar .u32) "k_cache_f16" kvWords
+              (kvHead * maxSeqLen * (D/2) + laneId)
+    ShaderM.runtimeFor splitStart splitEnd (Exp.litU32 wgSize) fun _ => do
+      ...
+      let kPacked ← K.loadAt (Exp.litU32 (pk * 32))
+      ...
+      K.advance (Exp.litU32 (wgSize * (D/2)))
+    ```
+-/
+def mutPtr (ty : WGSLType) (buf : String) (bufLen : Nat)
+    (baseOffset : Exp (.scalar .u32)) : ShaderM (MutPtr ty) := do
+  let name ← var (.scalar .u32) baseOffset
+  return ⟨buf, name, bufLen⟩
 
 end ShaderM
 

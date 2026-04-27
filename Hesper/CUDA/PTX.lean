@@ -294,6 +294,10 @@ inductive Inst where
 
   -- ── control flow ──
   | bar_sync     (id : Nat)
+  /-- `bar.warp.sync 0xFFFFFFFF;` — CUDA `__syncwarp()`. Synchronises
+      all 32 lanes of the issuing warp without crossing warps. Cheaper
+      than `bar.sync` (no block-wide rendezvous). -/
+  | bar_warp_sync
   | bra          (target : Label)
   | bra_not      (pred : RegPred) (target : Label)
   | label        (l : Label)
@@ -417,6 +421,7 @@ partial def Inst.toString : Inst → String
   | .shfl_bfly_f32 d s off => s!"  shfl.sync.bfly.b32 {d}, {s}, {off}, 31, 0xFFFFFFFF;"
   | .shfl_idx_f32 d s l    => s!"  shfl.sync.idx.b32 {d}, {s}, {l}, 31, 0xFFFFFFFF;"
   | .bar_sync id         => s!"  bar.sync {id};"
+  | .bar_warp_sync       => "  bar.warp.sync 0xFFFFFFFF;"
   | .bra target          => s!"  bra {target};"
   | .bra_not p target    => s!"  @!{p} bra {target};"
   | .label l             => s!"{l}:"
