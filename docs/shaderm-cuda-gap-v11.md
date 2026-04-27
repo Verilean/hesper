@@ -10,24 +10,23 @@ V11 (= llama.cpp の `nthreads_KQ=8` sub-warp partition 版に対応) の
 
 ## 0. 結論サマリ
 
-| カテゴリ | ギャップの大きさ | 主な要因 |
+| カテゴリ | 当初のギャップ | 現状 |
 |---|---|---|
-| 1 行レベル算術 | **小** | Step 1/8 で operator overloading 解決済 |
-| 1 行レベル制御 | **小** | Step 4 (lane/warp) Step 5 (warpReduceSum) で解決済 |
-| ループ構造 | **中** | `#pragma unroll` の意図が `for ... in [0:n] do ShaderM.scope do` で2行になる |
-| メモリ参照 | **大** | `K + i_KQ*nb11` 単位でのポインタ進行 vs hesper の絶対 word index 計算 |
-| 配列レジスタ | **大** | `Q_reg[ncols][...]` `VKQ[ncols][...]` が hesper では `Array String` ↔ `ShaderM.var` の二重管理 |
-| smem reuse | **中** | llama は `KQ` smem を Q quantize tmp と KQ score tmp で alias 再利用 / hesper は static name分離 |
-| sentinel化 | **中** | `-FLT_MAX/2.0f` `expf(sink-...)` 等の sentinel は単なる定数だが意味が暗黙 |
+| 1 行レベル算術 | 小 | ✅ Step 1/8 |
+| 1 行レベル制御 | 小 | ✅ Step 4/5 |
+| ループ構造 | 中 | ✅ Step 9a `unrollForScoped` |
+| メモリ参照 | 大 | ✅ Step 9b `MutPtr.advance` (`Ptr.atOffset` Step 6 と併用) |
+| 配列レジスタ | 大 | ✅ Step 9c `RegArray ty n` |
+| smem reuse | 中 | 未着手 (Step 9d、ROI 低) |
+| sentinel化 | 中 | ✅ Step 9f `Exp.negInf30` 他 |
+| online softmax | 中 | ✅ Step 9e `softmaxOnlineUpdate` |
+| `__syncwarp()` | 中 | ✅ Step 9g `warpBarrier` (PTX `bar.warp.sync`) |
 
-### 各項目の Step 9 候補 (優先度順)
+### 残ってるもの
 
-1. **`Ptr.advanceRow` / `Ptr` ベースの cache 書き込み**: `K += stride` 慣用句を hesper でも 1 行で書きたい
-2. **`RegArray ty n` (typed register array)**: `q0Vars : Array String` の手動管理を解消
-3. **`Q.scope` / smem alias**: 複数用途の smem を 1 declaration で寿命別に使い分けたい
-4. **softmax-online 高水準ヘルパ** `SoftmaxOnline.update kqMax kqSum kqRegVar kqMaxNew`
-5. **lane-id pattern matching の sugar**: `if laneOwns iKQ subWarp ...` 風の helper
-6. **sentinel constants**: `Exp.negInfHalf` (= `-FLT_MAX/2.0f`) を define
+- **S9d** smem alias view: 1 つの smem を quantize tmp と KQ score tmp で alias 再利用するパターン。 V11 / fattn-vec のみで価値があるので、本格的にこの kernel を最適化したくなったタイミングで着手で十分。
+- **lane-id pattern match sugar**: `if laneOwns iKQ subWarp ...` のような helper。優先度低、必要になったら追加。
+- **DSL 用 `for` macro**: CUDA の `for (init; cond; step1, step2, step3)` 多進行 update を Lean で 1 行表現する macro。Lean の構文制約で根本的に必要なときに検討。
 
 ---
 
