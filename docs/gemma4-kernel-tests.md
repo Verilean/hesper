@@ -19,7 +19,7 @@ infrequent or one-shot.
 | `fusedQ4KMLinearDP4AKernel` | [Linear.lean](../Hesper/Layers/Linear.lean) | Q4_K matmul (1-warp fallback) | — | — | [`cuda-dp4a-test`](../Tests/CUDA/CUDADP4ATest.lean) |
 | `fusedQ6KLinearDP4AKernel` | [Linear.lean](../Hesper/Layers/Linear.lean) | Q6_K ffn_down (1-warp default) | 21 | 49.9 | [`cuda-q6k-dp4a-test`](../Tests/CUDA/CUDAQ6KDP4ATest.lean) |
 | `fusedQ6KLinearDP4A4RowKernel` | [Linear.lean](../Hesper/Layers/Linear.lean) | Q6_K lm_head (4 rows / WG) | — | — | [`cuda-q6k-dp4a-test`](../Tests/CUDA/CUDAQ6KDP4ATest.lean) |
-| `fusedQ6KLinearDP4A4WarpKernel` *(opt-in)* | [Linear.lean](../Hesper/Layers/Linear.lean) | Q6_K matmul (4-warp 1-row, llama.cpp shape) | — | — | [`cuda-q6k-4warp-parity`](../Tests/CUDA/CUDAQ6K4WarpParityTest.lean) |
+| `fusedQ6KLinearDP4A4WarpKernel` *(opt-in)* | [Linear.lean](../Hesper/Layers/Linear.lean) | Q6_K matmul (4-warp 1-row, llama.cpp shape) | — | — | [`cuda-q6k-4warp-parity`](../Tests/CUDA/CUDAQ6K4WarpParityTest.lean) (single dispatch) + [`cuda-q6k-4warp-graphs`](../Tests/CUDA/CUDAQ6K4WarpGraphsTest.lean) (14× capture+replay) |
 | `matMulTransposeF16BlockCoopKernel` | [WGSL/MatMul.lean](../Hesper/WGSL/MatMul.lean) | f16 lm_head (when pre-dequantized) | 1 | 2741 (DRAM-bound) | [`cuda-q6k-to-f16-test`](../Tests/CUDA/Q6KToF16Test.lean) |
 | `quantizeQ8_1Kernel` | [Layers/Linear.lean](../Hesper/Layers/Linear.lean) | f32 → Q8_1 input quantize | 80 | 1.0 | covered by `cuda-dp4a-test`, `cuda-q6k-dp4a-test` |
 | `fusedRMSNormQ8_1Kernel` | [RMSNorm.lean](../Hesper/Layers/RMSNorm.lean) | Fused finalNorm + Q8_1 quantize for lm_head | 1 | — | end-to-end check (no isolated parity) |

@@ -19,9 +19,9 @@ def main (args : List String) : IO Unit := do
     IO.FS.writeFile s!"{outDir}/{name}.ptx" ptx
     IO.println s!"  {name}.ptx: {ptx.length} chars"
 
-  let dumpKernel2D (name : String) (bx by : Nat) (k : Hesper.WGSL.Monad.ShaderM Unit) : IO Unit := do
+  let dumpKernel2D (name : String) (bx byDim : Nat) (k : Hesper.WGSL.Monad.ShaderM Unit) : IO Unit := do
     let ptx := Hesper.CUDA.CodeGen.generatePTX name
-      { x := bx, y := by, z := 1 } k
+      { x := bx, y := byDim, z := 1 } k
     IO.FS.writeFile s!"{outDir}/{name}.ptx" ptx
     IO.println s!"  {name}.ptx: {ptx.length} chars"
 
