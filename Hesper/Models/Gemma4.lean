@@ -2240,7 +2240,13 @@ def forwardPrefillBatch [GPUBackend β] (ctx : β)
   -- VRAM round-trip (the f32 normed hidden state).  For the fallback
   -- paths (f32 matmul etc.) still run the standalone RMSNorm because
   -- they don't consume Q8_1.
-  match model.outputWeightF16 with
+  -- HESPER_DP4A_Q6K_4WARP=1 forces dp4a path even when an f16 lm_head
+  -- buffer was prepared at load time.  Same toggle as the decode site.
+  let force4WarpQ6K_pf ← do
+    match ← IO.getEnv "HESPER_DP4A_Q6K_4WARP" with
+    | some "1" => pure true
+    | _        => pure false
+  match (if force4WarpQ6K_pf then none else model.outputWeightF16) with
   | some f16W =>
     -- Pre-dequantized f16 lm_head — single dispatch, no Q8_1 quantize.
     RMSNorm.forward ctx model.finalNorm state.buf2 state.buf1
@@ -2541,7 +2547,13 @@ def forwardSingleToken [GPUBackend β] (ctx : β)
   Hesper.WGSL.Execute.withSection "lmHead" do
     -- Fast path: pre-dequantized f16 weights → f16 matmul (single dispatch,
     -- no Q8_1 quantize, ~10× speedup over Q6_K dp4a for vocab=262144).
-    match model.outputWeightF16 with
+    -- HESPER_DP4A_Q6K_4WARP=1 forces the dp4a 4-warp path even when the
+    -- f16 buffer exists — useful for A/B against the f16 fast path.
+    let force4WarpQ6K ← do
+      match ← IO.getEnv "HESPER_DP4A_Q6K_4WARP" with
+      | some "1" => pure true
+      | _        => pure false
+    match (if force4WarpQ6K then none else model.outputWeightF16) with
     | some f16W =>
       let lmHeadConfig : Hesper.WGSL.MatMul.Config := {
         M := 1, N := model.config.vocabSize, K := model.config.hiddenSize
@@ -2618,18 +2630,40 @@ def forwardSingleToken [GPUBackend β] (ctx : β)
           (hash ("fused-rmsnorm-q8_1-lmhead", model.config.hiddenSize))
           state.lmHeadQuantizePrepared
         -- Q6_K dp4a matmul (2D grid for vocabSize > 65535).
-        -- Default is the 4-warp cooperative variant (smem input reuse across
-        -- 4 output rows) — fastest on all shapes tested. Override via env:
-        --   HESPER_DP4A_Q6K_2ROW=1  → 2-warp variant  (64 threads, 2 rows/WG)
+        -- Variant selection (env, in priority order):
+        --   HESPER_DP4A_Q6K_4WARP=1 → 4-warp 1-row coop on K (llama.cpp shape)
         --   HESPER_DP4A_Q6K_1ROW=1  → single-warp     (32 threads, 1 row/WG)
+        --   HESPER_DP4A_Q6K_2ROW=1  → 2-warp variant  (64 threads, 2 rows/WG)
+        --   default                 → 4-warp 4-rows-per-WG (smem input share)
         let variant ← do
-          match ← IO.getEnv "HESPER_DP4A_Q6K_1ROW" with
-          | some "1" => pure "1row"
+          match ← IO.getEnv "HESPER_DP4A_Q6K_4WARP" with
+          | some "1" => pure "4warp"
           | _ =>
-            match ← IO.getEnv "HESPER_DP4A_Q6K_2ROW" with
-            | some "1" => pure "2row"
-            | _ => pure "4row"
+            match ← IO.getEnv "HESPER_DP4A_Q6K_1ROW" with
+            | some "1" => pure "1row"
+            | _ =>
+              match ← IO.getEnv "HESPER_DP4A_Q6K_2ROW" with
+              | some "1" => pure "2row"
+              | _ => pure "4row"
         match variant with
+        | "4warp" =>
+          -- 1 row per WG, 4 warps cooperate over K.  grid = vocabSize rows.
+          -- Use 2-D grid (gridX × gridY) to stay under WebGPU 65535 dim cap.
+          let gridX1 : Nat := 4096
+          let gridY1 : Nat := (model.config.vocabSize + gridX1 - 1) / gridX1
+          GPUBackend.executeWithConfigCached ctx
+            (Hesper.Layers.Linear.fusedQ6KLinearDP4A4WarpKernel
+              model.config.hiddenSize model.config.vocabSize gridX1)
+            [("weights", model.outputWeight), ("input_q8", q8Buf), ("output", state.logitsBuf)]
+            { numWorkgroups := (gridX1, gridY1, 1), workgroupSize := { x := 32, y := 4, z := 1 }
+              extensions := ["subgroups"]
+              -- Distinguish from the Linear dispatcher's 4-warp emit
+              -- (same ShaderM, different shape) — see preHash collision
+              -- note in Linear.lean's force4Warp branch.
+              funcName := s!"q6k_dp4a_4warp_lmhead_{model.config.hiddenSize}_{model.config.vocabSize}"
+              : Hesper.ExecConfig }
+            (hash ("q6k-dp4a-lmhead-4warp", model.config.hiddenSize, model.config.vocabSize))
+            state.lmHeadDP4APrepared
         | "4row" =>
           let quadCount := (model.config.vocabSize + 3) / 4
           let gridX4 : Nat := 4096

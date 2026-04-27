@@ -906,6 +906,10 @@ lean_exe «cuda-q6k-dp4a-test» where
   root := `Tests.CUDA.CUDAQ6KDP4ATest
   moreLinkArgs := stdLinkArgs ++ #["./.lake/build/native/libhesper_cuda.a", "-lcuda"]
 
+lean_exe «cuda-q6k-4warp-parity» where
+  root := `Tests.CUDA.CUDAQ6K4WarpParityTest
+  moreLinkArgs := stdLinkArgs ++ #["./.lake/build/native/libhesper_cuda.a", "-lcuda"]
+
 lean_exe «cuda-q6k-to-f16-test» where
   root := `Tests.CUDA.Q6KToF16Test
   moreLinkArgs := stdLinkArgs ++ #["./.lake/build/native/libhesper_cuda.a", "-lcuda"]
