@@ -379,20 +379,55 @@ def benchKernel
     (shader : Hesper.WGSL.Monad.ShaderM Unit)
     (bufs : List (String × GPUBackend.Buf Hesper.CUDAContext))
     (workgroupX : Nat) (numHeads : Nat)
-    (warmup iters : Nat) : IO (Float × Float) := do
+    (warmup iters : Nat)
+    (numWGY : Nat := 1)
+    (extensions : List String := ["subgroups"]) : IO (Float × Float) := do
+  let _ := kernelName
   let cfg : Hesper.ExecConfig := {
     workgroupSize := { x := workgroupX, y := 1, z := 1 }
-    numWorkgroups := (numHeads, 1, 1)
-    extensions := ["subgroups"]
+    numWorkgroups := (numHeads, numWGY, 1)
+    extensions := extensions
   }
-  -- Warmup: PTX JIT, cubin cache, pipeline cache all get warm.
   for _ in [0:warmup] do
     GPUBackend.execute ctx shader bufs cfg
   Hesper.CUDA.cuStreamSynchronize (0 : USize)
-  -- Timed loop
   let t0 ← IO.monoNanosNow
   for _ in [0:iters] do
     GPUBackend.execute ctx shader bufs cfg
+  Hesper.CUDA.cuStreamSynchronize (0 : USize)
+  let t1 ← IO.monoNanosNow
+  let totalNs := t1 - t0
+  let totalMs := totalNs.toFloat / 1.0e6
+  let avgUs := totalNs.toFloat / iters.toFloat / 1000.0
+  return (avgUs, totalMs)
+
+/-- Bench a split-K pair (partial then combine).  Times the two dispatches
+    together as one logical call.  Used for V9/V11 which need a separate
+    combine kernel. -/
+def benchSplitK
+    (ctx : Hesper.CUDAContext)
+    (partialShader combineShader : Hesper.WGSL.Monad.ShaderM Unit)
+    (partialBufs combineBufs : List (String × GPUBackend.Buf Hesper.CUDAContext))
+    (numHeads numSplits : Nat)
+    (warmup iters : Nat) : IO (Float × Float) := do
+  let partialCfg : Hesper.ExecConfig := {
+    workgroupSize := { x := 128, y := 1, z := 1 }
+    numWorkgroups := (numHeads, numSplits, 1)
+    extensions := ["subgroups", "f16"]
+  }
+  let combineCfg : Hesper.ExecConfig := {
+    workgroupSize := { x := 128, y := 1, z := 1 }
+    numWorkgroups := (numHeads, 1, 1)
+    extensions := ["subgroups"]
+  }
+  for _ in [0:warmup] do
+    GPUBackend.execute ctx partialShader partialBufs partialCfg
+    GPUBackend.execute ctx combineShader combineBufs combineCfg
+  Hesper.CUDA.cuStreamSynchronize (0 : USize)
+  let t0 ← IO.monoNanosNow
+  for _ in [0:iters] do
+    GPUBackend.execute ctx partialShader partialBufs partialCfg
+    GPUBackend.execute ctx combineShader combineBufs combineCfg
   Hesper.CUDA.cuStreamSynchronize (0 : USize)
   let t1 ← IO.monoNanosNow
   let totalNs := t1 - t0
@@ -550,12 +585,74 @@ unsafe def main : IO Unit := do
     let v2Speedup := vecUs / v2Us
     let v6Speedup := v2Us / v6Us
 
-    -- Raw-launch column: compile vecShader once (cuModuleLoadData +
-    -- cuModuleGetFunction), pre-resolve buffer args, then time bare
-    -- cuLaunchKernel in a tight loop. Excludes ShaderM.exec, preHash,
-    -- cudaModuleCache.get, and buffer-name resolution from the per-call
-    -- path — same kernel as the "vec" column but without
-    -- GPUBackend.execute machinery.
+    -- V7/V9/V11 columns (require f16 K/V cache; D % 64 == 0 ∧ D % 128 == 0).
+    let numSplits : Nat := 8
+    let v7Shader  := Hesper.WGSL.FlashAttention.flashAttentionVecParamsKernelV7
+                       nh nkv maxSeq hd scale
+    let v9Shader  := Hesper.WGSL.FlashAttention.flashAttentionVecParamsKernelV9
+                       nh nkv maxSeq hd numSplits scale
+    let v11Shader := Hesper.WGSL.FlashAttention.flashAttentionVecParamsKernelV11
+                       nh nkv maxSeq hd numSplits scale
+    let combineShader := Hesper.WGSL.FlashAttention.flashAttentionVecCombineKernel
+                           nh hd numSplits
+
+    let v7BufsBench : List (String × GPUBackend.Buf Hesper.CUDAContext) :=
+      [ ("q",            qBuf)
+      , ("k_cache_f16",  kBufHalf)
+      , ("v_cache_f16",  vBufHalf)
+      , ("output",       outBuf)
+      , ("params",       paramsBuf) ]
+    let partialOutBuf  ← GPUBackend.allocBuffer ctx ((nh * numSplits * hd * 4).toUSize)
+    let partialMetaBuf ← GPUBackend.allocBuffer ctx ((nh * numSplits * 2 * 4).toUSize)
+    let splitPartialBufs : List (String × GPUBackend.Buf Hesper.CUDAContext) :=
+      [ ("q",             qBuf)
+      , ("k_cache_f16",   kBufHalf)
+      , ("v_cache_f16",   vBufHalf)
+      , ("partial_out",   partialOutBuf)
+      , ("partial_meta",  partialMetaBuf)
+      , ("params",        paramsBuf) ]
+    let combineBufs : List (String × GPUBackend.Buf Hesper.CUDAContext) :=
+      [ ("partial_out",   partialOutBuf)
+      , ("partial_meta",  partialMetaBuf)
+      , ("output",        outBuf) ]
+
+    let (v7Us, _) ← benchKernel ctx "v7" v7Shader v7BufsBench 128 nh warmup iters
+                      (numWGY := 1) (extensions := ["subgroups", "f16"])
+    let (v9Us, _) ← if cacheLen >= numSplits then
+                      benchSplitK ctx v9Shader combineShader splitPartialBufs combineBufs
+                                  nh numSplits warmup iters
+                    else pure (0.0, 0.0)
+    let (v11Us, _) ← if cacheLen >= numSplits then
+                       benchSplitK ctx v11Shader combineShader splitPartialBufs combineBufs
+                                   nh numSplits warmup iters
+                     else pure (0.0, 0.0)
+
+    -- Raw-launch helper: compile a single shader, pre-resolve args, time
+    -- bare cuLaunchKernel.  Returns avg µs/call.
+    let rawLaunch (label : String) (shader : Hesper.WGSL.Monad.ShaderM Unit)
+                  (kernelBufs : List (String × GPUBackend.Buf Hesper.CUDAContext))
+                  (gx gy : Nat) (bx : UInt32) : IO Float := do
+      let ptx := Hesper.CUDA.CodeGen.generatePTX label
+                   { x := bx.toNat, y := 1, z := 1 } shader
+      let cudaMod ← Hesper.CUDA.cuModuleLoadData ptx
+      let f ← Hesper.CUDA.cuModuleGetFunction cudaMod label
+      let state := Hesper.WGSL.Monad.ShaderM.exec shader
+      let declaredNames := state.declaredBuffers.map (·.1)
+      let args : Array USize ← declaredNames.foldlM (init := #[]) fun acc name => do
+        match kernelBufs.find? (fun p => p.1 == name) with
+        | some (_, buf) => return acc.push buf.ptr
+        | none => throw (IO.userError s!"raw-launch {label}: missing buffer '{name}'")
+      for _ in [0:warmup] do
+        Hesper.CUDA.cuLaunchKernel f gx.toUInt32 gy.toUInt32 1 bx 1 1 0 args
+      Hesper.CUDA.cuStreamSynchronize (0 : USize)
+      let t0 ← IO.monoNanosNow
+      for _ in [0:iters] do
+        Hesper.CUDA.cuLaunchKernel f gx.toUInt32 gy.toUInt32 1 bx 1 1 0 args
+      Hesper.CUDA.cuStreamSynchronize (0 : USize)
+      let t1 ← IO.monoNanosNow
+      pure ((t1 - t0).toFloat / iters.toFloat / 1000.0)
+
+    -- Raw-launch column: same vec kernel but without GPUBackend.execute.
     let rawInfo ← do
       let funcName : String := "vec_raw_kernel"
       let ptx := Hesper.CUDA.CodeGen.generatePTX funcName
@@ -591,6 +688,23 @@ unsafe def main : IO Unit := do
       let vecVsRaw := vecUs / rawUs
       pure s!"  raw={rawUs} µs/call  vec/raw={vecVsRaw}×"
 
+    -- Raw-launch GPU times for V7/V9/V11: same kernels as the "v7/v9/v11"
+    -- columns but without GPUBackend.execute host-path cost.  V9/V11 each
+    -- include partial + combine.
+    let v7RawUs ← rawLaunch "v7_raw" v7Shader v7BufsBench nh 1 128
+    let v9PartialRawUs ← if cacheLen >= numSplits then
+                            rawLaunch "v9p_raw" v9Shader splitPartialBufs nh numSplits 128
+                         else pure 0.0
+    let v11PartialRawUs ← if cacheLen >= numSplits then
+                             rawLaunch "v11p_raw" v11Shader splitPartialBufs nh numSplits 128
+                          else pure 0.0
+    let combineRawUs ← if cacheLen >= numSplits then
+                           rawLaunch "comb_raw" combineShader combineBufs nh 1 128
+                       else pure 0.0
+    let v9RawUs := v9PartialRawUs + combineRawUs
+    let v11RawUs := v11PartialRawUs + combineRawUs
+    let rawV7V9V11 := s!"  raw_v7={v7RawUs}µs raw_v9={v9RawUs}µs (p={v9PartialRawUs} c={combineRawUs}) raw_v11={v11RawUs}µs (p={v11PartialRawUs} c={combineRawUs})"
+
     -- Fourth column: llama.cpp PTX (only if the PTX module loaded).
     let llamaInfo ← match llamaKernelOpt with
       | none => pure ""
@@ -612,8 +726,10 @@ unsafe def main : IO Unit := do
         let llamaMs := (t1 - t0).toFloat / 1.0e6
         let vecVsLlama := vecUs / llamaUs
         pure s!"  llama={llamaUs} µs/call ({llamaMs} ms / {iters})  vec/llama={vecVsLlama}×"
-    IO.println s!"  cacheLen={cacheLen}: legacy={legacyUs} vec={vecUs} v2={v2Us} v6={v6Us} µs/call  legacy/vec={speedup}× v2/v6={v6Speedup}×{rawInfo}{llamaInfo} (v6 {v6Ms}ms/{iters})"
+    IO.println s!"  cacheLen={cacheLen}: legacy={legacyUs} vec={vecUs} v2={v2Us} v6={v6Us} v7={v7Us} v9={v9Us} v11={v11Us} µs/call  legacy/vec={speedup}× v2/v6={v6Speedup}×{rawInfo}{rawV7V9V11}{llamaInfo} (v6 {v6Ms}ms/{iters})"
 
+    GPUBackend.freeBuffer ctx partialOutBuf
+    GPUBackend.freeBuffer ctx partialMetaBuf
     GPUBackend.freeBuffer ctx qBuf
     GPUBackend.freeBuffer ctx kBuf
     GPUBackend.freeBuffer ctx vBuf
