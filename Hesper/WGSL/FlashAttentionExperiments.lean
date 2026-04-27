@@ -1821,5 +1821,72 @@ def flashAttentionVecCombineKernel
       (Exp.div (Exp.var accVar) denom)
 
 
+/-- Production launcher for V11 FlashAttention (split-K + sub-warp partition,
+    f16 K/V cache).  Two kernels:
+      1. `flashAttentionVecParamsKernelV11` — partial: per-split (max, sum, vkq).
+      2. `flashAttentionVecCombineKernel`   — combine: cross-split softmax merge.
+
+    Inputs:
+    - `qBuf`           — f32, [numHeads * headDim]
+    - `kCacheF16Buf`   — u32 (packed half2), [numKVHeads * maxSeqLen * headDim / 2]
+    - `vCacheF16Buf`   — u32 (packed half2), [numKVHeads * maxSeqLen * headDim / 2]
+    - `paramsBuf`      — u32[2] = [pos, cacheLen]
+    - `partialOutBuf`  — f32, [numHeads * numSplits * headDim]   (state.flashPartialOutV11)
+    - `partialMetaBuf` — f32, [numHeads * numSplits * 2]         (state.flashPartialMetaV11)
+    - `outputBuf`      — f32, [numHeads * headDim]               (state.attnOutBuf)
+-/
+def executeFlashAttentionV11 [GPUBackend β] (ctx : β)
+    (qBuf kCacheF16Buf vCacheF16Buf paramsBuf
+     partialOutBuf partialMetaBuf outputBuf : GPUBackend.Buf β)
+    (numHeads numKVHeads maxSeqLen headDim : Nat) (scale : Float)
+    (kcrLookup :
+       Option (UInt64 → IO (IO.Ref (Option (GPUBackend.CachedDispatch β)))) := none)
+    : IO Unit := do
+  let numSplits : Nat := 8
+  let workgroupSize : Nat := 128
+
+  -- Partial kernel: gridDim = (numHeads, numSplits, 1)
+  let shaderP := flashAttentionVecParamsKernelV11
+                   numHeads numKVHeads maxSeqLen headDim numSplits scale
+  let namedBuffersP :=
+    [ ("q",            qBuf)
+    , ("k_cache_f16",  kCacheF16Buf)
+    , ("v_cache_f16",  vCacheF16Buf)
+    , ("partial_out",  partialOutBuf)
+    , ("partial_meta", partialMetaBuf)
+    , ("params",       paramsBuf) ]
+  let execConfigP : Hesper.ExecConfig := {
+    workgroupSize := { x := workgroupSize, y := 1, z := 1 }
+    numWorkgroups := (numHeads, numSplits, 1)
+    extensions := ["subgroups"]
+  }
+  let cacheKeyP : UInt64 :=
+    hash ("flashV11Partial", numHeads, numKVHeads, maxSeqLen, headDim, numSplits)
+  let refP ← match kcrLookup with
+    | some lk => lk cacheKeyP
+    | none    => IO.mkRef none
+  GPUBackend.executeWithConfigCached ctx shaderP namedBuffersP execConfigP cacheKeyP refP
+
+  -- Combine kernel: gridDim = (numHeads, 1, 1), workgroupSize = headDim
+  -- (combine kernel assumes elemsPerThread = headDim / workgroupSize, with
+  -- workgroupSize=128 and headDim=256 → 2 elems/thread).
+  let shaderC := flashAttentionVecCombineKernel numHeads headDim numSplits
+  let namedBuffersC :=
+    [ ("partial_out",  partialOutBuf)
+    , ("partial_meta", partialMetaBuf)
+    , ("output",       outputBuf) ]
+  let execConfigC : Hesper.ExecConfig := {
+    workgroupSize := { x := workgroupSize, y := 1, z := 1 }
+    numWorkgroups := (numHeads, 1, 1)
+    extensions := ["subgroups"]
+  }
+  let cacheKeyC : UInt64 :=
+    hash ("flashV11Combine", numHeads, headDim, numSplits)
+  let refC ← match kcrLookup with
+    | some lk => lk cacheKeyC
+    | none    => IO.mkRef none
+  GPUBackend.executeWithConfigCached ctx shaderC namedBuffersC execConfigC cacheKeyC refC
+
+
 end Hesper.WGSL.FlashAttention
 
