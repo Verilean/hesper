@@ -304,6 +304,14 @@ where
     let (r, s) := s.freshF32; (.f32 r, s.emit (.cvt_f32_u32 r re.toU32!))
     -- Note: for negative i32, cvt.rn.f32.u32 reinterprets as unsigned.
     -- Use cvt_f32_s32 variant for signed if needed (added below).
+  | .toF32U e =>
+    -- True unsigned f32 conversion.  Lowers to PTX cvt.rn.f32.u32 which
+    -- ptxas turns into a single I2FP.F32.U32 SASS instruction without the
+    -- prepending SGXT.U32 sign-extend that the .s32 variant inserts when
+    -- the source is a narrow bit-field (e.g. `(x >> 8) & 0x3F` for Q4_K
+    -- scale).  Use ONLY when the value is semantically non-negative.
+    let (re, s) := expToPTX e s
+    let (r, s) := s.freshF32; (.f32 r, s.emit (.cvt_f32_u32_real r re.toU32!))
   | .toU32 e =>
     let (re, s) := expToPTX e s
     let (r, s) := s.freshU32; (.u32 r, s.emit (.cvt_u32_f32 r re.toF32!))
