@@ -1,0 +1,151 @@
+import Hesper.Models.Gemma4
+import Hesper.Layers.Linear
+import Hesper.Backend
+import Hesper.Backend.CUDA
+import Hesper.Basic
+import Hesper.WGSL.Monad
+
+/-!
+# MMQ vs 1-warp batched matmul parity test
+
+Compares two batched Q4_K × Q8_1 matmul kernels on real Gemma 4 weights:
+
+  REFERENCE (1-warp):  `q4kMatmulBatchKernel`        block=32,  grid=(outDim, seqLen)
+  CANDIDATE (MMQ):     `q4kMatmulBatchMMQKernel`    block=256, grid=(outDim/32, seqLen/8)
+
+Both consume the same Q4_K weight tensor and the same pre-quantized Q8_1
+input (produced by `quantizeQ8_1BatchKernel`).  They must produce
+bit-identical (or near-bit-identical: rounding-tolerant ≤1e-3) outputs
+of shape `[outDim, seqLen]`.
+
+Used for: Phase 1c MMQ parity debugging.  When parity fails, the diff
+location pinpoints which sub-step (scale extraction, Y indexing, etc.)
+is wrong.
+
+Build: `lake build gemma4-q4k-mmq-parity`
+Run:   `lake exe gemma4-q4k-mmq-parity`
+-/
+
+open Hesper
+open Hesper.WGSL.Monad
+
+def maxAbsDiffMMQ (a b : Array Float) : Float := Id.run do
+  let mut m : Float := 0.0
+  for i in [0:a.size] do
+    let d := (a[i]! - b[i]!).abs
+    if d > m then m := d
+  return m
+
+def main : IO Unit := do
+  IO.println "=== Q4_K MMQ vs 1-warp batched parity ==="
+
+  let modelPath := "data/gemma-4-e4b-it-Q4_K_M.gguf"
+  Hesper.Layers.Linear.dp4aEnabled.set true
+  let ctx ← Hesper.CUDAContext.init
+
+  IO.println s!"[Load] {modelPath}"
+  let model ← Hesper.Models.Gemma4.Gemma4Model.fromGGUF ctx modelPath
+  let block0 ← match model.blocks[0]? with
+    | some b => pure b
+    | none   => do
+      IO.println "FAIL: model has no blocks"; IO.Process.exit 1
+
+  -- wQ: outDim=2048 (16 Q heads × headDim=128), inDim=2560.
+  -- 2048 % 32 == 0 ✓
+  let wQ := block0.attention.wQ
+  if wQ.quantFormat != .Q4_K then
+    IO.println s!"FAIL: wQ is not Q4_K (got {repr wQ.quantFormat})"; IO.Process.exit 1
+  let inDim  := wQ.config.inDim    -- 2560
+  let outDim := wQ.config.outDim   -- 2048
+
+  -- Test seqLen=8 (simplest MMQ tile: gridY = 1).
+  let seqLen := 8
+  IO.println s!"[Test] inDim={inDim} outDim={outDim} seqLen={seqLen}"
+  if outDim % 32 != 0 then
+    IO.println s!"FAIL: outDim {outDim} not divisible by 32"; IO.Process.exit 1
+  if seqLen % 8 != 0 then
+    IO.println s!"FAIL: seqLen {seqLen} not divisible by 8"; IO.Process.exit 1
+  if inDim % 256 != 0 then
+    IO.println s!"FAIL: inDim {inDim} not divisible by 256"; IO.Process.exit 1
+
+  -- 1. Build a deterministic f32 input of shape [seqLen, inDim] (column-major =
+  --    inDim rows × seqLen cols flat = inDim*seqLen floats, layout col*inDim + row).
+  let totalIn := inDim * seqLen
+  let inArr : Array Float :=
+    (List.range totalIn).toArray.map (fun i =>
+      Float.sin (i.toFloat * 0.013) * 0.4)
+  let inBytes ← Hesper.Basic.floatArrayToBytes inArr
+
+  let inputBuf  ← GPUBackend.allocBuffer ctx ((totalIn * 4).toUSize)
+  GPUBackend.writeBuffer ctx inputBuf inBytes
+
+  -- 2. Quantize input → Q8_1 batched.
+  let nQ8Blocks := inDim / 32
+  let q8BufBytes : USize := (nQ8Blocks * 9 * seqLen * 4).toUSize
+  let q8Buf ← GPUBackend.allocBuffer ctx q8BufBytes
+  let q8Ref ← IO.mkRef (none : Option (GPUBackend.CachedDispatch _))
+  GPUBackend.executeWithConfigCached ctx
+    (Hesper.Layers.Linear.quantizeQ8_1BatchKernel inDim seqLen)
+    [("input", inputBuf), ("output", q8Buf)]
+    { numWorkgroups := (nQ8Blocks, seqLen, 1), workgroupSize := { x := 32, y := 1, z := 1 } }
+    (hash ("test-q8-quant", inDim, seqLen)) q8Ref
+
+  let outBufSz : USize := (outDim * seqLen * 4).toUSize
+
+  -- 3. Reference path: 1-warp baseline.
+  let outBufRef ← GPUBackend.allocBuffer ctx outBufSz
+  let refRef ← IO.mkRef (none : Option (GPUBackend.CachedDispatch _))
+  GPUBackend.executeWithConfigCached ctx
+    (Hesper.Layers.Linear.q4kMatmulBatchKernel wQ.config seqLen)
+    [("weights", wQ.weightBuf), ("input_q8", q8Buf), ("output", outBufRef)]
+    { numWorkgroups := (outDim, seqLen, 1), workgroupSize := { x := 32, y := 1, z := 1 } }
+    (hash ("test-1warp", inDim, outDim, seqLen)) refRef
+
+  let outBytesRef ← GPUBackend.readBuffer ctx outBufRef outBufSz
+  let mut outArrRef : Array Float := Array.mkEmpty (outDim * seqLen)
+  for i in [0:outDim * seqLen] do
+    let f ← Hesper.Basic.bytesToFloat32 outBytesRef (i * 4)
+    outArrRef := outArrRef.push f
+  IO.println s!"[Ref ] out[0..4]   = {outArrRef.toList.take 4}"
+  IO.println s!"[Ref ] out[col1,0..3] = {(outArrRef.toList.drop outDim).take 4}"
+
+  -- 4. Candidate path: MMQ tile kernel.
+  let outBufMMQ ← GPUBackend.allocBuffer ctx outBufSz
+  let mmqRef ← IO.mkRef (none : Option (GPUBackend.CachedDispatch _))
+  let nTileCols := (seqLen + 7) / 8
+  GPUBackend.executeWithConfigCached ctx
+    (Hesper.Layers.Linear.q4kMatmulBatchMMQKernel wQ.config seqLen)
+    [("weights", wQ.weightBuf), ("input_q8", q8Buf), ("output", outBufMMQ)]
+    { numWorkgroups := (outDim / 32, nTileCols, 1),
+      workgroupSize := { x := 256, y := 1, z := 1 } }
+    (hash ("test-mmq", inDim, outDim, seqLen)) mmqRef
+
+  let outBytesMMQ ← GPUBackend.readBuffer ctx outBufMMQ outBufSz
+  let mut outArrMMQ : Array Float := Array.mkEmpty (outDim * seqLen)
+  for i in [0:outDim * seqLen] do
+    let f ← Hesper.Basic.bytesToFloat32 outBytesMMQ (i * 4)
+    outArrMMQ := outArrMMQ.push f
+  IO.println s!"[MMQ ] out[0..4]   = {outArrMMQ.toList.take 4}"
+  IO.println s!"[MMQ ] out[col1,0..3] = {(outArrMMQ.toList.drop outDim).take 4}"
+
+  -- 5. Diff.
+  let err := maxAbsDiffMMQ outArrRef outArrMMQ
+  IO.println s!"[Parity] max |err| over {outDim * seqLen} elements = {err}"
+
+  -- Locate first major mismatch for debugging.
+  let mut firstBigIdx : Int := -1
+  for i in [0:outDim * seqLen] do
+    let d := (outArrRef[i]! - outArrMMQ[i]!).abs
+    if d > 0.01 && firstBigIdx == -1 then
+      firstBigIdx := i.toInt32.toInt
+      let row := i % outDim
+      let col := i / outDim
+      IO.println s!"[Diff] first |err|>0.01 at i={i} (row={row}, col={col}): ref={outArrRef[i]!} mmq={outArrMMQ[i]!}"
+
+  if err == 0.0 then
+    IO.println "PASS: MMQ is BIT-IDENTICAL to 1-warp baseline"
+  else if err < 1.0e-3 then
+    IO.println s!"PASS (≈): MMQ matches baseline within 1e-3 (max |err| = {err})"
+  else
+    IO.println s!"FAIL: MMQ output differs from baseline (max |err| = {err})"
+    IO.Process.exit 1
