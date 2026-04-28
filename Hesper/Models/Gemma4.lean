@@ -2527,20 +2527,11 @@ def forwardSingleToken [GPUBackend β] (ctx : β)
       pure (a && b && useSubgroups && model.config.hiddenSize % 32 == 0)
     | _ => pure false
   if !useFusedNormLmHead then
+    -- Bypass the Circuit DSL path (which lowers RMSNorm at workgroupSize=256
+    -- and ignores the wgSize argument) and call the hand-written kernel
+    -- with workgroupSize=1024 directly.  Memo: project_rmsnorm_parity.md.
     Hesper.WGSL.Execute.withSection "finalNorm" do
-      let key := hash ("circuitFinalNorm-cuda", model.finalNorm.config.dim)
-      let ccRef ← Hesper.Circuit.getGlobalCircuitRef (β := β) key
-      Hesper.Circuit.runCachedFused ctx ccRef
-        (do
-          let xT ← Hesper.Circuit.CircuitM.registerExternal
-            (BufT := GPUBackend.Buf β) (CacheT := GPUBackend.CachedDispatch β)
-            currentBuf #[model.finalNorm.config.dim] .f32 .Global
-          let sT ← Hesper.Circuit.CircuitM.registerExternal
-            (BufT := GPUBackend.Buf β) (CacheT := GPUBackend.CachedDispatch β)
-            model.finalNorm.scale #[model.finalNorm.config.dim] .f32 .Global
-          let _y ← Hesper.Circuit.CircuitM.rmsNorm xT sT model.finalNorm.config.eps
-          pure ())
-        [(0, currentBuf), (1, model.finalNorm.scale), (5, nextBuf)]
+      RMSNorm.forward ctx model.finalNorm currentBuf nextBuf (workgroupSize := 1024)
 
   -- Step 4: LM head matmul (1 × hiddenSize @ hiddenSize × vocabSize)
   Hesper.WGSL.Execute.withSection "lmHead" do
