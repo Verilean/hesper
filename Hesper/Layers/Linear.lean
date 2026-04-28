@@ -2364,23 +2364,36 @@ def fusedQ4KMLinearDP4A4WarpKernel (config : Config) : ShaderM Unit := do
     let (scA, mA) := extractScaleMin bq8Off
     let (scB, mB) := extractScaleMin (Exp.add bq8Off (Exp.litU32 1))
 
-    let q4BaseIdx := Exp.add blockU32Base
-      (Exp.add (Exp.litU32 4) (Exp.add (Exp.mul bq8Off (Exp.litU32 4)) elemOff))
+    -- Bind q4BaseIdx into a register so the 2× ld.global for v0/v1 share the
+    -- same address-chain materialisation (otherwise codegen re-expands the
+    -- 3-add chain `blockU32Base + (4 + bq8Off*4 + elemOff)` for both reads).
+    let q4BaseIdxName ← ShaderM.var (.scalar .u32)
+      (Exp.add blockU32Base
+        (Exp.add (Exp.litU32 4) (Exp.add (Exp.mul bq8Off (Exp.litU32 4)) elemOff)))
+    let q4BaseIdx : Exp (.scalar .u32) := Exp.var q4BaseIdxName
     let v0 ← ShaderM.readBuffer (ty := .scalar .u32) (n := totalWeightU32) "weights" q4BaseIdx
     let v1 ← ShaderM.readBuffer (ty := .scalar .u32) (n := totalWeightU32) "weights" (Exp.add q4BaseIdx (Exp.litU32 4))
 
     -- Q8_1 reads from global memory (no smem staging — maximizes occupancy).
-    -- Hoist the two sub-block bases into explicit registers (shared across
-    -- 6 ld.global for this block of Q8_1).
+    -- Hoist sub-block bases AND the per-load addresses (q8Sub0Base + 1 +
+    -- elemOff) into explicit registers — codegen otherwise re-emits the
+    -- 2-add chain for u0/u1/u2/u3 individually.
     let q8Sub0BaseName ← ShaderM.var (.scalar .u32)
       (Exp.add (Exp.mul blockIdx (Exp.litU32 (8 * 9))) (Exp.mul bq8Off (Exp.litU32 9)))
     let q8Sub0Base : Exp (.scalar .u32) := Exp.var q8Sub0BaseName
     let q8Sub1BaseName ← ShaderM.var (.scalar .u32) (Exp.add q8Sub0Base (Exp.litU32 9))
     let q8Sub1Base : Exp (.scalar .u32) := Exp.var q8Sub1BaseName
-    let u0 ← ShaderM.readBuffer (ty := .scalar .u32) (n := q8InputU32Size) "input_q8" (Exp.add q8Sub0Base (Exp.add (Exp.litU32 1) elemOff))
-    let u1 ← ShaderM.readBuffer (ty := .scalar .u32) (n := q8InputU32Size) "input_q8" (Exp.add q8Sub0Base (Exp.add (Exp.litU32 5) elemOff))
-    let u2 ← ShaderM.readBuffer (ty := .scalar .u32) (n := q8InputU32Size) "input_q8" (Exp.add q8Sub1Base (Exp.add (Exp.litU32 1) elemOff))
-    let u3 ← ShaderM.readBuffer (ty := .scalar .u32) (n := q8InputU32Size) "input_q8" (Exp.add q8Sub1Base (Exp.add (Exp.litU32 5) elemOff))
+    -- Bind `1 + elemOff` and `5 + elemOff` once each (lane-invariant within
+    -- iter); the (q8Sub_Base + offset) addition still varies per sub-block
+    -- but the offset itself doesn't.
+    let q8Off1Name ← ShaderM.var (.scalar .u32) (Exp.add (Exp.litU32 1) elemOff)
+    let q8Off5Name ← ShaderM.var (.scalar .u32) (Exp.add (Exp.litU32 5) elemOff)
+    let q8Off1 : Exp (.scalar .u32) := Exp.var q8Off1Name
+    let q8Off5 : Exp (.scalar .u32) := Exp.var q8Off5Name
+    let u0 ← ShaderM.readBuffer (ty := .scalar .u32) (n := q8InputU32Size) "input_q8" (Exp.add q8Sub0Base q8Off1)
+    let u1 ← ShaderM.readBuffer (ty := .scalar .u32) (n := q8InputU32Size) "input_q8" (Exp.add q8Sub0Base q8Off5)
+    let u2 ← ShaderM.readBuffer (ty := .scalar .u32) (n := q8InputU32Size) "input_q8" (Exp.add q8Sub1Base q8Off1)
+    let u3 ← ShaderM.readBuffer (ty := .scalar .u32) (n := q8InputU32Size) "input_q8" (Exp.add q8Sub1Base q8Off5)
     let q8Hdr0 ← ShaderM.readBuffer (ty := .scalar .u32) (n := q8InputU32Size) "input_q8" q8Sub0Base
     let q8Hdr1 ← ShaderM.readBuffer (ty := .scalar .u32) (n := q8InputU32Size) "input_q8" q8Sub1Base
     -- Q8_1 header is now half2(d, sum) packed in a u32.  Extract `d` via
@@ -2402,8 +2415,6 @@ def fusedQ4KMLinearDP4A4WarpKernel (config : Config) : ShaderM Unit := do
     let dot1_0Combined := Exp.add acc0 dot1_0
     let sumU_0 := Exp.add (Exp.dot4I8Packed (Exp.litU32 0x01010101) u0)
                           (Exp.dot4I8Packed (Exp.litU32 0x01010101) u1)
-    let sumfD_0 := Exp.mul d8A (Exp.mul (Exp.toF32 dot1_0Combined) scA)
-    let sumfM_0 := Exp.mul d8A (Exp.mul (Exp.toF32 sumU_0) mA)
 
     let v0i1 := Exp.bitAnd (Exp.shiftRight v0 (Exp.litU32 4)) (Exp.litU32 0x0F0F0F0F)
     let v1i1 := Exp.bitAnd (Exp.shiftRight v1 (Exp.litU32 4)) (Exp.litU32 0x0F0F0F0F)
@@ -2412,17 +2423,30 @@ def fusedQ4KMLinearDP4A4WarpKernel (config : Config) : ShaderM Unit := do
     let dot1_1Combined := Exp.add acc1 dot1_1
     let sumU_1 := Exp.add (Exp.dot4I8Packed (Exp.litU32 0x01010101) u2)
                           (Exp.dot4I8Packed (Exp.litU32 0x01010101) u3)
-    let sumfD_1 := Exp.mul d8B (Exp.mul (Exp.toF32 dot1_1Combined) scB)
-    let sumfM_1 := Exp.mul d8B (Exp.mul (Exp.toF32 sumU_1) mB)
 
-    let blockSumfD := Exp.add sumfD_0 sumfD_1
-    let blockSumfM := Exp.add sumfM_0 sumfM_1
-    -- acc' = acc + dF * blockSumfD - dminF * blockSumfM
-    --      = fma(dF, blockSumfD, fma(-dminF, blockSumfM, acc))
-    -- llama.cpp emits 5 FFMA in the inner loop; hesper was emitting 0 fma.
-    -- ptxas does fold some `mul + add` into FFMA in SASS, but the explicit
-    -- fma in PTX gives ptxas more freedom over the schedule and ensures
-    -- the FFMA actually appears.
+    -- FFMA-folded epilogue.  Original chain:
+    --   sumfD_i = d8_i * (dot_i.toF32 * sc_i)
+    --   sumfM_i = d8_i * (sumU_i.toF32 * m_i)
+    --   blockSumfD = sumfD_0 + sumfD_1
+    --   blockSumfM = sumfM_0 + sumfM_1
+    --   acc' = fma(dF, blockSumfD, fma(-dminF, blockSumfM, acc))
+    -- = 8 mul + 2 add + 2 fma per iter.
+    --
+    -- Pre-multiply scale into d8 (loop-invariant per pair) gives:
+    --   blockSumfD = fma(dot_0F, d8AscA, dot_1F * d8BscB)
+    --   blockSumfM = fma(sumU_0F, d8AmA,  sumU_1F * d8BmB)
+    --   acc' = fma(dF, blockSumfD, fma(-dminF, blockSumfM, acc))
+    -- = 4 mul + 4 fma per iter (-1 mul, +2 fma).  ptxas can FFMA the rest.
+    let dot0F := Exp.toF32 dot1_0Combined
+    let dot1F := Exp.toF32 dot1_1Combined
+    let sumU0F := Exp.toF32 sumU_0
+    let sumU1F := Exp.toF32 sumU_1
+    let d8AscA := Exp.mul d8A scA
+    let d8BscB := Exp.mul d8B scB
+    let d8AmA  := Exp.mul d8A mA
+    let d8BmB  := Exp.mul d8B mB
+    let blockSumfD := Exp.fma dot0F d8AscA (Exp.mul dot1F d8BscB)
+    let blockSumfM := Exp.fma sumU0F d8AmA  (Exp.mul sumU1F d8BmB)
     let accPrime := Exp.fma dF blockSumfD (Exp.fma (Exp.neg dminF) blockSumfM acc)
     ShaderM.assign "acc" accPrime
     ) (pure ())
