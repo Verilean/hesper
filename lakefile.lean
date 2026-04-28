@@ -930,6 +930,10 @@ lean_exe «cuda-q6k-ptx-dump» where
   root := `Tests.CUDA.Q6KPtxDump
   moreLinkArgs := stdLinkArgs ++ #["./.lake/build/native/libhesper_cuda.a", "-lcuda"]
 
+lean_exe «cuda-q4k-ptx-dump» where
+  root := `Tests.CUDA.Q4KPtxDump
+  moreLinkArgs := stdLinkArgs ++ #["./.lake/build/native/libhesper_cuda.a", "-lcuda"]
+
 lean_exe «cuda-fa-golden-test» where
   root := `Tests.CUDA.CUDAFlashAttnGoldenTest
   moreLinkArgs := stdLinkArgs ++ #["./.lake/build/native/libhesper_cuda.a", "-lcuda"]

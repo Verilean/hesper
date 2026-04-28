@@ -2408,8 +2408,14 @@ def fusedQ4KMLinearDP4A4WarpKernel (config : Config) : ShaderM Unit := do
 
     let blockSumfD := Exp.add sumfD_0 sumfD_1
     let blockSumfM := Exp.add sumfM_0 sumfM_1
-    let blockContrib := Exp.sub (Exp.mul dF blockSumfD) (Exp.mul dminF blockSumfM)
-    ShaderM.assign "acc" (Exp.add acc blockContrib)
+    -- acc' = acc + dF * blockSumfD - dminF * blockSumfM
+    --      = fma(dF, blockSumfD, fma(-dminF, blockSumfM, acc))
+    -- llama.cpp emits 5 FFMA in the inner loop; hesper was emitting 0 fma.
+    -- ptxas does fold some `mul + add` into FFMA in SASS, but the explicit
+    -- fma in PTX gives ptxas more freedom over the schedule and ensures
+    -- the FFMA actually appears.
+    let accPrime := Exp.fma dF blockSumfD (Exp.fma (Exp.neg dminF) blockSumfM acc)
+    ShaderM.assign "acc" accPrime
     ) (pure ())
 
   -- Intra-warp reduce: all 32 lanes contribute distinct products (matches
