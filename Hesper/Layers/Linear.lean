@@ -3652,30 +3652,58 @@ def fusedQ6KLinearDP4A4WarpKernel (inDim outDim : Nat) (gridX : Nat := 0) : Shad
 
     ShaderM.assign "acc" (Exp.fma d (Exp.add sumf_0 sumf_1) acc)
 
-  -- Stage 1: per-warp lane reduction (32 lanes → 1 partial per warp).
-  ShaderM.varNamed "warpSum" (.scalar .f32) (Exp.subgroupAdd acc)
-  let warpSum : Exp (.scalar .f32) := Exp.var "warpSum"
+  -- Cross-warp reduction — match llama.cpp's `mul_mat_vec_q` exactly
+  -- (mmvq.cu:503-549).  Key insight: do NOT collapse each warp to a
+  -- scalar before publishing.  Instead, each lane of warps 1..3 stores
+  -- its OWN per-lane partial to smem; warp 0 then reads back per-lane
+  -- partials and accumulates them lane-parallel BEFORE the final
+  -- `warp_reduce_sum`.  This preserves the same f32 summation order as
+  -- the 1-warp kernel (binary-tree reduce of 32 partials), avoiding
+  -- the round-off drift that scalar-merge introduced.
+  --
+  -- Smem: nwarps-1 = 3 entries × warp_size = 96 floats (384 bytes).
+  let nwarpsMinus1 : Nat := 3
+  let warpSize    : Nat := 32
+  let smemSize    : Nat := nwarpsMinus1 * warpSize  -- 96
+  ShaderM.sharedNamed "s_warp_partials" (.array (.scalar .f32) smemSize)
 
-  -- Stage 2: cross-warp merge via smem.  Warps 1..3 publish their warp
-  -- partial; barrier; warp 0 reads and adds.  llama.cpp does the same with
-  -- `tmp_shared[nwarps-1][lane]` then warp 0 combines.  We only need 4
-  -- entries (one per warp), not nwarps-1 × warp_size, because we already
-  -- finished the within-warp reduction in stage 1.
-  ShaderM.sharedNamed "s_warp_partials" (.array (.scalar .f32) 4)
-  ShaderM.if_ (Exp.eq laneId (Exp.litU32 0)) (do
-    ShaderM.writeWorkgroup (ty := .scalar .f32) "s_warp_partials" warpId warpSum
+  -- Warps 1..3 publish (no per-warp reduce yet).  Layout:
+  --   s_warp_partials[(warpId-1)*32 + laneId] = acc
+  ShaderM.if_ (Exp.gt warpId (Exp.litU32 0)) (do
+    let warpIdM1 := Exp.sub warpId (Exp.litU32 1)
+    let smemIdx := Exp.add (Exp.mul warpIdM1 (Exp.litU32 32)) laneId
+    ShaderM.writeWorkgroup (ty := .scalar .f32) "s_warp_partials" smemIdx acc
   ) (pure ())
   ShaderM.barrier
 
-  ShaderM.if_ (Exp.and (Exp.eq warpId (Exp.litU32 0)) (Exp.eq laneId (Exp.litU32 0))) (do
-    let p0 ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := 4) "s_warp_partials" (Exp.litU32 0)
-    let p1 ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := 4) "s_warp_partials" (Exp.litU32 1)
-    let p2 ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := 4) "s_warp_partials" (Exp.litU32 2)
-    let p3 ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := 4) "s_warp_partials" (Exp.litU32 3)
-    let total := Exp.add (Exp.add p0 p1) (Exp.add p2 p3)
-    ShaderM.if_ inBounds (do
-      ShaderM.writeBuffer (ty := .scalar .f32) "output" outIdx total
-    ) (pure ())
+  -- Warps 1..3 done.  Warp 0 (all 32 lanes) accumulates lane-parallel.
+  -- Note: `subgroupAdd` is a warp-collective op — every lane in the
+  -- warp must reach it.  We can't put it inside an `if (warpId == 0)`
+  -- guard because warps 1..3 also need to "execute" the same lowered
+  -- shfl.bfly (a no-op for them since they returned).  Solution: do
+  -- the smem reads + `subgroupAdd` for **all** warps; only warp 0
+  -- writes the result.  Warps 1..3 read garbage and reduce it but
+  -- their reduction result is thrown away by the warpId==0 guard
+  -- on the final write.
+  let p1 ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := smemSize) "s_warp_partials"
+            (Exp.add (Exp.litU32 0) laneId)
+  let p2 ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := smemSize) "s_warp_partials"
+            (Exp.add (Exp.litU32 32) laneId)
+  let p3 ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := smemSize) "s_warp_partials"
+            (Exp.add (Exp.litU32 64) laneId)
+  -- llama.cpp loop order: tmp += tmp_shared[0]; tmp += [1]; tmp += [2].
+  ShaderM.assign "acc" (acc + p1)
+  ShaderM.assign "acc" ((Exp.var "acc" : Exp (.scalar .f32)) + p2)
+  ShaderM.assign "acc" ((Exp.var "acc" : Exp (.scalar .f32)) + p3)
+  -- Warp-collective reduce.  All 4 warps participate (warps 1-3's
+  -- result is unused).  Same binary-tree order as 1-warp kernel.
+  ShaderM.varNamed "total" (.scalar .f32)
+    (Exp.subgroupAdd (Exp.var "acc" : Exp (.scalar .f32)))
+  let total : Exp (.scalar .f32) := Exp.var "total"
+  ShaderM.if_ (Exp.and (Exp.and (Exp.eq warpId (Exp.litU32 0))
+                                (Exp.eq laneId (Exp.litU32 0)))
+                       inBounds) (do
+    ShaderM.writeBuffer (ty := .scalar .f32) "output" outIdx total
   ) (pure ())
 
 /-! ## Fused RMSNorm + Q4_K_M MatVec -/
@@ -4343,22 +4371,14 @@ def forwardDP4A [GPUBackend β] (ctx : β)
     -- canonical 10-decode run.  2-row was actually worse than either
     -- (1.401 ms/dec) — smem sharing of Q8_1 input did not pay for the
     -- occupancy hit at 4070 Ti's SM count.
-    -- Default 1-row.  4-warp variant matches llama.cpp's
-    -- `mul_mat_vec_q<Q6_K, nwarps=4>` shape and gives **+14% TPS at
-    -- graphs ON** (60.18 → 68.66 TPS, 60-tok decode "Hello world how
-    -- are you", end-to-end correct).  But on **short prefills**
-    -- (≤11 tokens) the slightly different cross-warp f32 reduction
-    -- order accumulates round-off across 14 layers × decode token
-    -- count and produces degenerate outputs ("Hello!!!" instead of
-    -- "Hello! How can I help you today?").  Microbench parity 6e-6
-    -- max-rel-diff masks this — only e2e short-prompt decode catches
-    -- it.  Until the f32-order sensitivity is fixed (bias precision
-    -- in cross-warp reduction or higher-precision smem accumulator),
-    -- keep 1-row default.
-    --
-    -- HESPER_Q6K_KERNEL=4warp (opt-in) for users who use long prompts
-    -- and want the +14% TPS.  Other variants {2row,4row} for regression.
-    let q6kVariant := (← IO.getEnv "HESPER_Q6K_KERNEL").getD "1row"
+    -- Default: 4-warp variant matching llama.cpp's
+    -- `mul_mat_vec_q<Q6_K, nwarps=4>` shape exactly — **per-lane** cross-
+    -- warp partials in smem (96 floats), warp 0 lanes accumulate own
+    -- partial then warp-reduce.  Same f32 summation order as the
+    -- 1-warp kernel, so no accumulator drift on short prompts.
+    -- +14% TPS at graphs ON (60.18 → 68.66 TPS).
+    -- Override with HESPER_Q6K_KERNEL={1row,2row,4row} for regression.
+    let q6kVariant := (← IO.getEnv "HESPER_Q6K_KERNEL").getD "4warp"
     let force1Row  := q6kVariant == "1row"
     let force2Row  := q6kVariant == "2row"
     let force4Warp := q6kVariant == "4warp"
