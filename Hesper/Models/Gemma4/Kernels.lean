@@ -114,9 +114,9 @@ def batchBroadcastScaleInPlaceKernel (total : Nat) : ShaderM Unit := do
     every thread re-reads its slice, normalises, multiplies by weight,
     and adds into the residual buffer (bound as read_write) in place.
 
-    Dispatch: `(1, 1, 1)` workgroups × 256 threads. -/
-def fusedPerLayerPostKernel (hiddenSize : Nat) (eps : Float) : ShaderM Unit := do
-  let wgSize := 256
+    Dispatch: `(1, 1, 1)` workgroups × `wgSize` threads. -/
+def fusedPerLayerPostKernel (hiddenSize : Nat) (eps : Float)
+    (wgSize : Nat := 256) : ShaderM Unit := do
   let numSubgroups := wgSize / 32
   let lid ← ShaderM.localId
   let tid := Exp.vec3X lid
@@ -184,8 +184,8 @@ def fusedPerLayerPostKernel (hiddenSize : Nat) (eps : Float) : ShaderM Unit := d
     Folds the `layerOutScale` dispatch into `ple.postNormAdd` when the
     block has a per-layer output scale, saving one dispatch per decode
     layer (-42 for a 42-layer model). -/
-def fusedPerLayerPostThenScaleKernel (hiddenSize : Nat) (eps : Float) : ShaderM Unit := do
-  let wgSize := 256
+def fusedPerLayerPostThenScaleKernel (hiddenSize : Nat) (eps : Float)
+    (wgSize : Nat := 256) : ShaderM Unit := do
   let numSubgroups := wgSize / 32
   let lid ← ShaderM.localId
   let tid := Exp.vec3X lid
