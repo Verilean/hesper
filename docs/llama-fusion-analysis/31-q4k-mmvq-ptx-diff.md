@@ -189,6 +189,86 @@ data in the next session before the §2 rewrite.
 3. §3 (hoist address bind) is small; do it as a warm-up while
    reading mmvq.cu for §2.
 
+## DRAM + SASS evidence (2026-04-28)
+
+Added DRAM throughput and full SASS dump comparison for hesper vs
+llama Q4_K mmvq.  Both confirm memory-bound + structural waste:
+
+**hesper Q4_K 4-warp gateup ncu** (production cubin
+`fc0e594e5c785155.cubin`, kernel `k1387739930045770`):
+
+| metric | hesper |
+|---|---:|
+| per-call (gpu time) | 78.8 µs |
+| **dram bytes read / call** | **29.55 MB** |
+| **L2 hit rate** | **6.4 %** |
+| L1 hit rate | 74.0 % |
+| sm throughput | 71.7 % of peak |
+| stall_long_scoreboard | 33.1 % |
+| registers/thread | 35 |
+| warps active | 87.9 % |
+
+Theoretical minimum DRAM = 1 row of Q4_K weights × N=8192 outputs =
+**11.8 MB / call**.  hesper actually pulls 29.55 MB = **2.5× the
+minimum**.  L2 hit only 6.4 % means the duplicated reads from the 16
+threads sharing a Q4_K block are NOT being absorbed by L2 — they
+hit DRAM.
+
+**SASS diff (full kernel, sm_89, post-ptxas)**:
+
+| op | hesper | llama | ratio |
+|---|--:|--:|--:|
+| total instructions | 3384 | 192 | **17.6×** |
+| LDG.E (loads) | 116 | 13 | 8.9× |
+| IDP.4A (dp4a) | 80 | 8 | 10× |
+| FFMA | 243 | 5 | 49× |
+| IMAD | 606 | 41 | 14.8× |
+| LDS | 90 | 3 | 30× |
+| IADD | 286 | 12 | 24× |
+
+llama's 192-instruction kernel runs a small `for` loop ~10 times to
+cover K=2560.  hesper's 3384 instructions for *2 outer iters*
+implies the inner-iter body is mostly straight-line (BSSY/BSYNC
+guards × 20+ `if blockInRange` enclosures, each with the full body
+inlined).  ptxas has no loop body to compress; the duplicated loads
+become 116 separate LDG.E instructions instead of llama's tight
+loop with reuse.
+
+**Verdict updated**: the gap is two compounding factors:
+
+1. **Duplicate scale/dmin/qs reads** — 16 threads sharing a block
+   each emit independent LDG.E (PTX 38 / iter, SASS 116 total).
+   At only 6.4 % L2 hit, these miss into DRAM repeatedly.
+
+2. **Lack of loop unrolling control** — hesper unrolls the
+   if-guarded body into one large basic block; llama leaves it as a
+   tight loop that ptxas schedules into 192 instructions reusing
+   registers.  This compounds with the duplicate loads since each
+   "duplicate" gets a fresh register and a fresh LDG.E.
+
+## Implementation options for next session
+
+**Option A**: smem broadcast of scale/dmin/qs (highest ROI).  Half-
+warp lane 0 reads dmU32/sc0/sc1/sc2 (4 loads), writes to smem,
+barrier, all 16 threads in the half-warp read from smem.  Eliminates
+~25 of the 38 ld.global per iter.  Predicted: dram bytes 29.55 →
+~13 MB, per-call 78 → ~35 µs, **+5–7 TPS**.
+
+**Option B**: vec4.u32 ld.global (LDG.E.128).  hesper currently
+emits 4× ld.global.u32 where llama emits 1× LDG.E.128.  Requires
+vec4-typed readBuffer in ShaderM + CodeGen support.  Preliminary
+check: V11 FlashAttn already uses `Exp.unpack4xU8` style vec4 — but
+unclear if available for plain weight reads.  Predicted: similar
+~5 TPS but more invasive.
+
+**Option C**: rewrite as a tight K loop instead of fully-inlined
+2-iter unroll (mirror llama's `for kbx = …; kbx < blocksPerRow;
+kbx += 8`).  Requires ShaderM.loop with body preserving
+register reuse — current implementation flattens it.  Riskier but
+addresses the structural 17.6× SASS bloat.
+
+A is the lowest-risk highest-evidence option.  Start there.
+
 ## Critical files
 
 - `Hesper/Layers/Linear.lean:2248` — `fusedQ4KMLinearDP4A4WarpKernel`
