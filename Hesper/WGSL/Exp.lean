@@ -53,6 +53,11 @@ inductive Exp : WGSLType → Type where
 
   -- Type conversions
   | toF32 {t : WGSLType} : Exp t → Exp (.scalar .f32)
+  -- True-unsigned variant of toF32: signals to CodeGen that the input is
+  -- semantically unsigned (e.g. Q4_K's 6-bit scale 0..63), so PTX should
+  -- emit cvt.rn.f32.u32 instead of cvt.rn.f32.s32.  WGSL emits the same
+  -- f32() cast — only PTX path differs.
+  | toF32U {t : WGSLType} : Exp t → Exp (.scalar .f32)
   | toF16 {t : WGSLType} : Exp t → Exp (.scalar .f16)
   | toI32 {t : WGSLType} : Exp t → Exp (.scalar .i32)
   | toU32 {t : WGSLType} : Exp t → Exp (.scalar .u32)
@@ -623,6 +628,7 @@ partial def Exp.toWGSL {t : WGSLType} : Exp t → String
     -- precompute (mp, L) keeps the u32 range safe.
     s!"u32((u64({toWGSL a}) * u64({toWGSL b})) >> 32u)"
   | toF32 e => s!"f32({toWGSL e})"
+  | toF32U e => s!"f32({toWGSL e})"
   | toF16 e => s!"f16({toWGSL e})"
   | toI32 e => s!"i32({toWGSL e})"
   | toU32 e => s!"u32({toWGSL e})"

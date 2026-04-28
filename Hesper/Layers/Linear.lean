@@ -579,7 +579,7 @@ def fusedQ4KMLinearBlockCoopKernel (config : Config) : ShaderM Unit := do
       let minHigh := Exp.bitOr minHiLo minHiHi
       let scaleU := Exp.select isLow scaleLow scaleHigh
       let minU   := Exp.select isLow minLow   minHigh
-      (Exp.toF32 scaleU, Exp.toF32 minU)
+      (Exp.toF32U scaleU, Exp.toF32U minU)
 
     let (scaleA, minA) := extractScaleMin is0
     let (scaleB, minB) := extractScaleMin is1
@@ -708,7 +708,7 @@ def fusedQ4KMLinearBlockCoop2RowKernel (config : Config) : ShaderM Unit := do
       let minHigh := Exp.bitOr minHiLo minHiHi
       let scaleU := Exp.select isLow scaleLow scaleHigh
       let minU   := Exp.select isLow minLow   minHigh
-      (Exp.toF32 scaleU, Exp.toF32 minU)
+      (Exp.toF32U scaleU, Exp.toF32U minU)
 
     let (scaleA, minA) := extractScaleMin is0
     let (scaleB, minB) := extractScaleMin is1
@@ -844,7 +844,7 @@ def fusedQ4KMLinearMultiSubgroupKernel (config : Config) (numSubgroups : Nat := 
       let minHigh := Exp.bitOr minHiLo minHiHi
       let scaleU := Exp.select isLow scaleLow scaleHigh
       let minU   := Exp.select isLow minLow   minHigh
-      (Exp.toF32 scaleU, Exp.toF32 minU)
+      (Exp.toF32U scaleU, Exp.toF32U minU)
 
     let (scaleA, minA) := extractScaleMin is0
     let (scaleB, minB) := extractScaleMin is1
@@ -1143,7 +1143,7 @@ def q4kMatmulBatchKernel (config : Config) (seqLen : Nat) : ShaderM Unit := do
       let minHigh := Exp.bitOr minHiLo minHiHi
       let scaleU := Exp.select isLow scaleLow scaleHigh
       let minU   := Exp.select isLow minLow   minHigh
-      (Exp.toF32 scaleU, Exp.toF32 minU)
+      (Exp.toF32U scaleU, Exp.toF32U minU)
 
     let (scA, mA) := extractScaleMin bq8Off
     let (scB, mB) := extractScaleMin (Exp.add bq8Off (Exp.litU32 1))
@@ -1310,7 +1310,7 @@ def emitQ4KMLinearDP4ABody (config : Config)
       let minHigh := Exp.bitOr minHiLo minHiHi
       let scaleU := Exp.select isLow scaleLow scaleHigh
       let minU   := Exp.select isLow minLow   minHigh
-      (Exp.toF32 scaleU, Exp.toF32 minU)
+      (Exp.toF32U scaleU, Exp.toF32U minU)
 
     let (scA, mA) := extractScaleMin bq8Off
     let (scB, mB) := extractScaleMin (Exp.add bq8Off (Exp.litU32 1))
@@ -1474,7 +1474,7 @@ def fusedQ4KMGateUpDP4AKernel (config : Config) : ShaderM Unit := do
         let minHigh := Exp.bitOr minHiLo minHiHi
         let scaleU := Exp.select isLow scaleLow scaleHigh
         let minU   := Exp.select isLow minLow   minHigh
-        (Exp.toF32 scaleU, Exp.toF32 minU)
+        (Exp.toF32U scaleU, Exp.toF32U minU)
 
       let (scA, mA) := extractScaleMin bq8Off
       let (scB, mB) := extractScaleMin (Exp.add bq8Off (Exp.litU32 1))
@@ -1639,7 +1639,7 @@ def fusedQ4KMKVDP4AKernel (config : Config) : ShaderM Unit := do
         let minHigh := Exp.bitOr minHiLo minHiHi
         let scaleU := Exp.select isLow scaleLow scaleHigh
         let minU   := Exp.select isLow minLow   minHigh
-        (Exp.toF32 scaleU, Exp.toF32 minU)
+        (Exp.toF32U scaleU, Exp.toF32U minU)
 
       let (scA, mA) := extractScaleMin bq8Off
       let (scB, mB) := extractScaleMin (Exp.add bq8Off (Exp.litU32 1))
@@ -1827,7 +1827,7 @@ def fusedQ4KMGateUpDP4A4RowKernel (config : Config) : ShaderM Unit := do
         let minHigh := Exp.bitOr minHiLo minHiHi
         let scaleU := Exp.select isLow scaleLow scaleHigh
         let minU   := Exp.select isLow minLow   minHigh
-        (Exp.toF32 scaleU, Exp.toF32 minU)
+        (Exp.toF32U scaleU, Exp.toF32U minU)
 
       let (scA, mA) := extractScaleMin bq8Off
       let (scB, mB) := extractScaleMin (Exp.add bq8Off (Exp.litU32 1))
@@ -2009,7 +2009,7 @@ def fusedQ4KMLinearDP4A4RowKernel (config : Config) : ShaderM Unit := do
       let minHigh := Exp.bitOr minHiLo minHiHi
       let scaleU := Exp.select isLow scaleLow scaleHigh
       let minU   := Exp.select isLow minLow   minHigh
-      (Exp.toF32 scaleU, Exp.toF32 minU)
+      (Exp.toF32U scaleU, Exp.toF32U minU)
 
     let (scA, mA) := extractScaleMin bq8Off
     let (scB, mB) := extractScaleMin (Exp.add bq8Off (Exp.litU32 1))
@@ -2154,7 +2154,7 @@ def fusedQ4KMLinearDP4A2RowKernel (config : Config) : ShaderM Unit := do
       let minHigh := Exp.bitOr minHiLo minHiHi
       let scaleU := Exp.select isLow scaleLow scaleHigh
       let minU   := Exp.select isLow minLow   minHigh
-      (Exp.toF32 scaleU, Exp.toF32 minU)
+      (Exp.toF32U scaleU, Exp.toF32U minU)
 
     let (scA, mA) := extractScaleMin bq8Off
     let (scB, mB) := extractScaleMin (Exp.add bq8Off (Exp.litU32 1))
@@ -2359,7 +2359,11 @@ def fusedQ4KMLinearDP4A4WarpKernel (config : Config) : ShaderM Unit := do
       let minHigh := Exp.bitOr minHiLo minHiHi
       let scaleU := Exp.select isLow scaleLow scaleHigh
       let minU   := Exp.select isLow minLow   minHigh
-      (Exp.toF32 scaleU, Exp.toF32 minU)
+      -- Q4_K scale/min are 6-bit unsigned values (0..63).  toF32U emits
+      -- cvt.rn.f32.u32 → I2FP.F32.U32 SASS; cvt.rn.f32.s32 (default toF32)
+      -- causes ptxas to insert SGXT.U32 sign-extension before the cvt.
+      -- Confirmed safe: scale/min always non-negative.
+      (Exp.toF32U scaleU, Exp.toF32U minU)
 
     let (scA, mA) := extractScaleMin bq8Off
     let (scB, mB) := extractScaleMin (Exp.add bq8Off (Exp.litU32 1))
@@ -2617,7 +2621,7 @@ def fusedQ4KMGateUpDP4A4WarpKernel (config : Config) : ShaderM Unit := do
         let minHigh := Exp.bitOr minHiLo minHiHi
         let scaleU := Exp.select isLow scaleLow scaleHigh
         let minU   := Exp.select isLow minLow   minHigh
-        (Exp.toF32 scaleU, Exp.toF32 minU)
+        (Exp.toF32U scaleU, Exp.toF32U minU)
 
       let (scA, mA) := extractScaleMin bq8Off
       let (scB, mB) := extractScaleMin (Exp.add bq8Off (Exp.litU32 1))
@@ -2827,7 +2831,7 @@ def fusedQ4KMLinearDP4A4WarpInlineQuantKernel (config : Config) : ShaderM Unit :
       let minHigh := Exp.bitOr minHiLo minHiHi
       let scaleU := Exp.select isLow scaleLow scaleHigh
       let minU   := Exp.select isLow minLow   minHigh
-      (Exp.toF32 scaleU, Exp.toF32 minU)
+      (Exp.toF32U scaleU, Exp.toF32U minU)
     let (scA, mA) := extractScaleMin bq8Off
     let (scB, mB) := extractScaleMin (Exp.add bq8Off (Exp.litU32 1))
     let q4BaseIdx := Exp.add blockU32Base
@@ -2972,7 +2976,7 @@ def fusedQ4KMLinearDP4A4WarpMultiLayerKernel
       let minHigh := Exp.bitOr minHiLo minHiHi
       let scaleU := Exp.select isLow scaleLow scaleHigh
       let minU   := Exp.select isLow minLow   minHigh
-      (Exp.toF32 scaleU, Exp.toF32 minU)
+      (Exp.toF32U scaleU, Exp.toF32U minU)
 
     let (scA, mA) := extractScaleMin bq8Off
     let (scB, mB) := extractScaleMin (Exp.add bq8Off (Exp.litU32 1))
@@ -4064,7 +4068,7 @@ def fusedRMSNormQ4KMLinearKernel (config : Config) (eps : Float) : ShaderM Unit 
       let minHigh := Exp.bitOr minHiLo minHiHi
       let scaleU := Exp.select isLow scaleLow scaleHigh
       let minU   := Exp.select isLow minLow   minHigh
-      (Exp.toF32 scaleU, Exp.toF32 minU)
+      (Exp.toF32U scaleU, Exp.toF32U minU)
 
     let (scaleA, minA) := extractScaleMin is0
     let (scaleB, minB) := extractScaleMin is1
@@ -4234,7 +4238,7 @@ def fusedQ4KMLinearSplitKKernel (config : Config) (splits : Nat) : ShaderM Unit 
       let minHigh := Exp.bitOr minHiLo minHiHi
       let scaleU := Exp.select isLow scaleLow scaleHigh
       let minU   := Exp.select isLow minLow   minHigh
-      (Exp.toF32 scaleU, Exp.toF32 minU)
+      (Exp.toF32U scaleU, Exp.toF32U minU)
 
     let (scaleA, minA) := extractScaleMin is0
     let (scaleB, minB) := extractScaleMin is1
