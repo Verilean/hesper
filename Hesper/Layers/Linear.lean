@@ -357,8 +357,8 @@ def fusedQ4KMLinear2RowSubgroupKernel (config : Config) : ShaderM Unit := do
     -- Row0 block header
     let b0 := Exp.add row0BaseU32 blockOffsetU32
     let dm0U32 ← ShaderM.readBuffer (ty := .scalar .u32) (n := totalWeightU32) "weights" b0
-    let d0 := fp16ToF32 (Exp.bitAnd dm0U32 (Exp.litU32 0xFFFF))
-    let dmin0 := fp16ToF32 (Exp.shiftRight dm0U32 (Exp.litU32 16))
+    let d0 := Exp.vecX (Exp.unpack2x16float dm0U32)
+    let dmin0 := Exp.vecY (Exp.unpack2x16float dm0U32)
     let sc0_0 ← ShaderM.readBuffer (ty := .scalar .u32) (n := totalWeightU32) "weights" (Exp.add b0 (Exp.litU32 1))
     let sc0_1 ← ShaderM.readBuffer (ty := .scalar .u32) (n := totalWeightU32) "weights" (Exp.add b0 (Exp.litU32 2))
     let sc0_2 ← ShaderM.readBuffer (ty := .scalar .u32) (n := totalWeightU32) "weights" (Exp.add b0 (Exp.litU32 3))
@@ -366,8 +366,8 @@ def fusedQ4KMLinear2RowSubgroupKernel (config : Config) : ShaderM Unit := do
     -- Row1 block header
     let b1 := Exp.add row1BaseU32 blockOffsetU32
     let dm1U32 ← ShaderM.readBuffer (ty := .scalar .u32) (n := totalWeightU32) "weights" b1
-    let d1 := fp16ToF32 (Exp.bitAnd dm1U32 (Exp.litU32 0xFFFF))
-    let dmin1 := fp16ToF32 (Exp.shiftRight dm1U32 (Exp.litU32 16))
+    let d1 := Exp.vecX (Exp.unpack2x16float dm1U32)
+    let dmin1 := Exp.vecY (Exp.unpack2x16float dm1U32)
     let sc1_0 ← ShaderM.readBuffer (ty := .scalar .u32) (n := totalWeightU32) "weights" (Exp.add b1 (Exp.litU32 1))
     let sc1_1 ← ShaderM.readBuffer (ty := .scalar .u32) (n := totalWeightU32) "weights" (Exp.add b1 (Exp.litU32 2))
     let sc1_2 ← ShaderM.readBuffer (ty := .scalar .u32) (n := totalWeightU32) "weights" (Exp.add b1 (Exp.litU32 3))
