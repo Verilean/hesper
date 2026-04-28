@@ -104,5 +104,26 @@ production decode today.
 ## Out of scope (won't do without strong reason)
 
 - **CUDA Graphs**: investigated; gain is < +1 TPS due to end-of-token sync
+  *(2026-04-29 update: graphs ON by default since #252, +20 TPS for decode)*
 - **Full TVM-style autotuning framework**: see TODO-P4 reasoning
-- **Tensor cores in DSL**: see TODO-D2; defer until prefill matters
+
+## Active 2026-04-29
+
+### TODO-MMQ: Q4_K MMQ kernel for prefill batched matmul
+- Phase 1 skeleton landed; correctness pending. Targets 17.6× kernel
+  speedup over 1-warp baseline at seqLen ≥ 8.
+- See `docs/llama-fusion-analysis/31-mmq-port-plan.md` and
+  `memory/project_mmq_phase1_parity_blocker.md`.
+- **Tensor cores in DSL** (was deferred): now relevant — prefill matters.
+  llama.cpp's MMQ has a `TURING_MMA_AVAILABLE` branch using `mma.sync` PTX.
+  hesper would need `Inst.mma_sync_m16n8k16` or similar primitive.
+  Not blocking Phase 1c (DP4A path is enough), but unlocks the next 2×
+  on prefill once parity holds.
+
+### TODO-DSL-BlockLayout: typed quantized buffer views
+- Discovered as a real DSL gap during MMQ port (see
+  `docs/shaderm-cuda-mapping.md` Section 3 + 6).
+- Lean structures `Q8_1View`, `Q8_1MMQView`, `Q4_KView` with named fields
+  (`.dsWord`, `.qs k`, `.scaleByteFor sb`) that lower to correct offsets.
+- Prevents the silent layout-mismatch bug we hit in MMQ Phase 1.
+- **Estimated effort**: 2-3 days (new types + 5-6 use-site refactors).

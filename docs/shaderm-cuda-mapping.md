@@ -3,7 +3,19 @@
 llama.cpp などの CUDA C++ カーネルを ShaderM に port するときの対応表と、
 認知ギャップを縮める DSL 改善 TODO。
 
-## 1. 対応表 (現状: 2026-04-27 段階)
+> **Last refresh:** 2026-04-29 (after Q4_K MMQ Phase 1 port attempt).
+>
+> **TL;DR for newcomers porting CUDA → ShaderM:**
+> 1. Read Section 1 (mapping table) first — it covers 95% of CUDA constructs.
+> 2. **Before claiming a feature is missing, grep `Hesper/WGSL/Monad.lean`.**
+>    Most `← TODO` lines below are *stale*; features were added but the doc
+>    drifted. Real status verified 2026-04-29.
+> 3. For complex multi-step kernels (e.g. MMQ), draw the K-loop and indexing
+>    on paper *before* writing ShaderM. The DSL faithfully transcribes what
+>    you write — it doesn't catch missing iteration ranges or off-by-N
+>    sub-block bugs (Section 6 has a worked example).
+
+## 1. 対応表 (現状: 2026-04-29 段階)
 
 | 用途 | CUDA C++ | ShaderM (現状) | ShaderM (目標) |
 |---|---|---|---|
@@ -34,11 +46,16 @@ llama.cpp などの CUDA C++ カーネルを ShaderM に port するときの対
 | `warp_reduce_sum<8>` | 3-shfl xor 1,2,4 ループ | 手書き 3 行 | ✅ `← ShaderM.warpReduceSum 8 x` (Step 5) |
 | `warp_reduce_max<n>` | shfl-xor max butterfly | 手書き | ✅ `← ShaderM.warpReduceMax n x` (Step 5) |
 | `ld.global.u32` | `*K_ptr` (after offset) | `← ShaderM.readBuffer ... idx` | 同じ |
-| **vec4 load** | `ggml_cuda_memcpy_1<16>(&dst, &K)` | (まだなし — `ld_v4_u32` PTX infra のみ) | `← ShaderM.readBufferVec4 ...` (← TODO) |
-| `__half2half2(x)` | `__half2half2(x)` | (手書き or pack2x16float) | `Exp.broadcastH2 x` (← TODO) |
+| **vec4 (4×u32) load** | `*reinterpret_cast<int4*>(&p[i])` | ✅ `← ShaderM.readBufferU32x4 buf base` returns `(u32, u32, u32, u32)` tuple | 同じ |
+| `__half2half2(x)` | `__half2half2(x)` | (手書き or `pack2x16float`) | `Exp.broadcastH2 x` (← still TODO) |
 | `fma.rn.f16x2` | `__hfma2(a, b, c)` | ✅ `Exp.fmaF16x2 a b c` | 同じ |
-| **f32 FMA** | `fmaf(a, b, c)` | (なし — mul + add 別命令) | `Exp.fma a b c` (← TODO) |
+| **f32 FMA** | `fmaf(a, b, c)` | ✅ `Exp.fma a b c` (Exp.lean:156) | 同じ |
 | ポインタ進める | `K += stride;` | ✅ `MutPtr.advance stride` (Step 9b) | 同じ |
+| **per-thread reg array** | `float tmp[N] = {0}` | ✅ `← ShaderM.regArray ty N init` (Step 9c) — `tmp.get i`, `tmp.set i v` | 同じ |
+| **smem array** | `__shared__ int x_qs[mmq_y * 33]` | ✅ `ShaderM.sharedNamed name (.array ty size)` | 同じ |
+| `unpack_scales_q45_K` | inline u8 bit ops | (existing `extractScaleMin` helper — see Linear.lean:2343) | reusable, just inline |
+| **block-cooperative load** | `for (i=0;i<N;i+=nwarps*ws) { ... }` | manual `unrollFor 4 fun loadIter => ...` | 既存の `unrollFor` で十分 |
+| **multi-row × multi-col output tile** | `float tmp[ncols_dst][nrows_dst]` | `RegArray (.scalar .f32) (ncols * nrows)` + 2D index helper | 2D の薄いラッパが欲しい (Section 3) |
 
 ## 2. 完了したステップ (Step 1-7)
 
@@ -115,41 +132,61 @@ llama.cpp などの CUDA C++ カーネルを ShaderM に port するときの対
 - 戻り値 `(kqMaxNew, scale, kqExp)` で VKQ 累積側の rescale が書ける
 - domain-specific だが flash-attn 系全部で同パターンなので価値あり
 
-## 3. 残り TODO (優先度順)
+## 3. 残り TODO (refreshed 2026-04-29 after Q4_K MMQ port)
 
-### 高 ROI
-- `← ShaderM.warpId` (`tid >>> 5`)
-- `← ShaderM.subWarpSplit 8` returns `(subWarp, subLane)` という pair
-- 効果: V11 のような sub-warp partition kernel を書くときの index 計算ミスを排除
+> **Note:** Steps 1–9g are all landed. Items previously marked `← TODO` in
+> Section 1 that pointed at warpId/subWarpSplit/warpReduceSum/Ptr/RegArray
+> are **all complete** — the doc was stale.
 
-**Step 5: 比較演算子 `<ᵉ` `=ᵉ` `≤ᵉ`**
-- `Exp.lt`, `Exp.eq` を演算子化 (Bool との衝突を避けるため `<ᵉ` のような unicode)
-- もしくは `Decidable` インスタンスで `==` を直接使う
-- `cond` 句が CUDA に近づく
+### 高 ROI (open)
 
-**Step 6: 高水準プリミティブ**
-- `ShaderM.warpReduceSum (n := 8) x` — 3-shfl もしくは subgroupAdd を選択
-- `ShaderM.warpReduceMax (n := 32) x`
-- `ShaderM.broadcastH2 x` — half2 broadcast
-- `ShaderM.readBufferVec4 ...` — `Inst.ld_v4_u32` を front-end で使えるように
-- 効果: V11 の Phase 1 実装の半分は warp_reduce で書ける
+**`Exp.broadcastH2 x`** — half2 broadcast of a single half scalar
+- CUDA: `__half2half2(x)`
+- Currently written manually with `pack2x16float`
+- Shows up in flash attn V12 and any per-iter half2 widening
+- 5–10 line addition in `Hesper/WGSL/Exp.lean` + lowering
 
-**Step 7: `Ptr ty` 抽象 (ポインタ進め)**
-- `structure Ptr (ty : WGSLType) where buf : String; offset : Exp (.scalar .u32)`
-- `Ptr.load`, `Ptr.advance`, `Ptr.storeAt`
-- llama.cpp の `K += stride; *K` パターンが直接書ける
+**`BlockLayout` typed buffer view** — *new TODO from MMQ port*
+- Problem: every kernel reads quantized buffers via raw `Exp.add base off` and
+  comments like `-- ds_word at sub*9 + 0, qs at sub*9 + 1..8` that drift over
+  time. MMQ Phase 1 had a parity bug *because the layout was wrong* and the
+  type system didn't catch it.
+- Sketch: a Lean structure `Q8_1View { col, sub : Exp u32 }` with methods
+  `.dsWord`, `.qs (k : Nat)` that lowers to the right offset. Unifies
+  knowledge of layout in one place. Other layouts (`Q4_K`, `block_q8_1_mmq`)
+  get parallel views.
+- ROI: prevents the class of bug we hit in MMQ Phase 1; quantized matmul
+  parity becomes much faster to debug.
 
-### 中期 (Step 8+)
+**`ShaderM.regArray2D ty (rows : Nat) (cols : Nat)`** — *new from MMQ port*
+- 2D acc tile `float tmp[ncols_dst][nrows_dst]` shows up in MMQ, MMVQ-with-ncols,
+  and TTT inner loops. Currently encoded with `RegArray ty (rows*cols)` plus a
+  hand-written `idx (i, j) = i*cols + j` helper.
+- Tiny wrapper over `RegArray` — `.get (i j : Nat)` / `.set (i j) v` —
+  mostly for documentation and intent.
 
-- **マクロ `share% v := e`**: 複数参照される `let` を自動的に `let'` 化
-- **比較で出てきた warning fix**: `select` の Bool 引数 vs Exp Bool の混同
-- **`ShaderM.warpBarrier`**: PTX backend では `bar.warp.sync`、WGSL ではフォールバックで block barrier
-- **Lane の暗黙化**: ShaderM 自体に lane context を入れて `tid` 自動アクセス (やりすぎかも、要検討)
+**`Exp.bufPtr "name" base`** — typed buffer pointer (read side of `MutPtr`)
+- `MutPtr` exists but is mutable. Most use cases (matmul Y reads from inside
+  a callee helper) want an *immutable* pointer with `.load (off : Nat)`.
+  Closely related to `BlockLayout` above.
+
+### 中期
+
+- **`ShaderM.staticFor n body`**: compile-time fully-unrolled loop where the
+  index becomes a `Nat` literal (vs `unrollFor` which is meta but still emits
+  `Exp.litU32` per iter). For ports of `#pragma unroll for (int i=0;i<8;++i)`
+  with constant `i` used in switch-like structures.
+- **`whenE cond do ...`**: `ShaderM.if_` with no else, sugar (50% of `if_`
+  call sites have `pure ()` else).
+- **共通 quantized-matmul helper**: `Q4K.dotPair v u sc m dm ds8 → Exp f32`
+  that wraps `vec_dot_q4_K_q8_1_impl_mmq` exactly. Hand-rolled in 4 places now;
+  consolidating prevents drift.
 
 ### 長期: アルゴリズム DSL
 
 - `Attention.kqDotProduct ...` など高水準ビルディングブロック
-- llama.cpp 的に「sub-warp partition」を選択肢として宣言、低レベル実装は backend 選択
+- `Matmul.qNK ncols_dst nrows_dst` — declarative matmul shape, backend picks
+  MMVQ / MMQ / WMMA at lower level
 - 多分 hesper の Circuit DSL v2 と統合する話
 
 ## 4. 認知ギャップ縮小の効果測定 (V9 inner loop の例)
@@ -225,3 +262,74 @@ ShaderM は元々 WGSL を生成するための DSL だった。WGSL 自体は C
 
 Step 1-3 は **Lean の機能 (typeclass, structure, naming) で記法を CUDA 寄りに**
 寄せた。Step 4+ も同方向で進める。
+
+## 6. Worked example: porting llama.cpp `mul_mat_q_kernel<Q4_K>` (MMQ)
+
+This is the case study from the 2026-04-29 Phase 1 attempt
+(`q4kMatmulBatchMMQKernel` in Linear.lean, see also
+`memory/project_mmq_phase1_parity_blocker.md`). Outcome: the kernel
+**compiled and ran 17.6× faster** than the 1-warp baseline but produced
+NaN output. Root causes were not DSL gaps — they were design errors that
+the DSL faithfully transcribed.
+
+### 6.1 What I got wrong
+
+| Error | What happened | What would have caught it |
+|---|---|---|
+| Inner dot iterated `bq8Off ∈ {0,1}` only, so each output saw 2/8 sub-blocks | Output magnitude wildly off (~50M instead of ~0.5) | Explicit `static_for sub in 0..8` over Q4_K sub-blocks would have made coverage visible |
+| Y tile read with offsets `{col*72 + sb*9 + 0..8}` (standard layout) but matmul expected MMQ-packed layout (4 ds at front, 32 qs after) | NaN at column 1+ from misaligned `ds` | `BlockLayout` typed view would have made layout choice explicit at the kernel signature |
+| `unpack_scales_q45_K` stubbed with `bitAnd sc_word 0xFF` (first byte) | Scale × 0..255 → magnitude ~10x too large per element | Reuse of existing `extractScaleMin` (Linear.lean:2343) instead of inlining a stub |
+
+### 6.2 What the DSL handled correctly
+
+- `RegArray (.scalar .f32) 2` for per-thread `(sumf_d, sumf_m)` accumulators
+  → no register-naming hand-rolling.
+- `ShaderM.unrollFor 4 fun loadIter => ...` for the cooperative X-tile load
+  → exactly mirrors `for (i0 = 0; i0 < mmq_y; i0 += nrows*nwarps)`.
+- `Exp.dot4I8Packed v u` for inline DP4A.
+- `Exp.unpack2x16float dmU32` returning a `(.vec2 .f32)` for `(d, dmin)`.
+
+The "DSL was hard" feeling was 90% me missing what was already there
+(`RegArray`, `Ptr`, `MutPtr`, `Exp.fma`) and 10% real (no `BlockLayout`,
+no `staticFor` with literal index).
+
+### 6.3 Recipe for next port
+
+1. **Read llama.cpp source twice** before opening Linear.lean. Sketch the
+   K-loop tree on paper:
+   ```
+   for kb0 in super_blocks:           ← outer (Q4_K = 256 K each)
+     load X tile (32 ints into smem)
+     for k01 in {0, 16}:              ← within a 32-int tile
+       for nib in {0, 1}:             ← QR4_K
+         for j in 0..7:               ← QI8_1
+           dp4a(v[j] >> 4*nib, u[nib*8+j])
+   ```
+   Confirm the iteration count multiplies out to the right number of
+   K-elements (here: super_blocks × 2 × 2 × 8 × 4 = K_total).
+
+2. **Pick the target Y layout up-front.** llama.cpp's MMVQ uses standard
+   `block_q8_1`; MMQ uses `block_q8_1_mmq`. Decide which one your kernel
+   reads and **comment it at the kernel signature**. If you change later,
+   update the comment first.
+
+3. **Write the parity test before the kernel body.** Use the pattern in
+   `Examples/DSL/Gemma4Q4KMMQParity.lean`: load real GGUF weights, feed
+   identical input through the new kernel and an existing reference
+   kernel, diff. The test runs in <2 s once weights are cached → very
+   tight feedback loop.
+
+4. **Bisect parity bottom-up:**
+   - Start with kernel writing zeros → confirm grid/block geometry
+     reaches every output (count writes per-output via atomic).
+   - Add load X → confirm one row matches by reading back x_qs to host.
+   - Add ONE sub-block dot → confirm magnitude ratio matches (expect
+     1/8 of full output, then × 8).
+   - Add full sub-block iteration → expect magnitude match.
+   - Add scale extraction → expect bit-exact parity (since reference
+     and candidate use the same `extractScaleMin`).
+
+5. **Reuse, don't reimplement.** `extractScaleMin` is already correct
+   in `q4kMatmulBatch4WarpKernel` and the 1-warp variant. Copy-paste it
+   into your new kernel verbatim before optimizing. The 6+6 bit pack
+   layout is too easy to get wrong from scratch.
