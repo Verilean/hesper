@@ -2240,13 +2240,12 @@ def forwardPrefillBatch [GPUBackend β] (ctx : β)
   -- VRAM round-trip (the f32 normed hidden state).  For the fallback
   -- paths (f32 matmul etc.) still run the standalone RMSNorm because
   -- they don't consume Q8_1.
-  -- Default: f16 lm_head (e2e correct).  HESPER_DP4A_Q6K_4WARP=1
-  -- forces dp4a path — same toggle as decode.
-  let force4WarpQ6K_pf ← do
-    match ← IO.getEnv "HESPER_DP4A_Q6K_4WARP" with
+  -- Default: dp4a Q6_K 4-warp.  HESPER_LMHEAD_F16=1 for f16 path.
+  let preferF16_pf ← do
+    match ← IO.getEnv "HESPER_LMHEAD_F16" with
     | some "1" => pure true
     | _        => pure false
-  match (if force4WarpQ6K_pf then none else model.outputWeightF16) with
+  match (if preferF16_pf then model.outputWeightF16 else none) with
   | some f16W =>
     -- Pre-dequantized f16 lm_head — single dispatch, no Q8_1 quantize.
     RMSNorm.forward ctx model.finalNorm state.buf2 state.buf1
@@ -2545,16 +2544,14 @@ def forwardSingleToken [GPUBackend β] (ctx : β)
 
   -- Step 4: LM head matmul (1 × hiddenSize @ hiddenSize × vocabSize)
   Hesper.WGSL.Execute.withSection "lmHead" do
-    -- Default: pre-dequantized f16 lm_head (single dispatch, e2e
-    -- correct on all prompt lengths).  HESPER_DP4A_Q6K_4WARP=1
-    -- forces dp4a 4-warp path — gives +27% TPS combined with
-    -- HESPER_Q6K_KERNEL=4warp at long prompts but degrades short
-    -- prompts (see project_q6k_4warp_graphs_bug.md).
-    let force4WarpQ6K ← do
-      match ← IO.getEnv "HESPER_DP4A_Q6K_4WARP" with
+    -- Default: dp4a Q6_K 4-warp (matches llama.cpp; +27% TPS combined
+    -- with HESPER_Q6K_KERNEL=4warp default).  HESPER_LMHEAD_F16=1 for
+    -- legacy pre-dequantized f16 path (slower).
+    let preferF16 ← do
+      match ← IO.getEnv "HESPER_LMHEAD_F16" with
       | some "1" => pure true
       | _        => pure false
-    match (if force4WarpQ6K then none else model.outputWeightF16) with
+    match (if preferF16 then model.outputWeightF16 else none) with
     | some f16W =>
       let lmHeadConfig : Hesper.WGSL.MatMul.Config := {
         M := 1, N := model.config.vocabSize, K := model.config.hiddenSize
@@ -2631,23 +2628,21 @@ def forwardSingleToken [GPUBackend β] (ctx : β)
           (hash ("fused-rmsnorm-q8_1-lmhead", model.config.hiddenSize))
           state.lmHeadQuantizePrepared
         -- Q6_K dp4a matmul (2D grid for vocabSize > 65535).
-        -- Default 4-row (smem-shared variant — same numerical accumulator
-        -- order as 1-row so e2e correct even on short prompts).  4-warp
-        -- 1-row gives more raw TPS but has the same short-prefill
-        -- numerical-drift issue noted on the ffn_down dispatcher.
-        --   HESPER_DP4A_Q6K_4WARP=1 → 4-warp 1-row coop on K (llama.cpp shape)
+        -- Default: 4-warp 1-row coop on K (matches llama.cpp shape,
+        -- same f32 summation order as 1-warp so e2e correct).
         --   HESPER_DP4A_Q6K_1ROW=1  → single-warp     (32 threads, 1 row/WG)
         --   HESPER_DP4A_Q6K_2ROW=1  → 2-warp variant  (64 threads, 2 rows/WG)
+        --   HESPER_DP4A_Q6K_4ROW=1  → 4-warp 4 rows/WG (smem input share)
         let variant ← do
-          match ← IO.getEnv "HESPER_DP4A_Q6K_4WARP" with
-          | some "1" => pure "4warp"
+          match ← IO.getEnv "HESPER_DP4A_Q6K_1ROW" with
+          | some "1" => pure "1row"
           | _ =>
-            match ← IO.getEnv "HESPER_DP4A_Q6K_1ROW" with
-            | some "1" => pure "1row"
+            match ← IO.getEnv "HESPER_DP4A_Q6K_2ROW" with
+            | some "1" => pure "2row"
             | _ =>
-              match ← IO.getEnv "HESPER_DP4A_Q6K_2ROW" with
-              | some "1" => pure "2row"
-              | _ => pure "4row"
+              match ← IO.getEnv "HESPER_DP4A_Q6K_4ROW" with
+              | some "1" => pure "4row"
+              | _ => pure "4warp"
         match variant with
         | "4warp" =>
           -- 1 row per WG, 4 warps cooperate over K.  grid = vocabSize rows.
