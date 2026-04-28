@@ -1073,6 +1073,68 @@ def quantizeQ8_1BatchKernel (inDim seqLen : Nat) : ShaderM Unit := do
     ShaderM.writeBuffer (ty := .scalar .u32) "output" outIdx packed
   ) (pure ())
 
+/-- Convert standard batched Q8_1 layout to MMQ-friendly `block_q8_1_mmq` layout.
+
+    Input  (standard, from `quantizeQ8_1BatchKernel`):
+      `[col][sub_block][9 ints]` = `[col][sub_block][ds_half2, qs0, qs1, ..., qs7]`
+      where `nQ8Blocks = inDim/32` and total size = `nQ8Blocks * 9 * seqLen`.
+
+    Output (MMQ, matches llama.cpp `block_q8_1_mmq` for `MMQ_Q8_1_DS_LAYOUT_DS4`):
+      `[mmq_group][36 ints]` where each group represents 4 sub-blocks (= 128 K):
+        - ints 0..3: 4 half2 ds words (one per sub-block, packed in u32)
+        - ints 4..35: 32 qs ints (8 per sub-block, contiguous)
+      `mmq_group` count = `nQ8Blocks/4 * seqLen` (sub-blocks must group in 4s).
+
+    Grid: `(nMMQGroups, seqLen, 1) × 36 threads`. Each thread copies one int.
+    Hesper `inDim` is always a multiple of 256 (Q4_K super-block) for our
+    target shapes, so `nQ8Blocks % 4 == 0` is guaranteed.
+
+    Used by the MMQ matmul path (Phase 1c) to bridge between hesper's
+    existing standard quantize kernel and llama-style MMQ matmul. -/
+def q8_1StdToMMQLayoutKernel (inDim seqLen : Nat) : ShaderM Unit := do
+  let wid ← ShaderM.workgroupId
+  let lid ← ShaderM.localId
+  let groupIdx := Exp.vec3X wid     -- 0..nMMQGroups
+  let colIdx := Exp.vec3Y wid       -- 0..seqLen
+  let tid := Exp.vec3X lid          -- 0..35
+
+  let nQ8Blocks := inDim / 32
+  let nMMQGroups := nQ8Blocks / 4    -- groups per column
+  let inSize := nQ8Blocks * 9 * seqLen
+  let outSize := nMMQGroups * 36 * seqLen
+
+  let _input ← ShaderM.declareReadOnlyBuffer "input_q8" (.array (.scalar .u32) inSize)
+  let _output ← ShaderM.declareOutputBuffer "output_mmq" (.array (.scalar .u32) outSize)
+
+  -- Output offset: column-major over (col, group, intInGroup).
+  -- Each col contains nMMQGroups groups of 36 ints; group has 4 ds + 32 qs.
+  let outBase := Exp.add
+    (Exp.mul colIdx (Exp.litU32 (nMMQGroups * 36)))
+    (Exp.mul groupIdx (Exp.litU32 36))
+
+  -- Each MMQ group covers 4 consecutive standard Q8_1 sub-blocks.
+  -- Standard sub-block `sub` lives at:
+  --   inputBase = colIdx * nQ8Blocks * 9 + (groupIdx*4 + sub) * 9
+  -- with int 0 = ds, ints 1..8 = qs.
+  let groupSubBase := Exp.mul groupIdx (Exp.litU32 4)
+  let colInBase := Exp.mul colIdx (Exp.litU32 (nQ8Blocks * 9))
+
+  ShaderM.if_ (Exp.lt tid (Exp.litU32 4)) (do
+    -- tid 0..3: copy ds half2 from sub-block `tid` to output[outBase + tid].
+    let inIdx := Exp.add colInBase (Exp.mul (Exp.add groupSubBase tid) (Exp.litU32 9))
+    let dsWord ← ShaderM.readBuffer (ty := .scalar .u32) (n := inSize) "input_q8" inIdx
+    ShaderM.assignIndex (ty := .scalar .u32) "output_mmq" (Exp.add outBase tid) dsWord
+  ) (do
+    -- tid 4..35: copy qs. tid-4 is the qs slot 0..31; sub = (tid-4)/8, qsIdx = (tid-4)%8.
+    let qsTid := Exp.sub tid (Exp.litU32 4)
+    let subIdx := Exp.shiftRight qsTid (Exp.litU32 3)         -- 0..3
+    let qsIdx := Exp.bitAnd qsTid (Exp.litU32 7)              -- 0..7
+    let inIdx := Exp.add colInBase
+      (Exp.add (Exp.mul (Exp.add groupSubBase subIdx) (Exp.litU32 9))
+               (Exp.add (Exp.litU32 1) qsIdx))
+    let qsWord ← ShaderM.readBuffer (ty := .scalar .u32) (n := inSize) "input_q8" inIdx
+    ShaderM.assignIndex (ty := .scalar .u32) "output_mmq" (Exp.add outBase tid) qsWord)
+
 /-- Batched Q4_K × Q8_1 matmul: `[outDim, inDim] × [inDim, seqLen] → [outDim, seqLen]`.
     Grid: `(outDim, seqLen, 1) × 32 threads`.  Each WG computes one output element.
     Column-major output: `output[col * outDim + row]`.
