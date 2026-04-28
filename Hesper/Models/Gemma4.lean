@@ -541,6 +541,19 @@ def forwardBlock [GPUBackend β] (ctx : β)
                       && useFusedQKV
                       && block.attention.wQ.config.inDim == block.attnNorm.config.dim
                       && block.attention.wQ.config.inDim % 256 == 0
+  -- own-KV layer with Q6_K wV (and Q4_K Q/K).  Standard fusedQKV requires
+  -- wV.Q4_K; this variant emits norm-fused-quantize + Q + K + V with V as
+  -- separate Q6_K dp4a kernel.  Saves 1 dispatch (RMSNorm) over the
+  -- fully unfused fallback.  Gemma 4 E4B has ~11 such layers.
+  let useFusedNormQKQ4KVQ6K := !disableFusion
+                            && cfg.hasKV li
+                            && block.attention.wQ.quantFormat == .Q4_K
+                            && block.attention.wK.quantFormat == .Q4_K
+                            && block.attention.wV.quantFormat == .Q6_K
+                            && block.attention.wK.config.inDim == block.attention.wQ.config.inDim
+                            && block.attention.wV.config.inDim == block.attention.wQ.config.inDim
+                            && block.attention.wQ.config.inDim == block.attnNorm.config.dim
+                            && block.attention.wQ.config.inDim % 256 == 0
   -- Shared-KV layer fast path: RMSNorm fused with the single wQ matmul.
   -- Applies when this layer has no own K/V (cfg.hasKV li = false) but still
   -- needs Q, and the shape constraints for dp4a Q8_1 quantize hold.
@@ -560,6 +573,11 @@ def forwardBlock [GPUBackend β] (ctx : β)
       Linear.forwardFusedNormQKV ctx block.attnNorm
         block.attention.wQ block.attention.wK block.attention.wV
         inputBuf state.qBuf state.kBuf state.vBuf kvRef
+  else if useFusedNormQKQ4KVQ6K then
+    Hesper.WGSL.Execute.withSection "attnNormQKVQ6K" do
+      Linear.forwardFusedNormQKQ4KVQ6K ctx block.attnNorm
+        block.attention.wQ block.attention.wK block.attention.wV
+        inputBuf state.qBuf state.kBuf state.vBuf
   else if useFusedNormWQ then
     Hesper.WGSL.Execute.withSection "attnNormWQ" do
       Linear.forwardFusedNormWQ ctx block.attnNorm block.attention.wQ
