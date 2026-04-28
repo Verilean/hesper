@@ -810,14 +810,14 @@ def forwardBlock [GPUBackend β] (ctx : β)
       | some k => k.getRef key
       | none => IO.mkRef none
     RMSNorm.forwardNormThenAdd ctx block.postAttnNorm
-      state.normedBuf inputBuf state.attnResidualBuf ref
+      state.normedBuf inputBuf state.attnResidualBuf ref (workgroupSize := 1024)
   dumpBuf ctx state.attnResidualBuf (cfg.hiddenSize * 4).toUSize s!"single_p{pos}_postAttn_L{li}"
 
   -- Step 7: FFN (dense or MoE)
   if block.isMoE then do
     -- MoE layer (from gemma4-iswa.cpp:117-169):
     -- 1. Shared expert: ffn_norm → GeGLU FFN → post_norm_1
-    RMSNorm.forward ctx block.ffnNorm state.attnResidualBuf state.normedBuf
+    RMSNorm.forward ctx block.ffnNorm state.attnResidualBuf state.normedBuf (workgroupSize := 1024)
     Linear.LinearLayer.forward ctx block.ffn.gate state.normedBuf state.gateBuf
     Linear.LinearLayer.forward ctx block.ffn.up state.normedBuf state.upBuf
     ce "geluMul"
@@ -929,7 +929,7 @@ def forwardBlock [GPUBackend β] (ctx : β)
       | some k => k.getRef keyFFN
       | none => IO.mkRef none
     RMSNorm.forwardNormThenAdd ctx block.postFFNNorm
-      state.ffnOutBuf state.attnResidualBuf outputBuf refFFN
+      state.ffnOutBuf state.attnResidualBuf outputBuf refFFN (workgroupSize := 1024)
   else do
     -- Dense FFN path (GeGLU).
     -- The fused-norm path collapses ffnNorm + Q8_1 + gate+up into 2
@@ -1003,7 +1003,7 @@ def forwardBlock [GPUBackend β] (ctx : β)
         | some k => k.getRef keyFFN2
         | none => IO.mkRef none
       RMSNorm.forwardNormThenAdd ctx block.postFFNNorm
-        state.ffnOutBuf state.attnResidualBuf outputBuf refFFN2
+        state.ffnOutBuf state.attnResidualBuf outputBuf refFFN2 (workgroupSize := 1024)
   dumpBuf ctx outputBuf (cfg.hiddenSize * 4).toUSize s!"single_p{pos}_postFFN_L{li}"
 
   -- Step 8: Per-layer embedding (optional, from gemma4-iswa.cpp:192-213)
@@ -2248,7 +2248,7 @@ def forwardPrefillBatch [GPUBackend β] (ctx : β)
   match (if preferF16_pf then model.outputWeightF16 else none) with
   | some f16W =>
     -- Pre-dequantized f16 lm_head — single dispatch, no Q8_1 quantize.
-    RMSNorm.forward ctx model.finalNorm state.buf2 state.buf1
+    RMSNorm.forward ctx model.finalNorm state.buf2 state.buf1 (workgroupSize := 1024)
     let lmHeadConfig : Hesper.WGSL.MatMul.Config := {
       M := 1, N := cfg.vocabSize, K := cfg.hiddenSize
     }
@@ -2298,7 +2298,7 @@ def forwardPrefillBatch [GPUBackend β] (ctx : β)
     else
       -- Fallback: f32 Q6_K kernel.  Needs standalone RMSNorm since the
       -- f32 matmul can't consume Q8_1.
-      RMSNorm.forward ctx model.finalNorm state.buf2 state.buf1
+      RMSNorm.forward ctx model.finalNorm state.buf2 state.buf1 (workgroupSize := 1024)
       let shaderF32 := if useSubgroups then
           Hesper.Quantization.Q6_K.fusedQ6KLinearBlockCoopKernel
             cfg.hiddenSize cfg.vocabSize gridX
@@ -2313,7 +2313,7 @@ def forwardPrefillBatch [GPUBackend β] (ctx : β)
           : Hesper.ExecConfig }
   | _ =>
     -- Non-Q6_K fallback: F32 matmul transpose.  Needs standalone RMSNorm.
-    RMSNorm.forward ctx model.finalNorm state.buf2 state.buf1
+    RMSNorm.forward ctx model.finalNorm state.buf2 state.buf1 (workgroupSize := 1024)
     let lmHeadConfig : Hesper.WGSL.MatMul.Config := {
       M := 1, N := cfg.vocabSize, K := cfg.hiddenSize
     }
