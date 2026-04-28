@@ -2323,13 +2323,17 @@ def fusedQ4KMLinearDP4A4WarpKernel (config : Config) : ShaderM Unit := do
       (Exp.add rowBaseU32 (Exp.mul blockIdx (Exp.litU32 36)))
     let blockU32Base : Exp (.scalar .u32) := Exp.var blockU32BaseName
 
-    let dmU32 ← ShaderM.readBuffer (ty := .scalar .u32) (n := totalWeightU32) "weights" blockU32Base
+    -- Coalesce the 4 contiguous u32 loads (dmU32 + sc0..sc2 at offsets 0..3)
+    -- into a single 128-bit ld.global.nc.v4.u32.  Q4_K block layout starts
+    -- with 4 u32 of metadata (dm + 3× scale words) at byte offset 0, so it
+    -- is naturally 16-byte aligned (block stride 36 u32 = 144 B).  Each
+    -- thread still reads its own block (no smem broadcast — Option B
+    -- avoids the divergent-control-flow hang that Option A hit), but
+    -- ptxas can issue one MIO op for the 16 bytes instead of four
+    -- separate scalar LDG.E sectors.
+    let (dmU32, sc0, sc1, sc2) ← ShaderM.readBufferU32x4 "weights" blockU32Base
     let dF := fp16ToF32 (Exp.bitAnd dmU32 (Exp.litU32 0xFFFF))
     let dminF := fp16ToF32 (Exp.shiftRight dmU32 (Exp.litU32 16))
-
-    let sc0 ← ShaderM.readBuffer (ty := .scalar .u32) (n := totalWeightU32) "weights" (Exp.add blockU32Base (Exp.litU32 1))
-    let sc1 ← ShaderM.readBuffer (ty := .scalar .u32) (n := totalWeightU32) "weights" (Exp.add blockU32Base (Exp.litU32 2))
-    let sc2 ← ShaderM.readBuffer (ty := .scalar .u32) (n := totalWeightU32) "weights" (Exp.add blockU32Base (Exp.litU32 3))
 
     let extractScaleMin (is : Exp (.scalar .u32)) : Exp (.scalar .f32) × Exp (.scalar .f32) :=
       let isLow := Exp.lt is (Exp.litU32 4)
