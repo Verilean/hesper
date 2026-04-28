@@ -4343,10 +4343,21 @@ def forwardDP4A [GPUBackend β] (ctx : β)
     -- canonical 10-decode run.  2-row was actually worse than either
     -- (1.401 ms/dec) — smem sharing of Q8_1 input did not pay for the
     -- occupancy hit at 4070 Ti's SM count.
-    -- Override with HESPER_Q6K_KERNEL=4warp (1 row, 4 warps coop on K —
-    -- llama.cpp's `mul_mat_vec_q<Q6_K, nwarps=4>` shape; 4× per-row
-    -- issue parallelism), HESPER_Q6K_KERNEL=4row (4 rows / WG, smem
-    -- input share), or HESPER_Q6K_KERNEL=2row (rarely wins).
+    -- Default 1-row.  4-warp variant matches llama.cpp's
+    -- `mul_mat_vec_q<Q6_K, nwarps=4>` shape and gives **+14% TPS at
+    -- graphs ON** (60.18 → 68.66 TPS, 60-tok decode "Hello world how
+    -- are you", end-to-end correct).  But on **short prefills**
+    -- (≤11 tokens) the slightly different cross-warp f32 reduction
+    -- order accumulates round-off across 14 layers × decode token
+    -- count and produces degenerate outputs ("Hello!!!" instead of
+    -- "Hello! How can I help you today?").  Microbench parity 6e-6
+    -- max-rel-diff masks this — only e2e short-prompt decode catches
+    -- it.  Until the f32-order sensitivity is fixed (bias precision
+    -- in cross-warp reduction or higher-precision smem accumulator),
+    -- keep 1-row default.
+    --
+    -- HESPER_Q6K_KERNEL=4warp (opt-in) for users who use long prompts
+    -- and want the +14% TPS.  Other variants {2row,4row} for regression.
     let q6kVariant := (← IO.getEnv "HESPER_Q6K_KERNEL").getD "1row"
     let force1Row  := q6kVariant == "1row"
     let force2Row  := q6kVariant == "2row"

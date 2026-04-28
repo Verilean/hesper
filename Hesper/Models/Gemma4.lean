@@ -2240,8 +2240,8 @@ def forwardPrefillBatch [GPUBackend β] (ctx : β)
   -- VRAM round-trip (the f32 normed hidden state).  For the fallback
   -- paths (f32 matmul etc.) still run the standalone RMSNorm because
   -- they don't consume Q8_1.
-  -- HESPER_DP4A_Q6K_4WARP=1 forces dp4a path even when an f16 lm_head
-  -- buffer was prepared at load time.  Same toggle as the decode site.
+  -- Default: f16 lm_head (e2e correct).  HESPER_DP4A_Q6K_4WARP=1
+  -- forces dp4a path — same toggle as decode.
   let force4WarpQ6K_pf ← do
     match ← IO.getEnv "HESPER_DP4A_Q6K_4WARP" with
     | some "1" => pure true
@@ -2545,10 +2545,11 @@ def forwardSingleToken [GPUBackend β] (ctx : β)
 
   -- Step 4: LM head matmul (1 × hiddenSize @ hiddenSize × vocabSize)
   Hesper.WGSL.Execute.withSection "lmHead" do
-    -- Fast path: pre-dequantized f16 weights → f16 matmul (single dispatch,
-    -- no Q8_1 quantize, ~10× speedup over Q6_K dp4a for vocab=262144).
-    -- HESPER_DP4A_Q6K_4WARP=1 forces the dp4a 4-warp path even when the
-    -- f16 buffer exists — useful for A/B against the f16 fast path.
+    -- Default: pre-dequantized f16 lm_head (single dispatch, e2e
+    -- correct on all prompt lengths).  HESPER_DP4A_Q6K_4WARP=1
+    -- forces dp4a 4-warp path — gives +27% TPS combined with
+    -- HESPER_Q6K_KERNEL=4warp at long prompts but degrades short
+    -- prompts (see project_q6k_4warp_graphs_bug.md).
     let force4WarpQ6K ← do
       match ← IO.getEnv "HESPER_DP4A_Q6K_4WARP" with
       | some "1" => pure true
@@ -2630,11 +2631,13 @@ def forwardSingleToken [GPUBackend β] (ctx : β)
           (hash ("fused-rmsnorm-q8_1-lmhead", model.config.hiddenSize))
           state.lmHeadQuantizePrepared
         -- Q6_K dp4a matmul (2D grid for vocabSize > 65535).
-        -- Variant selection (env, in priority order):
+        -- Default 4-row (smem-shared variant — same numerical accumulator
+        -- order as 1-row so e2e correct even on short prompts).  4-warp
+        -- 1-row gives more raw TPS but has the same short-prefill
+        -- numerical-drift issue noted on the ffn_down dispatcher.
         --   HESPER_DP4A_Q6K_4WARP=1 → 4-warp 1-row coop on K (llama.cpp shape)
         --   HESPER_DP4A_Q6K_1ROW=1  → single-warp     (32 threads, 1 row/WG)
         --   HESPER_DP4A_Q6K_2ROW=1  → 2-warp variant  (64 threads, 2 rows/WG)
-        --   default                 → 4-warp 4-rows-per-WG (smem input share)
         let variant ← do
           match ← IO.getEnv "HESPER_DP4A_Q6K_4WARP" with
           | some "1" => pure "4warp"
