@@ -5099,8 +5099,21 @@ def forwardBatchDP4A [GPUBackend β] (ctx : β)
       (hash ("q8_1-quantize-batch", layer.config.inDim, seqLen))
       layer.dp4aBatchQuantizePrepared
 
+    let useMMQ := (← IO.getEnv "HESPER_PREFILL_MMQ").isSome
     let use4Warp := (← IO.getEnv "HESPER_PREFILL_4WARP").isSome
-    if use4Warp && layer.config.inDim % 256 == 0 then
+    -- MMQ Phase 1: requires shapes divisible by tile (mmq_y=32, mmq_x=8)
+    -- and inDim a multiple of Q4_K super-block (256). Falls back otherwise.
+    if useMMQ && layer.config.inDim % 256 == 0
+       && layer.config.outDim % 32 == 0 && seqLen % 8 == 0 then
+      let nTileCols := (seqLen + 7) / 8
+      GPUBackend.executeWithConfigCached ctx
+        (q4kMatmulBatchMMQKernel layer.config seqLen)
+        [("weights", layer.weightBuf), ("input_q8", q8Buf), ("output", outputBuf)]
+        { numWorkgroups := (layer.config.outDim / 32, nTileCols, 1),
+          workgroupSize := { x := 256, y := 1, z := 1 } }
+        (hash ("q4k-batch-matmul-mmq", layer.config.inDim, layer.config.outDim, seqLen))
+        layer.dp4aBatchMatmulPrepared
+    else if use4Warp && layer.config.inDim % 256 == 0 then
       GPUBackend.executeWithConfigCached ctx
         (q4kMatmulBatch4WarpKernel layer.config seqLen)
         [("weights", layer.weightBuf), ("input_q8", q8Buf), ("output", outputBuf)]
@@ -5176,10 +5189,23 @@ def forwardBatchDP4A_fromQ8 [GPUBackend β] (ctx : β)
   -- ref keyed on seqLen); absent an override we fall back to the shared
   -- layer ref.
   let ref := refOverride.getD layer.dp4aBatchMatmulPrepared
-  -- 4-warp coop-K kernel (HESPER_PREFILL_4WARP=1) is currently broken — produces
-  -- non-bit-parity output for prefill. Default to the 1-warp baseline.
+  -- MMQ tile-based kernel (HESPER_PREFILL_MMQ=1, Phase 1).
+  -- Requires outDim % 32 == 0, seqLen % 8 == 0, inDim % 256 == 0.
+  -- Falls back to 1-warp / 4-warp variants otherwise.
+  let useMMQ := (← IO.getEnv "HESPER_PREFILL_MMQ").isSome
   let use4Warp := (← IO.getEnv "HESPER_PREFILL_4WARP").isSome
-  if use4Warp && layer.config.inDim % 256 == 0 then
+  if useMMQ && layer.config.inDim % 256 == 0
+     && layer.config.outDim % 32 == 0 && seqLen % 8 == 0 then
+    let nTileCols := (seqLen + 7) / 8
+    let cacheKey : UInt64 := hash ("q4k-batch-matmul-q8-mmq",
+      layer.config.inDim, layer.config.outDim, seqLen)
+    GPUBackend.executeWithConfigCached ctx
+      (q4kMatmulBatchMMQKernel layer.config seqLen)
+      [("weights", layer.weightBuf), ("input_q8", q8Buf), ("output", outputBuf)]
+      { numWorkgroups := (layer.config.outDim / 32, nTileCols, 1),
+        workgroupSize := { x := 256, y := 1, z := 1 } }
+      cacheKey ref
+  else if use4Warp && layer.config.inDim % 256 == 0 then
     let cacheKey : UInt64 := hash ("q4k-batch-matmul-q8-4warp",
       layer.config.inDim, layer.config.outDim, seqLen)
     GPUBackend.executeWithConfigCached ctx
