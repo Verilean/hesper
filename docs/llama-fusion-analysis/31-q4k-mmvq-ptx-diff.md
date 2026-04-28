@@ -254,6 +254,29 @@ barrier, all 16 threads in the half-warp read from smem.  Eliminates
 ~25 of the 38 ld.global per iter.  Predicted: dram bytes 29.55 →
 ~13 MB, per-call 78 → ~35 µs, **+5–7 TPS**.
 
+**Option A — attempted, reverted 2026-04-28**:
+PTX dump confirmed the change worked at the codegen level:
+ld.global 38 → 18 (-53 %), ld.shared 3 → 27, st.shared 1 → 5,
+bar.sync 1 → 2.  But the kernel hung at runtime — `gemma4-cuda
+"Hello" 30` never progressed past `[Prefill] Batched path`, even
+with a 5-minute timeout and a fresh cubin cache.  263 cubins were
+written (PTX JIT completed) so the hang is at GPU execution, not
+JIT.
+
+Likely cause: the `if (laneLow == 0)` block contains 4×
+`readBuffer` + 4× `writeWorkgroup`, and ShaderM's lowering of those
+inside a divergent `if_` may not be safe — the equivalent guarded
+path was tested only with `subgroupAdd` or pure smem stores in
+prior kernels (Q6_K), never with global loads.  The PTX looked
+plausible but ptxas may have scheduled a load on a lane where the
+predicate later returns false, leaving the dest register
+uninitialised — and the subsequent `ShaderM.barrier` hangs because
+some lanes never reach it (control flow divergence).
+
+Reverted to baseline (87.2 TPS).  Re-attempt with Option B (vec4
+LDG.E.128 — no divergent control flow) or write a microbench-only
+kernel to isolate the if-guarded readBuffer behaviour first.
+
 **Option B**: vec4.u32 ld.global (LDG.E.128).  hesper currently
 emits 4× ld.global.u32 where llama emits 1× LDG.E.128.  Requires
 vec4-typed readBuffer in ShaderM + CodeGen support.  Preliminary
