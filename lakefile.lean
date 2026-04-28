@@ -430,6 +430,10 @@ lean_exe «gemma4-qproj-parity» where
   root := `Examples.DSL.Gemma4QProjParity
   moreLinkArgs := stdLinkArgs ++ #["./.lake/build/native/libhesper_cuda.a", "-lcuda"]
 
+lean_exe «gemma4-q4k-mmq-parity» where
+  root := `Examples.DSL.Gemma4Q4KMMQParity
+  moreLinkArgs := stdLinkArgs ++ #["./.lake/build/native/libhesper_cuda.a", "-lcuda"]
+
 lean_exe «gemma4-qkv-parity» where
   root := `Examples.DSL.Gemma4QKVProjParity
   moreLinkArgs := stdLinkArgs ++ #["./.lake/build/native/libhesper_cuda.a", "-lcuda"]
