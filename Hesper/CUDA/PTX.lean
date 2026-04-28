@@ -386,6 +386,12 @@ partial def Inst.toString : Inst → String
     else s!"  mul.wide.u32 {d}, {s}, {n};"
   -- Use signed conversion so negative i32 (from dp4a.s32) round-trips correctly.
   -- cvt.rn.f32.s32 produces the same result as .u32 variant for positive inputs.
+  -- TRIED 2026-04-28: switching to cvt.rn.f32.u32 broke "Hello" parity (output
+  -- "스타일 if if if...") — dp4a results CAN be negative (Q8_1 has signed bytes
+  -- × Q4 unsigned), and treating them as unsigned destroys the matmul.  To
+  -- eliminate the SGXT.U32 from Q4_K scale path, a separate cvt_f32_u32_real
+  -- instruction would be needed and toF32 would have to dispatch on whether
+  -- the source is dp4a output (signed) or scale extraction (unsigned).
   | .cvt_f32_u32 d s     => s!"  cvt.rn.f32.s32 {d}, {s};"
   | .cvt_u32_f32 d s     => s!"  cvt.rzi.u32.f32 {d}, {s};"
   | .cvt_rni_s32_f32 d s => s!"  cvt.rni.s32.f32 {d}, {s};"
