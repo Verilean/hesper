@@ -1571,74 +1571,74 @@ def q4kMatmulBatchMMQKernel (config : Config) (seqLen : Nat) : ShaderM Unit := d
       let blockSumfD : Exp (.scalar .f32) := Exp.var "blockSumfD"
       let blockSumfM : Exp (.scalar .f32) := Exp.var "blockSumfM"
 
-      ShaderM.loop (Exp.litU32 0) (Exp.litU32 4) (Exp.litU32 1) fun g => do
-        -- Pair g covers sub-blocks (2g, 2g+1). qs ints (4 + 2g*4)..(4 + 2g*4 + 7)
-        -- shared between the two sub-blocks via low/high nibble:
-        --   low  nib of v[0..7] → sub 2g     (32 K-elements)
-        --   high nib of v[0..7] → sub 2g+1   (next 32 K-elements)
-        let subLo := Exp.mul g (Exp.litU32 2)             -- 0, 2, 4, 6
-        let subHi := Exp.add subLo (Exp.litU32 1)         -- 1, 3, 5, 7
-        let (scLo, mLo) := extractScaleMin subLo
-        let (scHi, mHi) := extractScaleMin subHi
+      -- Literal port of the 1-warp baseline (q4kMatmulBatchKernel, Linear.lean:1142):
+      -- baseline has 32 lanes that each cover ONE (bq8Off, elemOff) slot.
+      -- For per-thread MMQ we iterate the same (bq8Off, elemOff) grid sequentially.
+      -- Outer pairIdx ∈ {0,1,2,3} = baseline's pairIdx. bq8Off = pairIdx*2 ∈ {0,2,4,6}.
+      -- elemOff ∈ {0,1,2,3}. Inner: 4 dp4a per (bq8Off, elemOff) — exactly baseline's
+      -- per-lane 4 dp4a; just done sequentially, not warp-reduced.
+      ShaderM.loop (Exp.litU32 0) (Exp.litU32 4) (Exp.litU32 1) fun pairIdx => do
+        let bq8Off := Exp.mul pairIdx (Exp.litU32 2)        -- 0, 2, 4, 6
+        let bq8OffP1 := Exp.add bq8Off (Exp.litU32 1)        -- 1, 3, 5, 7
+        let (scA, mA) := extractScaleMin bq8Off
+        let (scB, mB) := extractScaleMin bq8OffP1
 
-        -- Q8_1 ds (header) for sub 2g (low) and sub 2g+1 (high). Standard layout.
-        let q8LoBase := Exp.add q8ColBase (Exp.mul subLo (Exp.litU32 9))
-        let q8HiBase := Exp.add q8ColBase (Exp.mul subHi (Exp.litU32 9))
+        ShaderM.loop (Exp.litU32 0) (Exp.litU32 4) (Exp.litU32 1) fun elemOff => do
+          -- v0 = q4[blockU32Base + 4 + bq8Off*4 + elemOff], v1 = same+4 (next 4 ints).
+          let q4BaseIdx := Exp.add blockU32Base
+            (Exp.add (Exp.litU32 4)
+              (Exp.add (Exp.mul bq8Off (Exp.litU32 4)) elemOff))
+          let v0 ← ShaderM.readBuffer (ty := .scalar .u32) (n := totalWeightU32)
+                     "weights" q4BaseIdx
+          let v1 ← ShaderM.readBuffer (ty := .scalar .u32) (n := totalWeightU32)
+                     "weights" (Exp.add q4BaseIdx (Exp.litU32 4))
 
-        let q8HdrLo ← ShaderM.readBuffer (ty := .scalar .u32) (n := q8InputU32Size)
-                        "input_q8" q8LoBase
-        let q8HdrHi ← ShaderM.readBuffer (ty := .scalar .u32) (n := q8InputU32Size)
-                        "input_q8" q8HiBase
-        let d8Lo := Exp.vecX (Exp.unpack2x16float q8HdrLo)
-        let d8Hi := Exp.vecX (Exp.unpack2x16float q8HdrHi)
-        let s8Lo := Exp.vecY (Exp.unpack2x16float q8HdrLo)
-        let s8Hi := Exp.vecY (Exp.unpack2x16float q8HdrHi)
+          -- Q8_1 sub-blocks: sub bq8Off (matched by low nib) and sub bq8Off+1 (high nib).
+          -- baseline lane: u0=q8[+1+elemOff], u1=q8[+5+elemOff] for sub bq8Off.
+          --                u2=q8[+1+elemOff], u3=q8[+5+elemOff] for sub bq8Off+1.
+          let q8Sub0Base := Exp.add q8ColBase (Exp.mul bq8Off (Exp.litU32 9))
+          let q8Sub1Base := Exp.add q8ColBase (Exp.mul bq8OffP1 (Exp.litU32 9))
+          let off1e := Exp.add (Exp.litU32 1) elemOff
+          let off5e := Exp.add (Exp.litU32 5) elemOff
+          let u0 ← ShaderM.readBuffer (ty := .scalar .u32) (n := q8InputU32Size)
+                     "input_q8" (Exp.add q8Sub0Base off1e)
+          let u1 ← ShaderM.readBuffer (ty := .scalar .u32) (n := q8InputU32Size)
+                     "input_q8" (Exp.add q8Sub0Base off5e)
+          let u2 ← ShaderM.readBuffer (ty := .scalar .u32) (n := q8InputU32Size)
+                     "input_q8" (Exp.add q8Sub1Base off1e)
+          let u3 ← ShaderM.readBuffer (ty := .scalar .u32) (n := q8InputU32Size)
+                     "input_q8" (Exp.add q8Sub1Base off5e)
+          -- ds for each sub.
+          let q8Hdr0 ← ShaderM.readBuffer (ty := .scalar .u32) (n := q8InputU32Size)
+                         "input_q8" q8Sub0Base
+          let q8Hdr1 ← ShaderM.readBuffer (ty := .scalar .u32) (n := q8InputU32Size)
+                         "input_q8" q8Sub1Base
+          let d8A := Exp.vecX (Exp.unpack2x16float q8Hdr0)
+          let d8B := Exp.vecX (Exp.unpack2x16float q8Hdr1)
 
-        -- Read 8 q4 ints (v[0..7]) at offset blockU32Base + 4 + 2g*4 + 0..7
-        -- = blockU32Base + 4 + g*8 + 0..7. This holds nibbles for sub 2g + sub 2g+1.
-        let q4Base := Exp.add blockU32Base
-          (Exp.add (Exp.litU32 4) (Exp.mul g (Exp.litU32 8)))
+          -- Mirror baseline arithmetic exactly (Linear.lean:1239-1257).
+          let v0i0 := Exp.bitAnd v0 (Exp.litU32 0x0F0F0F0F)
+          let v1i0 := Exp.bitAnd v1 (Exp.litU32 0x0F0F0F0F)
+          let acc0 := Exp.dot4I8Packed v0i0 u0
+          let dot1_0 := Exp.dot4I8Packed v1i0 u1
+          let dot1_0Comb := Exp.add acc0 dot1_0
+          let sumU_0 := Exp.add (Exp.dot4I8Packed (Exp.litU32 0x01010101) u0)
+                                 (Exp.dot4I8Packed (Exp.litU32 0x01010101) u1)
+          let sumfD_0 := Exp.mul d8A (Exp.mul (Exp.toF32 dot1_0Comb) scA)
+          let sumfM_0 := Exp.mul d8A (Exp.mul (Exp.toF32 sumU_0) mA)
 
-        -- Inner loop over 8 q4 ints / 8 q8 ints (= 32 K-products per nib).
-        ShaderM.varNamed "sumiLo" (.scalar .i32) (Exp.litI32 0)
-        ShaderM.varNamed "sumiHi" (.scalar .i32) (Exp.litI32 0)
-        ShaderM.varNamed "sumiU_Lo" (.scalar .i32) (Exp.litI32 0)
-        ShaderM.varNamed "sumiU_Hi" (.scalar .i32) (Exp.litI32 0)
-        let sumiLo : Exp (.scalar .i32) := Exp.var "sumiLo"
-        let sumiHi : Exp (.scalar .i32) := Exp.var "sumiHi"
-        let sumiU_Lo : Exp (.scalar .i32) := Exp.var "sumiU_Lo"
-        let sumiU_Hi : Exp (.scalar .i32) := Exp.var "sumiU_Hi"
+          let v0i1 := Exp.bitAnd (Exp.shiftRight v0 (Exp.litU32 4)) (Exp.litU32 0x0F0F0F0F)
+          let v1i1 := Exp.bitAnd (Exp.shiftRight v1 (Exp.litU32 4)) (Exp.litU32 0x0F0F0F0F)
+          let acc1 := Exp.dot4I8Packed v0i1 u2
+          let dot1_1 := Exp.dot4I8Packed v1i1 u3
+          let dot1_1Comb := Exp.add acc1 dot1_1
+          let sumU_1 := Exp.add (Exp.dot4I8Packed (Exp.litU32 0x01010101) u2)
+                                 (Exp.dot4I8Packed (Exp.litU32 0x01010101) u3)
+          let sumfD_1 := Exp.mul d8B (Exp.mul (Exp.toF32 dot1_1Comb) scB)
+          let sumfM_1 := Exp.mul d8B (Exp.mul (Exp.toF32 sumU_1) mB)
 
-        ShaderM.loop (Exp.litU32 0) (Exp.litU32 8) (Exp.litU32 1) fun j => do
-          let v_word ← ShaderM.readBuffer (ty := .scalar .u32) (n := totalWeightU32)
-                         "weights" (Exp.add q4Base j)
-          let u_lo ← ShaderM.readBuffer (ty := .scalar .u32) (n := q8InputU32Size)
-                       "input_q8" (Exp.add q8LoBase (Exp.add (Exp.litU32 1) j))
-          let u_hi ← ShaderM.readBuffer (ty := .scalar .u32) (n := q8InputU32Size)
-                       "input_q8" (Exp.add q8HiBase (Exp.add (Exp.litU32 1) j))
-          let v_nibLo := Exp.bitAnd v_word (Exp.litU32 0x0F0F0F0F)
-          let v_nibHi := Exp.bitAnd (Exp.shiftRight v_word (Exp.litU32 4)) (Exp.litU32 0x0F0F0F0F)
-          ShaderM.assign "sumiLo" (Exp.add sumiLo (Exp.dot4I8Packed v_nibLo u_lo))
-          ShaderM.assign "sumiHi" (Exp.add sumiHi (Exp.dot4I8Packed v_nibHi u_hi))
-          ShaderM.assign "sumiU_Lo" (Exp.add sumiU_Lo
-            (Exp.dot4I8Packed (Exp.litU32 0x01010101) u_lo))
-          ShaderM.assign "sumiU_Hi" (Exp.add sumiU_Hi
-            (Exp.dot4I8Packed (Exp.litU32 0x01010101) u_hi))
-
-        -- Per-(low, high)-sub-block scaled accumulation.
-        -- baseline: sumf_d += d8 * (dot * sc), sumf_m += d8 * (sumU * m)
-        -- but in the baseline 1-warp kernel, sumf_m uses dot4I8Packed of 0x01010101
-        -- against u (= sum of all u bytes), then * m * d8. We do the same.
-        let sumfDLo := Exp.mul d8Lo (Exp.mul (Exp.toF32 sumiLo) scLo)
-        let sumfDHi := Exp.mul d8Hi (Exp.mul (Exp.toF32 sumiHi) scHi)
-        let sumfMLo := Exp.mul d8Lo (Exp.mul (Exp.toF32 sumiU_Lo) mLo)
-        let sumfMHi := Exp.mul d8Hi (Exp.mul (Exp.toF32 sumiU_Hi) mHi)
-        -- Note: ds.y (s8Lo, s8Hi) is the precomputed sum-of-u in some Q8_1 variants;
-        -- hesper's standard Q8_1 baseline computes sum from u directly via dp4a, so
-        -- s8Lo / s8Hi are unused (kept above for documentation).
-        let _ := s8Lo; let _ := s8Hi
-        ShaderM.assign "blockSumfD" (Exp.add blockSumfD (Exp.add sumfDLo sumfDHi))
-        ShaderM.assign "blockSumfM" (Exp.add blockSumfM (Exp.add sumfMLo sumfMHi))
+          ShaderM.assign "blockSumfD" (Exp.add blockSumfD (Exp.add sumfD_0 sumfD_1))
+          ShaderM.assign "blockSumfM" (Exp.add blockSumfM (Exp.add sumfM_0 sumfM_1))
 
       -- After all 4 groups (= all 8 sub-blocks): apply outer dm scaling.
       let blockContrib := Exp.sub (Exp.mul dF blockSumfD) (Exp.mul dminF blockSumfM)
