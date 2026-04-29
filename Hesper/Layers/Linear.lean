@@ -5799,8 +5799,12 @@ def forwardBatchDP4A [GPUBackend β] (ctx : β)
     let useMMQ4 := (← IO.getEnv "HESPER_PREFILL_MMQ4").isSome
     let useMMQ2Default := !mmq2Off && !useMMQ && !useMMQ4
     let use4Warp := (← IO.getEnv "HESPER_PREFILL_4WARP").isSome
+    -- seqLen does NOT have to be divisible by 8: the MMQ2/MMQ4 kernels
+    -- already mask out-of-range j-columns (j_in check). We just round
+    -- the grid up via ceil(seqLen/8) and let the OOB threads no-op.
+    -- seqLen >= 2 ensures we are actually in batched territory.
     if useMMQ4 && layer.config.inDim % 256 == 0
-       && layer.config.outDim % 128 == 0 && seqLen % 8 == 0 then
+       && layer.config.outDim % 128 == 0 && seqLen >= 2 then
       let nTileCols := (seqLen + 7) / 8
       GPUBackend.executeWithConfigCached ctx
         (q4kMatmulBatchMMQ4Kernel layer.config seqLen)
@@ -5810,7 +5814,7 @@ def forwardBatchDP4A [GPUBackend β] (ctx : β)
         (hash ("q4k-batch-matmul-mmq4", layer.config.inDim, layer.config.outDim, seqLen))
         layer.dp4aBatchMatmulPrepared
     else if useMMQ2Default && layer.config.inDim % 256 == 0
-       && layer.config.outDim % 32 == 0 && seqLen % 8 == 0 then
+       && layer.config.outDim % 32 == 0 && seqLen >= 2 then
       let nTileCols := (seqLen + 7) / 8
       GPUBackend.executeWithConfigCached ctx
         (q4kMatmulBatchMMQ2Kernel layer.config seqLen)
@@ -5916,8 +5920,11 @@ def forwardBatchDP4A_fromQ8 [GPUBackend β] (ctx : β)
   let useMMQ4 := (← IO.getEnv "HESPER_PREFILL_MMQ4").isSome
   let useMMQ2Default := !mmq2Off && !useMMQ && !useMMQ4
   let use4Warp := (← IO.getEnv "HESPER_PREFILL_4WARP").isSome
+  -- See note in forwardBatchDP4A: seqLen %% 8 != 0 is fine because the
+  -- MMQ2/MMQ4 kernels mask out-of-range j-columns; we just round the
+  -- grid up via ceil(seqLen/8).
   if useMMQ4 && layer.config.inDim % 256 == 0
-     && layer.config.outDim % 128 == 0 && seqLen % 8 == 0 then
+     && layer.config.outDim % 128 == 0 && seqLen >= 2 then
     let nTileCols := (seqLen + 7) / 8
     let cacheKey : UInt64 := hash ("q4k-batch-matmul-q8-mmq4",
       layer.config.inDim, layer.config.outDim, seqLen)
@@ -5928,7 +5935,7 @@ def forwardBatchDP4A_fromQ8 [GPUBackend β] (ctx : β)
         workgroupSize := { x := 256, y := 1, z := 1 } }
       cacheKey ref
   else if useMMQ2Default && layer.config.inDim % 256 == 0
-     && layer.config.outDim % 32 == 0 && seqLen % 8 == 0 then
+     && layer.config.outDim % 32 == 0 && seqLen >= 2 then
     let nTileCols := (seqLen + 7) / 8
     let cacheKey : UInt64 := hash ("q4k-batch-matmul-q8-mmq2",
       layer.config.inDim, layer.config.outDim, seqLen)
