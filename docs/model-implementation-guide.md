@@ -2,6 +2,19 @@
 
 Best practices for adding new models and kernels, derived from BitNet and Gemma 4 implementation experience.
 
+> **Porting a CUDA kernel to ShaderM?** Read these first:
+>
+> 1. [`docs/shaderm-cuda-mapping.md`](shaderm-cuda-mapping.md) §1 —
+>    CUDA C++ ⇔ ShaderM construct table. **Grep `Hesper/WGSL/Monad.lean`
+>    before claiming a feature is missing** — most are already there.
+> 2. [`docs/shaderm-cuda-mapping.md`](shaderm-cuda-mapping.md) §6 —
+>    Worked example (Q4_K MMQ port post-mortem) with a step-by-step
+>    recipe: paper-sketch the K-loop, write the parity test first,
+>    bisect bottom-up.
+> 3. [`docs/circuit-dsl-todos.md`](circuit-dsl-todos.md) §"Active 2026-04-29"
+>    — open DSL gaps (e.g. `BlockLayout` for typed quantized buffer views)
+>    that show up when porting llama.cpp-style code.
+
 ## 1. Architecture: GPUBackend Typeclass
 
 All model code MUST use `[GPUBackend β]` — never hardcode `Device` or `CUDAContext`.

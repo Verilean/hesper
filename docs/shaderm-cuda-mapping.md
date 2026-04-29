@@ -272,26 +272,56 @@ This is the case study from the 2026-04-29 Phase 1 attempt
 NaN output. Root causes were not DSL gaps — they were design errors that
 the DSL faithfully transcribed.
 
+> **Source-of-truth links** (open these alongside the recipe in §6.3):
+>
+> - **DSL feature index** → §1 mapping table above. Grep `Hesper/WGSL/Monad.lean`
+>   for the exact API.
+> - **Existing kernels to copy from** (read these before writing a new one):
+>   - 1-warp Q4_K dp4a baseline: `Hesper/Layers/Linear.lean::q4kMatmulBatchKernel`
+>     (currently around line 1142). Reference algorithm; never break parity vs this.
+>   - 4-warp coop K variant: `Hesper/Layers/Linear.lean::fusedQ4KMLinearDP4A4WarpKernel`.
+>   - The shared `extractScaleMin` 6+6+4+2-bit Q4_K scale unpack appears verbatim
+>     in both — search for `extractScaleMin` in Linear.lean and **copy it, don't reinvent**.
+> - **Parity-test scaffold** → `Examples/DSL/Gemma4Q4KMMQParity.lean` and the
+>   surrounding `Examples/DSL/Gemma4*Parity.lean` family. They all follow the
+>   same load-real-GGUF-weights-then-diff pattern.
+> - **Buffer-layout primer**:
+>   - Q4_K block layout: `llama.cpp/ggml/src/ggml-common.h` (search `block_q4_K`).
+>     32 q4 ints (= 128 bytes) per super-block, sub-blocks paired (k, k+1) via
+>     low/high nibble of the same q4 ints.
+>   - Q8_1 standard: `[ds_half2 (1 int) | qs (8 ints)]` per 32-K sub-block.
+>     Hesper's `quantizeQ8_1BatchKernel` writes this layout. Used by hesper's
+>     1-warp baseline.
+>   - Q8_1 MMQ-packed: `block_q8_1_mmq` in `llama.cpp/ggml/src/ggml-cuda/mmq.cuh`
+>     line 28. **Different from standard**: 4 ds at the front of each 128-K
+>     group, then 32 qs ints contiguous. llama.cpp generates this via a
+>     dedicated `quantize_mmq_q8_1` kernel; hesper has nothing equivalent yet.
+
 ### 6.1 What I got wrong
 
-| Error | What happened | What would have caught it |
+| Error | What happened | What would have caught it (DSL → §1 row) |
 |---|---|---|
-| Inner dot iterated `bq8Off ∈ {0,1}` only, so each output saw 2/8 sub-blocks | Output magnitude wildly off (~50M instead of ~0.5) | Explicit `static_for sub in 0..8` over Q4_K sub-blocks would have made coverage visible |
-| Y tile read with offsets `{col*72 + sb*9 + 0..8}` (standard layout) but matmul expected MMQ-packed layout (4 ds at front, 32 qs after) | NaN at column 1+ from misaligned `ds` | `BlockLayout` typed view would have made layout choice explicit at the kernel signature |
-| `unpack_scales_q45_K` stubbed with `bitAnd sc_word 0xFF` (first byte) | Scale × 0..255 → magnitude ~10x too large per element | Reuse of existing `extractScaleMin` (Linear.lean:2343) instead of inlining a stub |
+| Inner dot iterated `bq8Off ∈ {0,1}` only, so each output saw 2/8 sub-blocks | Output magnitude wildly off (~50M instead of ~0.5) | Explicit `static_for sub in 0..8` over Q4_K sub-blocks would have made coverage visible. See §1 "**unroll for**" row + §3 *staticFor* TODO. |
+| Sub-block pairing for Q4_K nibbles assumed (k, k+4); actually it's (2g, 2g+1) sharing 8 q4 ints | Wrong-magnitude per-element output | Would *not* have been caught by DSL; needs reading `q4kMatmulBatchKernel` (Linear.lean) line-by-line. **Recipe step 5 below.** |
+| Y tile read with offsets `{col*72 + sb*9 + 0..8}` (standard layout) but matmul expected MMQ-packed layout (4 ds at front, 32 qs after) | NaN at column 1+ from misaligned `ds` | `BlockLayout` typed view (§3 *DSL-BlockLayout* TODO) would have made layout choice explicit at the kernel signature. |
+| `unpack_scales_q45_K` stubbed with `bitAnd sc_word 0xFF` (first byte) | Scale × 0..255 → magnitude ~10x too large per element | Reuse the existing `extractScaleMin` helper (search `extractScaleMin` in `Hesper/Layers/Linear.lean`) instead of inlining a stub. **Recipe step 5.** |
 
 ### 6.2 What the DSL handled correctly
 
-- `RegArray (.scalar .f32) 2` for per-thread `(sumf_d, sumf_m)` accumulators
-  → no register-naming hand-rolling.
-- `ShaderM.unrollFor 4 fun loadIter => ...` for the cooperative X-tile load
-  → exactly mirrors `for (i0 = 0; i0 < mmq_y; i0 += nrows*nwarps)`.
-- `Exp.dot4I8Packed v u` for inline DP4A.
-- `Exp.unpack2x16float dmU32` returning a `(.vec2 .f32)` for `(d, dmin)`.
+| DSL feature used (§1 row) | Mirror of CUDA construct |
+|---|---|
+| `ShaderM.varNamed`, `Exp.var name` (also `MutVar` / Step 2) | `float acc = 0; ...; acc += x;` |
+| `ShaderM.unrollFor 4 fun loadIter => ...` (§1 "unroll for", Step 3) | `#pragma unroll for (int i = 0; i < 4; ++i)` |
+| `Exp.dot4I8Packed v u` | inline `__dp4a(v, u, 0)` |
+| `Exp.unpack2x16float dmU32` | `__half22float2(dm)` |
+| `ShaderM.sharedNamed "x_qs" (.array ...)` | `__shared__ int x_qs[N]` |
+| `Exp.toF32`, `Exp.toF32U` | `(float)x` (signed) / `__uint2float_rn(x)` (unsigned) |
+| `ShaderM.if_ cond ... ` (§1 `if_`) | `if (cond) { ... }` |
 
 The "DSL was hard" feeling was 90% me missing what was already there
-(`RegArray`, `Ptr`, `MutPtr`, `Exp.fma`) and 10% real (no `BlockLayout`,
-no `staticFor` with literal index).
+(`RegArray`, `Ptr`, `MutPtr`, `Exp.fma` — all present, see §1 mapping +
+`Hesper/WGSL/Monad.lean`) and 10% real (no `BlockLayout`, no `staticFor`
+with literal index — see §3 TODOs).
 
 ### 6.3 Recipe for next port
 
@@ -308,16 +338,30 @@ no `staticFor` with literal index).
    Confirm the iteration count multiplies out to the right number of
    K-elements (here: super_blocks × 2 × 2 × 8 × 4 = K_total).
 
+   *DSL pieces you'll need:* §1 "unroll for" / "runtime for" rows for the
+   loops; §1 "shared array" + "per-thread reg array" rows for the smem /
+   register tiles; §1 "lane index" / "warp index" rows for thread→tile
+   index calculations.
+
 2. **Pick the target Y layout up-front.** llama.cpp's MMVQ uses standard
    `block_q8_1`; MMQ uses `block_q8_1_mmq`. Decide which one your kernel
    reads and **comment it at the kernel signature**. If you change later,
    update the comment first.
+
+   *Cross-ref:* See the layout primer at the top of §6 for the byte-level
+   diff between the two Q8_1 variants. Once `BlockLayout` (§3) lands this
+   choice will be in the type signature; until then, comment + assert.
 
 3. **Write the parity test before the kernel body.** Use the pattern in
    `Examples/DSL/Gemma4Q4KMMQParity.lean`: load real GGUF weights, feed
    identical input through the new kernel and an existing reference
    kernel, diff. The test runs in <2 s once weights are cached → very
    tight feedback loop.
+
+   *Test pattern:* `lake build gemma4-q4k-mmq-parity && lake exe ...`.
+   Diff threshold: `1e-3` for "near bit-parity" (Q4_K dp4a is integer-
+   accumulated so equal inputs *should* be bit-identical; floats only
+   diverge through the dF/dminF f16 conversions).
 
 4. **Bisect parity bottom-up:**
    - Start with kernel writing zeros → confirm grid/block geometry
@@ -329,7 +373,23 @@ no `staticFor` with literal index).
    - Add scale extraction → expect bit-exact parity (since reference
      and candidate use the same `extractScaleMin`).
 
+   *DSL pieces:* `ShaderM.if_`, `Exp.var`/`Exp.assign`, atomic helpers
+   if you take the per-output-write-count approach.
+
 5. **Reuse, don't reimplement.** `extractScaleMin` is already correct
    in `q4kMatmulBatch4WarpKernel` and the 1-warp variant. Copy-paste it
    into your new kernel verbatim before optimizing. The 6+6 bit pack
    layout is too easy to get wrong from scratch.
+
+   *Find it:* grep `extractScaleMin` in `Hesper/Layers/Linear.lean`.
+   Three sites currently — the inline-`let` form is most port-friendly.
+
+6. **Compare emitted PTX against the reference kernel for one tiny
+   shape** before benchmarking. `HESPER_PTX_DUMP=/tmp/ptx lake exe ...`
+   writes per-kernel `.ptx` files. Diff the inner-loop region against the
+   reference kernel's PTX; the K-loop trip count and `dp4a` instruction
+   count should match within a small constant.
+
+   *DSL pieces:* PTX dumping is built into `Hesper/Backend/CUDA.lean`
+   (`HESPER_PTX_DUMP` env). See `docs/sass-q6k-comparison.md` for an
+   example diff write-up.

@@ -109,11 +109,21 @@ production decode today.
 
 ## Active 2026-04-29
 
+> **Cross-ref for everything in this section:**
+> [`docs/shaderm-cuda-mapping.md`](shaderm-cuda-mapping.md) §6 — worked
+> example of porting llama.cpp `mul_mat_q_kernel<Q4_K>` to ShaderM,
+> including the parity-test recipe and a CUDA → DSL feature map (§1).
+> Read it before starting any new CUDA port.
+
 ### TODO-MMQ: Q4_K MMQ kernel for prefill batched matmul
 - Phase 1 skeleton landed; correctness pending. Targets 17.6× kernel
   speedup over 1-warp baseline at seqLen ≥ 8.
-- See `docs/llama-fusion-analysis/31-mmq-port-plan.md` and
-  `memory/project_mmq_phase1_parity_blocker.md`.
+- See [`docs/llama-fusion-analysis/31-mmq-port-plan.md`](llama-fusion-analysis/31-mmq-port-plan.md),
+  `memory/project_mmq_phase1_parity_blocker.md`, and the worked example
+  in [`docs/shaderm-cuda-mapping.md` §6](shaderm-cuda-mapping.md).
+- Reference algorithm: `q4kMatmulBatchKernel` in
+  `Hesper/Layers/Linear.lean` (1-warp baseline; never break parity vs this).
+- Parity scaffold: `Examples/DSL/Gemma4Q4KMMQParity.lean`.
 - **Tensor cores in DSL** (was deferred): now relevant — prefill matters.
   llama.cpp's MMQ has a `TURING_MMA_AVAILABLE` branch using `mma.sync` PTX.
   hesper would need `Inst.mma_sync_m16n8k16` or similar primitive.
@@ -121,9 +131,15 @@ production decode today.
   on prefill once parity holds.
 
 ### TODO-DSL-BlockLayout: typed quantized buffer views
-- Discovered as a real DSL gap during MMQ port (see
-  `docs/shaderm-cuda-mapping.md` Section 3 + 6).
+- Discovered as a real DSL gap during MMQ port. See
+  [`docs/shaderm-cuda-mapping.md` §3 + §6](shaderm-cuda-mapping.md)
+  for the bug class this prevents.
 - Lean structures `Q8_1View`, `Q8_1MMQView`, `Q4_KView` with named fields
   (`.dsWord`, `.qs k`, `.scaleByteFor sb`) that lower to correct offsets.
-- Prevents the silent layout-mismatch bug we hit in MMQ Phase 1.
+- Reference for byte-level layouts:
+  - Q4_K: `llama.cpp/ggml/src/ggml-common.h` (`block_q4_K`).
+  - Q8_1 standard: hesper's `quantizeQ8_1BatchKernel` writes this.
+  - Q8_1 MMQ: `llama.cpp/ggml/src/ggml-cuda/mmq.cuh:28` (`block_q8_1_mmq`).
+- Prevents the silent layout-mismatch bug we hit in MMQ Phase 1
+  (NaN at column 1+ from misaligned `ds`).
 - **Estimated effort**: 2-3 days (new types + 5-6 use-site refactors).
