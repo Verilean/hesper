@@ -1265,3 +1265,23 @@ lean_exe «transpile-cuda-stmt-test» where
   root := `Tests.Transpile.CUDAStmtTest
   supportInterpreter := false
   moreLinkArgs := stdLinkArgs
+
+lean_exe «transpile-cuda-vecdot-smoke» where
+  root := `Tests.Transpile.CUDAVecDotSmoke
+  supportInterpreter := false
+  moreLinkArgs := stdLinkArgs
+
+lean_exe «wmma-ptx-text-test» where
+  root := `Tests.CUDA.WmmaPTXTextTest
+  supportInterpreter := false
+  moreLinkArgs := stdLinkArgs
+
+lean_exe «wmma-shaderm-test» where
+  root := `Tests.CUDA.WmmaShaderMTest
+  supportInterpreter := false
+  moreLinkArgs := stdLinkArgs
+
+lean_exe «wmma-gpu-parity-test» where
+  root := `Tests.CUDA.WmmaGPUParityTest
+  supportInterpreter := false
+  moreLinkArgs := stdLinkArgs
