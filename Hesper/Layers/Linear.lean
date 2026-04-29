@@ -1596,8 +1596,10 @@ def q4kMatmulBatchMMQKernel (config : Config) (seqLen : Nat) : ShaderM Unit := d
           -- Q8_1 sub-blocks: sub bq8Off (matched by low nib) and sub bq8Off+1 (high nib).
           -- baseline lane: u0=q8[+1+elemOff], u1=q8[+5+elemOff] for sub bq8Off.
           --                u2=q8[+1+elemOff], u3=q8[+5+elemOff] for sub bq8Off+1.
-          let q8Sub0Base := Exp.add q8ColBase (Exp.mul bq8Off (Exp.litU32 9))
-          let q8Sub1Base := Exp.add q8ColBase (Exp.mul bq8OffP1 (Exp.litU32 9))
+          -- Each super-block has 8 sub-blocks × 9 ints = 72 ints in Q8_1 buffer per column.
+          let q8SuperBase := Exp.add q8ColBase (Exp.mul kbx0 (Exp.litU32 (8 * 9)))
+          let q8Sub0Base := Exp.add q8SuperBase (Exp.mul bq8Off (Exp.litU32 9))
+          let q8Sub1Base := Exp.add q8SuperBase (Exp.mul bq8OffP1 (Exp.litU32 9))
           let off1e := Exp.add (Exp.litU32 1) elemOff
           let off5e := Exp.add (Exp.litU32 5) elemOff
           let u0 ← ShaderM.readBuffer (ty := .scalar .u32) (n := q8InputU32Size)
