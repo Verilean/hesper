@@ -177,3 +177,45 @@ def main : IO Unit := do
   else
     IO.println s!"FAIL: MMQ2 differs from baseline (max |err| = {err2})"
     IO.Process.exit 1
+
+  -- 7. MMQ4 (llama.cpp WG/loop structure: mmq_y=128, mmq_x=8, nwarps=8).
+  IO.println ""
+  IO.println "=== MMQ4 (llama.cpp WG/loop: mmq_y=128, mmq_x=8) ==="
+  if outDim % 128 != 0 then
+    IO.println s!"SKIP: outDim {outDim} not divisible by 128 (MMQ4 uses mmq_y=128)"
+  else
+    let outBufMMQ4 ← GPUBackend.allocBuffer ctx outBufSz
+    let mmq4Ref ← IO.mkRef (none : Option (GPUBackend.CachedDispatch _))
+    GPUBackend.executeWithConfigCached ctx
+      (Hesper.Layers.Linear.q4kMatmulBatchMMQ4Kernel wQ.config seqLen)
+      [("weights", wQ.weightBuf), ("input_q8", q8Buf), ("output", outBufMMQ4)]
+      { numWorkgroups := (outDim / 128, nTileCols, 1),
+        workgroupSize := { x := 256, y := 1, z := 1 } }
+      (hash ("test-mmq4", inDim, outDim, seqLen)) mmq4Ref
+
+    let outBytesMMQ4 ← GPUBackend.readBuffer ctx outBufMMQ4 outBufSz
+    let mut outArrMMQ4 : Array Float := Array.mkEmpty (outDim * seqLen)
+    for i in [0:outDim * seqLen] do
+      let f ← Hesper.Basic.bytesToFloat32 outBytesMMQ4 (i * 4)
+      outArrMMQ4 := outArrMMQ4.push f
+    IO.println s!"[MMQ4] out[0..4]   = {outArrMMQ4.toList.take 4}"
+    IO.println s!"[MMQ4] out[col1,0..3] = {(outArrMMQ4.toList.drop outDim).take 4}"
+
+    let err4 := maxAbsDiffMMQ outArrRef outArrMMQ4
+    IO.println s!"[Parity MMQ4] max |err| = {err4}"
+
+    -- Locate first major mismatch.
+    let mut firstBigIdx4 : Int := -1
+    for i in [0:outDim * seqLen] do
+      let d := (outArrRef[i]! - outArrMMQ4[i]!).abs
+      if d > 0.01 && firstBigIdx4 == -1 then
+        firstBigIdx4 := i.toInt32.toInt
+        let row := i % outDim
+        let col := i / outDim
+        IO.println s!"[Diff MMQ4] first |err|>0.01 at i={i} (row={row}, col={col}): ref={outArrRef[i]!} mmq4={outArrMMQ4[i]!}"
+
+    if err4 < 1.0e-3 then
+      IO.println s!"PASS: MMQ4 matches baseline within 1e-3"
+    else
+      IO.println s!"FAIL: MMQ4 differs from baseline (max |err| = {err4})"
+      IO.Process.exit 1
