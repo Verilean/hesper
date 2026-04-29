@@ -1260,3 +1260,8 @@ lean_exe «transpile-cuda-expr-test» where
   root := `Tests.Transpile.CUDAExprTest
   supportInterpreter := false
   moreLinkArgs := stdLinkArgs
+
+lean_exe «transpile-cuda-stmt-test» where
+  root := `Tests.Transpile.CUDAStmtTest
+  supportInterpreter := false
+  moreLinkArgs := stdLinkArgs
