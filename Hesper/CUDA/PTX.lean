@@ -56,12 +56,39 @@ instance : ToString RegU64  where toString r := regName "rd" r.id r.scopeId
 instance : ToString RegPred where toString r := regName "p"  r.id r.scopeId
 instance : ToString RegB16  where toString r := regName "h"  r.id r.scopeId
 
+/-- WMMA fragment kind — what role the matrix plays in the mma. -/
+inductive WmmaFragKind where | a | b | c | d
+  deriving BEq, Repr, Inhabited
+
+/-- WMMA element type. `f16` packs 2 elements per b32 register;
+    `f32` is one element per f32 register; `bf16` packs 2 per b32. -/
+inductive WmmaElemTy where | f16 | bf16 | f32
+  deriving BEq, Repr, Inhabited
+
+/-- A WMMA fragment is a fixed-shape register group held collectively by
+    the warp. PTX `wmma.load/mma/store` reference these via a brace-list
+    of registers `{r0, r1, ...}`. We carry the per-thread regs as a
+    `u32` array (for half-typed fragments — 2 elements packed per
+    register) or `f32` array (for f32 result fragments). -/
+structure WmmaFrag where
+  kind    : WmmaFragKind
+  elemTy  : WmmaElemTy
+  m       : Nat
+  n       : Nat
+  k       : Nat
+  /-- Per-thread registers. For m16n16k16 f16:
+      A=4×u32, B=4×u32, C/D f32=8×f32, C/D f16=4×u32. -/
+  u32regs : Array RegU32 := #[]
+  f32regs : Array RegF32 := #[]
+  deriving Repr, Inhabited, BEq
+
 /-- Untyped register for varMap (bridges Exp's erased types to typed PTX). -/
 inductive AnyReg where
   | f32  (r : RegF32)
   | u32  (r : RegU32)
   | u64  (r : RegU64)
   | pred (r : RegPred)
+  | wmma (f : WmmaFrag)
   deriving BEq, Repr, Inhabited
 
 instance : ToString AnyReg where
@@ -70,6 +97,7 @@ instance : ToString AnyReg where
   | .u32 r  => toString r
   | .u64 r  => toString r
   | .pred r => toString r
+  | .wmma f => s!"<wmma {f.m}x{f.n}x{f.k}>"
 
 def AnyReg.isU32 : AnyReg → Bool
   | .u32 _ => true | _ => false
@@ -88,6 +116,12 @@ def AnyReg.toU64! : AnyReg → RegU64
 
 def AnyReg.toPred! : AnyReg → RegPred
   | .pred r => r | _ => default
+
+def AnyReg.toWmma! : AnyReg → WmmaFrag
+  | .wmma f => f | _ => default
+
+def AnyReg.isWmma : AnyReg → Bool
+  | .wmma _ => true | _ => false
 
 -- ============================================================================
 -- Special registers & immediates
@@ -231,6 +265,12 @@ inductive Inst where
   -- dp4a.u32.u32 d, a, b, c: d = c + dot(uint8x4(a), uint8x4(b))
   | dp4a_u32    (dst a b c : RegU32)
 
+  -- ── packed byte sub-saturate (CUDA __vsubss4) ──
+  -- sub.sat.s8x4 d, a, b: per-byte signed-saturating subtract.
+  -- Each lane is treated as int8 in [-128, 127]; result clamps on overflow.
+  -- Used by Q6_K vec_dot to do `(vil | vih) - 0x20202020` per byte.
+  | sub_sat_s8x4 (dst a b : RegU32)
+
   -- ── u64 arithmetic ── (all operands: RegU64, except mul_wide src is RegU32)
   | mov_u64     (dst src : RegU64)
   | add_u64     (dst src1 src2 : RegU64)
@@ -313,6 +353,23 @@ inductive Inst where
   | bra_not      (pred : RegPred) (target : Label)
   | label        (l : Label)
   | ret
+  /-- ── WMMA Tensor-Core instructions (sm_70+) ──
+      For m16n16k16 f16/f16/f32 only (most common Tensor Core shape).
+      `addr` is the base address (RegU64); `stride` is the row-stride
+      in elements (RegU32). Operands are register groups carried via
+      `Array RegU32` (for f16-typed operands; 2 elements packed per
+      .b32) or `Array RegF32` (for f32 result fragments). -/
+  | wmma_load_a_f16 (regs : Array RegU32) (addr : RegU64) (stride : RegU32)
+  | wmma_load_b_f16 (regs : Array RegU32) (addr : RegU64) (stride : RegU32)
+  | wmma_load_c_f32 (regs : Array RegF32) (addr : RegU64) (stride : RegU32)
+  | wmma_mma_f32_f16_f16_f32
+      (dRegs : Array RegF32) (aRegs bRegs : Array RegU32) (cRegs : Array RegF32)
+  | wmma_store_d_f32 (addr : RegU64) (regs : Array RegF32) (stride : RegU32)
+  /-- Initialize an f32 result fragment to zero. Lowers to per-register
+      `mov.f32 d, 0f00000000;` so the resulting fragment can feed
+      `wmma.mma.sync` as the C operand of an accumulator chain. -/
+  | wmma_zero_d_f32 (regs : Array RegF32)
+
   /-- PTX `{ ... }` block scope with **block-local** `.reg` declarations.
       Inside this scope, fresh registers were allocated against a private
       counter (starting at 0 for each scope) and use the prefix
@@ -377,6 +434,7 @@ partial def Inst.toString : Inst → String
   | .bfe_u32 d s start n => s!"  bfe.u32 {d}, {s}, {start}, {n};"
   | .dp4a_s32 d a b c    => s!"  dp4a.s32.s32 {d}, {a}, {b}, {c};"
   | .dp4a_u32 d a b c    => s!"  dp4a.u32.u32 {d}, {a}, {b}, {c};"
+  | .sub_sat_s8x4 d a b  => s!"  sub.sat.s8x4 {d}, {a}, {b};"
   | .mov_b32_f32_to_u32 d s => s!"  mov.b32 {d}, {s};"
   | .mov_b32_u32_to_f32 d s => s!"  mov.b32 {d}, {s};"
   | .mov_u64 d s         => s!"  mov.u64 {d}, {s};"
@@ -443,6 +501,40 @@ partial def Inst.toString : Inst → String
   | .bra_not p target    => s!"  @!{p} bra {target};"
   | .label l             => s!"{l}:"
   | .ret                 => "  ret;"
+  -- ── WMMA (Tensor Core) ──
+  -- m16n16k16 only. PTX requires `.aligned`. Stride is in *elements*.
+  -- Operand-modifier order (per PTX ISA 8.x manual):
+  --   wmma.load.<role>.sync.aligned.<layout>.<shape>.<space>.<type>
+  -- e.g. wmma.load.a.sync.aligned.row.m16n16k16.global.f16 {...}, [addr], stride;
+  -- The mma instruction's two layouts (alayout.blayout) come right after
+  -- `.aligned`, before `.shape`.
+  | .wmma_load_a_f16 regs addr stride =>
+    -- Generic-address form (no .global / .shared): ptxas resolves the
+    -- pointer's state space at JIT time so the same instruction works
+    -- for both global tiles and smem-staged tiles.
+    let lst := String.intercalate ", " (regs.toList.map (fun r => s!"{r}"))
+    s!"  wmma.load.a.sync.aligned.row.m16n16k16.f16 \{{lst}}, [{addr}], {stride};"
+  | .wmma_load_b_f16 regs addr stride =>
+    let lst := String.intercalate ", " (regs.toList.map (fun r => s!"{r}"))
+    s!"  wmma.load.b.sync.aligned.col.m16n16k16.f16 \{{lst}}, [{addr}], {stride};"
+  | .wmma_load_c_f32 regs addr stride =>
+    let lst := String.intercalate ", " (regs.toList.map (fun r => s!"{r}"))
+    s!"  wmma.load.c.sync.aligned.row.m16n16k16.f32 \{{lst}}, [{addr}], {stride};"
+  | .wmma_mma_f32_f16_f16_f32 d a b c =>
+    let dl := String.intercalate ", " (d.toList.map (fun r => s!"{r}"))
+    let al := String.intercalate ", " (a.toList.map (fun r => s!"{r}"))
+    let bl := String.intercalate ", " (b.toList.map (fun r => s!"{r}"))
+    let cl := String.intercalate ", " (c.toList.map (fun r => s!"{r}"))
+    -- Per nvcc: A and B types default to .f16 with m16n16k16, so the
+    -- shortened form `.<dType>.<cType>` is canonical. Keep both as
+    -- .f32.f32 so D and C are float accumulators.
+    s!"  wmma.mma.sync.aligned.row.col.m16n16k16.f32.f32 \{{dl}}, \{{al}}, \{{bl}}, \{{cl}};"
+  | .wmma_store_d_f32 addr regs stride =>
+    let lst := String.intercalate ", " (regs.toList.map (fun r => s!"{r}"))
+    s!"  wmma.store.d.sync.aligned.row.m16n16k16.f32 [{addr}], \{{lst}}, {stride};"
+  | .wmma_zero_d_f32 regs =>
+    let lines := regs.toList.map (fun r => s!"  mov.f32 {r}, 0f00000000;")
+    String.intercalate "\n" lines
   | .scopeBlock scopeId numF numR numRd numP numH insts => Id.run do
     -- Inner regs use prefix `%bf{scopeId}_<id>`, `%br{scopeId}_<id>`, etc.
     -- to avoid name collision with outer-scope regs (which use `%f<id>`).

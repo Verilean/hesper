@@ -660,6 +660,12 @@ where
     let (zero, s) := s.freshU32; let s := s.emit (.mov_u32_imm zero 0)
     let (r, s) := s.freshU32; (.u32 r, s.emit (.dp4a_u32 r ra.toU32! rb.toU32! zero))
 
+  -- __vsubss4: packed signed-saturating sub per byte (sm_70+)
+  | .subSatS8x4 a b =>
+    let (ra, s) := expToPTX a s; let (rb, s) := expToPTX b s
+    let (r, s) := s.freshU32
+    (.u32 r, s.emit (.sub_sat_s8x4 r ra.toU32! rb.toU32!))
+
   -- FMA
   | .fma a b c =>
     let (ra, s) := expToPTX a s; let (rb, s) := expToPTX b s; let (rc, s) := expToPTX c s
@@ -672,6 +678,88 @@ where
     let (ra, s) := expToPTX a s; let (rb, s) := expToPTX b s; let (rc, s) := expToPTX c s
     let (r, s) := s.freshU32
     (.u32 r, s.emit (.fma_rn_f16x2 r ra.toU32! rb.toU32! rc.toU32!))
+
+  -- ── WMMA (Tensor Core) ──
+  -- For m16n16k16 f16/f16/f32 (most common Tensor Core shape).
+  -- Fragments flow first-class through `AnyReg.wmma WmmaFrag`, so
+  -- `MultiplyAccumulate` and `Store` can recover the full per-thread
+  -- register group. The Exp's `bufRef : String` is `"&A"` (from
+  -- WGSL) — strip the leading `&` and look up the u64 base in varMap.
+  | .subgroupMatrixLoad (st := _st) (m := _m) (k := _k) bufRef offset _trans stride =>
+    let bufName := if bufRef.startsWith "&" then bufRef.drop 1 else bufRef
+    let (rOff, s) := expToPTX offset s
+    let (rStride, s) := expToPTX stride s
+    let rArr := (s.varMap.find? (·.1 == bufName)).map (·.2) |>.getD default
+    -- m16n16k16 .f16: A fragment is 8 .b32 regs per thread (verified
+    -- against nvcc reference output 2026-04-30; the "4 regs" figure
+    -- common in tutorials is per-pair-of-threads, not per-thread).
+    let (a0, s) := s.freshU32; let (a1, s) := s.freshU32
+    let (a2, s) := s.freshU32; let (a3, s) := s.freshU32
+    let (a4, s) := s.freshU32; let (a5, s) := s.freshU32
+    let (a6, s) := s.freshU32; let (a7, s) := s.freshU32
+    -- Byte address = base + offset*2 (each f16 = 2 bytes).
+    let (off64, s) := s.freshU64; let s := s.emit (.mul_wide_u32 off64 rOff.toU32! 2)
+    let (addr, s)  := s.freshU64; let s := s.emit (.add_u64 addr rArr.toU64! off64)
+    let regs := #[a0, a1, a2, a3, a4, a5, a6, a7]
+    let s := s.emit (.wmma_load_a_f16 regs addr rStride.toU32!)
+    let frag : WmmaFrag := { kind := .a, elemTy := .f16, m := 16, n := 16, k := 16, u32regs := regs }
+    (.wmma frag, s)
+  | .subgroupMatrixLoadRight (st := _st) (k := _k) (n := _n) bufRef offset _trans stride =>
+    let bufName := if bufRef.startsWith "&" then bufRef.drop 1 else bufRef
+    let (rOff, s) := expToPTX offset s
+    let (rStride, s) := expToPTX stride s
+    let rArr := (s.varMap.find? (·.1 == bufName)).map (·.2) |>.getD default
+    let (b0, s) := s.freshU32; let (b1, s) := s.freshU32
+    let (b2, s) := s.freshU32; let (b3, s) := s.freshU32
+    let (b4, s) := s.freshU32; let (b5, s) := s.freshU32
+    let (b6, s) := s.freshU32; let (b7, s) := s.freshU32
+    let (off64, s) := s.freshU64; let s := s.emit (.mul_wide_u32 off64 rOff.toU32! 2)
+    let (addr, s)  := s.freshU64; let s := s.emit (.add_u64 addr rArr.toU64! off64)
+    let regs := #[b0, b1, b2, b3, b4, b5, b6, b7]
+    let s := s.emit (.wmma_load_b_f16 regs addr rStride.toU32!)
+    let frag : WmmaFrag := { kind := .b, elemTy := .f16, m := 16, n := 16, k := 16, u32regs := regs }
+    (.wmma frag, s)
+  | .subgroupMatrixZeroResult (st := _st) (m := _m) (n := _n) =>
+    -- 8 f32 result regs zeroed.
+    let (c0, s) := s.freshF32; let (c1, s) := s.freshF32
+    let (c2, s) := s.freshF32; let (c3, s) := s.freshF32
+    let (c4, s) := s.freshF32; let (c5, s) := s.freshF32
+    let (c6, s) := s.freshF32; let (c7, s) := s.freshF32
+    let regs := #[c0, c1, c2, c3, c4, c5, c6, c7]
+    let s := s.emit (.wmma_zero_d_f32 regs)
+    let frag : WmmaFrag := { kind := .c, elemTy := .f32, m := 16, n := 16, k := 16, f32regs := regs }
+    (.wmma frag, s)
+  | .subgroupMatrixMultiplyAccumulate (st := _st) (m := _m) (k := _k) (n := _n) a b c =>
+    let (ra, s) := expToPTX a s
+    let (rb, s) := expToPTX b s
+    let (rc, s) := expToPTX c s
+    -- Allocate fresh D fragment (8 f32 regs for m16n16k16).
+    let (d0, s) := s.freshF32; let (d1, s) := s.freshF32
+    let (d2, s) := s.freshF32; let (d3, s) := s.freshF32
+    let (d4, s) := s.freshF32; let (d5, s) := s.freshF32
+    let (d6, s) := s.freshF32; let (d7, s) := s.freshF32
+    let dRegs := #[d0, d1, d2, d3, d4, d5, d6, d7]
+    let aFrag := ra.toWmma!
+    let bFrag := rb.toWmma!
+    let cFrag := rc.toWmma!
+    let s := s.emit (.wmma_mma_f32_f16_f16_f32 dRegs aFrag.u32regs bFrag.u32regs cFrag.f32regs)
+    let frag : WmmaFrag := { kind := .d, elemTy := .f32, m := 16, n := 16, k := 16, f32regs := dRegs }
+    (.wmma frag, s)
+  | .subgroupMatrixStore (st := _st) (m := _m) (n := _n) bufRef offset matExp _trans stride =>
+    let bufName := if bufRef.startsWith "&" then bufRef.drop 1 else bufRef
+    let (rOff, s)    := expToPTX offset s
+    let (rMat, s)    := expToPTX matExp s
+    let (rStride, s) := expToPTX stride s
+    let rArr := (s.varMap.find? (·.1 == bufName)).map (·.2) |>.getD default
+    -- Byte address = base + offset*4 (f32 result element = 4 bytes).
+    let (off64, s) := s.freshU64; let s := s.emit (.mul_wide_u32 off64 rOff.toU32! 4)
+    let (addr, s)  := s.freshU64; let s := s.emit (.add_u64 addr rArr.toU64! off64)
+    let dFrag := rMat.toWmma!
+    let s := s.emit (.wmma_store_d_f32 addr dFrag.f32regs rStride.toU32!)
+    -- The Exp's declared return type is `Exp (.scalar .u32)` (a unit
+    -- placeholder); emit a dummy mov.u32 0 to satisfy that.
+    let (r, s) := s.freshU32; let s := s.emit (.mov_u32_imm r 0)
+    (.u32 r, s)
 
   -- Fallback
   | _ => let (r, s) := s.freshU32; (.u32 r, s)
@@ -693,17 +781,45 @@ partial def stmtToPTX (stmt : Stmt) (s : GenState) : GenState :=
     let (ri, s) := expToPTX init s; s.bindVar name ri
 
   | .assign name _ty value =>
-    let (rv, s) := expToPTX value s
-    -- Invalidate exp CSE cache: any cached result that depended on `name`
-    -- (directly or transitively via another var that was already in cache)
-    -- now holds a stale register.  Clearing the entire cache is conservative
-    -- but correct; assign is rare enough in straight-line PTX that the
-    -- per-block CSE benefit between assigns is preserved.
-    let s := { s with expCache := [] }
-    match s.lookupVar name with
-    | some (.f32 r) => s.emit (.mov_f32 r rv.toF32!)
-    | some (.u32 r) => s.emit (.mov_u32 r rv.toU32!)
-    | _ => s.bindVar name rv
+    -- Special case: WMMA accumulator self-update
+    --   c_frag := subgroupMatrixMultiplyAccumulate(a, b, c_frag)
+    -- We want the mma to write its result D back into c_frag's existing
+    -- registers (PTX `wmma.mma.sync` allows D and C to alias). Without
+    -- this, each iteration of a K-loop would allocate 8 fresh f32 regs,
+    -- exploding register usage at K=2560 (160 iters → 1280 regs).
+    match value with
+    | .subgroupMatrixMultiplyAccumulate aExp bExp (.var cName) =>
+      match s.lookupVar name with
+      | some (.wmma cFragOld) =>
+        if cName == name then
+          let (raAny, s) := expToPTX aExp s
+          let (rbAny, s) := expToPTX bExp s
+          let aFrag := raAny.toWmma!
+          let bFrag := rbAny.toWmma!
+          let s := { s with expCache := [] }
+          s.emit (.wmma_mma_f32_f16_f16_f32 cFragOld.f32regs
+                                              aFrag.u32regs bFrag.u32regs
+                                              cFragOld.f32regs)
+        else
+          let (rv, s) := expToPTX value s
+          let s := { s with expCache := [] }
+          s.bindVar name rv
+      | _ =>
+        let (rv, s) := expToPTX value s
+        let s := { s with expCache := [] }
+        s.bindVar name rv
+    | _ =>
+      let (rv, s) := expToPTX value s
+      -- Invalidate exp CSE cache: any cached result that depended on `name`
+      -- (directly or transitively via another var that was already in cache)
+      -- now holds a stale register.  Clearing the entire cache is conservative
+      -- but correct; assign is rare enough in straight-line PTX that the
+      -- per-block CSE benefit between assigns is preserved.
+      let s := { s with expCache := [] }
+      match s.lookupVar name with
+      | some (.f32 r) => s.emit (.mov_f32 r rv.toF32!)
+      | some (.u32 r) => s.emit (.mov_u32 r rv.toU32!)
+      | _ => s.bindVar name rv
 
   | .assignIndex arrName idx _ty value =>
     let (rIdx, s) := expToPTX idx s; let (rVal, s) := expToPTX value s
