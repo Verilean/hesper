@@ -1653,6 +1653,206 @@ def q4kMatmulBatchMMQKernel (config : Config) (seqLen : Nat) : ShaderM Unit := d
     ShaderM.writeBuffer (ty := .scalar .f32) "output" outOff acc
   ) (pure ())
 
+/-- MMQ Phase 2: smem-staged X tile for actual perf win.
+
+    Same output shape as Phase 1c (32 rows × 8 cols per WG, 256 threads),
+    but loads X (Q4_K block) into shared memory once per super-block and
+    reuses across all 8 column threads. This is the actual MMQ optimisation
+    that llama.cpp's `mul_mat_q_kernel` exploits.
+
+    Smem layout per super-block load (one Q4_K block per row):
+      x_block: 32 rows × 36 ints = 1152 u32 = 4.6 KB
+        layout: row-major, 36 ints per row [dm, sc0, sc1, sc2, qs0..qs31]
+        no padding (36 != 32 + power-of-2, but bank conflicts are minor for
+        our access pattern — each thread reads contiguous ints from one row)
+
+    K-loop:
+      for kbx0 in 0..blocksPerRow:
+        # cooperative load: 256 threads, 32 rows × 36 ints = 1152 ints
+        # → 1152/256 = 4.5 ints/thread, do 5 strided iters
+        for it in 0..5:
+          idx = it*256 + tid
+          if idx < 1152:
+            x_block[idx] = weights[i_blk*32 * blocks*36 + (idx/36)*blocks*36 + kbx0*36 + (idx%36)]
+        barrier
+        # per-thread dot using smem reads instead of global
+        for pairIdx in 0..4:
+          for elemOff in 0..4:
+            v0, v1 from x_block[laneId * 36 + offsets]
+            u0..u3 from global Y (per warp/col, no sharing)
+            dp4a + accumulate
+        barrier (before next super-block load)
+
+    Wired behind HESPER_PREFILL_MMQ2=1.
+-/
+def q4kMatmulBatchMMQ2Kernel (config : Config) (seqLen : Nat) : ShaderM Unit := do
+  let wid ← ShaderM.workgroupId
+  let lid ← ShaderM.localId
+  let i_blk := Exp.vec3X wid
+  let j_blk := Exp.vec3Y wid
+  let tid := Exp.vec3X lid
+  let warpId := Exp.shiftRight tid (Exp.litU32 5)
+  let laneId := Exp.bitAnd tid (Exp.litU32 31)
+
+  let blocksPerRow := config.inDim / 256
+  let q8BlocksPerRow := config.inDim / 32
+  let totalWeightU32 := config.outDim * blocksPerRow * 36
+  let q8InputU32Size := q8BlocksPerRow * 9 * seqLen
+  let totalOutputSize := config.outDim * seqLen
+
+  let _weights ← ShaderM.declareReadOnlyBuffer "weights" (.array (.scalar .u32) totalWeightU32)
+  let _input ← ShaderM.declareReadOnlyBuffer "input_q8" (.array (.scalar .u32) q8InputU32Size)
+  let _output ← ShaderM.declareOutputBuffer "output" (.array (.scalar .f32) totalOutputSize)
+
+  -- Smem: 32 rows × 36 ints. Stride=37 to break 4-way bank conflicts on
+  -- the qs reads (most accesses are at offset 4 + 4*bq8Off + elemOff which
+  -- has variable stride per-pair).
+  let xStride : Nat := 37
+  ShaderM.sharedNamed "x_block" (.array (.scalar .u32) (32 * xStride))
+
+  let i_row := Exp.add (Exp.mul i_blk (Exp.litU32 32)) laneId
+  let j_col := Exp.add (Exp.mul j_blk (Exp.litU32 8)) warpId
+  let i_in := Exp.lt i_row (Exp.litU32 config.outDim)
+  let j_in := Exp.lt j_col (Exp.litU32 seqLen)
+  let validThread := Exp.and i_in j_in
+
+  ShaderM.varNamed "acc" (.scalar .f32) (Exp.litF32 0.0)
+  let acc : Exp (.scalar .f32) := Exp.var "acc"
+
+  let q8ColBase := Exp.mul j_col (Exp.litU32 (q8BlocksPerRow * 9))
+
+  ShaderM.loop (Exp.litU32 0) (Exp.litU32 blocksPerRow) (Exp.litU32 1) fun kbx0 => do
+    -- Phase A: cooperative X load. 256 threads, 32 rows × 36 ints = 1152 ints.
+    -- Each thread does 5 strided loads (256 * 5 = 1280 ≥ 1152), masked.
+    ShaderM.loop (Exp.litU32 0) (Exp.litU32 5) (Exp.litU32 1) fun it => do
+      let flatIdx := Exp.add (Exp.mul it (Exp.litU32 256)) tid
+      ShaderM.if_ (Exp.lt flatIdx (Exp.litU32 (32 * 36))) (do
+        let rowIdx := Exp.div flatIdx (Exp.litU32 36)
+        let intInRow := Exp.sub flatIdx (Exp.mul rowIdx (Exp.litU32 36))
+        let global_row := Exp.add (Exp.mul i_blk (Exp.litU32 32)) rowIdx
+        let inBoundsLoad := Exp.lt global_row (Exp.litU32 config.outDim)
+        ShaderM.if_ inBoundsLoad (do
+          let blockBase := Exp.add (Exp.mul global_row (Exp.litU32 (blocksPerRow * 36)))
+                                    (Exp.mul kbx0 (Exp.litU32 36))
+          let w ← ShaderM.readBuffer (ty := .scalar .u32) (n := totalWeightU32)
+                    "weights" (Exp.add blockBase intInRow)
+          ShaderM.assignIndex (ty := .scalar .u32) "x_block"
+            (Exp.add (Exp.mul rowIdx (Exp.litU32 xStride)) intInRow) w
+        ) (pure ())
+      ) (pure ())
+    ShaderM.barrier
+
+    -- Phase B: per-thread dot using smem-staged X.
+    ShaderM.if_ validThread (do
+      let xRowBase := Exp.mul laneId (Exp.litU32 xStride)
+      -- Read block metadata once per super-block from smem.
+      let dmU32 ← ShaderM.readWorkgroup (ty := .scalar .u32) (n := 32 * xStride)
+                    "x_block" xRowBase
+      let dF := Exp.vecX (Exp.unpack2x16float dmU32)
+      let dminF := Exp.vecY (Exp.unpack2x16float dmU32)
+      let sc0 ← ShaderM.readWorkgroup (ty := .scalar .u32) (n := 32 * xStride)
+                  "x_block" (Exp.add xRowBase (Exp.litU32 1))
+      let sc1 ← ShaderM.readWorkgroup (ty := .scalar .u32) (n := 32 * xStride)
+                  "x_block" (Exp.add xRowBase (Exp.litU32 2))
+      let sc2 ← ShaderM.readWorkgroup (ty := .scalar .u32) (n := 32 * xStride)
+                  "x_block" (Exp.add xRowBase (Exp.litU32 3))
+
+      let extractScaleMin (is : Exp (.scalar .u32)) : Exp (.scalar .f32) × Exp (.scalar .f32) :=
+        let isLow := Exp.lt is (Exp.litU32 4)
+        let shift4 := Exp.mul is (Exp.litU32 8)
+        let scaleLow := Exp.bitAnd (Exp.shiftRight sc0 shift4) (Exp.litU32 0x3F)
+        let minLow   := Exp.bitAnd (Exp.shiftRight sc1 shift4) (Exp.litU32 0x3F)
+        let isHi := Exp.sub is (Exp.litU32 4)
+        let shiftHi := Exp.mul isHi (Exp.litU32 8)
+        let scaleHiLo := Exp.bitAnd (Exp.shiftRight sc2 shiftHi) (Exp.litU32 0x0F)
+        let scaleHiHi := Exp.shiftLeft
+          (Exp.bitAnd (Exp.shiftRight sc0 (Exp.add shiftHi (Exp.litU32 6))) (Exp.litU32 0x03))
+          (Exp.litU32 4)
+        let scaleHigh := Exp.bitOr scaleHiLo scaleHiHi
+        let minHiLo := Exp.bitAnd (Exp.shiftRight sc2 (Exp.add shiftHi (Exp.litU32 4))) (Exp.litU32 0x0F)
+        let minHiHi := Exp.shiftLeft
+          (Exp.bitAnd (Exp.shiftRight sc1 (Exp.add shiftHi (Exp.litU32 6))) (Exp.litU32 0x03))
+          (Exp.litU32 4)
+        let minHigh := Exp.bitOr minHiLo minHiHi
+        let scaleU := Exp.select isLow scaleLow scaleHigh
+        let minU   := Exp.select isLow minLow   minHigh
+        (Exp.toF32U scaleU, Exp.toF32U minU)
+
+      ShaderM.varNamed "blockSumfD" (.scalar .f32) (Exp.litF32 0.0)
+      ShaderM.varNamed "blockSumfM" (.scalar .f32) (Exp.litF32 0.0)
+      let blockSumfD : Exp (.scalar .f32) := Exp.var "blockSumfD"
+      let blockSumfM : Exp (.scalar .f32) := Exp.var "blockSumfM"
+
+      ShaderM.loop (Exp.litU32 0) (Exp.litU32 4) (Exp.litU32 1) fun pairIdx => do
+        let bq8Off := Exp.mul pairIdx (Exp.litU32 2)
+        let bq8OffP1 := Exp.add bq8Off (Exp.litU32 1)
+        let (scA, mA) := extractScaleMin bq8Off
+        let (scB, mB) := extractScaleMin bq8OffP1
+
+        let q8SuperBase := Exp.add q8ColBase (Exp.mul kbx0 (Exp.litU32 (8 * 9)))
+        let q8Sub0Base := Exp.add q8SuperBase (Exp.mul bq8Off (Exp.litU32 9))
+        let q8Sub1Base := Exp.add q8SuperBase (Exp.mul bq8OffP1 (Exp.litU32 9))
+
+        ShaderM.loop (Exp.litU32 0) (Exp.litU32 4) (Exp.litU32 1) fun elemOff => do
+          -- v0, v1: read from smem (qs at offset 4 + bq8Off*4 + elemOff in row stride)
+          let qsOff := Exp.add (Exp.litU32 4)
+            (Exp.add (Exp.mul bq8Off (Exp.litU32 4)) elemOff)
+          let v0 ← ShaderM.readWorkgroup (ty := .scalar .u32) (n := 32 * xStride)
+                     "x_block" (Exp.add xRowBase qsOff)
+          let v1 ← ShaderM.readWorkgroup (ty := .scalar .u32) (n := 32 * xStride)
+                     "x_block" (Exp.add xRowBase (Exp.add qsOff (Exp.litU32 4)))
+
+          -- u0..u3 from global Y (small, no smem benefit)
+          let off1e := Exp.add (Exp.litU32 1) elemOff
+          let off5e := Exp.add (Exp.litU32 5) elemOff
+          let u0 ← ShaderM.readBuffer (ty := .scalar .u32) (n := q8InputU32Size)
+                     "input_q8" (Exp.add q8Sub0Base off1e)
+          let u1 ← ShaderM.readBuffer (ty := .scalar .u32) (n := q8InputU32Size)
+                     "input_q8" (Exp.add q8Sub0Base off5e)
+          let u2 ← ShaderM.readBuffer (ty := .scalar .u32) (n := q8InputU32Size)
+                     "input_q8" (Exp.add q8Sub1Base off1e)
+          let u3 ← ShaderM.readBuffer (ty := .scalar .u32) (n := q8InputU32Size)
+                     "input_q8" (Exp.add q8Sub1Base off5e)
+          let q8Hdr0 ← ShaderM.readBuffer (ty := .scalar .u32) (n := q8InputU32Size)
+                         "input_q8" q8Sub0Base
+          let q8Hdr1 ← ShaderM.readBuffer (ty := .scalar .u32) (n := q8InputU32Size)
+                         "input_q8" q8Sub1Base
+          let d8A := Exp.vecX (Exp.unpack2x16float q8Hdr0)
+          let d8B := Exp.vecX (Exp.unpack2x16float q8Hdr1)
+
+          let v0i0 := Exp.bitAnd v0 (Exp.litU32 0x0F0F0F0F)
+          let v1i0 := Exp.bitAnd v1 (Exp.litU32 0x0F0F0F0F)
+          let acc0 := Exp.dot4I8Packed v0i0 u0
+          let dot1_0 := Exp.dot4I8Packed v1i0 u1
+          let dot1_0Comb := Exp.add acc0 dot1_0
+          let sumU_0 := Exp.add (Exp.dot4I8Packed (Exp.litU32 0x01010101) u0)
+                                 (Exp.dot4I8Packed (Exp.litU32 0x01010101) u1)
+          let sumfD_0 := Exp.mul d8A (Exp.mul (Exp.toF32 dot1_0Comb) scA)
+          let sumfM_0 := Exp.mul d8A (Exp.mul (Exp.toF32 sumU_0) mA)
+
+          let v0i1 := Exp.bitAnd (Exp.shiftRight v0 (Exp.litU32 4)) (Exp.litU32 0x0F0F0F0F)
+          let v1i1 := Exp.bitAnd (Exp.shiftRight v1 (Exp.litU32 4)) (Exp.litU32 0x0F0F0F0F)
+          let acc1 := Exp.dot4I8Packed v0i1 u2
+          let dot1_1 := Exp.dot4I8Packed v1i1 u3
+          let dot1_1Comb := Exp.add acc1 dot1_1
+          let sumU_1 := Exp.add (Exp.dot4I8Packed (Exp.litU32 0x01010101) u2)
+                                 (Exp.dot4I8Packed (Exp.litU32 0x01010101) u3)
+          let sumfD_1 := Exp.mul d8B (Exp.mul (Exp.toF32 dot1_1Comb) scB)
+          let sumfM_1 := Exp.mul d8B (Exp.mul (Exp.toF32 sumU_1) mB)
+
+          ShaderM.assign "blockSumfD" (Exp.add blockSumfD (Exp.add sumfD_0 sumfD_1))
+          ShaderM.assign "blockSumfM" (Exp.add blockSumfM (Exp.add sumfM_0 sumfM_1))
+
+      let blockContrib := Exp.sub (Exp.mul dF blockSumfD) (Exp.mul dminF blockSumfM)
+      ShaderM.assign "acc" (Exp.add acc blockContrib)
+    ) (pure ())
+    ShaderM.barrier  -- before next super-block load
+
+  ShaderM.if_ validThread (do
+    let outOff := Exp.add (Exp.mul j_col (Exp.litU32 config.outDim)) i_row
+    ShaderM.writeBuffer (ty := .scalar .f32) "output" outOff acc
+  ) (pure ())
+
 /-- Q4_K × Q8_1 mat-vec body emitter (dp4a).
 
     llama.cppの `vec_dot_q4_K_q8_1_impl_vmmq` と同じアルゴリズム。
@@ -5247,8 +5447,20 @@ def forwardBatchDP4A_fromQ8 [GPUBackend β] (ctx : β)
   -- Requires outDim % 32 == 0, seqLen % 8 == 0, inDim % 256 == 0.
   -- Falls back to 1-warp / 4-warp variants otherwise.
   let useMMQ := (← IO.getEnv "HESPER_PREFILL_MMQ").isSome
+  let useMMQ2 := (← IO.getEnv "HESPER_PREFILL_MMQ2").isSome
   let use4Warp := (← IO.getEnv "HESPER_PREFILL_4WARP").isSome
-  if useMMQ && layer.config.inDim % 256 == 0
+  if useMMQ2 && layer.config.inDim % 256 == 0
+     && layer.config.outDim % 32 == 0 && seqLen % 8 == 0 then
+    let nTileCols := (seqLen + 7) / 8
+    let cacheKey : UInt64 := hash ("q4k-batch-matmul-q8-mmq2",
+      layer.config.inDim, layer.config.outDim, seqLen)
+    GPUBackend.executeWithConfigCached ctx
+      (q4kMatmulBatchMMQ2Kernel layer.config seqLen)
+      [("weights", layer.weightBuf), ("input_q8", q8Buf), ("output", outputBuf)]
+      { numWorkgroups := (layer.config.outDim / 32, nTileCols, 1),
+        workgroupSize := { x := 256, y := 1, z := 1 } }
+      cacheKey ref
+  else if useMMQ && layer.config.inDim % 256 == 0
      && layer.config.outDim % 32 == 0 && seqLen % 8 == 0 then
     let nTileCols := (seqLen + 7) / 8
     let cacheKey : UInt64 := hash ("q4k-batch-matmul-q8-mmq",

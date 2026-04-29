@@ -149,3 +149,31 @@ def main : IO Unit := do
   else
     IO.println s!"FAIL: MMQ output differs from baseline (max |err| = {err})"
     IO.Process.exit 1
+
+  -- 6. MMQ2 (smem-staged X tile) parity.
+  IO.println ""
+  IO.println "=== MMQ2 (smem-staged X) ==="
+  let outBufMMQ2 ← GPUBackend.allocBuffer ctx outBufSz
+  let mmq2Ref ← IO.mkRef (none : Option (GPUBackend.CachedDispatch _))
+  GPUBackend.executeWithConfigCached ctx
+    (Hesper.Layers.Linear.q4kMatmulBatchMMQ2Kernel wQ.config seqLen)
+    [("weights", wQ.weightBuf), ("input_q8", q8Buf), ("output", outBufMMQ2)]
+    { numWorkgroups := (outDim / 32, nTileCols, 1),
+      workgroupSize := { x := 256, y := 1, z := 1 } }
+    (hash ("test-mmq2", inDim, outDim, seqLen)) mmq2Ref
+
+  let outBytesMMQ2 ← GPUBackend.readBuffer ctx outBufMMQ2 outBufSz
+  let mut outArrMMQ2 : Array Float := Array.mkEmpty (outDim * seqLen)
+  for i in [0:outDim * seqLen] do
+    let f ← Hesper.Basic.bytesToFloat32 outBytesMMQ2 (i * 4)
+    outArrMMQ2 := outArrMMQ2.push f
+  IO.println s!"[MMQ2] out[0..4]   = {outArrMMQ2.toList.take 4}"
+  IO.println s!"[MMQ2] out[col1,0..3] = {(outArrMMQ2.toList.drop outDim).take 4}"
+
+  let err2 := maxAbsDiffMMQ outArrRef outArrMMQ2
+  IO.println s!"[Parity MMQ2] max |err| = {err2}"
+  if err2 < 1.0e-3 then
+    IO.println s!"PASS: MMQ2 matches baseline within 1e-3"
+  else
+    IO.println s!"FAIL: MMQ2 differs from baseline (max |err| = {err2})"
+    IO.Process.exit 1
