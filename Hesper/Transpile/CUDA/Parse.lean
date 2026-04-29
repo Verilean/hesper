@@ -282,4 +282,228 @@ def parseExprStr (src : String) : Except String CExpr :=
     else
       .ok e
 
+/-! ## Statement parsing (Phase 3) -/
+
+/-- Type-keyword set: tokens that can start a declaration. -/
+def isTypeKW (s : String) : Bool :=
+  s == "int" ∨ s == "uint" ∨ s == "float" ∨ s == "double"
+  ∨ s == "bool" ∨ s == "char" ∨ s == "short" ∨ s == "long"
+  ∨ s == "unsigned" ∨ s == "signed" ∨ s == "void"
+  ∨ s == "uint8_t" ∨ s == "uint16_t" ∨ s == "uint32_t" ∨ s == "uint64_t"
+  ∨ s == "int8_t" ∨ s == "int16_t" ∨ s == "int32_t" ∨ s == "int64_t"
+  ∨ s == "half" ∨ s == "half2" ∨ s == "float2" ∨ s == "float4"
+
+/-- Skip optional `const` / `volatile` qualifiers, accumulating into `tyText`. -/
+partial def consumeQualifiers (tyText : String) : ParseM String := do
+  match (← peek) with
+  | .ident s =>
+    if s == "const" ∨ s == "volatile" ∨ s == "__restrict__" ∨ s == "__device__" then
+      bump
+      consumeQualifiers (if tyText.isEmpty then s else tyText ++ " " ++ s)
+    else pure tyText
+  | _ => pure tyText
+
+/-- Read a type spec like `const int *`. Stops just before the variable
+    name token. Returns the (possibly empty) type string. -/
+partial def parseTypeSpec : ParseM String := do
+  -- Optional leading qualifiers
+  let mut ty ← consumeQualifiers ""
+  -- Base type: must be at least one ident that's a type keyword
+  match (← peek) with
+  | .ident s =>
+    if isTypeKW s then
+      bump
+      ty := if ty.isEmpty then s else ty ++ " " ++ s
+      -- Optional secondary types (e.g. `unsigned int`)
+      while ← (do match (← peek) with
+                  | .ident s2 => pure (isTypeKW s2)
+                  | _ => pure false) do
+        match (← peek) with
+        | .ident s2 => bump; ty := ty ++ " " ++ s2
+        | _ => pure ()
+    else
+      throw s!"parseTypeSpec: expected type, got '{s}'"
+  | t => throw s!"parseTypeSpec: expected type, got {repr t}"
+  -- Optional trailing qualifiers + pointer markers
+  ty ← consumeQualifiers ty
+  while (← matchPunct "*") ∨ (← matchPunct "&") do
+    ty := ty ++ " *"
+    ty ← consumeQualifiers ty
+  pure ty
+
+mutual
+
+/-- Parse a single statement. -/
+partial def parseStmt : ParseM CStmt := do
+  match (← peek) with
+  | .punct "{" =>
+    bump
+    let mut stmts : Array CStmt := #[]
+    while !(← matchPunct "}") do
+      let s ← parseStmt
+      stmts := stmts.push s
+    pure (CStmt.block stmts)
+  | .punct "#" =>
+    -- `#pragma unroll` etc. — consume tokens until next ; or { or }.
+    -- Lexer doesn't track newlines, so we approximate by stopping at
+    -- those punct boundaries.
+    bump
+    let text ← eatPragmaTokens ""
+    pure (CStmt.pragma text.trim)
+  | .ident kw =>
+    if kw == "if" then
+      bump; expectPunct "("
+      let c ← parseExpr
+      expectPunct ")"
+      let thn ← parseStmt
+      let els ← match (← peek) with
+        | .ident "else" => bump; let s ← parseStmt; pure (some s)
+        | _ => pure none
+      pure (CStmt.if_ c thn els)
+    else if kw == "for" then
+      bump; expectPunct "("
+      -- init
+      let initStmt ← match (← peek) with
+        | .punct ";" => bump; pure none
+        | .ident s =>
+          if isTypeKW s ∨ s == "const" then
+            -- `int k = 0`
+            let s ← parseDeclWithSemi
+            pure (some s)
+          else
+            -- expression init
+            let e ← parseExpr
+            expectPunct ";"
+            pure (some (CStmt.expr e))
+        | _ =>
+          let e ← parseExpr
+          expectPunct ";"
+          pure (some (CStmt.expr e))
+      -- cond
+      let cond ← match (← peek) with
+        | .punct ";" => bump; pure none
+        | _ =>
+          let c ← parseExpr
+          expectPunct ";"
+          pure (some c)
+      -- step
+      let step ← match (← peek) with
+        | .punct ")" => bump; pure none
+        | _ =>
+          let e ← parseExpr
+          expectPunct ")"
+          pure (some e)
+      let body ← parseStmt
+      pure (CStmt.for_ initStmt cond step body)
+    else if kw == "while" then
+      bump; expectPunct "("
+      let c ← parseExpr
+      expectPunct ")"
+      let body ← parseStmt
+      pure (CStmt.while_ c body)
+    else if kw == "return" then
+      bump
+      let e ← match (← peek) with
+        | .punct ";" => pure none
+        | _ => let e ← parseExpr; pure (some e)
+      expectPunct ";"
+      pure (CStmt.return_ e)
+    else if kw == "break" then
+      bump; expectPunct ";"; pure CStmt.break_
+    else if kw == "continue" then
+      bump; expectPunct ";"; pure CStmt.continue_
+    else if kw == "__syncthreads" then
+      bump; expectPunct "("; expectPunct ")"; expectPunct ";"
+      pure CStmt.sync_
+    else if isTypeKW kw ∨ kw == "const" ∨ kw == "volatile"
+            ∨ kw == "__restrict__" ∨ kw == "__device__" then
+      parseDeclWithSemi
+    else
+      -- Expression statement (e.g. `acc += foo;`, `func();`)
+      let e ← parseExpr
+      expectPunct ";"
+      pure (CStmt.expr e)
+  | .eof => throw "parseStmt: unexpected eof"
+  | t =>
+    -- Expression statement starting with non-ident (e.g. `(int)x` or `*p`)
+    let e ← parseExpr
+    expectPunct ";"
+    pure (CStmt.expr e)
+
+/-- Read pragma-line tokens until we hit a statement boundary. -/
+partial def eatPragmaTokens (acc : String) : ParseM String := do
+  match (← peek) with
+  | .eof => pure acc
+  | .punct s =>
+    if s == "{" ∨ s == "}" ∨ s == ";" then pure acc
+    else bump; eatPragmaTokens (acc ++ " " ++ s)
+  | .ident s => bump; eatPragmaTokens (acc ++ " " ++ s)
+  | .num s => bump; eatPragmaTokens (acc ++ " " ++ s)
+  | _ => pure acc
+
+/-- Parse a declaration, expecting a trailing `;`. Handles
+    `int k = 0;`, `int qs[N] = {...};` (no init list yet),
+    `int x;`, `int * p = ...;`. Multi-declarators (`int a, b;`) NYI. -/
+partial def parseDeclWithSemi : ParseM CStmt := do
+  let ty ← parseTypeSpec
+  match (← consume) with
+  | .ident name =>
+    -- Optional array size: `name[N]`
+    if (← matchPunct "[") then
+      let szExpr ← parseExpr
+      expectPunct "]"
+      -- Optional `= {...}` initializer (we accept and ignore for now)
+      if (← matchPunct "=") then
+        if (← matchPunct "{") then
+          -- skip to matching '}'
+          let mut depth := 1
+          while depth > 0 do
+            match (← consume) with
+            | .punct "{" => depth := depth + 1
+            | .punct "}" => depth := depth - 1
+            | .eof => throw "parseDecl: unmatched '{' in array init"
+            | _ => pure ()
+        else
+          let _ ← parseAssign
+      expectPunct ";"
+      pure (CStmt.declArr ty name szExpr)
+    else
+      let init ← if (← matchPunct "=") then
+        let e ← parseAssign
+        pure (some e)
+      else pure none
+      expectPunct ";"
+      pure (CStmt.decl ty name init)
+  | t => throw s!"parseDeclWithSemi: expected ident, got {repr t}"
+
+end -- mutual
+
+/-- Parse a complete CUDA statement (or block) from a string. -/
+def parseStmtStr (src : String) : Except String CStmt :=
+  let toks := lex src
+  let st : ParseState := { toks }
+  match (parseStmt.run.run st) with
+  | (.error e, _) => .error e
+  | (.ok s, st') =>
+    if h : st'.i < st'.toks.size then
+      match st'.toks[st'.i].tok with
+      | .eof => .ok s
+      | t => .error s!"trailing tokens after statement: {repr t}"
+    else
+      .ok s
+
+/-- Parse a block of statements (sequence). -/
+def parseStmtsStr (src : String) : Except String (Array CStmt) :=
+  let toks := lex src
+  let st : ParseState := { toks }
+  let act : ParseM (Array CStmt) := do
+    let mut acc : Array CStmt := #[]
+    while (← peek) != .eof do
+      let s ← parseStmt
+      acc := acc.push s
+    pure acc
+  match (act.run.run st) with
+  | (.error e, _) => .error e
+  | (.ok arr, _) => .ok arr
+
 end Hesper.Transpile.CUDA
