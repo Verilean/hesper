@@ -1,7 +1,6 @@
-import Hesper.Transpile.CUDA.Lex
-import Hesper.Transpile.CUDA.Parse
-import Hesper.Transpile.CUDA.Lower
+import Hesper.Transpile.CUDA
 import Hesper.WGSL.Exp
+import Hesper.WGSL.ExpRepr
 
 /-! # Phase 1 transpiler test
 
@@ -14,24 +13,11 @@ namespace Hesper.Transpile.CUDA.Test
 
 open Hesper.WGSL Hesper.Transpile.CUDA
 
-/-- Render an Exp (.scalar .u32) to a canonical S-expression string so
-    we can compare structurally. Covers only the subset Phase 1 emits. -/
-partial def renderU32 : Exp (.scalar .u32) → String
-  | .litU32 n => s!"(lit {n})"
-  | .var name => s!"(var {name})"
-  | .add a b => s!"(add {renderU32 a} {renderU32 b})"
-  | .sub a b => s!"(sub {renderU32 a} {renderU32 b})"
-  | .mul a b => s!"(mul {renderU32 a} {renderU32 b})"
-  | .shiftLeft a b => s!"(shl {renderU32 a} {renderU32 b})"
-  | .shiftRight a b => s!"(shr {renderU32 a} {renderU32 b})"
-  | .bitAnd a b => s!"(and {renderU32 a} {renderU32 b})"
-  | .bitOr a b => s!"(or {renderU32 a} {renderU32 b})"
-  | .bitXor a b => s!"(xor {renderU32 a} {renderU32 b})"
-  | _ => "(?)"
-
+/-- Compare two Exps via their canonical S-expression rendering
+    (provided by `Hesper.WGSL.ExpRepr`). -/
 def assertExpEq (label : String) (got expected : Exp (.scalar .u32)) : IO Unit := do
-  let g := renderU32 got
-  let e := renderU32 expected
+  let g := got.toSExp
+  let e := expected.toSExp
   if g = e then
     IO.println s!"PASS  {label}"
   else
@@ -39,10 +25,10 @@ def assertExpEq (label : String) (got expected : Exp (.scalar .u32)) : IO Unit :
     IO.println s!"  got      = {g}"
     IO.println s!"  expected = {e}"
 
-/-- Run lex+parse+lower on a CUDA expression string. -/
-def transpileU32 (env : IdEnv) (src : String) : Except String (Exp (.scalar .u32)) := do
-  let cexpr ← parseExprStr src
-  lowerU32 env cexpr
+/-- Run lex+parse+lower on a CUDA expression string.
+    Now just delegates to the umbrella module. -/
+def transpileU32 (env : IdEnv) (src : String) : Except String (Exp (.scalar .u32)) :=
+  cudaU32WithEnv env src
 
 def main : IO Unit := do
   IO.println "=== Phase 1 CUDA → ShaderM expression transpile tests ==="
@@ -106,6 +92,20 @@ def main : IO Unit := do
   match transpileU32 env "tid & 31" with
   | .ok e => assertExpEq "env-mapped tid" e expected8
   | .error err => IO.println s!"FAIL  env-mapped tid: {err}"
+
+  -- Test 9: cudaU32! ergonomics — compile-time fixed CUDA snippet,
+  -- no Except to unwrap. This is the "ideal API" for kernel authors:
+  --   let v0i0 := cudaU32! "v0 & 0x0F0F0F0F"
+  --   let v0i1 := cudaU32! "(v0 >> 4) & 0x0F0F0F0F"
+  let v0i0 := cudaU32! "v0 & 0x0F0F0F0F"
+  let v0i0_ref : Exp (.scalar .u32) :=
+    Exp.bitAnd (Exp.var "v0") (Exp.litU32 0x0F0F0F0F)
+  assertExpEq "cudaU32! v0 & 0x0F0F0F0F" v0i0 v0i0_ref
+
+  let v0i1 := cudaU32! "(v0 >> 4) & 0x0F0F0F0F"
+  let v0i1_ref : Exp (.scalar .u32) :=
+    Exp.bitAnd (Exp.shiftRight (Exp.var "v0") (Exp.litU32 4)) (Exp.litU32 0x0F0F0F0F)
+  assertExpEq "cudaU32! (v0 >> 4) & 0x0F" v0i1 v0i1_ref
 
   IO.println "=== done ==="
 
