@@ -5353,11 +5353,22 @@ def forwardBatchDP4A [GPUBackend β] (ctx : β)
       (hash ("q8_1-quantize-batch", layer.config.inDim, seqLen))
       layer.dp4aBatchQuantizePrepared
 
+    -- Same MMQ2-default selection as forwardBatchDP4A_fromQ8 below.
+    let mmq2Off := (← IO.getEnv "HESPER_PREFILL_MMQ2_OFF").isSome
     let useMMQ := (← IO.getEnv "HESPER_PREFILL_MMQ").isSome
+    let useMMQ2Default := !mmq2Off && !useMMQ
     let use4Warp := (← IO.getEnv "HESPER_PREFILL_4WARP").isSome
-    -- MMQ Phase 1: requires shapes divisible by tile (mmq_y=32, mmq_x=8)
-    -- and inDim a multiple of Q4_K super-block (256). Falls back otherwise.
-    if useMMQ && layer.config.inDim % 256 == 0
+    if useMMQ2Default && layer.config.inDim % 256 == 0
+       && layer.config.outDim % 32 == 0 && seqLen % 8 == 0 then
+      let nTileCols := (seqLen + 7) / 8
+      GPUBackend.executeWithConfigCached ctx
+        (q4kMatmulBatchMMQ2Kernel layer.config seqLen)
+        [("weights", layer.weightBuf), ("input_q8", q8Buf), ("output", outputBuf)]
+        { numWorkgroups := (layer.config.outDim / 32, nTileCols, 1),
+          workgroupSize := { x := 256, y := 1, z := 1 } }
+        (hash ("q4k-batch-matmul-mmq2", layer.config.inDim, layer.config.outDim, seqLen))
+        layer.dp4aBatchMatmulPrepared
+    else if useMMQ && layer.config.inDim % 256 == 0
        && layer.config.outDim % 32 == 0 && seqLen % 8 == 0 then
       let nTileCols := (seqLen + 7) / 8
       GPUBackend.executeWithConfigCached ctx
@@ -5443,13 +5454,17 @@ def forwardBatchDP4A_fromQ8 [GPUBackend β] (ctx : β)
   -- ref keyed on seqLen); absent an override we fall back to the shared
   -- layer ref.
   let ref := refOverride.getD layer.dp4aBatchMatmulPrepared
-  -- MMQ tile-based kernel (HESPER_PREFILL_MMQ=1, Phase 1).
-  -- Requires outDim % 32 == 0, seqLen % 8 == 0, inDim % 256 == 0.
-  -- Falls back to 1-warp / 4-warp variants otherwise.
+  -- MMQ2 (smem-staged X tile) is now the DEFAULT for shapes that meet its
+  -- preconditions: outDim % 32 == 0, seqLen % 8 == 0, inDim % 256 == 0.
+  -- Verified parity (max|err|=5e-6) and 1.12-1.17× wall-clock speedup
+  -- vs the 1-warp baseline at seqLen ∈ {16, 24, 32, 40}. See commit fe08bf3.
+  -- Set HESPER_PREFILL_MMQ2_OFF=1 to opt out for diagnostics.
+  -- HESPER_PREFILL_MMQ=1 / HESPER_PREFILL_4WARP=1 force the older variants.
+  let mmq2Off := (← IO.getEnv "HESPER_PREFILL_MMQ2_OFF").isSome
   let useMMQ := (← IO.getEnv "HESPER_PREFILL_MMQ").isSome
-  let useMMQ2 := (← IO.getEnv "HESPER_PREFILL_MMQ2").isSome
+  let useMMQ2Default := !mmq2Off && !useMMQ
   let use4Warp := (← IO.getEnv "HESPER_PREFILL_4WARP").isSome
-  if useMMQ2 && layer.config.inDim % 256 == 0
+  if useMMQ2Default && layer.config.inDim % 256 == 0
      && layer.config.outDim % 32 == 0 && seqLen % 8 == 0 then
     let nTileCols := (seqLen + 7) / 8
     let cacheKey : UInt64 := hash ("q4k-batch-matmul-q8-mmq2",
