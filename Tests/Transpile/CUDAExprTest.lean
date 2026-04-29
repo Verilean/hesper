@@ -25,10 +25,21 @@ def assertExpEq (label : String) (got expected : Exp (.scalar .u32)) : IO Unit :
     IO.println s!"  got      = {g}"
     IO.println s!"  expected = {e}"
 
-/-- Run lex+parse+lower on a CUDA expression string.
-    Now just delegates to the umbrella module. -/
+/-- Run lex+parse+lower on a CUDA expression string. -/
 def transpileU32 (env : IdEnv) (src : String) : Except String (Exp (.scalar .u32)) :=
-  cudaU32WithEnv env src
+  cudaU32WithIdEnv env src
+
+/-- Compare i32-typed Exps. -/
+def assertI32Eq (label : String) (got expected : Exp (.scalar .i32)) : IO Unit := do
+  let g := got.toSExp; let e := expected.toSExp
+  if g = e then IO.println s!"PASS  {label}"
+  else IO.println s!"FAIL  {label}\n  got      = {g}\n  expected = {e}"
+
+/-- Compare f32-typed Exps. -/
+def assertF32Eq (label : String) (got expected : Exp (.scalar .f32)) : IO Unit := do
+  let g := got.toSExp; let e := expected.toSExp
+  if g = e then IO.println s!"PASS  {label}"
+  else IO.println s!"FAIL  {label}\n  got      = {g}\n  expected = {e}"
 
 def main : IO Unit := do
   IO.println "=== Phase 1 CUDA → ShaderM expression transpile tests ==="
@@ -106,6 +117,56 @@ def main : IO Unit := do
   let v0i1_ref : Exp (.scalar .u32) :=
     Exp.bitAnd (Exp.shiftRight (Exp.var "v0") (Exp.litU32 4)) (Exp.litU32 0x0F0F0F0F)
   assertExpEq "cudaU32! (v0 >> 4) & 0x0F" v0i1 v0i1_ref
+
+  IO.println ""
+  IO.println "=== Phase 2: i32 / f32 lowering ==="
+
+  -- Test 11: __dp4a — the canonical Q4_K inner-loop intrinsic.
+  --   ggml_cuda_dp4a(v0i, u0, sumi)
+  --   = sumi + dot4I8Packed(v0i, u0)
+  let dp := cudaI32! "__dp4a(v0i, u0, sumi)"
+  let dp_ref : Exp (.scalar .i32) :=
+    Exp.add (Exp.var "sumi") (Exp.dot4I8Packed (Exp.var "v0i") (Exp.var "u0"))
+  assertI32Eq "cudaI32! __dp4a(v, u, c)" dp dp_ref
+
+  -- Test 12: chained dp4a (real llama.cpp pattern from
+  -- vec_dot_q4_K_q8_1_impl_vmmq line 514):
+  --   const int dot1 = ggml_cuda_dp4a(v1i, u[2*i+1], ggml_cuda_dp4a(v0i, u[2*i+0], 0));
+  -- We test the simpler 2-level nesting.
+  let dp2 := cudaI32! "__dp4a(v1i, u1, __dp4a(v0i, u0, 0))"
+  let dp2_ref : Exp (.scalar .i32) :=
+    Exp.add (Exp.add (Exp.litI32 0)
+                     (Exp.dot4I8Packed (Exp.var "v0i") (Exp.var "u0")))
+            (Exp.dot4I8Packed (Exp.var "v1i") (Exp.var "u1"))
+  assertI32Eq "cudaI32! chained dp4a" dp2 dp2_ref
+
+  -- Test 13: i32 arith (sumi_d * sc[i])
+  let sci := cudaI32! "dot * sc"
+  let sci_ref : Exp (.scalar .i32) := Exp.mul (Exp.var "dot") (Exp.var "sc")
+  assertI32Eq "cudaI32! dot * sc" sci sci_ref
+
+  -- Test 14: f32 arithmetic — d8 * (f32(dot) * scale)
+  let f1 := cudaF32! "d8 * dot * scale"
+  let f1_ref : Exp (.scalar .f32) :=
+    Exp.mul (Exp.mul (Exp.var "d8") (Exp.var "dot")) (Exp.var "scale")
+  assertF32Eq "cudaF32! d8 * dot * scale" f1 f1_ref
+
+  -- Test 15: float literal
+  let f2 := cudaF32! "0.5"
+  let f2_ref : Exp (.scalar .f32) := Exp.litF32 0.5
+  assertF32Eq "cudaF32! literal 0.5" f2 f2_ref
+
+  -- Test 16: __fmaf_rn(a, b, c)
+  let fma := cudaF32! "__fmaf_rn(a, b, c)"
+  let fma_ref : Exp (.scalar .f32) :=
+    Exp.fma (Exp.var "a") (Exp.var "b") (Exp.var "c")
+  assertF32Eq "cudaF32! __fmaf_rn" fma fma_ref
+
+  -- Test 17: int → float cast: (float) dot * scale
+  let castMul := cudaF32! "(float) dot * scale"
+  let castMul_ref : Exp (.scalar .f32) :=
+    Exp.mul (Exp.toF32 (Exp.var "dot" : Exp (.scalar .i32))) (Exp.var "scale")
+  assertF32Eq "cudaF32! (float) dot * scale" castMul castMul_ref
 
   IO.println "=== done ==="
 

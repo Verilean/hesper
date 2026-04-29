@@ -12,46 +12,71 @@ ergonomically convert a CUDA source string into a typed Hesper `Exp`.
 ```
 import Hesper.Transpile.CUDA
 
-#eval Hesper.Transpile.CUDA.cudaU32! "(v >> 4) & 0x0F0F0F0F"
--- Exp.bitAnd (Exp.shiftRight (Exp.var "v") (Exp.litU32 4)) (Exp.litU32 252645135)
+-- u32 (Phase 1)
+let v0i := cudaU32! "v0 & 0x0F0F0F0F"
 
-example : Exp (.scalar .u32) :=
-  Hesper.Transpile.CUDA.cudaU32! "(v >> 4) & 0x0F"
+-- i32 (Phase 2: __dp4a)
+let dp  := cudaI32! "__dp4a(v0, u0, acc)"
+
+-- f32 (Phase 2: float arith + casts)
+let s   := cudaF32! "(float) dot * scale"
 ```
 
-The `!` variant (`cudaU32!`) panics on parse/lower failure, suitable
-for compile-time fixed CUDA snippets. The total variant (`cudaU32`)
-returns `Except String _` for runtime / dynamic CUDA strings.
+Each variant has three forms:
+
+  cudaXxx           : Except-returning, total
+  cudaXxxWithEnv    : env-aware, Except-returning
+  cudaXxx!          : panicking (compile-time-fixed snippets)
 -/
 namespace Hesper.Transpile.CUDA
 
 open Hesper.WGSL
 
-/-- Parse + lower a CUDA expression string to `Exp (.scalar .u32)`,
-    using the supplied identifier environment. Returns `Except` so
-    callers can handle errors. -/
-def cudaU32WithEnv (env : IdEnv) (src : String)
-    : Except String (Exp (.scalar .u32)) := do
+/-! ## u32 entry points (Phase 1) -/
+
+/-- Parse + lower a CUDA expression to `Exp (.scalar .u32)`. -/
+def cudaU32WithEnv (env : Env) (src : String) : Except String (Exp (.scalar .u32)) := do
   let cexpr ← parseExprStr src
   lowerU32 env cexpr
 
-/-- Parse + lower a CUDA expression string to `Exp (.scalar .u32)`
-    with an empty environment. -/
-def cudaU32 (src : String) : Except String (Exp (.scalar .u32)) :=
-  cudaU32WithEnv emptyEnv src
+/-- Phase 1 alias: takes a u32-only `IdEnv`. -/
+def cudaU32WithIdEnv (env : IdEnv) (src : String) : Except String (Exp (.scalar .u32)) :=
+  cudaU32WithEnv (Env.ofU32 env) src
 
-/-- Panicking variant: returns the lowered `Exp`, panics on parse/lower
-    error. Use for compile-time-fixed CUDA snippets where any failure
-    indicates a transpiler bug rather than user input. -/
+def cudaU32 (src : String) : Except String (Exp (.scalar .u32)) :=
+  cudaU32WithEnv .empty src
+
 def cudaU32! (src : String) : Exp (.scalar .u32) :=
   match cudaU32 src with
   | .ok e => e
   | .error msg => panic! s!"cudaU32!: {msg}\n  source: {src}"
 
-/-- `cudaU32!` with a custom env. -/
-def cudaU32EnvOrPanic! (env : IdEnv) (src : String) : Exp (.scalar .u32) :=
-  match cudaU32WithEnv env src with
+/-! ## i32 entry points (Phase 2) -/
+
+def cudaI32WithEnv (env : Env) (src : String) : Except String (Exp (.scalar .i32)) := do
+  let cexpr ← parseExprStr src
+  lowerI32 env cexpr
+
+def cudaI32 (src : String) : Except String (Exp (.scalar .i32)) :=
+  cudaI32WithEnv .empty src
+
+def cudaI32! (src : String) : Exp (.scalar .i32) :=
+  match cudaI32 src with
   | .ok e => e
-  | .error msg => panic! s!"cudaU32EnvOrPanic!: {msg}\n  source: {src}"
+  | .error msg => panic! s!"cudaI32!: {msg}\n  source: {src}"
+
+/-! ## f32 entry points (Phase 2) -/
+
+def cudaF32WithEnv (env : Env) (src : String) : Except String (Exp (.scalar .f32)) := do
+  let cexpr ← parseExprStr src
+  lowerF32 env cexpr
+
+def cudaF32 (src : String) : Except String (Exp (.scalar .f32)) :=
+  cudaF32WithEnv .empty src
+
+def cudaF32! (src : String) : Exp (.scalar .f32) :=
+  match cudaF32 src with
+  | .ok e => e
+  | .error msg => panic! s!"cudaF32!: {msg}\n  source: {src}"
 
 end Hesper.Transpile.CUDA
