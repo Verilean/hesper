@@ -58,13 +58,15 @@ def main : IO Unit := do
   let inDim  := wQ.config.inDim    -- 2560
   let outDim := wQ.config.outDim   -- 2048
 
-  -- Test seqLen=8 (simplest MMQ tile: gridY = 1).
-  let seqLen := 8
+  -- Test seqLen from env (default 8 = simplest MMQ tile, gridY=1).
+  -- Set HESPER_PARITY_SEQLEN=18 to exercise non-multiple-of-8 (validates
+  -- the ceil(seqLen/8) gridY + j_in column masking).
+  let seqLen := match (← IO.getEnv "HESPER_PARITY_SEQLEN") with
+    | some s => (s.toNat?).getD 8
+    | none => 8
   IO.println s!"[Test] inDim={inDim} outDim={outDim} seqLen={seqLen}"
   if outDim % 32 != 0 then
     IO.println s!"FAIL: outDim {outDim} not divisible by 32"; IO.Process.exit 1
-  if seqLen % 8 != 0 then
-    IO.println s!"FAIL: seqLen {seqLen} not divisible by 8"; IO.Process.exit 1
   if inDim % 256 != 0 then
     IO.println s!"FAIL: inDim {inDim} not divisible by 256"; IO.Process.exit 1
 
