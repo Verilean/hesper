@@ -1255,3 +1255,8 @@ lean_exe small_embedding_test where
   root := `Tests.SmallEmbeddingTest
   supportInterpreter := false
   moreLinkArgs := stdLinkArgs
+
+lean_exe «transpile-cuda-expr-test» where
+  root := `Tests.Transpile.CUDAExprTest
+  supportInterpreter := false
+  moreLinkArgs := stdLinkArgs
