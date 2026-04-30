@@ -200,4 +200,91 @@ def autoEnvFor (items : Array TUItem) (target : CFunction) : Env :=
     bufs := autoBufs
     inlines := chainInlines autoInlines mmqHelperInlines }
 
+/-! ## Pass 0 — `#define` const scan
+
+The lexer strips `#define` directives entirely, so simple macro
+constants like `#define VDR_Q4_0_Q8_1_MMVQ 2` get lost.  We rescue
+them with a one-pass linewise text scan: any line of the form
+`#define IDENT <integer-literal>` becomes a `(IDENT, n)` entry that
+the lower's `env.consts` resolver can find.
+
+This unblocks local-array decls whose size is a `#define` (e.g.
+`int v[VDR_Q4_0_Q8_1_MMVQ];`) and `for (i = 0; i < CONST; ++i)`
+loops whose bound is a `#define`. -/
+
+/-- Parse the operand of a `#define NAME <text>` line as an Int when
+    `<text>` is a bare decimal/hex integer literal. Returns `none` for
+    function-like macros, multi-token operands, or non-integer values. -/
+def parseDefineLineRhs (rhs : String) : Option Int :=
+  let core := rhs.trim
+  if core.isEmpty then none
+  else
+    -- Reject anything that doesn't look like a single int literal.
+    let isOK : Bool := core.all (fun c =>
+      c.isDigit ∨ c == '-' ∨ c == 'x' ∨ c == 'X' ∨ c == 'u' ∨ c == 'U'
+      ∨ c == 'l' ∨ c == 'L' ∨ ('a' ≤ c ∧ c ≤ 'f')
+      ∨ ('A' ≤ c ∧ c ≤ 'F'))
+    if !isOK then none
+    else
+      let (sign, body) :=
+        if core.startsWith "-" then ((-1 : Int), core.drop 1) else ((1 : Int), core)
+      match parseIntLit body with
+      | .ok n => some (sign * (n : Int))
+      | .error _ => none
+
+/-- Scan source text for `#define IDENT <int>` lines. Function-like
+    macros (`#define F(x) ...`) and non-integer values are skipped. -/
+def collectDefines (src : String) : Array (String × Int) := Id.run do
+  let mut acc : Array (String × Int) := #[]
+  for line in src.splitOn "\n" do
+    let line := line.trim
+    if !line.startsWith "#" then continue
+    -- Drop the leading `#` and any whitespace, expect `define`.
+    let rest := (line.drop 1).trim
+    if !rest.startsWith "define" then continue
+    let rest := (rest.drop 6).trim
+    -- Identifier portion (alpha/_/digits); stop at first non-ident char.
+    let chars := rest.toList
+    let mut nameAcc : String := ""
+    let mut i : Nat := 0
+    let mut ok : Bool := true
+    while i < chars.length do
+      let c := chars[i]!
+      if c.isAlpha ∨ c == '_' ∨ (i > 0 ∧ c.isDigit) then
+        nameAcc := nameAcc.push c
+        i := i + 1
+      else
+        break
+    -- Skip function-like macros: `#define NAME(...)`.
+    if i < chars.length ∧ chars[i]! == '(' then ok := false
+    if !ok ∨ nameAcc.isEmpty then continue
+    let rhs := (rest.drop nameAcc.length).trim
+    match parseDefineLineRhs rhs with
+    | some n => acc := acc.push (nameAcc, n)
+    | none   => continue
+  acc
+
+/-- Build a `consts` resolver from the collected `#define` pairs,
+    layered over an existing resolver `prior` (so caller-provided
+    consts still win). -/
+def constsOfDefines (defs : Array (String × Int))
+    (prior : String → Option Int) : String → Option Int :=
+  fun n => match prior n with
+    | some v => some v
+    | none =>
+      defs.foldl (init := none) fun acc (k, v) =>
+        match acc with
+        | some _ => acc
+        | none => if k == n then some v else none
+
+/-- `autoEnvFor` extended with `#define` constant pickup. Pass the
+    source string in addition to the parsed TU and target — defines
+    found in the source feed `Env.consts`, so things like
+    `int v[VDR_Q4_0_Q8_1_MMVQ];` lower with the constant array size. -/
+def autoEnvForWithDefines
+    (src : String) (items : Array TUItem) (target : CFunction) : Env :=
+  let baseEnv := autoEnvFor items target
+  let defs := collectDefines src
+  { baseEnv with consts := constsOfDefines defs baseEnv.consts }
+
 end Hesper.Transpile.CUDA
