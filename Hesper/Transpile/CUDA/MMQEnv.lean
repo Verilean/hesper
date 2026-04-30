@@ -81,8 +81,9 @@ def mmqHelperInlines : String → Array CExpr → Option CExpr := fun fn args =>
   | "get_int_b1", _ => some (CExpr.numLit "0")
   | "get_int_b2", _ => some (CExpr.numLit "0")
   | "get_int_b4", _ => some (CExpr.numLit "0")
-  -- f32 intrinsics
-  | "log2f", _ => some (CExpr.numLit "0.0")
+  -- f32 intrinsics — wrap in float cast so lowerI32/U32 fall-throughs
+  -- don't hit "float-shape numLit" guard.
+  | "log2f", _ => some (CExpr.cast "float" (CExpr.numLit "0"))
   -- half2 arithmetic intrinsics. CUDA's `__hmul2`, `__hadd2`,
   -- `__low2half`, `__high2half`, `__half22float2` etc operate on
   -- packed half2 (= 2× fp16 in 32 bits). The hesper transpile target
@@ -102,6 +103,17 @@ def mmqHelperInlines : String → Array CExpr → Option CExpr := fun fn args =>
   | "__float22half2_rn", _ => some (CExpr.numLit "0")
   | "__floats2half2_rn", _ => some (CExpr.numLit "0")
   | "__halves2half2", _ => some (CExpr.numLit "0")
+  -- `__half2float(h)` / `__float2half(f)`: scalar fp16 ↔ f32 cvt.
+  -- Stub via `(float)0` cast so callers that treat the result as
+  -- f32 get a clean float, and lowerI32/U32 contexts that cast back
+  -- end up with 0 either way without hitting "float-shape numLit
+  -- in i32 context".
+  | "__half2float", _ => some (CExpr.cast "float" (CExpr.numLit "0"))
+  | "__float2half", _ => some (CExpr.numLit "0")
+  | "__half2int_rn", _ => some (CExpr.numLit "0")
+  | "make_half2", _ => some (CExpr.numLit "0")
+  | "make_float2", _ => some (CExpr.numLit "0")
+  | "make_uchar4", _ => some (CExpr.numLit "0")
   -- AMD-specific bit-perm intrinsic (RDNA byte-shuffle). Never live on
   -- our NVIDIA target, but appears in arch-conditional branches.
   | "__builtin_amdgcn_perm", _ => some (CExpr.numLit "0")
@@ -117,6 +129,34 @@ def mmqHelperInlines : String → Array CExpr → Option CExpr := fun fn args =>
   -- Helpers in mul_mat_vec / mul_mat_q dispatch path.
   | "calc_rows_per_block", _ => some (CExpr.numLit "1")
   | "calc_nthreads_per_block", _ => some (CExpr.numLit "32")
+  -- `__vsub4`: per-byte unsigned subtract; we don't model byte-packed
+  -- arithmetic at the transpile level. Stub to 0.
+  | "__vsub4", _ => some (CExpr.numLit "0")
+  | "__vadd4", _ => some (CExpr.numLit "0")
+  -- `sizeof(T)` — compile-time constant; the parser treats it as a
+  -- 1-arg call. For coverage, stub to 4 (most common smem-stride
+  -- multiplier on the target). Real codegen would resolve at parse
+  -- time but we don't model that yet.
+  | "sizeof", _ => some (CExpr.numLit "4")
+  -- `int(x)` parses as a 1-arg call; lower it as i32 cast / passthrough.
+  | "int", [arg] => some arg
+  | "uint", [arg] => some arg
+  | "float", [arg] => some arg
+  -- llama.cpp's `vec_dot_q*_q8_1_impl` family — user helpers that
+  -- always return `float`. Stub via `(float)0` cast so the lowering
+  -- chains in lowerU32 → lowerI32 → lowerF32 see the right type
+  -- without tripping the "float-shape numLit in i32 context" guard.
+  | "vec_dot_q8_0_q8_1_impl", _ => some (CExpr.cast "float" (CExpr.numLit "0"))
+  | "vec_dot_q8_1_q8_1_impl", _ => some (CExpr.cast "float" (CExpr.numLit "0"))
+  | "vec_dot_q8_0_16_q8_1_impl", _ => some (CExpr.cast "float" (CExpr.numLit "0"))
+  | "vec_dot_q3_K_q8_1_impl_mmq", _ => some (CExpr.cast "float" (CExpr.numLit "0"))
+  | "vec_dot_q4_K_q8_1_impl_mmq", _ => some (CExpr.cast "float" (CExpr.numLit "0"))
+  | "vec_dot_q5_K_q8_1_impl_mmq", _ => some (CExpr.cast "float" (CExpr.numLit "0"))
+  | "vec_dot_q6_K_q8_1_impl_mmq", _ => some (CExpr.cast "float" (CExpr.numLit "0"))
+  | "ggml_cuda_dp4a", [a, b, c] =>
+    -- Already in lowerI32, but the lowerU32 fall-through can hit it
+    -- before the lowerI32 dispatch picks it up; keep as inline too.
+    some (CExpr.binop .add c (CExpr.call "__dp4a" #[a, b, CExpr.numLit "0"]))
   -- llama.cpp helpers: signed-bit unpack tables. The full impl reads
   -- a packed lookup; for the transpile we stub to 0 since the kernels
   -- that use it (vec_dot_iq2_xxs etc) aren't on the Gemma 4 hot path.
