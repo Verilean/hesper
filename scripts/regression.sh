@@ -76,6 +76,7 @@ run_test "transpile-cuda-q4k-vecdot-smoke" "lake exe transpile-cuda-q4k-vecdot-s
 run_test "transpile-cuda-q4k-vecdot-gpu-parity" "lake exe transpile-cuda-q4k-vecdot-gpu-parity"
 run_test "transpile-cuda-prefill-probe" "lake exe transpile-cuda-prefill-probe"
 run_test "transpile-cuda-struct-probe" "lake exe transpile-cuda-struct-probe"
+run_test "transpile-cuda-q4k-wrapper-smoke" "lake exe transpile-cuda-q4k-wrapper-smoke"
 
 # ─── 2. PTX codegen text (CPU) ───────────────
 run_test "wmma-ptx-text-test"  "lake exe wmma-ptx-text-test"
