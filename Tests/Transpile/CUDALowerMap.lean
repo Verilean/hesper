@@ -75,10 +75,14 @@ structure Counts where
   fail      : Nat := 0
 
 /-- Env-builder strategy. `.fixed` uses the same env for every fn;
-    `.auto` synthesises a per-function env from the parsed TU. -/
+    `.auto` synthesises a per-function env from the parsed TU.
+    `.autoStrict` is the same as `.auto` but with `env.strict := true`,
+    so missing bindings surface as errors instead of being papered
+    over with placeholder literals. -/
 inductive EnvMode where
   | fixed (env : Env)
   | auto
+  | autoStrict
 
 def runFile (mode : EnvMode) (path : System.FilePath) : IO Counts := do
   let present ← path.pathExists
@@ -107,8 +111,12 @@ def runFile (mode : EnvMode) (path : System.FilePath) : IO Counts := do
         acc := acc.push s
     pure acc
   let mkEnv : CFunction → Env := match mode with
-    | .fixed e => fun _ => e
-    | .auto    => fun f => autoEnvForWithMultiDefines extraSrcs items f
+    | .fixed e   => fun _ => e
+    | .auto      => fun f => autoEnvForWithMultiDefines extraSrcs items f
+    | .autoStrict =>
+      fun f =>
+        let e := autoEnvForWithMultiDefines extraSrcs items f
+        { e with strict := true }
   let mut rows : Array FnRow := #[]
   for it in items do
     match it with
@@ -176,7 +184,8 @@ def main (args : List String) : IO Unit := do
   --   --auto  : 2-pass auto env. Per function, build buffers from its
   --             pointer params and inline-rewrite every const-return
   --             helper in the TU on top of mmqHelperInlines.
-  let useAuto := args.contains "--auto"
+  let useAuto := args.contains "--auto" ∨ args.contains "--auto-strict"
+  let useStrict := args.contains "--auto-strict" ∨ args.contains "--strict"
   let useMMQ  := args.contains "--mmq"
   let pathArgs := args.filter (fun a => !a.startsWith "--")
   let paths : List System.FilePath := match pathArgs with
@@ -188,13 +197,14 @@ def main (args : List String) : IO Unit := do
       ]
     | xs => xs.map System.FilePath.mk
   let mode : EnvMode :=
-    if useAuto then .auto
-    else if useMMQ then .fixed mmqDefaultEnv
-    else .fixed Env.empty
+    if useAuto then (if useStrict then .autoStrict else .auto)
+    else if useMMQ then .fixed (if useStrict then { mmqDefaultEnv with strict := true } else mmqDefaultEnv)
+    else .fixed (if useStrict then { Env.empty with strict := true } else Env.empty)
   let label :=
-    if useAuto then "auto Env (2-pass)"
-    else if useMMQ then "MMQ default"
-    else "default Env"
+    (if useAuto then "auto Env (2-pass)"
+     else if useMMQ then "MMQ default"
+     else "default Env") ++
+    (if useStrict then " [strict]" else "")
   IO.println s!"═══ Phase 12: lower-coverage map ({label}) ═══"
   let mut totalOk := 0
   let mut totalEmpty := 0

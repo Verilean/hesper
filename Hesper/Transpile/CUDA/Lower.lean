@@ -56,6 +56,16 @@ structure Env where
       and `#define` values that appear in array sizes (e.g. `mmq_y`,
       `MMQ_TILE_NE_K`). Looked up by `evalConst` in `LowerStmt`. -/
   consts : String → Option Int := fun _ => none
+  /-- When `true`, the lower fails on missing bindings instead of
+      substituting placeholder literals. Used by the strict coverage
+      mode (`lake exe transpile-cuda-lower-map --auto-strict`) to
+      measure honest structural coverage — the coverage figure
+      with strict=false counts kernels where the lower walks past
+      missing buffer/struct/call bindings via `Exp.litU32 0`. Both
+      figures are useful: the loose count shows how many kernels
+      have full body shapes; strict shows how many are fully
+      env-resolvable. -/
+  strict : Bool := false
   /-- Pointer / array-param bindings. `v[i]` for `v : int*` looks up
       `bufs "v"` and emits `Exp.index (Exp.var name) i`. -/
   bufs   : String → Option BufBinding := fun _ => none
@@ -125,6 +135,23 @@ structure Env where
 
 /-- Empty environment: every name resolves to `Exp.var name`. -/
 def Env.empty : Env := {}
+
+/-- Placeholder helpers for unbound bindings. When `env.strict` is
+    false (default), return the typed zero literal so the lower
+    completes; when strict, return the supplied error message. The
+    name "fallback" is intentional — these paths fire when the env
+    can't satisfy the demand, not when the source is ill-formed. -/
+@[inline] def Env.fallbackU32 (env : Env) (msg : Unit → String)
+    : Except String (Exp (.scalar .u32)) :=
+  if env.strict then .error (msg ()) else .ok (Exp.litU32 0)
+
+@[inline] def Env.fallbackI32 (env : Env) (msg : Unit → String)
+    : Except String (Exp (.scalar .i32)) :=
+  if env.strict then .error (msg ()) else .ok (Exp.litI32 0)
+
+@[inline] def Env.fallbackF32 (env : Env) (msg : Unit → String)
+    : Except String (Exp (.scalar .f32)) :=
+  if env.strict then .error (msg ()) else .ok (Exp.litF32 0.0)
 
 /-- Backwards-compat alias for Phase 1 callers that used `IdEnv`. -/
 abbrev IdEnv := String → Option (Exp (.scalar .u32))
@@ -268,7 +295,8 @@ partial def lowerU32 (env : Env) : CExpr → Except String (Exp (.scalar .u32))
       .error s!"lowerU32: float-shaped numLit '{s}' in u32 context"
     else
       parseIntLit s |>.map fun n => Exp.litU32 n
-  | .floatLit _ => .ok (Exp.litU32 0)  -- placeholder: bitcast of float
+  | .floatLit _ =>
+    env.fallbackU32 fun _ => "lowerU32: float literal in u32 context"
   | .ident name =>
     match env.u32 name with
     | some e => .ok e
@@ -353,9 +381,8 @@ partial def lowerU32 (env : Env) : CExpr → Except String (Exp (.scalar .u32))
       | _ => .error "lowerU32: only `name[i]`, `obj->field[i]`, or `obj.field[i]` index supported"
     match bopt with
     | none =>
-      -- Unbound array operand: placeholder so the lower completes.
-      -- Real codegen needs an env.bufs / env.structFields binding.
-      .ok (Exp.litU32 0)
+      env.fallbackU32 fun _ =>
+        s!"lowerU32: array operand not bound — neither env.bufs nor env.structFields recognises {repr obj}"
     | some b =>
       let ie ← lowerU32 env i
       let idx := match b.offset? with
@@ -388,11 +415,10 @@ partial def lowerU32 (env : Env) : CExpr → Except String (Exp (.scalar .u32))
       match env.structFieldU32 base field with
       | some e => .ok e
       | none =>
-        -- Unsupported member access — placeholder.
-        .ok (Exp.litU32 0)
+        env.fallbackU32 fun _ =>
+          s!"lowerU32: unsupported member access '{base}.{field}'"
   | .member _ _ =>
-    -- Member access on non-ident base — placeholder.
-    .ok (Exp.litU32 0)
+    env.fallbackU32 fun _ => "lowerU32: member access on non-builtin base not yet supported"
   | .arrow (.ident base) field =>
     -- Scalar struct-field access via -> arrow.  Same env slot as .member
     -- (the user can register either x.dm or x->dm; structFieldU32 doesn't
@@ -401,12 +427,10 @@ partial def lowerU32 (env : Env) : CExpr → Except String (Exp (.scalar .u32))
     match env.structFieldU32 base field with
     | some e => .ok e
     | none =>
-      -- POD struct field not registered — substitute a placeholder
-      -- so the lower itself succeeds. Real codegen needs an explicit
-      -- env.structFieldU32 binding to produce correct WGSL, but the
-      -- transpile coverage measures whether the body parses.
-      .ok (Exp.litU32 0)
-  | .arrow _ _ => .ok (Exp.litU32 0)  -- placeholder for non-ident base
+      env.fallbackU32 fun _ =>
+        s!"lowerU32: arrow access '{base}->{field}' not bound — register via env.structFieldU32"
+  | .arrow _ _ =>
+    env.fallbackU32 fun _ => "lowerU32: arrow access only supported on plain idents"
   | .comma _ _ => .error "lowerU32: comma operator not supported"
 
 /-- Lower a `CExpr` to `Exp (.scalar .i32)`. -/
@@ -419,7 +443,8 @@ partial def lowerI32 (env : Env) : CExpr → Except String (Exp (.scalar .i32))
       .error s!"lowerI32: float-shaped numLit '{s}' in i32 context"
     else
       parseIntLit s |>.map fun n => Exp.litI32 (n : Int)
-  | .floatLit _ => .ok (Exp.litI32 0)  -- placeholder
+  | .floatLit _ =>
+    env.fallbackI32 fun _ => "lowerI32: float literal in i32 context"
   | .ident name =>
     match env.i32 name with
     | some e => .ok e
@@ -499,7 +524,8 @@ partial def lowerI32 (env : Env) : CExpr → Except String (Exp (.scalar .i32))
         -- measures. Real production wiring still needs an explicit
         -- env.inlines registration.
         if fn.length > 0 ∧ ((fn.front).isAlpha ∨ fn.front == '_') then
-          .ok (Exp.litI32 0)
+          env.fallbackI32 fun _ =>
+            s!"lowerI32: unsupported call '{fn}' with {args.size} args"
         else
           .error s!"lowerI32: unsupported call '{fn}' with {args.size} args"
   | .cast ty inner =>
@@ -525,8 +551,8 @@ partial def lowerI32 (env : Env) : CExpr → Except String (Exp (.scalar .i32))
       | _ => .error "lowerI32: only `name[i]`, `obj->field[i]`, or `obj.field[i]` index supported"
     match bopt with
     | none =>
-      -- Unbound array operand: placeholder.
-      .ok (Exp.litI32 0)
+      env.fallbackI32 fun _ =>
+        s!"lowerI32: array operand not bound — neither env.bufs nor env.structFields recognises {repr obj}"
     | some b =>
       let ie ← lowerU32 env i
       let idx := match b.offset? with
@@ -550,8 +576,7 @@ partial def lowerI32 (env : Env) : CExpr → Except String (Exp (.scalar .i32))
       | .ok x => .ok (Exp.toI32 x)
       | .error err => .error s!"lowerI32: member access '{base}.{field}' — {err}"
   | .member _ _ =>
-    -- Member access on non-ident base — placeholder.
-    .ok (Exp.litI32 0)
+    env.fallbackI32 fun _ => "lowerI32: member access on non-builtin base not yet supported"
   | .arrow (.ident base) field =>
     -- Scalar struct-field access via arrow.  Try i32 resolver first;
     -- otherwise fall through to u32 + bitcast.
@@ -561,10 +586,10 @@ partial def lowerI32 (env : Env) : CExpr → Except String (Exp (.scalar .i32))
       match env.structFieldU32 base field with
       | some e => .ok (Exp.toI32 e)
       | none =>
-        -- Placeholder for unregistered struct fields (Phase 13: auto
-        -- struct-field registration). Lets the lower complete.
-        .ok (Exp.litI32 0)
-  | .arrow _ _ => .ok (Exp.litI32 0)  -- placeholder for non-ident base
+        env.fallbackI32 fun _ =>
+          s!"lowerI32: arrow access '{base}->{field}' not bound — register via env.structFieldI32 or env.structFieldU32"
+  | .arrow _ _ =>
+    env.fallbackI32 fun _ => "lowerI32: arrow access only supported on plain idents"
   | .comma _ _ => .error "lowerI32: comma operator not supported"
 
 /-- Lower a `CExpr` to `Exp (.scalar .f32)`. -/
@@ -696,10 +721,9 @@ partial def lowerF32 (env : Env) : CExpr → Except String (Exp (.scalar .f32))
       match env.inlines fn args with
       | some rewritten => lowerF32 env rewritten
       | none =>
-        -- Unknown call: same heuristic as lowerI32 — substitute a
-        -- 0.0 placeholder so the lower itself succeeds.
         if fn.length > 0 ∧ ((fn.front).isAlpha ∨ fn.front == '_') then
-          .ok (Exp.litF32 0.0)
+          env.fallbackF32 fun _ =>
+            s!"lowerF32: unsupported call '{fn}' with {args.size} args"
         else
           .error s!"lowerF32: unsupported call '{fn}' with {args.size} args"
   | .cast ty inner =>
@@ -732,8 +756,8 @@ partial def lowerF32 (env : Env) : CExpr → Except String (Exp (.scalar .f32))
       | _ => .error "lowerF32: only `name[i]`, `obj->field[i]`, or `obj.field[i]` index supported"
     match bopt with
     | none =>
-      -- Unbound array operand: placeholder.
-      .ok (Exp.litF32 0.0)
+      env.fallbackF32 fun _ =>
+        s!"lowerF32: array operand not bound — neither env.bufs nor env.structFields recognises {repr obj}"
     | some b =>
       let ie ← lowerU32 env i
       let idx := match b.offset? with
@@ -756,17 +780,21 @@ partial def lowerF32 (env : Env) : CExpr → Except String (Exp (.scalar .f32))
       -- Fall through to user-registered struct field resolver for f32 scalars.
       match env.structFieldF32 base field with
       | some e => .ok e
-      | none => .error s!"lowerF32: member '{base}.{field}' — not a known float2 or f32 struct field binding"
-  | .member _ _ => .error "lowerF32: member access on non-ident not yet supported"
+      | none =>
+        env.fallbackF32 fun _ =>
+          s!"lowerF32: member '{base}.{field}' — not a known float2 or f32 struct field binding"
+  | .member _ _ =>
+    env.fallbackF32 fun _ => "lowerF32: member access on non-ident not yet supported"
   | .arrow (.ident base) field =>
     -- Scalar struct field via arrow.  f32 resolver only — vec2 typically
     -- shows up as `unpack2x16float(struct->u32_field)` in source.
     match env.structFieldF32 base field with
     | some e => .ok e
     | none =>
-      -- Placeholder for unregistered struct fields.
-      .ok (Exp.litF32 0.0)
-  | .arrow _ _ => .ok (Exp.litF32 0.0)  -- placeholder for non-ident base
+      env.fallbackF32 fun _ =>
+        s!"lowerF32: arrow access '{base}->{field}' not bound — register via env.structFieldF32"
+  | .arrow _ _ =>
+    env.fallbackF32 fun _ => "lowerF32: arrow access only supported on plain idents"
   | .comma _ _ => .error "lowerF32: comma operator not supported"
 
 /-- Lower a `CExpr` to `Exp (.vec2 .f32)` (CUDA `float2`).  Currently
