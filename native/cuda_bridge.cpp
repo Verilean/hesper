@@ -228,6 +228,27 @@ extern "C" lean_obj_res lean_hesper_cuda_module_load_data(b_lean_obj_arg ptx_str
     return lean_io_result_mk_ok(lean_box_usize((size_t)mod));
 }
 
+// Variant of cuModuleLoadData that takes raw bytes (for cubin or fatbin
+// loading where the source is binary, not UTF-8 text). Skips the JIT and
+// disk-cache paths; the input is assumed to already be a fully compiled
+// cubin/fatbin/PTX-as-bytes that the driver can load directly.
+extern "C" lean_obj_res lean_hesper_cuda_module_load_data_bytes(b_lean_obj_arg ba) {
+    const uint8_t* data = lean_sarray_cptr(ba);
+    size_t len = lean_sarray_size(ba);
+    CUmodule mod;
+    CUresult err = cuModuleLoadData(&mod, data);
+    if (err != CUDA_SUCCESS) {
+        const char* errName = nullptr;
+        cuGetErrorName(err, &errName);
+        char buf[256];
+        snprintf(buf, sizeof(buf),
+                 "cuModuleLoadData (bytes, %zu B) failed: %s",
+                 len, errName ? errName : "unknown");
+        return lean_io_result_mk_error(lean_mk_io_user_error(lean_mk_string(buf)));
+    }
+    return lean_io_result_mk_ok(lean_box_usize((size_t)mod));
+}
+
 extern "C" lean_obj_res lean_hesper_cuda_module_get_function(size_t mod_val, b_lean_obj_arg func_name) {
     CUfunction func;
     CUDA_CHECK(cuModuleGetFunction(&func, (CUmodule)mod_val, lean_string_cstr(func_name)),

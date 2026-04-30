@@ -54,17 +54,22 @@ initialize kernelsRef : IO.Ref (Option Kernels) ← IO.mkRef none
 /-- Default paths.  Override by caller if needed. -/
 def defaultMmvqPath : String := "/tmp/llamacpp_ptx/mmvq.ptx"
 def defaultQuantizePath : String := "/tmp/llamacpp_ptx/quantize.ptx"
+/-- Cubin (preferred) and PTX fallback paths for the mmq Q4_K kernel.
+    Cubin avoids driver JIT and dodges PTX-version checks (PTX 8.7 from
+    nvcc 12.8 is rejected by driver 565.77).
+    See `docs/llama-fusion-analysis/31-mmq-q4k-ptx-extraction.md`. -/
+def defaultMmqQ4KCubinPath : String := "/tmp/llamacpp_ptx/mmq_q4k.cubin"
 def defaultMmqQ4KPath : String := "/tmp/llamacpp_ptx/mmq_q4k.ptx"
 
 /-- Load PTX modules and resolve target kernels.  Idempotent.
-    `mmq_q4k.ptx` is optional — if absent (or driver rejects the PTX
-    version), `mmqQ4K_x64` is left `none` so existing decode-only
-    callers keep working. See
-    `docs/llama-fusion-analysis/31-mmq-q4k-ptx-extraction.md` for the
-    extraction recipe and the open PTX-8.7-vs-driver issue. -/
+    For mmq Q4_K, tries cubin first (binary, via cuModuleLoadDataBytes)
+    then PTX (text, via cuModuleLoadData). If neither resolves,
+    `mmqQ4K_x64` is left `none` so existing decode-only callers keep
+    working. -/
 def loadKernels (mmvqPath : String := defaultMmvqPath)
     (quantizePath : String := defaultQuantizePath)
-    (mmqQ4KPath : String := defaultMmqQ4KPath) : IO Kernels := do
+    (mmqQ4KCubinPath : String := defaultMmqQ4KCubinPath)
+    (mmqQ4KPtxPath : String := defaultMmqQ4KPath) : IO Kernels := do
   match ← kernelsRef.get with
   | some k => return k
   | none =>
@@ -77,9 +82,15 @@ def loadKernels (mmvqPath : String := defaultMmvqPath)
     let q8q ← cuModuleGetFunction qMod q8_1QuantizeSymbol
     let mmqQ4K ← (do
       try
-        let present ← System.FilePath.pathExists mmqQ4KPath
-        if !present then return none
-        let mmqSrc ← IO.FS.readFile mmqQ4KPath
+        let cubinPresent ← System.FilePath.pathExists mmqQ4KCubinPath
+        if cubinPresent then
+          let bytes ← IO.FS.readBinFile mmqQ4KCubinPath
+          let mmqMod ← cuModuleLoadDataBytes bytes
+          let f ← cuModuleGetFunction mmqMod mmqQ4KMatmulSymbol_x64
+          return some f
+        let ptxPresent ← System.FilePath.pathExists mmqQ4KPtxPath
+        if !ptxPresent then return none
+        let mmqSrc ← IO.FS.readFile mmqQ4KPtxPath
         let mmqMod ← cuModuleLoadData mmqSrc
         let f ← cuModuleGetFunction mmqMod mmqQ4KMatmulSymbol_x64
         return some f
