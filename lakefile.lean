@@ -1348,6 +1348,11 @@ lean_exe «transpile-cuda-translation-unit» where
   supportInterpreter := false
   moreLinkArgs := stdLinkArgs
 
+lean_exe «transpile-cuda-lower-map» where
+  root := `Tests.Transpile.CUDALowerMap
+  supportInterpreter := false
+  moreLinkArgs := stdLinkArgs
+
 lean_exe «wmma-ptx-text-test» where
   root := `Tests.CUDA.WmmaPTXTextTest
   supportInterpreter := false
