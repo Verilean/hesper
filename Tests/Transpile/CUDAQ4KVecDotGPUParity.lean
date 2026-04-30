@@ -13,27 +13,44 @@ Closes the loop: parse llama.cpp's `vec_dot_q4_K_q8_1_impl_mmq` body
 (vecdotq.cuh:527) → ShaderM → PTX → JIT-load on RTX 4070 Ti → run with
 a small synthetic input → compare against a CPU reference.
 
-**STATUS** (2026-04-30): currently FAILS on GPU due to two PTX-codegen
-issues uncovered while running this test (independent of the transpile
-work itself, which produces correct WGSL — see `CUDAQ4KVecDotSmoke`):
+**STATUS** (2026-04-30): PASSING on RTX 4070 Ti (max |err| = 4.9e-4,
+within f16 ds8/dm4 round-trip tolerance).  Required fixing four
+underlying CodeGen issues:
 
-1. `i32` array reads emit `ld.global.nc.f32` then `cvt.rzi.u32.f32` for
-   `v_buf` / `u_buf`, destroying the bit-pattern.  The transpiled body
-   reads `v[j]` as i32 (matching llama.cpp's `const int * v`) but the
-   ShaderM→PTX path for an i32 buffer with subsequent bit-shift use
-   loses its way.
+1. `i32` buffer reads emitted `ld.global.f32` then `cvt.rzi.u32.f32` —
+   destroying the bit pattern.  Fix: register `.scalar .i32` buffers
+   alongside `.scalar .u32` in `u32BufferNames`, so PTX emits
+   `ld.global.u32` (signed/unsigned share the PTX register file).
 
-2. Body assignments to outer `varNamed`'d locals (`sumf_d`, `sumf_m`,
-   `result`) don't propagate.  The WGSL output is correct
-   (`sumf_d = sumf_d + …`) but PTX emits `mov.f32 %f3, %f3` (no-op) so
-   the accumulator never updates.  Both issues smell like missing
-   coordination between the transpiler's lowerStmtWithEnvUpdate and the
-   PTX SSA register pool.
+2. `Exp.toU32` always assumed input was f32 (`cvt.u32.f32`), silently
+   corrupting u32-valued inputs.  Fix: dispatch on input register
+   variant — u32 → identity, f32 → cvt — so `u32(int*)` reads work.
 
-The transpile **smoke** test (`CUDAQ4KVecDotSmoke`) PASSES — proving
-that all of `__half22float2`, `float2.x/.y`, `ggml_cuda_dp4a`, byte
-indexing, and `(v[j]>>(4*i))&0x0F0F0F0F` lower cleanly to WGSL.  The
-GPU parity gap is a separate codegen task tracked in the next phase.
+3. `Stmt.varDecl name (.scalar .i32) init` fell through to the generic
+   fallback that aliased the var directly to the init register —
+   colliding with the immediate-cache for literal 0.  Fix: dedicated
+   i32 case that allocates a fresh register and emits a mov.
+
+4. `lowerF32` for an `.ident` whose name is bound as i32 silently
+   returned `Exp.var name` typed-but-mismatched (an f32 expression
+   pointing at a u32 register).  In `Exp.mul` the type-mismatch
+   fallback dropped the operand entirely.  Fix: consult `env.i32`
+   in `lowerF32 .ident` and wrap with `Exp.toF32` for the implicit
+   `int → float` promotion (matches C semantics).
+
+Plus a transpiler-level fix:
+
+5. Decl of `float2 v = expr;` previously emitted `ShaderM.varNamed` for
+   a vec2.f32 local — but the PTX backend has no native vec2.f32
+   register form, so `v.x` reads returned a stale f32 register.
+   Fix: inline-substitute the init expression.  `f32x2 v` is bound
+   to the lowered init *expression*, not `Exp.var name`.  Subsequent
+   `v.x` / `v.y` lower to `vecX/vecY <init-expr>`, which CodeGen
+   already handles for `unpack2x16float`.
+
+The transpile **smoke** test (`CUDAQ4KVecDotSmoke`) was already
+passing pre-fix (proves WGSL emission); this GPU parity test was the
+end-to-end validation that uncovered the five CodeGen-side issues.
 -/
 namespace Hesper.Transpile.CUDA.Q4KVecDotGPU
 

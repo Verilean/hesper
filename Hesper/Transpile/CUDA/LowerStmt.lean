@@ -132,20 +132,54 @@ partial def lowerStmt (env : Env) : CStmt → Except String (ShaderM Unit)
   | .pragma _ => .ok (pure ())  -- preserve presence as no-op
   | .break_ => .error "lowerStmt: 'break' not supported"
   | .continue_ => .error "lowerStmt: 'continue' not supported"
-  | .return_ _ => .error "lowerStmt: 'return' inside body not supported"
+  | .return_ _ =>
+    -- A bare `return;` is only legal as the body of an `if`-guard; we
+    -- treat it as a no-op so that the block-level rewrite below can
+    -- transform `if (cond) return; <rest>` → `if (!cond) { <rest> }`.
+    -- Bare `return;` at the top level of the kernel body collapses to
+    -- a no-op (the kernel just exits naturally on fallthrough).
+    .ok (pure ())
   | .block stmts => do
     -- Thread `env` through the block so that statements that **update**
     -- the env (pointer arithmetic `x += off`, declarations introducing
     -- new bindings) take effect for following statements.  Currently
     -- only pointer-arith updates are propagated; new local decls add a
     -- ShaderM-level bound name which we don't need in env.
-    let mut envCur : Env := env
-    let mut acts : List (ShaderM Unit) := []
-    for s in stmts.toList do
-      let (envNext, act) ← lowerStmtWithEnvUpdate envCur s
-      envCur := envNext
-      acts := acts ++ [act]
-    .ok (acts.foldl (fun acc a => acc *> a) (pure ()))
+    --
+    -- Special-case: rewrite the early-exit guard pattern
+    --   `if (cond) return;`
+    --   <rest>
+    -- into
+    --   `if (!cond) { <rest> }`
+    -- so that the rest of the kernel runs only on threads that didn't
+    -- hit the guard. CUDA kernels frequently use this pattern for
+    -- bounds checks (`if (i0 >= ne0) return;`).  Doing this at block-
+    -- lowering time keeps the rewriting local and avoids an extra AST
+    -- pass.  Multiple guards stack naturally via recursion.
+    let isReturnGuard : CStmt → Option CExpr
+      | .if_ c (.return_ _) none => some c
+      | .if_ c (.block #[.return_ _]) none => some c
+      | _ => none
+    match (stmts.toList.findIdx? (fun s => (isReturnGuard s).isSome)) with
+    | some idx =>
+      let before := stmts.toList.take idx
+      let guardStmt := stmts.toList[idx]!
+      let after := stmts.toList.drop (idx + 1)
+      match isReturnGuard guardStmt with
+      | some c =>
+        -- Rebuild as: <before>; if (!cond) { <after> }
+        let inverted : CStmt := .if_ (CExpr.unop .logNot c) (.block after.toArray) none
+        let newBlock : CStmt := .block (before.toArray.push inverted)
+        lowerStmt env newBlock
+      | none => unreachable!
+    | none =>
+      let mut envCur : Env := env
+      let mut acts : List (ShaderM Unit) := []
+      for s in stmts.toList do
+        let (envNext, act) ← lowerStmtWithEnvUpdate envCur s
+        envCur := envNext
+        acts := acts ++ [act]
+      .ok (acts.foldl (fun acc a => acc *> a) (pure ()))
   | .if_ c thn els => do
     let condE ← lowerBool env c
     let thnA ← lowerStmt env thn
@@ -402,19 +436,34 @@ partial def lowerStmtWithEnvUpdate (env : Env) (s : CStmt)
   -- Local decls of typed scalars: extend env so that subsequent
   -- references to `name` (e.g. `tmp += __shfl_xor_sync(0u, tmp, 16u)`)
   -- type-resolve to the right slot.
-  | .decl _storage ty name _initOpt =>
-    let act ← lowerStmt env s
-    let env' : Env := match classifyTy ty with
-      | some (.scalar .u32) =>
-        { env with u32 := fun n => if n == name then some (Exp.var name) else env.u32 n }
-      | some (.scalar .i32) =>
-        { env with i32 := fun n => if n == name then some (Exp.var name) else env.i32 n }
-      | some (.scalar .f32) =>
-        { env with f32 := fun n => if n == name then some (Exp.var name) else env.f32 n }
-      | some (.vec2 .f32) =>
-        { env with f32x2 := fun n => if n == name then some (Exp.var name) else env.f32x2 n }
-      | _ => env
-    .ok (env', act)
+  | .decl _storage ty name initOpt =>
+    -- Special-case `float2 v = expr;` — the PTX backend has no native
+    -- vec2.f32 local-variable representation; emitting it as a runtime
+    -- ShaderM.varNamed yields a non-functional binding (subsequent `v.x`
+    -- reads return an unallocated f32 register).  Instead, *inline-
+    -- substitute* the init: bind `f32x2 v` directly to the lowered init
+    -- expression, and skip emitting a runtime decl.  Subsequent `v.x` /
+    -- `v.y` then lower to `Exp.vecX <init-expr>` / `Exp.vecY <init-expr>`,
+    -- which the PTX backend already handles.
+    match classifyTy ty with
+    | some (.vec2 .f32) =>
+      let initExpr ← match initOpt with
+        | some e => lowerF32x2 env e
+        | none => .ok (Exp.vec2 (Exp.litF32 0.0) (Exp.litF32 0.0))
+      let env' : Env :=
+        { env with f32x2 := fun n => if n == name then some initExpr else env.f32x2 n }
+      .ok (env', pure ())
+    | _ =>
+      let act ← lowerStmt env s
+      let env' : Env := match classifyTy ty with
+        | some (.scalar .u32) =>
+          { env with u32 := fun n => if n == name then some (Exp.var name) else env.u32 n }
+        | some (.scalar .i32) =>
+          { env with i32 := fun n => if n == name then some (Exp.var name) else env.i32 n }
+        | some (.scalar .f32) =>
+          { env with f32 := fun n => if n == name then some (Exp.var name) else env.f32 n }
+        | _ => env
+      .ok (env', act)
   | _ =>
     let act ← lowerStmt env s
     .ok (env, act)

@@ -313,8 +313,17 @@ where
     let (re, s) := expToPTX e s
     let (r, s) := s.freshF32; (.f32 r, s.emit (.cvt_f32_u32_real r re.toU32!))
   | .toU32 e =>
+    -- Polymorphic in input type:
+    --   u32 → identity (reinterpret; PTX shares the s32/u32 register file)
+    --   i32 → identity (same as above; the bit pattern stays put)
+    --   f32 → cvt.rzi.u32.f32 (round-toward-zero conversion)
+    -- Previously assumed input was f32, which silently corrupted u32-valued
+    -- inputs (e.g. an `int` buffer load reinterpreted via `Exp.toU32`).
     let (re, s) := expToPTX e s
-    let (r, s) := s.freshU32; (.u32 r, s.emit (.cvt_u32_f32 r re.toF32!))
+    match re with
+    | .u32 u => (.u32 u, s)
+    | .f32 f => let (r, s) := s.freshU32; (.u32 r, s.emit (.cvt_u32_f32 r f))
+    | _ => (re, s)
   | .toI32 e =>
     -- f32 → i32 (round toward zero, like toU32 but signed).
     -- Also handles u32 → i32 (identity bitcast) and i32 → i32 (identity).
@@ -777,6 +786,16 @@ partial def stmtToPTX (stmt : Stmt) (s : GenState) : GenState :=
     let (ri, s) := expToPTX init s
     let (r, s) := s.freshU32; let s := s.emit (.mov_u32 r ri.toU32!)
     s.bindVar name (.u32 r)
+  | .varDecl name _ty (some ⟨.scalar .i32, init⟩) =>
+    -- i32 shares PTX's u32 register file but the value is a *mutable* var,
+    -- so we MUST fresh a register and emit a mov — directly aliasing the
+    -- init register would share state with the literal-cache (e.g. literal
+    -- 0u's cached register), producing catastrophic register aliasing where
+    -- assigning the i32 var stomps on the literal.  This is the bug that
+    -- broke vec_dot_q4_K's `int sumi_d = 0; for (j) sumi_d = …;` pattern.
+    let (ri, s) := expToPTX init s
+    let (r, s) := s.freshU32; let s := s.emit (.mov_u32 r ri.toU32!)
+    s.bindVar name (.u32 r)
   | .varDecl name _ty (some ⟨_, init⟩) =>
     let (ri, s) := expToPTX init s; s.bindVar name ri
 
@@ -1021,10 +1040,15 @@ def generatePTX
     | _ => acc) #[]
   let paramNames := state.declaredBuffers.map (·.1) |>.toArray
   let sharedNames := state.sharedVars.map (·.1)
-  -- Identify u32-element buffers for correct ld.global.u32 generation
+  -- Identify u32/i32-element buffers for correct ld.global.u32 generation.
+  -- (i32 buffers also use ld.global.u32 at the PTX level — bit pattern is
+  -- the same, sign interpretation comes via Exp.toI32 / signed PTX ops.
+  -- Treating them as f32 — the previous default — silently corrupted the
+  -- value via cvt.rzi.u32.f32.)
   let u32BufferNames := state.declaredBuffers.foldl (fun (acc : List String) (name, ty, _) =>
     match ty with
     | .array (.scalar .u32) _ => name :: acc
+    | .array (.scalar .i32) _ => name :: acc
     | .array (.scalar .atomicU32) _ => name :: acc
     | _ => acc) []
   let u32SharedNames := state.sharedVars.foldl (fun (acc : List String) (name, ty) =>
