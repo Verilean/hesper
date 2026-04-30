@@ -285,6 +285,7 @@ partial def lowerU32 (env : Env) : CExpr → Except String (Exp (.scalar .u32))
     | .sub    => bin Exp.sub
     | .mul    => bin Exp.mul
     | .div    => bin Exp.div
+    | .mod    => bin Exp.mod
     | .shl    => bin Exp.shiftLeft
     | .shr    => bin Exp.shiftRight
     | .bitAnd => bin Exp.bitAnd
@@ -406,6 +407,7 @@ partial def lowerI32 (env : Env) : CExpr → Except String (Exp (.scalar .i32))
     | .sub => bin Exp.sub
     | .mul => bin Exp.mul
     | .div => bin Exp.div
+    | .mod => bin Exp.mod
     | .bitAnd => bitop Exp.bitAnd
     | .bitOr  => bitop Exp.bitOr
     | .bitXor => bitop Exp.bitXor

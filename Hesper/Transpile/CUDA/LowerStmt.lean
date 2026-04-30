@@ -452,6 +452,27 @@ partial def lowerExprStmt (env : Env) (e : CExpr) : Except String (ShaderM Unit)
     let v ← lowerU32 env rhs
     .ok (ShaderM.assign name (Exp.bitXor (Exp.var name) v))
   | .call "__syncthreads" #[] => .ok ShaderM.barrier
+  | .call fn args =>
+    -- Bare function call as statement (return value ignored).  Common
+    -- in llama.cpp source for void helpers like `load_tiles(...)`,
+    -- `vec_dot(...)`, `__syncthreads()`-likes, or user-injected
+    -- inlines that produce side-effecting code.  If the user
+    -- registered the function in `env.inlines`, expand the rewrite
+    -- and recursively lower the resulting expression as a statement.
+    -- Otherwise, treat as a no-op (the kernel still type-checks; the
+    -- caller knows the helper has been replaced).
+    match env.inlines fn args with
+    | some rewritten =>
+      -- Try lower the rewritten expr as a statement (may itself be
+      -- a call or compound assign); if that fails fall back to
+      -- evaluating it as a u32 expression and discarding the value.
+      match lowerExprStmt env rewritten with
+      | .ok act => .ok act
+      | .error _ =>
+        match lowerU32 env rewritten with
+        | .ok _ => .ok (pure ())  -- discard value
+        | .error e => .error s!"lowerExprStmt: inlined call '{fn}' rewrite failed: {e}"
+    | none => .ok (pure ())  -- no-op for unregistered void helpers
   | .binop .assign (.index (.ident bname) idx) rhs =>
     -- Local-array scalarized assignment: `v[<const>] = …` → `v_<n> = …`.
     match tryScalarizeLocalArray env (.ident bname) idx with
