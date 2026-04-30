@@ -160,6 +160,18 @@ partial def parsePrimary : ParseM CExpr := do
         expectPunct "}"
         pure (CExpr.call name args)
       | _ => pure (CExpr.ident name)
+  | .punct "{" =>
+    -- Brace-enclosed initializer list: `{1, 2, 3}` or `{}`. Used in
+    -- `int2 v = {0, 0};`, `int arr[N] = {…};`, return-by-aggregate
+    -- value `return {a, b};`. Parse the contents as a comma-separated
+    -- arg list and represent as a synthetic `__brace_init` call.
+    bump
+    if (← matchPunct "}") then
+      pure (CExpr.call "__brace_init" #[])
+    else
+      let args ← parseArgList
+      expectPunct "}"
+      pure (CExpr.call "__brace_init" args)
   | .punct "(" =>
     bump
     -- Try cast: `(<type>)<expr>`. Heuristic: peek-ahead to find `)`
@@ -230,6 +242,20 @@ partial def parsePostfix' (acc : CExpr) : ParseM CExpr := do
     let idx ← parseExpr
     expectPunct "]"
     parsePostfix' (CExpr.index acc idx)
+  | .punct "(" =>
+    -- Postfix call: `expr(args)` — covers chained calls like
+    -- `ctx.stream()`, `(cond ? f : g)(x)`, `arr[i](y)`.
+    bump
+    let args ← parseArgList
+    expectPunct ")"
+    -- We don't have a generic `Call expr args` constructor; reuse
+    -- `CExpr.call` keyed by best-effort string repr of the callee.
+    let calleeName : String := match acc with
+      | CExpr.ident s => s
+      | CExpr.member _ f => f
+      | CExpr.arrow _ f => f
+      | _ => "<callExpr>"
+    parsePostfix' (CExpr.call calleeName args)
   | .punct "." =>
     bump
     match (← consume) with
@@ -783,32 +809,33 @@ partial def parseDeclWithSemiStorage (storage : Storage) : ParseM CStmt := do
       expectPunct ";"
       pure (CStmt.declArr storage tyAdj name szExpr)
     else
-      let init ← if (← matchPunct "=") then
-        let e ← parseAssign
-        pure (some e)
-      else if (← matchPunct "{") then
-        -- Brace-initialiser: `T name{a, b, c};` or `T name{};`. Parse
-        -- as a no-op call expression to capture intent — the lowerer
-        -- can decide what to do with empty brace-init (often just
-        -- zero-init).
-        let args ← parseArgList
-        expectPunct "}"
-        pure (some (CExpr.call ty args))
-      else
-        -- C++ direct-init declarator: `T name(a, b, c);` (e.g.
-        -- `dim3 num_blocks(x, y, z);`). Only fire when `ty` is a
-        -- user-defined type name (NOT a built-in scalar) — we don't
-        -- want to misparse `int func(args);` (a function declaration)
-        -- as a decl-with-init. Builtin types use `=` for init.
-        let isUserType :=
-          ¬ (ty == "int" ∨ ty == "uint" ∨ ty == "float" ∨ ty == "double"
-             ∨ ty == "bool" ∨ ty == "char" ∨ ty == "short" ∨ ty == "long"
-             ∨ ty == "void" ∨ ty.endsWith "*")
-        if isUserType ∧ (← matchPunct "(") then
+      let init ← do
+        if (← matchPunct "=") then
+          let e ← parseAssign
+          pure (some e)
+        else if (← matchPunct "{") then
+          -- Brace-initialiser: `T name{a, b, c};` or `T name{};`. Parse
+          -- as a no-op call expression to capture intent — the lowerer
+          -- can decide what to do with empty brace-init (often just
+          -- zero-init).
           let args ← parseArgList
-          expectPunct ")"
+          expectPunct "}"
           pure (some (CExpr.call ty args))
-        else pure none
+        else
+          -- C++ direct-init declarator: `T name(a, b, c);` (e.g.
+          -- `dim3 num_blocks(x, y, z);`). Only fire when `ty` is a
+          -- user-defined type name (NOT a built-in scalar) — we don't
+          -- want to misparse `int func(args);` (a function declaration)
+          -- as a decl-with-init. Builtin types use `=` for init.
+          let isUserType :=
+            ¬ (ty == "int" ∨ ty == "uint" ∨ ty == "float" ∨ ty == "double"
+               ∨ ty == "bool" ∨ ty == "char" ∨ ty == "short" ∨ ty == "long"
+               ∨ ty == "void" ∨ ty.endsWith "*")
+          if isUserType ∧ (← matchPunct "(") then
+            let args ← parseArgList
+            expectPunct ")"
+            pure (some (CExpr.call ty args))
+          else pure none
       expectPunct ";"
       pure (CStmt.decl storage ty name init)
   | t => throw s!"parseDeclWithSemi: expected ident, got {repr t}"
