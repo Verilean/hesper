@@ -530,6 +530,15 @@ partial def lowerStmtWithEnvUpdate (env : Env) (s : CStmt)
       .ok (env', pure ())
     | _ =>
       let act ← lowerStmt env s
+      -- NOTE: tempting to register const-foldable inits (e.g.
+      -- `int idx = 0`) in env.consts so subsequent uses fold further,
+      -- but this breaks variables that are mutated later (`int sumi_d
+      -- = 0; sumi_d = sumi_d + …`) because we have no flow analysis
+      -- to detect mutation.  Without that, transpiled vec_dot
+      -- silently turns `sumi_d` into a const 0.  Caller should inline
+      -- the const directly into uses (the unroll substitutes loop
+      -- vars at iteration time, so `arr[(j0/4) + (i0/32)]` folds even
+      -- if there's no `idx` intermediate).
       let env' : Env := match classifyTy ty with
         | some (.scalar .u32) =>
           { env with u32 := fun n => if n == name then some (Exp.var name) else env.u32 n }
