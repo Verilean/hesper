@@ -78,6 +78,7 @@ run_test "transpile-cuda-prefill-probe" "lake exe transpile-cuda-prefill-probe"
 run_test "transpile-cuda-struct-probe" "lake exe transpile-cuda-struct-probe"
 run_test "transpile-cuda-q4k-wrapper-smoke" "lake exe transpile-cuda-q4k-wrapper-smoke"
 run_test "transpile-cuda-q4k-full-wrapper-smoke" "lake exe transpile-cuda-q4k-full-wrapper-smoke"
+run_test "transpile-cuda-mmq-q4k-smoke" "lake exe transpile-cuda-mmq-q4k-smoke"
 
 # ─── 2. PTX codegen text (CPU) ───────────────
 run_test "wmma-ptx-text-test"  "lake exe wmma-ptx-text-test"
