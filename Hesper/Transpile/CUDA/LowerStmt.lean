@@ -40,6 +40,61 @@ namespace Hesper.Transpile.CUDA
 
 open Hesper.WGSL Hesper.WGSL.Monad
 
+/-! ## Constexpr evaluator (for array sizes like `mmq_y * (MMQ_TILE_NE_K + 1)`).
+
+    Resolves identifiers via `Env.consts` (a String → Int map). Returns
+    `none` if any leaf is unknown or an unsupported operator appears. -/
+
+/-- Parse a non-negative integer literal token (decimal or hex with
+    optional `[uUlL]+` suffix) to `Int`. Returns `none` on malformed
+    input. -/
+def parseConstIntLit (s : String) : Option Int :=
+  let stripped := s.dropRightWhile (fun c =>
+    c == 'u' ∨ c == 'U' ∨ c == 'l' ∨ c == 'L')
+  let isHex := stripped.startsWith "0x" ∨ stripped.startsWith "0X"
+  let body := if isHex then stripped.drop 2 else stripped
+  let base : Nat := if isHex then 16 else 10
+  let digit (c : Char) : Option Nat :=
+    if c.isDigit then some (c.toNat - '0'.toNat)
+    else if isHex ∧ 'a' ≤ c ∧ c ≤ 'f' then some (10 + (c.toNat - 'a'.toNat))
+    else if isHex ∧ 'A' ≤ c ∧ c ≤ 'F' then some (10 + (c.toNat - 'A'.toNat))
+    else none
+  body.toList.foldlM (init := (0 : Int)) fun acc c => do
+    let d ← digit c
+    pure (acc * Int.ofNat base + Int.ofNat d)
+
+partial def evalConst (lookup : String → Option Int) : CExpr → Option Int
+  | .numLit s => parseConstIntLit s
+  | .ident n => lookup n
+  | .unop .neg e => do let v ← evalConst lookup e; pure (-v)
+  | .unop .bitNot e => do let v ← evalConst lookup e; pure (-v - 1)
+  | .binop op a b => do
+    let av ← evalConst lookup a
+    let bv ← evalConst lookup b
+    match op with
+    | .add => pure (av + bv)
+    | .sub => pure (av - bv)
+    | .mul => pure (av * bv)
+    | .div => if bv == 0 then none else pure (av / bv)
+    | .mod => if bv == 0 then none else pure (av % bv)
+    | .shl => pure (av * (2 ^ bv.toNat))
+    | .shr => pure (av / (2 ^ bv.toNat))
+    | .bitAnd => pure (Int.ofNat (av.toNat &&& bv.toNat))
+    | .bitOr  => pure (Int.ofNat (av.toNat ||| bv.toNat))
+    | .bitXor => pure (Int.ofNat (av.toNat ^^^ bv.toNat))
+    -- Logical ops for `if constexpr` conditions
+    | .logAnd => pure (if av != 0 ∧ bv != 0 then 1 else 0)
+    | .logOr  => pure (if av != 0 ∨ bv != 0 then 1 else 0)
+    | .eq => pure (if av == bv then 1 else 0)
+    | .ne => pure (if av != bv then 1 else 0)
+    | .lt => pure (if av < bv then 1 else 0)
+    | .le => pure (if av ≤ bv then 1 else 0)
+    | .gt => pure (if av > bv then 1 else 0)
+    | .ge => pure (if av ≥ bv then 1 else 0)
+    | _ => none
+  | .unop .logNot e => do let v ← evalConst lookup e; pure (if v == 0 then 1 else 0)
+  | _ => none
+
 /-! ## Type detection from CUDA type strings -/
 
 /-- Strip `const`/`volatile`/`__restrict__` qualifiers and pointer
@@ -77,8 +132,18 @@ partial def lowerStmt (env : Env) : CStmt → Except String (ShaderM Unit)
   | .continue_ => .error "lowerStmt: 'continue' not supported"
   | .return_ _ => .error "lowerStmt: 'return' inside body not supported"
   | .block stmts => do
-    let actions ← stmts.toList.mapM (lowerStmt env)
-    .ok (actions.foldl (fun acc a => acc *> a) (pure ()))
+    -- Thread `env` through the block so that statements that **update**
+    -- the env (pointer arithmetic `x += off`, declarations introducing
+    -- new bindings) take effect for following statements.  Currently
+    -- only pointer-arith updates are propagated; new local decls add a
+    -- ShaderM-level bound name which we don't need in env.
+    let mut envCur : Env := env
+    let mut acts : List (ShaderM Unit) := []
+    for s in stmts.toList do
+      let (envNext, act) ← lowerStmtWithEnvUpdate envCur s
+      envCur := envNext
+      acts := acts ++ [act]
+    .ok (acts.foldl (fun acc a => acc *> a) (pure ()))
   | .if_ c thn els => do
     let condE ← lowerBool env c
     let thnA ← lowerStmt env thn
@@ -86,10 +151,43 @@ partial def lowerStmt (env : Env) : CStmt → Except String (ShaderM Unit)
       | some s => lowerStmt env s
       | none => .ok (pure ())
     .ok (ShaderM.if_ condE thnA elsA)
+  | .ifConstexpr c thn els =>
+    -- Compile-time evaluate the condition using `env.consts`. Bool
+    -- conditions appear in two forms: a single `bool` template param
+    -- (`if constexpr (do_multiply)`) or an `&&` / `||` of params.
+    -- We treat any non-zero const as true, zero as false.
+    match evalConst env.consts c with
+    | some v =>
+      if v != 0 then
+        lowerStmt env thn
+      else
+        match els with
+        | some s => lowerStmt env s
+        | none => .ok (pure ())
+    | none =>
+      .error s!"lowerStmt: 'if constexpr (...)' condition not const-foldable; check that template params are bound in env.consts"
+  | .externSharedArr ty name =>
+    -- Runtime-sized smem array. We don't yet have a ShaderM
+    -- primitive for genuinely runtime-sized smem; we treat it as a
+    -- declaration the caller must materialise via `ShaderM.sharedNamed`
+    -- with a fixed size obtained from a separately-passed env const.
+    -- Look up `<name>_size` in consts as the convention.
+    match classifyTy ty with
+    | some elemTy =>
+      match env.consts s!"{name}_size" with
+      | some n =>
+        if n < 0 then .error s!"lowerStmt: extern __shared__ {name} negative size"
+        else .ok (ShaderM.sharedNamed name (.array elemTy n.toNat))
+      | none =>
+        .error s!"lowerStmt: extern __shared__ {name}[] needs '{name}_size' in env.consts"
+    | none => .error s!"lowerStmt: extern __shared__ {ty} {name}[] — unsupported elem type"
+  | .staticAssert => .ok (pure ())
   | .for_ initOpt condOpt stepOpt body =>
     lowerFor env initOpt condOpt stepOpt body
   | .while_ _ _ => .error "lowerStmt: 'while' not yet supported (use 'for')"
-  | .decl ty name initOpt =>
+  | .decl _storage ty name initOpt =>
+    -- `__shared__ int x;` (no array) is rare; we treat it the same as a
+    -- local for now since there's no shared scalar in WGSL.
     match classifyTy ty with
     | some (.scalar .u32) => do
       let init ← match initOpt with
@@ -107,11 +205,23 @@ partial def lowerStmt (env : Env) : CStmt → Except String (ShaderM Unit)
         | none => .ok (Exp.litF32 0.0)
       .ok (ShaderM.varNamed name (.scalar .f32) init)
     | _ => .error s!"lowerStmt: unsupported decl type '{ty}'"
-  | .declArr ty name _szExpr =>
-    -- `__shared__ int x[N]` — Phase 4 will handle smem; for now accept
-    -- and emit a comment-only no-op so we can at least *parse* kernels
-    -- containing them.
-    .error s!"lowerStmt: array decl '{ty} {name}[…]' not yet supported (Phase 4)"
+  | .declArr storage ty name szExpr =>
+    -- Shared arrays → `ShaderM.sharedNamed`. Local arrays not yet
+    -- supported (would need `var<private>` array decl which the DSL
+    -- doesn't currently expose).
+    match storage with
+    | .shared =>
+      match classifyTy ty with
+      | some elemTy =>
+        match evalConst env.consts szExpr with
+        | some n =>
+          if n < 0 then .error s!"lowerStmt: __shared__ {name}[…] negative size {n}"
+          else .ok (ShaderM.sharedNamed name (.array elemTy n.toNat))
+        | none =>
+          .error s!"lowerStmt: __shared__ {name}[…] size not constant-foldable"
+      | none => .error s!"lowerStmt: __shared__ {ty} {name}[…] — unsupported elem type"
+    | _ =>
+      .error s!"lowerStmt: local array decl '{ty} {name}[…]' not yet supported"
   | .expr e =>
     -- Expression statement: usually an assignment.
     lowerExprStmt env e
@@ -126,7 +236,7 @@ partial def lowerFor (env : Env)
     (body : CStmt) : Except String (ShaderM Unit) := do
   -- Init must be `<int|uint> k = <expr>;`
   let (iname, startExpr) ← match initOpt with
-    | some (.decl _ name (some e)) => .ok (name, e)
+    | some (.decl _ _ name (some e)) => .ok (name, e)
     | some (.expr (.binop .assign (.ident name) e)) => .ok (name, e)
     | _ => .error "lowerFor: expected `int k = e` style init"
   -- Cond: `k < bound` or `k <= bound`
@@ -138,7 +248,8 @@ partial def lowerFor (env : Env)
       if n == iname then .ok (b, true)
       else .error s!"lowerFor: loop var mismatch in cond ('{n}' vs '{iname}')"
     | _ => .error "lowerFor: expected `k < bound` / `k <= bound`"
-  -- Step: `k += s` or `k++`
+  -- Step: `k += s`, `k++`, or `k = k + s` (the desugared form many
+  -- llama.cpp source dumps emit after `pragma unroll`).
   let stepExpr : CExpr ← match stepOpt with
     | some (.binop .addAssign (.ident n) s) =>
       if n == iname then .ok s
@@ -146,7 +257,14 @@ partial def lowerFor (env : Env)
     | some (.unop .postInc (.ident n)) | some (.unop .preInc (.ident n)) =>
       if n == iname then .ok (.numLit "1")
       else .error s!"lowerFor: loop var mismatch in step ('{n}' vs '{iname}')"
-    | _ => .error "lowerFor: expected `k += s` or `k++`"
+    | some (.binop .assign (.ident n) (.binop .add (.ident m) s)) =>
+      if n == iname ∧ m == iname then .ok s
+      else .error s!"lowerFor: loop var mismatch in step ('{n}' or '{m}' vs '{iname}')"
+    | some (.binop .assign (.ident n) (.binop .add s (.ident m))) =>
+      -- `i = 1 + i` form
+      if n == iname ∧ m == iname then .ok s
+      else .error s!"lowerFor: loop var mismatch in step"
+    | _ => .error "lowerFor: expected `k += s`, `k++`, or `k = k + s`"
   -- Lower start, bound, step as u32 (CUDA `int` loop counters → u32 is
   -- fine because llama.cpp loops are non-negative).
   let s ← lowerU32 env startExpr
@@ -160,22 +278,22 @@ partial def lowerFor (env : Env)
   -- loop var is conceptually polymorphic (`int k` in CUDA can flow
   -- into i32, u32, or f32 contexts via implicit conversion).
   let bodyOf (k : Exp (.scalar .u32)) : Except String (ShaderM Unit) :=
-    let env' : Env := {
+    let env' : Env := { env with
       u32 := fun n => if n == iname then some k             else env.u32 n,
       i32 := fun n => if n == iname then some (Exp.toI32 k) else env.i32 n,
       f32 := fun n => if n == iname then some (Exp.toF32 k) else env.f32 n
     }
     lowerStmt env' body
-  -- We need `bodyOf` to produce a fresh ShaderM action *per* call to
-  -- the loop body, so each iteration sees the correct loop-var Exp.
-  -- Convert Except (ShaderM Unit) into ShaderM Unit by panicking on
-  -- error (errors at this layer have already been validated by the
-  -- expression-level lowerings above).
+  -- Validate the body once eagerly with a placeholder loop var, so
+  -- any lowering error surfaces here rather than disappearing inside
+  -- ShaderM.loop's body callback (where Inhabited would silently
+  -- swallow it via the Except.error → pure () path).
+  let _ ← bodyOf (Exp.var "__loopvar_probe")
   .ok do
     ShaderM.loop s bound stepE fun k =>
       match bodyOf k with
       | .ok a => a
-      | .error msg => panic! s!"lowerFor body: {msg}"
+      | .error _ => pure ()  -- unreachable: validated above
 
 /-- Lower a CUDA bool expression. Phase 3 supports comparisons (`a < b`)
     and short-circuit `&&` / `||`. -/
@@ -251,7 +369,74 @@ partial def lowerExprStmt (env : Env) (e : CExpr) : Except String (ShaderM Unit)
     let v ← lowerU32 env rhs
     .ok (ShaderM.assign name (Exp.bitXor (Exp.var name) v))
   | .call "__syncthreads" #[] => .ok ShaderM.barrier
+  | .binop .assign (.index (.ident bname) idx) rhs =>
+    -- Buffer write: `dst[i] = expr;` → ShaderM.writeBuffer.
+    match env.bufs bname with
+    | none => .error s!"lowerExprStmt: '{bname}' (used in '{bname}[…] = …') not bound as a buffer"
+    | some b => do
+      let ie ← lowerU32 env idx
+      let idxFinal := match b.offset? with
+        | some off => Exp.add off ie
+        | none => ie
+      match b.elemTy with
+      | .scalar .f32 => do
+        let v ← lowerF32 env rhs
+        .ok (ShaderM.writeBuffer (ty := .scalar .f32) b.name idxFinal v)
+      | .scalar .i32 => do
+        let v ← lowerI32 env rhs
+        .ok (ShaderM.writeBuffer (ty := .scalar .i32) b.name idxFinal v)
+      | .scalar .u32 => do
+        let v ← lowerU32 env rhs
+        .ok (ShaderM.writeBuffer (ty := .scalar .u32) b.name idxFinal v)
+      | t => .error s!"lowerExprStmt: write to buffer with unsupported elem type {repr t}"
   | _ => .error s!"lowerExprStmt: unsupported expression statement"
+
+/-- Lower a statement and report whether (and how) it updates the env
+    for following statements in a block.  Currently only **pointer
+    arithmetic on kernel pointer args** updates env: `x += off;` for a
+    pointer `x` accumulates `off` into `env.bufs x`'s `offset?` field,
+    so subsequent `x[i]` loads emit `Exp.index x (off+i)`. Other
+    statements lower as before and return env unchanged.
+
+    `extern __shared__` decls would also update env in a fuller
+    implementation (binding the smem array as a buffer). Not yet. -/
+partial def lowerStmtWithEnvUpdate (env : Env) (s : CStmt)
+    : Except String (Env × ShaderM Unit) := do
+  match s with
+  -- Pointer arithmetic on kernel pointer args.
+  | .expr (.binop .addAssign (.ident name) rhs) =>
+    match env.bufs name with
+    | some b => do
+      let offDelta ← lowerU32 env rhs
+      let newOff := match b.offset? with
+        | some old => Exp.add old offDelta
+        | none => offDelta
+      let bNew : BufBinding := { name := b.name, elemTy := b.elemTy, offset? := some newOff }
+      let oldBufs := env.bufs
+      let newBufs : String → Option BufBinding := fun n =>
+        if n == name then some bNew else oldBufs n
+      let env' : Env := { env with bufs := newBufs }
+      .ok (env', pure ())  -- pointer advance has no runtime ShaderM action
+    | none =>
+      let act ← lowerStmt env s
+      .ok (env, act)
+  -- Local decls of typed scalars: extend env so that subsequent
+  -- references to `name` (e.g. `tmp += __shfl_xor_sync(0u, tmp, 16u)`)
+  -- type-resolve to the right slot.
+  | .decl _storage ty name _initOpt =>
+    let act ← lowerStmt env s
+    let env' : Env := match classifyTy ty with
+      | some (.scalar .u32) =>
+        { env with u32 := fun n => if n == name then some (Exp.var name) else env.u32 n }
+      | some (.scalar .i32) =>
+        { env with i32 := fun n => if n == name then some (Exp.var name) else env.i32 n }
+      | some (.scalar .f32) =>
+        { env with f32 := fun n => if n == name then some (Exp.var name) else env.f32 n }
+      | _ => env
+    .ok (env', act)
+  | _ =>
+    let act ← lowerStmt env s
+    .ok (env, act)
 
 partial def lowerCompoundAssign (env : Env) (name : String) (rhs : CExpr)
     (mkU32 : Exp (.scalar .u32) → Exp (.scalar .u32) → Exp (.scalar .u32))
@@ -280,5 +465,27 @@ partial def lowerCompoundAssign (env : Env) (name : String) (rhs : CExpr)
       ShaderM.assign name (mkU32 (Exp.var name) v)
 
 end -- mutual
+
+/-! ## Function lowering (Phase 4)
+
+    Lowers a `CFunction` body to a `ShaderM Unit`. Template parameters
+    are folded into `Env.consts` via the user-supplied `templVals`
+    table; runtime parameters (e.g. pointer args) are not yet
+    represented and the lowering only succeeds for kernels whose body
+    refers to template params and globals via `Env`. -/
+
+/-- Lower a parsed function body to a `ShaderM` action. The caller
+    supplies `templVals` — concrete values for the template params
+    (e.g. `[("mmq_y", 128), ("mmq_x", 64), ("nwarps", 8)]`) — which
+    extend `env.consts`. Runtime params (`int *x`, etc.) must already
+    be wired in `env` (typically via a buffer-binding pre-pass). -/
+def lowerFunction (env : Env) (f : Hesper.Transpile.CUDA.CFunction)
+    (templVals : List (String × Int)) : Except String (ShaderM Unit) :=
+  let lookup (n : String) : Option Int :=
+    match templVals.find? (·.fst == n) with
+    | some (_, v) => some v
+    | none => env.consts n
+  let env' : Env := { env with consts := lookup }
+  lowerStmt env' f.body
 
 end Hesper.Transpile.CUDA

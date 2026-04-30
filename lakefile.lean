@@ -1275,6 +1275,11 @@ lean_exe «transpile-cuda-vecdot-smoke» where
   supportInterpreter := false
   moreLinkArgs := stdLinkArgs
 
+lean_exe «transpile-cuda-rmsnorm-smoke» where
+  root := `Tests.Transpile.CUDARmsNormSmoke
+  supportInterpreter := false
+  moreLinkArgs := stdLinkArgs
+
 lean_exe «wmma-ptx-text-test» where
   root := `Tests.CUDA.WmmaPTXTextTest
   supportInterpreter := false
