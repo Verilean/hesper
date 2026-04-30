@@ -213,6 +213,7 @@ partial def lowerU32 (env : Env) : CExpr → Except String (Exp (.scalar .u32))
     | .add    => bin Exp.add
     | .sub    => bin Exp.sub
     | .mul    => bin Exp.mul
+    | .div    => bin Exp.div
     | .shl    => bin Exp.shiftLeft
     | .shr    => bin Exp.shiftRight
     | .bitAnd => bin Exp.bitAnd
@@ -230,7 +231,11 @@ partial def lowerU32 (env : Env) : CExpr → Except String (Exp (.scalar .u32))
       lowerU32 env inner
     else
       .error s!"lowerU32: cast to '{ty}' not supported"
-  | .ternary _ _ _ => .error "lowerU32: ternary not yet supported"
+  | .ternary cond t f => do
+      let ce ← lowerBool env cond
+      let te ← lowerU32 env t
+      let fe ← lowerU32 env f
+      .ok (Exp.select ce te fe)
   | .index obj i => do
     let name ← match obj with
       | .ident n => .ok n
@@ -303,6 +308,7 @@ partial def lowerI32 (env : Env) : CExpr → Except String (Exp (.scalar .i32))
     | .add => bin Exp.add
     | .sub => bin Exp.sub
     | .mul => bin Exp.mul
+    | .div => bin Exp.div
     | .bitAnd => bitop Exp.bitAnd
     | .bitOr  => bitop Exp.bitOr
     | .bitXor => bitop Exp.bitXor
@@ -336,7 +342,11 @@ partial def lowerI32 (env : Env) : CExpr → Except String (Exp (.scalar .i32))
       lowerI32 env inner
     else
       .error s!"lowerI32: cast to '{ty}' not supported"
-  | .ternary _ _ _ => .error "lowerI32: ternary not yet supported"
+  | .ternary cond t f => do
+      let ce ← lowerBool env cond
+      let te ← lowerI32 env t
+      let fe ← lowerI32 env f
+      .ok (Exp.select ce te fe)
   | .index obj i => do
     let name ← match obj with
       | .ident n => .ok n
@@ -444,6 +454,18 @@ partial def lowerF32 (env : Env) : CExpr → Except String (Exp (.scalar .f32))
     | "logf", [a] => do
       let ae ← lowerF32 env a
       .ok (Exp.log ae)
+    | "cosf", [a] => do
+      let ae ← lowerF32 env a
+      .ok (Exp.cos ae)
+    | "sinf", [a] => do
+      let ae ← lowerF32 env a
+      .ok (Exp.sin ae)
+    | "powf", [a, b] => do
+      -- powf(a, b) = exp(b * log(a)).  WGSL has `pow` builtin; fall back to
+      -- exp/log composition for portability since Exp.pow is not yet defined.
+      let ae ← lowerF32 env a
+      let be ← lowerF32 env b
+      .ok (Exp.exp (Exp.mul be (Exp.log ae)))
     | "fmaxf", [a, b] => do
       let ae ← lowerF32 env a; let be ← lowerF32 env b
       .ok (Exp.max ae be)
@@ -480,7 +502,11 @@ partial def lowerF32 (env : Env) : CExpr → Except String (Exp (.scalar .f32))
         | .error _ => lowerF32 env inner
     else
       .error s!"lowerF32: cast to '{ty}' not supported"
-  | .ternary _ _ _ => .error "lowerF32: ternary not yet supported"
+  | .ternary cond t f => do
+      let ce ← lowerBool env cond
+      let te ← lowerF32 env t
+      let fe ← lowerF32 env f
+      .ok (Exp.select ce te fe)
   | .index obj i => do
     let name ← match obj with
       | .ident n => .ok n
@@ -528,6 +554,43 @@ partial def lowerF32x2 (env : Env) : CExpr → Except String (Exp (.vec2 .f32))
       .ok (Exp.unpack2x16float ae)
     | _, _ => .error s!"lowerF32x2: unsupported call '{fn}'"
   | _ => .error s!"lowerF32x2: unsupported expression"
+
+/-- Lower a CUDA bool expression. Supports comparisons (`a < b`, `==`, `!=`,
+    etc.) and short-circuit `&&` / `||`. Used by ternary lowering above and
+    by `lowerStmt` for `if (cond) … else …`.
+
+    Lives in the mutual block so the ternary cases in `lowerU32`/`lowerI32`/
+    `lowerF32` can call it. -/
+partial def lowerBool (env : Env) : CExpr → Except String (Exp (.scalar .bool))
+  | .binop op a b =>
+    let cmp (mk : ∀ {t : WGSLType}, Exp t → Exp t → Exp (.scalar .bool))
+        : Except String (Exp (.scalar .bool)) := do
+      match lowerU32 env a, lowerU32 env b with
+      | .ok ae, .ok be => .ok (mk ae be)
+      | _, _ =>
+        match lowerI32 env a, lowerI32 env b with
+        | .ok ae, .ok be => .ok (mk ae be)
+        | _, _ =>
+          match lowerF32 env a, lowerF32 env b with
+          | .ok ae, .ok be => .ok (mk ae be)
+          | _, _ => .error "lowerBool: cmp operands type-mismatch"
+    match op with
+    | .lt => cmp Exp.lt
+    | .le => cmp Exp.le
+    | .gt => cmp Exp.gt
+    | .ge => cmp Exp.ge
+    | .eq => cmp Exp.eq
+    | .ne => cmp Exp.ne
+    | .logAnd => do
+      let ae ← lowerBool env a; let be ← lowerBool env b
+      .ok (Exp.and ae be)
+    | .logOr => do
+      let ae ← lowerBool env a; let be ← lowerBool env b
+      .ok (Exp.or ae be)
+    | _ => .error s!"lowerBool: unsupported binop {repr op}"
+  | .unop .logNot a => do
+      let ae ← lowerBool env a; .ok (Exp.not ae)
+  | _ => .error "lowerBool: only comparisons / bool ops supported"
 
 end -- mutual
 
