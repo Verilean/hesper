@@ -287,4 +287,15 @@ def autoEnvForWithDefines
   let defs := collectDefines src
   { baseEnv with consts := constsOfDefines defs baseEnv.consts }
 
+/-- Multi-source variant: scan defines from all given source strings
+    (typically the file plus its `#include` chain) and merge them all
+    into `env.consts`. Useful for vecdotq.cuh which depends on
+    `QR2_K`, `QI4_K` etc defined in `ggml-common.h`. -/
+def autoEnvForWithMultiDefines
+    (srcs : Array String) (items : Array TUItem) (target : CFunction) : Env :=
+  let baseEnv := autoEnvFor items target
+  let allDefs : Array (String × Int) := srcs.foldl (init := #[]) fun acc s =>
+    acc ++ collectDefines s
+  { baseEnv with consts := constsOfDefines allDefs baseEnv.consts }
+
 end Hesper.Transpile.CUDA

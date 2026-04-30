@@ -65,7 +65,7 @@ def lowerOne (mkEnv : CFunction → Env) (f : CFunction) : FnRow :=
       { name := f.name, bodyEmpty := false, lowerErr := none,
         shaderLen := s.length }
     | .error e =>
-      let trimmed := if e.length > 80 then e.take 80 ++ "…" else e
+      let trimmed := if e.length > 200 then e.take 200 ++ "…" else e
       { name := f.name, bodyEmpty := false, lowerErr := some trimmed,
         shaderLen := 0 }
 
@@ -89,9 +89,26 @@ def runFile (mode : EnvMode) (path : System.FilePath) : IO Counts := do
   IO.println ""
   IO.println s!"═══ {path} ═══"
   let items := parseTranslationUnitStr src
+  -- Pull additional `#define` constants from related headers. Many
+  -- `vecdotq.cuh` / `mmq.cuh` decls reference QR2_K / QI4_K / QK_K
+  -- (in `ggml-common.h`) and VDR_Q4_0_Q8_1_MMQ etc (in `vecdotq.cuh`).
+  -- Loading these as extra `#define` sources unblocks `int u[2*VDR_*]`
+  -- style array-size const-folds.
+  let extraHdrs : Array System.FilePath := #[
+    "llama.cpp/ggml/src/ggml-common.h",
+    "llama.cpp/ggml/src/ggml-cuda/vecdotq.cuh",
+    "llama.cpp/ggml/src/ggml-cuda/mmq.cuh"
+  ]
+  let extraSrcs : Array String ← do
+    let mut acc : Array String := #[src]
+    for h in extraHdrs do
+      if (← h.pathExists) then
+        let s ← IO.FS.readFile h
+        acc := acc.push s
+    pure acc
   let mkEnv : CFunction → Env := match mode with
     | .fixed e => fun _ => e
-    | .auto    => fun f => autoEnvForWithDefines src items f
+    | .auto    => fun f => autoEnvForWithMultiDefines extraSrcs items f
   let mut rows : Array FnRow := #[]
   for it in items do
     match it with
@@ -123,8 +140,7 @@ def runFile (mode : EnvMode) (path : System.FilePath) : IO Counts := do
       if !found then
         newClasses := newClasses.push (e, 1)
       errClasses := newClasses
-      if firstFails.size < 6 then
-        firstFails := firstFails.push r
+      firstFails := firstFails.push r
   IO.println s!"  total parsed functions: {rows.size}"
   IO.println s!"  lower-ok    : {nOk}"
   IO.println s!"  body-empty  : {nEmpty}  (header-only fallback)"
@@ -147,7 +163,7 @@ def runFile (mode : EnvMode) (path : System.FilePath) : IO Counts := do
       let (msg, count) := sorted[k]!
       IO.println s!"    [{count}×] {msg}"
     IO.println ""
-    IO.println "  first failing functions:"
+    IO.println "  all failing functions:"
     for r in firstFails do
       let e := r.lowerErr.getD "?"
       IO.println s!"    ✖ {r.name}: {e}"
