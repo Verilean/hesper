@@ -69,6 +69,12 @@ opaque cuModuleGetFunction (mod : CUmodule) (funcName : @& String) : IO CUfuncti
 @[extern "lean_hesper_cuda_module_unload"]
 opaque cuModuleUnload (mod : CUmodule) : IO Unit
 
+/-- Raise a kernel's dynamic shared-memory limit (required for kernels
+    requesting > 48 KB of smem). Wraps `cuFuncSetAttribute` with
+    `CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES`. -/
+@[extern "lean_hesper_cuda_func_set_max_dynamic_smem"]
+opaque cuFuncSetMaxDynamicSmem (func : CUfunction) (bytes : USize) : IO Unit
+
 /-! ## Utilities -/
 
 @[extern "lean_hesper_fast_string_hash"]

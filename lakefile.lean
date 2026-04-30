@@ -752,6 +752,10 @@ lean_exe «llamacpp-ptx-load-test» where
   root := `Tests.LlamaCppPTX.LoadTest
   moreLinkArgs := stdLinkArgs ++ #["./.lake/build/native/libhesper_cuda.a", "-lcuda"]
 
+lean_exe «llamacpp-mmq-launch-test» where
+  root := `Tests.LlamaCppPTX.MmqLaunchTest
+  moreLinkArgs := stdLinkArgs ++ #["./.lake/build/native/libhesper_cuda.a", "-lcuda"]
+
 lean_exe «llamacpp-abi-test» where
   root := `Tests.LlamaCppPTX.ABITest
   moreLinkArgs := stdLinkArgs ++ #["./.lake/build/native/libhesper_cuda.a", "-lcuda"]
