@@ -189,6 +189,30 @@ def autoEnv (items : Array TUItem) (targetFn : String) : Option Env := Id.run do
       bufs := autoBufs
       inlines := chainInlines autoInlines mmqHelperInlines }
 
+/-! ## Common ggml block-type struct field registration
+
+For coverage measurement, when we see a `block_qX_Y * NAME` decl
+we auto-register the common fields (`d`, `qs`, `qh`, `dm`, `scales`,
+`hmask`, `ql`, `e`) as struct-field bindings pointing at the same
+underlying buffer as NAME. The actual byte offsets aren't tracked
+here — real codegen needs explicit `Env.structFields` registration
+with correct offsets. -/
+
+/-- Common struct-field names across ggml block types. Matching any of
+    these on a base bound in env.bufs causes the field to alias the
+    base buffer with no offset. -/
+def commonGgmlFields : Array String := #[
+  "d", "qs", "qh", "dm", "scales", "hmask", "ql", "e",
+  "ds", "scales_h", "scales_l", "signs"
+]
+
+-- (Earlier versions of this file had `autoStructFieldU32/I32/F32`
+-- helpers but they closed over `bufs` at env-construction time, so
+-- late-bound aliases registered by the ptr-rebind path in
+-- `lowerStmtWithEnvUpdate` were invisible. The cleaner implementation
+-- registers `env.structFields` directly at ptr-rebind time and at
+-- param-decl time via `autoEnvFor` below — see `blockParams` there.)
+
 /-- Convenience: like `autoEnv` but returns `mmqDefaultEnv` when the
     target isn't found. Useful for the lower-coverage map driver
     where every function in the TU is its own target. -/
@@ -196,9 +220,34 @@ def autoEnvFor (items : Array TUItem) (target : CFunction) : Env :=
   let fns := collectFns items
   let autoBufs := bufsOfParams target.params
   let autoInlines := inlinesOfConstFns fns
-  { mmqDefaultMembers with
+  let baseEnv := mmqDefaultMembers
+  -- For each `block_q*` typed pointer parameter, auto-register common
+  -- struct fields (`d`, `qs`, `qh`, `dm`, `scales`, etc) as aliases
+  -- pointing at the same underlying buffer. Late-bound locals from
+  -- `T * x = (T*) base + i;` rebinds get the same treatment in
+  -- `lowerStmtWithEnvUpdate`'s ptr-rebind path.
+  let blockParams : Array (String × BufBinding) := target.params.filterMap fun p =>
+    let coreTy :=
+      if p.ty.startsWith "const " then p.ty.drop 6
+      else if p.ty.startsWith "constexpr " then p.ty.drop 10
+      else p.ty
+    if coreTy.startsWith "block_" ∧ isPointerParam p.ty then
+      match autoBufs p.name with
+      | some b => some (p.name, b)
+      | none => none
+    else none
+  let oldStructFields := baseEnv.structFields
+  let newStructFields : String → String → Option BufBinding := fun base field =>
+    if commonGgmlFields.contains field then
+      blockParams.foldl (init := oldStructFields base field) fun acc (n, b) =>
+        match acc with
+        | some _ => acc
+        | none => if n == base then some b else none
+    else oldStructFields base field
+  { baseEnv with
     bufs := autoBufs
-    inlines := chainInlines autoInlines mmqHelperInlines }
+    inlines := chainInlines autoInlines mmqHelperInlines
+    structFields := newStructFields }
 
 /-! ## Pass 0 — `#define` const scan
 
