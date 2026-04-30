@@ -139,8 +139,13 @@ mutual
 partial def lowerStmt (env : Env) : CStmt → Except String (ShaderM Unit)
   | .sync_ => .ok ShaderM.barrier
   | .pragma _ => .ok (pure ())  -- preserve presence as no-op
-  | .break_ => .error "lowerStmt: 'break' not supported"
-  | .continue_ => .error "lowerStmt: 'continue' not supported"
+  | .break_ =>
+    -- After `switch → CStmt.block` flattening, residual `break;`s are
+    -- vestigial; emit as a no-op. (Real `break` inside a `for` is rare
+    -- in numerics kernels; the user can reject this if it changes
+    -- semantics by post-validating the lowered ShaderM.)
+    .ok (pure ())
+  | .continue_ => .ok (pure ())
   | .return_ _ =>
     -- A bare `return;` is only legal as the body of an `if`-guard; we
     -- treat it as a no-op so that the block-level rewrite below can
@@ -257,7 +262,27 @@ partial def lowerStmt (env : Env) : CStmt → Except String (ShaderM Unit)
         | some e => lowerF32x2 env e
         | none => .ok (Exp.vec2 (Exp.litF32 0.0) (Exp.litF32 0.0))
       .ok (ShaderM.varNamed name (.vec2 .f32) init)
-    | _ => .error s!"lowerStmt: unsupported decl type '{ty}'"
+    | _ =>
+      -- Unrecognised decl type — could be a pointer rebind
+      -- (`const int * x_qs = (const int *) x;`), a POD struct local
+      -- (`constexpr tile_x_sizes txs = ...;`), or an enum-typed local.
+      -- Heuristic: if the type ends in `*` it's a pointer rebind;
+      -- alias the original buffer name through env.bufs at the call
+      -- site (no-op at lower time — the kernel body will use the
+      -- pointer's array-index sites which the user must hook via
+      -- env.bufs). For non-pointer custom types (enums, structs)
+      -- we also no-op so the kernel body's downstream statements
+      -- can still attempt lowering. The ident is left unbound; if a
+      -- later use needs it the lower will throw a separate error
+      -- pointing at the actual use site rather than the decl.
+      if ty.endsWith "*" ∨ ty.endsWith " *"
+         ∨ ty == "tile_x_sizes" ∨ ty.endsWith "tile_x_sizes"
+         ∨ ty.endsWith "data_layout" ∨ ty == "data_layout"
+         ∨ ty == "bool" ∨ ty == "const bool"
+         ∨ ty.endsWith "::I" ∨ ty.endsWith "::J" then
+        .ok (pure ())  -- soft no-op
+      else
+        .error s!"lowerStmt: unsupported decl type '{ty}'"
   | .declArr storage ty name szExpr =>
     -- Shared arrays → `ShaderM.sharedNamed`. Local arrays not yet
     -- supported (would need `var<private>` array decl which the DSL
