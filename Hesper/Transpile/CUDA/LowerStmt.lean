@@ -274,7 +274,35 @@ partial def lowerStmt (env : Env) : CStmt → Except String (ShaderM Unit)
           .error s!"lowerStmt: __shared__ {name}[…] size not constant-foldable"
       | none => .error s!"lowerStmt: __shared__ {ty} {name}[…] — unsupported elem type"
     | _ =>
-      .error s!"lowerStmt: local array decl '{ty} {name}[…]' not yet supported"
+      -- Local array decl `int v[N];` — scalarize at transpile time.
+      -- Emit N separate scalar varDecls `v_0, v_1, ... v_{N-1}` so the
+      -- PTX backend (which lacks .array register form) can register-
+      -- allocate each slot independently.  Subsequent `v[k]` accesses
+      -- with const k look up via `tryScalarizeLocalArray` and rewrite
+      -- to `v_k`.  Env registration is done by `lowerStmtWithEnvUpdate`.
+      match classifyTy ty, evalConst env.consts szExpr with
+      | some elemTy, some n =>
+        if n < 0 then .error s!"lowerStmt: local array '{name}[{n}]' negative size"
+        else
+          let zeroInit : ShaderM Unit := match elemTy with
+            | .scalar .u32 => Id.run do
+              let mut acc : ShaderM Unit := pure ()
+              for k in [0:n.toNat] do
+                acc := acc *> ShaderM.varNamed s!"{name}_{k}" (.scalar .u32) (Exp.litU32 0)
+              return acc
+            | .scalar .i32 => Id.run do
+              let mut acc : ShaderM Unit := pure ()
+              for k in [0:n.toNat] do
+                acc := acc *> ShaderM.varNamed s!"{name}_{k}" (.scalar .i32) (Exp.litI32 0)
+              return acc
+            | .scalar .f32 => Id.run do
+              let mut acc : ShaderM Unit := pure ()
+              for k in [0:n.toNat] do
+                acc := acc *> ShaderM.varNamed s!"{name}_{k}" (.scalar .f32) (Exp.litF32 0.0)
+              return acc
+            | _ => pure ()
+          .ok zeroInit
+      | _, _ => .error s!"lowerStmt: local array '{ty} {name}[…]' — unrecognised elem type or non-const size"
   | .expr e =>
     -- Expression statement: usually an assignment.
     lowerExprStmt env e
@@ -318,8 +346,41 @@ partial def lowerFor (env : Env)
       if n == iname ∧ m == iname then .ok s
       else .error s!"lowerFor: loop var mismatch in step"
     | _ => .error "lowerFor: expected `k += s`, `k++`, or `k = k + s`"
-  -- Lower start, bound, step as u32 (CUDA `int` loop counters → u32 is
-  -- fine because llama.cpp loops are non-negative).
+  -- Try const-fold all three: if start/bound/step are compile-time
+  -- known, **unroll the loop at transpile time** so the body sees a
+  -- concrete integer for the loop variable.  This enables local-array
+  -- scalarization (`d8[i]` with const `i`) and matches llama.cpp's
+  -- `#pragma unroll` semantics.  Falls through to runtime loop if any
+  -- bound isn't foldable.
+  let unrolled : Option (Except String (ShaderM Unit)) :=
+    match evalConst env.consts startExpr,
+          evalConst env.consts boundExpr,
+          evalConst env.consts stepExpr with
+    | some startN, some boundN, some stepN =>
+      if stepN ≤ 0 then some (.error s!"lowerFor: non-positive step {stepN} in unrolled loop")
+      else
+        let lastN := if boundIsLE then boundN else boundN - 1
+        let result : Except String (ShaderM Unit) := Id.run do
+          let mut acts : List (ShaderM Unit) := []
+          let mut iVal : Int := startN
+          while iVal ≤ lastN do
+            let env' : Env := { env with
+              consts := fun n => if n == iname then some iVal else env.consts n,
+              u32 := fun n => if n == iname then some (Exp.litU32 iVal.toNat) else env.u32 n,
+              i32 := fun n => if n == iname then some (Exp.litI32 iVal) else env.i32 n,
+              f32 := fun n => if n == iname then some (Exp.litF32 (Float.ofInt iVal)) else env.f32 n
+            }
+            match lowerStmt env' body with
+            | .ok a => acts := acts ++ [a]
+            | .error e => return .error s!"lowerFor (unrolled, i={iVal}): {e}"
+            iVal := iVal + stepN
+          return .ok (acts.foldl (fun acc a => acc *> a) (pure ()))
+        some result
+    | _, _, _ => none
+  match unrolled with
+  | some result => result
+  | none =>
+  -- Runtime loop fallback.
   let s ← lowerU32 env startExpr
   let bExpr ← lowerU32 env boundExpr
   -- ShaderM.loop is a half-open range; if cond was `<=`, add 1 to bound.
@@ -392,6 +453,11 @@ partial def lowerExprStmt (env : Env) (e : CExpr) : Except String (ShaderM Unit)
     .ok (ShaderM.assign name (Exp.bitXor (Exp.var name) v))
   | .call "__syncthreads" #[] => .ok ShaderM.barrier
   | .binop .assign (.index (.ident bname) idx) rhs =>
+    -- Local-array scalarized assignment: `v[<const>] = …` → `v_<n> = …`.
+    match tryScalarizeLocalArray env (.ident bname) idx with
+    | some scalarName =>
+      lowerExprStmt env (.binop .assign (.ident scalarName) rhs)
+    | none =>
     -- Buffer write: `dst[i] = expr;` → ShaderM.writeBuffer.
     match env.bufs bname with
     | none => .error s!"lowerExprStmt: '{bname}' (used in '{bname}[…] = …') not bound as a buffer"
@@ -473,6 +539,48 @@ partial def lowerStmtWithEnvUpdate (env : Env) (s : CStmt)
           { env with f32 := fun n => if n == name then some (Exp.var name) else env.f32 n }
         | _ => env
       .ok (env', act)
+  | .declArr storage ty name szExpr =>
+    -- Local array (Storage.none) → register in env.localArrays so
+    -- `tryScalarizeLocalArray` can resolve `v[<const>]` to `v_<n>`.
+    -- Each scalarized slot is also registered in the typed env so
+    -- assignment `v_<n> = …` and reads in any context lower correctly.
+    match storage with
+    | .none =>
+      match classifyTy ty, evalConst env.consts szExpr with
+      | some elemTy, some n =>
+        if n < 0 then .error s!"lowerStmtWithEnvUpdate: local array negative size"
+        else do
+          let act ← lowerStmt env s
+          let nNat := n.toNat
+          let env' : Env :=
+            { env with
+              localArrays := fun nm =>
+                if nm == name then some (nNat, elemTy) else env.localArrays nm
+              -- Pre-register each slot in the typed env so subsequent
+              -- assignments and reads of `v_<k>` lower correctly.
+              u32 := fun nm => Id.run do
+                for k in [0:nNat] do
+                  if nm == s!"{name}_{k}" ∧ elemTy == .scalar .u32 then
+                    return some (Exp.var nm)
+                env.u32 nm
+              i32 := fun nm => Id.run do
+                for k in [0:nNat] do
+                  if nm == s!"{name}_{k}" ∧ elemTy == .scalar .i32 then
+                    return some (Exp.var nm)
+                env.i32 nm
+              f32 := fun nm => Id.run do
+                for k in [0:nNat] do
+                  if nm == s!"{name}_{k}" ∧ elemTy == .scalar .f32 then
+                    return some (Exp.var nm)
+                env.f32 nm
+            }
+          .ok (env', act)
+      | _, _ =>
+        let act ← lowerStmt env s
+        .ok (env, act)
+    | _ =>
+      let act ← lowerStmt env s
+      .ok (env, act)
   | _ =>
     let act ← lowerStmt env s
     .ok (env, act)
