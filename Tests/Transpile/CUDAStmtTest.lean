@@ -17,10 +17,16 @@ namespace Hesper.Transpile.CUDA.StmtTest
 
 open Hesper.WGSL Hesper.WGSL.Monad Hesper.Transpile.CUDA
 
-/-- Render the WGSL body emitted by a ShaderM action. -/
+/-- Render the WGSL body emitted by a ShaderM action. Includes
+    `var<workgroup>` declarations in the output so tests can observe
+    `__shared__` lowering. -/
 def renderShader (m : ShaderM Unit) : String :=
   let st := ShaderM.exec m
-  String.join (st.stmts.map (·.toWGSL 0))
+  let sharedDecls : String :=
+    st.sharedVars.foldl (init := "") fun acc (n, t) =>
+      acc ++ s!"var<workgroup> {n}: {t.toWGSL};\n"
+  let body : String := String.join (st.stmts.map (·.toWGSL 0))
+  sharedDecls ++ body
 
 /-- Parse + lower a CUDA stmt string and render its WGSL. Returns
     the rendered string, or an error message on failure. -/
@@ -93,6 +99,65 @@ def main : IO Unit := do
      } else {
        y = 2i;
      }"
+
+  IO.println ""
+  IO.println "=== Phase 4: __shared__ smem decls ==="
+
+  -- 7. simple __shared__ array with literal size.
+  assertWGSL "shared int x[128]" Env.empty
+    "__shared__ int x[128];"
+    "var<workgroup> x: array<i32, 128>;"
+
+  -- 8. shared array with constexpr size:
+  --      mmq_y = 128, MMQ_TILE_NE_K = 32
+  --      __shared__ int x_qs[mmq_y * (MMQ_TILE_NE_K + 1)];
+  -- expected size = 128 * 33 = 4224.
+  let constsEnv : Env := {
+    consts := fun n =>
+      if n == "mmq_y"          then some 128
+      else if n == "MMQ_TILE_NE_K" then some 32
+      else none
+  }
+  assertWGSL "shared with constexpr size" constsEnv
+    "__shared__ int x_qs[mmq_y * (MMQ_TILE_NE_K + 1)];"
+    "var<workgroup> x_qs: array<i32, 4224>;"
+
+  -- 9. shared float array (RMSNorm-style smem reduction buffer).
+  assertWGSL "shared float buf" Env.empty
+    "__shared__ float buf[256];"
+    "var<workgroup> buf: array<f32, 256>;"
+
+  -- 10. function transpile — template params fold into smem size.
+  -- This mirrors the shape of llama.cpp's `mul_mat_q_process_tile`:
+  --
+  --   template <int mmq_y, int mmq_x>
+  --   __device__ void foo() {
+  --     __shared__ int x_qs[mmq_y * (mmq_x + 1)];
+  --     __syncthreads();
+  --   }
+  --
+  -- With mmq_y=128, mmq_x=32 → 128*33 = 4224.
+  let funcSrc :=
+    "template <int mmq_y, int mmq_x> __device__ void foo() {
+       __shared__ int x_qs[mmq_y * (mmq_x + 1)];
+       __syncthreads();
+     }"
+  match parseFunctionStr funcSrc with
+  | .ok f =>
+    match lowerFunction Env.empty f [("mmq_y", 128), ("mmq_x", 32)] with
+    | .ok action =>
+      let normalize (s : String) : String :=
+        s.splitOn "\n" |>.map (·.trim) |>.filter (· ≠ "") |> String.intercalate "\n"
+      let g := normalize (renderShader action)
+      let e := normalize "var<workgroup> x_qs: array<i32, 4224>;
+        workgroupBarrier();"
+      if g = e then IO.println "PASS  function transpile (template + smem)"
+      else
+        IO.println "FAIL  function transpile (template + smem)"
+        IO.println s!"  got:\n{g}"
+        IO.println s!"  expected:\n{e}"
+    | .error err => IO.println s!"FAIL  function lowerFunction: {err}"
+  | .error err => IO.println s!"FAIL  function parse: {err}"
 
   IO.println "=== done ==="
 

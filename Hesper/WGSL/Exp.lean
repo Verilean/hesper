@@ -555,6 +555,16 @@ inductive Exp : WGSLType → Type where
   -- dot4U8Packed(a, b): treat each u32 as 4 unsigned int8s, compute dot product → u32
   | dot4U8Packed : Exp (.scalar .u32) → Exp (.scalar .u32) → Exp (.scalar .u32)
 
+  /-- Packed signed-saturating subtract per byte (CUDA `__vsubss4`).
+      Each lane interprets the u32 as 4 int8 values and computes
+      `clamp(a_byte - b_byte, -128, 127)` per byte. PTX lowers to
+      a single `sub.sat.s8x4` instruction (sm_70+). On WGSL there is
+      no native equivalent — it falls back to a per-byte sequence in
+      the WGSL emitter (acceptable since WGSL is not the perf path
+      for Q6_K). Used by Q6_K vec_dot to compute `(vil | vih) - 32`
+      per byte without cross-byte borrow. -/
+  | subSatS8x4 : Exp (.scalar .u32) → Exp (.scalar .u32) → Exp (.scalar .u32)
+
   -- Workgroup barrier (duplicate, already defined above - will be removed from toWGSL)
   | workgroupBarrier : Exp (.scalar .u32)  -- Returns unit
 
@@ -946,6 +956,11 @@ partial def Exp.toWGSL {t : WGSLType} : Exp t → String
     s!"dot4I8Packed({toWGSL a}, {toWGSL b})"
   | dot4U8Packed a b =>
     s!"dot4U8Packed({toWGSL a}, {toWGSL b})"
+  | subSatS8x4 a b =>
+    -- WGSL has no native sub.sat.s8x4. Emit a placeholder helper call;
+    -- if you target Web you must supply your own polyfill. CUDA path
+    -- bypasses this via expToPTX → sub_sat_s8x4 instruction.
+    s!"subSatS8x4({toWGSL a}, {toWGSL b})"
   | workgroupBarrier =>
     "workgroupBarrier()"
   | warpBarrier =>

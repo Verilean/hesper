@@ -102,6 +102,8 @@ partial def evalConst (lookup : String → Option Int) : CExpr → Option Int
 def classifyTy (s : String) : Option WGSLType :=
   -- Quick approach: look for keywords in the type string.
   if s.endsWith "*" ∨ s.endsWith "&" then none  -- pointer types unsupported
+  else if s.endsWith "float2" then
+    some (.vec2 .f32)
   else if s.endsWith "uint32_t" ∨ s.endsWith "unsigned" ∨ s == "unsigned int"
        ∨ s.endsWith "u32" ∨ s == "uint" then
     some (.scalar .u32)
@@ -204,6 +206,14 @@ partial def lowerStmt (env : Env) : CStmt → Except String (ShaderM Unit)
         | some e => lowerF32 env e
         | none => .ok (Exp.litF32 0.0)
       .ok (ShaderM.varNamed name (.scalar .f32) init)
+    | some (.vec2 .f32) => do
+      -- `float2 v = __half22float2(h);` — declare a vec2<f32> local
+      -- and bind it via env.f32x2 so subsequent `v.x` / `v.y` lower
+      -- to `vecX(v)` / `vecY(v)`.
+      let init ← match initOpt with
+        | some e => lowerF32x2 env e
+        | none => .ok (Exp.vec2 (Exp.litF32 0.0) (Exp.litF32 0.0))
+      .ok (ShaderM.varNamed name (.vec2 .f32) init)
     | _ => .error s!"lowerStmt: unsupported decl type '{ty}'"
   | .declArr storage ty name szExpr =>
     -- Shared arrays → `ShaderM.sharedNamed`. Local arrays not yet
@@ -432,6 +442,8 @@ partial def lowerStmtWithEnvUpdate (env : Env) (s : CStmt)
         { env with i32 := fun n => if n == name then some (Exp.var name) else env.i32 n }
       | some (.scalar .f32) =>
         { env with f32 := fun n => if n == name then some (Exp.var name) else env.f32 n }
+      | some (.vec2 .f32) =>
+        { env with f32x2 := fun n => if n == name then some (Exp.var name) else env.f32x2 n }
       | _ => env
     .ok (env', act)
   | _ =>
