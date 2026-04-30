@@ -566,6 +566,85 @@ partial def lowerStmtWithEnvUpdate (env : Env) (s : CStmt)
     | none =>
       let act ← lowerStmt env s
       .ok (env, act)
+  -- Pointer-rebind decl: `T * NAME = (T *) BASE;` or
+  -- `T * NAME = (T *) (BASE + OFFSET);` (or bare `T * NAME = BASE;`).
+  -- These are common in mmq.cuh where smem layouts are typed-aliased
+  -- onto a single `extern __shared__` byte buffer:
+  --   int   * x_qs = (int   *)  x_tile;
+  --   float * x_df = (float *) (x_qs + 2*MMQ_TILE_NE_K);
+  -- Aliasing the decl to the source buffer means subsequent
+  -- `x_qs[i] = …` lowers via the existing buffer-store path with the
+  -- offset folded in.
+  | .decl _storage ty name (some initE) =>
+    if ty.endsWith "*" ∨ ty.endsWith " *" then
+      -- Strip outer cast `(T *) inner` — same shape regardless of T.
+      let stripped : CExpr := match initE with
+        | .cast _ inner => inner
+        | other => other
+      -- Detect `BASE + OFFSET` (parenthesised or not) vs bare BASE.
+      let (baseName?, offset?) : Option String × Option CExpr :=
+        match stripped with
+        | .ident b => (some b, none)
+        | .binop .add (.ident b) off => (some b, some off)
+        | .binop .add off (.ident b) => (some b, some off)  -- commutative
+        | _ => (none, none)
+      match baseName? with
+      | some baseName =>
+        match env.bufs baseName with
+        | some bBase =>
+          -- Resolve the offset (when present). If it doesn't lower as
+          -- u32, fall through to the soft no-op rather than failing
+          -- the whole function — common for `const T * p = (T*)src + i`
+          -- where `i` is a `const int &` reference param we don't track.
+          let newOff? : Option (Exp (.scalar .u32)) :=
+            match offset? with
+            | none => bBase.offset?
+            | some off =>
+              match lowerU32 env off with
+              | .ok off' => some (match bBase.offset? with
+                  | some old => Exp.add old off'
+                  | none => off')
+              | .error _ => none
+          match offset?, newOff? with
+          | some _, none =>
+            -- Had an offset but couldn't lower it — punt to soft no-op.
+            let act ← lowerStmt env s
+            .ok (env, act)
+          | _, _ =>
+            let bAlias : BufBinding :=
+              { name := bBase.name, elemTy := bBase.elemTy, offset? := newOff? }
+            let oldBufs := env.bufs
+            let newBufs : String → Option BufBinding := fun n =>
+              if n == name then some bAlias else oldBufs n
+            let env' : Env := { env with bufs := newBufs }
+            -- No runtime decl needed — the alias is purely a name binding.
+            .ok (env', pure ())
+        | none =>
+          -- Base unbound — treat like the original soft-no-op decl
+          -- (the existing fallthrough in lowerStmt accepts ptr types).
+          let act ← lowerStmt env s
+          .ok (env, act)
+      | none =>
+        let act ← lowerStmt env s
+        .ok (env, act)
+    else
+      -- Non-pointer decl with init: fall through to the typed-scalar
+      -- branch below by re-matching.
+      let act ← lowerStmt env s
+      let env' : Env := match classifyTy ty with
+        | some (.scalar .u32) =>
+          { env with u32 := fun n => if n == name then some (Exp.var name) else env.u32 n }
+        | some (.scalar .i32) =>
+          { env with i32 := fun n => if n == name then some (Exp.var name) else env.i32 n }
+        | some (.scalar .f32) =>
+          { env with f32 := fun n => if n == name then some (Exp.var name) else env.f32 n }
+        | some (.vec2 .f32) =>
+          let initExpr := match lowerF32x2 env initE with
+            | .ok e => e
+            | .error _ => Exp.vec2 (Exp.litF32 0.0) (Exp.litF32 0.0)
+          { env with f32x2 := fun n => if n == name then some initExpr else env.f32x2 n }
+        | _ => env
+      .ok (env', act)
   -- Local decls of typed scalars: extend env so that subsequent
   -- references to `name` (e.g. `tmp += __shfl_xor_sync(0u, tmp, 16u)`)
   -- type-resolve to the right slot.
