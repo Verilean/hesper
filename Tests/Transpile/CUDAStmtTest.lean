@@ -83,11 +83,17 @@ def main : IO Unit := do
   --    }
   -- ShaderM.loop generates a fresh loop var (i0) and we bind k → i0
   -- in the body env. sum is i32 so we cast u32 k → i32.
-  assertWGSL "for-loop sum" { i32 := fun n => if n == "sum" then some (Exp.var "sum") else none }
+  -- Phase 9: const-foldable bounds → unroll at transpile time.
+  -- The body is duplicated 4 times with k = 0, 1, 2, 3 substituted.
+  -- This matches `#pragma unroll` semantics in CUDA.  Runtime-loop
+  -- form preserved for non-const bounds.
+  assertWGSL "for-loop sum (Phase 9 unrolled)"
+    { i32 := fun n => if n == "sum" then some (Exp.var "sum") else none }
     "for (int k = 0; k < 4; k += 1) { sum += k; }"
-    "for (var i0: u32 = 0u; (i0 < 4u); i0 = (i0 + 1u)) {
-       sum = (sum + i32(i0));
-     }"
+    "sum = (sum + 0i);
+     sum = (sum + 1i);
+     sum = (sum + 2i);
+     sum = (sum + 3i);"
 
   -- 6. if-else
   assertWGSL "if/else"

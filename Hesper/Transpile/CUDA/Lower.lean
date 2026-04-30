@@ -80,6 +80,17 @@ structure Env where
   structFieldU32 : String → String → Option (Exp (.scalar .u32)) := fun _ _ => none
   structFieldI32 : String → String → Option (Exp (.scalar .i32)) := fun _ _ => none
   structFieldF32 : String → String → Option (Exp (.scalar .f32)) := fun _ _ => none
+  /-- Local (register-allocated) C arrays.  When the body declares
+      `int v[2];`, we scalarize at transpile time: declare two scalar
+      vars `v_0, v_1` and look up `v[k]` (where `k` is constant-foldable)
+      as `v_<k>`.  This avoids needing a real PTX-level array (the PTX
+      backend has no `.array` register form), while still supporting
+      every llama.cpp inner-dot pattern (which always uses constant
+      indices into small stack arrays).
+
+      Maps name → (size, element WGSLType).  Populated by `.declArr
+      Storage.none` in `lowerStmtWithEnvUpdate`. -/
+  localArrays : String → Option (Nat × WGSLType) := fun _ => none
   /-- Member-access resolver for builtin compound names.  `threadIdx.x`
       is parsed as `member (ident "threadIdx") "x"` — the lowering
       consults `members ("threadIdx", "x")` to obtain the right
@@ -194,6 +205,45 @@ def parseFloatLit (s : String) : Except String Float := Id.run do
     return .error s!"trailing chars in float literal: {s}"
   return .ok (sign * result)
 
+/-- Tiny const-fold for compile-time integer expressions.  Used by
+    local-array scalarization (`v[0]` → `v_0`).  Distinct from the
+    fuller `evalConst` in LowerStmt.lean (which we can't call here
+    due to module ordering — Lower.lean must be standalone). -/
+partial def evalConstSmall (env : Env) : CExpr → Option Int
+  | .numLit s =>
+    match parseIntLit s with
+    | .ok n => some (Int.ofNat n)
+    | _ => none
+  | .ident name => env.consts name
+  | .unop .neg e => do let v ← evalConstSmall env e; pure (-v)
+  | .binop op a b => do
+    let av ← evalConstSmall env a
+    let bv ← evalConstSmall env b
+    match op with
+    | .add => some (av + bv)
+    | .sub => some (av - bv)
+    | .mul => some (av * bv)
+    | .div => if bv == 0 then none else some (av / bv)
+    | .mod => if bv == 0 then none else some (av % bv)
+    | .bitAnd => some (Int.ofNat (av.toNat &&& bv.toNat))
+    | .bitOr  => some (Int.ofNat (av.toNat ||| bv.toNat))
+    | .bitXor => some (Int.ofNat (av.toNat ^^^ bv.toNat))
+    | _ => none
+  | _ => none
+
+/-- If `obj[i]` indexes a transpile-known local array `v` with a
+    compile-time-foldable index, return the scalarized name `v_<n>`.
+    Returns `none` otherwise (caller falls through to the regular
+    buffer/struct-field path). -/
+def tryScalarizeLocalArray (env : Env) (obj idx : CExpr) : Option String :=
+  match obj with
+  | .ident name => do
+    let _ ← env.localArrays name
+    let n ← evalConstSmall env idx
+    if n < 0 then none
+    else some s!"{name}_{n.toNat}"
+  | _ => none
+
 /-! ## Type-directed lowering
 
 The three entry points (`lowerU32`, `lowerI32`, `lowerF32`) form a
@@ -258,6 +308,11 @@ partial def lowerU32 (env : Env) : CExpr → Except String (Exp (.scalar .u32))
       let fe ← lowerU32 env f
       .ok (Exp.select ce te fe)
   | .index obj i => do
+    -- Local array scalarization: `v[<const>]` → `v_<n>`.
+    match tryScalarizeLocalArray env obj i with
+    | some scalarName =>
+      lowerU32 env (.ident scalarName)
+    | none =>
     -- Resolve the array name. Three forms supported:
     --   v[i]            — bare ident
     --   bq->qs[i]       — struct-pointer arrow → field
@@ -390,6 +445,11 @@ partial def lowerI32 (env : Env) : CExpr → Except String (Exp (.scalar .i32))
       let fe ← lowerI32 env f
       .ok (Exp.select ce te fe)
   | .index obj i => do
+    -- Local array scalarization: `v[<const>]` → `v_<n>`.
+    match tryScalarizeLocalArray env obj i with
+    | some scalarName =>
+      lowerI32 env (.ident scalarName)
+    | none =>
     let bopt : Option BufBinding ← match obj with
       | .ident n => .ok (env.bufs n)
       | .arrow (.ident base) field => .ok (env.structFields base field)
@@ -573,6 +633,11 @@ partial def lowerF32 (env : Env) : CExpr → Except String (Exp (.scalar .f32))
       let fe ← lowerF32 env f
       .ok (Exp.select ce te fe)
   | .index obj i => do
+    -- Local array scalarization: `v[<const>]` → `v_<n>`.
+    match tryScalarizeLocalArray env obj i with
+    | some scalarName =>
+      lowerF32 env (.ident scalarName)
+    | none =>
     let bopt : Option BufBinding ← match obj with
       | .ident n => .ok (env.bufs n)
       | .arrow (.ident base) field => .ok (env.structFields base field)
