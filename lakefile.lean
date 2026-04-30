@@ -1298,6 +1298,11 @@ lean_exe «transpile-cuda-q4k-vecdot-gpu-parity» where
   root := `Tests.Transpile.CUDAQ4KVecDotGPUParity
   moreLinkArgs := stdLinkArgs ++ #["./.lake/build/native/libhesper_cuda.a", "-lcuda"]
 
+lean_exe «transpile-cuda-prefill-probe» where
+  root := `Tests.Transpile.CUDAPrefillProbe
+  supportInterpreter := false
+  moreLinkArgs := stdLinkArgs
+
 lean_exe «wmma-ptx-text-test» where
   root := `Tests.CUDA.WmmaPTXTextTest
   supportInterpreter := false

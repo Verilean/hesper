@@ -305,39 +305,8 @@ partial def lowerFor (env : Env)
       | .ok a => a
       | .error _ => pure ()  -- unreachable: validated above
 
-/-- Lower a CUDA bool expression. Phase 3 supports comparisons (`a < b`)
-    and short-circuit `&&` / `||`. -/
-partial def lowerBool (env : Env) : CExpr → Except String (Exp (.scalar .bool))
-  | .binop op a b =>
-    let cmp (mk : ∀ {t : WGSLType}, Exp t → Exp t → Exp (.scalar .bool))
-        : Except String (Exp (.scalar .bool)) := do
-      -- Try u32 first, then i32, then f32.
-      match lowerU32 env a, lowerU32 env b with
-      | .ok ae, .ok be => .ok (mk ae be)
-      | _, _ =>
-        match lowerI32 env a, lowerI32 env b with
-        | .ok ae, .ok be => .ok (mk ae be)
-        | _, _ =>
-          match lowerF32 env a, lowerF32 env b with
-          | .ok ae, .ok be => .ok (mk ae be)
-          | _, _ => .error "lowerBool: cmp operands type-mismatch"
-    match op with
-    | .lt => cmp Exp.lt
-    | .le => cmp Exp.le
-    | .gt => cmp Exp.gt
-    | .ge => cmp Exp.ge
-    | .eq => cmp Exp.eq
-    | .ne => cmp Exp.ne
-    | .logAnd => do
-      let ae ← lowerBool env a; let be ← lowerBool env b
-      .ok (Exp.and ae be)
-    | .logOr => do
-      let ae ← lowerBool env a; let be ← lowerBool env b
-      .ok (Exp.or ae be)
-    | _ => .error s!"lowerBool: unsupported binop {repr op}"
-  | .unop .logNot a => do
-    let ae ← lowerBool env a; .ok (Exp.not ae)
-  | _ => .error "lowerBool: only comparisons / bool ops supported"
+-- `lowerBool` moved into the Lower.lean mutual block so the
+-- ternary cases of `lowerU32`/`lowerI32`/`lowerF32` can call it.
 
 /-- Lower an expression statement. Most are assignments. -/
 partial def lowerExprStmt (env : Env) (e : CExpr) : Except String (ShaderM Unit) :=
