@@ -1082,7 +1082,30 @@ partial def parseFunction : ParseM CFunction := do
         | .punct "{" => break
         | .eof => break
         | _ => bump
-    let body ← parseStmt   -- expects a `{ ... }` block
+    -- Try to parse the body. If the body parser fails on some C++
+    -- construct we don't yet handle (e.g. C++17 lambdas, Tensor-Core
+    -- helper inlines, std::array operations), fall back to skipping
+    -- the brace-balanced body and returning an empty CStmt.block —
+    -- the function header still counts as parsed and the user can
+    -- fill in the body via env.inlines or a manual port.
+    let s0 ← get
+    let body ← match (← (parseStmt : ParseM CStmt).run.run s0) with
+      | (.ok b, st1) =>
+        set st1
+        pure b
+      | (.error _, _) =>
+        -- Restore and skip the brace-balanced `{...}` body
+        set s0
+        if (← matchPunct "{") then
+          let mut depth : Int := 1
+          while depth > 0 do
+            match (← peek) with
+            | .punct "{" => bump; depth := depth + 1
+            | .punct "}" =>
+              bump; depth := depth - 1
+            | .eof => break
+            | _ => bump
+        pure (CStmt.block #[])
     pure { attrs, templParams, retTy, name, params, body }
   | t => throw s!"parseFunction: expected function name, got {repr t}"
 
