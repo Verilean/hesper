@@ -928,6 +928,83 @@ def storeMatrixResult
   let storeExpr := Exp.subgroupMatrixStore bufferName offset mat (Exp.litBool false) stride
   emitStmt (Stmt.exprStmt storeExpr)
 
+/-! ## Fragment-as-local-variable helpers (real-CUDA-style WMMA)
+
+The array-of-fragments helpers above (`loadMatrixLeft`, `matrixMultiplyAccumulate`,
+`storeMatrixResult`) match WGSL's `array<subgroup_matrix_left, N>` model —
+nice for blocked algorithms but awkward to lower to PTX since fragments live
+in *registers*, not memory. The helpers below match the more direct
+`nvcuda::wmma::fragment a_frag; load_matrix_sync(a_frag, ...);` style: each
+fragment is a single named variable, with no array indirection. This is the
+recommended path for new WMMA kernels — the array helpers remain for
+backward-compat and WGSL-targeted code. -/
+
+/-- Declare a left fragment (`subgroup_matrix_left<st, m, k>`) bound to a
+    name, initialized via a load from `bufferName` at byte-offset `offset`
+    with row-major `stride` (in elements). -/
+def loadFragmentLeft
+    (st : ScalarType) (m k : Nat)
+    (name : String)
+    (bufferName : String)
+    (offset : Exp (.scalar .u32))
+    (stride : Exp (.scalar .u32))
+    : ShaderM Unit := do
+  let matTy := WGSLType.subgroupMatrixLeft st m k
+  let loadExpr := Exp.subgroupMatrixLoad bufferName offset (Exp.litBool false) stride
+  emitStmt (Stmt.varDecl name matTy (some ⟨matTy, loadExpr⟩))
+
+/-- Declare a right fragment, loaded col-major (the WGSL `subgroupMatrixLoadRight`
+    instruction, which lowers to PTX `wmma.load.b...col.f16`). -/
+def loadFragmentRight
+    (st : ScalarType) (k n : Nat)
+    (name : String)
+    (bufferName : String)
+    (offset : Exp (.scalar .u32))
+    (stride : Exp (.scalar .u32))
+    : ShaderM Unit := do
+  let matTy := WGSLType.subgroupMatrixRight st k n
+  let loadExpr := Exp.subgroupMatrixLoadRight bufferName offset (Exp.litBool false) stride
+  emitStmt (Stmt.varDecl name matTy (some ⟨matTy, loadExpr⟩))
+
+/-- Declare a result fragment initialized to zero. Maps to PTX
+    `mov.f32 %f0..7, 0;` for the f32 case (8 regs). -/
+def declareFragmentResultZero
+    (st : ScalarType) (m n : Nat)
+    (name : String)
+    : ShaderM Unit := do
+  let matTy := WGSLType.subgroupMatrixResult st m n
+  emitStmt (Stmt.varDecl name matTy (some ⟨matTy, Exp.subgroupMatrixZeroResult⟩))
+
+/-- `cName ← cName * (a × b)`. Uses the existing `Exp.subgroupMatrix-
+    MultiplyAccumulate`; lowers to one `wmma.mma.sync` instruction and
+    rebinds `cName` to the result fragment. -/
+def fragmentMultiplyAccumulate
+    (st : ScalarType) (m k n : Nat)
+    (cName aName bName : String)
+    : ShaderM Unit := do
+  let aMatTy := WGSLType.subgroupMatrixLeft st m k
+  let bMatTy := WGSLType.subgroupMatrixRight st k n
+  let cMatTy := WGSLType.subgroupMatrixResult st m n
+  let aExp : Exp aMatTy := Exp.var aName
+  let bExp : Exp bMatTy := Exp.var bName
+  let cExp : Exp cMatTy := Exp.var cName
+  let mma := Exp.subgroupMatrixMultiplyAccumulate aExp bExp cExp
+  emitStmt (Stmt.assign cName cMatTy mma)
+
+/-- Store a result fragment to a buffer at byte-offset `offset` with
+    row-major `stride` (in elements). -/
+def storeFragmentResult
+    (st : ScalarType) (m n : Nat)
+    (cName : String)
+    (bufferName : String)
+    (offset : Exp (.scalar .u32))
+    (stride : Exp (.scalar .u32))
+    : ShaderM Unit := do
+  let cMatTy := WGSLType.subgroupMatrixResult st m n
+  let cExp : Exp cMatTy := Exp.var cName
+  let storeExpr := Exp.subgroupMatrixStore bufferName offset cExp (Exp.litBool false) stride
+  emitStmt (Stmt.exprStmt storeExpr)
+
 /-- Static loop unrolling for matrix operations
 
     Executes an action for each index in the range [0, count)

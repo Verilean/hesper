@@ -49,6 +49,9 @@ structure Env where
   u32 : String → Option (Exp (.scalar .u32)) := fun _ => none
   i32 : String → Option (Exp (.scalar .i32)) := fun _ => none
   f32 : String → Option (Exp (.scalar .f32)) := fun _ => none
+  /-- f32 vec2 bindings (CUDA `float2` locals).  `__half22float2(h)`
+      returns one of these; `.x` / `.y` member access decomposes. -/
+  f32x2 : String → Option (Exp (.vec2 .f32)) := fun _ => none
   /-- Compile-time integer constants — used to evaluate template params
       and `#define` values that appear in array sizes (e.g. `mmq_y`,
       `MMQ_TILE_NE_K`). Looked up by `evalConst` in `LowerStmt`. -/
@@ -308,8 +311,9 @@ partial def lowerI32 (env : Env) : CExpr → Except String (Exp (.scalar .i32))
     | _ => .error s!"lowerI32: unsupported binop {repr op}"
   | .call fn args =>
     match fn, args.toList with
-    | "__dp4a", [a, b, c] => do
+    | "__dp4a", [a, b, c] | "ggml_cuda_dp4a", [a, b, c] => do
       -- __dp4a(a, b, c) = c + dot4I8Packed(a, b)  (i32 result)
+      -- llama.cpp uses ggml_cuda_dp4a as a portable alias.
       let ae ← lowerU32 env a
       let be ← lowerU32 env b
       let ce ← lowerI32 env c
@@ -496,9 +500,34 @@ partial def lowerF32 (env : Env) : CExpr → Except String (Exp (.scalar .f32))
       | .scalar .u32 =>
         .ok (Exp.toF32 (Exp.index (Exp.var b.name : Exp (.array (.scalar .u32) 0)) idx))
       | t => .error s!"lowerF32: buffer '{name}' has elem type {repr t}"
-  | .member _ _ => .error "lowerF32: member access not yet supported"
+  | .member (.ident base) field =>
+    -- `float2 v; v.x; v.y` — consult env.f32x2.
+    match env.f32x2 base, field with
+    | some v, "x" => .ok (Exp.vecX v)
+    | some v, "y" => .ok (Exp.vecY v)
+    | _, _ => .error s!"lowerF32: member '{base}.{field}' — not a known float2 binding"
+  | .member _ _ => .error "lowerF32: member access on non-ident not yet supported"
   | .arrow _ _ => .error "lowerF32: arrow access not yet supported"
   | .comma _ _ => .error "lowerF32: comma operator not supported"
+
+/-- Lower a `CExpr` to `Exp (.vec2 .f32)` (CUDA `float2`).  Currently
+    handles `__half22float2(h)` (returns vec2<f32>) and `.ident name`
+    bound in `env.f32x2`. -/
+partial def lowerF32x2 (env : Env) : CExpr → Except String (Exp (.vec2 .f32))
+  | .ident name =>
+    match env.f32x2 name with
+    | some e => .ok e
+    | none => .error s!"lowerF32x2: '{name}' not bound as a float2"
+  | .call fn args =>
+    match fn, args.toList with
+    | "__half22float2", [a] => do
+      -- The half2 may come from a half2*[i] read (which we lower as
+      -- u32 buffer index → unpack2x16float) or from a packed-u32
+      -- variable (which we treat the same way).
+      let ae ← lowerU32 env a
+      .ok (Exp.unpack2x16float ae)
+    | _, _ => .error s!"lowerF32x2: unsupported call '{fn}'"
+  | _ => .error s!"lowerF32x2: unsupported expression"
 
 end -- mutual
 

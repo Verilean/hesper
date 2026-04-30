@@ -1289,6 +1289,15 @@ lean_exe «transpile-cuda-rmsnorm-gpu-parity» where
   root := `Tests.Transpile.CUDARmsNormGPUParity
   moreLinkArgs := stdLinkArgs ++ #["./.lake/build/native/libhesper_cuda.a", "-lcuda"]
 
+lean_exe «transpile-cuda-q4k-vecdot-smoke» where
+  root := `Tests.Transpile.CUDAQ4KVecDotSmoke
+  supportInterpreter := false
+  moreLinkArgs := stdLinkArgs
+
+lean_exe «transpile-cuda-q4k-vecdot-gpu-parity» where
+  root := `Tests.Transpile.CUDAQ4KVecDotGPUParity
+  moreLinkArgs := stdLinkArgs ++ #["./.lake/build/native/libhesper_cuda.a", "-lcuda"]
+
 lean_exe «wmma-ptx-text-test» where
   root := `Tests.CUDA.WmmaPTXTextTest
   supportInterpreter := false
