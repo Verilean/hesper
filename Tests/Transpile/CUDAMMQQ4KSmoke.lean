@@ -88,6 +88,32 @@ def innerDotBody : String :=
   }
 }"
 
+/-- Phase 10b: more aggressive body using array-indexed compound assign
+    `sum[idx] += value` and the actual `vec_dot_q4_K_q8_1_impl_mmq`
+    inline call.  This is closer to what real llama.cpp source does. -/
+def innerDotBodyAggressive : String :=
+"{
+  float sum[2];
+  sum[0] = 0.0f;
+  sum[1] = 0.0f;
+
+  for (int k01 = 0; k01 < 32; k01 = k01 + 16) {
+    for (int j0 = 0; j0 < 8; j0 = j0 + 4) {
+      for (int i0 = 0; i0 < 32; i0 = i0 + 32) {
+        // `idx` is computed inline so that the unroller's
+        // substitution of j0 and i0 lets the array-index const-fold
+        // — keeping the transpiler from needing a flow-sensitive
+        // pass to detect that an `int idx = …;` decl is never
+        // mutated.
+        sum[(j0 / 4) + (i0 / 32)] = sum[(j0 / 4) + (i0 / 32)] + 1.0f;
+      }
+    }
+  }
+
+  result0 = sum[0];
+  result1 = sum[1];
+}"
+
 /-- Phase 10 env: simulates MMQ tile sizes via consts, exposes the
     underlying smem buffers as bufs.  In a full transpile we'd register
     threadIdx.x/.y via `env.threadIdxX` etc., but for this smoke the
@@ -107,22 +133,36 @@ def renderShader (m : ShaderM Unit) : String :=
   let st := ShaderM.exec m
   String.join (st.stmts.map (·.toWGSL 0))
 
-def main : IO Unit := do
-  IO.println "═══ Phase 10: MMQ Q4_K vec_dot_q4_K_q8_1_dp4a (distilled) ═══"
-  match parseStmtStr innerDotBody with
-  | .error e => IO.println s!"PARSE ERROR: {e}"
+def envForAggressive : Env := {
+  i32 := fun n => match n with
+    | "tx" | "ty" => some (Exp.var n)
+    | _ => none
+  f32 := fun n => match n with
+    | "result0" | "result1" => some (Exp.var n)
+    | _ => none
+  consts := fun _ => none
+}
+
+def probe (name : String) (body : String) (env : Env) : IO Unit := do
+  IO.println s!"--- {name} ---"
+  match parseStmtStr body with
+  | .error e => IO.println s!"  ✖ PARSE ERROR: {e}"
   | .ok stmt =>
-    IO.println "PARSE OK"
-    match lowerStmt envFor stmt with
-    | .error e => IO.println s!"LOWER ERROR: {e}"
+    match lowerStmt env stmt with
+    | .error e => IO.println s!"  ✖ LOWER ERROR: {e}"
     | .ok act =>
-      IO.println "LOWER OK"
-      IO.println "--- generated WGSL (top of) ---"
+      IO.println "  ✓ PARSE + LOWER OK"
       let s := renderShader act
       let lines := s.splitOn "\n"
-      for ln in lines.take 30 do IO.println ln
-      IO.println s!"... ({lines.length} lines total)"
-      IO.println "═══ done ═══"
+      IO.println s!"  ({lines.length} lines of WGSL emitted)"
+
+def main : IO Unit := do
+  IO.println "═══ Phase 10: MMQ Q4_K transpile probes ═══"
+  IO.println ""
+  probe "Phase 10  : nested-3 with stub bodies" innerDotBody envFor
+  probe "Phase 10b : sum[idx] += value (compound assign on local arr)" innerDotBodyAggressive envForAggressive
+  IO.println ""
+  IO.println "═══ done ═══"
 
 end Hesper.Transpile.CUDA.MMQQ4KSmoke
 
