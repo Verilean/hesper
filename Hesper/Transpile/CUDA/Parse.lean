@@ -750,10 +750,23 @@ partial def parseDeclWithSemiStorage (storage : Storage) : ParseM CStmt := do
   let ty ← parseTypeSpec
   match (← consume) with
   | .ident name =>
-    -- Optional array size: `name[N]`
+    -- Optional array size: `name[N]` (or multi-dim `name[N][M][...]`).
+    -- We capture the FIRST dimension as the size expression — extra
+    -- dimensions are folded into the type text by appending ` *`.
     if (← matchPunct "[") then
       let szExpr ← parseExpr
       expectPunct "]"
+      -- Consume any further `[N]` dimensions
+      let mut tyAdj := ty
+      while (← matchPunct "[") do
+        tyAdj := tyAdj ++ " *"
+        let mut depth : Int := 1
+        while depth > 0 do
+          match (← peek) with
+          | .punct "[" => bump; depth := depth + 1
+          | .punct "]" => bump; depth := depth - 1
+          | .eof => break
+          | _ => bump
       -- Optional `= {...}` initializer (we accept and ignore for now)
       if (← matchPunct "=") then
         if (← matchPunct "{") then
@@ -768,7 +781,7 @@ partial def parseDeclWithSemiStorage (storage : Storage) : ParseM CStmt := do
         else
           let _ ← parseAssign
       expectPunct ";"
-      pure (CStmt.declArr storage ty name szExpr)
+      pure (CStmt.declArr storage tyAdj name szExpr)
     else
       let init ← if (← matchPunct "=") then
         let e ← parseAssign
@@ -1123,11 +1136,11 @@ partial def classifyTopLevel : ParseM String := do
   let mut j := st.i
   let n := toks.size
   -- Skip leading attributes / template heads / qualifiers in the lookahead
-  let mut sawTemplate := false
+  let mut _sawTemplate := false
   while j < n do
     match toks[j]!.tok with
     | .ident "template" =>
-      sawTemplate := true
+      _sawTemplate := true
       j := j + 1
       -- skip balanced <...>
       if j < n ∧ toks[j]!.tok == .punct "<" then
