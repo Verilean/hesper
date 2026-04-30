@@ -19,6 +19,7 @@ inductive Tok where
   | ident (s : String)
   | num   (s : String)
   | fnum  (s : String)
+  | str   (s : String)   -- string literal contents (without quotes)
   | punct (s : String)
   | eof
   deriving Repr, Inhabited, BEq
@@ -43,9 +44,9 @@ private def isHexDigit (c : Char) : Bool :=
 private def known2 : Array String := #[
   "<<", ">>", "<=", ">=", "==", "!=", "&&", "||",
   "+=", "-=", "*=", "/=", "%=", "&=", "|=", "^=",
-  "++", "--", "->"]
+  "++", "--", "->", "::"]
 
-private def known3 : Array String := #["<<=", ">>=", "..."]
+private def known3 : Array String := #["<<=", ">>=", "...", "<<<", ">>>"]
 
 /-- Lex a CUDA source string into a token array. Always succeeds —
     unrecognised characters become single-char `punct` tokens. -/
@@ -75,6 +76,88 @@ partial def lex (src : String) : Array Spanned := Id.run do
       let (i', l', c') := advance i line col 1
       i := i'; line := l'; col := c'
       continue
+    -- Skip preprocessor directives. Two cases:
+    --
+    --   1. `#else` / `#elif` open an alternative branch we skip — keep
+    --      the `#if`/`#ifdef`/`#ifndef` branch (the "first" branch),
+    --      drop the alternative until the matching `#endif`. Without a
+    --      real preprocessor this approximates the most common build
+    --      configuration (the codebase tends to put the production
+    --      path in the first branch and arch-fallbacks in `#else`).
+    --      Critically, this avoids keeping BOTH branches which yields
+    --      malformed code (two `: ...;` after one `?`).
+    --
+    --   2. Other directives (`#include`, `#define`, `#pragma`,
+    --      `#error`, `#undef`, `#if`, `#ifdef`, `#ifndef`, `#endif`)
+    --      are line-skip — just consume to end-of-line. Backslash-
+    --      newline continuation for multi-line `#define` is respected.
+    if c = '#' then
+      let mut k := src.next i
+      while k < endPos ∧ (src.get k = ' ' ∨ src.get k = '\t') do
+        k := src.next k
+      let mut nameAcc := ""
+      while k < endPos ∧ (src.get k).isAlpha do
+        nameAcc := nameAcc.push (src.get k)
+        k := src.next k
+      let isElse := nameAcc == "else" ∨ nameAcc == "elif"
+      if isElse then
+        -- Skip everything from this `#else`/`#elif` until the matching
+        -- `#endif`, tracking nested `#if*`.
+        let mut j := i
+        let mut depth : Nat := 0
+        let mut atLineStart : Bool := true
+        while j < endPos do
+          let ch := src.get j
+          if ch = '\n' then
+            atLineStart := true
+            j := src.next j
+          else if ch = ' ' ∨ ch = '\t' then
+            j := src.next j
+          else if ch = '#' ∧ atLineStart then
+            atLineStart := false
+            let mut m := src.next j
+            while m < endPos ∧ (src.get m = ' ' ∨ src.get m = '\t') do
+              m := src.next m
+            let mut name2 := ""
+            while m < endPos ∧ (src.get m).isAlpha do
+              name2 := name2.push (src.get m)
+              m := src.next m
+            if name2 == "if" ∨ name2 == "ifdef" ∨ name2 == "ifndef" then
+              depth := depth + 1
+            else if name2 == "endif" then
+              if depth == 0 then
+                while m < endPos ∧ src.get m ≠ '\n' do
+                  m := src.next m
+                if m < endPos then m := src.next m
+                j := m
+                break
+              else
+                depth := depth - 1
+            while m < endPos ∧ src.get m ≠ '\n' do
+              m := src.next m
+            if m < endPos then m := src.next m
+            j := m
+          else
+            atLineStart := false
+            j := src.next j
+        let span := j.byteIdx - i.byteIdx
+        let (i', l', c') := advance i line col span
+        i := i'; line := l'; col := c'
+        continue
+      else
+        -- Plain single-line directive
+        let mut j := i
+        let mut prev : Char := ' '
+        while j < endPos do
+          let ch := src.get j
+          if ch = '\n' ∧ prev ≠ '\\' then break
+          prev := ch
+          j := src.next j
+        if j < endPos ∧ src.get j = '\n' then j := src.next j
+        let span := j.byteIdx - i.byteIdx
+        let (i', l', c') := advance i line col span
+        i := i'; line := l'; col := c'
+        continue
     -- Skip comments
     if c = '/' ∧ src.next i < endPos then
       let c2 := src.get (src.next i)
@@ -155,6 +238,52 @@ partial def lex (src : String) : Array Spanned := Id.run do
       i := j; line := l'; col := c'
       let t := if isFloat then Tok.fnum acc else Tok.num acc
       toks := toks.push { tok := t, pos }
+      continue
+    -- String literal: `"..."` with `\` escapes. Captures the contents
+    -- (no quotes). Multi-line strings are accepted.
+    if c = '"' then
+      let mut acc := ""
+      let mut j := src.next i
+      while j < endPos ∧ src.get j ≠ '"' do
+        let ch := src.get j
+        if ch = '\\' ∧ src.next j < endPos then
+          -- consume escape
+          acc := acc.push ch
+          j := src.next j
+          acc := acc.push (src.get j)
+          j := src.next j
+        else
+          acc := acc.push ch
+          j := src.next j
+      -- consume closing quote (if present)
+      if j < endPos then j := src.next j
+      let len := j.byteIdx - i.byteIdx
+      let (i', l', c') := advance i line col len
+      i := j; line := l'; col := c'
+      toks := toks.push { tok := .str acc, pos }
+      continue
+    -- Character literal: `'c'` or `'\\n'` — emit as a num token whose
+    -- text is the literal source span (parser treats it as int-like).
+    if c = '\'' then
+      let mut acc := "'"
+      let mut j := src.next i
+      while j < endPos ∧ src.get j ≠ '\'' do
+        let ch := src.get j
+        if ch = '\\' ∧ src.next j < endPos then
+          acc := acc.push ch
+          j := src.next j
+          acc := acc.push (src.get j)
+          j := src.next j
+        else
+          acc := acc.push ch
+          j := src.next j
+      if j < endPos then
+        acc := acc.push '\''
+        j := src.next j
+      let len := j.byteIdx - i.byteIdx
+      let (i', l', c') := advance i line col len
+      i := j; line := l'; col := c'
+      toks := toks.push { tok := .num acc, pos }
       continue
     -- Punctuation: try 3-char, then 2-char, then 1-char.
     let p1 := src.next i

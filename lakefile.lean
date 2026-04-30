@@ -1333,6 +1333,21 @@ lean_exe «transpile-cuda-mmq-outer-smoke» where
   supportInterpreter := false
   moreLinkArgs := stdLinkArgs
 
+lean_exe «transpile-cuda-unpack-scales-smoke» where
+  root := `Tests.Transpile.CUDAUnpackScalesSmoke
+  supportInterpreter := false
+  moreLinkArgs := stdLinkArgs
+
+lean_exe «transpile-cuda-mmq-q4k-full-smoke» where
+  root := `Tests.Transpile.CUDAMMQQ4KFullSmoke
+  supportInterpreter := false
+  moreLinkArgs := stdLinkArgs
+
+lean_exe «transpile-cuda-translation-unit» where
+  root := `Tests.Transpile.CUDATranslationUnit
+  supportInterpreter := false
+  moreLinkArgs := stdLinkArgs
+
 lean_exe «wmma-ptx-text-test» where
   root := `Tests.CUDA.WmmaPTXTextTest
   supportInterpreter := false
