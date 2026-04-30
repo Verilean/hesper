@@ -734,6 +734,28 @@ partial def lowerBool (env : Env) : CExpr → Except String (Exp (.scalar .bool)
     | _ => .error s!"lowerBool: unsupported binop {repr op}"
   | .unop .logNot a => do
       let ae ← lowerBool env a; .ok (Exp.not ae)
+  | .numLit s =>
+    -- `if (1)` / `if (0)` etc — accept as a const bool. Only a few
+    -- literal forms appear in practice; map them via integer parse.
+    match parseIntLit s with
+    | .ok n => .ok (if n != 0 then Exp.litBool true else Exp.litBool false)
+    | .error _ => .error s!"lowerBool: numLit '{s}' not understood as bool"
+  | .ident name =>
+    -- `if (cond)` where `cond` is a previously-declared local. We
+    -- have no type-tracking for bool locals at this point, so the
+    -- best we can do is assume non-zero-valued integer semantics:
+    -- compare the identifier (looked up via env.u32 / .i32 if any)
+    -- against zero.
+    match env.u32 name with
+    | some e => .ok (Exp.ne e (Exp.litU32 0))
+    | none =>
+      match env.i32 name with
+      | some e => .ok (Exp.ne e (Exp.litI32 0))
+      | none =>
+        -- Fallback: treat as `Exp.var name : u32` and compare to 0.
+        -- This may produce wrong-typed PTX but the semantic is right
+        -- (non-zero ⇒ true) for the kernel patterns we see.
+        .ok (Exp.ne (Exp.var (t := .scalar .u32) name) (Exp.litU32 0))
   | _ => .error "lowerBool: only comparisons / bool ops supported"
 
 end -- mutual

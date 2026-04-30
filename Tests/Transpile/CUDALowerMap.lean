@@ -1,6 +1,7 @@
 import Hesper.Transpile.CUDA
 import Hesper.Transpile.CUDA.Parse
 import Hesper.Transpile.CUDA.LowerStmt
+import Hesper.Transpile.CUDA.MMQEnv
 import Hesper.WGSL.Monad
 import Hesper.WGSL.Shader
 
@@ -52,11 +53,11 @@ def isEmptyBlock : CStmt → Bool
   | .block stmts => stmts.size == 0
   | _ => false
 
-def lowerOne (f : CFunction) : FnRow :=
+def lowerOne (env : Env) (f : CFunction) : FnRow :=
   if isEmptyBlock f.body then
     { name := f.name, bodyEmpty := true, lowerErr := none, shaderLen := 0 }
   else
-    match lowerStmt Env.empty f.body with
+    match lowerStmt env f.body with
     | .ok act =>
       let s := renderShader act
       { name := f.name, bodyEmpty := false, lowerErr := none,
@@ -71,7 +72,7 @@ structure Counts where
   bodyEmpty : Nat := 0
   fail      : Nat := 0
 
-def runFile (path : System.FilePath) : IO Counts := do
+def runFile (env : Env) (path : System.FilePath) : IO Counts := do
   let present ← path.pathExists
   if !present then
     IO.println s!"  (skipped — file not found: {path})"
@@ -83,7 +84,7 @@ def runFile (path : System.FilePath) : IO Counts := do
   let mut rows : Array FnRow := #[]
   for it in items do
     match it with
-    | .function f => rows := rows.push (lowerOne f)
+    | .function f => rows := rows.push (lowerOne env f)
     | _ => pure ()
   let mut nOk : Nat := 0
   let mut nEmpty : Nat := 0
@@ -142,7 +143,12 @@ def runFile (path : System.FilePath) : IO Counts := do
   pure { ok := nOk, bodyEmpty := nEmpty, fail := nFail }
 
 def main (args : List String) : IO Unit := do
-  let paths : List System.FilePath := match args with
+  -- `--mmq` flag: pre-load MMQ helper inlines + threadIdx/blockIdx
+  -- builtins. Without it, every call to `mmq_get_nwarps_device()` etc
+  -- fails because the lower has no idea what value to use.
+  let useMMQ := args.contains "--mmq"
+  let pathArgs := args.filter (fun a => !a.startsWith "--")
+  let paths : List System.FilePath := match pathArgs with
     | [] => [
         "llama.cpp/ggml/src/ggml-cuda/quantize.cu",
         "llama.cpp/ggml/src/ggml-cuda/vecdotq.cuh",
@@ -150,12 +156,14 @@ def main (args : List String) : IO Unit := do
         "llama.cpp/ggml/src/ggml-cuda/mmq.cuh"
       ]
     | xs => xs.map System.FilePath.mk
-  IO.println "═══ Phase 12: lower-coverage map (default Env) ═══"
+  let env := if useMMQ then mmqDefaultEnv else Env.empty
+  let label := if useMMQ then "MMQ default" else "default Env"
+  IO.println s!"═══ Phase 12: lower-coverage map ({label}) ═══"
   let mut totalOk := 0
   let mut totalEmpty := 0
   let mut totalFail := 0
   for p in paths do
-    let c ← runFile p
+    let c ← runFile env p
     totalOk := totalOk + c.ok
     totalEmpty := totalEmpty + c.bodyEmpty
     totalFail := totalFail + c.fail
