@@ -30,6 +30,18 @@ open Hesper.WGSL
 CUDA variables can have any type; we resolve them at lookup time
 using a typed environment. -/
 
+-- Buffer binding for pointer/array-typed CUDA parameters.
+-- name    = WGSL buffer or smem variable name to emit.
+-- elemTy  = element type (Scalar i32/u32/f32; bytes packed into u32).
+-- offset? = compile-time / runtime base offset (added to every index).
+--           Used to encode CUDA pointer arithmetic like `x += off; x[i]`
+--           by accumulating `off` into the binding without rewriting
+--           each load site.  None ≡ 0 offset.
+structure BufBinding where
+  name    : String
+  elemTy  : WGSLType
+  offset? : Option (Exp (.scalar .u32)) := none
+
 /-- Identifier environment: maps a CUDA name to a typed Hesper `Exp`
     for any of the scalar types we currently lower to. Lookup misses
     fall back to `Exp.var name`. -/
@@ -37,6 +49,32 @@ structure Env where
   u32 : String → Option (Exp (.scalar .u32)) := fun _ => none
   i32 : String → Option (Exp (.scalar .i32)) := fun _ => none
   f32 : String → Option (Exp (.scalar .f32)) := fun _ => none
+  /-- Compile-time integer constants — used to evaluate template params
+      and `#define` values that appear in array sizes (e.g. `mmq_y`,
+      `MMQ_TILE_NE_K`). Looked up by `evalConst` in `LowerStmt`. -/
+  consts : String → Option Int := fun _ => none
+  /-- Pointer / array-param bindings. `v[i]` for `v : int*` looks up
+      `bufs "v"` and emits `Exp.index (Exp.var name) i`. -/
+  bufs   : String → Option BufBinding := fun _ => none
+  /-- Member-access resolver for builtin compound names.  `threadIdx.x`
+      is parsed as `member (ident "threadIdx") "x"` — the lowering
+      consults `members ("threadIdx", "x")` to obtain the right
+      ShaderM expression (e.g. `Exp.vec3X (Exp.var "__local_id")`).
+      Returns the lowered `Exp` already wrapped in the appropriate
+      scalar type encoded as `Sigma` (we use a Σ-erased form: callers
+      pull from one of the typed members below). -/
+  threadIdxX : Option (Exp (.scalar .u32)) := none
+  threadIdxY : Option (Exp (.scalar .u32)) := none
+  threadIdxZ : Option (Exp (.scalar .u32)) := none
+  blockIdxX  : Option (Exp (.scalar .u32)) := none
+  blockIdxY  : Option (Exp (.scalar .u32)) := none
+  blockIdxZ  : Option (Exp (.scalar .u32)) := none
+  blockDimX  : Option (Exp (.scalar .u32)) := none
+  blockDimY  : Option (Exp (.scalar .u32)) := none
+  blockDimZ  : Option (Exp (.scalar .u32)) := none
+  gridDimX   : Option (Exp (.scalar .u32)) := none
+  gridDimY   : Option (Exp (.scalar .u32)) := none
+  gridDimZ   : Option (Exp (.scalar .u32)) := none
 
 /-- Empty environment: every name resolves to `Exp.var name`. -/
 def Env.empty : Env := {}
@@ -135,7 +173,14 @@ partial def lowerU32 (env : Env) : CExpr → Except String (Exp (.scalar .u32))
   | .ident name =>
     match env.u32 name with
     | some e => .ok e
-    | none => .ok (Exp.var name)
+    | none =>
+      -- Fall back to compile-time const lookup (template params,
+      -- `#define`s like QR4_K → 2).
+      match env.consts name with
+      | some n =>
+        if n < 0 then .ok (Exp.var name)
+        else .ok (Exp.litU32 n.toNat)
+      | none => .ok (Exp.var name)
   | .unop op a =>
     match op with
     | .bitNot => do
@@ -170,8 +215,41 @@ partial def lowerU32 (env : Env) : CExpr → Except String (Exp (.scalar .u32))
     else
       .error s!"lowerU32: cast to '{ty}' not supported"
   | .ternary _ _ _ => .error "lowerU32: ternary not yet supported"
-  | .index _ _ => .error "lowerU32: index expr not yet supported"
-  | .member _ _ => .error "lowerU32: member access not yet supported"
+  | .index obj i => do
+    let name ← match obj with
+      | .ident n => .ok n
+      | _ => .error "lowerU32: only `name[i]` index supported (no nested arrays)"
+    match env.bufs name with
+    | none => .error s!"lowerU32: '{name}' not bound as a buffer; add it to env.bufs"
+    | some b =>
+      let ie ← lowerU32 env i
+      let idx := match b.offset? with
+        | some off => Exp.add off ie
+        | none => ie
+      match b.elemTy with
+      | .scalar .u32 =>
+        .ok (Exp.index (Exp.var b.name : Exp (.array (.scalar .u32) 0)) idx)
+      | .scalar .i32 =>
+        -- `int *v` indexed in u32 context: bitcast.
+        .ok (Exp.toU32 (Exp.index (Exp.var b.name : Exp (.array (.scalar .i32) 0)) idx))
+      | t => .error s!"lowerU32: buffer '{name}' has elem type {repr t}"
+  | .member (.ident base) field =>
+    -- CUDA builtins: threadIdx.x/y/z, blockIdx.x/y/z, blockDim.x/y/z, gridDim.x/y/z
+    match base, field with
+    | "threadIdx", "x" => match env.threadIdxX with | some e => .ok e | none => .error "lowerU32: threadIdx.x not bound (set env.threadIdxX)"
+    | "threadIdx", "y" => match env.threadIdxY with | some e => .ok e | none => .error "lowerU32: threadIdx.y not bound"
+    | "threadIdx", "z" => match env.threadIdxZ with | some e => .ok e | none => .error "lowerU32: threadIdx.z not bound"
+    | "blockIdx",  "x" => match env.blockIdxX  with | some e => .ok e | none => .error "lowerU32: blockIdx.x not bound"
+    | "blockIdx",  "y" => match env.blockIdxY  with | some e => .ok e | none => .error "lowerU32: blockIdx.y not bound"
+    | "blockIdx",  "z" => match env.blockIdxZ  with | some e => .ok e | none => .error "lowerU32: blockIdx.z not bound"
+    | "blockDim",  "x" => match env.blockDimX  with | some e => .ok e | none => .error "lowerU32: blockDim.x not bound"
+    | "blockDim",  "y" => match env.blockDimY  with | some e => .ok e | none => .error "lowerU32: blockDim.y not bound"
+    | "blockDim",  "z" => match env.blockDimZ  with | some e => .ok e | none => .error "lowerU32: blockDim.z not bound"
+    | "gridDim",   "x" => match env.gridDimX   with | some e => .ok e | none => .error "lowerU32: gridDim.x not bound"
+    | "gridDim",   "y" => match env.gridDimY   with | some e => .ok e | none => .error "lowerU32: gridDim.y not bound"
+    | "gridDim",   "z" => match env.gridDimZ   with | some e => .ok e | none => .error "lowerU32: gridDim.z not bound"
+    | _, _ => .error s!"lowerU32: unsupported member access '{base}.{field}'"
+  | .member _ _ => .error "lowerU32: member access on non-builtin not yet supported"
   | .arrow _ _ => .error "lowerU32: arrow access not yet supported"
   | .comma _ _ => .error "lowerU32: comma operator not supported"
 
@@ -183,7 +261,10 @@ partial def lowerI32 (env : Env) : CExpr → Except String (Exp (.scalar .i32))
   | .ident name =>
     match env.i32 name with
     | some e => .ok e
-    | none => .ok (Exp.var name)
+    | none =>
+      match env.consts name with
+      | some n => .ok (Exp.litI32 n)
+      | none => .ok (Exp.var name)
   | .unop op a =>
     match op with
     | .neg => do
@@ -194,10 +275,23 @@ partial def lowerI32 (env : Env) : CExpr → Except String (Exp (.scalar .i32))
     let bin (mk : Exp (.scalar .i32) → Exp (.scalar .i32) → Exp (.scalar .i32))
         : Except String (Exp (.scalar .i32)) := do
       let ae ← lowerI32 env a; let be ← lowerI32 env b; .ok (mk ae be)
+    let bitop (mk : Exp (.scalar .u32) → Exp (.scalar .u32) → Exp (.scalar .u32))
+        : Except String (Exp (.scalar .i32)) := do
+      -- CUDA's `int` bitwise ops are conventionally implemented on the
+      -- underlying 32-bit pattern. We bitcast through u32, op, bitcast
+      -- back. (`Exp.toI32` / `toU32` lower to WGSL `i32(...)` / `u32(...)`
+      -- which on PTX is a no-op for same-bit-width int conversions.)
+      let ae ← lowerU32 env a; let be ← lowerU32 env b
+      .ok (Exp.toI32 (mk ae be))
     match op with
     | .add => bin Exp.add
     | .sub => bin Exp.sub
     | .mul => bin Exp.mul
+    | .bitAnd => bitop Exp.bitAnd
+    | .bitOr  => bitop Exp.bitOr
+    | .bitXor => bitop Exp.bitXor
+    | .shl    => bitop Exp.shiftLeft
+    | .shr    => bitop Exp.shiftRight
     | _ => .error s!"lowerI32: unsupported binop {repr op}"
   | .call fn args =>
     match fn, args.toList with
@@ -207,6 +301,15 @@ partial def lowerI32 (env : Env) : CExpr → Except String (Exp (.scalar .i32))
       let be ← lowerU32 env b
       let ce ← lowerI32 env c
       .ok (Exp.add ce (Exp.dot4I8Packed ae be))
+    | "__vsubss4", [a, b] => do
+      -- __vsubss4(a, b) = signed-saturating sub per byte. The CUDA
+      -- declared return type is `int`, but bit-pattern is 4 packed
+      -- int8s — most callers immediately feed it into `__dp4a`,
+      -- which takes u32. We lift to u32 + bitcast back to i32 so
+      -- both flows work.
+      let ae ← lowerU32 env a
+      let be ← lowerU32 env b
+      .ok (Exp.toI32 (Exp.subSatS8x4 ae be))
     | _, _ => .error s!"lowerI32: unsupported call '{fn}' with {args.size} args"
   | .cast ty inner =>
     if ty.endsWith "int" ∨ ty == "int32_t" ∨ ty == "i32" then
@@ -214,8 +317,31 @@ partial def lowerI32 (env : Env) : CExpr → Except String (Exp (.scalar .i32))
     else
       .error s!"lowerI32: cast to '{ty}' not supported"
   | .ternary _ _ _ => .error "lowerI32: ternary not yet supported"
-  | .index _ _ => .error "lowerI32: index expr not yet supported"
-  | .member _ _ => .error "lowerI32: member access not yet supported"
+  | .index obj i => do
+    let name ← match obj with
+      | .ident n => .ok n
+      | _ => .error "lowerI32: only `name[i]` index supported (no nested arrays)"
+    match env.bufs name with
+    | none => .error s!"lowerI32: '{name}' not bound as a buffer; add it to env.bufs"
+    | some b =>
+      let ie ← lowerU32 env i
+      let idx := match b.offset? with
+        | some off => Exp.add off ie
+        | none => ie
+      match b.elemTy with
+      | .scalar .i32 =>
+        .ok (Exp.index (Exp.var b.name : Exp (.array (.scalar .i32) 0)) idx)
+      | .scalar .u32 =>
+        -- `int * v` in CUDA may alias an `unsigned *` buffer; lift to i32.
+        .ok (Exp.toI32 (Exp.index (Exp.var b.name : Exp (.array (.scalar .u32) 0)) idx))
+      | t => .error s!"lowerI32: buffer '{name}' has elem type {repr t}, not i32/u32"
+  | .member (.ident base) field =>
+    -- Try lowering as u32 then bitcast to i32. The u32 lowering covers
+    -- all CUDA builtin members (threadIdx.x, etc.).
+    match lowerU32 env (.member (.ident base) field) with
+    | .ok x => .ok (Exp.toI32 x)
+    | .error err => .error s!"lowerI32: member access '{base}.{field}' — {err}"
+  | .member _ _ => .error "lowerI32: member access on non-builtin not yet supported"
   | .arrow _ _ => .error "lowerI32: arrow access not yet supported"
   | .comma _ _ => .error "lowerI32: comma operator not supported"
 
@@ -237,9 +363,20 @@ partial def lowerF32 (env : Env) : CExpr → Except String (Exp (.scalar .f32))
       .ok (Exp.neg ae)
     | _ => .error s!"lowerF32: unsupported unary {repr op}"
   | .binop op a b =>
+    -- Try f32 directly. If a sub-expression is i32 (e.g. `__dp4a` chain
+    -- or `int * int`), promote to f32 via `Exp.toF32`. Mirrors C's
+    -- implicit `int → float` conversion at mixed-type binary ops.
+    let lowerToF32 (e : CExpr) : Except String (Exp (.scalar .f32)) :=
+      match lowerF32 env e with
+      | .ok x => .ok x
+      | .error _ =>
+        match lowerI32 env e with
+        | .ok x => .ok (Exp.toF32 x)
+        | .error _ =>
+          lowerU32 env e |>.map Exp.toF32
     let bin (mk : Exp (.scalar .f32) → Exp (.scalar .f32) → Exp (.scalar .f32))
         : Except String (Exp (.scalar .f32)) := do
-      let ae ← lowerF32 env a; let be ← lowerF32 env b; .ok (mk ae be)
+      let ae ← lowerToF32 a; let be ← lowerToF32 b; .ok (mk ae be)
     match op with
     | .add => bin Exp.add
     | .sub => bin Exp.sub
@@ -266,6 +403,37 @@ partial def lowerF32 (env : Env) : CExpr → Except String (Exp (.scalar .f32))
       let be ← lowerF32 env b
       let ce ← lowerF32 env c
       .ok (Exp.fma ae be ce)
+    | "rsqrtf", [a] => do
+      let ae ← lowerF32 env a
+      .ok (Exp.inverseSqrt ae)
+    | "sqrtf", [a] => do
+      let ae ← lowerF32 env a
+      .ok (Exp.sqrt ae)
+    | "fabsf", [a] => do
+      let ae ← lowerF32 env a
+      .ok (Exp.abs ae)
+    | "expf", [a] => do
+      let ae ← lowerF32 env a
+      .ok (Exp.exp ae)
+    | "logf", [a] => do
+      let ae ← lowerF32 env a
+      .ok (Exp.log ae)
+    | "fmaxf", [a, b] => do
+      let ae ← lowerF32 env a; let be ← lowerF32 env b
+      .ok (Exp.max ae be)
+    | "fminf", [a, b] => do
+      let ae ← lowerF32 env a; let be ← lowerF32 env b
+      .ok (Exp.min ae be)
+    | "__shfl_xor_sync", [_mask, val, lane, _width] => do
+      -- __shfl_xor_sync(mask, val, lane_offset, width=warpSize)
+      -- → Exp.subgroupShuffleXor val lane_offset
+      let ve ← lowerF32 env val
+      let le ← lowerU32 env lane
+      .ok (Exp.subgroupShuffleXor ve le)
+    | "__shfl_xor_sync", [_mask, val, lane] => do
+      let ve ← lowerF32 env val
+      let le ← lowerU32 env lane
+      .ok (Exp.subgroupShuffleXor ve le)
     | _, _ => .error s!"lowerF32: unsupported call '{fn}' with {args.size} args"
   | .cast ty inner =>
     if ty.endsWith "float" ∨ ty.endsWith "f32" then
@@ -280,7 +448,25 @@ partial def lowerF32 (env : Env) : CExpr → Except String (Exp (.scalar .f32))
     else
       .error s!"lowerF32: cast to '{ty}' not supported"
   | .ternary _ _ _ => .error "lowerF32: ternary not yet supported"
-  | .index _ _ => .error "lowerF32: index expr not yet supported"
+  | .index obj i => do
+    let name ← match obj with
+      | .ident n => .ok n
+      | _ => .error "lowerF32: only `name[i]` index supported"
+    match env.bufs name with
+    | none => .error s!"lowerF32: '{name}' not bound as a buffer; add it to env.bufs"
+    | some b =>
+      let ie ← lowerU32 env i
+      let idx := match b.offset? with
+        | some off => Exp.add off ie
+        | none => ie
+      match b.elemTy with
+      | .scalar .f32 =>
+        .ok (Exp.index (Exp.var b.name : Exp (.array (.scalar .f32) 0)) idx)
+      | .scalar .i32 =>
+        .ok (Exp.toF32 (Exp.index (Exp.var b.name : Exp (.array (.scalar .i32) 0)) idx))
+      | .scalar .u32 =>
+        .ok (Exp.toF32 (Exp.index (Exp.var b.name : Exp (.array (.scalar .u32) 0)) idx))
+      | t => .error s!"lowerF32: buffer '{name}' has elem type {repr t}"
   | .member _ _ => .error "lowerF32: member access not yet supported"
   | .arrow _ _ => .error "lowerF32: arrow access not yet supported"
   | .comma _ _ => .error "lowerF32: comma operator not supported"

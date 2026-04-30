@@ -352,14 +352,47 @@ partial def parseStmt : ParseM CStmt := do
     pure (CStmt.pragma text.trim)
   | .ident kw =>
     if kw == "if" then
-      bump; expectPunct "("
+      bump
+      -- Handle `if constexpr (cond)` — the `constexpr` token is just
+      -- a marker before the condition.
+      let isConstexpr ← match (← peek) with
+        | .ident "constexpr" => bump; pure true
+        | _ => pure false
+      expectPunct "("
       let c ← parseExpr
       expectPunct ")"
       let thn ← parseStmt
       let els ← match (← peek) with
-        | .ident "else" => bump; let s ← parseStmt; pure (some s)
+        | .ident "else" => bump
+                           -- `else if` chains: parse next statement
+                           -- (which may itself be another `if constexpr`).
+                           let s ← parseStmt; pure (some s)
         | _ => pure none
-      pure (CStmt.if_ c thn els)
+      pure (if isConstexpr then CStmt.ifConstexpr c thn els else CStmt.if_ c thn els)
+    else if kw == "static_assert" then
+      bump; expectPunct "("
+      -- Skip everything up to matching ')'.
+      let mut depth := 1
+      while depth > 0 do
+        match (← consume) with
+        | .punct "(" => depth := depth + 1
+        | .punct ")" => depth := depth - 1
+        | .eof => throw "parseStmt: unmatched '(' in static_assert"
+        | _ => pure ()
+      expectPunct ";"
+      pure CStmt.staticAssert
+    else if kw == "extern" then
+      -- `extern __shared__ T name[];`
+      bump
+      match (← peek) with
+      | .ident "__shared__" => bump
+      | t => throw s!"parseStmt: expected '__shared__' after 'extern', got {repr t}"
+      let ty ← parseTypeSpec
+      match (← consume) with
+      | .ident name =>
+        expectPunct "["; expectPunct "]"; expectPunct ";"
+        pure (CStmt.externSharedArr ty name)
+      | t => throw s!"parseStmt: expected name in 'extern __shared__', got {repr t}"
     else if kw == "for" then
       bump; expectPunct "("
       -- init
@@ -415,6 +448,12 @@ partial def parseStmt : ParseM CStmt := do
     else if kw == "__syncthreads" then
       bump; expectPunct "("; expectPunct ")"; expectPunct ";"
       pure CStmt.sync_
+    else if kw == "__shared__" then
+      bump
+      parseDeclWithSemiStorage Storage.shared
+    else if kw == "__constant__" then
+      bump
+      parseDeclWithSemiStorage Storage.constant
     else if isTypeKW kw ∨ kw == "const" ∨ kw == "volatile"
             ∨ kw == "__restrict__" ∨ kw == "__device__" then
       parseDeclWithSemi
@@ -443,8 +482,10 @@ partial def eatPragmaTokens (acc : String) : ParseM String := do
 
 /-- Parse a declaration, expecting a trailing `;`. Handles
     `int k = 0;`, `int qs[N] = {...};` (no init list yet),
-    `int x;`, `int * p = ...;`. Multi-declarators (`int a, b;`) NYI. -/
-partial def parseDeclWithSemi : ParseM CStmt := do
+    `int x;`, `int * p = ...;`. Multi-declarators (`int a, b;`) NYI.
+    The leading `__shared__` / `__constant__` keyword (if any) is
+    captured in `storage`. -/
+partial def parseDeclWithSemiStorage (storage : Storage) : ParseM CStmt := do
   let ty ← parseTypeSpec
   match (← consume) with
   | .ident name =>
@@ -466,15 +507,18 @@ partial def parseDeclWithSemi : ParseM CStmt := do
         else
           let _ ← parseAssign
       expectPunct ";"
-      pure (CStmt.declArr ty name szExpr)
+      pure (CStmt.declArr storage ty name szExpr)
     else
       let init ← if (← matchPunct "=") then
         let e ← parseAssign
         pure (some e)
       else pure none
       expectPunct ";"
-      pure (CStmt.decl ty name init)
+      pure (CStmt.decl storage ty name init)
   | t => throw s!"parseDeclWithSemi: expected ident, got {repr t}"
+
+partial def parseDeclWithSemi : ParseM CStmt :=
+  parseDeclWithSemiStorage Storage.none
 
 end -- mutual
 
@@ -491,6 +535,111 @@ def parseStmtStr (src : String) : Except String CStmt :=
       | t => .error s!"trailing tokens after statement: {repr t}"
     else
       .ok s
+
+/-! ## Function-prototype parsing (Phase 4) -/
+
+/-- Skip CUDA function attributes: `__device__`, `__forceinline__`,
+    `__global__`, `inline`, `static`, etc. Returns the list of
+    attributes captured. -/
+partial def parseAttrs : ParseM (Array String) := do
+  let rec loop (acc : Array String) : ParseM (Array String) := do
+    match (← peek) with
+    | .ident s =>
+      if s == "__device__" ∨ s == "__forceinline__" ∨ s == "__global__"
+         ∨ s == "__host__" ∨ s == "inline" ∨ s == "static"
+         ∨ s == "extern" ∨ s == "constexpr" then
+        bump; loop (acc.push s)
+      else pure acc
+    | _ => pure acc
+  loop #[]
+
+/-- Parse `<T1 a, T2 b, ...>` after an initial `template`. Position is
+    just past the keyword. -/
+partial def parseTemplateParams : ParseM (Array CTemplParam) := do
+  expectPunct "<"
+  if (← matchPunct ">") then pure #[]
+  else
+    let parseOne : ParseM CTemplParam := do
+      -- Type token (treat `int`, `bool`, `ggml_type` etc. as opaque ident)
+      match (← consume) with
+      | .ident ty =>
+        match (← consume) with
+        | .ident name => pure { ty, name }
+        | t => throw s!"parseTemplateParams: expected name, got {repr t}"
+      | t => throw s!"parseTemplateParams: expected type ident, got {repr t}"
+    let head ← parseOne
+    let rec loop (acc : Array CTemplParam) : ParseM (Array CTemplParam) := do
+      if (← matchPunct ",") then
+        let p ← parseOne; loop (acc.push p)
+      else pure acc
+    let result ← loop #[head]
+    expectPunct ">"
+    pure result
+
+/-- Parse a single function parameter: `<type> <name> [= <default>]`.
+    The default expression is parsed if present; we accept it but the
+    lowering can ignore it for kernels invoked with explicit arguments. -/
+partial def parseParam : ParseM CParam := do
+  let ty ← parseTypeSpec
+  match (← consume) with
+  | .ident name =>
+    -- Optional `= <default-expr>`. The default expression is at
+    -- assignment precedence and stops at `,` or `)`.
+    if (← matchPunct "=") then
+      let d ← parseAssign
+      pure { ty, name, default? := some d }
+    else
+      pure { ty, name }
+  | t => throw s!"parseParam: expected name, got {repr t}"
+
+/-- Parse `( <param>, <param>, ... )`. Position is just past `(`. -/
+partial def parseParams : ParseM (Array CParam) := do
+  if (← matchPunct ")") then pure #[]
+  else
+    let head ← parseParam
+    let rec loop (acc : Array CParam) : ParseM (Array CParam) := do
+      if (← matchPunct ",") then
+        let p ← parseParam; loop (acc.push p)
+      else pure acc
+    let result ← loop #[head]
+    expectPunct ")"
+    pure result
+
+/-- Parse a CUDA function definition:
+
+    [template <...>] [attrs] retTy name(params) { body }
+
+    `attrs` covers `__device__`, `__global__`, `__forceinline__`, etc.
+    `retTy` is captured as a string. -/
+partial def parseFunction : ParseM CFunction := do
+  let templParams ← match (← peek) with
+    | .ident "template" => bump; parseTemplateParams
+    | _ => pure #[]
+  let attrs ← parseAttrs
+  -- Return type may be `void`, `int`, `static int`, etc. Reuse
+  -- `parseTypeSpec` which handles primitive types + qualifiers.
+  let retTy ← parseTypeSpec
+  match (← consume) with
+  | .ident name =>
+    expectPunct "("
+    let params ← parseParams
+    let body ← parseStmt   -- expects a `{ ... }` block
+    pure { attrs, templParams, retTy, name, params, body }
+  | t => throw s!"parseFunction: expected function name, got {repr t}"
+
+/-- Parse a complete CUDA function from a string. -/
+def parseFunctionStr (src : String) : Except String CFunction :=
+  let toks := lex src
+  let st : ParseState := { toks }
+  match (parseFunction.run.run st) with
+  | (.error e, _) => .error e
+  | (.ok f, st') =>
+    if h : st'.i < st'.toks.size then
+      match st'.toks[st'.i].tok with
+      | .eof => .ok f
+      | t => .error s!"trailing tokens after function: {repr t}"
+    else
+      .ok f
 
 /-- Parse a block of statements (sequence). -/
 def parseStmtsStr (src : String) : Except String (Array CStmt) :=

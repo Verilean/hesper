@@ -47,11 +47,20 @@ inductive CExpr where
   | comma   (a b : CExpr)
   deriving Repr, Inhabited
 
+/-- Storage qualifier for declarations. `none` = ordinary local /
+    register; `shared` = CUDA `__shared__` (workgroup memory in WGSL);
+    `constant` = CUDA `__constant__` (uniform in WGSL). -/
+inductive Storage where
+  | none
+  | shared
+  | constant
+  deriving Repr, Inhabited, BEq
+
 /-- Statement AST. -/
 inductive CStmt where
   | expr      (e : CExpr)
-  | decl      (ty : String) (name : String) (init : Option CExpr)
-  | declArr   (ty : String) (name : String) (sizeExpr : CExpr)
+  | decl      (storage : Storage) (ty : String) (name : String) (init : Option CExpr)
+  | declArr   (storage : Storage) (ty : String) (name : String) (sizeExpr : CExpr)
   | block     (stmts : Array CStmt)
   | if_       (cond : CExpr) (thn : CStmt) (els : Option CStmt)
   | for_      (init : Option CStmt) (cond : Option CExpr) (step : Option CExpr) (body : CStmt)
@@ -61,12 +70,25 @@ inductive CStmt where
   | continue_
   | sync_                    -- `__syncthreads()`
   | pragma    (s : String)   -- `#pragma unroll` etc.
+  /-- `if constexpr (cond) thn [else els]` — branch is selected at
+      lowering time using compile-time constants (template params). -/
+  | ifConstexpr (cond : CExpr) (thn : CStmt) (els : Option CStmt)
+  /-- `extern __shared__ T name[];` — runtime-sized smem array. The
+      element type is captured; the size is supplied at launch time and
+      the lowering binds it to a ShaderM buffer of unknown extent. -/
+  | externSharedArr (ty : String) (name : String)
+  /-- `static_assert(...)` — accepted and dropped (compile-time only). -/
+  | staticAssert
   deriving Repr, Inhabited
 
-/-- A function parameter (type kept as string; resolved at lowering). -/
+/-- A function parameter (type kept as string; resolved at lowering).
+    `default?` captures CUDA default arguments (`= nullptr`,
+    `= make_uint3(0,0,0)`) so the parser can accept them and the
+    lowering can ignore irrelevant defaulted ptr/struct args. -/
 structure CParam where
   ty : String
   name : String
+  default? : Option CExpr := none
   deriving Repr, Inhabited
 
 /-- A template parameter, e.g. `template <int mmq_y, bool need_check>`. -/
