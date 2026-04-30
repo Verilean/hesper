@@ -371,7 +371,13 @@ partial def lowerF32 (env : Env) : CExpr → Except String (Exp (.scalar .f32))
   | .ident name =>
     match env.f32 name with
     | some e => .ok e
-    | none => .ok (Exp.var name)
+    | none =>
+      -- Fall back to compile-time const lookup. CUDA `int ncols`
+      -- folded by template specialisation can flow into f32 contexts
+      -- like `mean = tmp / ncols`; we cast Int → Float here.
+      match env.consts name with
+      | some n => .ok (Exp.litF32 (Float.ofInt n))
+      | none => .ok (Exp.var name)
   | .unop op a =>
     match op with
     | .neg => do

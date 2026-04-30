@@ -1285,6 +1285,10 @@ lean_exe «transpile-cuda-rmsnorm-full-smoke» where
   supportInterpreter := false
   moreLinkArgs := stdLinkArgs
 
+lean_exe «transpile-cuda-rmsnorm-gpu-parity» where
+  root := `Tests.Transpile.CUDARmsNormGPUParity
+  moreLinkArgs := stdLinkArgs ++ #["./.lake/build/native/libhesper_cuda.a", "-lcuda"]
+
 lean_exe «wmma-ptx-text-test» where
   root := `Tests.CUDA.WmmaPTXTextTest
   supportInterpreter := false
