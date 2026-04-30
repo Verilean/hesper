@@ -156,33 +156,43 @@ This **matches hesper's standard Q8_1 layout** (post-#146 port).
 4. **If margin <1.2×**: the gap is launch overhead / dispatcher, not
    kernel — pivot to host-side investigation.
 
-## Known issue: PTX 8.7 vs driver 565.77
+## Resolved: PTX 8.7 vs driver 565.77 — cubin loader now in place
 
-The first extraction this session emits `.version 8.7` (not 8.6 like
-mmvq.ptx, both built with the same nvcc 12.8). Difference: mmq.cuh
-has 4 `NO_DEVICE_CODE` calls that expand to `__device__ printf(...)`
-for unreachable architectures. Even though the printf is dead code at
+The first extraction emits `.version 8.7` (not 8.6 like mmvq.ptx, both
+built with the same nvcc 12.8). Difference: mmq.cuh has 4
+`NO_DEVICE_CODE` calls that expand to `__device__ printf(...)` for
+unreachable architectures. Even though the printf is dead code at
 runtime, nvcc emits `.extern .func vprintf` in the PTX header, and the
 vararg-extension semantics force PTX 8.7. Driver 565.77 (CUDA 12.7)
 rejects this with `CUDA_ERROR_UNSUPPORTED_PTX_VERSION` even though
 ptxas (12.8) accepts it offline.
 
-Three known fixes for next session:
+**Resolution: cubin loader landed**. We added a
+`cuModuleLoadDataBytes : ByteArray → IO CUmodule` FFI variant
+(`Hesper/CUDA/FFI.lean` + `native/cuda_bridge.cpp`), and a cubin path
+in `LlamaCppPTX.loadKernels` that prefers cubin over PTX when present.
+Cubin is sm-specific binary which skips driver JIT and so dodges the
+PTX-version check entirely.
 
-1. **Patch llama.cpp/common.cuh locally**: change `NO_DEVICE_CODE` to
-   `__trap()` (drop printf). Eliminates vprintf reference, drops PTX to
-   8.6. Localised to a vendored llama.cpp clone. ~1 line change.
-2. **Add `cuModuleLoadDataBytes : ByteArray → IO CUmodule` FFI**: extract
-   to a cubin (`nvcc -cubin --generate-code=arch=compute_89,code=sm_89`)
-   instead of PTX. cubin is sm_89-specific binary that skips driver JIT
-   so PTX-version checks don't apply. Already verified to compile
-   cleanly. The current FFI takes a Lean `String` (UTF-8) which can't
-   carry binary cubin bytes; need ~30 lines new FFI binding.
-3. **Upgrade the runtime driver** to one that supports PTX 8.7
-   (NVIDIA 570+).
+**Cubin extraction** (preferred path):
+```bash
+NVCC=/nix/store/.../bin/nvcc
+cd llama.cpp/build
+$NVCC -cubin \
+  -DGGML_BACKEND_BUILD -DGGML_BACKEND_SHARED -DGGML_CUDA_PEER_MAX_BATCH_SIZE=128 \
+  -DGGML_CUDA_USE_GRAPHS -DGGML_SCHED_MAX_COPIES=4 -DGGML_SHARED \
+  -D_GNU_SOURCE -D_XOPEN_SOURCE=600 \
+  -I"../ggml/src/ggml-cuda/.." -I"../ggml/include" \
+  -O3 -DNDEBUG -std=c++17 \
+  --generate-code=arch=compute_89,code=sm_89 \
+  -use_fast_math -extended-lambda -Xcompiler=-fPIC \
+  -x cu -c ../ggml/src/ggml-cuda/template-instances/mmq-instance-q4_k.cu \
+  -o /tmp/llamacpp_ptx/mmq_q4k.cubin
+```
 
-(2) is the cleanest: cubin loading is faster than JIT anyway and we
-control the exact compiled output. Recommended path.
+Output: 2.5 MB cubin. Loader will pick it up automatically; verify with
+`lake exe llamacpp-ptx-load-test` showing
+`✓ mmq Q4_K (mmq_x=64) @ 0xXXXX`.
 
 ## Why this is worth doing
 

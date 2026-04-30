@@ -57,6 +57,12 @@ opaque cuCtxDestroy (ctx : CUcontext) : IO Unit
 @[extern "lean_hesper_cuda_module_load_data"]
 opaque cuModuleLoadData (ptxSource : @& String) : IO CUmodule
 
+/-- Variant that takes raw bytes (cubin / fatbin / pre-compiled PTX
+    blobs containing non-UTF-8 bytes). Skips disk-cache and JIT paths;
+    the input must already be in a form the driver accepts directly. -/
+@[extern "lean_hesper_cuda_module_load_data_bytes"]
+opaque cuModuleLoadDataBytes (data : @& ByteArray) : IO CUmodule
+
 @[extern "lean_hesper_cuda_module_get_function"]
 opaque cuModuleGetFunction (mod : CUmodule) (funcName : @& String) : IO CUfunction
 
