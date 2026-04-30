@@ -1323,6 +1323,16 @@ lean_exe «transpile-cuda-mmq-q4k-smoke» where
   supportInterpreter := false
   moreLinkArgs := stdLinkArgs
 
+lean_exe «transpile-cuda-mmq-load-tiles-smoke» where
+  root := `Tests.Transpile.CUDAMMQLoadTilesSmoke
+  supportInterpreter := false
+  moreLinkArgs := stdLinkArgs
+
+lean_exe «transpile-cuda-mmq-outer-smoke» where
+  root := `Tests.Transpile.CUDAMMQOuterSmoke
+  supportInterpreter := false
+  moreLinkArgs := stdLinkArgs
+
 lean_exe «wmma-ptx-text-test» where
   root := `Tests.CUDA.WmmaPTXTextTest
   supportInterpreter := false
