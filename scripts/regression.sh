@@ -73,6 +73,7 @@ run_test "transpile-cuda-rmsnorm-smoke" "lake exe transpile-cuda-rmsnorm-smoke"
 run_test "transpile-cuda-rmsnorm-full-smoke" "lake exe transpile-cuda-rmsnorm-full-smoke"
 run_test "transpile-cuda-rmsnorm-gpu-parity" "lake exe transpile-cuda-rmsnorm-gpu-parity"
 run_test "transpile-cuda-q4k-vecdot-smoke" "lake exe transpile-cuda-q4k-vecdot-smoke"
+run_test "transpile-cuda-q4k-vecdot-gpu-parity" "lake exe transpile-cuda-q4k-vecdot-gpu-parity"
 run_test "transpile-cuda-prefill-probe" "lake exe transpile-cuda-prefill-probe"
 
 # ─── 2. PTX codegen text (CPU) ───────────────

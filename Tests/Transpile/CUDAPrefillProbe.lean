@@ -42,24 +42,26 @@ def quantizeQ81Simplified : String :=
 "{
   const int i0 = blockDim.x * blockIdx.x + threadIdx.x;
 
-  if (i0 < ne0) {
-    const int i_cont = blockIdx.y * ne0 + i0;
-    const int ib  = i_cont / 32;
-    const int iqs = i_cont - ib * 32;
+  if (i0 >= ne0) {
+    return;
+  }
 
-    const float xi = i0 < ne00 ? x[i0] : 0.0f;
-    float amax = fabsf(xi);
-    float sum = xi;
+  const int i_cont = blockIdx.y * ne0 + i0;
+  const int ib  = i_cont / 32;
+  const int iqs = i_cont - ib * 32;
 
-    amax = warp_reduce_max(amax);
-    sum  = warp_reduce_sum(sum);
+  const float xi = i0 < ne00 ? x[i0] : 0.0f;
+  float amax = fabsf(xi);
+  float sum = xi;
 
-    const float d = amax / 127.0f;
+  amax = warp_reduce_max(amax);
+  sum  = warp_reduce_sum(sum);
 
-    qs[i_cont] = amax;
-    if (iqs == 0) {
-      ds[ib] = d;
-    }
+  const float d = amax / 127.0f;
+
+  qs[i_cont] = amax;
+  if (iqs == 0) {
+    ds[ib] = d;
   }
 }"
 
@@ -72,20 +74,22 @@ def ropeNeoxRotation : String :=
   const int row_dst = blockDim.x * blockIdx.x + threadIdx.x;
   const int i0 = 2 * (blockDim.y * blockIdx.y + threadIdx.y);
 
-  if (i0 < ne00) {
-    const int idst = i0 / 2 + row_dst * stride_out;
-    const int ix   = i0 / 2 + row_dst * stride_in;
-
-    const float theta_base = pos_val * theta_scale_pow_i0;
-    const float cos_theta = cosf(theta_base);
-    const float sin_theta = sinf(theta_base);
-
-    const float x0 = x[ix];
-    const float x1 = x[ix + n_dims_half];
-
-    dst[idst]                = x0 * cos_theta - x1 * sin_theta;
-    dst[idst + n_dims_half]  = x0 * sin_theta + x1 * cos_theta;
+  if (i0 >= ne00) {
+    return;
   }
+
+  const int idst = i0 / 2 + row_dst * stride_out;
+  const int ix   = i0 / 2 + row_dst * stride_in;
+
+  const float theta_base = pos_val * theta_scale_pow_i0;
+  const float cos_theta = cosf(theta_base);
+  const float sin_theta = sinf(theta_base);
+
+  const float x0 = x[ix];
+  const float x1 = x[ix + n_dims_half];
+
+  dst[idst]                = x0 * cos_theta - x1 * sin_theta;
+  dst[idst + n_dims_half]  = x0 * sin_theta + x1 * cos_theta;
 }"
 
 /-! ## Candidate 3: mul_mat_vec_q inner accumulator

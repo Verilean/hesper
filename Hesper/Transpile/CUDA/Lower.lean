@@ -391,7 +391,15 @@ partial def lowerF32 (env : Env) : CExpr → Except String (Exp (.scalar .f32))
       -- like `mean = tmp / ncols`; we cast Int → Float here.
       match env.consts name with
       | some n => .ok (Exp.litF32 (Float.ofInt n))
-      | none => .ok (Exp.var name)
+      | none =>
+        -- If `name` is bound as i32 (e.g. a CUDA `int` local feeding an
+        -- f32 context like `f32(sc[i]) * sumi_d`), wrap with `Exp.toF32`
+        -- so the PTX backend emits `cvt.rn.f32.s32` rather than treating
+        -- the i32 register as a stale f32 (bug #346 — silently dropped
+        -- the operand in `Exp.mul`).
+        match env.i32 name with
+        | some e => .ok (Exp.toF32 e)
+        | none => .ok (Exp.var name)
   | .unop op a =>
     match op with
     | .neg => do
