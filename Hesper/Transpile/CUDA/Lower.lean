@@ -59,6 +59,27 @@ structure Env where
   /-- Pointer / array-param bindings. `v[i]` for `v : int*` looks up
       `bufs "v"` and emits `Exp.index (Exp.var name) i`. -/
   bufs   : String → Option BufBinding := fun _ => none
+  /-- POD struct member resolver — given a struct-pointer name (e.g.
+      `bq4_K`) and a field name (e.g. `qs`), returns the underlying
+      byte buffer with the field's compile-time / runtime offset baked
+      into `BufBinding.offset?`.
+
+      Use case: llama.cpp prefill kernels heavily use packed structs
+      like `block_q4_K { half2 dm; uint8_t scales[12]; uint8_t qs[128]; }`.
+      The user pre-computes per-field BufBindings and registers them
+      here; subsequent `bq4_K->qs[i]` in source then lowers to a single
+      buffer load with offset `<bq4_K base offset> + offsetof(qs) + i`.
+
+      Returning `none` means "this struct/field is not registered" and
+      the lowerer falls through to its previous failure path. -/
+  structFields : String → String → Option BufBinding := fun _ _ => none
+  /-- POD struct member resolver — scalar member case. Given a struct-
+      pointer name and a field name, returns a typed Exp — used for
+      packed scalars like `bq4_K->dm` (a half2 that we read as u32 and
+      hand off to `unpack2x16float`). -/
+  structFieldU32 : String → String → Option (Exp (.scalar .u32)) := fun _ _ => none
+  structFieldI32 : String → String → Option (Exp (.scalar .i32)) := fun _ _ => none
+  structFieldF32 : String → String → Option (Exp (.scalar .f32)) := fun _ _ => none
   /-- Member-access resolver for builtin compound names.  `threadIdx.x`
       is parsed as `member (ident "threadIdx") "x"` — the lowering
       consults `members ("threadIdx", "x")` to obtain the right
@@ -237,11 +258,20 @@ partial def lowerU32 (env : Env) : CExpr → Except String (Exp (.scalar .u32))
       let fe ← lowerU32 env f
       .ok (Exp.select ce te fe)
   | .index obj i => do
-    let name ← match obj with
-      | .ident n => .ok n
-      | _ => .error "lowerU32: only `name[i]` index supported (no nested arrays)"
-    match env.bufs name with
-    | none => .error s!"lowerU32: '{name}' not bound as a buffer; add it to env.bufs"
+    -- Resolve the array name. Three forms supported:
+    --   v[i]            — bare ident
+    --   bq->qs[i]       — struct-pointer arrow → field
+    --   bq.qs[i]        — struct-value dot → field
+    -- For struct member access we look up `env.structFields` which
+    -- returns a synthetic BufBinding pointing at the underlying byte
+    -- buffer with the field's offset already baked in.
+    let bopt : Option BufBinding ← match obj with
+      | .ident n => .ok (env.bufs n)
+      | .arrow (.ident base) field => .ok (env.structFields base field)
+      | .member (.ident base) field => .ok (env.structFields base field)
+      | _ => .error "lowerU32: only `name[i]`, `obj->field[i]`, or `obj.field[i]` index supported"
+    match bopt with
+    | none => .error s!"lowerU32: array operand not bound — neither env.bufs nor env.structFields recognises {repr obj}"
     | some b =>
       let ie ← lowerU32 env i
       let idx := match b.offset? with
@@ -253,7 +283,7 @@ partial def lowerU32 (env : Env) : CExpr → Except String (Exp (.scalar .u32))
       | .scalar .i32 =>
         -- `int *v` indexed in u32 context: bitcast.
         .ok (Exp.toU32 (Exp.index (Exp.var b.name : Exp (.array (.scalar .i32) 0)) idx))
-      | t => .error s!"lowerU32: buffer '{name}' has elem type {repr t}"
+      | t => .error s!"lowerU32: buffer has elem type {repr t}"
   | .member (.ident base) field =>
     -- CUDA builtins: threadIdx.x/y/z, blockIdx.x/y/z, blockDim.x/y/z, gridDim.x/y/z
     match base, field with
@@ -269,9 +299,21 @@ partial def lowerU32 (env : Env) : CExpr → Except String (Exp (.scalar .u32))
     | "gridDim",   "x" => match env.gridDimX   with | some e => .ok e | none => .error "lowerU32: gridDim.x not bound"
     | "gridDim",   "y" => match env.gridDimY   with | some e => .ok e | none => .error "lowerU32: gridDim.y not bound"
     | "gridDim",   "z" => match env.gridDimZ   with | some e => .ok e | none => .error "lowerU32: gridDim.z not bound"
-    | _, _ => .error s!"lowerU32: unsupported member access '{base}.{field}'"
+    | _, _ =>
+      -- Fall through to user-registered struct field resolver.
+      match env.structFieldU32 base field with
+      | some e => .ok e
+      | none => .error s!"lowerU32: unsupported member access '{base}.{field}'"
   | .member _ _ => .error "lowerU32: member access on non-builtin not yet supported"
-  | .arrow _ _ => .error "lowerU32: arrow access not yet supported"
+  | .arrow (.ident base) field =>
+    -- Scalar struct-field access via -> arrow.  Same env slot as .member
+    -- (the user can register either x.dm or x->dm; structFieldU32 doesn't
+    -- distinguish since C semantically treats them the same once the LHS
+    -- resolves).
+    match env.structFieldU32 base field with
+    | some e => .ok e
+    | none => .error s!"lowerU32: arrow access '{base}->{field}' not bound — register via env.structFieldU32"
+  | .arrow _ _ => .error "lowerU32: arrow access only supported on plain idents"
   | .comma _ _ => .error "lowerU32: comma operator not supported"
 
 /-- Lower a `CExpr` to `Exp (.scalar .i32)`. -/
@@ -348,11 +390,13 @@ partial def lowerI32 (env : Env) : CExpr → Except String (Exp (.scalar .i32))
       let fe ← lowerI32 env f
       .ok (Exp.select ce te fe)
   | .index obj i => do
-    let name ← match obj with
-      | .ident n => .ok n
-      | _ => .error "lowerI32: only `name[i]` index supported (no nested arrays)"
-    match env.bufs name with
-    | none => .error s!"lowerI32: '{name}' not bound as a buffer; add it to env.bufs"
+    let bopt : Option BufBinding ← match obj with
+      | .ident n => .ok (env.bufs n)
+      | .arrow (.ident base) field => .ok (env.structFields base field)
+      | .member (.ident base) field => .ok (env.structFields base field)
+      | _ => .error "lowerI32: only `name[i]`, `obj->field[i]`, or `obj.field[i]` index supported"
+    match bopt with
+    | none => .error s!"lowerI32: array operand not bound — neither env.bufs nor env.structFields recognises {repr obj}"
     | some b =>
       let ie ← lowerU32 env i
       let idx := match b.offset? with
@@ -364,15 +408,28 @@ partial def lowerI32 (env : Env) : CExpr → Except String (Exp (.scalar .i32))
       | .scalar .u32 =>
         -- `int * v` in CUDA may alias an `unsigned *` buffer; lift to i32.
         .ok (Exp.toI32 (Exp.index (Exp.var b.name : Exp (.array (.scalar .u32) 0)) idx))
-      | t => .error s!"lowerI32: buffer '{name}' has elem type {repr t}, not i32/u32"
+      | t => .error s!"lowerI32: buffer has elem type {repr t}, not i32/u32"
   | .member (.ident base) field =>
-    -- Try lowering as u32 then bitcast to i32. The u32 lowering covers
-    -- all CUDA builtin members (threadIdx.x, etc.).
-    match lowerU32 env (.member (.ident base) field) with
-    | .ok x => .ok (Exp.toI32 x)
-    | .error err => .error s!"lowerI32: member access '{base}.{field}' — {err}"
+    -- Try the i32-typed struct field resolver first; otherwise fall
+    -- through to lowerU32 (covers CUDA builtin members threadIdx.x etc.)
+    -- and bitcast.
+    match env.structFieldI32 base field with
+    | some e => .ok e
+    | none =>
+      match lowerU32 env (.member (.ident base) field) with
+      | .ok x => .ok (Exp.toI32 x)
+      | .error err => .error s!"lowerI32: member access '{base}.{field}' — {err}"
   | .member _ _ => .error "lowerI32: member access on non-builtin not yet supported"
-  | .arrow _ _ => .error "lowerI32: arrow access not yet supported"
+  | .arrow (.ident base) field =>
+    -- Scalar struct-field access via arrow.  Try i32 resolver first;
+    -- otherwise fall through to u32 + bitcast.
+    match env.structFieldI32 base field with
+    | some e => .ok e
+    | none =>
+      match env.structFieldU32 base field with
+      | some e => .ok (Exp.toI32 e)
+      | none => .error s!"lowerI32: arrow access '{base}->{field}' not bound — register via env.structFieldI32 or env.structFieldU32"
+  | .arrow _ _ => .error "lowerI32: arrow access only supported on plain idents"
   | .comma _ _ => .error "lowerI32: comma operator not supported"
 
 /-- Lower a `CExpr` to `Exp (.scalar .f32)`. -/
@@ -516,11 +573,13 @@ partial def lowerF32 (env : Env) : CExpr → Except String (Exp (.scalar .f32))
       let fe ← lowerF32 env f
       .ok (Exp.select ce te fe)
   | .index obj i => do
-    let name ← match obj with
-      | .ident n => .ok n
-      | _ => .error "lowerF32: only `name[i]` index supported"
-    match env.bufs name with
-    | none => .error s!"lowerF32: '{name}' not bound as a buffer; add it to env.bufs"
+    let bopt : Option BufBinding ← match obj with
+      | .ident n => .ok (env.bufs n)
+      | .arrow (.ident base) field => .ok (env.structFields base field)
+      | .member (.ident base) field => .ok (env.structFields base field)
+      | _ => .error "lowerF32: only `name[i]`, `obj->field[i]`, or `obj.field[i]` index supported"
+    match bopt with
+    | none => .error s!"lowerF32: array operand not bound — neither env.bufs nor env.structFields recognises {repr obj}"
     | some b =>
       let ie ← lowerU32 env i
       let idx := match b.offset? with
@@ -533,15 +592,25 @@ partial def lowerF32 (env : Env) : CExpr → Except String (Exp (.scalar .f32))
         .ok (Exp.toF32 (Exp.index (Exp.var b.name : Exp (.array (.scalar .i32) 0)) idx))
       | .scalar .u32 =>
         .ok (Exp.toF32 (Exp.index (Exp.var b.name : Exp (.array (.scalar .u32) 0)) idx))
-      | t => .error s!"lowerF32: buffer '{name}' has elem type {repr t}"
+      | t => .error s!"lowerF32: buffer has elem type {repr t}"
   | .member (.ident base) field =>
-    -- `float2 v; v.x; v.y` — consult env.f32x2.
+    -- `float2 v; v.x; v.y` — consult env.f32x2 first.
     match env.f32x2 base, field with
     | some v, "x" => .ok (Exp.vecX v)
     | some v, "y" => .ok (Exp.vecY v)
-    | _, _ => .error s!"lowerF32: member '{base}.{field}' — not a known float2 binding"
+    | _, _ =>
+      -- Fall through to user-registered struct field resolver for f32 scalars.
+      match env.structFieldF32 base field with
+      | some e => .ok e
+      | none => .error s!"lowerF32: member '{base}.{field}' — not a known float2 or f32 struct field binding"
   | .member _ _ => .error "lowerF32: member access on non-ident not yet supported"
-  | .arrow _ _ => .error "lowerF32: arrow access not yet supported"
+  | .arrow (.ident base) field =>
+    -- Scalar struct field via arrow.  f32 resolver only — vec2 typically
+    -- shows up as `unpack2x16float(struct->u32_field)` in source.
+    match env.structFieldF32 base field with
+    | some e => .ok e
+    | none => .error s!"lowerF32: arrow access '{base}->{field}' not bound — register via env.structFieldF32"
+  | .arrow _ _ => .error "lowerF32: arrow access only supported on plain idents"
   | .comma _ _ => .error "lowerF32: comma operator not supported"
 
 /-- Lower a `CExpr` to `Exp (.vec2 .f32)` (CUDA `float2`).  Currently
