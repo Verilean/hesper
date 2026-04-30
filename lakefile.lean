@@ -1303,6 +1303,11 @@ lean_exe «transpile-cuda-prefill-probe» where
   supportInterpreter := false
   moreLinkArgs := stdLinkArgs
 
+lean_exe «transpile-cuda-struct-probe» where
+  root := `Tests.Transpile.CUDAStructProbe
+  supportInterpreter := false
+  moreLinkArgs := stdLinkArgs
+
 lean_exe «wmma-ptx-text-test» where
   root := `Tests.CUDA.WmmaPTXTextTest
   supportInterpreter := false
