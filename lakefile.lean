@@ -1280,6 +1280,11 @@ lean_exe «transpile-cuda-rmsnorm-smoke» where
   supportInterpreter := false
   moreLinkArgs := stdLinkArgs
 
+lean_exe «transpile-cuda-rmsnorm-full-smoke» where
+  root := `Tests.Transpile.CUDARmsNormFullSmoke
+  supportInterpreter := false
+  moreLinkArgs := stdLinkArgs
+
 lean_exe «wmma-ptx-text-test» where
   root := `Tests.CUDA.WmmaPTXTextTest
   supportInterpreter := false

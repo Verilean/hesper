@@ -71,13 +71,55 @@ partial def parsePrimary : ParseM CExpr := do
   | .fnum s => bump; pure (CExpr.floatLit s)
   | .ident name =>
     bump
-    match (← peek) with
-    | .punct "(" =>
-      bump
+    -- Check for `name<TArgs>(...)` — templated call.  Heuristic: peek
+    -- a `<` followed eventually by a matching `>` and then `(`. If we
+    -- find that pattern within a small lookahead, consume the
+    -- `<...>` (we drop the template args here — template values are
+    -- expected to be folded by the user's `Env.consts` registration
+    -- or `Env.inlines` rewrite key by name).
+    let isTemplCall ← do
+      match (← peek) with
+      | .punct "<" =>
+        let st0 ← get
+        let savedI := st0.i
+        -- Forward scan: count nested `<>` and find a `>` that lands
+        -- right before `(`.  Cap the scan at 32 tokens.
+        let mut depth : Int := 0
+        let mut j := savedI
+        let cap := savedI + 32
+        let mut found := false
+        let toks := st0.toks
+        while !found ∧ j < cap ∧ j < toks.size do
+          match toks[j]!.tok with
+          | .punct "<" => depth := depth + 1; j := j + 1
+          | .punct ">" =>
+            depth := depth - 1
+            if depth == 0 ∧ j + 1 < toks.size ∧ toks[j+1]!.tok == .punct "(" then
+              found := true
+            else
+              j := j + 1
+          | .eof => j := cap
+          | _ => j := j + 1
+        if found then
+          -- Consume tokens through the matching '>' (inclusive).
+          set { st0 with i := j + 1 }
+          pure true
+        else
+          pure false
+      | _ => pure false
+    if isTemplCall then
+      expectPunct "("
       let args ← parseArgList
       expectPunct ")"
       pure (CExpr.call name args)
-    | _ => pure (CExpr.ident name)
+    else
+      match (← peek) with
+      | .punct "(" =>
+        bump
+        let args ← parseArgList
+        expectPunct ")"
+        pure (CExpr.call name args)
+      | _ => pure (CExpr.ident name)
   | .punct "(" =>
     bump
     -- Try cast: `(<type>)<expr>`. Heuristic: peek-ahead to find `)`

@@ -75,6 +75,18 @@ structure Env where
   gridDimX   : Option (Exp (.scalar .u32)) := none
   gridDimY   : Option (Exp (.scalar .u32)) := none
   gridDimZ   : Option (Exp (.scalar .u32)) := none
+  /-- Inline-call rewrites for templated CUDA helpers like
+      `warp_reduce_sum<float, 32>(x)` and `block_reduce<SUM, 32, float>
+      (val, s_sum)`.  When `lowerF32`/`lowerI32`/`lowerU32` see a call
+      `f(args)` and `inlines f` returns `some rewrite`, the lowering
+      replaces the call with `rewrite args` (a fresh CExpr) and
+      re-enters the lowerer.  This implements expression-level inline
+      expansion of templated callees without parsing the full callee
+      definition each time.  The rewrite is type-agnostic at the
+      `CExpr` level — type resolution happens during the re-lowering
+      of the resulting expression.  Returning `none` falls through to
+      the default error path. -/
+  inlines    : String → Array CExpr → Option CExpr := fun _ _ => none
 
 /-- Empty environment: every name resolves to `Exp.var name`. -/
 def Env.empty : Env := {}
@@ -205,8 +217,9 @@ partial def lowerU32 (env : Env) : CExpr → Except String (Exp (.scalar .u32))
     | .bitXor => bin Exp.bitXor
     | _ => .error s!"lowerU32: unsupported binop {repr op}"
   | .call fn args =>
-    -- u32-context calls are rare; most intrinsics return i32 or f32.
-    .error s!"lowerU32: call '{fn}' (returns non-u32?) — try lowerI32/lowerF32 if you know the type"
+    match env.inlines fn args with
+    | some rewritten => lowerU32 env rewritten
+    | none => .error s!"lowerU32: call '{fn}' (returns non-u32?) — try lowerI32/lowerF32 if you know the type"
   | .cast ty inner =>
     -- (uint32_t) e → drop the cast (assume inner already u32)
     if ty.endsWith "uint32_t" ∨ ty.endsWith "unsigned" ∨ ty == "unsigned int"
@@ -310,7 +323,10 @@ partial def lowerI32 (env : Env) : CExpr → Except String (Exp (.scalar .i32))
       let ae ← lowerU32 env a
       let be ← lowerU32 env b
       .ok (Exp.toI32 (Exp.subSatS8x4 ae be))
-    | _, _ => .error s!"lowerI32: unsupported call '{fn}' with {args.size} args"
+    | _, _ =>
+      match env.inlines fn args with
+      | some rewritten => lowerI32 env rewritten
+      | none => .error s!"lowerI32: unsupported call '{fn}' with {args.size} args"
   | .cast ty inner =>
     if ty.endsWith "int" ∨ ty == "int32_t" ∨ ty == "i32" then
       lowerI32 env inner
@@ -434,7 +450,14 @@ partial def lowerF32 (env : Env) : CExpr → Except String (Exp (.scalar .f32))
       let ve ← lowerF32 env val
       let le ← lowerU32 env lane
       .ok (Exp.subgroupShuffleXor ve le)
-    | _, _ => .error s!"lowerF32: unsupported call '{fn}' with {args.size} args"
+    | _, _ =>
+      -- Last-resort: consult the inline-rewrite table.  If the user
+      -- registered `fn` (e.g. `warp_reduce_sum`, `block_reduce`) as an
+      -- inline that produces a fresh CExpr, we re-enter the lowerer
+      -- with the rewritten expression.
+      match env.inlines fn args with
+      | some rewritten => lowerF32 env rewritten
+      | none => .error s!"lowerF32: unsupported call '{fn}' with {args.size} args"
   | .cast ty inner =>
     if ty.endsWith "float" ∨ ty.endsWith "f32" then
       -- (float) e — try to lower from i32 first (most common), then
