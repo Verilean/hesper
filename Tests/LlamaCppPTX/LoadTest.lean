@@ -18,4 +18,7 @@ unsafe def main : IO Unit := do
   IO.println s!"✓ Q4_K matmul @ 0x{Nat.toDigits 16 k.q4kMatmul.toNat |>.asString}"
   IO.println s!"✓ Q6_K matmul @ 0x{Nat.toDigits 16 k.q6kMatmul.toNat |>.asString}"
   IO.println s!"✓ quantize_q8_1 @ 0x{Nat.toDigits 16 k.q8_1Quantize.toNat |>.asString}"
+  match k.mmqQ4K_x64 with
+  | some f => IO.println s!"✓ mmq Q4_K (mmq_x=64) @ 0x{Nat.toDigits 16 f.toNat |>.asString}"
+  | none => IO.println "  mmq Q4_K not loaded (mmq_q4k.ptx absent — extract per docs/llama-fusion-analysis/31)"
   IO.println "PASS"

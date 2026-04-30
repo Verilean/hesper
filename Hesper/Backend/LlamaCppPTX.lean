@@ -35,21 +35,36 @@ def q6kMatmulSymbol : String :=
 def q8_1QuantizeSymbol : String :=
   "_Z13quantize_q8_1PKfPvlllllj5uint3"
 
+/-- Q4_K mat-mat (mmq) kernel — prefill path. mmq_x=64, need_check=false.
+    Source: `mmq.cuh`'s `mul_mat_q<GGML_TYPE_Q4_K, 64, false>`.
+    See `docs/llama-fusion-analysis/31-mmq-q4k-ptx-extraction.md` for ABI. -/
+def mmqQ4KMatmulSymbol_x64 : String :=
+  "_Z9mul_mat_qIL9ggml_type12ELi64ELb0EEvPKcPKiS4_S4_PfS5_iiiiiiiiiiiiiiiii"
+
 /-- Cached compiled kernel handles. -/
 structure Kernels where
   q4kMatmul : CUfunction
   q6kMatmul : CUfunction
   q8_1Quantize : CUfunction
+  /-- Prefill mmq Q4_K kernel — `none` if `mmq_q4k.ptx` was not present. -/
+  mmqQ4K_x64 : Option CUfunction := none
 
 initialize kernelsRef : IO.Ref (Option Kernels) ← IO.mkRef none
 
 /-- Default paths.  Override by caller if needed. -/
 def defaultMmvqPath : String := "/tmp/llamacpp_ptx/mmvq.ptx"
 def defaultQuantizePath : String := "/tmp/llamacpp_ptx/quantize.ptx"
+def defaultMmqQ4KPath : String := "/tmp/llamacpp_ptx/mmq_q4k.ptx"
 
-/-- Load PTX modules and resolve the three target kernels.  Idempotent. -/
+/-- Load PTX modules and resolve target kernels.  Idempotent.
+    `mmq_q4k.ptx` is optional — if absent (or driver rejects the PTX
+    version), `mmqQ4K_x64` is left `none` so existing decode-only
+    callers keep working. See
+    `docs/llama-fusion-analysis/31-mmq-q4k-ptx-extraction.md` for the
+    extraction recipe and the open PTX-8.7-vs-driver issue. -/
 def loadKernels (mmvqPath : String := defaultMmvqPath)
-    (quantizePath : String := defaultQuantizePath) : IO Kernels := do
+    (quantizePath : String := defaultQuantizePath)
+    (mmqQ4KPath : String := defaultMmqQ4KPath) : IO Kernels := do
   match ← kernelsRef.get with
   | some k => return k
   | none =>
@@ -60,7 +75,20 @@ def loadKernels (mmvqPath : String := defaultMmvqPath)
     let q4k ← cuModuleGetFunction mmvqMod q4kMatmulSymbol
     let q6k ← cuModuleGetFunction mmvqMod q6kMatmulSymbol
     let q8q ← cuModuleGetFunction qMod q8_1QuantizeSymbol
-    let k : Kernels := { q4kMatmul := q4k, q6kMatmul := q6k, q8_1Quantize := q8q }
+    let mmqQ4K ← (do
+      try
+        let present ← System.FilePath.pathExists mmqQ4KPath
+        if !present then return none
+        let mmqSrc ← IO.FS.readFile mmqQ4KPath
+        let mmqMod ← cuModuleLoadData mmqSrc
+        let f ← cuModuleGetFunction mmqMod mmqQ4KMatmulSymbol_x64
+        return some f
+      catch e =>
+        IO.eprintln s!"[LlamaCppPTX] mmq Q4_K load failed: {e.toString}"
+        return none)
+    let k : Kernels :=
+      { q4kMatmul := q4k, q6kMatmul := q6k, q8_1Quantize := q8q,
+        mmqQ4K_x64 := mmqQ4K }
     kernelsRef.set (some k)
     return k
 
