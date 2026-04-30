@@ -2,6 +2,7 @@ import Hesper.Transpile.CUDA
 import Hesper.Transpile.CUDA.Parse
 import Hesper.Transpile.CUDA.LowerStmt
 import Hesper.Transpile.CUDA.MMQEnv
+import Hesper.Transpile.CUDA.AutoEnv
 import Hesper.WGSL.Monad
 import Hesper.WGSL.Shader
 
@@ -53,10 +54,11 @@ def isEmptyBlock : CStmt → Bool
   | .block stmts => stmts.size == 0
   | _ => false
 
-def lowerOne (env : Env) (f : CFunction) : FnRow :=
+def lowerOne (mkEnv : CFunction → Env) (f : CFunction) : FnRow :=
   if isEmptyBlock f.body then
     { name := f.name, bodyEmpty := true, lowerErr := none, shaderLen := 0 }
   else
+    let env := mkEnv f
     match lowerStmt env f.body with
     | .ok act =>
       let s := renderShader act
@@ -72,7 +74,13 @@ structure Counts where
   bodyEmpty : Nat := 0
   fail      : Nat := 0
 
-def runFile (env : Env) (path : System.FilePath) : IO Counts := do
+/-- Env-builder strategy. `.fixed` uses the same env for every fn;
+    `.auto` synthesises a per-function env from the parsed TU. -/
+inductive EnvMode where
+  | fixed (env : Env)
+  | auto
+
+def runFile (mode : EnvMode) (path : System.FilePath) : IO Counts := do
   let present ← path.pathExists
   if !present then
     IO.println s!"  (skipped — file not found: {path})"
@@ -81,10 +89,13 @@ def runFile (env : Env) (path : System.FilePath) : IO Counts := do
   IO.println ""
   IO.println s!"═══ {path} ═══"
   let items := parseTranslationUnitStr src
+  let mkEnv : CFunction → Env := match mode with
+    | .fixed e => fun _ => e
+    | .auto    => fun f => autoEnvFor items f
   let mut rows : Array FnRow := #[]
   for it in items do
     match it with
-    | .function f => rows := rows.push (lowerOne env f)
+    | .function f => rows := rows.push (lowerOne mkEnv f)
     | _ => pure ()
   let mut nOk : Nat := 0
   let mut nEmpty : Nat := 0
@@ -143,10 +154,14 @@ def runFile (env : Env) (path : System.FilePath) : IO Counts := do
   pure { ok := nOk, bodyEmpty := nEmpty, fail := nFail }
 
 def main (args : List String) : IO Unit := do
-  -- `--mmq` flag: pre-load MMQ helper inlines + threadIdx/blockIdx
-  -- builtins. Without it, every call to `mmq_get_nwarps_device()` etc
-  -- fails because the lower has no idea what value to use.
-  let useMMQ := args.contains "--mmq"
+  -- Env strategy flags (mutually exclusive; --auto wins if both set):
+  --   --mmq   : MMQ default env (helper inlines + threadIdx/blockIdx
+  --             builtins, fixed for every function)
+  --   --auto  : 2-pass auto env. Per function, build buffers from its
+  --             pointer params and inline-rewrite every const-return
+  --             helper in the TU on top of mmqHelperInlines.
+  let useAuto := args.contains "--auto"
+  let useMMQ  := args.contains "--mmq"
   let pathArgs := args.filter (fun a => !a.startsWith "--")
   let paths : List System.FilePath := match pathArgs with
     | [] => [
@@ -156,14 +171,20 @@ def main (args : List String) : IO Unit := do
         "llama.cpp/ggml/src/ggml-cuda/mmq.cuh"
       ]
     | xs => xs.map System.FilePath.mk
-  let env := if useMMQ then mmqDefaultEnv else Env.empty
-  let label := if useMMQ then "MMQ default" else "default Env"
+  let mode : EnvMode :=
+    if useAuto then .auto
+    else if useMMQ then .fixed mmqDefaultEnv
+    else .fixed Env.empty
+  let label :=
+    if useAuto then "auto Env (2-pass)"
+    else if useMMQ then "MMQ default"
+    else "default Env"
   IO.println s!"═══ Phase 12: lower-coverage map ({label}) ═══"
   let mut totalOk := 0
   let mut totalEmpty := 0
   let mut totalFail := 0
   for p in paths do
-    let c ← runFile env p
+    let c ← runFile mode p
     totalOk := totalOk + c.ok
     totalEmpty := totalEmpty + c.bodyEmpty
     totalFail := totalFail + c.fail
