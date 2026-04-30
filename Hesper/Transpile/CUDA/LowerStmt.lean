@@ -104,11 +104,20 @@ def classifyTy (s : String) : Option WGSLType :=
   if s.endsWith "*" ∨ s.endsWith "&" then none  -- pointer types unsupported
   else if s.endsWith "float2" then
     some (.vec2 .f32)
+  -- Narrow unsigned types (uint8_t, uint16_t, uint64_t) all share the
+  -- u32 register file at the WGSL/PTX level; the difference is just
+  -- how many bytes the load instruction reads.  For local-variable
+  -- typing we treat them all as u32 — load-width concerns are handled
+  -- at the buffer-binding level, not the value-type level.
   else if s.endsWith "uint32_t" ∨ s.endsWith "unsigned" ∨ s == "unsigned int"
-       ∨ s.endsWith "u32" ∨ s == "uint" then
+       ∨ s.endsWith "u32" ∨ s == "uint"
+       ∨ s.endsWith "uint8_t" ∨ s.endsWith "uint16_t" ∨ s.endsWith "uint64_t"
+       ∨ s == "u8" ∨ s == "u16" ∨ s == "u64" then
     some (.scalar .u32)
   else if s.endsWith "int32_t" ∨ s.endsWith "int" ∨ s == "i32"
-       ∨ s == "signed int" ∨ s == "signed" then
+       ∨ s == "signed int" ∨ s == "signed"
+       ∨ s.endsWith "int8_t" ∨ s.endsWith "int16_t" ∨ s.endsWith "int64_t"
+       ∨ s == "i8" ∨ s == "i16" ∨ s == "i64" then
     some (.scalar .i32)
   else if s.endsWith "float" ∨ s.endsWith "f32" then
     some (.scalar .f32)
