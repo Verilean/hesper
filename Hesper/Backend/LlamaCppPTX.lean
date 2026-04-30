@@ -637,4 +637,91 @@ def launchFlashAttnVecF16F16D256
     0
     bytes offsets
 
+/-! ## mmq Q4_K matmul launch (prefill)
+
+Signature (23 params):
+  mul_mat_q<Q4_K, mmq_x=64, need_check=false>(
+    const char *x,                  // Q4_K weights
+    const int *y,                   // Q8_1 input tiles
+    const int32_t *ids_dst,         // MoE — nullptr
+    const int32_t *expert_bounds,   // MoE — nullptr
+    float *dst,                     // f32 output
+    float *tmp_fixup,               // stream-K — nullptr
+    int ncols_x, nrows_x, ncols_dst, stride_row_x, ncols_y, stride_col_dst,
+    int channel_ratio, nchannels_y, stride_channel_x, stride_channel_y, stride_channel_dst,
+    int sample_ratio, nsamples_y, stride_sample_x, stride_sample_y, stride_sample_dst,
+    int ncols_max)
+
+For our microbench (no MoE, single-channel/sample, no stream-K):
+  ncols_x       = K (= inDim)
+  nrows_x       = outDim
+  ncols_dst     = seqLen
+  stride_row_x  = K / 32 (Q4_K block count per row, where 256 elements/block)
+  ncols_y       = seqLen
+  stride_col_dst= outDim
+  channel_ratio = nsamples ratio = 1
+  nchannels_y = nsamples_y = 1
+  all channel/sample strides = 0
+  ncols_max     = seqLen
+
+Launch (per `launch_mul_mat_q` for sm_89 with TURING_MMA_AVAILABLE,
+  mmq_y=128, mmq_x=64, nwarps=8):
+  block_dims = (warp_size=32, nwarps=8, 1) — 256 threads
+  block_nums = ((outDim + 127) / 128, (seqLen + 63) / 64, 1)
+  dynamic smem = nbytes (caller computes — typically 46-50 KB for sm_89,
+                          must be raised above 48 KB via cuFuncSetAttribute) -/
+def launchMmqQ4K (kFunc : CUfunction)
+    (weightBuf : CUdeviceptr) (q8Buf : CUdeviceptr) (dstBuf : CUdeviceptr)
+    (inDim outDim seqLen : Nat)
+    (smemBytes : UInt32) : IO Unit := do
+  let mut bytes : ByteArray := ByteArray.empty
+  let mut offsets : Array USize := #[]
+  -- 0: const char *x (Q4_K weights)
+  offsets := offsets.push bytes.size.toUSize
+  bytes := pushU64 bytes weightBuf.toUInt64
+  -- 1: const int *y (Q8_1 input)
+  offsets := offsets.push bytes.size.toUSize
+  bytes := pushU64 bytes q8Buf.toUInt64
+  -- 2: const int32_t *ids_dst (NULL)
+  offsets := offsets.push bytes.size.toUSize
+  bytes := pushU64 bytes 0
+  -- 3: const int32_t *expert_bounds (NULL)
+  offsets := offsets.push bytes.size.toUSize
+  bytes := pushU64 bytes 0
+  -- 4: float *dst
+  offsets := offsets.push bytes.size.toUSize
+  bytes := pushU64 bytes dstBuf.toUInt64
+  -- 5: float *tmp_fixup (NULL — no stream-K)
+  offsets := offsets.push bytes.size.toUSize
+  bytes := pushU64 bytes 0
+  -- 6-22: 17 × int32 scalars
+  let scalars : Array UInt32 := #[
+    inDim.toUInt32,         -- ncols_x = K
+    outDim.toUInt32,        -- nrows_x = outDim
+    seqLen.toUInt32,        -- ncols_dst = seqLen
+    (inDim / 256).toUInt32, -- stride_row_x = K / qk (Q4_K: qk=256, super-blocks/row)
+    seqLen.toUInt32,        -- ncols_y = seqLen
+    outDim.toUInt32,        -- stride_col_dst = nrows_dst = outDim
+    1,                     -- channel_ratio
+    1,                     -- nchannels_y
+    0, 0, 0,               -- stride_channel_x, _y, _dst
+    1,                     -- sample_ratio
+    1,                     -- nsamples_y
+    0, 0, 0,               -- stride_sample_x, _y, _dst
+    seqLen.toUInt32        -- ncols_max
+  ]
+  for v in scalars do
+    offsets := offsets.push bytes.size.toUSize
+    bytes := pushU32 bytes v
+  -- Grid: ((outDim + mmq_y - 1) / mmq_y, (seqLen + mmq_x - 1) / mmq_x, 1)
+  -- where mmq_y=128, mmq_x=64 for sm ≥ 7.5.
+  let nty : UInt32 := ((outDim + 127) / 128).toUInt32
+  let ntx : UInt32 := ((seqLen + 63) / 64).toUInt32
+  -- Block: (32, 8, 1) — warp_size × nwarps for sm_89.
+  launchOnCaptureStream kFunc
+    nty ntx 1
+    32 8 1
+    smemBytes
+    bytes offsets
+
 end Hesper.LlamaCppPTX

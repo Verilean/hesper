@@ -261,6 +261,17 @@ extern "C" lean_obj_res lean_hesper_cuda_module_unload(size_t mod_val) {
     return lean_io_result_mk_ok(lean_box(0));
 }
 
+// Raise a kernel's dynamic shared-memory limit. Required for kernels
+// that request > 48 KB of dynamic smem (e.g. llama.cpp's mmq tile-GEMM
+// at mmq_y=128, mmq_x=64, ~46-50 KB needed).
+extern "C" lean_obj_res lean_hesper_cuda_func_set_max_dynamic_smem(size_t func_val, size_t bytes) {
+    CUDA_CHECK(cuFuncSetAttribute((CUfunction)func_val,
+                                   CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                                   (int)bytes),
+               "cuFuncSetAttribute(MAX_DYNAMIC_SHARED_SIZE_BYTES)");
+    return lean_io_result_mk_ok(lean_box(0));
+}
+
 // ============================================================================
 // Memory
 // ============================================================================
