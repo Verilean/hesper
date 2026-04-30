@@ -194,6 +194,33 @@ Output: 2.5 MB cubin. Loader will pick it up automatically; verify with
 `lake exe llamacpp-ptx-load-test` showing
 `✓ mmq Q4_K (mmq_x=64) @ 0xXXXX`.
 
+## Status (after this session, 2026-04-30)
+
+Landed:
+- ✓ Cubin extraction recipe (this doc)
+- ✓ `cuModuleLoadDataBytes` FFI for binary cubin loading (commit `0ef465d`)
+- ✓ `cuFuncSetMaxDynamicSmem` FFI for raising smem cap above 48 KB
+- ✓ `LlamaCppPTX.launchMmqQ4K` — packs 23 args (6 ptrs + 17 ints) and
+  launches with grid=(outDim/128, seqLen/64, 1), block=(32,8,1)
+  (commit `578b5f2`)
+- ✓ `Tests/LlamaCppPTX/MmqLaunchTest.lean` — confirms ABI is correct:
+  loads cubin, raises smem to 96 KB, launches, syncs, reads zero
+  output for zero inputs
+
+Pending for #343 (perf microbench):
+- llama.cpp's mmq kernel reads Q8_1 in the **`block_q8_1_mmq` layout**:
+  144 B / 128 elements = 4 sub-blocks of 32 i8 quants packed + 4 half2
+  (d, s) scale-sum pairs at the tail (per-pair-of-sub-blocks, with 16 B
+  padding to avoid smem bank conflicts).
+  This is **different from hesper's standard Q8_1 layout** (post-#146
+  port, 36 B / 32 elements). Two options to match:
+  1. Use llama.cpp's `quantize_q8_1_mmq` kernel (also in mmq.cuh /
+     quantize.cu) which we'd extract similarly to mmq Q4_K.
+  2. Write a Lean-side reformat from standard Q8_1 to mmq layout.
+- Once Q8_1 inputs are in the right format, the microbench is:
+  hesper `q4kMatmulBatchMMQ5Kernel` vs `launchMmqQ4K`, same shape,
+  cuStreamSync-bracketed batches, ms/call comparison + parity check.
+
 ## Why this is worth doing
 
 The 9.2× prefill gap is the single largest perf delta vs llama.cpp
