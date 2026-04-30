@@ -254,7 +254,14 @@ mutual
 
 /-- Lower a `CExpr` to `Exp (.scalar .u32)`. -/
 partial def lowerU32 (env : Env) : CExpr → Except String (Exp (.scalar .u32))
-  | .numLit s => parseIntLit s |>.map fun n => Exp.litU32 n
+  | .numLit s =>
+    -- Reject float-shaped numLits ("0.0", "1.5f", "1e-3") cleanly so
+    -- callers like `lowerBool` can fall through to `lowerF32` instead
+    -- of bubbling an internal "can't parse integer literal" error.
+    if s.any (fun c => c == '.' ∨ c == 'e' ∨ c == 'E') then
+      .error s!"lowerU32: float-shaped numLit '{s}' in u32 context"
+    else
+      parseIntLit s |>.map fun n => Exp.litU32 n
   | .floatLit _ => .error "lowerU32: float literal in u32 context"
   | .ident name =>
     match env.u32 name with
@@ -375,7 +382,10 @@ partial def lowerU32 (env : Env) : CExpr → Except String (Exp (.scalar .u32))
 /-- Lower a `CExpr` to `Exp (.scalar .i32)`. -/
 partial def lowerI32 (env : Env) : CExpr → Except String (Exp (.scalar .i32))
   | .numLit s =>
-    parseIntLit s |>.map fun n => Exp.litI32 (n : Int)
+    if s.any (fun c => c == '.' ∨ c == 'e' ∨ c == 'E') then
+      .error s!"lowerI32: float-shaped numLit '{s}' in i32 context"
+    else
+      parseIntLit s |>.map fun n => Exp.litI32 (n : Int)
   | .floatLit _ => .error "lowerI32: float literal in i32 context"
   | .ident name =>
     match env.i32 name with
@@ -432,6 +442,18 @@ partial def lowerI32 (env : Env) : CExpr → Except String (Exp (.scalar .i32))
       let ae ← lowerU32 env a
       let be ← lowerU32 env b
       .ok (Exp.toI32 (Exp.subSatS8x4 ae be))
+    -- CUDA float→int rounding intrinsics. We don't have separate
+    -- WGSL ops for round-to-nearest / round-toward-zero etc — they
+    -- all collapse to Exp.toI32 / Exp.toU32, with the rounding mode
+    -- decided by the codegen target. Acceptable for the kernel
+    -- transpile use case (kernels treat these as "convert to int";
+    -- the difference between rint/floor/ceil only matters when the
+    -- input is exactly half-integral, which the dp4a/quantize paths
+    -- never hit).
+    | "__float2int_rn", [e] | "__float2int_rz", [e]
+    | "__float2int_rd", [e] | "__float2int_ru", [e] => do
+      let ee ← lowerF32 env e
+      .ok (Exp.toI32 ee)
     | _, _ =>
       match env.inlines fn args with
       | some rewritten => lowerI32 env rewritten
@@ -497,9 +519,15 @@ partial def lowerI32 (env : Env) : CExpr → Except String (Exp (.scalar .i32))
 /-- Lower a `CExpr` to `Exp (.scalar .f32)`. -/
 partial def lowerF32 (env : Env) : CExpr → Except String (Exp (.scalar .f32))
   | .numLit s => do
-    -- Bare integer used in f32 context: convert.
-    let n ← parseIntLit s
-    .ok (Exp.litF32 (Float.ofNat n))
+    -- numLit in an f32 context. Some lexer paths emit `0.0` / `1.5f` /
+    -- `1e-3` as `numLit` rather than `floatLit`; sniff for a decimal
+    -- point or exponent and route through `parseFloatLit` accordingly.
+    -- Otherwise fall back to integer parse and promote.
+    if s.any (fun c => c == '.' ∨ c == 'e' ∨ c == 'E') then
+      parseFloatLit s |>.map fun f => Exp.litF32 f
+    else
+      let n ← parseIntLit s
+      .ok (Exp.litF32 (Float.ofNat n))
   | .floatLit s => parseFloatLit s |>.map fun f => Exp.litF32 f
   | .ident name =>
     match env.f32 name with

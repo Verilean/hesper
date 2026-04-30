@@ -91,7 +91,7 @@ def runFile (mode : EnvMode) (path : System.FilePath) : IO Counts := do
   let items := parseTranslationUnitStr src
   let mkEnv : CFunction → Env := match mode with
     | .fixed e => fun _ => e
-    | .auto    => fun f => autoEnvFor items f
+    | .auto    => fun f => autoEnvForWithDefines src items f
   let mut rows : Array FnRow := #[]
   for it in items do
     match it with

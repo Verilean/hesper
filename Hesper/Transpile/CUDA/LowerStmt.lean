@@ -275,11 +275,23 @@ partial def lowerStmt (env : Env) : CStmt → Except String (ShaderM Unit)
       -- can still attempt lowering. The ident is left unbound; if a
       -- later use needs it the lower will throw a separate error
       -- pointing at the actual use site rather than the decl.
+      -- Strip leading `const ` for the comparison so we don't have
+      -- to enumerate every cv-qualified variant.
+      let core := if ty.startsWith "const " then ty.drop 6 else ty
       if ty.endsWith "*" ∨ ty.endsWith " *"
-         ∨ ty == "tile_x_sizes" ∨ ty.endsWith "tile_x_sizes"
-         ∨ ty.endsWith "data_layout" ∨ ty == "data_layout"
-         ∨ ty == "bool" ∨ ty == "const bool"
-         ∨ ty.endsWith "::I" ∨ ty.endsWith "::J" then
+         ∨ core == "tile_x_sizes" ∨ core.endsWith "tile_x_sizes"
+         ∨ core.endsWith "data_layout" ∨ core == "data_layout"
+         ∨ core == "bool"
+         ∨ ty.endsWith "::I" ∨ ty.endsWith "::J"
+         -- Coordinate-bag tuples (CUDA <vector_types.h>): `int2`,
+         -- `uint2`, `uint3`, `dim3` etc. These appear at kernel-launch
+         -- sites (`dim3 num_blocks = ...; kernel<<<num_blocks,…>>>`)
+         -- which we don't lower anyway, so soft no-op is safe. If a
+         -- body-level use site reads `.x/.y/.z` later, that read will
+         -- still error with a clear "ident not bound" message.
+         ∨ core == "int2" ∨ core == "uint2" ∨ core == "uint3"
+         ∨ core == "int3" ∨ core == "uint4" ∨ core == "int4"
+         ∨ core == "dim3" ∨ core == "float2" ∨ core == "float4" then
         .ok (pure ())  -- soft no-op
       else
         .error s!"lowerStmt: unsupported decl type '{ty}'"
