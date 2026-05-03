@@ -216,3 +216,42 @@ def main : IO Unit := do
   else
     IO.println s!"FAIL: MMQ6 differs from baseline (max |err| = {err6})"
     IO.Process.exit 1
+
+  -- 7. MMQ7 (cp.async multi-stage prefetch pipeline).
+  IO.println ""
+  IO.println "=== MMQ7 (cp.async multi-stage pipeline, double-buffer smem) ==="
+  let outBufMMQ7 ← GPUBackend.allocBuffer ctx outBufSz
+  let mmq7Ref ← IO.mkRef (none : Option (GPUBackend.CachedDispatch _))
+  let nTileColsMMQ7 := (seqLen + 31) / 32
+  GPUBackend.executeWithConfigCached ctx
+    (Hesper.Layers.Linear.q4kMatmulBatchMMQ7Kernel wQ.config seqLen)
+    [("weights", wQ.weightBuf), ("input_q8", q8Buf), ("output", outBufMMQ7)]
+    { numWorkgroups := (outDim / 64, nTileColsMMQ7, 1),
+      workgroupSize := { x := 256, y := 1, z := 1 } }
+    (hash ("test-mmq7", inDim, outDim, seqLen)) mmq7Ref
+
+  let outBytesMMQ7 ← GPUBackend.readBuffer ctx outBufMMQ7 outBufSz
+  let mut outArrMMQ7 : Array Float := Array.mkEmpty (outDim * seqLen)
+  for i in [0:outDim * seqLen] do
+    let f ← Hesper.Basic.bytesToFloat32 outBytesMMQ7 (i * 4)
+    outArrMMQ7 := outArrMMQ7.push f
+  IO.println s!"[MMQ7] out[0..4]   = {outArrMMQ7.toList.take 4}"
+  IO.println s!"[MMQ7] out[col1,0..3] = {(outArrMMQ7.toList.drop outDim).take 4}"
+
+  let err7 := maxAbsDiffMMQ outArrRef outArrMMQ7
+  IO.println s!"[Parity MMQ7] max |err| = {err7}"
+
+  let mut firstBigIdx7 : Int := -1
+  for i in [0:outDim * seqLen] do
+    let d := (outArrRef[i]! - outArrMMQ7[i]!).abs
+    if d > 0.01 && firstBigIdx7 == -1 then
+      firstBigIdx7 := i.toInt32.toInt
+      let row := i % outDim
+      let col := i / outDim
+      IO.println s!"[Diff MMQ7] first |err|>0.01 at i={i} (row={row}, col={col}): ref={outArrRef[i]!} mmq7={outArrMMQ7[i]!}"
+
+  if err7 < 1.0e-3 then
+    IO.println s!"PASS: MMQ7 matches baseline within 1e-3"
+  else
+    IO.println s!"FAIL: MMQ7 differs from baseline (max |err| = {err7})"
+    IO.Process.exit 1
