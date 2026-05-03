@@ -10,6 +10,7 @@ inductive ScalarType where
   | f16    -- 16-bit floating point (requires f16 extension)
   | i32    -- 32-bit signed integer
   | u32    -- 32-bit unsigned integer
+  | u64    -- 64-bit unsigned integer (used for raw pointer Exps in CUDA backend; WGSL has no native u64)
   | bool   -- Boolean type
   | atomicI32  -- Atomic 32-bit signed integer (for atomic operations)
   | atomicU32  -- Atomic 32-bit unsigned integer (for atomic operations)
@@ -96,6 +97,7 @@ def ScalarType.toWGSL : ScalarType → String
   | .f16 => "f16"
   | .i32 => "i32"
   | .u32 => "u32"
+  | .u64 => "u64"  -- WGSL has no native u64; only used in CUDA backend for raw pointer Exps
   | .bool => "bool"
   | .atomicI32 => "atomic<i32>"
   | .atomicU32 => "atomic<u32>"
@@ -134,6 +136,7 @@ def ScalarType.byteSize : ScalarType → Nat
   | .f16 => 2
   | .i32 => 4
   | .u32 => 4
+  | .u64 => 8
   | .bool => 4  -- bools are 4 bytes in WGSL
   | .atomicI32 => 4  -- atomic<i32> is 4 bytes
   | .atomicU32 => 4  -- atomic<u32> is 4 bytes
@@ -164,6 +167,7 @@ def ScalarType.alignment : ScalarType → Nat
   | .f16 => 2
   | .i32 => 4
   | .u32 => 4
+  | .u64 => 8
   | .bool => 4
   | .atomicI32 => 4
   | .atomicU32 => 4

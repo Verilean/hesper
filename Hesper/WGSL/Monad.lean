@@ -433,6 +433,27 @@ def barrier : ShaderM Unit :=
 def warpBarrier : ShaderM Unit :=
   emitStmt (Stmt.exprStmt Exp.warpBarrier)
 
+/-- ── cp.async (sm_80+) ──
+    Issue an async global→shared memory copy of `bytes` bytes
+    (must be 4, 8, or 16). Non-blocking — completion synchronised
+    via `cpAsyncCommit` + `cpAsyncWait`. Used by llama.cpp's MMQ
+    pipeline to overlap the next K-iteration's load with the
+    current K-iteration's compute. WGSL backend has no equivalent. -/
+def cpAsync (smemAddr : Exp (.scalar .u32))
+            (globalAddr : Exp (.scalar .u64))
+            (bytes : Nat) : ShaderM Unit :=
+  emitStmt (Stmt.exprStmt (Exp.cpAsyncCgSharedGlobal smemAddr globalAddr bytes))
+
+/-- `cp.async.commit_group` — bundle all preceding `cpAsync` issues
+    by this thread into one group for later `cpAsyncWait`. -/
+def cpAsyncCommit : ShaderM Unit :=
+  emitStmt (Stmt.exprStmt Exp.cpAsyncCommitGroup)
+
+/-- `cp.async.wait_group N` — block this thread until all but the most
+    recent N committed groups have completed. `N=0` waits for all. -/
+def cpAsyncWait (n : Nat) : ShaderM Unit :=
+  emitStmt (Stmt.exprStmt (Exp.cpAsyncWaitGroup n))
+
 -- ============================================================================
 -- Built-in Variables
 -- ============================================================================
