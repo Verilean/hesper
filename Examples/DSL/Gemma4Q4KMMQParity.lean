@@ -138,14 +138,14 @@ def main : IO Unit := do
 
   -- 5. MMQ5 (full llama-shape: mmq_y=128, mmq_x=64, X+Y smem).
   IO.println ""
-  IO.println "=== MMQ5 (llama-shape: mmq_y=128, mmq_x=64, X+Y smem) ==="
+  IO.println "=== MMQ5 (mmq_y=64, mmq_x=32, X+Y smem — half tile rev. 2026-05-02) ==="
   let outBufMMQ5 ← GPUBackend.allocBuffer ctx outBufSz
   let mmq5Ref ← IO.mkRef (none : Option (GPUBackend.CachedDispatch _))
-  let nTileColsMMQ5 := (seqLen + 63) / 64
+  let nTileColsMMQ5 := (seqLen + 31) / 32
   GPUBackend.executeWithConfigCached ctx
     (Hesper.Layers.Linear.q4kMatmulBatchMMQ5Kernel wQ.config seqLen)
     [("weights", wQ.weightBuf), ("input_q8", q8Buf), ("output", outBufMMQ5)]
-    { numWorkgroups := (outDim / 128, nTileColsMMQ5, 1),
+    { numWorkgroups := (outDim / 64, nTileColsMMQ5, 1),
       workgroupSize := { x := 256, y := 1, z := 1 } }
     (hash ("test-mmq5", inDim, outDim, seqLen)) mmq5Ref
 
