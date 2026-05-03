@@ -353,6 +353,28 @@ inductive Inst where
   | bra_not      (pred : RegPred) (target : Label)
   | label        (l : Label)
   | ret
+
+  /-- ── Async copy (sm_80+) ──
+      `cp.async.cg.shared.global [smem_u32_addr], [global_u64_addr], N;`
+      issues a non-blocking global→shared copy of `bytes` bytes. Must be
+      followed by `cp.async.commit_group` and `cp.async.wait_group` to
+      establish a fence on completion.
+
+      `bytes` must be 4, 8, or 16. `.cg` ("cache-global") is the variant
+      used by llama.cpp's MMQ pipeline. The copy completes asynchronously
+      so subsequent compute on data already in smem can overlap with the
+      next stage's load. -/
+  | cp_async_cg_shared_global (smemAddr : RegU32) (globalAddr : RegU64) (bytes : Nat)
+  /-- `cp.async.commit_group;` — mark all preceding cp.async issues by
+      this thread as one "group". Used together with `cp.async.wait_group N`
+      to set up a sliding-window pipeline: at K-iter `i`, issue cp.async
+      for `i+1`, commit, then `wait_group 1` to ensure `i-1`'s data has
+      landed before consuming it. -/
+  | cp_async_commit_group
+  /-- `cp.async.wait_group N;` — block this thread until all but the most
+      recent N committed groups have completed (`N=0` waits for all). -/
+  | cp_async_wait_group (n : Nat)
+
   /-- ── WMMA Tensor-Core instructions (sm_70+) ──
       For m16n16k16 f16/f16/f32 only (most common Tensor Core shape).
       `addr` is the base address (RegU64); `stride` is the row-stride
@@ -501,6 +523,11 @@ partial def Inst.toString : Inst → String
   | .bra_not p target    => s!"  @!{p} bra {target};"
   | .label l             => s!"{l}:"
   | .ret                 => "  ret;"
+  -- ── Async copy (sm_80+) ──
+  | .cp_async_cg_shared_global s g n =>
+    s!"  cp.async.cg.shared.global [{s}], [{g}], {n};"
+  | .cp_async_commit_group => "  cp.async.commit_group;"
+  | .cp_async_wait_group n => s!"  cp.async.wait_group {n};"
   -- ── WMMA (Tensor Core) ──
   -- m16n16k16 only. PTX requires `.aligned`. Stride is in *elements*.
   -- Operand-modifier order (per PTX ISA 8.x manual):
