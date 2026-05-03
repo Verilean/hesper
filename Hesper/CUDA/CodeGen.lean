@@ -76,6 +76,14 @@ def Exp.cseable {t : WGSLType} : Exp t → Bool
   -- | .neg _ | .toF32 _ | .toI32 _ | .toU32 _ | .toF16 _
   -- | .mulhiU32 _ _ => true
   -- | _ => false
+  --
+  -- IMPORTANT: when re-enabling CSE, never add these to the safe-list:
+  --   .cpAsyncCgSharedGlobal, .cpAsyncCommitGroup, .cpAsyncWaitGroup
+  --   — these are side-effects (memory copy / barrier), not pure
+  --   computation. CSE-merging two cp.async calls in different K-iters
+  --   would skip the second async copy.
+  --   .bufferAddr — pure arithmetic, but rare and not worth the cache
+  --   overhead; safe to leave out of the safe-list.
 
 /-- Generate PTX for an Exp, returning AnyReg + state. -/
 partial def expToPTX (e : Exp t) (s : GenState) : ExpResult :=
