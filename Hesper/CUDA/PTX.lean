@@ -360,11 +360,15 @@ inductive Inst where
       followed by `cp.async.commit_group` and `cp.async.wait_group` to
       establish a fence on completion.
 
-      `bytes` must be 4, 8, or 16. `.cg` ("cache-global") is the variant
-      used by llama.cpp's MMQ pipeline. The copy completes asynchronously
-      so subsequent compute on data already in smem can overlap with the
-      next stage's load. -/
+      **`.cg` ("cache-global") only supports `bytes = 16`** (the L1-bypass
+      variant requires 16-byte aligned 16-byte transfers). For 4- or 8-byte
+      transfers use `.ca`. llama.cpp's MMQ pipeline uses `.cg` with 16B. -/
   | cp_async_cg_shared_global (smemAddr : RegU32) (globalAddr : RegU64) (bytes : Nat)
+  /-- `cp.async.ca.shared.global [smem], [global], N;` — cache-all variant
+      that supports `bytes ∈ {4, 8, 16}`. Slower than `.cg` per byte for
+      16B transfers but the only option for 4-byte transfers used in
+      element-wise async copy. -/
+  | cp_async_ca_shared_global (smemAddr : RegU32) (globalAddr : RegU64) (bytes : Nat)
   /-- `cp.async.commit_group;` — mark all preceding cp.async issues by
       this thread as one "group". Used together with `cp.async.wait_group N`
       to set up a sliding-window pipeline: at K-iter `i`, issue cp.async
@@ -526,6 +530,8 @@ partial def Inst.toString : Inst → String
   -- ── Async copy (sm_80+) ──
   | .cp_async_cg_shared_global s g n =>
     s!"  cp.async.cg.shared.global [{s}], [{g}], {n};"
+  | .cp_async_ca_shared_global s g n =>
+    s!"  cp.async.ca.shared.global [{s}], [{g}], {n};"
   | .cp_async_commit_group => "  cp.async.commit_group;"
   | .cp_async_wait_group n => s!"  cp.async.wait_group {n};"
   -- ── WMMA (Tensor Core) ──

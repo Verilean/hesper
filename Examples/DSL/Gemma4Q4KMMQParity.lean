@@ -175,3 +175,44 @@ def main : IO Unit := do
   else
     IO.println s!"FAIL: MMQ5 differs from baseline (max |err| = {err5})"
     IO.Process.exit 1
+
+  -- 6. MMQ6 (cp.async loads, single-stage). Same shape and arithmetic as
+  -- MMQ5 but Phase A/A' use cp.async.ca instead of ld→reg→st.shared.
+  IO.println ""
+  IO.println "=== MMQ6 (cp.async X+Y loads, single-stage) ==="
+  let outBufMMQ6 ← GPUBackend.allocBuffer ctx outBufSz
+  let mmq6Ref ← IO.mkRef (none : Option (GPUBackend.CachedDispatch _))
+  let nTileColsMMQ6 := (seqLen + 31) / 32
+  GPUBackend.executeWithConfigCached ctx
+    (Hesper.Layers.Linear.q4kMatmulBatchMMQ6Kernel wQ.config seqLen)
+    [("weights", wQ.weightBuf), ("input_q8", q8Buf), ("output", outBufMMQ6)]
+    { numWorkgroups := (outDim / 64, nTileColsMMQ6, 1),
+      workgroupSize := { x := 256, y := 1, z := 1 } }
+    (hash ("test-mmq6", inDim, outDim, seqLen)) mmq6Ref
+
+  let outBytesMMQ6 ← GPUBackend.readBuffer ctx outBufMMQ6 outBufSz
+  let mut outArrMMQ6 : Array Float := Array.mkEmpty (outDim * seqLen)
+  for i in [0:outDim * seqLen] do
+    let f ← Hesper.Basic.bytesToFloat32 outBytesMMQ6 (i * 4)
+    outArrMMQ6 := outArrMMQ6.push f
+  IO.println s!"[MMQ6] out[0..4]   = {outArrMMQ6.toList.take 4}"
+  IO.println s!"[MMQ6] out[col1,0..3] = {(outArrMMQ6.toList.drop outDim).take 4}"
+
+  let err6 := maxAbsDiffMMQ outArrRef outArrMMQ6
+  IO.println s!"[Parity MMQ6] max |err| = {err6}"
+
+  -- Locate first major mismatch.
+  let mut firstBigIdx6 : Int := -1
+  for i in [0:outDim * seqLen] do
+    let d := (outArrRef[i]! - outArrMMQ6[i]!).abs
+    if d > 0.01 && firstBigIdx6 == -1 then
+      firstBigIdx6 := i.toInt32.toInt
+      let row := i % outDim
+      let col := i / outDim
+      IO.println s!"[Diff MMQ6] first |err|>0.01 at i={i} (row={row}, col={col}): ref={outArrRef[i]!} mmq6={outArrMMQ6[i]!}"
+
+  if err6 < 1.0e-3 then
+    IO.println s!"PASS: MMQ6 matches baseline within 1e-3"
+  else
+    IO.println s!"FAIL: MMQ6 differs from baseline (max |err| = {err6})"
+    IO.Process.exit 1
