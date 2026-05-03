@@ -589,12 +589,11 @@ inductive Exp : WGSLType → Type where
   | sharedSymAddr : (smemName : String) → (elemSize : Nat) → Exp (.scalar .u32) → Exp (.scalar .u32)
 
   /-- ── cp.async (sm_80+) ── async global→shared copy.
-      `cpAsyncCgSharedGlobal smemAddrU32 globalAddrU64 bytes` issues a
-      non-blocking copy of `bytes` bytes from global memory to shared
-      memory. `bytes` must be 4, 8, or 16. Must be paired with
-      `cpAsyncCommitGroup` and `cpAsyncWaitGroup`. WGSL backend has no
-      equivalent — falls back to a synchronous copy via a temporary. -/
+      **`.cg` only supports `bytes = 16`.** Use `cpAsyncCaSharedGlobal`
+      for 4- or 8-byte transfers. -/
   | cpAsyncCgSharedGlobal : Exp (.scalar .u32) → Exp (.scalar .u64) → Nat → Exp (.scalar .u32)
+  /-- `cp.async.ca` cache-all variant. Supports `bytes ∈ {4, 8, 16}`. -/
+  | cpAsyncCaSharedGlobal : Exp (.scalar .u32) → Exp (.scalar .u64) → Nat → Exp (.scalar .u32)
   /-- `cp.async.commit_group` — mark all preceding cp.async issues by
       this thread as one group. -/
   | cpAsyncCommitGroup : Exp (.scalar .u32)
@@ -1001,6 +1000,8 @@ partial def Exp.toWGSL {t : WGSLType} : Exp t → String
   | cpAsyncCgSharedGlobal _ _ _ =>
     -- WGSL has no async-copy primitive; CUDA-only construct.
     "/* cp.async.cg.shared.global — CUDA-only */"
+  | cpAsyncCaSharedGlobal _ _ _ =>
+    "/* cp.async.ca.shared.global — CUDA-only */"
   | cpAsyncCommitGroup =>
     "/* cp.async.commit_group — CUDA-only */"
   | cpAsyncWaitGroup _ =>

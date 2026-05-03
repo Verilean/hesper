@@ -675,6 +675,11 @@ where
     let (rGlobal, s) := expToPTX globalAddr s
     let (r, s) := s.freshU32
     (.u32 r, s.emit (.cp_async_cg_shared_global rSmem.toU32! rGlobal.toU64! nBytes))
+  | .cpAsyncCaSharedGlobal smemAddr globalAddr nBytes =>
+    let (rSmem, s) := expToPTX smemAddr s
+    let (rGlobal, s) := expToPTX globalAddr s
+    let (r, s) := s.freshU32
+    (.u32 r, s.emit (.cp_async_ca_shared_global rSmem.toU32! rGlobal.toU64! nBytes))
   | .cpAsyncCommitGroup =>
     let (r, s) := s.freshU32
     (.u32 r, s.emit .cp_async_commit_group)

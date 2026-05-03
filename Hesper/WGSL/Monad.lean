@@ -458,6 +458,14 @@ def cpAsync (smemAddr : Exp (.scalar .u32))
             (bytes : Nat) : ShaderM Unit :=
   emitStmt (Stmt.exprStmt (Exp.cpAsyncCgSharedGlobal smemAddr globalAddr bytes))
 
+/-- `cp.async.ca` cache-all variant — supports `bytes ∈ {4, 8, 16}`.
+    Slower per byte than `.cg` for 16-byte transfers but the only option
+    for narrower transfers. -/
+def cpAsyncCa (smemAddr : Exp (.scalar .u32))
+              (globalAddr : Exp (.scalar .u64))
+              (bytes : Nat) : ShaderM Unit :=
+  emitStmt (Stmt.exprStmt (Exp.cpAsyncCaSharedGlobal smemAddr globalAddr bytes))
+
 /-- `cp.async.commit_group` — bundle all preceding `cpAsync` issues
     by this thread into one group for later `cpAsyncWait`. -/
 def cpAsyncCommit : ShaderM Unit :=
