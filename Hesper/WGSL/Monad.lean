@@ -433,6 +433,13 @@ def barrier : ShaderM Unit :=
 def warpBarrier : ShaderM Unit :=
   emitStmt (Stmt.exprStmt Exp.warpBarrier)
 
+/-- Pure: raw u64 pointer to element `idx` of a global buffer.
+    `elemSize` is the byte size of one element (typically 4 for u32/f32).
+    Used as the global-address operand for `cpAsync`. CUDA-only. -/
+def bufferAddr (bufName : String) (elemSize : Nat)
+               (idx : Exp (.scalar .u32)) : Exp (.scalar .u64) :=
+  Exp.bufferAddr bufName elemSize idx
+
 /-- ── cp.async (sm_80+) ──
     Issue an async global→shared memory copy of `bytes` bytes
     (must be 4, 8, or 16). Non-blocking — completion synchronised

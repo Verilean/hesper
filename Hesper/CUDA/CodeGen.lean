@@ -631,6 +631,17 @@ where
   | .workgroupBarrier => let (r, s) := s.freshU32; (.u32 r, s.emit (.bar_sync 0))
   | .warpBarrier      => let (r, s) := s.freshU32; (.u32 r, s.emit .bar_warp_sync)
 
+  -- Raw pointer to global buffer element idx (no dereference).
+  -- Lowers to: mul.wide.u32 off, idx, elemSize; add.u64 addr, base, off.
+  -- The buffer base pointer was bound to varMap at kernel entry by
+  -- `ld.param.u64`. Used as the global-addr operand for cp.async.
+  | .bufferAddr name elemSize idx =>
+    let rArr := (s.varMap.find? (·.1 == name)).map (·.2) |>.getD default
+    let (rIdx, s) := expToPTX idx s
+    let (off, s) := s.freshU64; let s := s.emit (.mul_wide_u32 off rIdx.toU32! elemSize)
+    let (addr, s) := s.freshU64; let s := s.emit (.add_u64 addr rArr.toU64! off)
+    (.u64 addr, s)
+
   -- ── Async copy (sm_80+) ──
   -- cp.async takes a u32 smem address (RegU32) and u64 global address
   -- (RegU64). Both are computed via expToPTX recursion. Returns a fresh
