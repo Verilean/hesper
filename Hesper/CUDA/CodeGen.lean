@@ -631,6 +631,22 @@ where
   | .workgroupBarrier => let (r, s) := s.freshU32; (.u32 r, s.emit (.bar_sync 0))
   | .warpBarrier      => let (r, s) := s.freshU32; (.u32 r, s.emit .bar_warp_sync)
 
+  -- ── Async copy (sm_80+) ──
+  -- cp.async takes a u32 smem address (RegU32) and u64 global address
+  -- (RegU64). Both are computed via expToPTX recursion. Returns a fresh
+  -- u32 placeholder (cp.async itself produces no value).
+  | .cpAsyncCgSharedGlobal smemAddr globalAddr nBytes =>
+    let (rSmem, s) := expToPTX smemAddr s
+    let (rGlobal, s) := expToPTX globalAddr s
+    let (r, s) := s.freshU32
+    (.u32 r, s.emit (.cp_async_cg_shared_global rSmem.toU32! rGlobal.toU64! nBytes))
+  | .cpAsyncCommitGroup =>
+    let (r, s) := s.freshU32
+    (.u32 r, s.emit .cp_async_commit_group)
+  | .cpAsyncWaitGroup n =>
+    let (r, s) := s.freshU32
+    (.u32 r, s.emit (.cp_async_wait_group n))
+
   -- Round-to-nearest-even f32 → i32 (matches llama.cpp's roundf semantics).
   | .roundToI32 v =>
     let (rv, s) := expToPTX v s
@@ -1037,6 +1053,9 @@ def generatePTX
     match ty with
     | .array (.scalar .f32) n => acc.push { name, elemType := "f32", count := n }
     | .array (.scalar .u32) n => acc.push { name, elemType := "u32", count := n }
+    -- i32 smem maps to .shared .u32 at the PTX level — bit pattern
+    -- identical, signedness comes from the load/op instruction.
+    | .array (.scalar .i32) n => acc.push { name, elemType := "u32", count := n }
     | _ => acc) #[]
   let paramNames := state.declaredBuffers.map (·.1) |>.toArray
   let sharedNames := state.sharedVars.map (·.1)
@@ -1054,6 +1073,8 @@ def generatePTX
   let u32SharedNames := state.sharedVars.foldl (fun (acc : List String) (name, ty) =>
     match ty with
     | .array (.scalar .u32) _ => name :: acc
+    -- i32 smem also uses u32-typed loads; signedness comes from the op.
+    | .array (.scalar .i32) _ => name :: acc
     | _ => acc) []
   -- Buffers declared with access mode `.read` get `ld.global.nc` (read-only L1).
   let readOnlyBufferNames := state.declaredBuffers.foldl (fun (acc : List String) (name, _, mode) =>

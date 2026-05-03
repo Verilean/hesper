@@ -575,6 +575,20 @@ inductive Exp : WGSLType → Type where
       preserves correctness. -/
   | warpBarrier : Exp (.scalar .u32)
 
+  /-- ── cp.async (sm_80+) ── async global→shared copy.
+      `cpAsyncCgSharedGlobal smemAddrU32 globalAddrU64 bytes` issues a
+      non-blocking copy of `bytes` bytes from global memory to shared
+      memory. `bytes` must be 4, 8, or 16. Must be paired with
+      `cpAsyncCommitGroup` and `cpAsyncWaitGroup`. WGSL backend has no
+      equivalent — falls back to a synchronous copy via a temporary. -/
+  | cpAsyncCgSharedGlobal : Exp (.scalar .u32) → Exp (.scalar .u64) → Nat → Exp (.scalar .u32)
+  /-- `cp.async.commit_group` — mark all preceding cp.async issues by
+      this thread as one group. -/
+  | cpAsyncCommitGroup : Exp (.scalar .u32)
+  /-- `cp.async.wait_group N` — block until all but the most recent N
+      committed groups have completed. `N=0` waits for all. -/
+  | cpAsyncWaitGroup : Nat → Exp (.scalar .u32)
+
 /-- Convert Float to WGSL literal string with full precision.
     Uses scientific notation (e.g. `1.0e-7`) when needed to preserve
     significant digits. FP32 has ~7 significant decimal digits. -/
@@ -966,6 +980,13 @@ partial def Exp.toWGSL {t : WGSLType} : Exp t → String
   | warpBarrier =>
     -- WGSL has no warp-sync primitive; fall back to block barrier.
     "workgroupBarrier()"
+  | cpAsyncCgSharedGlobal _ _ _ =>
+    -- WGSL has no async-copy primitive; CUDA-only construct.
+    "/* cp.async.cg.shared.global — CUDA-only */"
+  | cpAsyncCommitGroup =>
+    "/* cp.async.commit_group — CUDA-only */"
+  | cpAsyncWaitGroup _ =>
+    "/* cp.async.wait_group — CUDA-only */"
 
 /-! ## Operator overloading for ergonomic Exp construction
 
