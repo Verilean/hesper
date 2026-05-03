@@ -5961,16 +5961,29 @@ def forwardBatchDP4A [GPUBackend β] (ctx : β)
     -- Same MMQ2-default selection as forwardBatchDP4A_fromQ8 below.
     let mmq2Off := (← IO.getEnv "HESPER_PREFILL_MMQ2_OFF").isSome
     let mmq5Forced := (← IO.getEnv "HESPER_PREFILL_MMQ5").isSome
+    let mmq7Forced := (← IO.getEnv "HESPER_PREFILL_MMQ7").isSome
     -- MMQ5 (mmq_y=128, mmq_x=64, ~38KB smem) wins only when the full
     -- 128×64 tile is well-utilized — i.e. seqLen >= 32. For shorter
     -- prompts, MMQ2 (mmq_y=32, mmq_x=8) is ~1.5× faster (measured
     -- 2026-05-02: seqLen=51 → MMQ5 264ms vs MMQ2 175ms).
-    let useMMQ5 := mmq5Forced ∨ seqLen ≥ 32
-    let useMMQ2Default := !mmq2Off && !useMMQ5
+    -- MMQ7 = MMQ5 + cp.async multi-stage prefetch pipeline (opt-in).
+    let useMMQ7 := mmq7Forced
+    let useMMQ5 := !useMMQ7 ∧ (mmq5Forced ∨ seqLen ≥ 32)
+    let useMMQ2Default := !mmq2Off && !useMMQ5 && !useMMQ7
     -- seqLen does NOT have to be divisible by 8: the MMQ kernels already
     -- mask out-of-range j-columns (j_in check). The grid rounds up via
     -- ceil(seqLen/N) and OOB threads no-op. seqLen >= 2 means batched.
-    if useMMQ5 && layer.config.inDim % 256 == 0
+    if useMMQ7 && layer.config.inDim % 256 == 0
+       && layer.config.outDim % 64 == 0 && seqLen >= 2 then
+      let nTileCols := (seqLen + 31) / 32
+      GPUBackend.executeWithConfigCached ctx
+        (q4kMatmulBatchMMQ7Kernel layer.config seqLen)
+        [("weights", layer.weightBuf), ("input_q8", q8Buf), ("output", outputBuf)]
+        { numWorkgroups := (layer.config.outDim / 64, nTileCols, 1),
+          workgroupSize := { x := 256, y := 1, z := 1 } }
+        (hash ("q4k-batch-matmul-mmq7", layer.config.inDim, layer.config.outDim, seqLen))
+        layer.dp4aBatchMatmulPrepared
+    else if useMMQ5 && layer.config.inDim % 256 == 0
        && layer.config.outDim % 64 == 0 && seqLen >= 2 then
       let nTileCols := (seqLen + 31) / 32
       GPUBackend.executeWithConfigCached ctx
@@ -6104,10 +6117,23 @@ def forwardBatchDP4A_fromQ8 [GPUBackend β] (ctx : β)
   -- outDim % 128 == 0 and seqLen >= 2.
   let mmq2Off := (← IO.getEnv "HESPER_PREFILL_MMQ2_OFF").isSome
   let mmq5Forced := (← IO.getEnv "HESPER_PREFILL_MMQ5").isSome
+  let mmq7Forced := (← IO.getEnv "HESPER_PREFILL_MMQ7").isSome
   -- See comment at forwardBatchDP4A — MMQ5 wins only at seqLen >= 32.
-  let useMMQ5 := mmq5Forced ∨ seqLen ≥ 32
-  let useMMQ2Default := !mmq2Off && !useMMQ5
-  if useMMQ5 && layer.config.inDim % 256 == 0
+  let useMMQ7 := mmq7Forced
+  let useMMQ5 := !useMMQ7 ∧ (mmq5Forced ∨ seqLen ≥ 32)
+  let useMMQ2Default := !mmq2Off && !useMMQ5 && !useMMQ7
+  if useMMQ7 && layer.config.inDim % 256 == 0
+     && layer.config.outDim % 64 == 0 && seqLen >= 2 then
+    let nTileCols := (seqLen + 31) / 32
+    let cacheKey : UInt64 := hash ("q4k-batch-matmul-q8-mmq7",
+      layer.config.inDim, layer.config.outDim, seqLen)
+    GPUBackend.executeWithConfigCached ctx
+      (q4kMatmulBatchMMQ7Kernel layer.config seqLen)
+      [("weights", layer.weightBuf), ("input_q8", q8Buf), ("output", outputBuf)]
+      { numWorkgroups := (layer.config.outDim / 64, nTileCols, 1),
+        workgroupSize := { x := 256, y := 1, z := 1 } }
+      cacheKey ref
+  else if useMMQ5 && layer.config.inDim % 256 == 0
      && layer.config.outDim % 64 == 0 && seqLen >= 2 then
     let nTileCols := (seqLen + 31) / 32
     let cacheKey : UInt64 := hash ("q4k-batch-matmul-q8-mmq5",
