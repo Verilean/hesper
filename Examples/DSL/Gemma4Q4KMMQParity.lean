@@ -49,21 +49,30 @@ def main : IO Unit := do
     | none   => do
       IO.println "FAIL: model has no blocks"; IO.Process.exit 1
 
-  -- wQ: outDim=2048 (16 Q heads × headDim=128), inDim=2560.
-  let wQ := block0.attention.wQ
+  -- HESPER_PARITY_SHAPE selects which Q4_K weight matrix to test.
+  -- Defaults to wQ. Possible values: wQ | wK | wO | gate | down.
+  -- (wV ≡ wK shape; up ≡ gate shape — skipped to keep tests minimal.)
+  let shapeName := (← IO.getEnv "HESPER_PARITY_SHAPE").getD "wQ"
+  let wQ ← match shapeName with
+    | "wQ"   => pure block0.attention.wQ
+    | "wK"   => pure block0.attention.wK
+    | "wO"   => pure block0.attention.wO
+    | "gate" => pure block0.ffn.gate
+    | "down" => pure block0.ffn.down
+    | other  => do
+      IO.println s!"FAIL: unknown HESPER_PARITY_SHAPE '{other}' (use wQ/wK/wO/gate/down)"
+      IO.Process.exit 1
   if wQ.quantFormat != .Q4_K then
-    IO.println s!"FAIL: wQ is not Q4_K (got {repr wQ.quantFormat})"; IO.Process.exit 1
-  let inDim  := wQ.config.inDim    -- 2560
-  let outDim := wQ.config.outDim   -- 2048
+    IO.println s!"FAIL: {shapeName} is not Q4_K (got {repr wQ.quantFormat})"; IO.Process.exit 1
+  let inDim  := wQ.config.inDim
+  let outDim := wQ.config.outDim
 
-  -- Test seqLen from env (default 64 = covers full MMQ5 tile mmq_x=64).
-  -- 18 to test non-multiple-of-8 / non-multiple-of-64 column masking.
   let seqLen := match (← IO.getEnv "HESPER_PARITY_SEQLEN") with
     | some s => (s.toNat?).getD 64
     | none => 64
-  IO.println s!"[Test] inDim={inDim} outDim={outDim} seqLen={seqLen}"
-  if outDim % 128 != 0 then
-    IO.println s!"FAIL: outDim {outDim} not divisible by 128"; IO.Process.exit 1
+  IO.println s!"[Test] shape={shapeName}  inDim={inDim} outDim={outDim} seqLen={seqLen}"
+  if outDim % 64 != 0 then
+    IO.println s!"FAIL: outDim {outDim} not divisible by 64 (MMQ5/6/7 require mmq_y=64)"; IO.Process.exit 1
   if inDim % 256 != 0 then
     IO.println s!"FAIL: inDim {inDim} not divisible by 256"; IO.Process.exit 1
 
