@@ -19,6 +19,18 @@ lean_lib «Tests» where
   roots := #[`Tests]
   globs := #[.submodules `Tests]
 
+-- KernelStub extractor (research / design tool).
+-- See `tools/StubExtract/Stub.lean` for the schema and rationale.
+-- NOT linked into production. NOT linked from Hesper/.
+lean_lib «StubExtract» where
+  srcDir := "tools"
+  roots := #[`StubExtract.Stub, `StubExtract.Extract]
+
+lean_exe «stub-extract» where
+  srcDir := "tools"
+  root := `StubExtract.Main
+  supportInterpreter := false
+
 -- ============================================================================
 -- NATIVE DEPENDENCY BUILD (auto-triggered by `lake build`)
 -- ============================================================================
@@ -882,6 +894,10 @@ lean_exe «cuda-fma-f16x2-test» where
   root := `Tests.CUDA.CUDAFmaF16x2Test
   moreLinkArgs := stdLinkArgs ++ #["./.lake/build/native/libhesper_cuda.a", "-lcuda"]
 
+lean_exe «cuda-cp-async-smoke» where
+  root := `Tests.CUDA.CUDACpAsyncTest
+  moreLinkArgs := stdLinkArgs ++ #["./.lake/build/native/libhesper_cuda.a", "-lcuda"]
+
 lean_exe «cuda-fa-v11-parity» where
   root := `Tests.CUDA.V11LauncherParityTest
   moreLinkArgs := stdLinkArgs ++ #["./.lake/build/native/libhesper_cuda.a", "-lcuda"]
@@ -1260,98 +1276,6 @@ lean_exe small_embedding_test where
   supportInterpreter := false
   moreLinkArgs := stdLinkArgs
 
-lean_exe «transpile-cuda-expr-test» where
-  root := `Tests.Transpile.CUDAExprTest
-  supportInterpreter := false
-  moreLinkArgs := stdLinkArgs
-
-lean_exe «transpile-cuda-stmt-test» where
-  root := `Tests.Transpile.CUDAStmtTest
-  supportInterpreter := false
-  moreLinkArgs := stdLinkArgs
-
-lean_exe «transpile-cuda-vecdot-smoke» where
-  root := `Tests.Transpile.CUDAVecDotSmoke
-  supportInterpreter := false
-  moreLinkArgs := stdLinkArgs
-
-lean_exe «transpile-cuda-rmsnorm-smoke» where
-  root := `Tests.Transpile.CUDARmsNormSmoke
-  supportInterpreter := false
-  moreLinkArgs := stdLinkArgs
-
-lean_exe «transpile-cuda-rmsnorm-full-smoke» where
-  root := `Tests.Transpile.CUDARmsNormFullSmoke
-  supportInterpreter := false
-  moreLinkArgs := stdLinkArgs
-
-lean_exe «transpile-cuda-rmsnorm-gpu-parity» where
-  root := `Tests.Transpile.CUDARmsNormGPUParity
-  moreLinkArgs := stdLinkArgs ++ #["./.lake/build/native/libhesper_cuda.a", "-lcuda"]
-
-lean_exe «transpile-cuda-q4k-vecdot-smoke» where
-  root := `Tests.Transpile.CUDAQ4KVecDotSmoke
-  supportInterpreter := false
-  moreLinkArgs := stdLinkArgs
-
-lean_exe «transpile-cuda-q4k-vecdot-gpu-parity» where
-  root := `Tests.Transpile.CUDAQ4KVecDotGPUParity
-  moreLinkArgs := stdLinkArgs ++ #["./.lake/build/native/libhesper_cuda.a", "-lcuda"]
-
-lean_exe «transpile-cuda-prefill-probe» where
-  root := `Tests.Transpile.CUDAPrefillProbe
-  supportInterpreter := false
-  moreLinkArgs := stdLinkArgs
-
-lean_exe «transpile-cuda-struct-probe» where
-  root := `Tests.Transpile.CUDAStructProbe
-  supportInterpreter := false
-  moreLinkArgs := stdLinkArgs
-
-lean_exe «transpile-cuda-q4k-wrapper-smoke» where
-  root := `Tests.Transpile.CUDAQ4KWrapperSmoke
-  supportInterpreter := false
-  moreLinkArgs := stdLinkArgs
-
-lean_exe «transpile-cuda-q4k-full-wrapper-smoke» where
-  root := `Tests.Transpile.CUDAQ4KFullWrapperSmoke
-  supportInterpreter := false
-  moreLinkArgs := stdLinkArgs
-
-lean_exe «transpile-cuda-mmq-q4k-smoke» where
-  root := `Tests.Transpile.CUDAMMQQ4KSmoke
-  supportInterpreter := false
-  moreLinkArgs := stdLinkArgs
-
-lean_exe «transpile-cuda-mmq-load-tiles-smoke» where
-  root := `Tests.Transpile.CUDAMMQLoadTilesSmoke
-  supportInterpreter := false
-  moreLinkArgs := stdLinkArgs
-
-lean_exe «transpile-cuda-mmq-outer-smoke» where
-  root := `Tests.Transpile.CUDAMMQOuterSmoke
-  supportInterpreter := false
-  moreLinkArgs := stdLinkArgs
-
-lean_exe «transpile-cuda-unpack-scales-smoke» where
-  root := `Tests.Transpile.CUDAUnpackScalesSmoke
-  supportInterpreter := false
-  moreLinkArgs := stdLinkArgs
-
-lean_exe «transpile-cuda-mmq-q4k-full-smoke» where
-  root := `Tests.Transpile.CUDAMMQQ4KFullSmoke
-  supportInterpreter := false
-  moreLinkArgs := stdLinkArgs
-
-lean_exe «transpile-cuda-translation-unit» where
-  root := `Tests.Transpile.CUDATranslationUnit
-  supportInterpreter := false
-  moreLinkArgs := stdLinkArgs
-
-lean_exe «transpile-cuda-lower-map» where
-  root := `Tests.Transpile.CUDALowerMap
-  supportInterpreter := false
-  moreLinkArgs := stdLinkArgs
 
 lean_exe «wmma-ptx-text-test» where
   root := `Tests.CUDA.WmmaPTXTextTest

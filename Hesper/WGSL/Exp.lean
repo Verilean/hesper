@@ -582,6 +582,12 @@ inductive Exp : WGSLType → Type where
       no notion of raw pointer Exps — only used in the CUDA path. -/
   | bufferAddr : (bufName : String) → (elemSize : Nat) → Exp (.scalar .u32) → Exp (.scalar .u64)
 
+  /-- Raw u32 byte-address of element `idx` in a shared-memory array.
+      Lowers to `mov.u32 + add.u32` on CUDA. Used as the smem-address
+      operand for `cpAsyncCgSharedGlobal`. `elemSize` is byte size of
+      one element (typically 4 for u32 smem arrays). -/
+  | sharedSymAddr : (smemName : String) → (elemSize : Nat) → Exp (.scalar .u32) → Exp (.scalar .u32)
+
   /-- ── cp.async (sm_80+) ── async global→shared copy.
       `cpAsyncCgSharedGlobal smemAddrU32 globalAddrU64 bytes` issues a
       non-blocking copy of `bytes` bytes from global memory to shared
@@ -990,6 +996,8 @@ partial def Exp.toWGSL {t : WGSLType} : Exp t → String
   | bufferAddr name _ _ =>
     -- WGSL has no raw-pointer Exps; CUDA-only construct.
     s!"/* bufferAddr({name}) — CUDA-only */"
+  | sharedSymAddr name _ _ =>
+    s!"/* sharedSymAddr({name}) — CUDA-only */"
   | cpAsyncCgSharedGlobal _ _ _ =>
     -- WGSL has no async-copy primitive; CUDA-only construct.
     "/* cp.async.cg.shared.global — CUDA-only */"

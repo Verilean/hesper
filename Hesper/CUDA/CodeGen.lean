@@ -650,6 +650,22 @@ where
     let (addr, s) := s.freshU64; let s := s.emit (.add_u64 addr rArr.toU64! off)
     (.u64 addr, s)
 
+  -- Raw u32 byte-address of element idx in a shared-memory array.
+  -- Lowers to: mov.u32 sym, smemSym; shl off, idx, log2(elemSize); add.u32 addr, sym, off.
+  -- Used as smem operand for cp.async. elemSize must be 4, 8, or 16
+  -- (cp.async transfer sizes); other sizes are not currently supported.
+  | .sharedSymAddr name elemSize idx =>
+    let (rIdx, s) := expToPTX idx s
+    let (symR, s) := s.freshU32; let s := s.emit (.mov_shared_addr symR name)
+    let shiftBits :=
+      if elemSize == 4 then 2
+      else if elemSize == 8 then 3
+      else if elemSize == 16 then 4
+      else 2  -- Default to 4-byte stride; non-pow2 not supported here.
+    let (off, s) := s.freshU32; let s := s.emit (.shl_u32 off rIdx.toU32! shiftBits)
+    let (addr, s) := s.freshU32; let s := s.emit (.add_u32 addr symR off)
+    (.u32 addr, s)
+
   -- ── Async copy (sm_80+) ──
   -- cp.async takes a u32 smem address (RegU32) and u64 global address
   -- (RegU64). Both are computed via expToPTX recursion. Returns a fresh

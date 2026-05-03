@@ -440,6 +440,13 @@ def bufferAddr (bufName : String) (elemSize : Nat)
                (idx : Exp (.scalar .u32)) : Exp (.scalar .u64) :=
   Exp.bufferAddr bufName elemSize idx
 
+/-- Pure: raw u32 byte-address of element `idx` in a shared-memory array.
+    `elemSize` must be 4, 8, or 16. Used as the smem-address operand
+    for `cpAsync`. CUDA-only. -/
+def sharedSymAddr (smemName : String) (elemSize : Nat)
+                  (idx : Exp (.scalar .u32)) : Exp (.scalar .u32) :=
+  Exp.sharedSymAddr smemName elemSize idx
+
 /-- ── cp.async (sm_80+) ──
     Issue an async global→shared memory copy of `bytes` bytes
     (must be 4, 8, or 16). Non-blocking — completion synchronised
