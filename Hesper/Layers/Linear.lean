@@ -1467,6 +1467,13 @@ def q4kMatmulBatchMMQ5Kernel (config : Config) (seqLen : Nat) : ShaderM Unit := 
   let _input ← ShaderM.declareReadOnlyBuffer "input_q8" (.array (.scalar .u32) q8InputU32Size)
   let _output ← ShaderM.declareOutputBuffer "output" (.array (.scalar .f32) totalOutputSize)
 
+  -- launch_bounds(256, 2): force ptxas to fit ≥ 2 blocks/SM for occupancy.
+  -- ncu measured MMQ5 at 75 reg/thread → 1 block/SM (17.8% occupancy).
+  -- Target 128 reg/thread max → 2 block/SM = 35% occupancy. RTX 4070 Ti has
+  -- 100 KB smem/SM so 2 × 18.8 KB = 37.6 KB fits.
+  ShaderM.setMaxnreg 128
+  ShaderM.setMinnctapersm 2
+
   -- X tile: 64 rows × 37 stride (36 packed Q4_K ints + 1 pad).
   let xStride : Nat := 37
   ShaderM.sharedNamed "x_block" (.array (.scalar .u32) (64 * xStride))

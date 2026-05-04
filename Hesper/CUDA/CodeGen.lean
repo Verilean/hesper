@@ -1089,6 +1089,11 @@ def generatePTX
     if workgroupSize.x > 0 then some (workgroupSize.x, workgroupSize.y, workgroupSize.z)
     else none
   let state := ShaderM.exec computation
+  -- ShaderM.setMaxnreg / setMinnctapersm override the function-level args,
+  -- so kernels can self-declare their occupancy hint without the dispatcher
+  -- needing to pass anything through executeWithConfigCached.
+  let maxnreg := state.maxnreg.orElse fun _ => maxnreg
+  let minnctapersm := state.minnctapersm.orElse fun _ => minnctapersm
   let sharedDecls := state.sharedVars.foldl (fun (acc : Array SharedDecl) (name, ty) =>
     match ty with
     | .array (.scalar .f32) n => acc.push { name, elemType := "f32", count := n }

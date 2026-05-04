@@ -46,6 +46,14 @@ structure ShaderState where
   sharedVars : List (String × WGSLType)                -- Shared memory declarations
   declaredBuffers : List (String × WGSLType × BufferAccessMode)  -- Auto-tracked buffer bindings (name, type, access mode)
   needsSubgroups : Bool := false                       -- Set automatically when subgroupAdd is used
+  /-- Optional `__launch_bounds__` analogue: caps register allocation per
+      thread. CUDA backend lowers to PTX `.maxnreg`. None = ptxas default
+      (which may pick a higher count and reduce occupancy). -/
+  maxnreg : Option Nat := none
+  /-- Optional minimum CTAs per SM hint. Combined with maxntid (derived
+      from workgroup size), this is the full `__launch_bounds__(threads,
+      minCtas)` equivalent — ptxas uses it to size register allocation. -/
+  minnctapersm : Option Nat := none
 
 /-- The Shader Monad -/
 abbrev ShaderM (α : Type) := StateM ShaderState α
@@ -58,7 +66,9 @@ def initialState : ShaderState :=
     varCounter := 0
     sharedVars := []
     declaredBuffers := []
-    needsSubgroups := false }
+    needsSubgroups := false
+    maxnreg := none
+    minnctapersm := none }
 
 /-- Run a shader computation and extract the result and final state -/
 def run (m : ShaderM α) : α × ShaderState :=
@@ -432,6 +442,19 @@ def barrier : ShaderM Unit :=
     must finish writing before reading. -/
 def warpBarrier : ShaderM Unit :=
   emitStmt (Stmt.exprStmt Exp.warpBarrier)
+
+/-- Cap per-thread register usage at `n`. ptxas will spill to local memory
+    if it would otherwise exceed this. Used for occupancy tuning — fewer
+    registers per thread → more blocks per SM. CUDA-only (lowers to PTX
+    `.maxnreg`). WGSL backend ignores. -/
+def setMaxnreg (n : Nat) : ShaderM Unit :=
+  modify fun s => { s with maxnreg := some n }
+
+/-- Promise that ≥ `n` CTAs will run per SM. Combined with the workgroup
+    size (which gives ptxas `.maxntid`), this is the `__launch_bounds__`
+    equivalent — lets ptxas pick a register budget that fits N blocks. -/
+def setMinnctapersm (n : Nat) : ShaderM Unit :=
+  modify fun s => { s with minnctapersm := some n }
 
 /-- Pure: raw u64 pointer to element `idx` of a global buffer.
     `elemSize` is the byte size of one element (typically 4 for u32/f32).
