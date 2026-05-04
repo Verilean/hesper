@@ -910,6 +910,14 @@ lean_exe «cuda-conv-transpose-1d-parity» where
   root := `Tests.CUDA.CUDAConvTranspose1dTest
   moreLinkArgs := stdLinkArgs ++ #["./.lake/build/native/libhesper_cuda.a", "-lcuda"]
 
+lean_exe «cuda-im2col-vs-llama» where
+  root := `Tests.CUDA.CUDAIm2colVsLlamaTest
+  moreLinkArgs := stdLinkArgs ++ #["./.lake/build/native/libhesper_cuda.a", "-lcuda"]
+
+lean_exe «cuda-conv-transpose-1d-vs-llama» where
+  root := `Tests.CUDA.CUDAConvTranspose1dVsLlamaTest
+  moreLinkArgs := stdLinkArgs ++ #["./.lake/build/native/libhesper_cuda.a", "-lcuda"]
+
 lean_exe «cuda-fa-v11-parity» where
   root := `Tests.CUDA.V11LauncherParityTest
   moreLinkArgs := stdLinkArgs ++ #["./.lake/build/native/libhesper_cuda.a", "-lcuda"]
