@@ -100,6 +100,7 @@ inductive Exp : WGSLType → Type where
   | vecY {st : ScalarType} : Exp (.vec2 st) → Exp (.scalar st)
   | vec3X {st : ScalarType} : Exp (.vec3 st) → Exp (.scalar st)
   | vec3Y {st : ScalarType} : Exp (.vec3 st) → Exp (.scalar st)
+  | vec3Z {st : ScalarType} : Exp (.vec3 st) → Exp (.scalar st)
   | vecZ {st : ScalarType} : Exp (.vec3 st) → Exp (.scalar st)
   | vecW {st : ScalarType} : Exp (.vec4 st) → Exp (.scalar st)
   -- vec4 component access (.x/.y/.z; .w covered by vecW above).
@@ -680,6 +681,7 @@ partial def Exp.toWGSL {t : WGSLType} : Exp t → String
   | vecY v => s!"{toWGSL v}.y"
   | vec3X v => s!"{toWGSL v}.x"
   | vec3Y v => s!"{toWGSL v}.y"
+  | vec3Z v => s!"{toWGSL v}.z"
   | vecZ v => s!"{toWGSL v}.z"
   | vecW v => s!"{toWGSL v}.w"
   | vec4X v => s!"{toWGSL v}.x"

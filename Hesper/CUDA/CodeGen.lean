@@ -491,6 +491,20 @@ where
     else if isLocal then let (r, s) := s.readSReg .tid_y; (.u32 r, s)
     else if isWG then let (r, s) := s.readSReg .ctaid_y; (.u32 r, s)
     else let (r, s) := s.freshU32; (.u32 r, s)
+  | .vec3Z v =>
+    let (rv, s) := expToPTX v s
+    let isGlobal := s.varMap.any (fun (n, reg) => reg == rv && n == "global_invocation_id")
+    let isLocal  := s.varMap.any (fun (n, reg) => reg == rv && n == "local_invocation_id")
+    let isWG     := s.varMap.any (fun (n, reg) => reg == rv && n == "workgroup_id")
+    if isGlobal then
+      let (c, s) := s.readSReg .ctaid_z
+      let (n, s) := s.readSReg .ntid_z
+      let (t, s) := s.readSReg .tid_z
+      let (r, s) := s.freshU32
+      (.u32 r, s.emit (.mad_lo_u32 r c n t))
+    else if isLocal then let (r, s) := s.readSReg .tid_z; (.u32 r, s)
+    else if isWG then let (r, s) := s.readSReg .ctaid_z; (.u32 r, s)
+    else let (r, s) := s.freshU32; (.u32 r, s)
 
   -- Memory access
   | .index arr idx =>
