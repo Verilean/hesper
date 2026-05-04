@@ -140,4 +140,36 @@ def im2colF32Kernel
     )
   ) (pure ())
 
+/-- Naive f32 matmul kernel: `dst[m, n] = Σ_k a[m, k] * b[n, k]`.
+    Note: `b` is stored row-major as `[N, K]` so `b[n, k]` is at
+    `n * K + k`. This matches the conv2d use case where the weight
+    tensor `[OC, IC*KH*KW]` is contiguous along the IC*KH*KW dimension.
+
+    Grid: `(N, M, 1)` workgroups, `(1, 1, 1)` block. Each thread emits
+    one output element. Slow (no smem, no fma chain) but parity-correct.
+
+    Used as the matmul stage of conv2d via im2col. Not for hot-path use. -/
+def matmulF32NaiveKernel
+    (M N K : Nat) : ShaderM Unit := do
+  let _a   ← ShaderM.declareReadOnlyBuffer "a"   (.array (.scalar .f32) (M * K))
+  let _b   ← ShaderM.declareReadOnlyBuffer "b"   (.array (.scalar .f32) (N * K))
+  let _dst ← ShaderM.declareOutputBuffer  "dst" (.array (.scalar .f32) (M * N))
+
+  let wid ← ShaderM.workgroupId
+  let n := Exp.vec3X wid               -- output column ∈ [0, N)
+  let m := Exp.vec3Y wid               -- output row    ∈ [0, M)
+
+  ShaderM.varNamed "acc" (.scalar .f32) (Exp.litF32 0.0)
+  ShaderM.loop (Exp.litU32 0) (Exp.litU32 K) (Exp.litU32 1) fun k => do
+    let aIdx := Exp.add (Exp.mul m (Exp.litU32 K)) k
+    let bIdx := Exp.add (Exp.mul n (Exp.litU32 K)) k
+    let av ← ShaderM.readBuffer (ty := .scalar .f32) (n := M * K) "a" aIdx
+    let bv ← ShaderM.readBuffer (ty := .scalar .f32) (n := N * K) "b" bIdx
+    let accExp : Exp (.scalar .f32) := Exp.var "acc"
+    ShaderM.assign "acc" (Exp.add accExp (Exp.mul av bv))
+
+  let dstIdx := Exp.add (Exp.mul m (Exp.litU32 N)) n
+  let accExp : Exp (.scalar .f32) := Exp.var "acc"
+  ShaderM.writeBuffer (ty := .scalar .f32) "dst" dstIdx accExp
+
 end Hesper.Layers.Vision
