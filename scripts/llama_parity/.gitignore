@@ -1,2 +1,4 @@
 dump_im2col_golden
 dump_conv_transpose_1d_golden
+bench_im2col
+bench_conv_transpose_1d
