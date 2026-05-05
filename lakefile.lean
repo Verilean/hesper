@@ -426,6 +426,15 @@ def stdLinkArgs : Array String :=
       "-ldl",
       "-lpthread"]
 
+/-- Per-exe CUDA link args. Empty on macOS so exes that conditionally use the
+    CUDA backend still link there (CUDA codegen falls back to no-op at runtime).
+    Note: stdLinkArgs already includes the CUDA library on Linux for the FFI
+    surface, but per-exe definitions historically appended these unconditionally.
+    We centralise here so adding macOS support is a single-line change. -/
+def cudaExeArgs : Array String :=
+  if System.Platform.isOSX then #[]
+  else #["./.lake/build/native/libhesper_cuda.a", "-lcuda"]
+
 -- ============================================================================
 -- EXAMPLES - Organized by Category
 -- ============================================================================
@@ -436,47 +445,47 @@ def stdLinkArgs : Array String :=
 
 lean_exe «circuit-irv2-poc» where
   root := `Examples.DSL.CircuitIRv2PoC
-  moreLinkArgs := stdLinkArgs ++ #["./.lake/build/native/libhesper_cuda.a", "-lcuda"]
+  moreLinkArgs := stdLinkArgs ++ cudaExeArgs
 
 lean_exe «gemma4-qproj-parity» where
   root := `Examples.DSL.Gemma4QProjParity
-  moreLinkArgs := stdLinkArgs ++ #["./.lake/build/native/libhesper_cuda.a", "-lcuda"]
+  moreLinkArgs := stdLinkArgs ++ cudaExeArgs
 
 lean_exe «gemma4-q4k-mmq-parity» where
   root := `Examples.DSL.Gemma4Q4KMMQParity
-  moreLinkArgs := stdLinkArgs ++ #["./.lake/build/native/libhesper_cuda.a", "-lcuda"]
+  moreLinkArgs := stdLinkArgs ++ cudaExeArgs
 
 lean_exe «gemma4-qkv-parity» where
   root := `Examples.DSL.Gemma4QKVProjParity
-  moreLinkArgs := stdLinkArgs ++ #["./.lake/build/native/libhesper_cuda.a", "-lcuda"]
+  moreLinkArgs := stdLinkArgs ++ cudaExeArgs
 
 lean_exe «gemma4-ffn-parity» where
   root := `Examples.DSL.Gemma4FFNParity
-  moreLinkArgs := stdLinkArgs ++ #["./.lake/build/native/libhesper_cuda.a", "-lcuda"]
+  moreLinkArgs := stdLinkArgs ++ cudaExeArgs
 
 lean_exe «gemma4-postffn-parity» where
   root := `Examples.DSL.Gemma4PostFFNParity
-  moreLinkArgs := stdLinkArgs ++ #["./.lake/build/native/libhesper_cuda.a", "-lcuda"]
+  moreLinkArgs := stdLinkArgs ++ cudaExeArgs
 
 lean_exe «gemma4-kv-parity» where
   root := `Examples.DSL.Gemma4KVWriteParity
-  moreLinkArgs := stdLinkArgs ++ #["./.lake/build/native/libhesper_cuda.a", "-lcuda"]
+  moreLinkArgs := stdLinkArgs ++ cudaExeArgs
 
 lean_exe «gemma4-k-parity» where
   root := `Examples.DSL.Gemma4KWriteParity
-  moreLinkArgs := stdLinkArgs ++ #["./.lake/build/native/libhesper_cuda.a", "-lcuda"]
+  moreLinkArgs := stdLinkArgs ++ cudaExeArgs
 
 lean_exe «gemma4-kv-multi-parity» where
   root := `Examples.DSL.Gemma4KVWriteMultiParity
-  moreLinkArgs := stdLinkArgs ++ #["./.lake/build/native/libhesper_cuda.a", "-lcuda"]
+  moreLinkArgs := stdLinkArgs ++ cudaExeArgs
 
 lean_exe «gemma4-ropeq-parity» where
   root := `Examples.DSL.Gemma4RopeQParity
-  moreLinkArgs := stdLinkArgs ++ #["./.lake/build/native/libhesper_cuda.a", "-lcuda"]
+  moreLinkArgs := stdLinkArgs ++ cudaExeArgs
 
 lean_exe «gemma4-dispatch-count» where
   root := `Examples.DSL.Gemma4DispatchCount
-  moreLinkArgs := stdLinkArgs ++ #["./.lake/build/native/libhesper_cuda.a", "-lcuda"]
+  moreLinkArgs := stdLinkArgs ++ cudaExeArgs
 
 lean_exe «dsl-basics» where
   root := `Examples.DSL.DSLBasics
@@ -758,63 +767,63 @@ lean_exe «fuse-write-destination-test» where
 
 lean_exe «scatter-dynamic-gpu-test» where
   root := `Tests.Circuit.ScatterDynamicGPUTest
-  moreLinkArgs := stdLinkArgs ++ #["./.lake/build/native/libhesper_cuda.a", "-lcuda"]
+  moreLinkArgs := stdLinkArgs ++ cudaExeArgs
 
 lean_exe «llamacpp-ptx-load-test» where
   root := `Tests.LlamaCppPTX.LoadTest
-  moreLinkArgs := stdLinkArgs ++ #["./.lake/build/native/libhesper_cuda.a", "-lcuda"]
+  moreLinkArgs := stdLinkArgs ++ cudaExeArgs
 
 lean_exe «llamacpp-mmq-launch-test» where
   root := `Tests.LlamaCppPTX.MmqLaunchTest
-  moreLinkArgs := stdLinkArgs ++ #["./.lake/build/native/libhesper_cuda.a", "-lcuda"]
+  moreLinkArgs := stdLinkArgs ++ cudaExeArgs
 
 lean_exe «llamacpp-abi-test» where
   root := `Tests.LlamaCppPTX.ABITest
-  moreLinkArgs := stdLinkArgs ++ #["./.lake/build/native/libhesper_cuda.a", "-lcuda"]
+  moreLinkArgs := stdLinkArgs ++ cudaExeArgs
 
 lean_exe «hesper-vs-llamacpp-q4k» where
   root := `Tests.LlamaCppPTX.HesperVsLlamacppQ4K
-  moreLinkArgs := stdLinkArgs ++ #["./.lake/build/native/libhesper_cuda.a", "-lcuda"]
+  moreLinkArgs := stdLinkArgs ++ cudaExeArgs
 
 lean_exe «rope-k-scatter-gpu-test» where
   root := `Tests.Circuit.RopeKScatterGPUTest
-  moreLinkArgs := stdLinkArgs ++ #["./.lake/build/native/libhesper_cuda.a", "-lcuda"]
+  moreLinkArgs := stdLinkArgs ++ cudaExeArgs
 
 lean_exe «warp-sum-gpu-test» where
   root := `Tests.Circuit.WarpSumGPUTest
-  moreLinkArgs := stdLinkArgs ++ #["./.lake/build/native/libhesper_cuda.a", "-lcuda"]
+  moreLinkArgs := stdLinkArgs ++ cudaExeArgs
 
 lean_exe «warp-dotproduct-gpu-test» where
   root := `Tests.Circuit.WarpDotProductGPUTest
-  moreLinkArgs := stdLinkArgs ++ #["./.lake/build/native/libhesper_cuda.a", "-lcuda"]
+  moreLinkArgs := stdLinkArgs ++ cudaExeArgs
 
 lean_exe «reduce-scatter-gpu-test» where
   root := `Tests.Circuit.ReduceScatterGPUTest
-  moreLinkArgs := stdLinkArgs ++ #["./.lake/build/native/libhesper_cuda.a", "-lcuda"]
+  moreLinkArgs := stdLinkArgs ++ cudaExeArgs
 
 lean_exe «fastdiv-gpu-test» where
   root := `Tests.Circuit.FastdivGPUTest
-  moreLinkArgs := stdLinkArgs ++ #["./.lake/build/native/libhesper_cuda.a", "-lcuda"]
+  moreLinkArgs := stdLinkArgs ++ cudaExeArgs
 
 lean_exe «pointwise-gpu-test» where
   root := `Tests.Circuit.PointwiseGPUTest
-  moreLinkArgs := stdLinkArgs ++ #["./.lake/build/native/libhesper_cuda.a", "-lcuda"]
+  moreLinkArgs := stdLinkArgs ++ cudaExeArgs
 
 lean_exe «broadcast-gpu-test» where
   root := `Tests.Circuit.BroadcastGPUTest
-  moreLinkArgs := stdLinkArgs ++ #["./.lake/build/native/libhesper_cuda.a", "-lcuda"]
+  moreLinkArgs := stdLinkArgs ++ cudaExeArgs
 
 lean_exe «rmsnorm-gpu-test» where
   root := `Tests.Circuit.RmsNormGPUTest
-  moreLinkArgs := stdLinkArgs ++ #["./.lake/build/native/libhesper_cuda.a", "-lcuda"]
+  moreLinkArgs := stdLinkArgs ++ cudaExeArgs
 
 lean_exe «fused-norm-q8-gpu-test» where
   root := `Tests.Circuit.FusedNormQ8GPUTest
-  moreLinkArgs := stdLinkArgs ++ #["./.lake/build/native/libhesper_cuda.a", "-lcuda"]
+  moreLinkArgs := stdLinkArgs ++ cudaExeArgs
 
 lean_exe «fused-qkv-norm-gpu-test» where
   root := `Tests.Circuit.FusedQKVNormGPUTest
-  moreLinkArgs := stdLinkArgs ++ #["./.lake/build/native/libhesper_cuda.a", "-lcuda"]
+  moreLinkArgs := stdLinkArgs ++ cudaExeArgs
 
 lean_exe «bitnet-ttt-mqar» where
   root := `Examples.BitNetTTT_MQAR
@@ -836,11 +845,11 @@ lean_exe «ptx-codegen-test» where
   root := `Tests.CUDA.PTXCodeGenTest
 
 def cudaLinkArgs : Array String :=
-  stdLinkArgs ++ #["./.lake/build/native/libhesper_cuda.a", "-ldl"]
+  stdLinkArgs ++ cudaExeArgs ++ #["-ldl"]
 
 lean_exe «cuda-minimal-test» where
   root := `Tests.CUDA.CUDAMinimalTest
-  moreLinkArgs := #["./.lake/build/native/libhesper_cuda.a", "-lcuda"]
+  moreLinkArgs := cudaExeArgs
 
 lean_exe «cuda-execute-test» where
   root := `Tests.CUDA.CUDAExecuteTest
@@ -848,215 +857,215 @@ lean_exe «cuda-execute-test» where
 
 lean_exe «buffer-array-test» where
   root := `Tests.CUDA.BufferArrayTest
-  moreLinkArgs := stdLinkArgs ++ #["./.lake/build/native/libhesper_cuda.a", "-lcuda"]
+  moreLinkArgs := stdLinkArgs ++ cudaExeArgs
 
 lean_exe «multi-layer-q4k-test» where
   root := `Tests.CUDA.MultiLayerQ4KTest
-  moreLinkArgs := stdLinkArgs ++ #["./.lake/build/native/libhesper_cuda.a", "-lcuda"]
+  moreLinkArgs := stdLinkArgs ++ cudaExeArgs
 
 lean_exe «cuda-matmul-test» where
   root := `Tests.CUDA.CUDAMatMulTest
-  moreLinkArgs := stdLinkArgs ++ #["./.lake/build/native/libhesper_cuda.a", "-lcuda"]
+  moreLinkArgs := stdLinkArgs ++ cudaExeArgs
 
 lean_exe «cuda-matmul-microbench» where
   root := `Tests.CUDA.CUDAMatmulMicrobench
-  moreLinkArgs := stdLinkArgs ++ #["./.lake/build/native/libhesper_cuda.a", "-lcuda"]
+  moreLinkArgs := stdLinkArgs ++ cudaExeArgs
 
 lean_exe «cuda-launch-bench» where
   root := `Tests.CUDA.CUDALaunchBench
-  moreLinkArgs := stdLinkArgs ++ #["./.lake/build/native/libhesper_cuda.a", "-lcuda"]
+  moreLinkArgs := stdLinkArgs ++ cudaExeArgs
 
 lean_exe «cuda-backend-test» where
   root := `Tests.CUDA.CUDABackendTest
-  moreLinkArgs := stdLinkArgs ++ #["./.lake/build/native/libhesper_cuda.a", "-lcuda"]
+  moreLinkArgs := stdLinkArgs ++ cudaExeArgs
 
 lean_exe «cuda-bitnet-test» where
   root := `Tests.CUDA.CUDABitNetTest
-  moreLinkArgs := stdLinkArgs ++ #["./.lake/build/native/libhesper_cuda.a", "-lcuda"]
+  moreLinkArgs := stdLinkArgs ++ cudaExeArgs
 
 lean_exe «cuda-benchmark» where
   root := `Tests.CUDA.CUDABenchmark
-  moreLinkArgs := stdLinkArgs ++ #["./.lake/build/native/libhesper_cuda.a", "-lcuda"]
+  moreLinkArgs := stdLinkArgs ++ cudaExeArgs
 
 lean_exe «bitnet-cuda» where
   root := `Examples.BitNetCUDA
-  moreLinkArgs := stdLinkArgs ++ #["./.lake/build/native/libhesper_cuda.a", "-lcuda"]
+  moreLinkArgs := stdLinkArgs ++ cudaExeArgs
 
 lean_exe «cuda-bitlinear-test» where
   root := `Tests.CUDA.CUDABitLinearTest
-  moreLinkArgs := stdLinkArgs ++ #["./.lake/build/native/libhesper_cuda.a", "-lcuda"]
+  moreLinkArgs := stdLinkArgs ++ cudaExeArgs
 
 lean_exe «cuda-flash-test» where
   root := `Tests.CUDA.CUDAFlashAttnTest
-  moreLinkArgs := stdLinkArgs ++ #["./.lake/build/native/libhesper_cuda.a", "-lcuda"]
+  moreLinkArgs := stdLinkArgs ++ cudaExeArgs
 
 lean_exe «cuda-fma-f16x2-test» where
   root := `Tests.CUDA.CUDAFmaF16x2Test
-  moreLinkArgs := stdLinkArgs ++ #["./.lake/build/native/libhesper_cuda.a", "-lcuda"]
+  moreLinkArgs := stdLinkArgs ++ cudaExeArgs
 
 lean_exe «cuda-cp-async-smoke» where
   root := `Tests.CUDA.CUDACpAsyncTest
-  moreLinkArgs := stdLinkArgs ++ #["./.lake/build/native/libhesper_cuda.a", "-lcuda"]
+  moreLinkArgs := stdLinkArgs ++ cudaExeArgs
 
 lean_exe «cuda-im2col-parity» where
   root := `Tests.CUDA.CUDAIm2colTest
-  moreLinkArgs := stdLinkArgs ++ #["./.lake/build/native/libhesper_cuda.a", "-lcuda"]
+  moreLinkArgs := stdLinkArgs ++ cudaExeArgs
 
 lean_exe «cuda-conv2d-parity» where
   root := `Tests.CUDA.CUDAConv2dTest
-  moreLinkArgs := stdLinkArgs ++ #["./.lake/build/native/libhesper_cuda.a", "-lcuda"]
+  moreLinkArgs := stdLinkArgs ++ cudaExeArgs
 
 lean_exe «cuda-conv-transpose-1d-parity» where
   root := `Tests.CUDA.CUDAConvTranspose1dTest
-  moreLinkArgs := stdLinkArgs ++ #["./.lake/build/native/libhesper_cuda.a", "-lcuda"]
+  moreLinkArgs := stdLinkArgs ++ cudaExeArgs
 
 lean_exe «cuda-im2col-vs-llama» where
   root := `Tests.CUDA.CUDAIm2colVsLlamaTest
-  moreLinkArgs := stdLinkArgs ++ #["./.lake/build/native/libhesper_cuda.a", "-lcuda"]
+  moreLinkArgs := stdLinkArgs ++ cudaExeArgs
 
 lean_exe «cuda-conv-transpose-1d-vs-llama» where
   root := `Tests.CUDA.CUDAConvTranspose1dVsLlamaTest
-  moreLinkArgs := stdLinkArgs ++ #["./.lake/build/native/libhesper_cuda.a", "-lcuda"]
+  moreLinkArgs := stdLinkArgs ++ cudaExeArgs
 
 lean_exe «cuda-im2col-bench» where
   root := `Tests.CUDA.CUDAIm2colBench
-  moreLinkArgs := stdLinkArgs ++ #["./.lake/build/native/libhesper_cuda.a", "-lcuda"]
+  moreLinkArgs := stdLinkArgs ++ cudaExeArgs
 
 lean_exe «cuda-conv-transpose-1d-bench» where
   root := `Tests.CUDA.CUDAConvTranspose1dBench
-  moreLinkArgs := stdLinkArgs ++ #["./.lake/build/native/libhesper_cuda.a", "-lcuda"]
+  moreLinkArgs := stdLinkArgs ++ cudaExeArgs
 
 lean_exe «cuda-geglu-quick-vs-llama» where
   root := `Tests.CUDA.CUDAGegluQuickTest
-  moreLinkArgs := stdLinkArgs ++ #["./.lake/build/native/libhesper_cuda.a", "-lcuda"]
+  moreLinkArgs := stdLinkArgs ++ cudaExeArgs
 
 lean_exe «cuda-concat-dim0-vs-llama» where
   root := `Tests.CUDA.CUDAConcatDim0Test
-  moreLinkArgs := stdLinkArgs ++ #["./.lake/build/native/libhesper_cuda.a", "-lcuda"]
+  moreLinkArgs := stdLinkArgs ++ cudaExeArgs
 
 lean_exe «cuda-permute-4d-vs-llama» where
   root := `Tests.CUDA.CUDAPermute4dTest
-  moreLinkArgs := stdLinkArgs ++ #["./.lake/build/native/libhesper_cuda.a", "-lcuda"]
+  moreLinkArgs := stdLinkArgs ++ cudaExeArgs
 
 lean_exe «cuda-if-branch-cse-microtest» where
   root := `Tests.CUDA.CUDAIfBranchCSEMicrotest
-  moreLinkArgs := stdLinkArgs ++ #["./.lake/build/native/libhesper_cuda.a", "-lcuda"]
+  moreLinkArgs := stdLinkArgs ++ cudaExeArgs
 
 lean_exe «cuda-concat-no-hoist-repro» where
   root := `Tests.CUDA.CUDAConcatNoHoistTest
-  moreLinkArgs := stdLinkArgs ++ #["./.lake/build/native/libhesper_cuda.a", "-lcuda"]
+  moreLinkArgs := stdLinkArgs ++ cudaExeArgs
 
 lean_exe «cuda-fa-v11-parity» where
   root := `Tests.CUDA.V11LauncherParityTest
-  moreLinkArgs := stdLinkArgs ++ #["./.lake/build/native/libhesper_cuda.a", "-lcuda"]
+  moreLinkArgs := stdLinkArgs ++ cudaExeArgs
 
 lean_exe «cuda-fa-batch-f16-parity» where
   root := `Tests.CUDA.BatchAttnF16Test
-  moreLinkArgs := stdLinkArgs ++ #["./.lake/build/native/libhesper_cuda.a", "-lcuda"]
+  moreLinkArgs := stdLinkArgs ++ cudaExeArgs
 
 lean_exe «cuda-rope-kv-batch-f16-parity» where
   root := `Tests.CUDA.RopeKVBatchF16Test
-  moreLinkArgs := stdLinkArgs ++ #["./.lake/build/native/libhesper_cuda.a", "-lcuda"]
+  moreLinkArgs := stdLinkArgs ++ cudaExeArgs
 
 lean_exe «cuda-ptx-inst-test» where
   root := `Tests.CUDA.CUDAPTXInstTest
-  moreLinkArgs := stdLinkArgs ++ #["./.lake/build/native/libhesper_cuda.a", "-lcuda"]
+  moreLinkArgs := stdLinkArgs ++ cudaExeArgs
 
 lean_exe «cuda-dp4a-test» where
   root := `Tests.CUDA.CUDADP4ATest
-  moreLinkArgs := stdLinkArgs ++ #["./.lake/build/native/libhesper_cuda.a", "-lcuda"]
+  moreLinkArgs := stdLinkArgs ++ cudaExeArgs
 
 lean_exe «cuda-quantize-test» where
   root := `Tests.CUDA.CUDAQuantizeTest
-  moreLinkArgs := stdLinkArgs ++ #["./.lake/build/native/libhesper_cuda.a", "-lcuda"]
+  moreLinkArgs := stdLinkArgs ++ cudaExeArgs
 
 lean_exe «cuda-simple-test» where
   root := `Tests.CUDA.CUDASimpleTest
-  moreLinkArgs := stdLinkArgs ++ #["./.lake/build/native/libhesper_cuda.a", "-lcuda"]
+  moreLinkArgs := stdLinkArgs ++ cudaExeArgs
 
 lean_exe «cuda-q6k-dp4a-test» where
   root := `Tests.CUDA.CUDAQ6KDP4ATest
-  moreLinkArgs := stdLinkArgs ++ #["./.lake/build/native/libhesper_cuda.a", "-lcuda"]
+  moreLinkArgs := stdLinkArgs ++ cudaExeArgs
 
 lean_exe «cuda-q6k-4warp-parity» where
   root := `Tests.CUDA.CUDAQ6K4WarpParityTest
-  moreLinkArgs := stdLinkArgs ++ #["./.lake/build/native/libhesper_cuda.a", "-lcuda"]
+  moreLinkArgs := stdLinkArgs ++ cudaExeArgs
 
 lean_exe «cuda-q6k-4warp-graphs» where
   root := `Tests.CUDA.CUDAQ6K4WarpGraphsTest
-  moreLinkArgs := stdLinkArgs ++ #["./.lake/build/native/libhesper_cuda.a", "-lcuda"]
+  moreLinkArgs := stdLinkArgs ++ cudaExeArgs
 
 lean_exe «cuda-q6k-to-f16-test» where
   root := `Tests.CUDA.Q6KToF16Test
-  moreLinkArgs := stdLinkArgs ++ #["./.lake/build/native/libhesper_cuda.a", "-lcuda"]
+  moreLinkArgs := stdLinkArgs ++ cudaExeArgs
 
 lean_exe «cuda-f16-lmhead-microbench» where
   root := `Tests.CUDA.F16LmHeadMicrobench
-  moreLinkArgs := stdLinkArgs ++ #["./.lake/build/native/libhesper_cuda.a", "-lcuda"]
+  moreLinkArgs := stdLinkArgs ++ cudaExeArgs
 
 lean_exe «cuda-f16-lmhead-ptx-dump» where
   root := `Tests.CUDA.F16LmHeadPtxDump
-  moreLinkArgs := stdLinkArgs ++ #["./.lake/build/native/libhesper_cuda.a", "-lcuda"]
+  moreLinkArgs := stdLinkArgs ++ cudaExeArgs
 
 lean_exe «cuda-q6k-ptx-dump» where
   root := `Tests.CUDA.Q6KPtxDump
-  moreLinkArgs := stdLinkArgs ++ #["./.lake/build/native/libhesper_cuda.a", "-lcuda"]
+  moreLinkArgs := stdLinkArgs ++ cudaExeArgs
 
 lean_exe «cuda-q4k-ptx-dump» where
   root := `Tests.CUDA.Q4KPtxDump
-  moreLinkArgs := stdLinkArgs ++ #["./.lake/build/native/libhesper_cuda.a", "-lcuda"]
+  moreLinkArgs := stdLinkArgs ++ cudaExeArgs
 
 lean_exe «cuda-fa-golden-test» where
   root := `Tests.CUDA.CUDAFlashAttnGoldenTest
-  moreLinkArgs := stdLinkArgs ++ #["./.lake/build/native/libhesper_cuda.a", "-lcuda"]
+  moreLinkArgs := stdLinkArgs ++ cudaExeArgs
 
 lean_exe «cuda-if-guarded-rb-test» where
   root := `Tests.CUDA.IfGuardedReadBufferTest
-  moreLinkArgs := stdLinkArgs ++ #["./.lake/build/native/libhesper_cuda.a", "-lcuda"]
+  moreLinkArgs := stdLinkArgs ++ cudaExeArgs
 
 lean_exe «cuda-cse-assign-bug-test» where
   root := `Tests.CUDA.CSEAssignBugTest
-  moreLinkArgs := stdLinkArgs ++ #["./.lake/build/native/libhesper_cuda.a", "-lcuda"]
+  moreLinkArgs := stdLinkArgs ++ cudaExeArgs
 
 lean_exe «cuda-rope-k-f16-test» where
   root := `Tests.CUDA.RopeKF16Test
-  moreLinkArgs := stdLinkArgs ++ #["./.lake/build/native/libhesper_cuda.a", "-lcuda"]
+  moreLinkArgs := stdLinkArgs ++ cudaExeArgs
 
 lean_exe «cuda-bitnet-golden-test» where
   root := `Tests.CUDA.CUDABitNetGoldenTest
-  moreLinkArgs := stdLinkArgs ++ #["./.lake/build/native/libhesper_cuda.a", "-lcuda"]
+  moreLinkArgs := stdLinkArgs ++ cudaExeArgs
 
 lean_exe «gemma4-cuda» where
   root := `Examples.Gemma4CUDA
-  moreLinkArgs := stdLinkArgs ++ #["./.lake/build/native/libhesper_cuda.a", "-lcuda"]
+  moreLinkArgs := stdLinkArgs ++ cudaExeArgs
 
 lean_exe «mmap-smoke» where
   root := `Tests.CUDA.MmapSmokeTest
-  moreLinkArgs := stdLinkArgs ++ #["./.lake/build/native/libhesper_cuda.a", "-lcuda"]
+  moreLinkArgs := stdLinkArgs ++ cudaExeArgs
 
 lean_exe «gemma4-llama-skeleton» where
   root := `Examples.Gemma4LlamaSkeleton
-  moreLinkArgs := stdLinkArgs ++ #["./.lake/build/native/libhesper_cuda.a", "-lcuda"]
+  moreLinkArgs := stdLinkArgs ++ cudaExeArgs
 
 lean_exe «gemma4-llama-prefill-skeleton» where
   root := `Examples.Gemma4LlamaPrefillSkeleton
-  moreLinkArgs := stdLinkArgs ++ #["./.lake/build/native/libhesper_cuda.a", "-lcuda"]
+  moreLinkArgs := stdLinkArgs ++ cudaExeArgs
 
 lean_exe «gemma4-stub-decode-bench» where
   root := `Examples.Gemma4StubDecodeBench
-  moreLinkArgs := stdLinkArgs ++ #["./.lake/build/native/libhesper_cuda.a", "-lcuda"]
+  moreLinkArgs := stdLinkArgs ++ cudaExeArgs
 
 lean_exe «gemma4-unit-tests» where
   root := `Tests.GoldenUnit.Main
-  moreLinkArgs := stdLinkArgs ++ #["./.lake/build/native/libhesper_cuda.a", "-lcuda"]
+  moreLinkArgs := stdLinkArgs ++ cudaExeArgs
 
 lean_exe «gemma4-kernel-bench» where
   root := `Tests.Perf.Gemma4KernelBench
-  moreLinkArgs := stdLinkArgs ++ #["./.lake/build/native/libhesper_cuda.a", "-lcuda"]
+  moreLinkArgs := stdLinkArgs ++ cudaExeArgs
 
 lean_exe «cuda-graph-smoke» where
   root := `Examples.CUDAGraphSmoke
-  moreLinkArgs := stdLinkArgs ++ #["./.lake/build/native/libhesper_cuda.a", "-lcuda"]
+  moreLinkArgs := stdLinkArgs ++ cudaExeArgs
 
 -- ============================================================================
 -- SIMD CPU BACKEND (Google Highway)
