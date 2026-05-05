@@ -28,6 +28,7 @@ recipes/
 data/*.gguf
 venv/
 Tests/golden-values-gemma4/
+Tests/golden-values/
 
 # ── Release prep cleanup (2026-05-05) ──────────────────────────────────
 # macOS metadata
