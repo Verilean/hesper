@@ -268,4 +268,75 @@ def concat_dim0_f32_kernel (ne00 ne10 ne1 ne2 : Nat) : ShaderM Unit := do
     )
   ) (pure ())
 
+/-- 4D permute + contiguous copy for f32.
+
+  Input shape `[s0, s1, s2, s3]` (ne[] order, fastest-first).  Output is
+  the same data physically copied so that axis `perm[i]` of the input
+  becomes axis `i` of the output.
+
+  Currently specialised: `permIdx` is one of {0,1,2,3} permutations
+  represented as 4 Nats `(p0,p1,p2,p3)`.
+
+  Used by Gemma 4 SigLIP encoder for `CONT(PERMUTE(...))` chains —
+  4× per encode pass (one input prep, three layer-output reorders).
+
+  The output element at `(o0,o1,o2,o3)` (output coords) corresponds to
+  the input element at `(o[invPerm[0]], o[invPerm[1]], ...)`.
+
+  llama.cpp reference: `cpy.cu` with strided source (no dedicated permute
+  kernel; ggml fuses PERMUTE+CONT as a single CPY with custom strides).
+
+  Dispatch: 1 thread per output element.  Block dim = 256, grid splits
+  output into 1D blocks. -/
+def permute_4d_f32_kernel (s0 s1 s2 s3 : Nat) (p0 p1 p2 p3 : Nat) : ShaderM Unit := do
+  let total := s0 * s1 * s2 * s3
+  let inSizes : List Nat := [s0, s1, s2, s3]
+  -- Output dim sizes:
+  let oS0 := inSizes[p0]!
+  let oS1 := inSizes[p1]!
+  let oS2 := inSizes[p2]!
+  let _oS3 := inSizes[p3]!  -- unused after we have total
+
+  -- inverse perm: which output axis each input axis maps to
+  let perm : List Nat := [p0, p1, p2, p3]
+  let invPerm : Array Nat := Id.run do
+    let mut a : Array Nat := Array.replicate 4 0
+    for i in [0:4] do
+      a := a.set! perm[i]! i
+    return a
+
+  let _src ← ShaderM.declareReadOnlyBuffer "src" (.array (.scalar .f32) total)
+  let _dst ← ShaderM.declareOutputBuffer "dst" (.array (.scalar .f32) total)
+
+  let lid ← ShaderM.localId
+  let wid ← ShaderM.workgroupId
+  let tid ← ShaderM.let' (.scalar .u32) (Exp.vec3X lid)
+  let bx ← ShaderM.let' (.scalar .u32) (Exp.vec3X wid)
+  let gid ← ShaderM.let' (.scalar .u32) (Exp.add (Exp.mul bx (Exp.litU32 256)) tid)
+  let inBounds := Exp.lt gid (Exp.litU32 total)
+  ShaderM.if_ inBounds (do
+    -- Decode output coords (o0, o1, o2, o3) from gid (row-major; ne[]
+    -- = fastest-first → flat = o3*oS2*oS1*oS0 + o2*oS1*oS0 + o1*oS0 + o0).
+    let o0 ← ShaderM.let' (.scalar .u32) (Exp.mod gid (Exp.litU32 oS0))
+    let q1 ← ShaderM.let' (.scalar .u32) (Exp.div gid (Exp.litU32 oS0))
+    let o1 ← ShaderM.let' (.scalar .u32) (Exp.mod q1 (Exp.litU32 oS1))
+    let q2 ← ShaderM.let' (.scalar .u32) (Exp.div q1 (Exp.litU32 oS1))
+    let o2 ← ShaderM.let' (.scalar .u32) (Exp.mod q2 (Exp.litU32 oS2))
+    let o3 ← ShaderM.let' (.scalar .u32) (Exp.div q2 (Exp.litU32 oS2))
+    -- Map to input coords via invPerm: input axis i = output axis invPerm[i].
+    let pickO (k : Nat) : Exp (.scalar .u32) :=
+      if k = 0 then o0 else if k = 1 then o1 else if k = 2 then o2 else o3
+    let i0 := pickO invPerm[0]!
+    let i1 := pickO invPerm[1]!
+    let i2 := pickO invPerm[2]!
+    let i3 := pickO invPerm[3]!
+    let srcIdx ← ShaderM.let' (.scalar .u32) (
+      Exp.add i0
+        (Exp.add (Exp.mul i1 (Exp.litU32 s0))
+          (Exp.add (Exp.mul i2 (Exp.litU32 (s0 * s1)))
+                   (Exp.mul i3 (Exp.litU32 (s0 * s1 * s2))))))
+    let v ← ShaderM.readBuffer (ty := .scalar .f32) (n := total) "src" srcIdx
+    ShaderM.writeBuffer (ty := .scalar .f32) "dst" gid v
+  ) (pure ())
+
 end Hesper.Layers.Vision
