@@ -3,3 +3,4 @@ dump_conv_transpose_1d_golden
 bench_im2col
 bench_conv_transpose_1d
 dump_geglu_quick_golden
+dump_concat_dim0_golden

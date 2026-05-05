@@ -930,6 +930,10 @@ lean_exe «cuda-geglu-quick-vs-llama» where
   root := `Tests.CUDA.CUDAGegluQuickTest
   moreLinkArgs := stdLinkArgs ++ #["./.lake/build/native/libhesper_cuda.a", "-lcuda"]
 
+lean_exe «cuda-concat-dim0-vs-llama» where
+  root := `Tests.CUDA.CUDAConcatDim0Test
+  moreLinkArgs := stdLinkArgs ++ #["./.lake/build/native/libhesper_cuda.a", "-lcuda"]
+
 lean_exe «cuda-fa-v11-parity» where
   root := `Tests.CUDA.V11LauncherParityTest
   moreLinkArgs := stdLinkArgs ++ #["./.lake/build/native/libhesper_cuda.a", "-lcuda"]

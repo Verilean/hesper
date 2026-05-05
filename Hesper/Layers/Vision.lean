@@ -210,4 +210,62 @@ def geglu_quick_split_f32_kernel (n : Nat) : ShaderM Unit := do
     ShaderM.writeBuffer (ty := .scalar .f32) "dst" i out
   ) (pure ())
 
+/-- CONCAT along dim=0 (innermost / fastest axis) for f32 tensors.
+
+  Output shape: `[ne00 + ne10, ne1, ne2, 1]` where `x : [ne00, ne1, ne2, 1]`
+  and `y : [ne10, ne1, ne2, 1]`.
+
+  Used by Gemma 4 SigLIP encoder for M-RoPE (rotates two halves of Q/K
+  with different RoPE bases, then concats). 32× per encode pass.
+
+  Dispatch: 1 thread per output element along dim 0; (ne1, ne2) parallel
+  via gridY/gridZ.  Block dim = 256.
+
+  llama.cpp reference: `concat_f32_dim0` in
+  `ggml/src/ggml-cuda/concat.cu` line 4.
+-/
+def concat_dim0_f32_kernel (ne00 ne10 ne1 ne2 : Nat) : ShaderM Unit := do
+  let ne0 := ne00 + ne10
+  let _x ← ShaderM.declareReadOnlyBuffer "x" (.array (.scalar .f32) (ne00 * ne1 * ne2))
+  let _y ← ShaderM.declareReadOnlyBuffer "y" (.array (.scalar .f32) (ne10 * ne1 * ne2))
+  let _dst ← ShaderM.declareOutputBuffer  "dst" (.array (.scalar .f32) (ne0 * ne1 * ne2))
+
+  let lid ← ShaderM.localId
+  let wid ← ShaderM.workgroupId
+  let bx ← ShaderM.let' (.scalar .u32) (Exp.vec3X wid)
+  let by_ ← ShaderM.let' (.scalar .u32) (Exp.vec3Y wid)
+  let bz ← ShaderM.let' (.scalar .u32) (Exp.vec3Z wid)
+  let tid ← ShaderM.let' (.scalar .u32) (Exp.vec3X lid)
+  let nidx ← ShaderM.let' (.scalar .u32) (Exp.add (Exp.mul bx (Exp.litU32 256)) tid)
+  let inBounds := Exp.lt nidx (Exp.litU32 ne0)
+  ShaderM.if_ inBounds (do
+    let offDst ← ShaderM.let' (.scalar .u32) (
+      Exp.add (Exp.add nidx (Exp.mul by_ (Exp.litU32 ne0)))
+              (Exp.mul bz (Exp.litU32 (ne0 * ne1))))
+    -- Compute offsets for both branches up-front, then select via `Exp.select`.
+    -- Avoids any nested if_ semantics that may mis-lower under Hesper's
+    -- branch-merge / CSE pass.
+    let offSrcX ← ShaderM.let' (.scalar .u32) (
+      Exp.add (Exp.add nidx (Exp.mul by_ (Exp.litU32 ne00)))
+              (Exp.mul bz (Exp.litU32 (ne00 * ne1))))
+    let nIdxAdj ← ShaderM.let' (.scalar .u32) (Exp.sub nidx (Exp.litU32 ne00))
+    let offSrcY ← ShaderM.let' (.scalar .u32) (
+      Exp.add (Exp.add nIdxAdj (Exp.mul by_ (Exp.litU32 ne10)))
+              (Exp.mul bz (Exp.litU32 (ne10 * ne1))))
+    let fromX := Exp.lt nidx (Exp.litU32 ne00)
+    -- Read both x[offSrcX] and y[offSrcY] (one of them OOB-but-ignored when
+    -- nidx is in the wrong range; CUDA does NOT fault on OOB reads from
+    -- ld.global.nc as long as the address is mapped.  We mask with select.)
+    --
+    -- However for safety we use nested if_ with isolated loads to avoid
+    -- spurious OOB.  Each branch reads its own buffer + writes its own dst.
+    ShaderM.if_ fromX (do
+      let v ← ShaderM.readBuffer (ty := .scalar .f32) (n := ne00 * ne1 * ne2) "x" offSrcX
+      ShaderM.writeBuffer (ty := .scalar .f32) "dst" offDst v
+    ) (do
+      let v ← ShaderM.readBuffer (ty := .scalar .f32) (n := ne10 * ne1 * ne2) "y" offSrcY
+      ShaderM.writeBuffer (ty := .scalar .f32) "dst" offDst v
+    )
+  ) (pure ())
+
 end Hesper.Layers.Vision
