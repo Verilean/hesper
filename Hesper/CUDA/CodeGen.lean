@@ -973,6 +973,25 @@ partial def stmtToPTX (stmt : Stmt) (s : GenState) : GenState :=
     s.emit (.label endL)
 
   | .ifStmt cond thenBody elseBody =>
+    -- KNOWN ISSUE (2026-05-05): expCache leaks across then/else branches.
+    -- A register cached inside `thenBody` is only assigned on threads
+    -- that took the then path; reusing it from `elseBody` (where the
+    -- same Exp shape may appear) reads an uninitialised register on
+    -- else-path threads.  Workaround at the user level: hoist any
+    -- shared sub-expression to a `let'` BEFORE the if_, so both
+    -- branches reference a register guaranteed to be assigned at
+    -- the dominator.  See `feedback_if_branches_hoist_offsets.md`.
+    --
+    -- An attempted CodeGen-side fix (snapshot/restore cacheBefore
+    -- around branches + post-if reset) caused unrelated failures
+    -- in concat_dim0 (CUDA_ERROR_INVALID_ADDRESS_SPACE) — the
+    -- expCache also encodes register bindings that the post-if
+    -- region depends on (e.g. recomputed buffer base+offset
+    -- arithmetic).  Pure cache reset is too aggressive.  Proper
+    -- fix needs separating the "valid registers across this path"
+    -- set from the "CSE-equivalent expressions" set, which is a
+    -- larger refactor.  Rolled back; user-side hoist remains the
+    -- supported pattern.
     let (pc, s) := expToPTX cond s
     let (elseL, s) := s.freshLabel; let (endL, s) := s.freshLabel
     let s := s.emit (.bra_not pc.toPred! elseL)
