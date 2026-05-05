@@ -973,34 +973,51 @@ partial def stmtToPTX (stmt : Stmt) (s : GenState) : GenState :=
     s.emit (.label endL)
 
   | .ifStmt cond thenBody elseBody =>
-    -- KNOWN ISSUE (2026-05-05): expCache leaks across then/else branches.
-    -- A register cached inside `thenBody` is only assigned on threads
-    -- that took the then path; reusing it from `elseBody` (where the
-    -- same Exp shape may appear) reads an uninitialised register on
-    -- else-path threads.  Workaround at the user level: hoist any
-    -- shared sub-expression to a `let'` BEFORE the if_, so both
-    -- branches reference a register guaranteed to be assigned at
-    -- the dominator.  See `feedback_if_branches_hoist_offsets.md`.
+    -- CSE caches must be scoped per-branch.  A register that is allocated
+    -- + emitted inside `thenBody` (via `freshU32 + mov_sreg` for first
+    -- sreg use, or `freshU32 + arith` for first Exp eval) only gets
+    -- assigned on threads that took the then path.  If the `elseBody`
+    -- caches the same Exp/sreg key and reuses the register, threads on
+    -- the else path read an uninitialised register → CUDA error
+    -- (INVALID_ADDRESS_SPACE in the address-arith case).
     --
-    -- An attempted CodeGen-side fix (snapshot/restore cacheBefore
-    -- around branches + post-if reset) caused unrelated failures
-    -- in concat_dim0 (CUDA_ERROR_INVALID_ADDRESS_SPACE) — the
-    -- expCache also encodes register bindings that the post-if
-    -- region depends on (e.g. recomputed buffer base+offset
-    -- arithmetic).  Pure cache reset is too aggressive.  Proper
-    -- fix needs separating the "valid registers across this path"
-    -- set from the "CSE-equivalent expressions" set, which is a
-    -- larger refactor.  Rolled back; user-side hoist remains the
-    -- supported pattern.
+    -- Fix: snapshot all CSE caches (sreg / imm / exp) before lowering
+    -- each branch and restore them between branches.  After the join,
+    -- reset to the pre-if snapshot — anything cached *inside* a branch
+    -- is unreachable from post-if code (those regs are live only on
+    -- one path, not both).  varMap is NOT scoped (var bindings come
+    -- from `Stmt.varDecl` which is path-local by design — `assign`
+    -- already invalidates expCache, so post-if vars are reachable
+    -- only via varMap, which is path-independent).
+    --
+    -- Discovered 2026-05-05; see Tests/CUDA/CUDAConcatNoHoistTest.lean
+    -- for the minimal failing case.  Earlier attempt to clear only
+    -- expCache (leaving sregCache untouched) was insufficient — the
+    -- bug requires scoping ALL three caches.
+    let cacheBefore := (s.sregCache, s.immCache, s.expCache)
     let (pc, s) := expToPTX cond s
     let (elseL, s) := s.freshLabel; let (endL, s) := s.freshLabel
     let s := s.emit (.bra_not pc.toPred! elseL)
+    -- Snapshot for then-branch (start with the post-cond cache state).
+    let cacheBeforeThen := (s.sregCache, s.immCache, s.expCache)
     let s := thenBody.foldl (fun s st => stmtToPTX st s) s
     if !elseBody.isEmpty then
       let s := s.emit (.bra endL); let s := s.emit (.label elseL)
+      -- Restore to the pre-then snapshot before lowering else.
+      -- This drops then-only cache entries (unreachable from else
+      -- path) but keeps everything that was cached BEFORE either
+      -- branch entered (the cond compute / earlier code).
+      let (sr, im, ex) := cacheBeforeThen
+      let s := { s with sregCache := sr, immCache := im, expCache := ex }
       let s := elseBody.foldl (fun s st => stmtToPTX st s) s
-      s.emit (.label endL)
-    else s.emit (.label elseL)
+      let s := s.emit (.label endL)
+      -- Post-join: drop branch-local caches; restore pre-if snapshot.
+      let (sr, im, ex) := cacheBefore
+      { s with sregCache := sr, immCache := im, expCache := ex }
+    else
+      let s := s.emit (.label elseL)
+      let (sr, im, ex) := cacheBefore
+      { s with sregCache := sr, immCache := im, expCache := ex }
 
   | .varDeclLdV4U32 n0 n1 n2 n3 bufName u32Idx =>
     -- Lower to one ld.global.nc.v4.u32 instruction, binding 4 fresh u32

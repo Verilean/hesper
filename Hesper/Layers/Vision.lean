@@ -232,38 +232,29 @@ def concat_dim0_f32_kernel (ne00 ne10 ne1 ne2 : Nat) : ShaderM Unit := do
 
   let lid ← ShaderM.localId
   let wid ← ShaderM.workgroupId
-  let bx ← ShaderM.let' (.scalar .u32) (Exp.vec3X wid)
-  let by_ ← ShaderM.let' (.scalar .u32) (Exp.vec3Y wid)
-  let bz ← ShaderM.let' (.scalar .u32) (Exp.vec3Z wid)
-  let tid ← ShaderM.let' (.scalar .u32) (Exp.vec3X lid)
-  let nidx ← ShaderM.let' (.scalar .u32) (Exp.add (Exp.mul bx (Exp.litU32 256)) tid)
+  let bx := Exp.vec3X wid
+  let by_ := Exp.vec3Y wid
+  let bz := Exp.vec3Z wid
+  let tid := Exp.vec3X lid
+  let nidx := Exp.add (Exp.mul bx (Exp.litU32 256)) tid
   let inBounds := Exp.lt nidx (Exp.litU32 ne0)
   ShaderM.if_ inBounds (do
-    let offDst ← ShaderM.let' (.scalar .u32) (
+    let offDst :=
       Exp.add (Exp.add nidx (Exp.mul by_ (Exp.litU32 ne0)))
-              (Exp.mul bz (Exp.litU32 (ne0 * ne1))))
-    -- IMPORTANT: pre-compute both branch offsets here (before the
-    -- inner if_) and let'-bind them.  See feedback memory
-    -- `feedback_if_branches_hoist_offsets.md` — Hesper's CodeGen
-    -- expCache state currently leaks between if_ branches; offsets
-    -- computed inside a branch may mis-merge with the other branch's
-    -- shape and produce wrong reads.  The CodeGen-side fix attempt
-    -- (snapshot/restore expCache around if_) introduced unrelated
-    -- failures and was rolled back; the user-side workaround below
-    -- is the supported pattern.
-    let offSrcX ← ShaderM.let' (.scalar .u32) (
-      Exp.add (Exp.add nidx (Exp.mul by_ (Exp.litU32 ne00)))
-              (Exp.mul bz (Exp.litU32 (ne00 * ne1))))
-    let nIdxAdj ← ShaderM.let' (.scalar .u32) (Exp.sub nidx (Exp.litU32 ne00))
-    let offSrcY ← ShaderM.let' (.scalar .u32) (
-      Exp.add (Exp.add nIdxAdj (Exp.mul by_ (Exp.litU32 ne10)))
-              (Exp.mul bz (Exp.litU32 (ne10 * ne1))))
+              (Exp.mul bz (Exp.litU32 (ne0 * ne1)))
     let fromX := Exp.lt nidx (Exp.litU32 ne00)
     ShaderM.if_ fromX (do
-      let v ← ShaderM.readBuffer (ty := .scalar .f32) (n := ne00 * ne1 * ne2) "x" offSrcX
+      let offSrc :=
+        Exp.add (Exp.add nidx (Exp.mul by_ (Exp.litU32 ne00)))
+                (Exp.mul bz (Exp.litU32 (ne00 * ne1)))
+      let v ← ShaderM.readBuffer (ty := .scalar .f32) (n := ne00 * ne1 * ne2) "x" offSrc
       ShaderM.writeBuffer (ty := .scalar .f32) "dst" offDst v
     ) (do
-      let v ← ShaderM.readBuffer (ty := .scalar .f32) (n := ne10 * ne1 * ne2) "y" offSrcY
+      let nIdxAdj := Exp.sub nidx (Exp.litU32 ne00)
+      let offSrc :=
+        Exp.add (Exp.add nIdxAdj (Exp.mul by_ (Exp.litU32 ne10)))
+                (Exp.mul bz (Exp.litU32 (ne10 * ne1)))
+      let v ← ShaderM.readBuffer (ty := .scalar .f32) (n := ne10 * ne1 * ne2) "y" offSrc
       ShaderM.writeBuffer (ty := .scalar .f32) "dst" offDst v
     )
   ) (pure ())
