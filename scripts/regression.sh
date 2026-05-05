@@ -31,8 +31,13 @@ run_test() {
   local cmd="$*"
   echo ""
   echo "═══════ $name ═══════"
-  if eval "$cmd" 2>&1 | tail -20 | tee /tmp/_hesper_regression_last.log | grep -qE "FAIL|error: Lean exited"; then
-    echo "✖ FAIL: $name"
+  # Run cmd and capture exit code via PIPESTATUS so a non-zero exit
+  # (e.g. "unknown executable" or any other lake/exec failure) is
+  # detected even if no FAIL/error string is in the tail.
+  eval "$cmd" 2>&1 | tail -20 | tee /tmp/_hesper_regression_last.log
+  local rc="${PIPESTATUS[0]}"
+  if [[ $rc -ne 0 ]] || grep -qE "FAIL|error: Lean exited|unknown executable" /tmp/_hesper_regression_last.log; then
+    echo "✖ FAIL: $name (rc=$rc)"
     FAIL+=("$name")
     if [[ $CONTINUE -eq 0 ]]; then
       echo ""
@@ -65,22 +70,9 @@ echo "════════════════════════�
 echo "Hesper full regression suite"
 echo "═══════════════════════════════════════════"
 
-# ─── 1. Transpiler unit (CPU) ────────────────
-run_test "transpile-cuda-expr-test" "lake exe transpile-cuda-expr-test"
-run_test "transpile-cuda-stmt-test" "lake exe transpile-cuda-stmt-test"
-run_test "transpile-cuda-vecdot-smoke" "lake exe transpile-cuda-vecdot-smoke"
-run_test "transpile-cuda-rmsnorm-smoke" "lake exe transpile-cuda-rmsnorm-smoke"
-run_test "transpile-cuda-rmsnorm-full-smoke" "lake exe transpile-cuda-rmsnorm-full-smoke"
-run_test "transpile-cuda-rmsnorm-gpu-parity" "lake exe transpile-cuda-rmsnorm-gpu-parity"
-run_test "transpile-cuda-q4k-vecdot-smoke" "lake exe transpile-cuda-q4k-vecdot-smoke"
-run_test "transpile-cuda-q4k-vecdot-gpu-parity" "lake exe transpile-cuda-q4k-vecdot-gpu-parity"
-run_test "transpile-cuda-prefill-probe" "lake exe transpile-cuda-prefill-probe"
-run_test "transpile-cuda-struct-probe" "lake exe transpile-cuda-struct-probe"
-run_test "transpile-cuda-q4k-wrapper-smoke" "lake exe transpile-cuda-q4k-wrapper-smoke"
-run_test "transpile-cuda-q4k-full-wrapper-smoke" "lake exe transpile-cuda-q4k-full-wrapper-smoke"
-run_test "transpile-cuda-mmq-q4k-smoke" "lake exe transpile-cuda-mmq-q4k-smoke"
-run_test "transpile-cuda-mmq-load-tiles-smoke" "lake exe transpile-cuda-mmq-load-tiles-smoke"
-run_test "transpile-cuda-mmq-outer-smoke" "lake exe transpile-cuda-mmq-outer-smoke"
+# ─── 1. (Reserved — transpile suite removed 2026-05-05; see
+#        feedback_transpile_abandoned.md.  CPU-only Lean unit tests
+#        for any new pipeline replace this section.)
 
 # ─── 2. PTX codegen text (CPU) ───────────────
 run_test "wmma-ptx-text-test"  "lake exe wmma-ptx-text-test"
