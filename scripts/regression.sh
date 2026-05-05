@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # Hesper full regression suite — runs after any DSL/codegen/PTX change.
 #
-# Coverage:
-#   1. Transpiler unit tests (Lex/Parse/Lower) — CPU only, fast
-#   2. PTX codegen text emission (incl. WMMA) — CPU only
-#   3. Low-level CUDA kernel tests on real GPU (dp4a/fma/bitlinear/Q6_K)
-#   4. Gemma 4 layer-0 parity tests against real GGUF weights
+# Coverage (26 tests as of v0.7-gemma4):
+#   1. PTX codegen text emission (incl. WMMA) — CPU only
+#   2. Low-level CUDA kernel tests on real GPU (dp4a/fma/bitlinear/Q6_K)
+#   3. WGSL DSL tests (CPU)
+#   4. Gemma 4 layer-0 parity tests against real GGUF weights (9 tests)
 #
 # Total runtime: ~3-5 min on RTX 4070 Ti when builds are cached.
 # Stops at first FAIL. Pass `--continue` to keep going past failures.
