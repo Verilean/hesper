@@ -28,3 +28,45 @@ recipes/
 data/*.gguf
 venv/
 Tests/golden-values-gemma4/
+
+# ── Release prep cleanup (2026-05-05) ──────────────────────────────────
+# macOS metadata
+._*
+.DS_Store
+
+# Build/debug artifacts
+*.ptx
+debug_*.ptx
+elf.o
+*.tgz
+hesper-ttt/
+hesper-ttt.tgz
+
+# Vendored dependencies (external repos used for goldens / parity)
+llama.cpp/
+dawn/
+
+# Vulkan device dumps
+VP_VULKANINFO_*.json
+
+# Node tooling (used by some tools/, never shipped)
+node_modules/
+package-lock.json
+package.json
+
+# Scratch / one-off scripts
+tmp_*.py
+
+# Python caches
+__pycache__/
+*.pyc
+
+# Claude Code state (machine-local, never share)
+.claude/
+
+# Model GGUF (already partially listed above; broaden)
+data/gguf/
+
+# Local benchmark / profile outputs
+docs/llama-fusion-analysis/bench/*.txt
+docs/llama-fusion-analysis/ir-analysis-lmhead/*.json

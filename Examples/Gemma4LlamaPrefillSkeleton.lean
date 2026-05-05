@@ -124,13 +124,34 @@ unsafe def main (args : List String) : IO Unit := do
   let mut lastDisp : Nat := 0
 
   -- 1. Prefill: run full prompt to populate KV caches.
-  let prefillStart ← IO.monoNanosNow
+  --    With HESPER_PREFILL_WARMUP=1, run the prefill twice and only
+  --    report the second (warm) timing — useful for kernel-speed
+  --    comparisons where PTX JIT cost otherwise dominates the wall.
+  let warmupPrefill ← match ← IO.getEnv "HESPER_PREFILL_WARMUP" with
+    | some "1" => pure true
+    | _        => pure false
   do
     let mut bytes : ByteArray := ByteArray.empty
     for i in [0:initialToks.size] do
       bytes := bytes ++ Hesper.WebGPU.BufferOps.uint32ToBytes initialToks[i]!.toUInt32
     GPUBackend.writeBuffer ctx tokenIdsBuf bytes
 
+    if warmupPrefill then
+      scratchPool.reset
+      Hesper.resetDispatchCounter
+      let warmStart ← IO.monoNanosNow
+      let _ ← forwardPrefillLlamaCpp ctx model initialToks.size state
+        (tokenIdsBuf := some tokenIdsBuf) (startPos := 0)
+        (persistentCaches := some kvPairs)
+        (scratchPool := some scratchPool)
+      let warmEnd ← IO.monoNanosNow
+      let warmMs := (warmEnd - warmStart).toFloat / 1000000.0
+      IO.println s!"[prefill warmup] seqLen={initialToks.size} ({warmMs}ms, cold)"
+      -- Reset KV caches and scratch so the measured prefill starts clean.
+      -- We don't actually need to re-init the buffers — the prefill writes
+      -- into them from startPos=0 which overwrites everything.
+
+    let prefillStart ← IO.monoNanosNow
     scratchPool.reset
     Hesper.resetDispatchCounter
     let logitsOpt ← forwardPrefillLlamaCpp ctx model initialToks.size state
@@ -152,7 +173,8 @@ unsafe def main (args : List String) : IO Unit := do
           bestVal := fb; bestIdx := i; first := false
       let decoded := Hesper.Tokenizer.SentencePiece.decode tokenizer #[bestIdx]
       let prefillMs := (prefillEnd - prefillStart).toFloat / 1000000.0
-      IO.println s!"[prefill] seqLen={initialToks.size} next={bestIdx} \"{decoded}\" ({prefillMs}ms, {lastDisp} dispatches)"
+      let label := if warmupPrefill then "prefill warm" else "prefill"
+      IO.println s!"[{label}] seqLen={initialToks.size} next={bestIdx} \"{decoded}\" ({prefillMs}ms, {lastDisp} dispatches)"
       generatedIds := generatedIds.push bestIdx
     | none => IO.println "[prefill] no logits"
 
