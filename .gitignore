@@ -37,10 +37,18 @@ Tests/golden-values-gemma4/
 # Build/debug artifacts
 *.ptx
 debug_*.ptx
+*.cubin
+*.sass
 elf.o
 *.tgz
 hesper-ttt/
 hesper-ttt.tgz
+
+# nsys / chrome-trace dumps (large, regenerable)
+docs/llama-fusion-analysis/trace_*.txt
+docs/llama-fusion-analysis/trace_*.out
+docs/llama-fusion-analysis/**/chrome_trace_*.json
+docs/llama-fusion-analysis/**/hesper_vs_llama*.json
 
 # Vendored dependencies (external repos used for goldens / parity)
 llama.cpp/
