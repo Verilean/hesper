@@ -938,6 +938,14 @@ lean_exe «cuda-permute-4d-vs-llama» where
   root := `Tests.CUDA.CUDAPermute4dTest
   moreLinkArgs := stdLinkArgs ++ #["./.lake/build/native/libhesper_cuda.a", "-lcuda"]
 
+lean_exe «cuda-if-branch-cse-microtest» where
+  root := `Tests.CUDA.CUDAIfBranchCSEMicrotest
+  moreLinkArgs := stdLinkArgs ++ #["./.lake/build/native/libhesper_cuda.a", "-lcuda"]
+
+lean_exe «cuda-concat-no-hoist-repro» where
+  root := `Tests.CUDA.CUDAConcatNoHoistTest
+  moreLinkArgs := stdLinkArgs ++ #["./.lake/build/native/libhesper_cuda.a", "-lcuda"]
+
 lean_exe «cuda-fa-v11-parity» where
   root := `Tests.CUDA.V11LauncherParityTest
   moreLinkArgs := stdLinkArgs ++ #["./.lake/build/native/libhesper_cuda.a", "-lcuda"]
