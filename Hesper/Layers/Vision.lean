@@ -242,9 +242,15 @@ def concat_dim0_f32_kernel (ne00 ne10 ne1 ne2 : Nat) : ShaderM Unit := do
     let offDst ← ShaderM.let' (.scalar .u32) (
       Exp.add (Exp.add nidx (Exp.mul by_ (Exp.litU32 ne0)))
               (Exp.mul bz (Exp.litU32 (ne0 * ne1))))
-    -- Compute offsets for both branches up-front, then select via `Exp.select`.
-    -- Avoids any nested if_ semantics that may mis-lower under Hesper's
-    -- branch-merge / CSE pass.
+    -- IMPORTANT: pre-compute both branch offsets here (before the
+    -- inner if_) and let'-bind them.  See feedback memory
+    -- `feedback_if_branches_hoist_offsets.md` — Hesper's CodeGen
+    -- expCache state currently leaks between if_ branches; offsets
+    -- computed inside a branch may mis-merge with the other branch's
+    -- shape and produce wrong reads.  The CodeGen-side fix attempt
+    -- (snapshot/restore expCache around if_) introduced unrelated
+    -- failures and was rolled back; the user-side workaround below
+    -- is the supported pattern.
     let offSrcX ← ShaderM.let' (.scalar .u32) (
       Exp.add (Exp.add nidx (Exp.mul by_ (Exp.litU32 ne00)))
               (Exp.mul bz (Exp.litU32 (ne00 * ne1))))
@@ -253,12 +259,6 @@ def concat_dim0_f32_kernel (ne00 ne10 ne1 ne2 : Nat) : ShaderM Unit := do
       Exp.add (Exp.add nIdxAdj (Exp.mul by_ (Exp.litU32 ne10)))
               (Exp.mul bz (Exp.litU32 (ne10 * ne1))))
     let fromX := Exp.lt nidx (Exp.litU32 ne00)
-    -- Read both x[offSrcX] and y[offSrcY] (one of them OOB-but-ignored when
-    -- nidx is in the wrong range; CUDA does NOT fault on OOB reads from
-    -- ld.global.nc as long as the address is mapped.  We mask with select.)
-    --
-    -- However for safety we use nested if_ with isolated loads to avoid
-    -- spurious OOB.  Each branch reads its own buffer + writes its own dst.
     ShaderM.if_ fromX (do
       let v ← ShaderM.readBuffer (ty := .scalar .f32) (n := ne00 * ne1 * ne2) "x" offSrcX
       ShaderM.writeBuffer (ty := .scalar .f32) "dst" offDst v
