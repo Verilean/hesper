@@ -172,4 +172,42 @@ def matmulF32NaiveKernel
   let accExp : Exp (.scalar .f32) := Exp.var "acc"
   ShaderM.writeBuffer (ty := .scalar .f32) "dst" dstIdx accExp
 
+/-- GEGLU_QUICK split kernel for f32.
+
+  Formula: `dst[i] = gelu_quick(x[i]) * g[i]`
+           where `gelu_quick(x) = x * sigmoid(1.702 * x)
+                                = x / (1 + exp(-1.702 * x))`
+
+  Both `x` and `g` are contiguous f32 buffers of size `n`.  Output `dst` is
+  size `n`.  Element-wise pointwise — one thread per output element.
+
+  Used by Gemma 4 SigLIP encoder (16× per encode pass) as the FFN
+  activation (replaces the standard GELU-then-mul).  The "_quick" variant
+  uses the cheaper sigmoid-based formula instead of the tanh-based one.
+
+  llama.cpp reference: `op_gelu_quick` in
+  `ggml/src/ggml-cuda/unary.cu` line 345 (paired with
+  `ggml_cuda_op_unary_gated`). -/
+def geglu_quick_split_f32_kernel (n : Nat) : ShaderM Unit := do
+  let _x ← ShaderM.declareReadOnlyBuffer "x" (.array (.scalar .f32) n)
+  let _g ← ShaderM.declareReadOnlyBuffer "g" (.array (.scalar .f32) n)
+  let _dst ← ShaderM.declareOutputBuffer "dst" (.array (.scalar .f32) n)
+
+  let lid ← ShaderM.localId
+  let wid ← ShaderM.workgroupId
+  let i := Exp.add (Exp.mul (Exp.vec3X wid) (Exp.litU32 256)) (Exp.vec3X lid)
+  let inBounds := Exp.lt i (Exp.litU32 n)
+  ShaderM.if_ inBounds (do
+    let xv ← ShaderM.readBuffer (ty := .scalar .f32) (n := n) "x" i
+    let gv ← ShaderM.readBuffer (ty := .scalar .f32) (n := n) "g" i
+    -- sigmoid(1.702 * x) = 1 / (1 + exp(-1.702 * x))
+    let kCoef := Exp.litF32 (-1.702)
+    let arg := Exp.mul kCoef xv
+    let denom := Exp.add (Exp.litF32 1.0) (Exp.exp arg)
+    let sigmoidVal := Exp.div (Exp.litF32 1.0) denom
+    let geluq := Exp.mul xv sigmoidVal
+    let out := Exp.mul geluq gv
+    ShaderM.writeBuffer (ty := .scalar .f32) "dst" i out
+  ) (pure ())
+
 end Hesper.Layers.Vision
