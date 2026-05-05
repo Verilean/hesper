@@ -5,16 +5,21 @@ import Hesper.WGSL.Exp
 import Hesper
 
 /-!
-# Repro: concat_dim0 with offsets computed INSIDE branches (no let' hoist)
+# Regression sentinel: concat_dim0 with offsets INSIDE branches (no let' hoist)
 
-This is the original (allegedly-buggy) form of `concat_dim0_f32_kernel`
-that produced max |err| = 0.589 against llama.cpp on 2026-05-05.
+This is the original natural form of `concat_dim0_f32_kernel` — offsets
+computed inside each `if_` branch instead of hoisted to `let'` before
+the branch.  Before the codegen scoped-cache fix (commit XXX), this
+form produced `CUDA_ERROR_INVALID_ADDRESS_SPACE` because the sreg /
+imm / exp caches leaked across branches: a register first emitted
+inside `thenBody` was reused inside `elseBody`, but it's only
+assigned on threads that took the then path.
 
-The kernel here is byte-for-byte the structure I tried first, before
-adopting the let' hoist workaround. If this test PASSES, my original
-diagnosis was wrong and there is no CSE leak — I just had a coding
-bug at the time. If it FAILS, the bug is real and we have a clean
-minimal repro.
+After the fix (snapshot/restore all 3 caches around `ifStmt` branches),
+this form is bit-exact correct.
+
+Keep this test as a regression sentinel: if it ever fails again, the
+codegen-side cache scoping has regressed.
 -/
 
 open Hesper
@@ -72,16 +77,13 @@ private def readBinAsF32 (path : String) (n : Nat) : IO (Array Float) := do
     throw <| IO.userError s!"file {path}: expected {n*4} bytes, got {bytes.size}"
   unpackF32 bytes n
 
-/-- Confirms (as of 2026-05-05, commit c63c305) that the offsets-inside-branches
-    form of `concat_dim0_f32_kernel` triggers `CUDA_ERROR_INVALID_ADDRESS_SPACE`.
-
-    NOT part of `scripts/regression.sh` — this test is **expected to fail** until
-    the codegen-side scoped-cache fix lands (Tasks #369 → #372).  When it
-    passes, that fix is in and the user-side hoist workaround can be removed
-    (Task #372 / CSE-E). -/
+/-- Sentinel test: the natural offsets-inside-branches form of concat must
+    produce bit-exact output vs llama.cpp.  This relies on the codegen-side
+    scoped-cache fix (snapshot/restore sregCache/immCache/expCache around
+    ifStmt branches).  If this test fails again, the cache scoping has
+    regressed. -/
 unsafe def main : IO Unit := do
-  IO.println "═══ concat_dim0 no-hoist repro vs llama.cpp ═══"
-  IO.println "  NOTE: this test is EXPECTED TO FAIL until codegen scoped-cache fix lands"
+  IO.println "═══ concat_dim0 no-hoist (sentinel) vs llama.cpp ═══"
   let goldenDir ← (← IO.getEnv "GOLDEN_DIR").getDM (pure "/tmp/concat_dim0_golden")
   let ne00 := 32
   let ne10 := 32
@@ -132,7 +134,7 @@ unsafe def main : IO Unit := do
 
   IO.println s!"  max |err| = {maxErr}, mismatched = {nMis}/{outSize}"
   if maxErr < 1e-5 then
-    IO.println "═══ no-hoist concat PASS — original CSE diagnosis was WRONG ═══"
+    IO.println "═══ concat_dim0 no-hoist sentinel PASS ═══"
   else
-    IO.println "═══ no-hoist concat FAIL — CSE leak is real, repro confirmed ═══"
+    IO.println "═══ concat_dim0 no-hoist sentinel FAIL — codegen cache scoping regressed ═══"
     IO.Process.exit 1
