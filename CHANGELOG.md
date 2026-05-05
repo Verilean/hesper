@@ -104,10 +104,11 @@ RTX 4070 Ti against the Q4_K_M quantization. ~635 commits since v0.6
 - `Hesper/Inference/Sampling.lean`: argmax / temperature / top-k.
 
 ### Quality / testing
-- 43-test regression suite (`scripts/regression.sh`); ~3-5 min on RTX
+- 26-test regression suite (`scripts/regression.sh`); ~3-5 min on RTX
   4070 Ti when builds are cached. Stops at first failure or
   `--continue`. Strengthened detection: catches non-zero exit codes
-  + "unknown executable" silent passes.
+  + "unknown executable" silent passes (caught 17 silently-passing
+  transpile entries that were removed).
 - 9 Gemma 4 layer-0 parity tests against real GGUF weights, all max
   |err| = 0.0.
 - llama.cpp PTX execution path (loader + arg packing + launch helpers)

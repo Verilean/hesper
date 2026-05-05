@@ -5,7 +5,7 @@ families and DSL designs. This document declares each module's status as of
 this release.
 
 **Status legend**:
-- ✅ **production** — required by the Gemma 4 inference path; covered by `scripts/regression.sh` (43-test suite).
+- ✅ **production** — required by the Gemma 4 inference path; covered by `scripts/regression.sh` (26-test suite).
 - 🟡 **preview** — implemented + parity-tested but not on the default decode path. Examples: vision/audio kernels, WMMA Tensor Core path. Will graduate to production once wired in and validated end-to-end.
 - 🧪 **experimental** — exploratory code from past iterations. Compiles, but not actively used. Keep for now; may be removed in a future release.
 - 📚 **infra/lib** — internal infrastructure (logging, FFI, build wiring, test utilities). Always loaded but invisible to end users.
