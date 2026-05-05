@@ -5,6 +5,23 @@ import Hesper.Backend
 /-!
 # Vision tower kernels (im2col, conv2d helpers)
 
+🟡 **STATUS: PREVIEW** (as of release prep, 2026-05-05).
+
+Each kernel here has byte-for-byte parity vs llama.cpp's CPU output
+(`Tests/CUDA/CUDA*VsLlamaTest.lean`).  None are wired into the Gemma 4
+LLM inference path — they're foundation for an upcoming SigLIP encoder.
+
+For "image input on hesper" you'd still need:
+1. SigLIP encoder driver (mmproj GGUF load + forward, ~2-3 sessions)
+2. Image preprocessing (224×224 RGB resize + normalize, 1 session)
+3. End-to-end golden vs `llama-mtmd-debug` (1 session)
+
+See `docs/video-impl-plan/02-siglip-op-coverage.md` for the path.
+
+When that lands, kernels in this file graduate to ✅ production.
+
+---
+
 Foundation for running 2D-conv-based vision encoders (CLIP-ViT, SigLIP,
 generic ViTs with patch embedding) on hesper. Mirrors llama.cpp's
 `ggml/src/ggml-cuda/im2col.cu` algorithm.

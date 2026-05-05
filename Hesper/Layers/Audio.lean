@@ -5,6 +5,24 @@ import Hesper.Backend
 /-!
 # Audio model kernels (1D conv-transpose, ...)
 
+🟡 **STATUS: PREVIEW** (as of release prep, 2026-05-05).
+
+`conv_transpose_1d_f32` here has byte-for-byte parity vs llama.cpp's CPU
+output (see `Tests/CUDA/AudioConvTranspose1DParity.lean`). However it is
+**not on the Gemma 4 LLM decode path** — Gemma 4 decode is text-only.
+
+This module is the foundation for future audio decoders (Mamba/SSM-adjacent
+ops, small TTS upsamplers, audio codec heads). The remaining audio family
+(SSM scan, RWKV time-mix, Mamba selective scan) is blocked on per-thread
+local arrays / CUB BlockLoad — see `project_audio_kernel_triage.md`.
+
+For the current Gemma 4 release, treat this as preview/non-shipping code:
+not in `scripts/regression.sh` (43-test suite), not exposed via any
+`lean_exe`. Will graduate to production once an actual audio decoder is
+wired end-to-end.
+
+---
+
 Foundation for running 1D-conv-based audio decoders (Mamba/SSM-adjacent
 ops, small TTS upsamplers, audio codec heads). Mirrors llama.cpp's
 `ggml/src/ggml-cuda/conv-transpose-1d.cu` algorithm.
