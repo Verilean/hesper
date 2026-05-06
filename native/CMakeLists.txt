@@ -29,12 +29,15 @@ message(STATUS "Dawn build directory: ${DAWN_BUILD_DIR}")
 # Build our native bridge library
 add_library(hesper_native STATIC bridge.cpp glfw_bridge.cpp)
 
-# Include Lean, Dawn, and GLFW headers (GLFW is in Dawn's third_party)
+# Include Lean, Dawn, and GLFW headers (GLFW is in Dawn's third_party).
+# Upstream Dawn moved glfw from third_party/glfw/src/include to
+# third_party/glfw3/src/include — list both so we work with either layout.
 target_include_directories(hesper_native PRIVATE
   ${LEAN_INCLUDE_DIR}
   ${DAWN_SRC_DIR}/include
   ${DAWN_BUILD_DIR}/gen/include
   ${DAWN_SRC_DIR}/third_party/glfw/include
+  ${DAWN_SRC_DIR}/third_party/glfw3/src/include
 )
 
 # Link Dawn GLFW utilities for surface creation
