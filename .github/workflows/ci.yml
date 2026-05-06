@@ -349,11 +349,53 @@ jobs:
           fail-on-alert: false
 
   # ============================================================================
+  # CPU-only Lean tests (no GPU backend, no native deps)
+  # ============================================================================
+  # `-Kgpu=cpu` is a Lake build config flag (see lakefile.lean). It drops
+  # `nativeDeps` from extraDepTargets (so cmake / Dawn / Vulkan / CUDA SDK
+  # are not invoked) and empties `cudaExeArgs` for CUDA-linked exes.
+  # Builds AND RUNS the WGSL DSL + Numerical test runners — pure-Lean, no
+  # GPU required.
+  cpu-tests:
+    name: CPU-only Lean tests (Ubuntu)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Setup Lean
+        uses: leanprover/lean-action@v1
+        with:
+          auto-config: false
+
+      - name: Restore Lake packages cache
+        uses: actions/cache@v4
+        with:
+          path: .lake/packages
+          key: lake-pkgs-${{ hashFiles('lean-toolchain', 'lake-manifest.json') }}
+          restore-keys: lake-pkgs-
+
+      - name: Build Hesper library (CPU-only)
+        run: lake -Kgpu=cpu build Hesper
+
+      - name: Build CPU test runners
+        run: lake -Kgpu=cpu build test-wgsl-dsl test-numerical
+
+      - name: Run WGSL DSL tests
+        run: .lake/build/bin/test-wgsl-dsl
+
+      - name: Run Numerical tests
+        run: .lake/build/bin/test-numerical
+
+  # ============================================================================
   # Test Coverage Summary
   # ============================================================================
   test-summary:
     name: Test Summary
-    needs: [lean-build, linux-vulkan, windows-d3d12, macos-metal]
+    needs: [lean-build, linux-vulkan, windows-d3d12, macos-metal, cpu-tests]
     runs-on: ubuntu-latest
     if: always()
 
@@ -362,11 +404,13 @@ jobs:
         run: |
           echo "=== Hesper CI Test Summary ==="
           echo "Lean Build: ${{ needs.lean-build.result }}"
+          echo "CPU tests (build+run): ${{ needs.cpu-tests.result }}"
           echo "Linux + Vulkan: ${{ needs.linux-vulkan.result }}"
           echo "Windows + D3D12: ${{ needs.windows-d3d12.result }}"
           echo "macOS + Metal: ${{ needs.macos-metal.result }}"
 
           if [ "${{ needs.lean-build.result }}" != "success" ] || \
+             [ "${{ needs.cpu-tests.result }}" != "success" ] || \
              [ "${{ needs.linux-vulkan.result }}" != "success" ] || \
              [ "${{ needs.windows-d3d12.result }}" != "success" ] || \
              [ "${{ needs.macos-metal.result }}" != "success" ]; then

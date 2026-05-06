@@ -2,8 +2,29 @@ import Lake
 open Lake DSL
 open System (FilePath)
 
+/-! ## Build configuration
+
+  `gpu` selects which GPU backend to compile against. Default is `cuda`
+  to preserve the existing dev workflow exactly. Pass `-Kgpu=cpu` for
+  hosts without CUDA / Dawn / Vulkan SDKs (macOS, CUDA-less Linux CI).
+
+  Recognised values:
+    cuda  — full native build (Dawn + bridge + SIMD + libhesper_cuda.a),
+            all CUDA-dependent lean_exe targets link normally. (default)
+    cpu   — skip native build entirely; CUDA-linked lean_exe targets
+            still exist but their cudaExeArgs evaluate to [], so as long
+            as you only ask for pure-Lean exes (test-wgsl-dsl,
+            test-numerical, etc) the build doesn't try to link CUDA.
+
+  Examples:
+    lake build hesper                     # gpu=cuda (default)
+    lake -Kgpu=cpu build test-wgsl-dsl    # CPU-only build, no Dawn/CUDA
+-/
+def gpuBackend : String := (get_config? gpu).getD "cuda"
+def withCuda : Bool := gpuBackend == "cuda"
+
 package «Hesper» where
-  extraDepTargets := #[`nativeDeps]
+  extraDepTargets := if withCuda then #[`nativeDeps] else #[]
 
 require LSpec from git
   "https://github.com/argumentcomputer/LSpec.git" @ "main"
@@ -391,7 +412,7 @@ def stdLinkArgs : Array String :=
     "./.lake/build/simd/_deps/highway-build/libhwy.a"
   ]
   let cudaArgs :=
-    if System.Platform.isOSX then #[]
+    if !withCuda || System.Platform.isOSX then #[]
     else #["./.lake/build/native/libhesper_cuda.a", "-lcuda"]
   if System.Platform.isOSX then
     #["-Wl,-force_load,./.lake/build/native/libhesper_native.a",
@@ -426,13 +447,12 @@ def stdLinkArgs : Array String :=
       "-ldl",
       "-lpthread"]
 
-/-- Per-exe CUDA link args. Empty on macOS so exes that conditionally use the
-    CUDA backend still link there (CUDA codegen falls back to no-op at runtime).
-    Note: stdLinkArgs already includes the CUDA library on Linux for the FFI
-    surface, but per-exe definitions historically appended these unconditionally.
-    We centralise here so adding macOS support is a single-line change. -/
+/-- Per-exe CUDA link args. Empty when:
+    - `-Kgpu=cpu` is passed (CPU-only build, no CUDA SDK assumed), or
+    - host is macOS (cuda_bridge.cpp uses Linux-only CUDA driver API).
+    Otherwise links the CUDA bridge static library + libcuda. -/
 def cudaExeArgs : Array String :=
-  if System.Platform.isOSX then #[]
+  if !withCuda || System.Platform.isOSX then #[]
   else #["./.lake/build/native/libhesper_cuda.a", "-lcuda"]
 
 -- ============================================================================

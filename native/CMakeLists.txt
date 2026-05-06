@@ -45,9 +45,20 @@ target_link_libraries(hesper_native PRIVATE
 # Note: GLFW and Dawn linking happens in the final executable via lakefile.lean
 
 # ============================================================================
-# CUDA bridge (always built — uses dlopen, no CUDA SDK dependency)
+# CUDA bridge — Linux only (cuda_bridge.cpp uses CUDA driver API)
 # ============================================================================
-find_package(CUDAToolkit REQUIRED)
-add_library(hesper_cuda STATIC cuda_bridge.cpp)
-target_include_directories(hesper_cuda PRIVATE ${LEAN_INCLUDE_DIR} ${CUDAToolkit_INCLUDE_DIRS})
-target_link_libraries(hesper_cuda PRIVATE CUDA::cuda_driver)
+# The lakefile's buildBridgeIfNeeded only builds the hesper_cuda target on
+# non-macOS hosts, but cmake configure runs unconditionally. Guard the
+# CUDAToolkit lookup so configure works on macOS / hosts without CUDA SDK.
+if(NOT APPLE)
+    find_package(CUDAToolkit QUIET)
+    if(CUDAToolkit_FOUND)
+        add_library(hesper_cuda STATIC cuda_bridge.cpp)
+        target_include_directories(hesper_cuda PRIVATE ${LEAN_INCLUDE_DIR} ${CUDAToolkit_INCLUDE_DIRS})
+        target_link_libraries(hesper_cuda PRIVATE CUDA::cuda_driver)
+    else()
+        message(STATUS "CUDAToolkit not found — skipping hesper_cuda target")
+    endif()
+else()
+    message(STATUS "macOS host — skipping hesper_cuda target")
+endif()
