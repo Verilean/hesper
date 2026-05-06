@@ -70,10 +70,17 @@ jobs:
             ninja-build \
             libvulkan-dev \
             vulkan-tools \
+            libx11-dev \
             libxrandr-dev \
             libxinerama-dev \
             libxcursor-dev \
             libxi-dev \
+            libxext-dev \
+            libxkbcommon-dev \
+            libxcb1-dev \
+            libxcb-randr0-dev \
+            libwayland-dev \
+            wayland-protocols \
             libgl1-mesa-dev \
             pkg-config
 
