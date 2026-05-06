@@ -208,11 +208,12 @@ private def buildSimdIfNeeded (cwd : FilePath) : IO UInt32 := do
     IO.println "[Hesper] SIMD library built."
     return 0
 
-/-- Returns true iff `cmd` is on PATH (uses `which`). -/
+/-- Returns true iff `cmd` is on PATH. Uses `which` on Unix, `where` on Windows. -/
 private def hasCmd (cmd : String) : IO Bool := do
+  let probe := if System.Platform.isWindows then "where" else "which"
   try
     let child ← IO.Process.spawn {
-      cmd := "which", args := #[cmd], stdout := .null, stderr := .null }
+      cmd := probe, args := #[cmd], stdout := .null, stderr := .null }
     return (← child.wait) == 0
   catch _ => return false
 
@@ -222,6 +223,12 @@ private def hasCmd (cmd : String) : IO Bool := do
 private def probeCudaEnv : IO (Option String) := do
   if System.Platform.isOSX then
     return some "macOS host (cuda_bridge.cpp is Linux-only)"
+  if System.Platform.isWindows then
+    -- The lakefile's nativeDeps script uses curl + tar to download Dawn,
+    -- and `cuda_bridge.cpp` is gated to Linux. Windows doesn't have a
+    -- supported native build path here yet; force fallback so Lean lib
+    -- + pure-Lean exes still build.
+    return some "Windows host (no supported native build path yet)"
   if !(← hasCmd "cmake") then
     return some "cmake not found on PATH"
   -- libcuda.so ships with the NVIDIA driver. nvcc ships with the toolkit.
