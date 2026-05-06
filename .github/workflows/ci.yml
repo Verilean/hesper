@@ -104,25 +104,21 @@ jobs:
             ${{ runner.os }}-dawn-
 
       - name: Build Dawn (Vulkan backend)
-        if: steps.cache-dawn.outputs.cache-hit != 'true'
         run: |
-          echo "Building Dawn with Vulkan backend..."
-          mkdir -p .lake/build
-          # Note: Dawn build would go here if native/ exists
-          # For now, just verify structure
-          ls -la native/ || echo "Native directory not found"
+          echo "Building Dawn with Vulkan backend (native + Dawn + SIMD)..."
+          lake run buildNative
 
       - name: Build Hesper
         run: |
-          lake build Hesper
+          lake -Kgpu=cuda build Hesper
           echo "Hesper library built successfully on Linux"
 
       - name: Run tests
         run: |
           echo "Running Lean tests..."
-          lake build Tests.WGSLDSLTests
-          lake build Tests.NumericalTests
-          lake build Tests.GPUAccuracyTests
+          lake -Kgpu=cuda build Tests.WGSLDSLTests
+          lake -Kgpu=cuda build Tests.NumericalTests
+          lake -Kgpu=cuda build Tests.GPUAccuracyTests
           echo "All test targets built successfully"
 
   # ============================================================================
@@ -166,29 +162,24 @@ jobs:
             ${{ runner.os }}-dawn-
 
       - name: Build Dawn (D3D12 backend)
-        if: steps.cache-dawn-windows.outputs.cache-hit != 'true'
         shell: powershell
         run: |
-          Write-Host "Building Dawn with D3D12 backend..."
-          if (Test-Path native/) {
-            Write-Host "Native directory found"
-          } else {
-            Write-Host "Native directory not found (expected for pure Lean build)"
-          }
+          Write-Host "Building Dawn with D3D12 backend (native + Dawn + SIMD)..."
+          lake run buildNative
 
       - name: Build Hesper
         shell: powershell
         run: |
-          lake build Hesper
+          lake -Kgpu=cuda build Hesper
           Write-Host "Hesper library built successfully on Windows"
 
       - name: Run tests
         shell: powershell
         run: |
           Write-Host "Running Lean tests..."
-          lake build Tests.WGSLDSLTests
-          lake build Tests.NumericalTests
-          lake build Tests.GPUAccuracyTests
+          lake -Kgpu=cuda build Tests.WGSLDSLTests
+          lake -Kgpu=cuda build Tests.NumericalTests
+          lake -Kgpu=cuda build Tests.GPUAccuracyTests
           Write-Host "All test targets built successfully"
 
   # ============================================================================
