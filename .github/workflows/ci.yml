@@ -350,13 +350,11 @@ jobs:
           fail-on-alert: false
 
   # ============================================================================
-  # CPU-only Lean tests (no GPU backend, no native deps)
+  # CPU-only Lean tests (no CUDA, but Dawn/WGSL still built)
   # ============================================================================
-  # `-Kgpu=cpu` is a Lake build config flag (see lakefile.lean). It drops
-  # `nativeDeps` from extraDepTargets (so cmake / Dawn / Vulkan / CUDA SDK
-  # are not invoked) and empties `cudaExeArgs` for CUDA-linked exes.
-  # Builds AND RUNS the WGSL DSL + Numerical test runners — pure-Lean, no
-  # GPU required.
+  # `-Kgpu=cpu` skips the CUDA bridge but still builds Dawn + native bridge
+  # + SIMD (the WGSL/Vulkan backend). Builds AND RUNS the WGSL DSL +
+  # Numerical test runners.
   cpu-tests:
     name: CPU-only Lean tests (Ubuntu)
     runs-on: ubuntu-latest
@@ -366,6 +364,17 @@ jobs:
         uses: actions/checkout@v4
         with:
           submodules: recursive
+
+      - name: Install Dawn build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential cmake ninja-build pkg-config \
+            libvulkan-dev \
+            libx11-dev libxrandr-dev libxinerama-dev libxcursor-dev libxi-dev \
+            libxext-dev libxkbcommon-dev libxcb1-dev libxcb-randr0-dev \
+            libwayland-dev wayland-protocols \
+            libgl1-mesa-dev
 
       - name: Setup Lean
         uses: leanprover/lean-action@v1

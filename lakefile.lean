@@ -4,25 +4,24 @@ open System (FilePath)
 
 /-! ## Build configuration
 
-  `gpu` selects which GPU backend to compile against.
+  `gpu` controls only the **CUDA PTX backend** — whether libhesper_cuda.a
+  is built and linked into lean_exe targets. It does NOT control Dawn /
+  native bridge / SIMD: those are needed by every backend (WGSL + Vulkan
+  + Metal + D3D12) so they always build.
 
   Recognised values:
-    auto  — (default) probe the host. If cmake + libcuda/nvcc are
-            present, run the full native build. Otherwise nativeDeps
-            prints a message and skips silently — pure-Lean lib + exes
-            still build, but anything that links libhesper_cuda.a will
-            fail at the link step.
-    cuda  — force the full native build. Hard-error if any tool is
-            missing (no fallback).
-    cpu   — skip native build entirely. CUDA-linked lean_exe targets
-            still exist but their cudaExeArgs evaluate to [], so as
-            long as you only ask for pure-Lean exes (test-wgsl-dsl,
-            test-numerical, etc) the build doesn't try to link CUDA.
+    auto  — (default) probe the host. CUDA bridge built+linked if cmake
+            + libcuda/nvcc are present, otherwise skipped with a message.
+            Dawn + native bridge + SIMD always build either way.
+    cuda  — force CUDA bridge build. Hard-error if CUDA SDK missing.
+    cpu   — skip CUDA bridge entirely. cudaExeArgs evaluate to [], so
+            as long as you only ask for non-CUDA exes (gemma4-cuda etc
+            won't link), the build succeeds.
 
   Examples:
-    lake build hesper                     # auto: probe & fall back if needed
-    lake -Kgpu=cuda build hesper          # force CUDA (no fallback)
-    lake -Kgpu=cpu build test-wgsl-dsl    # explicit CPU-only, no probe
+    lake build hesper                     # auto: probe CUDA, build Dawn always
+    lake -Kgpu=cuda build hesper          # force CUDA (Dawn + CUDA)
+    lake -Kgpu=cpu build test-wgsl-dsl    # WGSL via Dawn, no CUDA
 -/
 def gpuBackend : String := (get_config? gpu).getD "auto"
 
@@ -38,9 +37,9 @@ def withCuda : Bool := gpuBackend != "cpu"
 def cudaRequired : Bool := gpuBackend == "cuda"
 
 package «Hesper» where
-  -- `cpu` mode skips nativeDeps entirely. `auto` and `cuda` schedule it;
-  -- `nativeDeps` itself decides whether to fall back (auto) or error (cuda).
-  extraDepTargets := if gpuBackend == "cpu" then #[] else #[`nativeDeps]
+  -- nativeDeps always runs (Dawn + native bridge + SIMD). The CUDA
+  -- bridge inside it is gated separately by `withCuda` / probe.
+  extraDepTargets := #[`nativeDeps]
 
 require LSpec from git
   "https://github.com/argumentcomputer/LSpec.git" @ "main"
@@ -158,8 +157,10 @@ private def buildDawnIfNeeded (cwd : FilePath) : IO UInt32 := do
     IO.println "[Hesper] Dawn already built (cached)."
   return 0
 
-/-- Build the Hesper native bridge library and (on Linux) the CUDA bridge. -/
-private def buildBridgeIfNeeded (cwd : FilePath) : IO UInt32 := do
+/-- Build the Hesper native bridge library. The CUDA bridge is built only
+    when `buildCuda = true` (controlled by `withCuda` + probe at the call
+    site). The native bridge (Dawn / WGSL FFI surface) is always built. -/
+private def buildBridgeIfNeeded (cwd : FilePath) (buildCuda : Bool) : IO UInt32 := do
   let bridgeBuild := cwd / ".lake/build/native"
   let nativeLib := bridgeBuild / "libhesper_native.a"
   let cudaLib := bridgeBuild / "libhesper_cuda.a"
@@ -179,8 +180,10 @@ private def buildBridgeIfNeeded (cwd : FilePath) : IO UInt32 := do
     if ret != 0 then return ret
   else
     IO.println "[Hesper] Native bridge already built (cached)."
-  -- CUDA bridge: only on Linux (cuda_bridge.cpp uses CUDA driver API)
-  if !System.Platform.isOSX then
+  -- CUDA bridge: only when CUDA is requested AND CMakeLists.txt actually
+  -- exposed the hesper_cuda target (gated by `if(NOT APPLE)` + CUDAToolkit
+  -- presence in native/CMakeLists.txt).
+  if buildCuda && !System.Platform.isOSX then
     if !(← cudaLib.pathExists) then
       IO.println "[Hesper] Building Hesper CUDA bridge..."
       let ret ← runCmd "cmake" #["--build", bridgeBuild.toString, "--target", "hesper_cuda", "-j", "8"]
@@ -249,21 +252,28 @@ private def probeCudaEnv : IO (Option String) := do
   return none
 
 /-- Lake target that builds all native dependencies before any Lean compilation.
-    In `auto` mode (default), probes for cmake / CUDA and silently skips
-    with a message if any are missing. In `cuda` mode (explicit), errors
-    on any failure. -/
+
+    Dawn + native bridge + SIMD always build (they are the WGSL/Vulkan/Metal/
+    D3D12 backend foundation). The CUDA bridge is the only piece gated by
+    `gpu`:
+      - cpu  → never built
+      - cuda → built; hard-error if CUDAToolkit / libcuda is missing
+      - auto → probed; built if cmake + libcuda/nvcc present, else skipped
+               with a warning. Either way the rest of nativeDeps continues. -/
 target nativeDeps : Unit := do
-  -- gpu=auto fallback: probe before invoking cmake
-  if !cudaRequired then
+  -- Decide whether to build the CUDA bridge.
+  let mut buildCudaBridge := withCuda
+  if withCuda && !cudaRequired then
+    -- gpu=auto: probe; on failure, skip CUDA but continue with Dawn/SIMD.
     if let some reason ← probeCudaEnv then
-      IO.println s!"[Hesper] gpu=auto: {reason} → skipping native build (Dawn / bridge / SIMD)."
-      IO.println "[Hesper] CPU-only build will continue. Pass -Kgpu=cuda to require CUDA, or -Kgpu=cpu to silence this probe."
-      return .nil
+      IO.println s!"[Hesper] gpu=auto: {reason} → skipping CUDA bridge."
+      IO.println "[Hesper] WGSL/Dawn build continues. Pass -Kgpu=cuda to require CUDA, or -Kgpu=cpu to silence this probe."
+      buildCudaBridge := false
   let cwd ← IO.currentDir
   let ret ← buildDawnIfNeeded cwd
   if ret != 0 then
     error s!"Dawn build failed (exit code {ret})"
-  let ret ← buildBridgeIfNeeded cwd
+  let ret ← buildBridgeIfNeeded cwd buildCudaBridge
   if ret != 0 then
     error s!"Native bridge build failed (exit code {ret})"
   let ret ← buildSimdIfNeeded cwd
