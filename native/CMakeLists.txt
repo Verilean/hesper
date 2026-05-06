@@ -57,7 +57,9 @@ target_link_libraries(hesper_native PRIVATE
 # is satisfied and platforms without CUDA can still build/run the WGSL
 # parts of Hesper.
 set(HESPER_CUDA_AVAILABLE FALSE)
-if(NOT APPLE)
+# cuda_bridge.cpp uses the Linux libcuda.so / dlopen pattern, so the real
+# bridge only builds on Linux. On macOS and Windows we always use the stub.
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     find_package(CUDAToolkit QUIET)
     if(CUDAToolkit_FOUND)
         set(HESPER_CUDA_AVAILABLE TRUE)

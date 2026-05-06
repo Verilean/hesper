@@ -103,9 +103,17 @@ private def compileDawn (dawnSrc dawnBuild dawnInstall : FilePath) : IO UInt32 :
   -- Visual Studio on Windows). `--config Release` is passed to
   -- `cmake --build` and `--install` below so that multi-config
   -- generators emit and install from `Release/` correctly.
+  -- Visual Studio is a multi-config generator; CMAKE_BUILD_TYPE alone
+  -- doesn't constrain it, and `cmake --install` then races between
+  -- Release/ and Debug/ subdirs and emits the infamous
+  -- "INSTALL cannot find ... Release/webgpu_dawn.lib: File exists" error.
+  -- CMAKE_CONFIGURATION_TYPES=Release pins the multi-config generator
+  -- to a single config, matching the single-config (Makefiles/Ninja)
+  -- behavior we get on Linux/macOS.
   let cmakeArgs := #[
     "-S", dawnSrc.toString, "-B", dawnBuild.toString,
     "-DCMAKE_BUILD_TYPE=Release",
+    "-DCMAKE_CONFIGURATION_TYPES=Release",
     "-DDAWN_FETCH_DEPENDENCIES=ON",
     "-DDAWN_BUILD_SAMPLES=OFF", "-DDAWN_BUILD_EXAMPLES=OFF", "-DDAWN_BUILD_TESTS=OFF",
     "-DDAWN_ENABLE_INSTALL=ON", "-DDAWN_BUILD_MONOLITHIC_LIBRARY=STATIC",
@@ -179,6 +187,7 @@ private def buildBridgeIfNeeded (cwd : FilePath) : IO UInt32 := do
     let ret ← runCmd "cmake" #[
       "-S", (cwd / "native").toString, "-B", bridgeBuild.toString,
       "-DCMAKE_BUILD_TYPE=Release",
+      "-DCMAKE_CONFIGURATION_TYPES=Release",
       "-DDAWN_SRC_DIR=" ++ (cwd / ".lake/build/dawn-src").toString,
       "-DDAWN_BUILD_DIR=" ++ (cwd / ".lake/build/dawn-build").toString]
     if ret != 0 then return ret
@@ -208,7 +217,8 @@ private def buildSimdIfNeeded (cwd : FilePath) : IO UInt32 := do
     IO.FS.createDirAll simdBuild
     let ret ← runCmd "cmake" #[
       "-S", (cwd / "c_src").toString, "-B", simdBuild.toString,
-      "-DCMAKE_BUILD_TYPE=Release"]
+      "-DCMAKE_BUILD_TYPE=Release",
+      "-DCMAKE_CONFIGURATION_TYPES=Release"]
     if ret != 0 then return ret
     let ret ← runCmd "cmake" #["--build", simdBuild.toString, "--target", "hesper_simd", "-j", "8"]
     if ret != 0 then return ret
@@ -231,11 +241,13 @@ private def probeCudaEnv : IO (Option String) := do
   if System.Platform.isOSX then
     return some "macOS host (cuda_bridge.cpp is Linux-only)"
   if System.Platform.isWindows then
-    -- The lakefile's nativeDeps script uses curl + tar to download Dawn,
-    -- and `cuda_bridge.cpp` is gated to Linux. Windows doesn't have a
-    -- supported native build path here yet; force fallback so Lean lib
-    -- + pure-Lean exes still build.
-    return some "Windows host (no supported native build path yet)"
+    -- cuda_bridge.cpp uses the Linux libcuda.so / dlopen pattern.
+    -- Windows would need the bridge ported to LoadLibrary("nvcuda.dll").
+    -- Until that lands, the CUDA bridge build is forced to the stub on
+    -- Windows (see CMakeLists.txt: `if(NOT APPLE)` is too lax — but the
+    -- stub branch still emits the symbols, so exes link). Dawn + native
+    -- bridge themselves DO build on Windows now.
+    return some "Windows host (cuda_bridge.cpp is Linux-only — using stub)"
   if !(← hasCmd "cmake") then
     return some "cmake not found on PATH"
   -- libcuda.so ships with the NVIDIA driver. nvcc ships with the toolkit.
@@ -257,23 +269,18 @@ private def probeCudaEnv : IO (Option String) := do
 
 /-- Lake target that builds all native dependencies before any Lean compilation.
 
-    On Linux + macOS: builds Dawn + native bridge + CUDA bridge + SIMD.
+    Builds Dawn + native bridge + CUDA bridge + SIMD on every platform.
     The CUDA bridge is real on Linux+CUDA hosts and a stub elsewhere
     (cuda_bridge_stub.cpp), so Lean exes always link successfully — but
     actually invoking CUDA at runtime errors out unless the real bridge
     is present. The `gpu` flag still controls whether `lean_exe` targets
     add `-lcuda` to their link line (cudaExeArgs).
 
-    On Windows: skipped entirely. Dawn's install step fights with
-    Visual Studio's multi-config Release/ subdirectory, and we don't
-    have a working end-to-end Windows native build path yet. Lean exes
-    that need libhesper_cuda.a / libhesper_native.a / libwebgpu_dawn
-    won't link, but pure-Lean `lake build Hesper` (lib only) succeeds. -/
+    Visual Studio (Windows default) is a multi-config generator;
+    `CMAKE_CONFIGURATION_TYPES=Release` is passed at configure time so
+    that `cmake --install` doesn't try to find Debug/ subdir variants
+    of webgpu_dawn.lib — the symptom reported on the dawn-graphics list. -/
 target nativeDeps : Unit := do
-  if System.Platform.isWindows then
-    IO.println "[Hesper] Windows host: skipping native build (Dawn install path issues)."
-    IO.println "[Hesper] Pure-Lean targets still build; native exes will fail to link."
-    return .nil
   let cwd ← IO.currentDir
   let ret ← buildDawnIfNeeded cwd
   if ret != 0 then

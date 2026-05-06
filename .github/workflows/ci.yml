@@ -174,9 +174,12 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-dawn-
 
-      # Note: native build (Dawn / bridge / SIMD) is currently skipped on
-      # Windows by the lakefile — Dawn's install step fights with Visual
-      # Studio's multi-config layout. We only verify pure-Lean compilation.
+      - name: Build Dawn + native bridge + SIMD (Windows / D3D12)
+        shell: powershell
+        run: |
+          Write-Host "Building Dawn + native bridge + SIMD for Windows D3D12..."
+          lake run buildNative
+          Write-Host "Native deps built successfully"
 
       - name: Build Hesper (Lean lib only)
         shell: powershell
