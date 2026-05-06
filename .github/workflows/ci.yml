@@ -36,7 +36,7 @@ jobs:
             build-essential cmake ninja-build pkg-config \
             libvulkan-dev \
             libx11-dev libxrandr-dev libxinerama-dev libxcursor-dev libxi-dev \
-            libxext-dev libxkbcommon-dev libxcb1-dev libxcb-randr0-dev \
+            libxext-dev libxkbcommon-dev libxcb1-dev libx11-xcb-dev libxcb-randr0-dev \
             libwayland-dev wayland-protocols \
             libgl1-mesa-dev
 
@@ -90,6 +90,7 @@ jobs:
             libxext-dev \
             libxkbcommon-dev \
             libxcb1-dev \
+            libx11-xcb-dev \
             libxcb-randr0-dev \
             libwayland-dev \
             wayland-protocols \
@@ -384,7 +385,7 @@ jobs:
             build-essential cmake ninja-build pkg-config \
             libvulkan-dev \
             libx11-dev libxrandr-dev libxinerama-dev libxcursor-dev libxi-dev \
-            libxext-dev libxkbcommon-dev libxcb1-dev libxcb-randr0-dev \
+            libxext-dev libxkbcommon-dev libxcb1-dev libx11-xcb-dev libxcb-randr0-dev \
             libwayland-dev wayland-protocols \
             libgl1-mesa-dev
 
