@@ -13,11 +13,12 @@ permissions:
 
 jobs:
   # ============================================================================
-  # Lean Build and Unit Tests (Fast - No GPU Required)
+  # Lean Build and Unit Tests (No CUDA, Dawn/WGSL still built)
   # ============================================================================
-  # Uses the default `gpu=auto`. On the GitHub runner cmake exists but
-  # libcuda.so/nvcc do not, so nativeDeps probes, prints a "skipping
-  # native build" message, and continues with a CPU-only library build.
+  # Uses the default `gpu=auto`. cmake exists but libcuda.so/nvcc don't,
+  # so the auto-probe skips the CUDA bridge with a message. Dawn / native
+  # bridge / SIMD still build (WGSL backend), which requires X11+Vulkan
+  # dev headers below.
   lean-build:
     name: Lean Build (Ubuntu)
     runs-on: ubuntu-latest
@@ -27,6 +28,17 @@ jobs:
         uses: actions/checkout@v4
         with:
           submodules: recursive
+
+      - name: Install Dawn build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential cmake ninja-build pkg-config \
+            libvulkan-dev \
+            libx11-dev libxrandr-dev libxinerama-dev libxcursor-dev libxi-dev \
+            libxext-dev libxkbcommon-dev libxcb1-dev libxcb-randr0-dev \
+            libwayland-dev wayland-protocols \
+            libgl1-mesa-dev
 
       - name: Setup Lean
         uses: leanprover/lean-action@v1
