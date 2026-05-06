@@ -4,27 +4,43 @@ open System (FilePath)
 
 /-! ## Build configuration
 
-  `gpu` selects which GPU backend to compile against. Default is `cuda`
-  to preserve the existing dev workflow exactly. Pass `-Kgpu=cpu` for
-  hosts without CUDA / Dawn / Vulkan SDKs (macOS, CUDA-less Linux CI).
+  `gpu` selects which GPU backend to compile against.
 
   Recognised values:
-    cuda  — full native build (Dawn + bridge + SIMD + libhesper_cuda.a),
-            all CUDA-dependent lean_exe targets link normally. (default)
-    cpu   — skip native build entirely; CUDA-linked lean_exe targets
-            still exist but their cudaExeArgs evaluate to [], so as long
-            as you only ask for pure-Lean exes (test-wgsl-dsl,
+    auto  — (default) probe the host. If cmake + libcuda/nvcc are
+            present, run the full native build. Otherwise nativeDeps
+            prints a message and skips silently — pure-Lean lib + exes
+            still build, but anything that links libhesper_cuda.a will
+            fail at the link step.
+    cuda  — force the full native build. Hard-error if any tool is
+            missing (no fallback).
+    cpu   — skip native build entirely. CUDA-linked lean_exe targets
+            still exist but their cudaExeArgs evaluate to [], so as
+            long as you only ask for pure-Lean exes (test-wgsl-dsl,
             test-numerical, etc) the build doesn't try to link CUDA.
 
   Examples:
-    lake build hesper                     # gpu=cuda (default)
-    lake -Kgpu=cpu build test-wgsl-dsl    # CPU-only build, no Dawn/CUDA
+    lake build hesper                     # auto: probe & fall back if needed
+    lake -Kgpu=cuda build hesper          # force CUDA (no fallback)
+    lake -Kgpu=cpu build test-wgsl-dsl    # explicit CPU-only, no probe
 -/
-def gpuBackend : String := (get_config? gpu).getD "cuda"
-def withCuda : Bool := gpuBackend == "cuda"
+def gpuBackend : String := (get_config? gpu).getD "auto"
+
+/-- True iff the build is allowed to link libhesper_cuda.a / -lcuda.
+    `auto` and `cuda` enable it; `cpu` disables. (Whether the linked
+    library actually exists is determined at `nativeDeps` time when in
+    `auto` mode.) -/
+def withCuda : Bool := gpuBackend != "cpu"
+
+/-- True iff the user *demanded* CUDA (`-Kgpu=cuda`). `auto` does NOT
+    set this; it just tries CUDA and falls back. Used by `nativeDeps`
+    to decide whether a missing CUDA SDK is a hard error or a warning. -/
+def cudaRequired : Bool := gpuBackend == "cuda"
 
 package «Hesper» where
-  extraDepTargets := if withCuda then #[`nativeDeps] else #[]
+  -- `cpu` mode skips nativeDeps entirely. `auto` and `cuda` schedule it;
+  -- `nativeDeps` itself decides whether to fall back (auto) or error (cuda).
+  extraDepTargets := if gpuBackend == "cpu" then #[] else #[`nativeDeps]
 
 require LSpec from git
   "https://github.com/argumentcomputer/LSpec.git" @ "main"
@@ -192,8 +208,50 @@ private def buildSimdIfNeeded (cwd : FilePath) : IO UInt32 := do
     IO.println "[Hesper] SIMD library built."
     return 0
 
-/-- Lake target that builds all native dependencies before any Lean compilation. -/
+/-- Returns true iff `cmd` is on PATH (uses `which`). -/
+private def hasCmd (cmd : String) : IO Bool := do
+  try
+    let child ← IO.Process.spawn {
+      cmd := "which", args := #[cmd], stdout := .null, stderr := .null }
+    return (← child.wait) == 0
+  catch _ => return false
+
+/-- Probe for the tools/libs needed by the CUDA + Dawn build path.
+    Returns `none` if everything is present, or `some reason` describing
+    the first missing piece. -/
+private def probeCudaEnv : IO (Option String) := do
+  if System.Platform.isOSX then
+    return some "macOS host (cuda_bridge.cpp is Linux-only)"
+  if !(← hasCmd "cmake") then
+    return some "cmake not found on PATH"
+  -- libcuda.so ships with the NVIDIA driver. nvcc ships with the toolkit.
+  -- Either alone is enough to attempt the CUDA bridge build.
+  let libcudaCandidates := #[
+    "/usr/lib/x86_64-linux-gnu/libcuda.so",
+    "/usr/lib/x86_64-linux-gnu/libcuda.so.1",
+    "/usr/lib64/libcuda.so",
+    "/usr/lib64/libcuda.so.1"
+  ]
+  let mut foundLibcuda := false
+  for p in libcudaCandidates do
+    if (← System.FilePath.pathExists p) then
+      foundLibcuda := true
+      break
+  if !foundLibcuda && !(← hasCmd "nvcc") then
+    return some "neither libcuda.so nor nvcc found"
+  return none
+
+/-- Lake target that builds all native dependencies before any Lean compilation.
+    In `auto` mode (default), probes for cmake / CUDA and silently skips
+    with a message if any are missing. In `cuda` mode (explicit), errors
+    on any failure. -/
 target nativeDeps : Unit := do
+  -- gpu=auto fallback: probe before invoking cmake
+  if !cudaRequired then
+    if let some reason ← probeCudaEnv then
+      IO.println s!"[Hesper] gpu=auto: {reason} → skipping native build (Dawn / bridge / SIMD)."
+      IO.println "[Hesper] CPU-only build will continue. Pass -Kgpu=cuda to require CUDA, or -Kgpu=cpu to silence this probe."
+      return .nil
   let cwd ← IO.currentDir
   let ret ← buildDawnIfNeeded cwd
   if ret != 0 then

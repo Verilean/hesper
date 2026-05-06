@@ -15,6 +15,9 @@ jobs:
   # ============================================================================
   # Lean Build and Unit Tests (Fast - No GPU Required)
   # ============================================================================
+  # Uses the default `gpu=auto`. On the GitHub runner cmake exists but
+  # libcuda.so/nvcc do not, so nativeDeps probes, prints a "skipping
+  # native build" message, and continues with a CPU-only library build.
   lean-build:
     name: Lean Build (Ubuntu)
     runs-on: ubuntu-latest
