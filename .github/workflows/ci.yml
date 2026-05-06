@@ -255,6 +255,14 @@ jobs:
       - name: Build native libraries
         run: lake run buildNative
 
+      - name: Diagnostics — list Dawn output libraries
+        if: always()
+        run: |
+          echo "=== Static libs under .lake/build/dawn-build ==="
+          find .lake/build/dawn-build -name "*.a" 2>/dev/null | sort || true
+          echo "=== Static libs under .lake/build/dawn-install ==="
+          find .lake/build/dawn-install -name "*.a" 2>/dev/null | sort || true
+
       - name: Build test-all
         run: lake build test-all
 

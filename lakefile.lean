@@ -491,13 +491,13 @@ script buildNative do
 def stdLinkArgs : Array String :=
   -- Dawn installs to lib/ on macOS, lib64/ on Linux x86_64
   let dawnLibDir := if System.Platform.isOSX then "lib" else "lib64"
-  -- glfw3 is needed by the Linux Vulkan/X11 path. macOS/Metal's Dawn
-  -- build doesn't produce a glfw3 static lib (it links Cocoa frameworks
-  -- directly), so skip -lglfw3 there.
+  -- glfw3 is needed on every platform: glfw_bridge.cpp directly calls
+  -- glfwInit / glfwCreateWindow / etc. Dawn's CMakeLists toggles
+  -- DAWN_USE_GLFW=ON for "(UNIX AND NOT ANDROID) OR (WIN32 AND NOT
+  -- WINDOWS_STORE)" so libglfw3.a IS produced in
+  -- third_party/glfw3/src/src on macOS, Linux, and Windows.
   let glfwArgs : Array String :=
-    if System.Platform.isOSX then #[]
-    else #[
-      -- Upstream Dawn moved glfw from third_party/glfw/src to third_party/glfw3/src/src
+    #[
       "-L./.lake/build/dawn-build/third_party/glfw3/src/src", "-lglfw3"
     ]
   let commonArgs := #[
