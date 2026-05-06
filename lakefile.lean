@@ -99,8 +99,14 @@ private def downloadDawn (cwd : FilePath) (dawnSrc : FilePath) (dawnVersion : St
 private def compileDawn (dawnSrc dawnBuild dawnInstall : FilePath) : IO UInt32 := do
   IO.println "[Hesper] Building Dawn (this may take 10-15 minutes on first build)..."
   IO.FS.createDirAll dawnBuild.toString
+  -- Force Ninja (single-config) to avoid Visual Studio's multi-config
+  -- `Release/` subdirectory layout, which breaks Dawn's install step on
+  -- Windows: cmake_install.cmake looks for `webgpu_dawn.lib` directly in
+  -- `src/dawn/native/` but the multi-config build puts it under
+  -- `src/dawn/native/Release/`.
   let cmakeArgs := #[
     "-S", dawnSrc.toString, "-B", dawnBuild.toString,
+    "-G", "Ninja",
     "-DCMAKE_BUILD_TYPE=Release",
     "-DDAWN_FETCH_DEPENDENCIES=ON",
     "-DDAWN_BUILD_SAMPLES=OFF", "-DDAWN_BUILD_EXAMPLES=OFF", "-DDAWN_BUILD_TESTS=OFF",
@@ -109,16 +115,19 @@ private def compileDawn (dawnSrc dawnBuild dawnInstall : FilePath) : IO UInt32 :
     "-DTINT_BUILD_TESTS=OFF", "-DTINT_BUILD_IR_BINARY=OFF", "-DTINT_BUILD_CMD_TOOLS=OFF",
     "-DDAWN_ENABLE_NULL=OFF", "-DDAWN_ENABLE_DESKTOP_GL=OFF", "-DDAWN_ENABLE_OPENGLES=OFF"
   ]
-  let cmakeArgsFinal :=
+  let backendArgs :=
     if System.Platform.isOSX then
-      cmakeArgs ++ #["-DDAWN_ENABLE_METAL=ON", "-DDAWN_ENABLE_VULKAN=OFF"]
+      #["-DDAWN_ENABLE_METAL=ON", "-DDAWN_ENABLE_VULKAN=OFF", "-DDAWN_ENABLE_D3D12=OFF"]
+    else if System.Platform.isWindows then
+      #["-DDAWN_ENABLE_D3D12=ON", "-DDAWN_ENABLE_VULKAN=OFF", "-DDAWN_ENABLE_METAL=OFF"]
     else
-      cmakeArgs ++ #["-DDAWN_ENABLE_VULKAN=ON", "-DDAWN_ENABLE_METAL=OFF"]
+      #["-DDAWN_ENABLE_VULKAN=ON", "-DDAWN_ENABLE_METAL=OFF", "-DDAWN_ENABLE_D3D12=OFF"]
+  let cmakeArgsFinal := cmakeArgs ++ backendArgs
   let ret ← runCmd "cmake" cmakeArgsFinal
   if ret != 0 then return ret
-  let ret ← runCmd "cmake" #["--build", dawnBuild.toString, "-j", "8"]
+  let ret ← runCmd "cmake" #["--build", dawnBuild.toString, "--config", "Release", "-j", "8"]
   if ret != 0 then return ret
-  let ret ← runCmd "cmake" #["--install", dawnBuild.toString]
+  let ret ← runCmd "cmake" #["--install", dawnBuild.toString, "--config", "Release"]
   return ret
 
 /-- Build Dawn from tarball, configure + compile + install. Cached via hash file. -/
@@ -157,10 +166,11 @@ private def buildDawnIfNeeded (cwd : FilePath) : IO UInt32 := do
     IO.println "[Hesper] Dawn already built (cached)."
   return 0
 
-/-- Build the Hesper native bridge library. The CUDA bridge is built only
-    when `buildCuda = true` (controlled by `withCuda` + probe at the call
-    site). The native bridge (Dawn / WGSL FFI surface) is always built. -/
-private def buildBridgeIfNeeded (cwd : FilePath) (buildCuda : Bool) : IO UInt32 := do
+/-- Build the Hesper native bridge library AND the CUDA bridge.
+    The CUDA bridge target always exists in CMakeLists.txt — it's the
+    real implementation when CUDAToolkit is found, or a stub otherwise
+    (so Lean exes link successfully on every platform). -/
+private def buildBridgeIfNeeded (cwd : FilePath) : IO UInt32 := do
   let bridgeBuild := cwd / ".lake/build/native"
   let nativeLib := bridgeBuild / "libhesper_native.a"
   let cudaLib := bridgeBuild / "libhesper_cuda.a"
@@ -170,26 +180,23 @@ private def buildBridgeIfNeeded (cwd : FilePath) (buildCuda : Bool) : IO UInt32 
     IO.FS.createDirAll bridgeBuild
     let ret ← runCmd "cmake" #[
       "-S", (cwd / "native").toString, "-B", bridgeBuild.toString,
+      "-G", "Ninja",
       "-DCMAKE_BUILD_TYPE=Release",
       "-DDAWN_SRC_DIR=" ++ (cwd / ".lake/build/dawn-src").toString,
       "-DDAWN_BUILD_DIR=" ++ (cwd / ".lake/build/dawn-build").toString]
     if ret != 0 then return ret
   if !(← nativeLib.pathExists) then
     IO.println "[Hesper] Building Hesper native bridge..."
-    let ret ← runCmd "cmake" #["--build", bridgeBuild.toString, "--target", "hesper_native", "-j", "8"]
+    let ret ← runCmd "cmake" #["--build", bridgeBuild.toString, "--target", "hesper_native", "--config", "Release", "-j", "8"]
     if ret != 0 then return ret
   else
     IO.println "[Hesper] Native bridge already built (cached)."
-  -- CUDA bridge: only when CUDA is requested AND CMakeLists.txt actually
-  -- exposed the hesper_cuda target (gated by `if(NOT APPLE)` + CUDAToolkit
-  -- presence in native/CMakeLists.txt).
-  if buildCuda && !System.Platform.isOSX then
-    if !(← cudaLib.pathExists) then
-      IO.println "[Hesper] Building Hesper CUDA bridge..."
-      let ret ← runCmd "cmake" #["--build", bridgeBuild.toString, "--target", "hesper_cuda", "-j", "8"]
-      if ret != 0 then return ret
-    else
-      IO.println "[Hesper] CUDA bridge already built (cached)."
+  if !(← cudaLib.pathExists) then
+    IO.println "[Hesper] Building Hesper CUDA bridge (real or stub depending on CUDAToolkit)..."
+    let ret ← runCmd "cmake" #["--build", bridgeBuild.toString, "--target", "hesper_cuda", "--config", "Release", "-j", "8"]
+    if ret != 0 then return ret
+  else
+    IO.println "[Hesper] CUDA bridge already built (cached)."
   return 0
 
 /-- Build the SIMD library (Google Highway). -/
@@ -253,27 +260,18 @@ private def probeCudaEnv : IO (Option String) := do
 
 /-- Lake target that builds all native dependencies before any Lean compilation.
 
-    Dawn + native bridge + SIMD always build (they are the WGSL/Vulkan/Metal/
-    D3D12 backend foundation). The CUDA bridge is the only piece gated by
-    `gpu`:
-      - cpu  → never built
-      - cuda → built; hard-error if CUDAToolkit / libcuda is missing
-      - auto → probed; built if cmake + libcuda/nvcc present, else skipped
-               with a warning. Either way the rest of nativeDeps continues. -/
+    Dawn + native bridge + CUDA bridge + SIMD all build on every platform.
+    The CUDA bridge is real on Linux+CUDA hosts and a stub elsewhere
+    (cuda_bridge_stub.cpp), so Lean exes always link successfully — but
+    actually invoking CUDA at runtime errors out unless the real bridge
+    is present. The `gpu` flag still controls whether `lean_exe` targets
+    add `-lcuda` to their link line (cudaExeArgs). -/
 target nativeDeps : Unit := do
-  -- Decide whether to build the CUDA bridge.
-  let mut buildCudaBridge := withCuda
-  if withCuda && !cudaRequired then
-    -- gpu=auto: probe; on failure, skip CUDA but continue with Dawn/SIMD.
-    if let some reason ← probeCudaEnv then
-      IO.println s!"[Hesper] gpu=auto: {reason} → skipping CUDA bridge."
-      IO.println "[Hesper] WGSL/Dawn build continues. Pass -Kgpu=cuda to require CUDA, or -Kgpu=cpu to silence this probe."
-      buildCudaBridge := false
   let cwd ← IO.currentDir
   let ret ← buildDawnIfNeeded cwd
   if ret != 0 then
     error s!"Dawn build failed (exit code {ret})"
-  let ret ← buildBridgeIfNeeded cwd buildCudaBridge
+  let ret ← buildBridgeIfNeeded cwd
   if ret != 0 then
     error s!"Native bridge build failed (exit code {ret})"
   let ret ← buildSimdIfNeeded cwd

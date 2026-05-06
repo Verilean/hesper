@@ -45,20 +45,29 @@ target_link_libraries(hesper_native PRIVATE
 # Note: GLFW and Dawn linking happens in the final executable via lakefile.lean
 
 # ============================================================================
-# CUDA bridge — Linux only (cuda_bridge.cpp uses CUDA driver API)
+# CUDA bridge: real on Linux+CUDA, stub elsewhere
 # ============================================================================
-# The lakefile's buildBridgeIfNeeded only builds the hesper_cuda target on
-# non-macOS hosts, but cmake configure runs unconditionally. Guard the
-# CUDAToolkit lookup so configure works on macOS / hosts without CUDA SDK.
+# Lean exes always link `lean_hesper_cuda_*` symbols (declared via
+# `@[extern]` in Hesper.CUDA.FFI). The library that provides them is
+# either the real implementation (cuda_bridge.cpp + libcuda) or a stub
+# that errors at runtime (cuda_bridge_stub.cpp). Either way the linker
+# is satisfied and platforms without CUDA can still build/run the WGSL
+# parts of Hesper.
+set(HESPER_CUDA_AVAILABLE FALSE)
 if(NOT APPLE)
     find_package(CUDAToolkit QUIET)
     if(CUDAToolkit_FOUND)
-        add_library(hesper_cuda STATIC cuda_bridge.cpp)
-        target_include_directories(hesper_cuda PRIVATE ${LEAN_INCLUDE_DIR} ${CUDAToolkit_INCLUDE_DIRS})
-        target_link_libraries(hesper_cuda PRIVATE CUDA::cuda_driver)
-    else()
-        message(STATUS "CUDAToolkit not found — skipping hesper_cuda target")
+        set(HESPER_CUDA_AVAILABLE TRUE)
     endif()
+endif()
+
+if(HESPER_CUDA_AVAILABLE)
+    message(STATUS "CUDAToolkit found — building real hesper_cuda bridge")
+    add_library(hesper_cuda STATIC cuda_bridge.cpp)
+    target_include_directories(hesper_cuda PRIVATE ${LEAN_INCLUDE_DIR} ${CUDAToolkit_INCLUDE_DIRS})
+    target_link_libraries(hesper_cuda PRIVATE CUDA::cuda_driver)
 else()
-    message(STATUS "macOS host — skipping hesper_cuda target")
+    message(STATUS "CUDAToolkit not found / non-Linux — building hesper_cuda STUB")
+    add_library(hesper_cuda STATIC cuda_bridge_stub.cpp)
+    target_include_directories(hesper_cuda PRIVATE ${LEAN_INCLUDE_DIR})
 endif()
