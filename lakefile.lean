@@ -518,7 +518,7 @@ def stdLinkArgs : Array String :=
     #["-Wl,-force_load,./.lake/build/native/libhesper_native.a",
       "-Wl,-force_load,./.lake/build/dawn-build/src/dawn/libdawn_proc.a",
       "-Wl,-force_load,./.lake/build/dawn-build/src/dawn/glfw/libdawn_glfw.a"]
-    ++ commonArgs ++
+    ++ commonArgs ++ cudaArgs ++
     #["-lc++",
       "-L/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/lib",
       "-F/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/System/Library/Frameworks",
