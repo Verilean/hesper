@@ -10,6 +10,7 @@
 // found OR the host is non-Linux.
 
 #include <lean/lean.h>
+#include <cstdio>
 #include <cstring>
 
 static lean_obj_res cuda_unavailable(const char* func) {
