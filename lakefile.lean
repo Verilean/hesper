@@ -99,14 +99,12 @@ private def downloadDawn (cwd : FilePath) (dawnSrc : FilePath) (dawnVersion : St
 private def compileDawn (dawnSrc dawnBuild dawnInstall : FilePath) : IO UInt32 := do
   IO.println "[Hesper] Building Dawn (this may take 10-15 minutes on first build)..."
   IO.FS.createDirAll dawnBuild.toString
-  -- Force Ninja (single-config) to avoid Visual Studio's multi-config
-  -- `Release/` subdirectory layout, which breaks Dawn's install step on
-  -- Windows: cmake_install.cmake looks for `webgpu_dawn.lib` directly in
-  -- `src/dawn/native/` but the multi-config build puts it under
-  -- `src/dawn/native/Release/`.
+  -- Use the platform default generator (Unix Makefiles on Linux/macOS,
+  -- Visual Studio on Windows). `--config Release` is passed to
+  -- `cmake --build` and `--install` below so that multi-config
+  -- generators emit and install from `Release/` correctly.
   let cmakeArgs := #[
     "-S", dawnSrc.toString, "-B", dawnBuild.toString,
-    "-G", "Ninja",
     "-DCMAKE_BUILD_TYPE=Release",
     "-DDAWN_FETCH_DEPENDENCIES=ON",
     "-DDAWN_BUILD_SAMPLES=OFF", "-DDAWN_BUILD_EXAMPLES=OFF", "-DDAWN_BUILD_TESTS=OFF",
@@ -180,7 +178,6 @@ private def buildBridgeIfNeeded (cwd : FilePath) : IO UInt32 := do
     IO.FS.createDirAll bridgeBuild
     let ret ← runCmd "cmake" #[
       "-S", (cwd / "native").toString, "-B", bridgeBuild.toString,
-      "-G", "Ninja",
       "-DCMAKE_BUILD_TYPE=Release",
       "-DDAWN_SRC_DIR=" ++ (cwd / ".lake/build/dawn-src").toString,
       "-DDAWN_BUILD_DIR=" ++ (cwd / ".lake/build/dawn-build").toString]
