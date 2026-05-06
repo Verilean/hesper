@@ -174,26 +174,22 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-dawn-
 
-      - name: Build Dawn (D3D12 backend)
-        shell: powershell
-        run: |
-          Write-Host "Building Dawn with D3D12 backend (native + Dawn + SIMD)..."
-          lake run buildNative
+      # Note: native build (Dawn / bridge / SIMD) is currently skipped on
+      # Windows by the lakefile — Dawn's install step fights with Visual
+      # Studio's multi-config layout. We only verify pure-Lean compilation.
 
-      - name: Build Hesper
+      - name: Build Hesper (Lean lib only)
         shell: powershell
         run: |
-          lake -Kgpu=cuda build Hesper
+          lake build Hesper
           Write-Host "Hesper library built successfully on Windows"
 
-      - name: Run tests
+      - name: Build WGSL DSL + Numerical tests (lean_lib only, no exe link)
         shell: powershell
         run: |
-          Write-Host "Running Lean tests..."
-          lake -Kgpu=cuda build Tests.WGSLDSLTests
-          lake -Kgpu=cuda build Tests.NumericalTests
-          lake -Kgpu=cuda build Tests.GPUAccuracyTests
-          Write-Host "All test targets built successfully"
+          lake build Tests.WGSLDSLTests
+          lake build Tests.NumericalTests
+          Write-Host "Test lean_libs built successfully"
 
   # ============================================================================
   # macOS with Metal Backend - Full Build + Test + Benchmark

@@ -257,13 +257,23 @@ private def probeCudaEnv : IO (Option String) := do
 
 /-- Lake target that builds all native dependencies before any Lean compilation.
 
-    Dawn + native bridge + CUDA bridge + SIMD all build on every platform.
+    On Linux + macOS: builds Dawn + native bridge + CUDA bridge + SIMD.
     The CUDA bridge is real on Linux+CUDA hosts and a stub elsewhere
     (cuda_bridge_stub.cpp), so Lean exes always link successfully — but
     actually invoking CUDA at runtime errors out unless the real bridge
     is present. The `gpu` flag still controls whether `lean_exe` targets
-    add `-lcuda` to their link line (cudaExeArgs). -/
+    add `-lcuda` to their link line (cudaExeArgs).
+
+    On Windows: skipped entirely. Dawn's install step fights with
+    Visual Studio's multi-config Release/ subdirectory, and we don't
+    have a working end-to-end Windows native build path yet. Lean exes
+    that need libhesper_cuda.a / libhesper_native.a / libwebgpu_dawn
+    won't link, but pure-Lean `lake build Hesper` (lib only) succeeds. -/
 target nativeDeps : Unit := do
+  if System.Platform.isWindows then
+    IO.println "[Hesper] Windows host: skipping native build (Dawn install path issues)."
+    IO.println "[Hesper] Pure-Lean targets still build; native exes will fail to link."
+    return .nil
   let cwd ← IO.currentDir
   let ret ← buildDawnIfNeeded cwd
   if ret != 0 then
@@ -467,23 +477,36 @@ script buildNative do
 
 -- Standard linker configuration for all FFI executables (based on glfw-triangle + Google Highway)
 -- Platform-specific: macOS uses frameworks + force_load; Linux uses whole-archive + Vulkan/X11
--- Note: libhesper_cuda.a is unconditionally linked because Hesper.lean's CUDA FFI
--- is exported into nearly every Lean module's .c.o.export, making the symbols
--- live for any exe that imports anything from Hesper.* on Linux.
+-- Note: libhesper_cuda.a is ALWAYS linked because Hesper.CUDA.FFI's @[extern]
+-- symbols leak into every exe via Lean's .c.o.export. The library is the real
+-- bridge on Linux+CUDA hosts and a stub elsewhere; either way the file exists.
+-- Only `-lcuda` (the NVIDIA driver shim) is gated by `withCuda`.
 def stdLinkArgs : Array String :=
   -- Dawn installs to lib/ on macOS, lib64/ on Linux x86_64
   let dawnLibDir := if System.Platform.isOSX then "lib" else "lib64"
+  -- glfw3 is needed by the Linux Vulkan/X11 path. macOS/Metal's Dawn
+  -- build doesn't produce a glfw3 static lib (it links Cocoa frameworks
+  -- directly), so skip -lglfw3 there.
+  let glfwArgs : Array String :=
+    if System.Platform.isOSX then #[]
+    else #[
+      -- Upstream Dawn moved glfw from third_party/glfw/src to third_party/glfw3/src/src
+      "-L./.lake/build/dawn-build/third_party/glfw3/src/src", "-lglfw3"
+    ]
   let commonArgs := #[
     "-L./.lake/build/dawn-build/src/dawn", "-ldawn_proc",
-    "-L./.lake/build/dawn-install/" ++ dawnLibDir, "-lwebgpu_dawn",
-    -- Upstream Dawn moved glfw from third_party/glfw/src to third_party/glfw3/src/src
-    "-L./.lake/build/dawn-build/third_party/glfw3/src/src", "-lglfw3",
+    "-L./.lake/build/dawn-install/" ++ dawnLibDir, "-lwebgpu_dawn"
+  ] ++ glfwArgs ++ #[
     "./.lake/build/simd/libhesper_simd.a",
     "./.lake/build/simd/_deps/highway-build/libhwy.a"
   ]
+  -- Always link libhesper_cuda.a (real or stub). -lcuda only when CUDA SDK is
+  -- actually wanted AND we're on Linux (libcuda.so is the NVIDIA driver shim).
   let cudaArgs :=
-    if !withCuda || System.Platform.isOSX then #[]
-    else #["./.lake/build/native/libhesper_cuda.a", "-lcuda"]
+    if !withCuda || System.Platform.isOSX then
+      #["./.lake/build/native/libhesper_cuda.a"]
+    else
+      #["./.lake/build/native/libhesper_cuda.a", "-lcuda"]
   if System.Platform.isOSX then
     #["-Wl,-force_load,./.lake/build/native/libhesper_native.a",
       "-Wl,-force_load,./.lake/build/dawn-build/src/dawn/libdawn_proc.a",
@@ -517,13 +540,15 @@ def stdLinkArgs : Array String :=
       "-ldl",
       "-lpthread"]
 
-/-- Per-exe CUDA link args. Empty when:
-    - `-Kgpu=cpu` is passed (CPU-only build, no CUDA SDK assumed), or
-    - host is macOS (cuda_bridge.cpp uses Linux-only CUDA driver API).
-    Otherwise links the CUDA bridge static library + libcuda. -/
+/-- Per-exe CUDA link args. libhesper_cuda.a is always linked (real on
+    Linux+CUDA, stub elsewhere — both expose the `lean_hesper_cuda_*`
+    symbols that Lean exes reference via @[extern]). Only `-lcuda`
+    (the NVIDIA driver shim) is gated. -/
 def cudaExeArgs : Array String :=
-  if !withCuda || System.Platform.isOSX then #[]
-  else #["./.lake/build/native/libhesper_cuda.a", "-lcuda"]
+  if !withCuda || System.Platform.isOSX then
+    #["./.lake/build/native/libhesper_cuda.a"]
+  else
+    #["./.lake/build/native/libhesper_cuda.a", "-lcuda"]
 
 -- ============================================================================
 -- EXAMPLES - Organized by Category
