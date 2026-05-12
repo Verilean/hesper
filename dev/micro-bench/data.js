@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1778604875676,
+  "lastUpdate": 1778605611564,
   "repoUrl": "https://github.com/Verilean/hesper",
   "entries": {
     "Hesper Kernel Micro-Benchmark": [
@@ -275,6 +275,75 @@ window.BENCHMARK_DATA = {
           {
             "name": "GPU Argmax (128256)",
             "value": 2.884929,
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "junji.hashimoto@gree.net",
+            "name": "Junji Hashimoto",
+            "username": "junjihashimoto"
+          },
+          "committer": {
+            "email": "junji.hashimoto@gree.net",
+            "name": "Junji Hashimoto",
+            "username": "junjihashimoto"
+          },
+          "distinct": true,
+          "id": "dc995d7bda77d6e168dbcca22e31ddf09eaca01e",
+          "message": "ci: drop redundant Lean Build (Ubuntu) job\n\nThe job runs `lake build Hesper / Tests.WGSLDSLTests / Tests.NumericalTests`\nwhich is a strict subset of what Linux + Vulkan already does, but installs\nno system dependencies. Now that `lake build` triggers `nativeDeps` (Dawn +\nGLFW + SIMD), the bare Ubuntu runner fails when Dawn's GLFW tries to find\nX11 dev libs. Remove the job rather than duplicate the Vulkan install step.",
+          "timestamp": "2026-05-13T02:03:14+09:00",
+          "tree_id": "4eb824b1754a118f2c911a8eee9a2efd9a79d5b8",
+          "url": "https://github.com/Verilean/hesper/commit/dc995d7bda77d6e168dbcca22e31ddf09eaca01e"
+        },
+        "date": 1778605610173,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "Projected TPS",
+            "value": 1.286632,
+            "unit": "tokens/sec"
+          },
+          {
+            "name": "RMSNorm (2560)",
+            "value": 0.816887,
+            "unit": "ms"
+          },
+          {
+            "name": "BitLinear Q (2560->2560)",
+            "value": 3.328029,
+            "unit": "ms"
+          },
+          {
+            "name": "BitLinear Gate (2560->6912)",
+            "value": 1.43585,
+            "unit": "ms"
+          },
+          {
+            "name": "BitLinear Down (6912->2560)",
+            "value": 1.487858,
+            "unit": "ms"
+          },
+          {
+            "name": "Elementwise Add (2560)",
+            "value": 1.455271,
+            "unit": "ms"
+          },
+          {
+            "name": "ReLU-Sqr-Mul (6912)",
+            "value": 0.866392,
+            "unit": "ms"
+          },
+          {
+            "name": "MatMul LM Head",
+            "value": 35.738496,
+            "unit": "ms"
+          },
+          {
+            "name": "GPU Argmax (128256)",
+            "value": 1.689242,
             "unit": "ms"
           }
         ]
