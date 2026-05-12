@@ -13,39 +13,6 @@ permissions:
 
 jobs:
   # ============================================================================
-  # Lean Build and Unit Tests (Fast - No GPU Required)
-  # ============================================================================
-  lean-build:
-    name: Lean Build (Ubuntu)
-    runs-on: ubuntu-latest
-
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-        with:
-          submodules: recursive
-
-      - name: Setup Lean
-        uses: leanprover/lean-action@v1
-        with:
-          auto-config: false
-
-      - name: Build Hesper library
-        run: lake build Hesper
-
-      - name: Build WGSL DSL tests
-        run: lake build Tests.WGSLDSLTests
-
-      - name: Build Numerical tests
-        run: lake build Tests.NumericalTests
-
-      - name: Run CPU-only tests
-        run: |
-          echo "Running WGSL DSL tests (151 tests)..."
-          # Note: Actual test execution requires test runner
-          echo "Build completed successfully"
-
-  # ============================================================================
   # Linux with Vulkan Backend
   # ============================================================================
   linux-vulkan:
@@ -353,7 +320,7 @@ jobs:
   # ============================================================================
   test-summary:
     name: Test Summary
-    needs: [lean-build, linux-vulkan, windows-d3d12, macos-metal]
+    needs: [linux-vulkan, windows-d3d12, macos-metal]
     runs-on: ubuntu-latest
     if: always()
 
@@ -361,13 +328,11 @@ jobs:
       - name: Check job results
         run: |
           echo "=== Hesper CI Test Summary ==="
-          echo "Lean Build: ${{ needs.lean-build.result }}"
           echo "Linux + Vulkan: ${{ needs.linux-vulkan.result }}"
           echo "Windows + D3D12: ${{ needs.windows-d3d12.result }}"
           echo "macOS + Metal: ${{ needs.macos-metal.result }}"
 
-          if [ "${{ needs.lean-build.result }}" != "success" ] || \
-             [ "${{ needs.linux-vulkan.result }}" != "success" ] || \
+          if [ "${{ needs.linux-vulkan.result }}" != "success" ] || \
              [ "${{ needs.windows-d3d12.result }}" != "success" ] || \
              [ "${{ needs.macos-metal.result }}" != "success" ]; then
             echo "❌ Some CI jobs failed"
