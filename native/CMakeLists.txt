@@ -45,9 +45,18 @@ target_link_libraries(hesper_native PRIVATE
 # Note: GLFW and Dawn linking happens in the final executable via lakefile.lean
 
 # ============================================================================
-# CUDA bridge (always built — uses dlopen, no CUDA SDK dependency)
+# CUDA bridge
+# - Linux: real implementation linking against the CUDA driver API.
+# - macOS / Windows: stub library that defines the same symbols (returning IO
+#   errors). Required so Lean modules importing Hesper.CUDA.FFI still link,
+#   even though no CUDA calls are made on these platforms.
 # ============================================================================
-find_package(CUDAToolkit REQUIRED)
-add_library(hesper_cuda STATIC cuda_bridge.cpp)
-target_include_directories(hesper_cuda PRIVATE ${LEAN_INCLUDE_DIR} ${CUDAToolkit_INCLUDE_DIRS})
-target_link_libraries(hesper_cuda PRIVATE CUDA::cuda_driver)
+if(APPLE OR WIN32)
+    add_library(hesper_cuda STATIC cuda_bridge_stub.c)
+    target_include_directories(hesper_cuda PRIVATE ${LEAN_INCLUDE_DIR})
+else()
+    find_package(CUDAToolkit REQUIRED)
+    add_library(hesper_cuda STATIC cuda_bridge.cpp)
+    target_include_directories(hesper_cuda PRIVATE ${LEAN_INCLUDE_DIR} ${CUDAToolkit_INCLUDE_DIRS})
+    target_link_libraries(hesper_cuda PRIVATE CUDA::cuda_driver)
+endif()
