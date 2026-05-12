@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1774762152145,
+  "lastUpdate": 1778604935219,
   "repoUrl": "https://github.com/Verilean/hesper",
   "entries": {
     "BitNet Inference Benchmark": [
@@ -90,6 +90,36 @@ window.BENCHMARK_DATA = {
             "value": 14.552593,
             "unit": "tokens/sec",
             "extra": "ms/token: 1568.817313"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "junji.hashimoto@gree.net",
+            "name": "Junji Hashimoto",
+            "username": "junjihashimoto"
+          },
+          "committer": {
+            "email": "junji.hashimoto@gree.net",
+            "name": "Junji Hashimoto",
+            "username": "junjihashimoto"
+          },
+          "distinct": true,
+          "id": "3a1f3ace94e54ef89aa68007f2968a657dd06f70",
+          "message": "ci: fix macOS Metal and Windows D3D12 builds\n\n- native/CMakeLists.txt: gate the real CUDA bridge to Linux only; build a\n  stub library on macOS/Windows so Lean modules that re-export\n  Hesper.CUDA.FFI symbols still link without a CUDA SDK present.\n- native/cuda_bridge_stub.c: stubs for all 59 CUDA FFI entry points,\n  returning IO.userError. Never invoked on macOS/Windows; exist purely to\n  satisfy the linker.\n- lakefile.lean:\n    * always build hesper_cuda (real on Linux, stub elsewhere) and link\n      libhesper_cuda.a from stdLinkArgs on macOS.\n    * pass --config Release to cmake --build/--install so multi-config\n      generators (Visual Studio on Windows) produce Release artifacts.\n    * enable D3D12 backend on Windows in compileDawn.\n    * include both upstream Dawn glfw layouts as -L paths so either\n      version (glfw/src or glfw3/src/src) resolves -lglfw3.\n    * sync the nativeDeps Dawn pin to match the CI cache key (3f79f3a).\n    * use platform-appropriate static-lib filename (.lib on Windows) for\n      cache hit detection and tag the Dawn build hash with windows/osx/linux.",
+          "timestamp": "2026-05-13T01:38:29+09:00",
+          "tree_id": "8e48cb838bf4d67f342e75a901253ee085e9eb1d",
+          "url": "https://github.com/Verilean/hesper/commit/3a1f3ace94e54ef89aa68007f2968a657dd06f70"
+        },
+        "date": 1778604933216,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "BitNet b1.58 2B Inference (macOS Metal)",
+            "value": 4.092437,
+            "unit": "tokens/sec",
+            "extra": "ms/token: 3268.819229"
           }
         ]
       }
