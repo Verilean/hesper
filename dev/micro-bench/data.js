@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1778645355898,
+  "lastUpdate": 1778651298950,
   "repoUrl": "https://github.com/Verilean/hesper",
   "entries": {
     "Hesper Kernel Micro-Benchmark": [
@@ -551,6 +551,75 @@ window.BENCHMARK_DATA = {
           {
             "name": "GPU Argmax (128256)",
             "value": 6.388325,
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "junji.hashimoto@gree.net",
+            "name": "Junji Hashimoto",
+            "username": "junjihashimoto"
+          },
+          "committer": {
+            "email": "junji.hashimoto@gree.net",
+            "name": "Junji Hashimoto",
+            "username": "junjihashimoto"
+          },
+          "distinct": true,
+          "id": "90bbcbc135d2c6026e151c18f6e008f460c83660",
+          "message": "native: compile the CUDA stub as C++ instead of C\n\nMSVC defaults to refusing <stdatomic.h> in C mode even with /std:c11 —\nit requires an additional experimental flag (/experimental:c11atomics):\n  error C1189: \"C atomic support is not enabled\"\n\n<lean/lean.h> pulls in <stdatomic.h> transitively, so the C stub cannot\nbe compiled by MSVC without depending on an experimental flag. Compile\nthe stub as C++ instead; C++ has standard atomics and no extra flags.\n\nThe zero-arg `name()` signatures still satisfy callers from Lean-\ngenerated C with arbitrary arguments: under `extern \"C\"` the linker\nmatches by symbol name only, and the platform ABI delivers the unused\narguments into registers/stack the stub never reads.",
+          "timestamp": "2026-05-13T14:44:50+09:00",
+          "tree_id": "e994c7e8341c582bfdd08be24a23d12690562280",
+          "url": "https://github.com/Verilean/hesper/commit/90bbcbc135d2c6026e151c18f6e008f460c83660"
+        },
+        "date": 1778651297406,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "Projected TPS",
+            "value": 2.287941,
+            "unit": "tokens/sec"
+          },
+          {
+            "name": "RMSNorm (2560)",
+            "value": 0.987704,
+            "unit": "ms"
+          },
+          {
+            "name": "BitLinear Q (2560->2560)",
+            "value": 0.910963,
+            "unit": "ms"
+          },
+          {
+            "name": "BitLinear Gate (2560->6912)",
+            "value": 1.190042,
+            "unit": "ms"
+          },
+          {
+            "name": "BitLinear Down (6912->2560)",
+            "value": 1.2461,
+            "unit": "ms"
+          },
+          {
+            "name": "Elementwise Add (2560)",
+            "value": 0.755392,
+            "unit": "ms"
+          },
+          {
+            "name": "ReLU-Sqr-Mul (6912)",
+            "value": 0.619929,
+            "unit": "ms"
+          },
+          {
+            "name": "MatMul LM Head",
+            "value": 36.527338,
+            "unit": "ms"
+          },
+          {
+            "name": "GPU Argmax (128256)",
+            "value": 2.006204,
             "unit": "ms"
           }
         ]
