@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1778605722368,
+  "lastUpdate": 1778630834231,
   "repoUrl": "https://github.com/Verilean/hesper",
   "entries": {
     "BitNet Inference Benchmark": [
@@ -150,6 +150,36 @@ window.BENCHMARK_DATA = {
             "value": 0.121684,
             "unit": "tokens/sec",
             "extra": "ms/token: 8508.951355"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "junji.hashimoto@gree.net",
+            "name": "Junji Hashimoto",
+            "username": "junjihashimoto"
+          },
+          "committer": {
+            "email": "junji.hashimoto@gree.net",
+            "name": "Junji Hashimoto",
+            "username": "junjihashimoto"
+          },
+          "distinct": true,
+          "id": "a4a6f46ea2b72e84ef62ba9e0316760a4a3bed41",
+          "message": "ci: unblock Linux X11 build and MSVC C++ compile of lean.h\n\n- ci.yml (linux-vulkan): add libx11-dev, libx11-xcb-dev, libxext-dev,\n  libxcb1-dev, libxkbcommon-dev, libwayland-dev. Dawn's GLFW pulls\n  X11/Xlib-xcb.h transitively, which only ships with libx11-xcb-dev.\n- native/bridge.cpp, native/glfw_bridge.cpp: shim `_Noreturn` to\n  `__declspec(noreturn)` before including <lean/lean.h> on MSVC. Lean's\n  header expands LEAN_NORETURN to `_Noreturn` unconditionally on _MSC_VER,\n  but MSVC only recognises `_Noreturn` as a C-language keyword — in C++\n  mode it is undefined, so the Lean header fails to parse.",
+          "timestamp": "2026-05-13T09:02:49+09:00",
+          "tree_id": "3d02e12542b4db96cb272217e1f3dd12ec7037c3",
+          "url": "https://github.com/Verilean/hesper/commit/a4a6f46ea2b72e84ef62ba9e0316760a4a3bed41"
+        },
+        "date": 1778630832294,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "BitNet b1.58 2B Inference (macOS Metal)",
+            "value": 4.783097,
+            "unit": "tokens/sec",
+            "extra": "ms/token: 5002.488208"
           }
         ]
       }
