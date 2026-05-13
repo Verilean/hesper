@@ -1,17 +1,26 @@
-// macOS stub for Hesper's CUDA FFI symbols.
+// Stub for Hesper's CUDA FFI symbols on platforms without CUDA.
 //
-// On Linux, `cuda_bridge.cpp` provides real implementations that link against
-// the CUDA driver API. On macOS there is no CUDA, but every Lean module that
-// transitively imports `Hesper.CUDA.FFI` references these symbols from its
-// generated `.c.o.export`. Without a stub library, even non-CUDA executables
+// On Linux with a CUDA Toolkit, `cuda_bridge.cpp` provides real
+// implementations that link against the CUDA driver API. On macOS, Windows,
+// or Linux without CUDA, every Lean module that transitively imports
+// `Hesper.CUDA.FFI` still references these symbols from its generated
+// `.c.o.export`. Without a stub library, even non-CUDA executables
 // (test-all, bitnet-complete, ...) fail to link.
 //
-// These stubs return `IO.Error.userError "CUDA not available on macOS"` and
-// must never be invoked at runtime on macOS — they exist purely to satisfy
-// the linker. Defined in plain C with unspecified-arg signatures so the
-// platform ABI delivers caller arguments harmlessly into registers/stack we
-// never read.
+// Each stub returns `IO.Error.userError "CUDA is not available"` and must
+// never be invoked at runtime on these platforms — the entry points exist
+// purely to satisfy the linker. Defined with zero-arg signatures inside
+// `extern "C"`; the platform ABI delivers caller arguments harmlessly into
+// registers/stack the stub never reads.
+//
+// Compiled as C++ so MSVC does not require its experimental C11 atomics
+// flag for the <stdatomic.h> pulled in transitively by <lean/lean.h>.
 
+// MSVC's <stdnoreturn.h> only defines `_Noreturn` as a C-language keyword;
+// in C++ mode it is undefined, so Lean's `LEAN_NORETURN` macro fails.
+#if defined(_MSC_VER) && !defined(_Noreturn)
+#define _Noreturn __declspec(noreturn)
+#endif
 #include <lean/lean.h>
 
 #ifdef __cplusplus
@@ -20,7 +29,7 @@ extern "C" {
 
 static lean_obj_res hesper_cuda_unavailable(void) {
     return lean_io_result_mk_error(
-        lean_mk_io_user_error(lean_mk_string("CUDA is not available on macOS")));
+        lean_mk_io_user_error(lean_mk_string("CUDA is not available on this build")));
 }
 
 #define HESPER_CUDA_STUB(name) \
