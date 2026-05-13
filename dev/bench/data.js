@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1778645424233,
+  "lastUpdate": 1778651367171,
   "repoUrl": "https://github.com/Verilean/hesper",
   "entries": {
     "BitNet Inference Benchmark": [
@@ -240,6 +240,36 @@ window.BENCHMARK_DATA = {
             "value": 6.36941,
             "unit": "tokens/sec",
             "extra": "ms/token: 2091.452563"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "junji.hashimoto@gree.net",
+            "name": "Junji Hashimoto",
+            "username": "junjihashimoto"
+          },
+          "committer": {
+            "email": "junji.hashimoto@gree.net",
+            "name": "Junji Hashimoto",
+            "username": "junjihashimoto"
+          },
+          "distinct": true,
+          "id": "90bbcbc135d2c6026e151c18f6e008f460c83660",
+          "message": "native: compile the CUDA stub as C++ instead of C\n\nMSVC defaults to refusing <stdatomic.h> in C mode even with /std:c11 —\nit requires an additional experimental flag (/experimental:c11atomics):\n  error C1189: \"C atomic support is not enabled\"\n\n<lean/lean.h> pulls in <stdatomic.h> transitively, so the C stub cannot\nbe compiled by MSVC without depending on an experimental flag. Compile\nthe stub as C++ instead; C++ has standard atomics and no extra flags.\n\nThe zero-arg `name()` signatures still satisfy callers from Lean-\ngenerated C with arbitrary arguments: under `extern \"C\"` the linker\nmatches by symbol name only, and the platform ABI delivers the unused\narguments into registers/stack the stub never reads.",
+          "timestamp": "2026-05-13T14:44:50+09:00",
+          "tree_id": "e994c7e8341c582bfdd08be24a23d12690562280",
+          "url": "https://github.com/Verilean/hesper/commit/90bbcbc135d2c6026e151c18f6e008f460c83660"
+        },
+        "date": 1778651365493,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "BitNet b1.58 2B Inference (macOS Metal)",
+            "value": 8.168063,
+            "unit": "tokens/sec",
+            "extra": "ms/token: 1869.284021"
           }
         ]
       }
