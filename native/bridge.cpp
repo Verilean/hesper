@@ -10,6 +10,7 @@
 #include <dawn/native/DawnNative.h>
 #include <iostream>
 #include <vector>
+#include <array>
 #include <chrono>
 #include <thread>
 #include <iomanip>
