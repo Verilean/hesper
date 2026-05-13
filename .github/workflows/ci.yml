@@ -34,10 +34,16 @@ jobs:
             ninja-build \
             libvulkan-dev \
             vulkan-tools \
+            libx11-dev \
+            libx11-xcb-dev \
             libxrandr-dev \
             libxinerama-dev \
             libxcursor-dev \
             libxi-dev \
+            libxext-dev \
+            libxcb1-dev \
+            libxkbcommon-dev \
+            libwayland-dev \
             libgl1-mesa-dev \
             pkg-config
 
