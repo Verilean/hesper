@@ -69,6 +69,8 @@ else()
     message(STATUS "Hesper CUDA bridge: stub (no CUDA Toolkit)")
     add_library(hesper_cuda STATIC cuda_bridge_stub.c)
     target_include_directories(hesper_cuda PRIVATE ${LEAN_INCLUDE_DIR})
+    # <lean/lean.h> pulls in <stdatomic.h>; MSVC requires /std:c11 for those.
+    set_target_properties(hesper_cuda PROPERTIES C_STANDARD 11 C_STANDARD_REQUIRED ON)
 endif()
 
 # Expose the decision to consumers via a marker file that lakefile.lean
