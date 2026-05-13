@@ -2,6 +2,12 @@
  * Hesper SIMD Operations - Google Highway Implementation
  */
 
+// MSVC's <stdnoreturn.h> only defines `_Noreturn` as a C-language keyword;
+// in C++ mode it is undefined, so Lean's `LEAN_NORETURN` macro (which expands
+// to `_Noreturn` on MSVC) fails to compile. Provide a C++-side substitute.
+#if defined(_MSC_VER) && !defined(_Noreturn)
+#define _Noreturn __declspec(noreturn)
+#endif
 #include <lean/lean.h>
 #include <cstdint>
 #include <cstring>
