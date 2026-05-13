@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1778651298950,
+  "lastUpdate": 1778655251508,
   "repoUrl": "https://github.com/Verilean/hesper",
   "entries": {
     "Hesper Kernel Micro-Benchmark": [
@@ -620,6 +620,75 @@ window.BENCHMARK_DATA = {
           {
             "name": "GPU Argmax (128256)",
             "value": 2.006204,
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "junji.hashimoto@gree.net",
+            "name": "Junji Hashimoto",
+            "username": "junjihashimoto"
+          },
+          "committer": {
+            "email": "junji.hashimoto@gree.net",
+            "name": "Junji Hashimoto",
+            "username": "junjihashimoto"
+          },
+          "distinct": true,
+          "id": "eee64585ce805525fc69652ee4f1a1a90f54d79d",
+          "message": "simd: shim _Noreturn for MSVC C++ before <lean/lean.h>\n\nSame fix as the native bridge: Lean's header expands LEAN_NORETURN to\n`_Noreturn`, which MSVC only recognises in C mode. Apply the shim in\nboth simd_ops_highway.cpp and simd_ops_highway.h so any consumer of the\nSIMD code that pulls in lean.h transitively also gets the substitute.",
+          "timestamp": "2026-05-13T15:50:26+09:00",
+          "tree_id": "34a42ae8407ed57297b5d0a777810855d044361b",
+          "url": "https://github.com/Verilean/hesper/commit/eee64585ce805525fc69652ee4f1a1a90f54d79d"
+        },
+        "date": 1778655249523,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "Projected TPS",
+            "value": 1.864908,
+            "unit": "tokens/sec"
+          },
+          {
+            "name": "RMSNorm (2560)",
+            "value": 0.994817,
+            "unit": "ms"
+          },
+          {
+            "name": "BitLinear Q (2560->2560)",
+            "value": 1.436775,
+            "unit": "ms"
+          },
+          {
+            "name": "BitLinear Gate (2560->6912)",
+            "value": 1.497867,
+            "unit": "ms"
+          },
+          {
+            "name": "BitLinear Down (6912->2560)",
+            "value": 1.223129,
+            "unit": "ms"
+          },
+          {
+            "name": "Elementwise Add (2560)",
+            "value": 0.974313,
+            "unit": "ms"
+          },
+          {
+            "name": "ReLU-Sqr-Mul (6912)",
+            "value": 0.738192,
+            "unit": "ms"
+          },
+          {
+            "name": "MatMul LM Head",
+            "value": 37.258108,
+            "unit": "ms"
+          },
+          {
+            "name": "GPU Argmax (128256)",
+            "value": 2.411708,
             "unit": "ms"
           }
         ]
