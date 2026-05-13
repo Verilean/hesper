@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1778630772656,
+  "lastUpdate": 1778641511322,
   "repoUrl": "https://github.com/Verilean/hesper",
   "entries": {
     "Hesper Kernel Micro-Benchmark": [
@@ -413,6 +413,75 @@ window.BENCHMARK_DATA = {
           {
             "name": "GPU Argmax (128256)",
             "value": 2.483462,
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "junji.hashimoto@gree.net",
+            "name": "Junji Hashimoto",
+            "username": "junjihashimoto"
+          },
+          "committer": {
+            "email": "junji.hashimoto@gree.net",
+            "name": "Junji Hashimoto",
+            "username": "junjihashimoto"
+          },
+          "distinct": true,
+          "id": "4a0592f13fc989330e9541ec2c0703cf5cedd33b",
+          "message": "native: auto-detect CUDA, bump to C++20, fix MSVC headers\n\n- native/CMakeLists.txt:\n    * Auto-detect CUDA Toolkit instead of hard-requiring it. On Linux\n      hosts without CUDA (e.g. the CI Vulkan runner) fall back to the\n      stub bridge so cmake configure succeeds. macOS and Windows still\n      always use the stub. Write a marker file (hesper_cuda.found) so\n      downstream tooling can later condition link flags on the decision.\n    * Bump CMAKE_CXX_STANDARD to 20. bridge.cpp uses designated\n      initializers, which are a non-standard extension in C++17 that\n      MSVC rejects (`/std:c++20` required).\n- native/bridge.cpp: explicitly include <array>. MSVC's standard\n  headers do not transitively pull it in, unlike libstdc++/libc++.",
+          "timestamp": "2026-05-13T11:00:38+09:00",
+          "tree_id": "bf79218f34b7b7c643b30f4a4b85095ee7dedde8",
+          "url": "https://github.com/Verilean/hesper/commit/4a0592f13fc989330e9541ec2c0703cf5cedd33b"
+        },
+        "date": 1778641509874,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "Projected TPS",
+            "value": 2.716019,
+            "unit": "tokens/sec"
+          },
+          {
+            "name": "RMSNorm (2560)",
+            "value": 0.656579,
+            "unit": "ms"
+          },
+          {
+            "name": "BitLinear Q (2560->2560)",
+            "value": 0.796196,
+            "unit": "ms"
+          },
+          {
+            "name": "BitLinear Gate (2560->6912)",
+            "value": 0.867204,
+            "unit": "ms"
+          },
+          {
+            "name": "BitLinear Down (6912->2560)",
+            "value": 1.227171,
+            "unit": "ms"
+          },
+          {
+            "name": "Elementwise Add (2560)",
+            "value": 0.673412,
+            "unit": "ms"
+          },
+          {
+            "name": "ReLU-Sqr-Mul (6912)",
+            "value": 0.845804,
+            "unit": "ms"
+          },
+          {
+            "name": "MatMul LM Head",
+            "value": 39.226708,
+            "unit": "ms"
+          },
+          {
+            "name": "GPU Argmax (128256)",
+            "value": 6.103254,
             "unit": "ms"
           }
         ]
