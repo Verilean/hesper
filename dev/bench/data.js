@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1778641573048,
+  "lastUpdate": 1778645424233,
   "repoUrl": "https://github.com/Verilean/hesper",
   "entries": {
     "BitNet Inference Benchmark": [
@@ -210,6 +210,36 @@ window.BENCHMARK_DATA = {
             "value": 9.565431,
             "unit": "tokens/sec",
             "extra": "ms/token: 1845.669167"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "junji.hashimoto@gree.net",
+            "name": "Junji Hashimoto",
+            "username": "junjihashimoto"
+          },
+          "committer": {
+            "email": "junji.hashimoto@gree.net",
+            "name": "Junji Hashimoto",
+            "username": "junjihashimoto"
+          },
+          "distinct": true,
+          "id": "b757b3cd01dae316f34a99194beb70a7a6b1f1a7",
+          "message": "native: enable C11 for the CUDA stub on MSVC\n\nMSVC defaults to C89 for .c sources and refuses to compile\n<vcruntime_c11_stdatomic.h> (pulled in transitively from <lean/lean.h>):\n  error C1189: \"C atomics require C11 or later\"\n\nSet C_STANDARD=11 on the hesper_cuda stub target to add /std:c11.",
+          "timestamp": "2026-05-13T12:45:46+09:00",
+          "tree_id": "9f42360f4e5e0681bb36b61331a90ea9490c41be",
+          "url": "https://github.com/Verilean/hesper/commit/b757b3cd01dae316f34a99194beb70a7a6b1f1a7"
+        },
+        "date": 1778645422711,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "BitNet b1.58 2B Inference (macOS Metal)",
+            "value": 6.36941,
+            "unit": "tokens/sec",
+            "extra": "ms/token: 2091.452563"
           }
         ]
       }
