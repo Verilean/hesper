@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1778651367171,
+  "lastUpdate": 1778655313560,
   "repoUrl": "https://github.com/Verilean/hesper",
   "entries": {
     "BitNet Inference Benchmark": [
@@ -270,6 +270,36 @@ window.BENCHMARK_DATA = {
             "value": 8.168063,
             "unit": "tokens/sec",
             "extra": "ms/token: 1869.284021"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "junji.hashimoto@gree.net",
+            "name": "Junji Hashimoto",
+            "username": "junjihashimoto"
+          },
+          "committer": {
+            "email": "junji.hashimoto@gree.net",
+            "name": "Junji Hashimoto",
+            "username": "junjihashimoto"
+          },
+          "distinct": true,
+          "id": "eee64585ce805525fc69652ee4f1a1a90f54d79d",
+          "message": "simd: shim _Noreturn for MSVC C++ before <lean/lean.h>\n\nSame fix as the native bridge: Lean's header expands LEAN_NORETURN to\n`_Noreturn`, which MSVC only recognises in C mode. Apply the shim in\nboth simd_ops_highway.cpp and simd_ops_highway.h so any consumer of the\nSIMD code that pulls in lean.h transitively also gets the substitute.",
+          "timestamp": "2026-05-13T15:50:26+09:00",
+          "tree_id": "34a42ae8407ed57297b5d0a777810855d044361b",
+          "url": "https://github.com/Verilean/hesper/commit/eee64585ce805525fc69652ee4f1a1a90f54d79d"
+        },
+        "date": 1778655311706,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "BitNet b1.58 2B Inference (macOS Metal)",
+            "value": 5.8969,
+            "unit": "tokens/sec",
+            "extra": "ms/token: 2383.883937"
           }
         ]
       }
