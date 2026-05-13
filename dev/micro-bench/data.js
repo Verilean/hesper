@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1778641511322,
+  "lastUpdate": 1778645355898,
   "repoUrl": "https://github.com/Verilean/hesper",
   "entries": {
     "Hesper Kernel Micro-Benchmark": [
@@ -482,6 +482,75 @@ window.BENCHMARK_DATA = {
           {
             "name": "GPU Argmax (128256)",
             "value": 6.103254,
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "junji.hashimoto@gree.net",
+            "name": "Junji Hashimoto",
+            "username": "junjihashimoto"
+          },
+          "committer": {
+            "email": "junji.hashimoto@gree.net",
+            "name": "Junji Hashimoto",
+            "username": "junjihashimoto"
+          },
+          "distinct": true,
+          "id": "b757b3cd01dae316f34a99194beb70a7a6b1f1a7",
+          "message": "native: enable C11 for the CUDA stub on MSVC\n\nMSVC defaults to C89 for .c sources and refuses to compile\n<vcruntime_c11_stdatomic.h> (pulled in transitively from <lean/lean.h>):\n  error C1189: \"C atomics require C11 or later\"\n\nSet C_STANDARD=11 on the hesper_cuda stub target to add /std:c11.",
+          "timestamp": "2026-05-13T12:45:46+09:00",
+          "tree_id": "9f42360f4e5e0681bb36b61331a90ea9490c41be",
+          "url": "https://github.com/Verilean/hesper/commit/b757b3cd01dae316f34a99194beb70a7a6b1f1a7"
+        },
+        "date": 1778645354192,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "Projected TPS",
+            "value": 1.950331,
+            "unit": "tokens/sec"
+          },
+          {
+            "name": "RMSNorm (2560)",
+            "value": 1.165712,
+            "unit": "ms"
+          },
+          {
+            "name": "BitLinear Q (2560->2560)",
+            "value": 1.22005,
+            "unit": "ms"
+          },
+          {
+            "name": "BitLinear Gate (2560->6912)",
+            "value": 1.09825,
+            "unit": "ms"
+          },
+          {
+            "name": "BitLinear Down (6912->2560)",
+            "value": 2.056767,
+            "unit": "ms"
+          },
+          {
+            "name": "Elementwise Add (2560)",
+            "value": 0.669829,
+            "unit": "ms"
+          },
+          {
+            "name": "ReLU-Sqr-Mul (6912)",
+            "value": 0.769179,
+            "unit": "ms"
+          },
+          {
+            "name": "MatMul LM Head",
+            "value": 35.5789,
+            "unit": "ms"
+          },
+          {
+            "name": "GPU Argmax (128256)",
+            "value": 6.388325,
             "unit": "ms"
           }
         ]
