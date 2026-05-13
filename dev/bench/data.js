@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1778630834231,
+  "lastUpdate": 1778641573048,
   "repoUrl": "https://github.com/Verilean/hesper",
   "entries": {
     "BitNet Inference Benchmark": [
@@ -180,6 +180,36 @@ window.BENCHMARK_DATA = {
             "value": 4.783097,
             "unit": "tokens/sec",
             "extra": "ms/token: 5002.488208"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "junji.hashimoto@gree.net",
+            "name": "Junji Hashimoto",
+            "username": "junjihashimoto"
+          },
+          "committer": {
+            "email": "junji.hashimoto@gree.net",
+            "name": "Junji Hashimoto",
+            "username": "junjihashimoto"
+          },
+          "distinct": true,
+          "id": "4a0592f13fc989330e9541ec2c0703cf5cedd33b",
+          "message": "native: auto-detect CUDA, bump to C++20, fix MSVC headers\n\n- native/CMakeLists.txt:\n    * Auto-detect CUDA Toolkit instead of hard-requiring it. On Linux\n      hosts without CUDA (e.g. the CI Vulkan runner) fall back to the\n      stub bridge so cmake configure succeeds. macOS and Windows still\n      always use the stub. Write a marker file (hesper_cuda.found) so\n      downstream tooling can later condition link flags on the decision.\n    * Bump CMAKE_CXX_STANDARD to 20. bridge.cpp uses designated\n      initializers, which are a non-standard extension in C++17 that\n      MSVC rejects (`/std:c++20` required).\n- native/bridge.cpp: explicitly include <array>. MSVC's standard\n  headers do not transitively pull it in, unlike libstdc++/libc++.",
+          "timestamp": "2026-05-13T11:00:38+09:00",
+          "tree_id": "bf79218f34b7b7c643b30f4a4b85095ee7dedde8",
+          "url": "https://github.com/Verilean/hesper/commit/4a0592f13fc989330e9541ec2c0703cf5cedd33b"
+        },
+        "date": 1778641571731,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "BitNet b1.58 2B Inference (macOS Metal)",
+            "value": 9.565431,
+            "unit": "tokens/sec",
+            "extra": "ms/token: 1845.669167"
           }
         ]
       }
