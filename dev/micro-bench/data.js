@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1778605611564,
+  "lastUpdate": 1778630772656,
   "repoUrl": "https://github.com/Verilean/hesper",
   "entries": {
     "Hesper Kernel Micro-Benchmark": [
@@ -344,6 +344,75 @@ window.BENCHMARK_DATA = {
           {
             "name": "GPU Argmax (128256)",
             "value": 1.689242,
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "junji.hashimoto@gree.net",
+            "name": "Junji Hashimoto",
+            "username": "junjihashimoto"
+          },
+          "committer": {
+            "email": "junji.hashimoto@gree.net",
+            "name": "Junji Hashimoto",
+            "username": "junjihashimoto"
+          },
+          "distinct": true,
+          "id": "a4a6f46ea2b72e84ef62ba9e0316760a4a3bed41",
+          "message": "ci: unblock Linux X11 build and MSVC C++ compile of lean.h\n\n- ci.yml (linux-vulkan): add libx11-dev, libx11-xcb-dev, libxext-dev,\n  libxcb1-dev, libxkbcommon-dev, libwayland-dev. Dawn's GLFW pulls\n  X11/Xlib-xcb.h transitively, which only ships with libx11-xcb-dev.\n- native/bridge.cpp, native/glfw_bridge.cpp: shim `_Noreturn` to\n  `__declspec(noreturn)` before including <lean/lean.h> on MSVC. Lean's\n  header expands LEAN_NORETURN to `_Noreturn` unconditionally on _MSC_VER,\n  but MSVC only recognises `_Noreturn` as a C-language keyword — in C++\n  mode it is undefined, so the Lean header fails to parse.",
+          "timestamp": "2026-05-13T09:02:49+09:00",
+          "tree_id": "3d02e12542b4db96cb272217e1f3dd12ec7037c3",
+          "url": "https://github.com/Verilean/hesper/commit/a4a6f46ea2b72e84ef62ba9e0316760a4a3bed41"
+        },
+        "date": 1778630770886,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "Projected TPS",
+            "value": 1.136342,
+            "unit": "tokens/sec"
+          },
+          {
+            "name": "RMSNorm (2560)",
+            "value": 3.202233,
+            "unit": "ms"
+          },
+          {
+            "name": "BitLinear Q (2560->2560)",
+            "value": 2.127767,
+            "unit": "ms"
+          },
+          {
+            "name": "BitLinear Gate (2560->6912)",
+            "value": 1.639625,
+            "unit": "ms"
+          },
+          {
+            "name": "BitLinear Down (6912->2560)",
+            "value": 1.531904,
+            "unit": "ms"
+          },
+          {
+            "name": "Elementwise Add (2560)",
+            "value": 0.614537,
+            "unit": "ms"
+          },
+          {
+            "name": "ReLU-Sqr-Mul (6912)",
+            "value": 0.659917,
+            "unit": "ms"
+          },
+          {
+            "name": "MatMul LM Head",
+            "value": 39.412533,
+            "unit": "ms"
+          },
+          {
+            "name": "GPU Argmax (128256)",
+            "value": 2.483462,
             "unit": "ms"
           }
         ]
