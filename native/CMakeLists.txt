@@ -1,7 +1,8 @@
 cmake_minimum_required(VERSION 3.16)
 project(HesperNative)
 
-set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
 # Expect DAWN_SRC_DIR and DAWN_BUILD_DIR to be provided
@@ -46,17 +47,30 @@ target_link_libraries(hesper_native PRIVATE
 
 # ============================================================================
 # CUDA bridge
-# - Linux: real implementation linking against the CUDA driver API.
-# - macOS / Windows: stub library that defines the same symbols (returning IO
-#   errors). Required so Lean modules importing Hesper.CUDA.FFI still link,
-#   even though no CUDA calls are made on these platforms.
+# - Auto-detect: if the CUDA Toolkit is available, build the real bridge
+#   that links against the CUDA driver API. Otherwise fall back to the stub
+#   library so Lean modules importing Hesper.CUDA.FFI still link.
+# - macOS / Windows: always stub (no CUDA support upstream).
 # ============================================================================
-if(APPLE OR WIN32)
-    add_library(hesper_cuda STATIC cuda_bridge_stub.c)
-    target_include_directories(hesper_cuda PRIVATE ${LEAN_INCLUDE_DIR})
-else()
-    find_package(CUDAToolkit REQUIRED)
+set(HESPER_CUDA_FOUND FALSE)
+if(NOT (APPLE OR WIN32))
+    find_package(CUDAToolkit QUIET)
+    if(CUDAToolkit_FOUND)
+        set(HESPER_CUDA_FOUND TRUE)
+    endif()
+endif()
+
+if(HESPER_CUDA_FOUND)
+    message(STATUS "Hesper CUDA bridge: real (CUDA Toolkit detected)")
     add_library(hesper_cuda STATIC cuda_bridge.cpp)
     target_include_directories(hesper_cuda PRIVATE ${LEAN_INCLUDE_DIR} ${CUDAToolkit_INCLUDE_DIRS})
     target_link_libraries(hesper_cuda PRIVATE CUDA::cuda_driver)
+else()
+    message(STATUS "Hesper CUDA bridge: stub (no CUDA Toolkit)")
+    add_library(hesper_cuda STATIC cuda_bridge_stub.c)
+    target_include_directories(hesper_cuda PRIVATE ${LEAN_INCLUDE_DIR})
 endif()
+
+# Expose the decision to consumers via a marker file that lakefile.lean
+# inspects to decide whether to add `-lcuda` to executable link lines.
+file(WRITE "${CMAKE_BINARY_DIR}/hesper_cuda.found" "${HESPER_CUDA_FOUND}")
