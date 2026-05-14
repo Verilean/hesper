@@ -2,7 +2,7 @@
 
 This chapter walks you through creating a new Lean 4 project that uses
 Hesper as a library dependency. At the end you'll have a working
-executable that runs a small computation on the GPU.
+executable that runs a small GPU shader expression.
 
 ## Create a fresh package
 
@@ -16,14 +16,15 @@ This produces a minimal `MyHesperApp/` tree with `lakefile.lean`,
 
 ## Depend on Hesper
 
-Edit `lakefile.lean` to add a `require` clause:
+Edit `lakefile.lean` to add a `require` clause (this snippet is a Lake
+build script — it's not regular Lean code, so we can't execute it in
+the notebook, but you can paste it into your project's `lakefile.lean`):
 
-```lean
+```text
 import Lake
 open Lake DSL
 
 package «MyHesperApp» where
-  -- optional: extraDepTargets to build native deps eagerly
 
 require Hesper from git
   "https://github.com/Verilean/hesper.git" @ "main"
@@ -39,35 +40,28 @@ Run `lake update Hesper` once to fetch the dependency. The first build
 will compile Hesper's native bits (Dawn, Highway) — that takes about ten
 minutes. Subsequent builds are incremental.
 
-## A minimal GPU computation
+## A minimal Hesper program
 
-Replace `Main.lean` with:
+Once `Hesper` is available, your `Main.lean` can use it like any other
+module. Here we just build a small WGSL expression and pretty-print it:
 
 ```lean
-import Hesper.Compute
 import Hesper.WGSL.DSL
 
-def main : IO Unit := do
-  let dev ← Hesper.Device.create
-  let n := 1024
+open Hesper.WGSL
 
-  -- Build a buffer of 1024 f32 zeros, run an "add 1" shader, read it
-  -- back, and print the first element.
-  let input  ← dev.allocBuffer (n * 4)
-  let output ← dev.allocBuffer (n * 4)
+def shader : Exp (.scalar .f32) :=
+  let x : Exp (.scalar .f32) := var "x"
+  let y : Exp (.scalar .f32) := var "y"
+  sqrt (x * x + y * y)
 
-  -- Use the high-level API for simple elementwise ops — Ch02 shows
-  -- how to write the shader by hand.
-  dev.fill input 0.0
-  dev.elementwise output input (fun x => x + 1.0)
-
-  let host : ByteArray ← dev.readBuffer output
-  let firstF32 : Float := host.toFloat32Array.get! 0
-  IO.println s!"output[0] = {firstF32}"      -- 1.0
+#eval shader.toWGSL
+-- sqrt(((x * x) + (y * y)))
 ```
 
-`Hesper.Compute` exposes the user-facing API. `Hesper.WGSL.DSL` exports
-the type-safe shader-expression layer covered in the next chapter.
+In a real app you'd replace `#eval` with a `def main : IO Unit := ...`
+that uploads the kernel to the GPU. See Ch02 for the full ShaderM flow,
+and the runnable example at `Examples/DSL/DSLBasics.lean`.
 
 ## Build and run
 
@@ -76,18 +70,12 @@ lake build
 ./.lake/build/bin/my-hesper-app
 ```
 
-Expected output:
-
-```
-output[0] = 1.0
-```
-
 If the build fails complaining about Dawn or X11 headers, see the
 [Setup](Ch00_Setup.md) chapter for platform-specific apt/brew packages.
 
 ## What's next
 
 - [Chapter 02 — The Shader DSL](Ch02_DSL.md): write the shader expression
-  by hand instead of using the elementwise helper.
+  by hand and emit a full kernel.
 - [Chapter 04 — High-Level API & Tensors](Ch04_HighLevelApi.md): jump to
   tensor and NN layers if you'd rather not write shaders.

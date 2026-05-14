@@ -12,7 +12,7 @@ dependent type system on top.
 def square (x : Float) : Float := x * x
 
 #eval square 3.14                 -- 9.8596
-#check square                     -- Float → Float
+#check @square                    -- @square : Float → Float
 ```
 
 `def name (args) : ReturnType := body`. Type annotations on arguments
@@ -40,9 +40,10 @@ desugars to `Array.map xs`.
 structure Shape where
   rows : Nat
   cols : Nat
-  deriving Repr
+deriving Repr
 
 def s : Shape := { rows := 3, cols := 4 }
+
 #eval s.rows * s.cols             -- 12
 ```
 
@@ -56,8 +57,6 @@ just like Haskell or Rust:
 ```lean
 def hello : IO Unit := do
   IO.println "hello GPU"
-  let n ← IO.getNumHeartbeats
-  IO.println s!"current heartbeats = {n}"
 
 #eval hello
 ```
@@ -71,16 +70,18 @@ Lean lets a type depend on a value. This is what makes the shader DSL
 type-safe:
 
 ```lean
-inductive ScalarKind | f32 | i32 | u32
+inductive Kind | f32 | i32 | u32
 
--- Types are *indexed* by ScalarKind — different scalar kinds give
--- different types, so the elaborator refuses to mix them.
-def repr : ScalarKind → Type
+-- A type that depends on a value of Kind.  We use `abbrev` (not `def`)
+-- so that `Carrier .f32` reduces to `Float` transparently — otherwise
+-- the elaborator can't see through the alias when it needs to find a
+-- `OfNat Float 1` instance below.
+abbrev Carrier : Kind → Type
   | .f32 => Float
   | .i32 => Int
   | .u32 => UInt32
 
-def one : (k : ScalarKind) → repr k
+def oneOf : (k : Kind) → Carrier k
   | .f32 => 1.0
   | .i32 => 1
   | .u32 => 1
@@ -99,6 +100,9 @@ class Approximable (α : Type) where
 
 instance : Approximable Float where
   approxEq a b := (a - b).abs < 1e-6
+
+#eval Approximable.approxEq (1.0 : Float) 1.0000001
+-- true
 ```
 
 Hesper uses typeclasses for `GPUBackend` (Ch05), `Differentiable` (Ch03),
@@ -106,14 +110,15 @@ and for tensor element types.
 
 ## Module imports
 
-```lean
+A real Lean file starts with all its imports up top, like Python or
+Haskell. In the rest of this tutorial each chapter's notebook places
+its imports in the *first* code cell:
+
+```text
 import Hesper.WGSL.DSL          -- the type-safe shader DSL
 import Hesper.Compute           -- high-level compute API
 import Hesper.Models.BitNet     -- BitNet inference
 ```
-
-Imports go at the top of the file. The tutorial uses one import line
-per chapter as needed.
 
 ## What's next
 

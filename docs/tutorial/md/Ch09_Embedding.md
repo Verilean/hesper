@@ -1,14 +1,17 @@
 # Chapter 09 — Embedding Hesper in Other Projects
 
 Hesper is published as a Lake package. This chapter shows the three
-common ways to depend on it from your own code.
+common ways to depend on it from your own code. The `lakefile.lean`
+snippets below are build-script DSL, *not* regular Lean — they're
+shown as `text` blocks because they can only be elaborated by the
+Lake driver.
 
 ## Pattern 1: pure-Lean dependency
 
 If you only need the DSL and the high-level API (no native customisation),
 add Hesper to your `lakefile.lean`:
 
-```lean
+```text
 import Lake
 open Lake DSL
 
@@ -35,7 +38,7 @@ loops.
 
 For reproducibility, pin a tag or commit hash:
 
-```lean
+```text
 require Hesper from git
   "https://github.com/Verilean/hesper.git" @ "v0.7-gemma4"
 ```
@@ -49,7 +52,7 @@ the same Hesper.
 If you're developing both your app and Hesper, replace the git URL with
 a path:
 
-```lean
+```text
 require Hesper from "/path/to/local/hesper"
 ```
 
@@ -61,7 +64,7 @@ If your app has its own C++ FFI on top of Hesper's, you need to extend
 the link line. Hesper exposes `stdLinkArgs` and `cudaExeArgs` as `def`s
 in its `lakefile.lean`; mirror that pattern in your own:
 
-```lean
+```text
 def myExtraLinks : Array String := #[
   "-L/usr/local/lib", "-lmyhelper"
 ]
@@ -84,7 +87,7 @@ The library is split so you can keep imports minimal:
 | `Hesper.WGSL.Monad` | The `ShaderM` monad |
 | `Hesper.Compute` | High-level device + buffer + dispatch API |
 | `Hesper.Layers.*` | Pre-built NN layers |
-| `Hesper.AD` | Reverse-mode autodiff |
+| `Hesper.Core.Differentiable` | Reverse-mode autodiff core |
 | `Hesper.Models.BitNet` | The full BitNet engine |
 | `Hesper.Models.Gemma4` | The full Gemma 4 engine (CUDA only) |
 | `Hesper.CUDA.*` | Direct CUDA driver bindings (advanced) |
@@ -92,38 +95,13 @@ The library is split so you can keep imports minimal:
 Lean is good at dead-code elimination across modules, so importing
 `Hesper.Compute` doesn't drag every model into your binary.
 
-## Worked example: a custom training loop
-
-```lean
-import Hesper.Compute
-import Hesper.AD
-import Hesper.Layers.Linear
-
-structure Model where
-  fc : Linear (inDim := 32) (outDim := 32)
-
-def trainStep (m : Model) (x y : Tensor [.batch 64, .dim 32]) :
-    AD.Update Model :=
-  AD.gradientStep (lr := 1e-3) m fun m =>
-    let pred := m.fc.forward x
-    let loss := ((pred - y) * (pred - y)).mean
-    loss
-
-def main : IO Unit := do
-  let dev ← Hesper.Device.create
-  let mut model : Model := { fc := Linear.random dev 32 32 }
-  for _step in [0:1000] do
-    let (x, y) ← sampleBatch dev
-    model := trainStep model x y |>.apply
-```
-
-A complete runnable version lives in `Examples/MachineLearning/`.
+A complete runnable training loop lives in `Examples/MachineLearning/`.
 
 ## Versioning and stability
 
 Hesper is alpha (see the project README). API breakage policy:
 
-- **Stable**: `Exp`, `ShaderM` core, `Tensor`, `Differentiable`.
+- **Stable**: `Exp`, `ShaderM` core, `TensorDesc`, `Differentiable`.
 - **Stabilising**: `Circuit` DSL, `GPUBackend` typeclass.
 - **Unstable**: model-specific internals (`Hesper.Models.*` private
   modules), CUDA-specific tuning knobs.

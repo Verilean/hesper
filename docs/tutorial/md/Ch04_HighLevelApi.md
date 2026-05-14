@@ -1,115 +1,92 @@
 # Chapter 04 — High-Level API & Tensors
 
 Most users don't write shaders directly — they compose tensors and NN
-layers. This chapter shows the layer above `ShaderM`: `Tensor`, the
-standard NN modules under `Hesper.Layers.*`, and the `Hesper.Compute`
-runtime.
+layers. This chapter shows the layer above `ShaderM`: tensor
+descriptors, the matmul / RMSNorm / attention helpers under
+`Hesper.Layers.*`, and the runtime under `Hesper.Compute`.
 
 ## Tensors
 
-```lean
-import Hesper.Tensor
-
--- A shape is a list of named dimensions:
-abbrev Shape := List Dim
-
-def t : Tensor [.batch 4, .seq 16, .dim 768] := ...
-```
-
-Shapes are dependent types — operations check at elaboration time that
-inputs are compatible:
+The smallest unit of typed shape information is `TensorDesc`:
 
 ```lean
-def matmul (a : Tensor [.batch B, .row M, .col K])
-           (b : Tensor [.batch B, .row K, .col N]) :
-           Tensor [.batch B, .row M, .col N] := ...
+import Hesper.Tensor.Types
 
--- Mismatching K dimensions is a Lean error, not a runtime crash.
+open Hesper.Tensor
+
+#check @TensorDesc.matrix
+-- TensorDesc.matrix : Nat → Nat → optParam DType .f32 → TensorDesc
+
+#eval (TensorDesc.matrix 768 768).sizeBytes
+-- 2359296   (768*768*4 bytes for f32)
 ```
+
+`TensorDesc` carries shape and dtype together so the compute layer can
+allocate the right buffer size without separate book-keeping.
+
+## Configuring a matmul
+
+Hesper ships pre-fused matmul kernels for the common quantised formats
+(`Q4_K`, `Q6_K`). Each one takes a `Config` describing the (inDim,
+outDim) shape and the quantisation parameters:
+
+```text
+-- See Hesper/Layers/Linear.lean
+let cfg : Linear.Config := {
+  inDim  := 2560
+  outDim := 2560
+  -- + scale / block parameters specific to the quant type
+}
+
+-- Then build a ShaderM kernel for this shape:
+let kernel : ShaderM Unit := Linear.fusedQ4KMLinearKernel cfg
+```
+
+The kernel takes the input as a buffer of Q8_1-quantised activations
+and the weight as `block_q4_K` blocks (the GGUF layout). Higher-level
+"Tensor" objects are still under construction — for now you wire
+buffers up through `ShaderM` and the FFI directly.
 
 ## Pre-built layers
 
-`Hesper.Layers.*` provides the standard transformer building blocks:
+`Hesper.Layers.*` contains the standard transformer building blocks:
 
-| Module | Layers |
+| Module | Highlights |
 |---|---|
-| `Linear` | `Linear`, `Linear.forward`, `Linear.forwardBatch` |
-| `Attention` | `Attention.flash`, `Attention.scaledDot` |
-| `RMSNorm` | `RMSNorm`, `RMSNorm.fused` |
-| `Embedding` | `Embedding`, `embedTokens` |
-| `Activation` | `gelu`, `relu`, `silu`, `geluQuick` |
+| `Linear` | Q4_K / Q6_K dp4a and MMQ tile kernels (decode + prefill) |
+| `Attention` | Flash-attention V11 (sub-warp partition, K-parallel, split-K) |
+| `RMSNorm` | Fused RMSNorm + Q8_1 quantise (eliminates the round-trip) |
+| `Embedding` | Token embedding lookup |
+| `Activation` | `gelu`, `geluQuick`, `relu`, `silu` |
 
-Each layer is `Differentiable`, so composing them into a model gives
-you AD for free.
+Each layer's source has a short docstring at the top explaining when
+to use which kernel variant.
 
-## A small MLP
+## Composing a model
 
-```lean
-import Hesper.Compute
-import Hesper.Layers.Linear
-import Hesper.Layers.Activation
+For an end-to-end example see:
 
-structure MLP where
-  fc1 : Linear (inDim := 256) (outDim := 1024)
-  fc2 : Linear (inDim := 1024) (outDim := 256)
+- `Hesper/Models/BitNet.lean` — every BitNet b1.58 layer wired together.
+- `Hesper/Models/Gemma4.lean` — Gemma 4 E4B forward + decode loop.
+- `Examples/BitNetComplete.lean` — driver that runs BitNet inference.
+- `Examples/Gemma4CUDA.lean` — driver that runs Gemma 4 inference.
 
-def MLP.forward (m : MLP) (x : Tensor [.batch B, .dim 256]) :
-    Tensor [.batch B, .dim 256] :=
-  m.fc2.forward (relu (m.fc1.forward x))
-```
-
-Build it, allocate buffers, run forward:
-
-```lean
-def main : IO Unit := do
-  let dev ← Hesper.Device.create
-  let mlp : MLP := { fc1 := Linear.random ..., fc2 := Linear.random ... }
-  let x : Tensor [.batch 8, .dim 256] ← Tensor.randn dev ..
-  let y := mlp.forward x
-  let host ← dev.readTensor y
-  IO.println s!"y[0,:5] = {host.firstRow.take 5}"
-```
+We walk those drivers in Ch07 and Ch08.
 
 ## Operator fusion via Circuit DSL
 
-When you compose many layers, the high-level API uses a fusion DSL
-behind the scenes. For an attention block:
+When you compose many layers, the kernel-fusion layer under
+`Hesper.Circuit` rewrites the graph before emitting shaders. The
+fusion passes (pointwise, reduce-into-quantise, matmul-epilogue,
+scatter, etc.) are responsible for the ~10× dispatch-count reduction
+documented in the CHANGELOG.
 
-```lean
-import Hesper.Circuit
-
-def attentionBlock (h : Tensor [.batch B, .seq S, .dim D]) :
-    Tensor [.batch B, .seq S, .dim D] :=
-  let (q, k, v) := splitQKV (qkvProj.forward h)
-  flashAttention q k v |> projOut.forward
-```
-
-The compiler fuses the matmul, scale, online softmax, and apply into a
-single shader (flash-attention pattern), and fuses the residual / RMSNorm
-into the same dispatch where it can. See
-[`docs/circuit-dsl-tutorial.md`](../../circuit-dsl-tutorial.md) for the
-mechanics.
-
-You don't have to opt in. Writing layer composition the obvious way
-gives you fused kernels; if you need to inspect the result, dump the
-generated WGSL/PTX via `Circuit.dump`.
-
-## Optimizers
-
-```lean
-import Hesper.NN.Optim
-
-let opt := Adam.create lr := 1e-3
-let (newModel, newOpt) := Adam.step opt model grads
-```
-
-`Hesper.NN.Optim` ships `SGD`, `Adam`, and `LoRA`-aware variants. They
-all consume the `vjp` from Ch03 and update model parameters in place
-on the GPU.
+See [`docs/circuit-dsl-tutorial.md`](../../circuit-dsl-tutorial.md)
+for a walkthrough of the IR and how each pass works.
 
 ## What's next
 
-- [Chapter 05 — Switching Backends](Ch05_Backends.md): the same model
+- [Chapter 05 — Switching Backends](Ch05_Backends.md): the same kernel
   on CUDA instead of WebGPU.
-- [Chapter 07 — BitNet End-to-End](Ch07_BitNet.md): everything in this
+- [Chapter 07 — BitNet End-to-End](Ch07_BitNet.md): every piece in this
   chapter applied to a real inference engine.

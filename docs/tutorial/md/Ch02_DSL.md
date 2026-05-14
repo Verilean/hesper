@@ -19,49 +19,55 @@ the work:
 
 ```lean
 import Hesper.WGSL.DSL
+import Hesper.WGSL.CodeGen
+
+open Hesper.WGSL
+open Hesper.WGSL.Monad (ShaderM)
+open Hesper.WGSL.Monad.ShaderM
+open Hesper.WGSL.CodeGen
 
 -- f32 expressions:
-let x : Exp (.scalar .f32) := var "x"
-let y : Exp (.scalar .f32) := var "y"
-let r := sqrt (x * x + y * y)         -- OK
-
--- This is a compile error, not a runtime crash:
--- let bad : Exp (.scalar .f32) := x + (var "i" : Exp (.scalar .i32))
+def x_f32 : Exp (.scalar .f32) := var "x"
+def y_f32 : Exp (.scalar .f32) := var "y"
+def r_f32 := sqrt (x_f32 * x_f32 + y_f32 * y_f32)
 ```
 
-If your shader elaborates, its types are consistent.
+```lean
+-- This is fine and elaborates to a printable expression:
+#eval r_f32.toWGSL
+-- sqrt(((x * x) + (y * y)))
+```
+
+If your shader elaborates, its types are consistent. Try uncommenting
+the line below in your own copy — it's a Lean type error, not a
+runtime crash:
+
+```text
+-- def bad : Exp (.scalar .f32) :=
+--   x_f32 + (var "i" : Exp (.scalar .i32))
+```
 
 ## The `Exp` layer
 
-`Exp` is indexed by a `Ty` describing the shape and scalar kind. Common
-constructors:
+`Exp` is indexed by a `WGSLType` describing the shape and scalar kind.
+Common constructors:
 
 ```lean
--- Variable / parameter:
-var "name" : Exp (.scalar .f32)
+-- Variables and literals
+#check (var "name" : Exp (.scalar .f32))
+#check (Exp.litF32 1.0 : Exp (.scalar .f32))
+#check (Exp.litU32 0  : Exp (.scalar .u32))
 
--- Numeric literals:
-const 1.0 : Exp (.scalar .f32)
+-- Arithmetic (operators come from instances on Exp):
+#check fun (a b : Exp (.scalar .f32)) => a + b
+#check fun (a b : Exp (.scalar .f32)) => a * b
 
--- Arithmetic:
-(a + b)        -- Exp (.scalar .f32)
-(a * b)
-(a / b)
-
--- Math:
-sqrt a
-log a
-exp a
-relu a
+-- Math wrappers:
+#check fun (a : Exp (.scalar .f32)) => sqrt a
 ```
 
-Vector and matrix types work the same way:
-
-```lean
-let v : Exp (.vec 4 .f32) := var "v"
-let w : Exp (.vec 4 .f32) := var "w"
-let dot4 := v.dot w            -- Exp (.scalar .f32)
-```
+Vector types work the same way — `Exp (.vec3 .f32)` is a 3-vector of
+f32, etc.
 
 ## The `ShaderM` monad
 
@@ -73,79 +79,52 @@ A full kernel is a `ShaderM Unit`. Inside it you can:
 - emit reads and writes that lower to actual ld/st instructions.
 
 ```lean
-import Hesper.WGSL.Monad
-
-def addOneKernel (n : Nat) : ShaderM Unit := do
-  let input  ← declareReadOnlyBuffer (.array .f32 n)
-  let output ← declareOutputBuffer    (.array .f32 n)
-  let gid    ← workgroupX
-  if_ (gid <ᵉ .nat n) do
-    let x := readBuffer input gid
-    writeBuffer output gid (x + const 1.0)
+def addOneKernel : ShaderM Unit := do
+  let _input  ← declareInputBuffer  "input"  (.array (.scalar .f32) 1024)
+  let _output ← declareOutputBuffer "output" (.array (.scalar .f32) 1024)
+  let gid ← globalId
+  let idx := Exp.vecZ gid                     -- thread x-coordinate
+  let v ← readBuffer (ty := .scalar .f32) (n := 1024) "input" idx
+  writeBuffer (ty := .scalar .f32) "output" idx (v + Exp.litF32 1.0)
 ```
 
-`workgroupX` is the global-thread-x index. `<ᵉ` is the lifted `<`
-operator on `Exp` (Lean's `<` operates on values, not shader
-expressions, hence the suffix).
+`globalId : ShaderM (Exp (.vec3 .u32))` gives the global thread id;
+`Exp.vecZ` projects the x-component. `if_` and `loop` follow the same
+pattern (see `Hesper/WGSL/Monad.lean`).
 
 ## Compiling to WGSL
 
 ```lean
-import Hesper.WGSL.Execute
-
-let wgsl : String := Hesper.WGSL.toString (addOneKernel 1024)
-IO.println wgsl
+def addOneWGSL : IO Unit := do
+  -- Generate the full WGSL module string and print it
+  let src := Hesper.WGSL.CodeGen.generateWGSLSimple addOneKernel
+  IO.println src
 ```
 
-The generated WGSL is a faithful translation — every Lean construct
-maps to a deterministic WGSL fragment. There's no hidden optimizer in
-the way; what you write is what runs.
+`toWGSL` is the deterministic printer — what you write is what runs.
+There's no hidden optimizer in the way.
 
 ## Compiling to PTX
 
-The same `ShaderM` value goes through a different backend:
-
-```lean
-import Hesper.CUDA.CodeGen
-
-let ptx : String := Hesper.CUDA.toPTX (addOneKernel 1024)
-IO.println ptx
-```
-
-PTX is NVIDIA's intermediate representation; the driver JITs it into
-SASS at load time. Ch05 covers backend selection in depth.
+The same `ShaderM` value goes through a different backend for CUDA.
+See `Hesper/CUDA/CodeGen.lean` for the PTX printer; the lowering for
+each `Exp` constructor lives next to it. Ch05 covers backend selection
+in depth.
 
 ## Common patterns
 
-### Reduction along the last axis
+The pre-built examples in `Examples/DSL/` show idiomatic kernels:
 
-```lean
-def sumLastAxis (n : Nat) : ShaderM Unit := do
-  let input  ← declareReadOnlyBuffer (.array .f32 n)
-  let output ← declareOutputBuffer    (.scalar .f32)
-  let mut acc ← varNamed "acc" (const 0.0)
-  loop (n.toNat) fun i => do
-    acc := acc + readBuffer input (.nat i)
-  writeBuffer output (.nat 0) acc
-```
+- **`Examples/DSL/DSLBasics.lean`** — arithmetic and shader expression
+  printing.
+- **`Examples/DSL/CodeGenDemo.lean`** — simpleKernel / reductionKernel /
+  complexCompute, end-to-end ShaderM + WGSL.
+- **`Examples/DSL/AtomicCounter.lean`** — atomic ops with `if_` and
+  workgroup barriers.
 
-### Matmul one-row-per-thread
-
-See `Examples/Compute/MatmulSimple.lean` for a runnable version. The
-sketch:
-
-```lean
-def matmulRow (m k n : Nat) : ShaderM Unit := do
-  let a ← declareReadOnlyBuffer (.array .f32 (m * k))
-  let b ← declareReadOnlyBuffer (.array .f32 (k * n))
-  let c ← declareOutputBuffer    (.array .f32 (m * n))
-  let row ← workgroupX
-  let col ← workgroupY
-  let mut acc ← varNamed "acc" (const 0.0)
-  loop k fun i => do
-    acc := acc + readBuffer a (row * .nat k + .nat i)
-              * readBuffer b (.nat i * .nat n + col)
-  writeBuffer c (row * .nat n + col) acc
+```bash
+lake exe codegen-demo        # prints the three kernels above as WGSL
+lake exe dsl-basics          # prints Exp expressions
 ```
 
 ## Where to look next
