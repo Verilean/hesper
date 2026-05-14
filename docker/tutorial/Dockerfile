@@ -155,48 +155,20 @@ COPY Tests       ./Tests
 # Tutorial sources (Markdown master + build script):
 COPY docs/tutorial ./docs/tutorial
 
-# Build the library so each module's `.c.o.export` exists for the
-# bundling step.  Native deps (Dawn / Highway / CUDA bridge) build
-# the first time, then are cached.
+# Build the library + an exe so each module's `.c.o.export` exists for
+# the bundling step.  `lean_lib` alone does NOT trigger `c.o.export`
+# generation; only the link step of a `lean_exe` does.  `stub-extract`
+# is the lightest exe in this repo and imports the bulk of Hesper.*
+# transitively, so building it materialises ~133 `.c.o.export` files.
+# Build the Hesper library so `Hesper.olean` exists on LEAN_PATH.
+# Native deps (Dawn / Highway / CUDA bridge) build the first time
+# then are cached.
+#
+# Notebooks evaluate DSL/`#eval` examples that return pure strings;
+# they don't call into the WebGPU FFI directly.  So we don't need to
+# re-link the xeus-lean kernel against Hesper — the vanilla xlean
+# from Stage 3 picks up Hesper via LEAN_PATH (patched in below).
 RUN lake build Hesper
-
-# ─── Stage 5 ── Re-link xlean against Hesper ──────────────────────
-# Bundle every Hesper module's compiled `.c.o.export` into a single
-# static archive `libhesper_olean.a`.  Exclude `Main.c.o.export`
-# files: each carries a `lean_main` symbol that would clash with
-# xlean's own `lean_main`.
-RUN cd /workspace/hesper/.lake/build/ir && \
-    find . -name "*.c.o.export" ! -name "Main.c.o.export" -print0 \
-      | xargs -0 ar rcs /workspace/hesper/libhesper_olean.a && \
-    echo "Bundled $(ar t /workspace/hesper/libhesper_olean.a | wc -l) objects into libhesper_olean.a"
-
-# Re-link xlean with `--whole-archive libhesper_olean.a + the same
-# native link line every Hesper exe uses (Dawn, Highway, CUDA bridge
-# or stub, X11/Vulkan).  `XEUS_LEAN_EXTRA_LIBS` is xeus-lean's generic
-# extension hook — anything in this whitespace-separated env var is
-# appended to xlean's link line.
-RUN cd /opt/xeus-lean && rm -f .lake/build/bin/xlean && \
-    XEUS_LEAN_EXTRA_LIBS=" \
-      -Wl,--whole-archive \
-      /workspace/hesper/libhesper_olean.a \
-      -Wl,--no-whole-archive \
-      -Wl,--whole-archive \
-      /workspace/hesper/.lake/build/native/libhesper_native.a \
-      /workspace/hesper/.lake/build/dawn-build/src/dawn/libdawn_proc.a \
-      /workspace/hesper/.lake/build/dawn-build/src/dawn/glfw/libdawn_glfw.a \
-      -Wl,--no-whole-archive \
-      -L/workspace/hesper/.lake/build/dawn-build/src/dawn -ldawn_proc \
-      -L/workspace/hesper/.lake/build/dawn-install/lib64 -lwebgpu_dawn \
-      -L/workspace/hesper/.lake/build/dawn-build/third_party/glfw3/src/src \
-      -lglfw3 \
-      /workspace/hesper/.lake/build/simd/libhesper_simd.a \
-      /workspace/hesper/.lake/build/simd/_deps/highway-build/libhwy.a \
-      /workspace/hesper/.lake/build/native/libhesper_cuda.a \
-      -lstdc++ -lvulkan -lX11 -lX11-xcb -lxcb -lwayland-client -ldl -lpthread \
-    " \
-      lake build xlean
-
-RUN install -m 0755 /opt/xeus-lean/.lake/build/bin/xlean /usr/local/bin/xlean
 
 # Convert .md → .ipynb for every chapter.
 RUN bash docs/tutorial/build-from-md.sh
