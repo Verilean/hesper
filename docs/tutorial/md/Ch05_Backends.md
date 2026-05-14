@@ -6,25 +6,32 @@ Hesper compiles the same `ShaderM` source to two backends:
   Windows).
 - **CUDA PTX** via the libcuda driver API.
 
-You pick the backend at compile time. Most code is backend-agnostic
-through the `GPUBackend` typeclass.
+You pick the backend at compile time. Most code stays
+backend-agnostic through the `GPUBackend` typeclass.
 
 ## The `GPUBackend` typeclass
 
 ```lean
-class GPUBackend (m : Type → Type) where
-  Device   : Type
-  Buffer   : Type
-  Kernel   : Type
-  allocBuffer  : Device → Nat → m Buffer
-  writeBuffer  : Device → Buffer → ByteArray → m Unit
-  readBuffer   : Device → Buffer → m ByteArray
-  compileKernel : Device → ShaderM Unit → m Kernel
-  dispatchKernel : Device → Kernel → Args → m Unit
+import Hesper.Backend
+
+open Hesper
+
+-- The typeclass is parameterised by a context type β (the "device").
+-- Every backend supplies a Buf type and the operations we need:
+#check @GPUBackend
+-- @GPUBackend : (β : Type) → Type 1
+
+-- Some of the methods that backends must implement:
+#check @GPUBackend.allocBuffer
+-- allocBuffer : ∀ {β} [GPUBackend β], β → USize → IO _
+#check @GPUBackend.executeWithConfig
+#check @GPUBackend.readBuffer
 ```
 
-`Hesper.Compute` parameterises every high-level API over `GPUBackend`,
-so writing model code rarely mentions the backend at all.
+The full interface is in `Hesper/Backend.lean`. Two concrete instances
+ship today: `Hesper.Backend.WebGPU` and `Hesper.Backend.CUDA`. They
+share the same `ShaderM` input — the kernels you wrote in Ch02 work
+unchanged on both.
 
 ## Choosing at build time with `-Kgpu`
 
@@ -43,33 +50,14 @@ The flag controls *only* whether `-lcuda` (the NVIDIA driver shim)
 links into the final executable. Dawn / WebGPU is always built — it's
 how every shader-target backend works on macOS, Linux, and Windows.
 
-## Backend selection at runtime
-
-Within a CUDA build you can still target either backend per device:
-
-```lean
-import Hesper.WebGPU.Device
-import Hesper.CUDA.Device
-
-def main : IO Unit := do
-  -- CUDA path (only available in a -Kgpu=cuda exe):
-  let cudaDev ← Hesper.CUDA.Device.create
-  let cudaKernel ← cudaDev.compileKernel myKernel
-
-  -- WebGPU path is always available:
-  let wgpuDev ← Hesper.WebGPU.Device.create
-  let wgpuKernel ← wgpuDev.compileKernel myKernel
-  ...
-```
-
 ## What changes between backends
 
 | Aspect | WebGPU | CUDA PTX |
 |---|---|---|
 | Surface language | WGSL | PTX 8.7 (NVIDIA) |
 | Tensor cores | via `subgroupMatrix*` → WMMA (limited) | `wmma.mma.sync` directly |
-| Async memcpy | `writeBuffer`/`readBuffer` | `cuMemcpyHtoD_v2` + streams |
-| Capture / graphs | command-buffer batching | CUDA Graphs |
+| Async memcpy | command-buffer batching | `cuMemcpyHtoD_v2` + streams |
+| Capture / graphs | n/a in Dawn | CUDA Graphs |
 | Driver | Dawn / Metal / Vulkan / D3D12 | `libcuda.so.1` |
 
 For most layers the difference is invisible; for the perf-critical

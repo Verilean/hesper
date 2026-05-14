@@ -1,0 +1,98 @@
+name: Tutorial elaboration check
+
+on:
+  push:
+    branches: [ master, main ]
+    paths:
+      - 'docs/tutorial/md/**'
+      - 'docs/tutorial/build-from-md.sh'
+      - '.github/workflows/tutorial-check.yml'
+  pull_request:
+    branches: [ master, main ]
+    paths:
+      - 'docs/tutorial/md/**'
+      - 'docs/tutorial/build-from-md.sh'
+      - '.github/workflows/tutorial-check.yml'
+  workflow_dispatch:
+
+jobs:
+  elaborate:
+    name: Convert .md → .lean and elaborate every chapter
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install apt deps for Hesper native build
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake ninja-build pkg-config \
+            libx11-dev libx11-xcb-dev libxrandr-dev libxinerama-dev \
+            libxcursor-dev libxi-dev libxext-dev libxcb1-dev \
+            libxkbcommon-dev libwayland-dev libgl1-mesa-dev \
+            clang libc++-dev libc++abi-dev nlohmann-json3-dev \
+            uuid-dev libssl-dev
+
+      - name: Setup Lean
+        uses: leanprover/lean-action@v1
+        with:
+          auto-config: false
+
+      - name: Cache Lake packages
+        uses: actions/cache@v4
+        with:
+          path: .lake/packages
+          key: lake-pkgs-${{ hashFiles('lean-toolchain', 'lake-manifest.json') }}
+          restore-keys: lake-pkgs-
+
+      - name: Cache xeus-lean build
+        id: cache-xeus-lean
+        uses: actions/cache@v4
+        with:
+          path: /opt/xeus-lean
+          key: xeus-lean-${{ hashFiles('docs/tutorial/build-from-md.sh') }}
+
+      - name: Build xeus-lean (xlean-convert only)
+        if: steps.cache-xeus-lean.outputs.cache-hit != 'true'
+        run: |
+          sudo mkdir -p /opt
+          sudo chown "$USER" /opt
+          cd /opt
+          git clone --depth 1 https://github.com/Verilean/xeus-lean.git
+          cd xeus-lean
+          # Only xlean-convert is needed for the .md → .lean conversion;
+          # the full xeus kernel is not required by this CI job.
+          lake build xlean-convert
+
+      - name: Install xlean-convert on PATH
+        run: |
+          sudo install -m 0755 /opt/xeus-lean/.lake/build/bin/xlean-convert \
+            /usr/local/bin/xlean-convert
+          xlean-convert --help
+
+      - name: Build Hesper (so chapters can `import Hesper.*`)
+        run: lake build Hesper
+
+      - name: Convert every chapter .md → .lean
+        run: bash docs/tutorial/build-from-md.sh
+
+      - name: Elaborate every generated chapter
+        run: |
+          set -e
+          failed=0
+          for f in docs/tutorial/Notebooks/Gen/Ch*.lean; do
+            base=$(basename "$f" .lean)
+            echo "=== $base ==="
+            if ! lake env lean "$f"; then
+              echo "::error file=$f::tutorial chapter failed to elaborate"
+              failed=$((failed + 1))
+            fi
+          done
+          if [ "$failed" -ne 0 ]; then
+            echo "$failed chapter(s) failed to elaborate" >&2
+            exit 1
+          fi

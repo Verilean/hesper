@@ -1,69 +1,77 @@
 # Chapter 03 — Automatic Differentiation & Verified Ops
 
 Hesper ships a reverse-mode autodiff layer that's *verified*: every
-forward primitive comes with a proven-correct backward primitive, and
-fused kernels are checked against the unfused reference at the type
-level. You get gradients without writing them by hand, and without
-trusting an opaque framework.
+forward primitive comes with a backward primitive, and the equivalence
+between fused and unfused kernels is checked at the type level. You
+get gradients without writing them by hand.
 
 For the full design notes see [`docs/VERIFIED_AD.md`](../../VERIFIED_AD.md).
 This chapter is the hands-on tour.
 
 ## The `Differentiable` typeclass
 
-Every primitive that participates in AD implements one interface:
-
 ```lean
-class Differentiable (op : OpKind) where
-  forward  : Tensor → Tensor
-  backward : Tensor → Tensor → Tensor    -- (input, grad-out) → grad-in
-  -- and a proof that backward is correct w.r.t. forward
+import Hesper.Core.Differentiable
+
+open Hesper.Core
+
+-- The shape of the interface — every differentiable op has a forward
+-- function and a vector-Jacobian-product backward function.
+#check @Differentiable.forward
+-- Differentiable.forward : ∀ {Op I O} [self : Differentiable Op I O], Op → I → O
+
+#check @Differentiable.backward
+-- Differentiable.backward : ∀ {Op I O} [self : Differentiable Op I O], Op → I → O → I
 ```
 
-Built-in instances cover the usual list: `add`, `mul`, `relu`, `gelu`,
-`softmax`, `rmsNorm`, `matmul`, `embedding`, `flashAttention`. Each
-instance also registers a *fused-kernel parity* spec, which kernel-fusion
-passes must respect.
+The three type parameters are:
 
-## A tiny example
+- `Op` — a marker / configuration type for the operation (`AddOp`,
+  `MatMulOp`, `ReLUOp`, …).
+- `I` — the input shape: `Float` for scalars, `TensorData` for tensors,
+  product types for multi-input ops.
+- `O` — the output shape.
+
+`backward op x dy` is the vector-Jacobian product: given a cotangent
+`dy` at the output, produce a cotangent `dx` at the input.
+
+## A trivial scalar instance
 
 ```lean
-import Hesper.AD
+-- A marker for "multiply by a constant scalar":
+structure ScaleByTwo where
+  deriving Repr
 
-def f (x : Tensor [.batch 4, .dim 8]) : Tensor [.batch 4, .dim 8] :=
-  relu (x * x + x)
-
--- Forward and backward in one call:
-def main : IO Unit := do
-  let x : Tensor [.batch 4, .dim 8] ← Tensor.randn ...
-  let (y, vjp) := AD.forwardWithBackward f x
-  IO.println s!"y = {y}"
-
-  -- Pull back a unit cotangent:
-  let dy : Tensor [.batch 4, .dim 8] := Tensor.ones _
-  let dx := vjp dy
-  IO.println s!"∂y/∂x · 1 = {dx}"
+instance : Differentiable ScaleByTwo Float Float where
+  forward  _ x        := 2.0 * x
+  backward _ _ dy     := 2.0 * dy        -- d/dx (2x) · dy = 2·dy
 ```
 
-`forwardWithBackward` returns the forward result and a `vjp` closure
-that applies the transpose of the linearization at `x`. This is the
-standard reverse-mode pattern; the difference is that every step is
-backed by a Lean proof.
+```lean
+def s : ScaleByTwo := {}
+
+#eval (Differentiable.forward  s (3.0 : Float) : Float)        -- 6.0
+#eval (Differentiable.backward s (3.0 : Float) (1.0 : Float))  -- 2.0
+```
+
+That's the whole interface. Composing op instances (Chain rule, etc.)
+lives in `Hesper.AD.Chain`; ready-made instances for the tensor
+primitives live in `Hesper.AD.BackwardOps`.
 
 ## Where the verification lives
 
 Two kinds of proofs travel with the AD code:
 
-1. **Per-primitive correctness.** For each `Differentiable` instance,
-   a theorem in `Hesper/AD/Primitives/<op>.lean` says
-   `backward op x (grad-of forward op at x) = grad-of identity`.
+1. **Per-primitive correctness.** `Hesper/AD/Verified.lean` carries the
+   theorem that, for each shipped op, `backward` is the transpose of
+   the linearization of `forward`.
 2. **Fusion equivalence.** When a kernel-fusion pass merges two ops
-   into one shader, it must discharge a proof that the fused kernel
+   into one shader, it discharges a proof that the fused kernel
    computes the same forward and the same backward as the unfused
-   chain. The proofs live in `Hesper/Tensor/VerifiedOpFusion.lean`.
+   chain (see `Hesper/Tensor/VerifiedOpFusion.lean`).
 
-When you add a new primitive, the elaborator forces you to supply both
-proofs — there's no "trust me" escape hatch.
+If you add a new primitive, the elaborator forces you to supply the
+proof — there's no "trust me" escape hatch.
 
 ## Running the AD demos
 
@@ -73,8 +81,8 @@ lake exe verified-op-demo      # show a fused op matching its unfused spec
 lake exe unified-ad-demo       # one big example using all features
 ```
 
-`Examples/MachineLearning/` contains a small Adam optimizer and a
-LoRA-style fine-tuning loop that all build on this layer.
+`Examples/MachineLearning/` contains a small Adam optimizer driver and
+a LoRA-style fine-tuning loop that all build on this layer.
 
 ## What you can rely on
 
@@ -86,10 +94,10 @@ LoRA-style fine-tuning loop that all build on this layer.
 ## What this *doesn't* give you
 
 - It doesn't prove numerical stability — `1/x` near zero still
-  explodes. Use `safeDiv` / `safeLog` where it matters.
+  explodes. Use safe variants where it matters.
 - It doesn't replace tests — proofs are about mathematics, not
   hardware. Bit-parity tests against a CPU reference still live in
-  `Tests/AD/`.
+  `Tests/`.
 
 ## What's next
 

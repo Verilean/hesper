@@ -18,7 +18,7 @@ lake exe bitnet-complete --stats
 
 Expected output:
 
-```
+```text
 > Hello, world!
 Hello, world! I'm a 20-year-old college student...
 
@@ -28,7 +28,7 @@ Performance: 125.6 TPS (8.0 ms/token)
 
 ## What's interesting about BitNet
 
-BitNet b1.58 quantizes every weight to `{-1, 0, +1}` (1.58 bits per
+BitNet b1.58 quantises every weight to `{-1, 0, +1}` (1.58 bits per
 weight). The forward pass becomes additions only — no fp multiplies in
 the matmul path. The challenge for a GPU implementation is squeezing
 useful throughput out of an op that's normally memory-bound by the
@@ -36,46 +36,47 @@ weight reads.
 
 Hesper's recipe:
 
-| Optimization | What it does | Source |
+| Optimisation | What it does | Source |
 |---|---|---|
-| **i2_s ternary kernel** | Pack 4 weights into 8 bits; matmul = popcount-style add | `Hesper/Models/BitNet/Linear.lean` |
-| **Flash attention** | Fused score + online softmax + apply in one kernel | `Hesper/Layers/Attention.lean` |
-| **Fused gate+up+ReLU²×mul** | One FFN dispatch instead of four | `Hesper/Layers/FFN.lean` |
+| **i2_s ternary kernel** | Pack 4 weights into 8 bits; matmul = popcount-style add | `Hesper/Models/BitNet.lean` |
+| **Flash attention** | Fused score + online softmax + apply in one kernel | `Hesper/Layers/FlashAttention.lean` |
+| **Fused gate+up+ReLU²×mul** | One FFN dispatch instead of four | `Hesper/Layers/*` |
 | **Fused KV cache write** | Score + scatter into one kernel | `Hesper/Layers/Attention.lean` |
-| **F16 LM-head matmul** | Shared-memory tile across 128 K vocab | `Hesper/Models/BitNet/LMHead.lean` |
+| **F16 LM-head matmul** | Shared-memory tile across the 128 K vocab | `Hesper/Models/BitNet.lean` |
 | **PreparedDispatch capture** | 99 % pipeline-cache hit rate | `Hesper/Compute.lean` |
-| **Single GPU submit/token** | Command-buffer batching | `Hesper/Models/BitNet/Decoder.lean` |
-| **KV cache + GQA** | 20 heads / 5 KV heads | `Hesper/Models/BitNet/Decoder.lean` |
+| **Single GPU submit/token** | Command-buffer batching | `Examples/BitNetComplete.lean` |
+| **KV cache + GQA** | 20 heads / 5 KV heads | `Hesper/Models/BitNet.lean` |
 
-## Running the inference loop
+## Sketch of the inference loop
 
-The top-level entry point looks like this (abridged):
+The driver in `Examples/BitNetComplete.lean` wires this up
+end-to-end. Schematically:
 
-```lean
-import Hesper.Models.BitNet
-import Hesper.Compute
+```text
+let dev   ← Hesper.Device.create
+let model ← BitNet.load dev "data/bitnet-1.58-2b.bin"
+let tok   ← BitNet.Tokenizer.load "data/bitnet-tokenizer.json"
 
-def main : IO Unit := do
-  let dev   ← Hesper.Device.create
-  let model ← BitNet.load dev "data/bitnet-1.58-2b.bin"
-  let tok   ← BitNet.Tokenizer.load "data/bitnet-tokenizer.json"
+let prompt := "Hello, world!"
+let mut state := BitNet.State.init model
+let mut tokens := tok.encode prompt
 
-  let prompt := "Hello, world!"
-  let mut state := BitNet.State.init model
-  let mut tokens := tok.encode prompt
+for _ in [0:64] do
+  let logits ← BitNet.forward model state tokens.back!
+  let next   := BitNet.argmax logits
+  tokens := tokens.push next
+  state := BitNet.advance state
+  IO.print (tok.decode #[next])
 
-  for _ in [0:64] do
-    let logits ← BitNet.forward model state tokens.back!
-    let next   := BitNet.argmax logits
-    tokens := tokens.push next
-    state := BitNet.advance state
-    IO.print (tok.decode #[next])
-
-  IO.println ""
+IO.println ""
 ```
 
+(The exact function names live in `Hesper/Models/BitNet.lean` and the
+`Examples/BitNetComplete.lean` driver — they're plumbing-heavy and not
+worth reproducing verbatim in a tutorial.)
+
 `BitNet.forward` is where every fused kernel actually runs. Internally
-it does:
+it does, per token:
 
 1. Embed the token.
 2. For each of the 30 transformer layers:
@@ -105,13 +106,15 @@ load time.
 
 Start here:
 
-- `Hesper/Models/BitNet/Decoder.lean` — the top-level transformer loop.
-- `Hesper/Models/BitNet/Linear.lean` — the i2_s matmul kernel.
-- `Hesper/Layers/Attention.lean` — flash attention shared with Gemma 4.
-- `Hesper/Models/BitNet/LMHead.lean` — the LM head matmul.
-- `Examples/MachineLearning/BitNetTrain.lean` — the LoRA training driver.
+- `Hesper/Models/BitNet.lean` — the top-level transformer and
+  per-layer kernels.
+- `Hesper/Layers/FlashAttention.lean` — flash attention shared with
+  Gemma 4.
+- `Examples/BitNetComplete.lean` — the inference driver wired up to
+  `bitnet-complete`.
+- `Examples/MachineLearning/` — LoRA training drivers.
 
 ## What's next
 
 - [Chapter 08 — Gemma 4 End-to-End](Ch08_Gemma4.md): a larger transformer
-  on the CUDA backend with quantized weights (Q4_K_M / Q6_K).
+  on the CUDA backend with quantised weights (Q4_K_M / Q6_K).

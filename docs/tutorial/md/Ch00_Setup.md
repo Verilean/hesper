@@ -35,18 +35,25 @@ load any later chapter as a notebook and run its code cells.
 
 ## A first sanity check
 
-The smallest thing we can run is a Hesper smoke test that prints the
-Lean toolchain version and verifies the WGSL DSL elaborates:
+The smallest thing we can run is a Hesper smoke test that elaborates a
+WGSL expression and pretty-prints the generated shader code:
 
 ```lean
 import Hesper.WGSL.DSL
 
+open Hesper.WGSL
+
 -- Build a tiny shader expression — this fails at elaboration time if
--- the DSL doesn't load, so reaching the end means everything is fine.
-#check fun (x : Exp (.scalar .f32)) => sqrt (x * x + var "one")
+-- the DSL doesn't load.
+def smoke : Exp (.scalar .f32) :=
+  let x : Exp (.scalar .f32) := var "x"
+  sqrt (x * x + x)
+
+-- And inspect the generated WGSL source:
+#eval smoke.toWGSL
 ```
 
-In a notebook this prints the inferred type. From the command line:
+In a notebook this prints `sqrt(((x * x) + x))`. From the command line:
 
 ```bash
 lake env lean --version
