@@ -8,6 +8,79 @@ package «Hesper» where
 require LSpec from git
   "https://github.com/argumentcomputer/LSpec.git" @ "main"
 
+-- ============================================================================
+-- NATIVE LINKER FLAGS
+-- ============================================================================
+-- Defined up here (before any `lean_lib` / `lean_exe`) so the tutorial
+-- Docker image (`docker/tutorial/Dockerfile`) can reuse the same Dawn /
+-- Highway / CUDA bridge link line when re-linking the xeus-lean kernel
+-- against Hesper.  `stdLinkArgs` and `cudaExeArgs` are referenced by
+-- every `lean_exe` further down the file.
+
+-- Standard linker configuration for all FFI executables (based on glfw-triangle + Google Highway)
+-- Platform-specific: macOS uses frameworks + force_load; Linux uses whole-archive + Vulkan/X11
+-- Note: libhesper_cuda.a is unconditionally linked because Hesper.lean's CUDA FFI
+-- is exported into nearly every Lean module's .c.o.export, making the symbols
+-- live for any exe that imports anything from Hesper.* on Linux.
+def stdLinkArgs : Array String :=
+  -- Dawn installs to lib/ on macOS, lib64/ on Linux x86_64
+  let dawnLibDir := if System.Platform.isOSX then "lib" else "lib64"
+  let commonArgs := #[
+    "-L./.lake/build/dawn-build/src/dawn", "-ldawn_proc",
+    "-L./.lake/build/dawn-install/" ++ dawnLibDir, "-lwebgpu_dawn",
+    -- Upstream Dawn moved glfw from third_party/glfw/src to third_party/glfw3/src/src
+    -- Pass both -L flags so either layout resolves; the first match wins.
+    "-L./.lake/build/dawn-build/third_party/glfw3/src/src",
+    "-L./.lake/build/dawn-build/third_party/glfw/src",
+    "-lglfw3",
+    "./.lake/build/simd/libhesper_simd.a",
+    "./.lake/build/simd/_deps/highway-build/libhwy.a"
+  ]
+  let cudaArgs :=
+    if System.Platform.isOSX then #["./.lake/build/native/libhesper_cuda.a"]
+    else #["./.lake/build/native/libhesper_cuda.a", "-lcuda"]
+  if System.Platform.isOSX then
+    #["-Wl,-force_load,./.lake/build/native/libhesper_native.a",
+      "-Wl,-force_load,./.lake/build/dawn-build/src/dawn/libdawn_proc.a",
+      "-Wl,-force_load,./.lake/build/dawn-build/src/dawn/glfw/libdawn_glfw.a"]
+    ++ commonArgs ++ cudaArgs ++
+    #["-lc++",
+      "-L/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/lib",
+      "-F/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/System/Library/Frameworks",
+      "-Wl,-syslibroot,/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk",
+      "-lobjc",
+      "-framework", "CoreFoundation",
+      "-framework", "Metal",
+      "-framework", "Foundation",
+      "-framework", "QuartzCore",
+      "-framework", "IOKit",
+      "-framework", "IOSurface",
+      "-framework", "Cocoa"]
+  else
+    #["-Wl,--whole-archive",
+      "./.lake/build/native/libhesper_native.a",
+      "./.lake/build/dawn-build/src/dawn/libdawn_proc.a",
+      "./.lake/build/dawn-build/src/dawn/glfw/libdawn_glfw.a",
+      "-Wl,--no-whole-archive"]
+    ++ commonArgs ++ cudaArgs ++
+    #["-lstdc++",
+      "-lvulkan",
+      "-lX11",
+      "-lX11-xcb",
+      "-lxcb",
+      "-lwayland-client",
+      "-ldl",
+      "-lpthread"]
+
+/-- Per-exe CUDA link args. Empty on macOS so exes that conditionally use the
+    CUDA backend still link there (CUDA codegen falls back to no-op at runtime).
+    Note: stdLinkArgs already includes the CUDA library on Linux for the FFI
+    surface, but per-exe definitions historically appended these unconditionally.
+    We centralise here so adding macOS support is a single-line change. -/
+def cudaExeArgs : Array String :=
+  if System.Platform.isOSX then #[]
+  else #["./.lake/build/native/libhesper_cuda.a", "-lcuda"]
+
 lean_lib «Hesper» where
   -- add library configuration options here
 
@@ -396,73 +469,11 @@ script buildNative do
   IO.println "[Hesper] All native dependencies built."
   return 0
 
--- Standard linker configuration for all FFI executables (based on glfw-triangle + Google Highway)
--- Platform-specific: macOS uses frameworks + force_load; Linux uses whole-archive + Vulkan/X11
--- Note: libhesper_cuda.a is unconditionally linked because Hesper.lean's CUDA FFI
--- is exported into nearly every Lean module's .c.o.export, making the symbols
--- live for any exe that imports anything from Hesper.* on Linux.
-def stdLinkArgs : Array String :=
-  -- Dawn installs to lib/ on macOS, lib64/ on Linux x86_64
-  let dawnLibDir := if System.Platform.isOSX then "lib" else "lib64"
-  let commonArgs := #[
-    "-L./.lake/build/dawn-build/src/dawn", "-ldawn_proc",
-    "-L./.lake/build/dawn-install/" ++ dawnLibDir, "-lwebgpu_dawn",
-    -- Upstream Dawn moved glfw from third_party/glfw/src to third_party/glfw3/src/src
-    -- Pass both -L flags so either layout resolves; the first match wins.
-    "-L./.lake/build/dawn-build/third_party/glfw3/src/src",
-    "-L./.lake/build/dawn-build/third_party/glfw/src",
-    "-lglfw3",
-    "./.lake/build/simd/libhesper_simd.a",
-    "./.lake/build/simd/_deps/highway-build/libhwy.a"
-  ]
-  let cudaArgs :=
-    if System.Platform.isOSX then #["./.lake/build/native/libhesper_cuda.a"]
-    else #["./.lake/build/native/libhesper_cuda.a", "-lcuda"]
-  if System.Platform.isOSX then
-    #["-Wl,-force_load,./.lake/build/native/libhesper_native.a",
-      "-Wl,-force_load,./.lake/build/dawn-build/src/dawn/libdawn_proc.a",
-      "-Wl,-force_load,./.lake/build/dawn-build/src/dawn/glfw/libdawn_glfw.a"]
-    ++ commonArgs ++ cudaArgs ++
-    #["-lc++",
-      "-L/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/lib",
-      "-F/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/System/Library/Frameworks",
-      "-Wl,-syslibroot,/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk",
-      "-lobjc",
-      "-framework", "CoreFoundation",
-      "-framework", "Metal",
-      "-framework", "Foundation",
-      "-framework", "QuartzCore",
-      "-framework", "IOKit",
-      "-framework", "IOSurface",
-      "-framework", "Cocoa"]
-  else
-    #["-Wl,--whole-archive",
-      "./.lake/build/native/libhesper_native.a",
-      "./.lake/build/dawn-build/src/dawn/libdawn_proc.a",
-      "./.lake/build/dawn-build/src/dawn/glfw/libdawn_glfw.a",
-      "-Wl,--no-whole-archive"]
-    ++ commonArgs ++ cudaArgs ++
-    #["-lstdc++",
-      "-lvulkan",
-      "-lX11",
-      "-lX11-xcb",
-      "-lxcb",
-      "-lwayland-client",
-      "-ldl",
-      "-lpthread"]
-
-/-- Per-exe CUDA link args. Empty on macOS so exes that conditionally use the
-    CUDA backend still link there (CUDA codegen falls back to no-op at runtime).
-    Note: stdLinkArgs already includes the CUDA library on Linux for the FFI
-    surface, but per-exe definitions historically appended these unconditionally.
-    We centralise here so adding macOS support is a single-line change. -/
-def cudaExeArgs : Array String :=
-  if System.Platform.isOSX then #[]
-  else #["./.lake/build/native/libhesper_cuda.a", "-lcuda"]
-
 -- ============================================================================
 -- EXAMPLES - Organized by Category
 -- ============================================================================
+-- (Linker flag defs `stdLinkArgs` and `cudaExeArgs` are defined near the
+--  top of the file so `lean_lib Hesper` can reference them.)
 
 -- ----------------------------------------------------------------------------
 -- DSL Examples (Pure Lean - Type-safe WGSL DSL demonstration)
