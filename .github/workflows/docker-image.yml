@@ -1,0 +1,169 @@
+name: Build Hesper Tutorial Docker Image
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Image tag to publish (default: latest)'
+        required: false
+        default: 'latest'
+        type: string
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: hesper-tutorial
+  DOCKERFILE: docker/tutorial/Dockerfile
+
+jobs:
+  # Build per-architecture images and push by digest.
+  # Using native runners (amd64 + arm64) avoids QEMU emulation, which
+  # would otherwise dominate build time for the Lean / xeus-lean stage.
+  build:
+    name: Build (${{ matrix.platform }})
+    runs-on: ${{ matrix.runs-on }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            runs-on: ubuntu-latest
+            arch_label: amd64
+          - platform: linux/arm64
+            runs-on: ubuntu-24.04-arm
+            arch_label: arm64
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Normalize repository owner (lowercase for GHCR)
+        id: owner
+        run: |
+          owner_lc="${GITHUB_REPOSITORY_OWNER,,}"
+          echo "owner_lc=${owner_lc}" >> "$GITHUB_OUTPUT"
+
+      - name: Determine image tag
+        id: tag
+        run: |
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            tag="${GITHUB_REF##refs/tags/}"
+          else
+            tag="${{ inputs.tag }}"
+          fi
+          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+          echo "Using tag: ${tag}"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build & push by digest
+        id: build
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ${{ env.DOCKERFILE }}
+          platforms: ${{ matrix.platform }}
+          outputs: |
+            type=image,name=${{ env.REGISTRY }}/${{ steps.owner.outputs.owner_lc }}/${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=true
+          cache-from: type=gha,scope=tutorial-${{ matrix.arch_label }}
+          cache-to:   type=gha,scope=tutorial-${{ matrix.arch_label }},mode=max
+
+      - name: Export digest
+        run: |
+          mkdir -p /tmp/digests
+          digest="${{ steps.build.outputs.digest }}"
+          touch "/tmp/digests/${digest#sha256:}"
+
+      - name: Upload digest artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: digests-${{ matrix.arch_label }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  # Combine per-arch digests into one multi-arch manifest and push under
+  # both the release tag and `:latest`.
+  merge:
+    name: Merge multi-arch manifest
+    needs: build
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Normalize repository owner
+        id: owner
+        run: |
+          owner_lc="${GITHUB_REPOSITORY_OWNER,,}"
+          echo "owner_lc=${owner_lc}" >> "$GITHUB_OUTPUT"
+
+      - name: Determine image tag
+        id: tag
+        run: |
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            tag="${GITHUB_REF##refs/tags/}"
+          else
+            tag="${{ inputs.tag }}"
+          fi
+          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+
+      - name: Download digests
+        uses: actions/download-artifact@v4
+        with:
+          path: /tmp/digests
+          pattern: digests-*
+          merge-multiple: true
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create & push multi-arch manifest
+        working-directory: /tmp/digests
+        run: |
+          IMG="${{ env.REGISTRY }}/${{ steps.owner.outputs.owner_lc }}/${{ env.IMAGE_NAME }}"
+          TAG="${{ steps.tag.outputs.tag }}"
+
+          # Build the source list of per-digest references:
+          refs=()
+          for f in *; do
+            refs+=("${IMG}@sha256:${f}")
+          done
+
+          # Push under the resolved tag…
+          docker buildx imagetools create \
+            --tag "${IMG}:${TAG}" \
+            "${refs[@]}"
+
+          # …and (always) under `:latest`.
+          if [[ "${TAG}" != "latest" ]]; then
+            docker buildx imagetools create \
+              --tag "${IMG}:latest" \
+              "${refs[@]}"
+          fi
+
+      - name: Inspect manifest
+        run: |
+          IMG="${{ env.REGISTRY }}/${{ steps.owner.outputs.owner_lc }}/${{ env.IMAGE_NAME }}"
+          docker buildx imagetools inspect "${IMG}:${{ steps.tag.outputs.tag }}"
