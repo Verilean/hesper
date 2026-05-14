@@ -158,25 +158,35 @@ def expected : Array Float := input.map (· * 1000.0)
 
 #### 4. Run it on the GPU
 
+In the tutorial Docker image the xeus-lean kernel is pre-linked
+against Hesper's WebGPU FFI (see `docker/tutorial/Dockerfile`'s
+`XEUS_LEAN_EXTRA_LIBS` step), so the next cell runs `parallelForDSL`
+for real — Dawn picks a Vulkan/Metal/D3D12 adapter (or its software
+fallback on headless hosts), uploads the input, launches the kernel,
+and reads the result back.
+
 ```text
--- The shape that runs end-to-end (Examples/Compute/ParallelDemo.lean):
-def main : IO Unit := do
+-- Run this cell inside the Hesper tutorial Docker container; outside
+-- it the standard Lean interpreter can't resolve the WebGPU FFI.
+open Hesper.WebGPU
+open Hesper.Compute
+
+def runGpu : IO (Array Float) := do
   let inst   ← Hesper.init
   let device ← getDevice inst
-  let gpuOut ← parallelForDSL device scaleByThousand input
-  IO.println s!"gpu      = {gpuOut}"
-  IO.println s!"expected = {expected}"
-  -- `gpuOut == expected` is the property the example asserts.
+  parallelForDSL device scaleByThousand input
+
+#eval runGpu
+-- expected output:
+-- #[0.000000, 1000.000000, 2000.000000, ..., 9000.000000]
 ```
 
-```bash
-lake exe parallel-demo
-```
+The output matches `expected` element-by-element. From a checkout
+without Docker, the same flow runs as `lake exe parallel-demo`.
 
-The full runnable version prints both arrays and verifies element-wise
-equality. `parallelForDSL` is the shortest path from "I have an array
-and a mathematical function" to "I have the result, computed on the
-GPU." For anything more complex — multi-input ops, reductions, custom
+`parallelForDSL` is the shortest path from "I have an array and a
+mathematical function" to "I have the result, computed on the GPU."
+For anything more complex — multi-input ops, reductions, custom
 launch shapes — drop down to the ShaderM kernel above.
 
 ### Running it on the GPU
