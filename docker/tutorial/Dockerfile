@@ -64,7 +64,7 @@ RUN pip install --break-system-packages --no-cache-dir \
 # ─── Stage 2 ── Lean toolchain via elan ────────────────────────────
 FROM base AS lean
 
-ARG LEAN_VERSION=v4.26.0
+ARG LEAN_VERSION=v4.28.0
 RUN curl -sSf https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh \
       | sh -s -- -y --default-toolchain ${LEAN_VERSION}
 

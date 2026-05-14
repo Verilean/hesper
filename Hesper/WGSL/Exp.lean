@@ -623,12 +623,13 @@ def floatToWGSL (f : Float) : String :=
     let mStr := toString mScaled
     -- Pad to at least 7 digits
     let mStr := if mStr.length < 7 then
-      String.mk (List.replicate (7 - mStr.length) '0') ++ mStr
+      String.ofList (List.replicate (7 - mStr.length) '0') ++ mStr
     else mStr
     let mIntPart := mStr.take 1
+    -- v4.28: `String.drop` returns `String.Slice` (not `String`), and
+    -- `String.Slice.dropRightWhile` was renamed `dropEndWhile`.
     let mFracPart := mStr.drop 1
-    -- Trim trailing zeros from fraction for cleaner output
-    let mFracTrimmed := mFracPart.dropRightWhile (· == '0')
+    let mFracTrimmed := (mFracPart.dropEndWhile (· == '0')).toString
     let mFracFinal := if mFracTrimmed.isEmpty then "0" else mFracTrimmed
     s!"{sign}{mIntPart}.{mFracFinal}e{expInt}"
 
