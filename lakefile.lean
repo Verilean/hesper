@@ -82,7 +82,13 @@ def cudaExeArgs : Array String :=
   else #["./.lake/build/native/libhesper_cuda.a", "-lcuda"]
 
 lean_lib «Hesper» where
-  -- add library configuration options here
+  -- precompileModules: produces a per-module `.so` next to each `.olean`.
+  -- Combined with `moreLinkArgs := stdLinkArgs` this means every
+  -- `@[extern]` declaration in Hesper.* resolves at `#eval` time when
+  -- the `.so` is loaded — letting notebook cells run real GPU kernels
+  -- without a custom kernel re-link.
+  precompileModules := true
+  moreLinkArgs := stdLinkArgs
 
 lean_lib «Examples» where
   roots := #[`Examples]
