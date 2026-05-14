@@ -13,6 +13,7 @@ The smallest unit of typed shape information is `TensorDesc`:
 import Hesper.Tensor.Types
 import Hesper.WGSL.DSL
 import Hesper.WGSL.CodeGen
+import Hesper.Compute
 
 open Hesper.Tensor
 open Hesper.WGSL
@@ -111,6 +112,72 @@ Real reduce kernels (`Hesper/Layers/RMSNorm.lean`) use a proper
 tree-reduction inside the workgroup; this sketch shows the structural
 pattern (smem + barrier + thread-0 write-back) that every reduction
 follows.
+
+### The one-liner: `parallelForDSL`
+
+For pure pointwise ops over an `Array Float`, you don't need to write
+ShaderM at all — `Hesper.Compute.parallelForDSL` takes a
+`Exp .f32 → Exp .f32` function and does the buffer setup / dispatch /
+readback for you. Here's the schematic, then we compute the answer
+two ways so you can see *the values* before and after.
+
+#### 1. Build the input
+
+```lean
+-- 10 floats: [0.0, 1.0, 2.0, ..., 9.0]
+def input : Array Float := (Array.range 10).map (·.toFloat)
+
+#eval input
+-- #[0.000000, 1.000000, 2.000000, 3.000000, 4.000000,
+--   5.000000, 6.000000, 7.000000, 8.000000, 9.000000]
+```
+
+#### 2. Define the kernel as a pure function on `Exp`
+
+```lean
+-- The DSL function we'll send to the GPU.  This is a *value*, not
+-- a side-effecting call — `parallelForDSL` later compiles it to WGSL.
+def scaleByThousand : Exp (.scalar .f32) → Exp (.scalar .f32) :=
+  fun x => x * Exp.litF32 1000.0
+
+-- Inspect the WGSL Hesper generates for this kernel (pure, no GPU):
+#eval (Hesper.Compute.generateUnaryShader scaleByThousand).take 300
+```
+
+#### 3. Compute the expected result on the CPU
+
+```lean
+-- Same semantics in plain Lean — useful for tests and for the
+-- "what should the GPU produce?" reference.
+def expected : Array Float := input.map (· * 1000.0)
+
+#eval expected
+-- #[0.000000, 1000.000000, 2000.000000, 3000.000000, 4000.000000,
+--   5000.000000, 6000.000000, 7000.000000, 8000.000000, 9000.000000]
+```
+
+#### 4. Run it on the GPU
+
+```text
+-- The shape that runs end-to-end (Examples/Compute/ParallelDemo.lean):
+def main : IO Unit := do
+  let inst   ← Hesper.init
+  let device ← getDevice inst
+  let gpuOut ← parallelForDSL device scaleByThousand input
+  IO.println s!"gpu      = {gpuOut}"
+  IO.println s!"expected = {expected}"
+  -- `gpuOut == expected` is the property the example asserts.
+```
+
+```bash
+lake exe parallel-demo
+```
+
+The full runnable version prints both arrays and verifies element-wise
+equality. `parallelForDSL` is the shortest path from "I have an array
+and a mathematical function" to "I have the result, computed on the
+GPU." For anything more complex — multi-input ops, reductions, custom
+launch shapes — drop down to the ShaderM kernel above.
 
 ### Running it on the GPU
 
