@@ -1,0 +1,48 @@
+# hesper graphs ON: 60 tokens, decode wall 531.3 ms, 52451 kernel events (874/tok)
+# llama-cli graphs OFF: 60 tokens, decode wall 563.2 ms, 72075 kernel events (1201/tok)
+
+kernel class                                h_ms/tok h_calls/tok  h_µs/call      l_ms/tok l_calls/tok  l_µs/call
+--------------------------------------------------------------------------------------------------------------
+matmul (mmvq Q4_K+Q6_K)                            -          -          -         6.509      299.9       21.7
+matmul Q4_K                                    3.702      144.6       25.6             -          -          -
+matmul Q6_K                                    1.114        1.0     1133.0             -          -          -
+matmul Q6_K (ffn_down)                         0.965       20.6       46.7             -          -          -
+RMSNorm                                        0.256       83.6        3.1         0.688      300.4        2.3
+argmax/reduce single-WG                        0.679       84.6        8.0             -          -          -
+UNCLASSIFIED bx=128 gx=8 prefix=               0.326       82.6        3.9             -          -          -
+flashAttn                                          -          -          -         0.281       41.8        6.7
+quantize_q8_1                                      -          -          -         0.274      299.9        0.9
+UNCLASSIFIED bx=64 gx=1024 prefix=             0.249       34.4        7.2             -          -          -
+PLE post-scale (fused)                         0.190       41.3        4.6             -          -          -
+UNCLASSIFIED bx=32 gx=256 prefix=              0.170       41.3        4.1             -          -          -
+RoPE                                           0.103       54.1        1.9         0.064       65.6        1.0
+UNCLASSIFIED bx=32 gx=10752 prefix=            0.117        1.0      119.1             -          -          -
+matmul (f16 vec)                                   -          -          -         0.112        1.0      113.8
+binary bcast (mul/add)                             -          -          -         0.099       85.6        1.2
+UNCLASSIFIED bx=64 gx=2048 prefix=             0.091        6.9       13.2             -          -          -
+UNCLASSIFIED bx=32 gx=512 prefix=              0.087       19.7        4.4             -          -          -
+KV cache write                                 0.027       23.6        1.2         0.047       47.6        1.0
+UNCLASSIFIED bx=32 gx=320 prefix=              0.048       41.3        1.2             -          -          -
+UNCLASSIFIED bx=32 gx=8 prefix=                0.042       41.3        1.0             -          -          -
+UNCLASSIFIED bx=32 gx=80 prefix=               0.039       41.3        0.9             -          -          -
+RMSNorm/stub bx=256 gx=8                       0.039       24.6        1.6             -          -          -
+OTHER (flash_attn_stream_k_fixup)                  -          -          -         0.034        7.4        4.6
+qkvNorm (RMSNorm fused)                        0.034       23.6        1.4             -          -          -
+UNCLASSIFIED bx=64 gx=256 prefix=              0.033       10.8        3.1             -          -          -
+UNCLASSIFIED bx=32 gx=64 prefix=               0.032       34.4        0.9             -          -          -
+OTHER (unary_op_kernel)                            -          -          -         0.032       41.8        0.8
+UNCLASSIFIED bx=32 gx=1024 prefix=             0.028        3.9        7.2             -          -          -
+UNCLASSIFIED bx=32 gx=128 prefix=              0.007        6.9        1.0             -          -          -
+OTHER (scale_f32)                                  -          -          -         0.004        3.9        1.0
+OTHER (k_get_rows_float)                           -          -          -         0.004        3.0        1.3
+logit softcap                                  0.004        1.0        3.7             -          -          -
+OTHER (softcap_f32)                                -          -          -         0.003        1.0        3.1
+RMSNorm/stub bx=256 gx=42                      0.003        1.0        3.0             -          -          -
+embedding lookup                               0.003        2.0        1.5             -          -          -
+RMSNorm+add (fused)                            0.002        1.0        1.8             -          -          -
+RMSNorm/stub bx=256 gx=1024                    0.002        1.0        1.7             -          -          -
+copy                                               -          -          -         0.002        2.0        0.8
+UNCLASSIFIED bx=1 gx=1 prefix=                 0.001        1.0        1.5             -          -          -
+OTHER (unary_gated_op_kernel)                      -          -          -         0.001        0.5        1.2
+--------------------------------------------------------------------------------------------------------------
+TOTAL                                          8.393                               8.153                      
