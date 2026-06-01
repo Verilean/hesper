@@ -72,7 +72,14 @@ jobs:
         run: |
           sudo install -m 0755 /opt/xeus-lean/.lake/build/bin/xlean-convert \
             /usr/local/bin/xlean-convert
-          xlean-convert --help
+          # Smoke-test: running with no args prints usage and exits non-zero
+          # by design.  We only want to confirm the binary is on PATH and
+          # executable, so swallow the exit code and grep for "xlean-convert"
+          # in the usage banner.
+          xlean-convert 2>&1 | grep -q 'xlean-convert' || {
+            echo "xlean-convert did not print its usage banner — install failed?";
+            exit 1;
+          }
 
       - name: Build Hesper (so chapters can `import Hesper.*`)
         run: lake build Hesper
