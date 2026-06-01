@@ -19,6 +19,13 @@ jobs:
   elaborate:
     name: Convert .md → .lean and elaborate every chapter
     runs-on: ubuntu-latest
+    env:
+      # CI runner has no NVIDIA driver, so libcuda.so isn't present.
+      # `precompileModules := true` on `lean_lib «Hesper»` links a `.so`
+      # per Lean module; the lakefile's Linux CUDA branch appends
+      # `-lcuda` unconditionally and the whole build fails.  This flag
+      # falls back to the CUDA-stub static archive only.
+      HESPER_NO_CUDA: "1"
 
     steps:
       - name: Checkout repository

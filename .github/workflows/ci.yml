@@ -18,6 +18,15 @@ jobs:
   linux-vulkan:
     name: Linux + Vulkan
     runs-on: ubuntu-22.04
+    env:
+      # CI runners have no NVIDIA driver, so `libcuda.so` is absent.
+      # `precompileModules := true` (lakefile.lean) builds a per-module
+      # `.so` for every Hesper Lean file; without this flag they each
+      # try to link `-lcuda` and the whole build fails.  The flag tells
+      # the lakefile to link the CUDA-stub static archive only (which
+      # turns CUDA FFI calls into runtime errors — never reached on the
+      # Vulkan path) and skip `-lcuda` entirely.
+      HESPER_NO_CUDA: "1"
 
     steps:
       - name: Checkout repository
@@ -111,6 +120,11 @@ jobs:
   windows-d3d12:
     name: Windows + D3D12
     runs-on: windows-2022
+    env:
+      # CI runners have no NVIDIA driver — see comment on the
+      # linux-vulkan job above.  Required because lakefile's CUDA branch
+      # currently fires on `!isOSX`, which includes Windows.
+      HESPER_NO_CUDA: "1"
 
     steps:
       - name: Checkout repository
