@@ -103,11 +103,27 @@ message(STATUS "Hesper native: bundling ${_GLFW3_ARCHIVE}")
 # table) because the same C `wgpu*` symbols are already supplied by
 # libdawn_proc.a's dispatcher.
 if(APPLE)
+  # libwebgpu_dawn.a + libglfw3.a contain Objective-C / Objective-C++
+  # objects (Metal backend in Dawn, Cocoa window code in GLFW), so the
+  # SHARED .dylib has to resolve the libobjc runtime entry points
+  # (objc_msgSendSuper2, objc_opt_class, …) and the Cocoa / Metal /
+  # CoreFoundation framework symbols here.  Before hesper_native became
+  # SHARED, these were resolved at the final lean_exe link via
+  # `stdLinkArgs` in lakefile.lean; now the dylib stands on its own
+  # and must link the same set itself.
   target_link_libraries(hesper_native PRIVATE
     "-Wl,-force_load,${DAWN_BUILD_DIR}/src/dawn/libdawn_proc.a"
     ${DAWN_BUILD_DIR}/src/dawn/glfw/libdawn_glfw.a
     ${_WEBGPU_DAWN_ARCHIVE}
     ${_GLFW3_ARCHIVE}
+    "-lobjc"
+    "-framework" "CoreFoundation"
+    "-framework" "Foundation"
+    "-framework" "Metal"
+    "-framework" "QuartzCore"
+    "-framework" "IOKit"
+    "-framework" "IOSurface"
+    "-framework" "Cocoa"
   )
 else()
   target_link_libraries(hesper_native PRIVATE
