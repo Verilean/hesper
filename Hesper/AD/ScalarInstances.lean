@@ -38,4 +38,19 @@ instance : Differentiable ReLUOp Float Float where
   forward := fun _ x => max 0.0 x
   backward := fun _ x _ => if x > 0.0 then 1.0 else 0.0
 
+/-- Per-row squared error `(p - y)²`.
+    Used as the verified building block for MSE in tape-based training:
+    sum over rows then divide by N. -/
+structure SquaredErrorOp deriving Inhabited
+
+instance : Differentiable SquaredErrorOp (Float × Float) Float where
+  forward  := fun _ (p, y) =>
+    let d := p - y
+    d * d
+  backward := fun _ (p, y) v =>
+    -- d(loss)/dp = 2*(p-y)*v
+    -- d(loss)/dy = -2*(p-y)*v
+    let d := p - y
+    (2.0 * d * v, -2.0 * d * v)
+
 end Hesper.AD

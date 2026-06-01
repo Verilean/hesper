@@ -10,13 +10,17 @@ descriptors, the matmul / RMSNorm / attention helpers under
 The smallest unit of typed shape information is `TensorDesc`:
 
 ```lean
+import Hesper                 -- Hesper.init lives in the root module
 import Hesper.Tensor.Types
 import Hesper.WGSL.DSL
 import Hesper.WGSL.CodeGen
 import Hesper.Compute
 
 open Hesper.Tensor
-open Hesper.WGSL
+-- Open every WGSL submodule *except* `Hesper.WGSL.Kernel` to avoid the
+-- `Hesper.WGSL.Kernel.ShaderM` vs `Hesper.WGSL.Monad.ShaderM` clash:
+-- the tutorial DSL uses the latter (state-monad form).
+open Hesper.WGSL hiding ShaderM
 open Hesper.WGSL.Monad (ShaderM)
 open Hesper.WGSL.Monad.ShaderM
 open Hesper.WGSL.CodeGen
@@ -158,16 +162,15 @@ def expected : Array Float := input.map (· * 1000.0)
 
 #### 4. Run it on the GPU
 
-In the tutorial Docker image the xeus-lean kernel is pre-linked
-against Hesper's WebGPU FFI (see `docker/tutorial/Dockerfile`'s
-`XEUS_LEAN_EXTRA_LIBS` step), so the next cell runs `parallelForDSL`
-for real — Dawn picks a Vulkan/Metal/D3D12 adapter (or its software
-fallback on headless hosts), uploads the input, launches the kernel,
-and reads the result back.
+In the tutorial Docker image the xeus-lean kernel loads Hesper's
+WebGPU FFI shared libraries on startup (via the patched xlean's
+`LEAN_DYNLIB_PATH` mechanism — see `docker/tutorial/Dockerfile`),
+so the next cell runs `parallelForDSL` for real. Dawn picks a
+Vulkan adapter (your discrete GPU if the container has one mounted,
+otherwise the Mesa `lavapipe` software renderer), uploads the
+input, launches the kernel, and reads the result back.
 
-```text
--- Run this cell inside the Hesper tutorial Docker container; outside
--- it the standard Lean interpreter can't resolve the WebGPU FFI.
+```lean
 open Hesper.WebGPU
 open Hesper.Compute
 
@@ -177,17 +180,58 @@ def runGpu : IO (Array Float) := do
   parallelForDSL device scaleByThousand input
 
 #eval runGpu
--- expected output:
--- #[0.000000, 1000.000000, 2000.000000, ..., 9000.000000]
+-- #[0.000000, 1000.000000, 2000.000000, 3000.000000, 4000.000000,
+--   5000.000000, 6000.000000, 7000.000000, 8000.000000, 9000.000000]
 ```
 
-The output matches `expected` element-by-element. From a checkout
-without Docker, the same flow runs as `lake exe parallel-demo`.
+On a checkout without Docker, the same flow runs as `lake exe parallel-demo`.
 
 `parallelForDSL` is the shortest path from "I have an array and a
 mathematical function" to "I have the result, computed on the GPU."
 For anything more complex — multi-input ops, reductions, custom
 launch shapes — drop down to the ShaderM kernel above.
+
+#### Silencing the `[Hesper]` / `[C++]` boot messages
+
+By default, Hesper prints a few diagnostic lines on `Hesper.init` and
+each GPU call:
+
+```text
+[Hesper] Initialized. Found 1 adapters:
+  - NVIDIA: 565.77 (Backend: Vulkan)
+[Hesper] Device: subgroups + subgroup_matrix
+[C++] WebGPU External classes registered
+[C++] createBuffer: size=40, mapped=false
+```
+
+These are useful when debugging adapter selection, but they clutter
+notebook output once you trust the setup.  Two ways to silence them:
+
+**Option 1 — environment variable** (recommended; works from the
+shell that launches the kernel):
+
+```bash
+HESPER_LOG_LEVEL=quiet docker run --rm -p 8888:8888 hesper-tutorial:latest
+# or, inside the container, when launching jupyter:
+HESPER_LOG_LEVEL=quiet jupyter lab ...
+```
+
+Recognised quiet values (case-insensitive): `silent`, `quiet`,
+`error`, `warn`, `warning`, `off`, `0`, `false`, `none`.  Anything
+else (or unset) keeps verbose logging ON.
+
+**Option 2 — programmatic toggle** (works from inside a notebook
+cell, even after the kernel started with logs ON):
+
+```lean
+import Hesper.Logging
+
+#eval Hesper.Logging.setVerbose false
+```
+
+This flips both the Lean and C++ flags at runtime, so subsequent
+`Hesper.init` / `getDevice` / `createBuffer` calls run silently.
+Call `Hesper.Logging.setVerbose true` to re-enable when debugging.
 
 ### Running it on the GPU
 
