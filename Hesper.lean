@@ -86,6 +86,9 @@ import Hesper.GLFW.Types
 import Hesper.GLFW.Internal
 import Hesper.GLFW
 
+-- Ch11 data analysis primitives (CSV + DataFrame, used by notebook).
+import Hesper.Data.DataFrame
+
 /-!
 # Hesper: Verified WebGPU Inference Engine
 

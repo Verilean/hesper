@@ -5,6 +5,15 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
+# C++ stdlib: 2026-05-25 we use whatever the host compiler defaults to
+# (libstdc++ for gcc on Linux, libc++ for AppleClang on macOS).  Dawn
+# is built with the same default in lakefile.lean::compileDawn — see
+# the long-form note there for why a previous attempt to force libc++
+# (toolchain file) didn't stick across Dawn's FetchContent deps.
+if(CMAKE_TOOLCHAIN_FILE)
+  message(STATUS "Hesper native: using toolchain ${CMAKE_TOOLCHAIN_FILE}")
+endif()
+
 # Expect DAWN_SRC_DIR and DAWN_BUILD_DIR to be provided
 if(NOT DEFINED DAWN_SRC_DIR)
     message(FATAL_ERROR "DAWN_SRC_DIR must be specified")
@@ -27,8 +36,27 @@ message(STATUS "Lean include directory: ${LEAN_INCLUDE_DIR}")
 message(STATUS "Dawn source directory: ${DAWN_SRC_DIR}")
 message(STATUS "Dawn build directory: ${DAWN_BUILD_DIR}")
 
-# Build our native bridge library
-add_library(hesper_native STATIC bridge.cpp glfw_bridge.cpp)
+# Build our native bridge library as a SHARED library.
+#
+# Why SHARED (was STATIC before 2026-05-25):
+#   With `precompileModules := true` in lakefile.lean every Hesper.* module
+#   becomes its own `.so`.  If Dawn's static archives (libdawn_proc.a +
+#   libwebgpu_dawn.a) were whole-archived into each per-module link line,
+#   each `.so` would have its OWN private copy of Dawn's internal `procs`
+#   static (the function-pointer table that `dawnProcSetProcs` fills).
+#   `Hesper.init` would set `procs` in `libHesper_Hesper.so`'s copy, but
+#   `getDevice` running from `Hesper_Hesper_WebGPU_Device.so` would read
+#   ITS own still-NULL copy and SIGSEGV jumping through a NULL fn ptr.
+#
+#   Putting bridge.cpp + all Dawn archives into a single SHARED lib
+#   guarantees there is exactly one `procs` static in the process, so
+#   `dawnProcSetProcs(...)` is visible to every dlopen()'d Hesper module.
+#
+# The Dawn / GLFW static archives are pulled in with --whole-archive so
+# their symbols (`dawnProcSetProcs`, `wgpuInstance*`, the entire Dawn
+# native runtime) are present in libhesper_native.so.  Consumers link
+# with `-lhesper_native` only — Dawn becomes an implementation detail.
+add_library(hesper_native SHARED bridge.cpp glfw_bridge.cpp)
 
 # Include Lean, Dawn, and GLFW headers (GLFW is in Dawn's third_party)
 target_include_directories(hesper_native PRIVATE
@@ -38,12 +66,61 @@ target_include_directories(hesper_native PRIVATE
   ${DAWN_SRC_DIR}/third_party/glfw/include
 )
 
-# Link Dawn GLFW utilities for surface creation
-target_link_libraries(hesper_native PRIVATE
-  ${DAWN_BUILD_DIR}/src/dawn/glfw/libdawn_glfw.a
-)
+# Resolve the install-side libwebgpu_dawn.a — CMake's GNUInstallDirs picks
+# `lib/` on Ubuntu and `lib64/` on NixOS, so probe both.
+if(EXISTS "${DAWN_INSTALL_DIR}/lib64/libwebgpu_dawn.a")
+  set(_WEBGPU_DAWN_ARCHIVE "${DAWN_INSTALL_DIR}/lib64/libwebgpu_dawn.a")
+elseif(EXISTS "${DAWN_INSTALL_DIR}/lib/libwebgpu_dawn.a")
+  set(_WEBGPU_DAWN_ARCHIVE "${DAWN_INSTALL_DIR}/lib/libwebgpu_dawn.a")
+else()
+  message(FATAL_ERROR
+    "libwebgpu_dawn.a not found under ${DAWN_INSTALL_DIR}/lib{,64}/")
+endif()
+message(STATUS "Hesper native: bundling ${_WEBGPU_DAWN_ARCHIVE}")
 
-# Note: GLFW and Dawn linking happens in the final executable via lakefile.lean
+# Resolve glfw3 — moved between Dawn revisions
+if(EXISTS "${DAWN_BUILD_DIR}/third_party/glfw3/src/src/libglfw3.a")
+  set(_GLFW3_ARCHIVE "${DAWN_BUILD_DIR}/third_party/glfw3/src/src/libglfw3.a")
+elseif(EXISTS "${DAWN_BUILD_DIR}/third_party/glfw/src/libglfw3.a")
+  set(_GLFW3_ARCHIVE "${DAWN_BUILD_DIR}/third_party/glfw/src/libglfw3.a")
+else()
+  message(FATAL_ERROR
+    "libglfw3.a not found under ${DAWN_BUILD_DIR}/third_party/glfw{,3}/...")
+endif()
+message(STATUS "Hesper native: bundling ${_GLFW3_ARCHIVE}")
+
+# Critical: --whole-archive libdawn_proc.a ONLY.  That archive is tiny
+# (~150 KB, just dawn_proc.cpp.o + dawn_thread_dispatch_proc.cpp.o) and
+# owns the `procs` static globals that `dawnProcSetProcs(...)` fills.
+# By forcing the entire archive into libhesper_native.so we guarantee
+# the `procs` static exists exactly once in the process — fixing the
+# 2026-05-24 crash where each per-module precompiled `.so` had its own
+# private (and uninitialised) `procs` table.
+#
+# libwebgpu_dawn.a is linked WITHOUT --whole-archive, so the linker
+# pulls only what bridge.cpp references on-demand.  This skips
+# webgpu_dawn_native_proc.cpp.o (the alternative direct-dispatch proc
+# table) because the same C `wgpu*` symbols are already supplied by
+# libdawn_proc.a's dispatcher.
+if(APPLE)
+  target_link_libraries(hesper_native PRIVATE
+    "-Wl,-force_load,${DAWN_BUILD_DIR}/src/dawn/libdawn_proc.a"
+    ${DAWN_BUILD_DIR}/src/dawn/glfw/libdawn_glfw.a
+    ${_WEBGPU_DAWN_ARCHIVE}
+    ${_GLFW3_ARCHIVE}
+  )
+else()
+  target_link_libraries(hesper_native PRIVATE
+    "-Wl,--whole-archive"
+    "${DAWN_BUILD_DIR}/src/dawn/libdawn_proc.a"
+    "-Wl,--no-whole-archive"
+    ${DAWN_BUILD_DIR}/src/dawn/glfw/libdawn_glfw.a
+    ${_WEBGPU_DAWN_ARCHIVE}
+    ${_GLFW3_ARCHIVE}
+    # System libraries Dawn / GLFW depend on at run time.
+    vulkan dl pthread X11 X11-xcb xcb wayland-client
+  )
+endif()
 
 # ============================================================================
 # CUDA bridge

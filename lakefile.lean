@@ -22,27 +22,46 @@ require LSpec from git
 -- Note: libhesper_cuda.a is unconditionally linked because Hesper.lean's CUDA FFI
 -- is exported into nearly every Lean module's .c.o.export, making the symbols
 -- live for any exe that imports anything from Hesper.* on Linux.
+/-- `HESPER_NO_CUDA=1` (read at lakefile-load time) tells the Linux
+    link line to skip `-lcuda` for environments where the CUDA user-
+    mode driver shared library isn't installed (tutorial Docker image,
+    CI runners with a WebGPU-only target).  The stub
+    `libhesper_cuda.a` is still linked so CUDA FFI calls resolve to
+    error-returning stubs instead of being undefined symbols. -/
+unsafe def hesperNoCudaImpl : Bool :=
+  match unsafeBaseIO (IO.getEnv "HESPER_NO_CUDA") with
+  | some v => v == "1" || v == "true"
+  | none   => false
+
+@[implemented_by hesperNoCudaImpl]
+def hesperNoCuda : Bool := false
+
 def stdLinkArgs : Array String :=
-  -- Dawn installs to lib/ on macOS, lib64/ on Linux x86_64
-  let dawnLibDir := if System.Platform.isOSX then "lib" else "lib64"
+  -- Dawn lives in `libhesper_native.{so,dylib}` (a SHARED library that
+  -- whole-archives libdawn_proc.a, libwebgpu_dawn.a, and libdawn_glfw.a
+  -- on the inside — see `native/CMakeLists.txt`).  Every consumer (root
+  -- lean_lib `Hesper`, per-module precompiled `.so`s, every lean_exe)
+  -- just links `-lhesper_native` to get ONE shared copy of Dawn's
+  -- runtime state in the process.  Previously each precompiled module
+  -- whole-archived its own private copy of libdawn_proc.a, which gave
+  -- each `.so` its own `procs` static — `Hesper.init` set procs in
+  -- libHesper_Hesper.so's copy, then `getDevice` read Device.so's still
+  -- NULL copy and SIGSEGV'd jumping through a NULL fn ptr.
   let commonArgs := #[
-    "-L./.lake/build/dawn-build/src/dawn", "-ldawn_proc",
-    "-L./.lake/build/dawn-install/" ++ dawnLibDir, "-lwebgpu_dawn",
-    -- Upstream Dawn moved glfw from third_party/glfw/src to third_party/glfw3/src/src
-    -- Pass both -L flags so either layout resolves; the first match wins.
-    "-L./.lake/build/dawn-build/third_party/glfw3/src/src",
-    "-L./.lake/build/dawn-build/third_party/glfw/src",
-    "-lglfw3",
+    "-L./.lake/build/native", "-lhesper_native",
+    -- Highway SIMD is a small leaf — still safe to static-link directly.
     "./.lake/build/simd/libhesper_simd.a",
     "./.lake/build/simd/_deps/highway-build/libhwy.a"
   ]
   let cudaArgs :=
     if System.Platform.isOSX then #["./.lake/build/native/libhesper_cuda.a"]
+    else if hesperNoCuda then #["./.lake/build/native/libhesper_cuda.a"]
     else #["./.lake/build/native/libhesper_cuda.a", "-lcuda"]
   if System.Platform.isOSX then
-    #["-Wl,-force_load,./.lake/build/native/libhesper_native.a",
-      "-Wl,-force_load,./.lake/build/dawn-build/src/dawn/libdawn_proc.a",
-      "-Wl,-force_load,./.lake/build/dawn-build/src/dawn/glfw/libdawn_glfw.a"]
+    -- macOS: rpath to the shared lib so dlopen finds it without
+    -- DYLD_LIBRARY_PATH at run time.
+    #["-Wl,-rpath,@loader_path/../native",
+      "-Wl,-rpath,@executable_path/.lake/build/native"]
     ++ commonArgs ++ cudaArgs ++
     #["-lc++",
       "-L/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/lib",
@@ -57,20 +76,27 @@ def stdLinkArgs : Array String :=
       "-framework", "IOSurface",
       "-framework", "Cocoa"]
   else
-    #["-Wl,--whole-archive",
-      "./.lake/build/native/libhesper_native.a",
-      "./.lake/build/dawn-build/src/dawn/libdawn_proc.a",
-      "./.lake/build/dawn-build/src/dawn/glfw/libdawn_glfw.a",
-      "-Wl,--no-whole-archive"]
-    ++ commonArgs ++ cudaArgs ++
-    #["-lstdc++",
-      "-lvulkan",
-      "-lX11",
-      "-lX11-xcb",
-      "-lxcb",
-      "-lwayland-client",
-      "-ldl",
-      "-lpthread"]
+    -- Linux: rpath into the build tree so unwrapped lean_exe / dlopen()
+    -- from xlean finds libhesper_native.so without LD_LIBRARY_PATH.
+    -- $ORIGIN is the directory of the consumer .so / exe.
+    --
+    -- C++ stdlib: NOT specified here.  The per-module precompiled .so
+    -- files contain only Lean-generated C against `lean_object*` — no
+    -- C++ TUs of their own.  All the libstdc++ ABI surface lives
+    -- inside libhesper_native.so (built with the host compiler's
+    -- default stdlib, which is libstdc++ for gcc and clang on Linux),
+    -- so consumers don't have to agree on a stdlib at link time.
+    commonArgs ++ cudaArgs ++
+    -- $ORIGIN relative paths.  Lay out which consumer lives where:
+    --   Hesper_Hesper_*.so → .lake/build/lib/lean/Hesper_*.so       → ../../native
+    --   libHesper_Hesper.so (sharedLib) → .lake/build/lib/lib*.so   → ../native
+    --   lean_exe binaries    → .lake/build/bin/*                    → ../native
+    -- We list all three so any consumer resolves libhesper_native.so.
+    #["-Wl,-rpath,$ORIGIN/../native",
+      "-Wl,-rpath,$ORIGIN/../../native",
+      -- libhesper_native.so already links vulkan / X11 / wayland; we
+      -- keep `-ldl -lpthread` here because Lean glue may also need them.
+      "-ldl", "-lpthread"]
 
 /-- Per-exe CUDA link args. Empty on macOS so exes that conditionally use the
     CUDA backend still link there (CUDA codegen falls back to no-op at runtime).
@@ -79,6 +105,7 @@ def stdLinkArgs : Array String :=
     We centralise here so adding macOS support is a single-line change. -/
 def cudaExeArgs : Array String :=
   if System.Platform.isOSX then #[]
+  else if hesperNoCuda then #["./.lake/build/native/libhesper_cuda.a"]
   else #["./.lake/build/native/libhesper_cuda.a", "-lcuda"]
 
 lean_lib «Hesper» where
@@ -142,6 +169,17 @@ private def downloadDawn (cwd : FilePath) (dawnSrc : FilePath) (dawnVersion : St
 private def compileDawn (dawnSrc dawnBuild dawnInstall : FilePath) : IO UInt32 := do
   IO.println "[Hesper] Building Dawn (this may take 10-15 minutes on first build)..."
   IO.FS.createDirAll dawnBuild.toString
+  -- C++ stdlib: 2026-05-25 reverted to libstdc++ on Linux (Dawn's own
+  -- default).  Previous experiments forcing libc++ via a CMake
+  -- toolchain file caused Dawn's FetchContent dependencies (Abseil,
+  -- SPIRV-Tools, etc.) to leak libstdc++-mangled std::__future_base
+  -- symbols into libwebgpu_dawn.a anyway — those sub-projects reset
+  -- CXX_FLAGS in their own `project()` call.  When libhesper_native
+  -- became SHARED (so Dawn's `procs` static would be unique per
+  -- process — see native/CMakeLists.txt) the unresolved libstdc++
+  -- symbols started failing dlopen().  bridge.cpp never crosses
+  -- `std::*` types over the Lean FFI, so we don't need ABI match
+  -- with Lean's libc++.
   let cmakeArgs := #[
     "-S", dawnSrc.toString, "-B", dawnBuild.toString,
     "-DCMAKE_BUILD_TYPE=Release",
@@ -194,7 +232,18 @@ private def buildDawnIfNeeded (cwd : FilePath) : IO UInt32 := do
     if System.Platform.isOSX then "osx"
     else if System.Platform.isWindows then "windows"
     else "linux"
-  let buildConfig := s!"{dawnVersion}-{platform}-Release"
+  -- Suffix the cache key with the C++ stdlib so that flipping the Dawn
+  -- ABI between libstdc++ and libc++ invalidates the cached build.
+  -- 2026-05-25: switched from libc++ → libstdc++ on Linux.  See the
+  -- long-form note in native/CMakeLists.txt for why.  Short version:
+  -- the libc++ choice was a defensive measure that proved unnecessary
+  -- (gdb showed the real bug was Dawn proc-table duplication, not a
+  -- libc++ mismatch) and Dawn's FetchContent sub-projects leak
+  -- libstdc++-mangled symbols even with a libcxx toolchain file.
+  let cxxStdlib :=
+    if System.Platform.isOSX || System.Platform.isWindows then "default"
+    else "libstdcxx"
+  let buildConfig := s!"{dawnVersion}-{platform}-Release-{cxxStdlib}"
   let hashFile := cwd / ".lake/build/dawn-build.hash"
   let hashExists ← hashFile.pathExists
   let storedHash ← if hashExists then IO.FS.readFile hashFile else pure ""
@@ -207,23 +256,48 @@ private def buildDawnIfNeeded (cwd : FilePath) : IO UInt32 := do
     IO.println "[Hesper] Dawn already built (cached)."
   return 0
 
-/-- Build the Hesper native bridge library and (on Linux) the CUDA bridge. -/
+/-- Build the Hesper native bridge library and (on Linux) the CUDA bridge.
+
+    Linux / macOS produce a SHARED `libhesper_native.{so,dylib}` so that
+    Dawn's static archives (whole-archived inside it) contribute their
+    `procs` and other static globals exactly once per process — see
+    `native/CMakeLists.txt` for the long-form rationale.  Windows still
+    produces a `.lib`. -/
 private def buildBridgeIfNeeded (cwd : FilePath) : IO UInt32 := do
   let bridgeBuild := cwd / ".lake/build/native"
-  -- MSVC produces .lib; gcc/clang produce .a.
-  let libExt := if System.Platform.isWindows then "lib" else "a"
-  let libPrefix := if System.Platform.isWindows then "" else "lib"
+  let (libPrefix, libExt) :=
+    if System.Platform.isWindows then ("", "lib")
+    else if System.Platform.isOSX then ("lib", "dylib")
+    else ("lib", "so")
   let nativeLib := bridgeBuild / s!"{libPrefix}hesper_native.{libExt}"
-  let cudaLib := bridgeBuild / s!"{libPrefix}hesper_cuda.{libExt}"
-  let needConfigure := !(← (bridgeBuild / "CMakeCache.txt").pathExists)
+  let cudaLib   := bridgeBuild / s!"{libPrefix}hesper_cuda.a"
+  -- If a stale STATIC `libhesper_native.a` from a pre-shared-lib build
+  -- is on disk, the next `cmake --build` would still produce only the
+  -- SHARED `.so`/`.dylib`, but the cached CMakeCache.txt may be from
+  -- the STATIC-era configure.  Force a reconfigure when we detect that
+  -- the expected SHARED output is missing but a stale STATIC archive
+  -- is sitting next to it.
+  let staleStatic := bridgeBuild / s!"{libPrefix}hesper_native.a"
+  let haveStale ←
+    if System.Platform.isWindows then pure false
+    else pure ((← staleStatic.pathExists) && !(← nativeLib.pathExists))
+  let needConfigure := !(← (bridgeBuild / "CMakeCache.txt").pathExists) || haveStale
+  if haveStale then
+    IO.println "[Hesper] Stale STATIC libhesper_native.a detected — forcing reconfigure for SHARED build"
+    -- Wipe the CMake cache so the SHARED-lib configure takes effect.
+    let _ ← runCmd "rm" #["-f", (bridgeBuild / "CMakeCache.txt").toString, staleStatic.toString]
   if needConfigure then
     IO.println "[Hesper] Configuring native bridge..."
     IO.FS.createDirAll bridgeBuild
+    -- 2026-05-25: libstdc++ is the default for CMake's host gcc/clang
+    -- on Linux, so we no longer pass a toolchain file.  Matches Dawn's
+    -- own libstdc++ build (see buildDawnIfNeeded cache key).
     let ret ← runCmd "cmake" #[
       "-S", (cwd / "native").toString, "-B", bridgeBuild.toString,
       "-DCMAKE_BUILD_TYPE=Release",
-      "-DDAWN_SRC_DIR=" ++ (cwd / ".lake/build/dawn-src").toString,
-      "-DDAWN_BUILD_DIR=" ++ (cwd / ".lake/build/dawn-build").toString]
+      "-DDAWN_SRC_DIR="     ++ (cwd / ".lake/build/dawn-src").toString,
+      "-DDAWN_BUILD_DIR="   ++ (cwd / ".lake/build/dawn-build").toString,
+      "-DDAWN_INSTALL_DIR=" ++ (cwd / ".lake/build/dawn-install").toString]
     if ret != 0 then return ret
   if !(← nativeLib.pathExists) then
     IO.println "[Hesper] Building Hesper native bridge..."
@@ -331,7 +405,18 @@ script buildNative do
   -- Create a hash of Dawn version + build config to track if rebuild is needed
   let dawnVersion := "3f79f3aefe0b0a498002564fcfb13eb21ab6c047"
   let platform := if System.Platform.isOSX then "osx" else "linux"
-  let buildConfig := s!"{dawnVersion}-{platform}-Release"
+  -- Suffix the cache key with the C++ stdlib so that flipping the Dawn
+  -- ABI between libstdc++ and libc++ invalidates the cached build.
+  -- 2026-05-25: switched from libc++ → libstdc++ on Linux.  See the
+  -- long-form note in native/CMakeLists.txt for why.  Short version:
+  -- the libc++ choice was a defensive measure that proved unnecessary
+  -- (gdb showed the real bug was Dawn proc-table duplication, not a
+  -- libc++ mismatch) and Dawn's FetchContent sub-projects leak
+  -- libstdc++-mangled symbols even with a libcxx toolchain file.
+  let cxxStdlib :=
+    if System.Platform.isOSX || System.Platform.isWindows then "default"
+    else "libstdcxx"
+  let buildConfig := s!"{dawnVersion}-{platform}-Release-{cxxStdlib}"
   let hashFile := cwd / ".lake/build/dawn-build.hash"
 
   let hashExists ← hashFile.pathExists
@@ -414,8 +499,9 @@ script buildNative do
     cmd := "cmake"
     args := #["-S", srcDir.toString, "-B", bridgeBuild.toString,
               "-DCMAKE_BUILD_TYPE=Release",
-              "-DDAWN_SRC_DIR=" ++ dawnSrc.toString,
-              "-DDAWN_BUILD_DIR=" ++ dawnBuild.toString]
+              "-DDAWN_SRC_DIR="     ++ dawnSrc.toString,
+              "-DDAWN_BUILD_DIR="   ++ dawnBuild.toString,
+              "-DDAWN_INSTALL_DIR=" ++ dawnInstall.toString]
   } >>= (·.wait)
 
   if bridgeCmakeRet != 0 then
@@ -593,6 +679,17 @@ lean_exe «hesper» where
   moreLinkArgs := stdLinkArgs
 lean_exe «parallel-demo» where
   root := `Examples.Compute.ParallelDemo
+  moreLinkArgs := stdLinkArgs
+
+/-- Ch11 California Housing — DataFrame demo (CPU-only data ops). -/
+lean_exe «california-housing» where
+  root := `Examples.Tutorial.CaliforniaHousing
+  moreLinkArgs := stdLinkArgs
+
+/-- Ch11 California Housing — same training loop, every iter dispatched
+    onto WebGPU via Hesper.WGSL.MatMul + a few small pointwise kernels. -/
+lean_exe «california-housing-gpu» where
+  root := `Examples.Tutorial.CaliforniaHousingGPU
   moreLinkArgs := stdLinkArgs
 
 lean_exe «hesper-simple» where
