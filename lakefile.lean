@@ -337,6 +337,14 @@ private def buildSimdIfNeeded (cwd : FilePath) : IO UInt32 := do
 
 /-- Lake target that builds all native dependencies before any Lean compilation. -/
 target nativeDeps : Unit := do
+  -- Windows: skip the Dawn + native-bridge build.  Hesper has no
+  -- production Windows backend yet, and `native/CMakeLists.txt`
+  -- searches for the Unix-style `libwebgpu_dawn.a` / `libglfw3.a`
+  -- archives that MSVC's Dawn build doesn't produce (it emits
+  -- `webgpu_dawn.lib` instead).  Leaving this as a no-op keeps
+  -- `lake build Hesper` (pure Lean) green on the Windows CI runner
+  -- without pretending the native bridge works there.
+  if System.Platform.isWindows then return .nil
   let cwd ← IO.currentDir
   let ret ← buildDawnIfNeeded cwd
   if ret != 0 then
