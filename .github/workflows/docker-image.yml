@@ -1,4 +1,4 @@
-name: Build Hesper Tutorial Docker Image
+name: Tutorial Docker image
 
 on:
   push:
@@ -7,82 +7,69 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Image tag to publish (default: latest)'
-        required: false
+        description: 'Image tag (defaults to "latest")'
         default: 'latest'
-        type: string
-
-permissions:
-  contents: read
-  packages: write
-
-env:
-  REGISTRY: ghcr.io
-  IMAGE_NAME: hesper-tutorial
-  DOCKERFILE: docker/tutorial/Dockerfile
 
 jobs:
-  # Build per-architecture images and push by digest.
-  # Using native runners (amd64 + arm64) avoids QEMU emulation, which
-  # would otherwise dominate build time for the Lean / xeus-lean stage.
+  # Build each architecture on its own native runner.  Pushes by
+  # digest only; the `merge` job below stitches the two digests into
+  # a single multi-arch manifest list tagged for the registry.
+  #
+  # The previous single-runner workflow built linux/arm64 under
+  # QEMU on an amd64 host, which made the arm64 leg of the build
+  # (Lean toolchain + xeus-lean clang build) take ~hour scale.
+  # Native arm64 runners bring it back to amd64 parity, so the
+  # wall-clock time is now max(amd64, arm64) instead of
+  # amd64 + (amd64 × ~5-10).
   build:
-    name: Build (${{ matrix.platform }})
-    runs-on: ${{ matrix.runs-on }}
     strategy:
       fail-fast: false
       matrix:
         include:
           - platform: linux/amd64
-            runs-on: ubuntu-latest
-            arch_label: amd64
+            runner: ubuntu-latest
+            suffix: amd64
           - platform: linux/arm64
-            runs-on: ubuntu-24.04-arm
-            arch_label: arm64
+            runner: ubuntu-24.04-arm
+            suffix: arm64
+
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      packages: write
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-        with:
-          submodules: recursive
+      - uses: actions/checkout@v4
 
-      - name: Normalize repository owner (lowercase for GHCR)
+      - name: Resolve image owner (lowercase)
         id: owner
         run: |
-          owner_lc="${GITHUB_REPOSITORY_OWNER,,}"
-          echo "owner_lc=${owner_lc}" >> "$GITHUB_OUTPUT"
-
-      - name: Determine image tag
-        id: tag
-        run: |
-          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
-            tag="${GITHUB_REF##refs/tags/}"
-          else
-            tag="${{ inputs.tag }}"
-          fi
-          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
-          echo "Using tag: ${tag}"
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+          # ghcr.io requires repository names to be all-lowercase,
+          # but `github.repository_owner` keeps the org's display
+          # case (e.g. "Verilean").  Lowercase it here so the image
+          # name is accepted by the registry.
+          echo "owner=${GITHUB_REPOSITORY_OWNER,,}" >> "$GITHUB_OUTPUT"
 
       - name: Log in to GHCR
         uses: docker/login-action@v3
         with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.repository_owner }}
+          registry: ghcr.io
+          username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build & push by digest
+      - name: Set up buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push by digest
         id: build
         uses: docker/build-push-action@v5
         with:
           context: .
-          file: ${{ env.DOCKERFILE }}
+          file: docker/tutorial/Dockerfile
           platforms: ${{ matrix.platform }}
-          outputs: |
-            type=image,name=${{ env.REGISTRY }}/${{ steps.owner.outputs.owner_lc }}/${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=true
-          cache-from: type=gha,scope=tutorial-${{ matrix.arch_label }}
-          cache-to:   type=gha,scope=tutorial-${{ matrix.arch_label }},mode=max
+          outputs: type=image,name=ghcr.io/${{ steps.owner.outputs.owner }}/hesper-tutorial,push-by-digest=true,name-canonical=true,push=true
+          cache-from: type=gha,scope=${{ matrix.suffix }}
+          cache-to: type=gha,scope=${{ matrix.suffix }},mode=max
 
       - name: Export digest
         run: |
@@ -90,37 +77,35 @@ jobs:
           digest="${{ steps.build.outputs.digest }}"
           touch "/tmp/digests/${digest#sha256:}"
 
-      - name: Upload digest artifact
+      - name: Upload digest
         uses: actions/upload-artifact@v4
         with:
-          name: digests-${{ matrix.arch_label }}
+          name: digests-${{ matrix.suffix }}
           path: /tmp/digests/*
           if-no-files-found: error
           retention-days: 1
 
-  # Combine per-arch digests into one multi-arch manifest and push under
-  # both the release tag and `:latest`.
+  # Combine the per-arch digests produced by `build` into a single
+  # multi-arch manifest list and publish it under both the
+  # release/dispatch tag and `:latest`.
   merge:
-    name: Merge multi-arch manifest
-    needs: build
     runs-on: ubuntu-latest
+    needs: build
+    permissions:
+      contents: read
+      packages: write
 
     steps:
-      - name: Normalize repository owner
-        id: owner
-        run: |
-          owner_lc="${GITHUB_REPOSITORY_OWNER,,}"
-          echo "owner_lc=${owner_lc}" >> "$GITHUB_OUTPUT"
-
-      - name: Determine image tag
+      - name: Resolve image tag and owner
         id: tag
         run: |
-          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
-            tag="${GITHUB_REF##refs/tags/}"
+          owner_lc="${GITHUB_REPOSITORY_OWNER,,}"
+          echo "owner=${owner_lc}" >> "$GITHUB_OUTPUT"
+          if [[ "${{ github.event_name }}" == "push" ]]; then
+            echo "tag=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
           else
-            tag="${{ inputs.tag }}"
+            echo "tag=${{ github.event.inputs.tag }}" >> "$GITHUB_OUTPUT"
           fi
-          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
 
       - name: Download digests
         uses: actions/download-artifact@v4
@@ -129,41 +114,20 @@ jobs:
           pattern: digests-*
           merge-multiple: true
 
-      - name: Set up Docker Buildx
+      - name: Set up buildx
         uses: docker/setup-buildx-action@v3
 
       - name: Log in to GHCR
         uses: docker/login-action@v3
         with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.repository_owner }}
+          registry: ghcr.io
+          username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Create & push multi-arch manifest
+      - name: Create manifest list and push
         working-directory: /tmp/digests
         run: |
-          IMG="${{ env.REGISTRY }}/${{ steps.owner.outputs.owner_lc }}/${{ env.IMAGE_NAME }}"
-          TAG="${{ steps.tag.outputs.tag }}"
-
-          # Build the source list of per-digest references:
-          refs=()
-          for f in *; do
-            refs+=("${IMG}@sha256:${f}")
-          done
-
-          # Push under the resolved tag…
           docker buildx imagetools create \
-            --tag "${IMG}:${TAG}" \
-            "${refs[@]}"
-
-          # …and (always) under `:latest`.
-          if [[ "${TAG}" != "latest" ]]; then
-            docker buildx imagetools create \
-              --tag "${IMG}:latest" \
-              "${refs[@]}"
-          fi
-
-      - name: Inspect manifest
-        run: |
-          IMG="${{ env.REGISTRY }}/${{ steps.owner.outputs.owner_lc }}/${{ env.IMAGE_NAME }}"
-          docker buildx imagetools inspect "${IMG}:${{ steps.tag.outputs.tag }}"
+            -t ghcr.io/${{ steps.tag.outputs.owner }}/hesper-tutorial:${{ steps.tag.outputs.tag }} \
+            -t ghcr.io/${{ steps.tag.outputs.owner }}/hesper-tutorial:latest \
+            $(printf 'ghcr.io/${{ steps.tag.outputs.owner }}/hesper-tutorial@sha256:%s ' *)
