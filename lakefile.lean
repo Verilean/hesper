@@ -36,7 +36,13 @@ unsafe def hesperNoCudaImpl : Bool :=
 @[implemented_by hesperNoCudaImpl]
 def hesperNoCuda : Bool := false
 
-def stdLinkArgs : Array String :=
+def stdLinkArgs : Array String := Id.run do
+  -- Windows: no native bridge is built (see the `nativeDeps` target —
+  -- `System.Platform.isWindows` early-returns).  Returning an empty
+  -- link line lets the per-module `.dll`s link cleanly against
+  -- pure-Lean code only; the lean_exe targets that actually need
+  -- WebGPU don't exist on the Windows CI path.
+  if System.Platform.isWindows then return #[]
   -- Dawn lives in `libhesper_native.{so,dylib}` (a SHARED library that
   -- whole-archives libdawn_proc.a, libwebgpu_dawn.a, and libdawn_glfw.a
   -- on the inside — see `native/CMakeLists.txt`).  Every consumer (root
@@ -60,33 +66,32 @@ def stdLinkArgs : Array String :=
   if System.Platform.isOSX then
     -- macOS: rpath to the shared lib so dlopen finds it without
     -- DYLD_LIBRARY_PATH at run time.
-    #["-Wl,-rpath,@loader_path/../native",
-      "-Wl,-rpath,@executable_path/.lake/build/native"]
-    ++ commonArgs ++ cudaArgs ++
-    #["-lc++",
-      "-L/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/lib",
-      "-F/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/System/Library/Frameworks",
-      "-Wl,-syslibroot,/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk",
-      "-lobjc",
-      "-framework", "CoreFoundation",
-      "-framework", "Metal",
-      "-framework", "Foundation",
-      "-framework", "QuartzCore",
-      "-framework", "IOKit",
-      "-framework", "IOSurface",
-      "-framework", "Cocoa"]
-  else
-    -- Linux: rpath into the build tree so unwrapped lean_exe / dlopen()
-    -- from xlean finds libhesper_native.so without LD_LIBRARY_PATH.
-    -- $ORIGIN is the directory of the consumer .so / exe.
-    --
-    -- C++ stdlib: NOT specified here.  The per-module precompiled .so
-    -- files contain only Lean-generated C against `lean_object*` — no
-    -- C++ TUs of their own.  All the libstdc++ ABI surface lives
-    -- inside libhesper_native.so (built with the host compiler's
-    -- default stdlib, which is libstdc++ for gcc and clang on Linux),
-    -- so consumers don't have to agree on a stdlib at link time.
-    commonArgs ++ cudaArgs ++
+    return #["-Wl,-rpath,@loader_path/../native",
+             "-Wl,-rpath,@executable_path/.lake/build/native"]
+        ++ commonArgs ++ cudaArgs ++
+        #["-lc++",
+          "-L/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/lib",
+          "-F/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/System/Library/Frameworks",
+          "-Wl,-syslibroot,/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk",
+          "-lobjc",
+          "-framework", "CoreFoundation",
+          "-framework", "Metal",
+          "-framework", "Foundation",
+          "-framework", "QuartzCore",
+          "-framework", "IOKit",
+          "-framework", "IOSurface",
+          "-framework", "Cocoa"]
+  -- Linux: rpath into the build tree so unwrapped lean_exe / dlopen()
+  -- from xlean finds libhesper_native.so without LD_LIBRARY_PATH.
+  -- $ORIGIN is the directory of the consumer .so / exe.
+  --
+  -- C++ stdlib: NOT specified here.  The per-module precompiled .so
+  -- files contain only Lean-generated C against `lean_object*` — no
+  -- C++ TUs of their own.  All the libstdc++ ABI surface lives
+  -- inside libhesper_native.so (built with the host compiler's
+  -- default stdlib, which is libstdc++ for gcc and clang on Linux),
+  -- so consumers don't have to agree on a stdlib at link time.
+  return commonArgs ++ cudaArgs ++
     -- $ORIGIN relative paths.  Lay out which consumer lives where:
     --   Hesper_Hesper_*.so → .lake/build/lib/lean/Hesper_*.so       → ../../native
     --   libHesper_Hesper.so (sharedLib) → .lake/build/lib/lib*.so   → ../native
@@ -105,6 +110,9 @@ def stdLinkArgs : Array String :=
     We centralise here so adding macOS support is a single-line change. -/
 def cudaExeArgs : Array String :=
   if System.Platform.isOSX then #[]
+  -- Windows: no native bridge is built (nativeDeps is a no-op there),
+  -- so don't try to link the CUDA stub archive that doesn't exist.
+  else if System.Platform.isWindows then #[]
   else if hesperNoCuda then #["./.lake/build/native/libhesper_cuda.a"]
   else #["./.lake/build/native/libhesper_cuda.a", "-lcuda"]
 
