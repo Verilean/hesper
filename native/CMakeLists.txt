@@ -111,19 +111,33 @@ if(APPLE)
   # SHARED, these were resolved at the final lean_exe link via
   # `stdLinkArgs` in lakefile.lean; now the dylib stands on its own
   # and must link the same set itself.
+  #
+  # We use `find_library` instead of plain `-framework Foo` so CMake
+  # resolves the framework path against `CMAKE_OSX_SYSROOT` (the macOS
+  # SDK).  Passing the framework as a raw `-framework Foo` string
+  # confused the GitHub Actions linker (`ld: library 'CoreFoundation'
+  # not found`) on macOS-15 because the SDK's `System/Library/Frameworks`
+  # was not on the default framework search path.
+  find_library(COCOA_LIB Cocoa REQUIRED)
+  find_library(COREFOUNDATION_LIB CoreFoundation REQUIRED)
+  find_library(FOUNDATION_LIB Foundation REQUIRED)
+  find_library(METAL_LIB Metal REQUIRED)
+  find_library(QUARTZCORE_LIB QuartzCore REQUIRED)
+  find_library(IOKIT_LIB IOKit REQUIRED)
+  find_library(IOSURFACE_LIB IOSurface REQUIRED)
   target_link_libraries(hesper_native PRIVATE
     "-Wl,-force_load,${DAWN_BUILD_DIR}/src/dawn/libdawn_proc.a"
     ${DAWN_BUILD_DIR}/src/dawn/glfw/libdawn_glfw.a
     ${_WEBGPU_DAWN_ARCHIVE}
     ${_GLFW3_ARCHIVE}
     "-lobjc"
-    "-framework" "CoreFoundation"
-    "-framework" "Foundation"
-    "-framework" "Metal"
-    "-framework" "QuartzCore"
-    "-framework" "IOKit"
-    "-framework" "IOSurface"
-    "-framework" "Cocoa"
+    ${COREFOUNDATION_LIB}
+    ${FOUNDATION_LIB}
+    ${METAL_LIB}
+    ${QUARTZCORE_LIB}
+    ${IOKIT_LIB}
+    ${IOSURFACE_LIB}
+    ${COCOA_LIB}
   )
 else()
   target_link_libraries(hesper_native PRIVATE
