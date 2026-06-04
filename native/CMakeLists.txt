@@ -68,9 +68,21 @@ add_library(hesper_native SHARED bridge.cpp glfw_bridge.cpp)
 # explicitly.  `-undefined dynamic_lookup` is the standard Apple flag
 # for "plugin dylibs that will be loaded into a host that provides
 # these symbols" — exactly the Lean FFI pattern.
+#
+# We also set the dylib's install_name (LC_ID_DYLIB) to its absolute
+# build path so that consumer dylibs (Hesper_Hesper_*.dylib) embed the
+# same absolute path in their LC_LOAD_DYLIB and dyld finds it without
+# any @rpath search.  The previous `@rpath/libhesper_native.dylib`
+# install_name combined with `@loader_path/../native` rpaths from the
+# lakefile worked on a single dev machine but failed on macos-15 CI
+# (file path expanded through `..` rejected by dyld as "no such file"
+# even though the file existed on disk).
 if(APPLE)
   target_link_options(hesper_native PRIVATE
     "-Wl,-undefined,dynamic_lookup")
+  set_target_properties(hesper_native PROPERTIES
+    INSTALL_NAME_DIR "${CMAKE_BINARY_DIR}"
+    BUILD_WITH_INSTALL_NAME_DIR TRUE)
 endif()
 
 # Include Lean, Dawn, and GLFW headers (GLFW is in Dawn's third_party)
