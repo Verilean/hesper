@@ -58,6 +58,21 @@ message(STATUS "Dawn build directory: ${DAWN_BUILD_DIR}")
 # with `-lhesper_native` only — Dawn becomes an implementation detail.
 add_library(hesper_native SHARED bridge.cpp glfw_bridge.cpp)
 
+# macOS: bridge.cpp references Lean runtime symbols (lean_alloc_object,
+# lean_mk_string, lean_inc_heartbeat, mi_malloc_small, ...) but the
+# Lean runtime lives in the *consumer* (the lean_exe / xeus-lean
+# kernel) that dlopen()'s libhesper_native.dylib at run time, not in
+# the dylib itself.  Linux ld silently allows shared-lib undefined
+# symbols by default, but Apple ld (since macos-15 / Xcode 16) refuses
+# to link a dylib with any unresolved symbol unless we say so
+# explicitly.  `-undefined dynamic_lookup` is the standard Apple flag
+# for "plugin dylibs that will be loaded into a host that provides
+# these symbols" — exactly the Lean FFI pattern.
+if(APPLE)
+  target_link_options(hesper_native PRIVATE
+    "-Wl,-undefined,dynamic_lookup")
+endif()
+
 # Include Lean, Dawn, and GLFW headers (GLFW is in Dawn's third_party)
 target_include_directories(hesper_native PRIVATE
   ${LEAN_INCLUDE_DIR}
