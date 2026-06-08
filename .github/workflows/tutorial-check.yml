@@ -101,6 +101,17 @@ jobs:
           failed=0
           for f in docs/tutorial/Notebooks/Gen/Ch*.lean; do
             base=$(basename "$f" .lean)
+            # Ch11 imports xeus-lean's `Display` module for rich
+            # HTML cell output (`Display.html (df.toHtmlHead ...)`).
+            # That module only resolves inside the xlean kernel, not
+            # under plain `lake env lean`, so skip Ch11 from this
+            # elaborate gate.  Ch11 is still exercised end-to-end in
+            # the Docker image where `xlean-convert --eval` renders
+            # the notebook against the real xlean runtime.
+            if [ "$base" = "Ch11_DataAnalysis" ]; then
+              echo "=== $base (skipped: Display module is xlean-only) ==="
+              continue
+            fi
             echo "=== $base ==="
             if ! lake env lean "$f"; then
               echo "::error file=$f::tutorial chapter failed to elaborate"
