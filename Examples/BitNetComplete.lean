@@ -174,7 +174,9 @@ def runInteractive (ggufPath : String) (loraPath : Option String := none) : IO U
       break
 
     if input.startsWith "/tokens " then
-      let text := input.drop 8
+      -- Lean v4.28: `String.drop` returns a `String.Slice`; `encode`
+      -- expects `String`, so re-materialise the substring explicitly.
+      let text := (input.drop 8).toString
       let tokens := encode tokenizer text
       IO.println s!"Tokens ({tokens.size}): {tokens}"
       for i in [:tokens.size] do
@@ -186,7 +188,7 @@ def runInteractive (ggufPath : String) (loraPath : Option String := none) : IO U
       continue
 
     if input.startsWith "/maxlen " then
-      let nStr := input.drop 8 |>.trim
+      let nStr := (input.drop 8 |>.trim).toString
       maxTokens := nStr.toNat!
       IO.println s!"Max generation length set to {maxTokens}"
       IO.println ""

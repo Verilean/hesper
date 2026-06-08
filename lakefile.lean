@@ -122,7 +122,12 @@ lean_lib «Hesper» where
   -- `@[extern]` declaration in Hesper.* resolves at `#eval` time when
   -- the `.so` is loaded — letting notebook cells run real GPU kernels
   -- without a custom kernel re-link.
-  precompileModules := true
+  --
+  -- Disabled on Windows: nativeDeps is a no-op there (libwebgpu_dawn.a
+  -- doesn't exist on MSVC), so per-module .dll links would fail with
+  -- "undefined symbol: lean_glfw_*" / "lean_hesper_*" — the bridge
+  -- those externs point to was never built.
+  precompileModules := !System.Platform.isWindows
   moreLinkArgs := stdLinkArgs
 
 lean_lib «Examples» where
