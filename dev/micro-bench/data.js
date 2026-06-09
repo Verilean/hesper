@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1778655251508,
+  "lastUpdate": 1780968191858,
   "repoUrl": "https://github.com/Verilean/hesper",
   "entries": {
     "Hesper Kernel Micro-Benchmark": [
@@ -689,6 +689,75 @@ window.BENCHMARK_DATA = {
           {
             "name": "GPU Argmax (128256)",
             "value": 2.411708,
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "junjihashimoto@users.noreply.github.com",
+            "name": "junji hashimoto",
+            "username": "junjihashimoto"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "09733e160748a6c48bb1656bd2f9c7d0b26d8ad3",
+          "message": "Merge pull request #7 from Verilean/docs/sparkle-style-tutorial\n\nDocs/sparkle style tutorial",
+          "timestamp": "2026-06-09T10:07:35+09:00",
+          "tree_id": "25fc958ff7a26e8869f30ba94af95d022877aed4",
+          "url": "https://github.com/Verilean/hesper/commit/09733e160748a6c48bb1656bd2f9c7d0b26d8ad3"
+        },
+        "date": 1780968189992,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "Projected TPS",
+            "value": 2.180094,
+            "unit": "tokens/sec"
+          },
+          {
+            "name": "RMSNorm (2560)",
+            "value": 0.81405,
+            "unit": "ms"
+          },
+          {
+            "name": "BitLinear Q (2560->2560)",
+            "value": 0.701263,
+            "unit": "ms"
+          },
+          {
+            "name": "BitLinear Gate (2560->6912)",
+            "value": 1.403963,
+            "unit": "ms"
+          },
+          {
+            "name": "BitLinear Down (6912->2560)",
+            "value": 1.657071,
+            "unit": "ms"
+          },
+          {
+            "name": "Elementwise Add (2560)",
+            "value": 1.20725,
+            "unit": "ms"
+          },
+          {
+            "name": "ReLU-Sqr-Mul (6912)",
+            "value": 0.896242,
+            "unit": "ms"
+          },
+          {
+            "name": "MatMul LM Head",
+            "value": 43.586129,
+            "unit": "ms"
+          },
+          {
+            "name": "GPU Argmax (128256)",
+            "value": 4.863846,
             "unit": "ms"
           }
         ]
