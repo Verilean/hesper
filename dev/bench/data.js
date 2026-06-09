@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1778655313560,
+  "lastUpdate": 1780968239403,
   "repoUrl": "https://github.com/Verilean/hesper",
   "entries": {
     "BitNet Inference Benchmark": [
@@ -300,6 +300,36 @@ window.BENCHMARK_DATA = {
             "value": 5.8969,
             "unit": "tokens/sec",
             "extra": "ms/token: 2383.883937"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "junjihashimoto@users.noreply.github.com",
+            "name": "junji hashimoto",
+            "username": "junjihashimoto"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "09733e160748a6c48bb1656bd2f9c7d0b26d8ad3",
+          "message": "Merge pull request #7 from Verilean/docs/sparkle-style-tutorial\n\nDocs/sparkle style tutorial",
+          "timestamp": "2026-06-09T10:07:35+09:00",
+          "tree_id": "25fc958ff7a26e8869f30ba94af95d022877aed4",
+          "url": "https://github.com/Verilean/hesper/commit/09733e160748a6c48bb1656bd2f9c7d0b26d8ad3"
+        },
+        "date": 1780968237015,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "BitNet b1.58 2B Inference (macOS Metal)",
+            "value": 12.588242,
+            "unit": "tokens/sec",
+            "extra": "ms/token: 1229.365166"
           }
         ]
       }
