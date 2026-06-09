@@ -296,19 +296,31 @@ jobs:
           EOF
           cat micro-bench-results.json
 
-      - name: Store micro-benchmark result
+      - name: Store micro-benchmark result (workflow-mode Pages, no gh-pages push)
         uses: benchmark-action/github-action-benchmark@v1
         if: github.event_name == 'push'
         with:
           name: Hesper Kernel Micro-Benchmark
           tool: customSmallerIsBetter
           output-file-path: micro-bench-results.json
-          benchmark-data-dir-path: dev/micro-bench
+          # Write history to a single JSON consumed by the `pages` job
+          # below.  No `gh-pages` branch push — the pages job folds it
+          # into the Pages artifact under `site/dev/micro-bench/`.
+          external-data-json-path: ./cache/micro-bench.json
           github-token: ${{ secrets.GITHUB_TOKEN }}
-          auto-push: true
+          auto-push: false
           alert-threshold: "150%"
           comment-on-alert: true
           fail-on-alert: false
+
+      - name: Upload micro-bench data artifact (for Pages job)
+        if: github.event_name == 'push'
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-data-micro
+          path: ./cache/micro-bench.json
+          retention-days: 7
+          if-no-files-found: warn
 
       - name: Restore GGUF model cache
         id: cache-gguf
@@ -348,18 +360,28 @@ jobs:
           EOF
           cat benchmark-results.json
 
-      - name: Store benchmark result
+      - name: Store BitNet benchmark result (workflow-mode Pages, no gh-pages push)
         uses: benchmark-action/github-action-benchmark@v1
         if: github.event_name == 'push'
         with:
           name: BitNet Inference Benchmark
           tool: customBiggerIsBetter
           output-file-path: benchmark-results.json
+          external-data-json-path: ./cache/bitnet-bench.json
           github-token: ${{ secrets.GITHUB_TOKEN }}
-          auto-push: true
+          auto-push: false
           alert-threshold: "80%"
           comment-on-alert: true
           fail-on-alert: false
+
+      - name: Upload BitNet bench data artifact (for Pages job)
+        if: github.event_name == 'push'
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-data-bitnet
+          path: ./cache/bitnet-bench.json
+          retention-days: 7
+          if-no-files-found: warn
 
   # ============================================================================
   # Test Coverage Summary

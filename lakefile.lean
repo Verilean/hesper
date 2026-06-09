@@ -8,6 +8,18 @@ package «Hesper» where
 require LSpec from git
   "https://github.com/argumentcomputer/LSpec.git" @ "main"
 
+-- `doc-gen4` powers the API-reference rendering on the GitHub Pages
+-- site (https://verilean.github.io/hesper/api/).  We pin to `main`;
+-- the Pages job invokes `lake update doc-gen4 && lake build Hesper:docs`
+-- on its own runner so the freshly-resolved manifest never has to
+-- be committed.  Production builds DO need the require statement
+-- so `lake-manifest.json` knows about the dependency tree, but
+-- they never invoke `lake build Hesper:docs`, so the doc-gen4
+-- libraries are only fetched on `lake update`, not on a normal
+-- build of Hesper itself.
+require «doc-gen4» from git
+  "https://github.com/leanprover/doc-gen4" @ "v4.28.0"
+
 -- ============================================================================
 -- NATIVE LINKER FLAGS
 -- ============================================================================
