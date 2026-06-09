@@ -16,6 +16,10 @@
 #include <iomanip>
 #include <cstring>
 #include <cstdio>
+#include <cstdlib>
+#include <cctype>
+#include <algorithm>
+#include <string>
 #include <atomic>
 #include <memory>
 #include <future>
@@ -49,8 +53,28 @@ static const wgpu::RequestAdapterOptions* togglesAdapterOptions() {
     return &options;
 }
 
-// Global verbose flag for controlling debug output
-static bool g_verbose = true;
+// Global verbose flag for controlling debug output.
+//
+// Default: respects the `HESPER_LOG_LEVEL` env var read once at process
+// start.  Values that disable verbose output: "silent", "quiet", "error",
+// "warn", "warning", "off", "0", "false", "none".  Anything else (or
+// unset) keeps verbose=true for backward compatibility.
+//
+// Programmatic override: `Hesper.Logging.setVerbose : Bool → IO Unit`
+// (Lean) calls `lean_hesper_set_verbose` (C++) to flip this at runtime —
+// useful inside notebooks where the env var was already consumed.
+static bool g_verbose = []() {
+  const char* lvl = std::getenv("HESPER_LOG_LEVEL");
+  if (!lvl) return true;
+  std::string v(lvl);
+  // lowercase compare
+  std::transform(v.begin(), v.end(), v.begin(),
+                 [](unsigned char c){ return std::tolower(c); });
+  if (v == "silent" || v == "quiet" || v == "error" || v == "warn" ||
+      v == "warning" || v == "off" || v == "0" || v == "false" ||
+      v == "none") return false;
+  return true;
+}();
 #define DBG_PRINT(...) do { if (g_verbose) { __VA_ARGS__; } } while(0)
 
 // ============================================================================
@@ -687,7 +711,7 @@ static wgpu::Device createDeviceWithMaxLimits(wgpu::Adapter& adapter) {
     FeatureLevel level = getFeatureLevel();
     bool hasSubgroups = adapter.HasFeature(wgpu::FeatureName::Subgroups);
 
-    if (level != FeatureLevel::Auto) {
+    if (g_verbose && level != FeatureLevel::Auto) {
         std::cout << "[Hesper] HESPER_GPU_FEATURES="
                   << (level == FeatureLevel::SubgroupMatrix ? "subgroup_matrix" :
                       level == FeatureLevel::Subgroup ? "subgroup" : "basic")
@@ -704,33 +728,35 @@ static wgpu::Device createDeviceWithMaxLimits(wgpu::Adapter& adapter) {
             };
             wgpu::Device device = tryCreateDevice(adapter, allFeatures.data(), allFeatures.size(), limits, &toggles);
             if (device) {
-                std::cout << "[Hesper] Device: subgroups + subgroup_matrix" << std::endl;
+                if (g_verbose) std::cout << "[Hesper] Device: subgroups + subgroup_matrix" << std::endl;
                 // Dump supported subgroup matrix configs so users/kernel authors
                 // know which (M, N, K, inType, outType) tuples to target.
-                wgpu::AdapterInfo info{};
-                wgpu::AdapterPropertiesSubgroupMatrixConfigs smConfigs{};
-                info.nextInChain = &smConfigs;
-                if (adapter.GetInfo(&info) == wgpu::Status::Success) {
-                    std::cout << "[Hesper] SubgroupMatrix configs (count="
-                              << smConfigs.configCount << "):" << std::endl;
-                    auto typeName = [](wgpu::SubgroupMatrixComponentType t) -> const char* {
-                        switch (t) {
-                            case wgpu::SubgroupMatrixComponentType::F16: return "f16";
-                            case wgpu::SubgroupMatrixComponentType::F32: return "f32";
-                            case wgpu::SubgroupMatrixComponentType::I8:  return "i8";
-                            case wgpu::SubgroupMatrixComponentType::U8:  return "u8";
-                            case wgpu::SubgroupMatrixComponentType::I32: return "i32";
-                            case wgpu::SubgroupMatrixComponentType::U32: return "u32";
-                            default: return "?";
+                if (g_verbose) {
+                    wgpu::AdapterInfo info{};
+                    wgpu::AdapterPropertiesSubgroupMatrixConfigs smConfigs{};
+                    info.nextInChain = &smConfigs;
+                    if (adapter.GetInfo(&info) == wgpu::Status::Success) {
+                        std::cout << "[Hesper] SubgroupMatrix configs (count="
+                                  << smConfigs.configCount << "):" << std::endl;
+                        auto typeName = [](wgpu::SubgroupMatrixComponentType t) -> const char* {
+                            switch (t) {
+                                case wgpu::SubgroupMatrixComponentType::F16: return "f16";
+                                case wgpu::SubgroupMatrixComponentType::F32: return "f32";
+                                case wgpu::SubgroupMatrixComponentType::I8:  return "i8";
+                                case wgpu::SubgroupMatrixComponentType::U8:  return "u8";
+                                case wgpu::SubgroupMatrixComponentType::I32: return "i32";
+                                case wgpu::SubgroupMatrixComponentType::U32: return "u32";
+                                default: return "?";
+                            }
+                        };
+                        for (size_t i = 0; i < smConfigs.configCount; ++i) {
+                            const auto& c = smConfigs.configs[i];
+                            std::cout << "  [" << i << "] M=" << c.M << " N=" << c.N
+                                      << " K=" << c.K
+                                      << " in=" << typeName(c.componentType)
+                                      << " out=" << typeName(c.resultComponentType)
+                                      << std::endl;
                         }
-                    };
-                    for (size_t i = 0; i < smConfigs.configCount; ++i) {
-                        const auto& c = smConfigs.configs[i];
-                        std::cout << "  [" << i << "] M=" << c.M << " N=" << c.N
-                                  << " K=" << c.K
-                                  << " in=" << typeName(c.componentType)
-                                  << " out=" << typeName(c.resultComponentType)
-                                  << std::endl;
                     }
                 }
                 return device;
@@ -774,9 +800,9 @@ static wgpu::Device createDeviceWithMaxLimits(wgpu::Adapter& adapter) {
             wgpu::Device device = tryCreateDevice(adapter,
                 subgroupFeatures.data(), subgroupFeatures.size(), limits, &toggles);
             if (device) {
-                std::cout << "[Hesper] Device: subgroups"
-                          << (hasShaderF16 ? " + shaderF16" : "")
-                          << " (no subgroup_matrix)" << std::endl;
+                if (g_verbose) std::cout << "[Hesper] Device: subgroups"
+                                         << (hasShaderF16 ? " + shaderF16" : "")
+                                         << " (no subgroup_matrix)" << std::endl;
                 return device;
             }
             if (level == FeatureLevel::Subgroup) {
@@ -797,7 +823,7 @@ static wgpu::Device createDeviceWithMaxLimits(wgpu::Adapter& adapter) {
         };
         wgpu::Device device = tryCreateDevice(adapter, basicFeatures.data(), basicFeatures.size(), limits, &toggles);
         if (device) {
-            std::cout << "[Hesper] Device: basic (shaderF16, no subgroups)" << std::endl;
+            if (g_verbose) std::cout << "[Hesper] Device: basic (shaderF16, no subgroups)" << std::endl;
             return device;
         }
         if (g_verbose) std::cout << "[Hesper] shaderF16-only failed, trying minimal..." << std::endl;
@@ -806,7 +832,7 @@ static wgpu::Device createDeviceWithMaxLimits(wgpu::Adapter& adapter) {
     // --- Tier 4: No optional features (maximum compatibility) ---
     wgpu::Device device = tryCreateDevice(adapter, nullptr, 0, limits, &toggles);
     if (device) {
-        std::cout << "[Hesper] Device: minimal (no ShaderF16, no subgroups)" << std::endl;
+        if (g_verbose) std::cout << "[Hesper] Device: minimal (no ShaderF16, no subgroups)" << std::endl;
     }
     return device;
 }

@@ -241,6 +241,28 @@ def relu (ctx : ADContext) (x : Dual) : ADContext × Dual :=
     x ctx.tape
   ({ tape := tape' }, d)
 
+/-! ## Verified op integration
+
+The methods above (`add`, `mul`, `sub`, …) hardcode each op's local
+gradient in the body, which is fine for the built-in arithmetic but
+forces every new op to be hand-coded.  `liftBinaryVerified` plugs the
+gap by reading the local gradient straight out of the
+`Differentiable` instance — i.e. the same forward/backward pair we'd
+register for any Hesper verified op.
+
+The cost is the function-pointer indirection through the typeclass;
+the benefit is that any `Differentiable Op (Float × Float) Float`
+becomes a Dual op with no further wiring.  Used by Ch11 for
+`SquaredErrorOp` so the MSE training loop is built from a *verified*
+loss op rather than ad-hoc `mul`/`sub`/`pow`. -/
+def liftBinaryVerified
+    {Op : Type} [inst : Hesper.Core.Differentiable Op (Float × Float) Float]
+    (ctx : ADContext) (op : Op) (x y : Dual) : ADContext × Dual :=
+  let primal := inst.forward op (x.primal, y.primal)
+  let (gx, gy) := inst.backward op (x.primal, y.primal) 1.0
+  let (tape', idx) := ctx.tape.add [x.tapeIdx, y.tapeIdx] [gx, gy]
+  ({ tape := tape' }, { primal, tapeIdx := idx })
+
 end ADContext
 
 /-- Reverse-mode gradient computation via backpropagation -/

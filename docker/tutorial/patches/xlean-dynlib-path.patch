@@ -1,0 +1,34 @@
+diff --git a/src/XeusKernel.lean b/src/XeusKernel.lean
+index a06e40d..01deac1 100644
+--- a/src/XeusKernel.lean
++++ b/src/XeusKernel.lean
+@@ -6,6 +6,7 @@ Xeus Kernel - Lean owns the main loop and calls C++ xeus via FFI
+ -/
+ import REPL.Main
+ import Lean.Data.Json
++import Lean.LoadDynlib
+ -- Display lets user cells emit MIME-typed payloads (HTML / SVG / Markdown / ...).
+ -- The buffer is drained after every cell and forwarded to Jupyter through the
+ -- C++ FFI, which parses the MIME markers out of the result string.
+@@ -254,6 +255,21 @@ def main (args : List String) : IO Unit := do
+   -- Initialize search path
+   Lean.initSearchPath (← Lean.findSysroot)
+ 
++  -- Load any extra native shared libraries listed in `LEAN_DYNLIB_PATH`
++  -- (colon-separated list of `.so` paths).  This is what makes
++  -- `#eval` cells in notebooks resolve `@[extern]` symbols provided by
++  -- downstream Lean libraries built with `precompileModules := true`
++  -- — without this, the elaborator can typecheck the call but cannot
++  -- run it.
++  if let some dynlibPath ← IO.getEnv "LEAN_DYNLIB_PATH" then
++    for entry in dynlibPath.splitOn ":" do
++      if !entry.isEmpty then
++        debugLog s!"[Lean Kernel] Loading dynlib: {entry}"
++        try
++          Lean.loadDynlib entry
++        catch e =>
++          IO.eprintln s!"[Lean Kernel] Warning: failed to load {entry}: {e}"
++
+   debugLog "[Lean Kernel] Initializing FFI..."
+   ffiInitialize
+ 

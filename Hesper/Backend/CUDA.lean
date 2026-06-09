@@ -580,7 +580,7 @@ instance : GPUBackend CUDAContext where
                 c == '_' || (c.toLower != 'a' && c.toLower != 'e' &&
                              c.toLower != 'i' && c.toLower != 'o' &&
                              c.toLower != 'u'))
-          (String.mk compressed).take 24 ++ "_"
+          (String.ofList compressed).take 24 |>.toString ++ "_"
       let funcName :=
         if cacheKey == 0 then config.funcName
         else s!"{humanTag}k{(toString cacheKey.toNat).take 16}"
