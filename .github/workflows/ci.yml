@@ -18,6 +18,15 @@ jobs:
   linux-vulkan:
     name: Linux + Vulkan
     runs-on: ubuntu-22.04
+    env:
+      # CI runners have no NVIDIA driver, so `libcuda.so` is absent.
+      # `precompileModules := true` (lakefile.lean) builds a per-module
+      # `.so` for every Hesper Lean file; without this flag they each
+      # try to link `-lcuda` and the whole build fails.  The flag tells
+      # the lakefile to link the CUDA-stub static archive only (which
+      # turns CUDA FFI calls into runtime errors — never reached on the
+      # Vulkan path) and skip `-lcuda` entirely.
+      HESPER_NO_CUDA: "1"
 
     steps:
       - name: Checkout repository
@@ -34,6 +43,7 @@ jobs:
             ninja-build \
             libvulkan-dev \
             vulkan-tools \
+            mesa-vulkan-drivers \
             libx11-dev \
             libx11-xcb-dev \
             libxrandr-dev \
@@ -47,8 +57,10 @@ jobs:
             libgl1-mesa-dev \
             pkg-config
 
-          # Verify Vulkan installation
-          vulkaninfo --summary || echo "Vulkan not available (expected in CI)"
+          # Verify Vulkan installation; expects Mesa `lavapipe` (software
+          # Vulkan ICD) so the Ch04 tutorial parity test below can dispatch
+          # a real compute kernel even on a runner without a GPU.
+          vulkaninfo --summary
 
       - name: Setup Lean
         uses: leanprover/lean-action@v1
@@ -88,12 +100,31 @@ jobs:
           lake build Tests.GPUAccuracyTests
           echo "All test targets built successfully"
 
+      # Ch04 tutorial regression — pins the WebGPU/Vulkan path the
+      # docs/tutorial Notebook walks the user through (`parallelForDSL` +
+      # `scaleByThousand` → `[0, 1000, …, 9000]`).  Catches the two
+      # bugs that previously broke the tutorial cell:
+      #   1. duplicate `data` binding in `generateUnaryShader`
+      #   2. `floatToWGSL 1000.0` mis-emitting `1.0e2` instead of `1.0e3`
+      # The CPU sub-tests (WGSL codegen) work on any runner; the GPU
+      # sub-test dispatches through Dawn against Mesa's `lavapipe`
+      # software Vulkan installed above.
+      - name: Build & run Ch04 tutorial regression (test-compute)
+        run: |
+          lake build test-compute
+          .lake/build/bin/test-compute
+
   # ============================================================================
   # Windows with D3D12 Backend
   # ============================================================================
   windows-d3d12:
     name: Windows + D3D12
     runs-on: windows-2022
+    env:
+      # CI runners have no NVIDIA driver — see comment on the
+      # linux-vulkan job above.  Required because lakefile's CUDA branch
+      # currently fires on `!isOSX`, which includes Windows.
+      HESPER_NO_CUDA: "1"
 
     steps:
       - name: Checkout repository
@@ -218,11 +249,20 @@ jobs:
       - name: Build test-all
         run: lake build test-all
 
+      - name: Build test-compute (Ch04 tutorial regression)
+        run: lake build test-compute
+
       - name: Build bitnet-complete and micro-bench
         run: lake build bitnet-complete micro-bench
 
       - name: Run unit tests
         run: .lake/build/bin/test-all
+
+      # Ch04 tutorial regression — same gate as the linux-vulkan job, but
+      # dispatched against Apple's Metal backend so a Metal-shader-side
+      # regression of the tutorial path is also caught.
+      - name: Run Ch04 tutorial regression (test-compute)
+        run: .lake/build/bin/test-compute
 
       - name: Run micro-benchmark
         run: .lake/build/bin/micro-bench | tee micro-bench-output.txt

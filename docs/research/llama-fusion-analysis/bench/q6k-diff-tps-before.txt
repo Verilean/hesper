@@ -1,0 +1,3 @@
+[Gemma4] Generated 60 tokens in 667.738268 ms (89.855566 tokens/sec)
+[Gemma4] Generated 60 tokens in 668.628076 ms (89.735986 tokens/sec)
+[Gemma4] Generated 60 tokens in 670.895268 ms (89.432737 tokens/sec)

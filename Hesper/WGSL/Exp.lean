@@ -615,20 +615,29 @@ def floatToWGSL (f : Float) : String :=
     -- FP32 has ~7 significant decimal digits.
     -- Format: sign + mantissa + "e" + exponent
     let log10 := Float.log abs / Float.log 10.0
-    let exp := log10.floor
-    let expInt := exp.toInt64.toInt
-    let mantissa := abs / Float.pow 10.0 exp
+    let expF := log10.floor
+    -- `log abs / log 10` is *almost* exact for powers of ten, but rounds
+    -- below by a few ulps: `log(1000)/log(10)` evaluates to
+    -- 2.9999999999999996, so `.floor` returns 2 and `mantissa` ends up at
+    -- 10.0 — producing the literal "1.0e2" (=100) for an input of 1000.
+    -- Detect that case (mantissa ≥ 10) and bump the exponent up.
+    let mantissa0 := abs / Float.pow 10.0 expF
+    let bump := mantissa0 ≥ 10.0
+    let expF := if bump then expF + 1.0 else expF
+    let mantissa := if bump then mantissa0 / 10.0 else mantissa0
+    let expInt := expF.toInt64.toInt
     -- Scale mantissa to 7 significant digits
     let mScaled := (mantissa * 1000000.0).round.toUInt64
     let mStr := toString mScaled
     -- Pad to at least 7 digits
     let mStr := if mStr.length < 7 then
-      String.mk (List.replicate (7 - mStr.length) '0') ++ mStr
+      String.ofList (List.replicate (7 - mStr.length) '0') ++ mStr
     else mStr
     let mIntPart := mStr.take 1
+    -- v4.28: `String.drop` returns `String.Slice` (not `String`), and
+    -- `String.Slice.dropRightWhile` was renamed `dropEndWhile`.
     let mFracPart := mStr.drop 1
-    -- Trim trailing zeros from fraction for cleaner output
-    let mFracTrimmed := mFracPart.dropRightWhile (· == '0')
+    let mFracTrimmed := (mFracPart.dropEndWhile (· == '0')).toString
     let mFracFinal := if mFracTrimmed.isEmpty then "0" else mFracTrimmed
     s!"{sign}{mIntPart}.{mFracFinal}e{expInt}"
 

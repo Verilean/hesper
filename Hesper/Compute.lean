@@ -242,12 +242,20 @@ def generateUnaryShader (f : Exp (.scalar .f32) → Exp (.scalar .f32)) : String
     let gid ← Monad.ShaderM.globalId
     let i := Exp.vec3X gid
 
-    let dataBuf ← Monad.ShaderM.declareInputBuffer "data" (.scalar .f32)
-    let _outputBuf ← Monad.ShaderM.declareOutputBuffer "data" (.scalar .f32)
+    -- `parallelFor` exposes a single read_write buffer at binding 0 and uses
+    -- it both for input and result, so we declare exactly one storage buffer
+    -- here.  The buffer holds an `array<f32>` (runtime-sized) so the kernel
+    -- can use `arrayLength(&data)` for bounds-checking — WGSL `arrayLength`
+    -- only applies to `array<T>`, not bare `f32`.  Declaring a second binding
+    -- with the same WGSL identifier ("data") would produce invalid WGSL
+    -- ("'data' previously declared here") that Dawn rejects at
+    -- CreateShaderModule, so we must keep this to a single declaration.
+    let dataBuf ← Monad.ShaderM.declareStorageBuffer "data"
+                    (.runtimeArray (.scalar .f32)) .readWrite
 
     let len := Exp.arrayLength (t := .scalar .f32) "&data"
     Monad.ShaderM.if_ (Exp.lt i len) (do
-      let x ← Monad.ShaderM.readBuffer (ty := .scalar .f32) (n := 1024) dataBuf i
+      let x ← Monad.ShaderM.readBuffer (ty := .scalar .f32) (n := 0) dataBuf i
       let result := f x
       Monad.ShaderM.writeBuffer (ty := .scalar .f32) dataBuf i result
     ) (pure ())

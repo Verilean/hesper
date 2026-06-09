@@ -5,6 +5,8 @@ import Hesper.WebGPU.Buffer
 import Hesper.WebGPU.Shader
 import Hesper.WebGPU.Pipeline
 import Hesper.WebGPU.Types
+import Hesper.Compute
+import Hesper.WGSL.DSL
 
 /-!
 # Compute Pipeline Integration Tests
@@ -107,6 +109,66 @@ def testInvalidShader : IO TestSeq := withDevice fun _ device => do
 
   pure $ test "Invalid shader compilation fails gracefully" result
 
+/-! ### Ch04 tutorial parity tests
+
+The tutorial chapter `docs/tutorial/md/Ch04_HighLevelApi.md` ships a
+`scaleByThousand` example that walks a user from "I have an Array
+Float" to "I have the same array scaled by 1000.0 on the GPU." These
+tests pin the exact code path that example uses so we don't break
+the tutorial again — they were added after two regressions:
+
+1. `generateUnaryShader` declared both an input AND an output buffer
+   under the same WGSL identifier `data`, producing invalid WGSL
+   ("'data' previously declared here") that Dawn rejected at
+   CreateShaderModule.
+2. `floatToWGSL 1000.0` returned the literal "1.0e2" (=100), not
+   "1.0e3" (=1000), because `log abs / log 10` rounds *below* by
+   a few ulps for powers of ten, leaving the mantissa at exactly
+   10.0 instead of 1.0 with the exponent bumped.
+
+If either regresses again, *both* the unit WGSL test and the full
+GPU dispatch test below will fail. The WGSL test runs on CPU only
+(no GPU required), so it traps a `floatToWGSL` / `generateUnaryShader`
+regression even on machines where the GPU path is skipped.
+-/
+
+-- The exact DSL function the tutorial walks the user through.
+def scaleByThousand : Hesper.WGSL.Exp (.scalar .f32) → Hesper.WGSL.Exp (.scalar .f32) :=
+  fun x => x * Hesper.WGSL.Exp.litF32 1000.0
+
+-- Test (CPU-only): WGSL codegen for the tutorial kernel.  Pins the
+-- single-binding layout that `parallelFor` expects and the literal
+-- `1.0e3` for the scaling constant.  No GPU required.
+def testCh04WGSLCodegen : IO TestSeq := do
+  let wgsl := Hesper.Compute.generateUnaryShader scaleByThousand
+  -- A correct shader has exactly one storage binding named `data`
+  -- and folds the literal 1000.0 as "1.0e3".  Any regression of the
+  -- two bugs above flips one of these substring checks.
+  -- `(s.splitOn sub).length - 1` counts non-overlapping occurrences of `sub` in `s`.
+  let nDataBindings := (wgsl.splitOn "data: array<f32>").length - 1
+  let hasLit1e3 := (wgsl.splitOn "1.0e3").length > 1
+  let hasLit1e2 := (wgsl.splitOn "1.0e2").length > 1
+  pure $
+    test "Ch04 generateUnaryShader: exactly one `data` storage binding" (nDataBindings == 1)
+    ++ test "Ch04 generateUnaryShader: literal 1.0e3 present" hasLit1e3
+    ++ test "Ch04 generateUnaryShader: literal 1.0e2 absent (regression guard for floatToWGSL bug)" (! hasLit1e2)
+
+-- Test (GPU): end-to-end `parallelForDSL` on the host's default GPU.
+-- This is the cell the tutorial runs in xeus-lean and is what the
+-- user expects to see produce `[0, 1000, …, 9000]`.
+def testCh04ParallelForDSL : IO TestSeq := withDevice fun _ device => do
+  let input : Array Float := (Array.range 10).map (·.toFloat)
+  let out ← Hesper.Compute.parallelForDSL device scaleByThousand input
+  let expected : Array Float := input.map (· * 1000.0)
+  let sizesMatch := out.size == expected.size
+  let valsMatch := sizesMatch && (Array.zip out expected).all (fun (a, b) =>
+    -- Allow a tiny absolute tolerance — f32 round-trip on the GPU
+    -- gives bit-exact results for these inputs, but be defensive.
+    let d := a - b
+    let abs_d := if d < 0.0 then 0.0 - d else d
+    abs_d < 0.001)
+  pure $ test s!"Ch04 parallelForDSL scaleByThousand → [0, 1000, …, 9000] (got {out})" valsMatch
+
 -- All compute tests
 def allTests : IO (List (String × List TestSeq)) := do
   IO.println "Running Compute Pipeline Tests..."
@@ -117,6 +179,8 @@ def allTests : IO (List (String × List TestSeq)) := do
   let t4 ← testFullComputePipeline
   let t5 ← testMultipleShaders
   let t6 ← testInvalidShader
+  let t7 ← testCh04WGSLCodegen
+  let t8 ← testCh04ParallelForDSL
 
   pure [
     ("Shader Module Creation", [t1]),
@@ -124,7 +188,9 @@ def allTests : IO (List (String × List TestSeq)) := do
     ("Compute Pipeline Creation", [t3]),
     ("Full Pipeline Setup", [t4]),
     ("Multiple Shaders", [t5]),
-    ("Error: Invalid Shader", [t6])
+    ("Error: Invalid Shader", [t6]),
+    ("Ch04 tutorial WGSL codegen (CPU)", [t7]),
+    ("Ch04 tutorial parallelForDSL (GPU)", [t8])
   ]
 
 end Tests.ComputeTests
