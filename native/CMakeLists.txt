@@ -14,14 +14,6 @@ if(CMAKE_TOOLCHAIN_FILE)
   message(STATUS "Hesper native: using toolchain ${CMAKE_TOOLCHAIN_FILE}")
 endif()
 
-# Expect DAWN_SRC_DIR and DAWN_BUILD_DIR to be provided
-if(NOT DEFINED DAWN_SRC_DIR)
-    message(FATAL_ERROR "DAWN_SRC_DIR must be specified")
-endif()
-if(NOT DEFINED DAWN_BUILD_DIR)
-    message(FATAL_ERROR "DAWN_BUILD_DIR must be specified")
-endif()
-
 # Find Lean installation
 if(NOT DEFINED LEAN_INCLUDE_DIR)
     execute_process(
@@ -31,8 +23,57 @@ if(NOT DEFINED LEAN_INCLUDE_DIR)
     )
     set(LEAN_INCLUDE_DIR "${LEAN_PREFIX}/include")
 endif()
-
 message(STATUS "Lean include directory: ${LEAN_INCLUDE_DIR}")
+
+# ============================================================================
+# Emscripten (browser WebGPU via emdawnwebgpu) — short-circuit branch.
+#
+# When this CMakeLists is invoked under `emcmake cmake ...`, we DON'T build
+# a Dawn-backed shared lib.  Instead we produce a single static archive
+# `libhesper_wasm.a` containing bridge.cpp + cuda_bridge_stub.cpp, and we
+# let the xeus-lean wasm build link us against emdawnwebgpu's `libwebgpu_dawn.a`
+# (its wasm-side reimplementation of the same `wgpu*` C API).
+#
+# The caller picks emdawnwebgpu via one of:
+#   1. `-DEMDAWNWEBGPU_PORT=1` (or `-DEMDAWNWEBGPU_DIR=...`)  → we add
+#      `-sUSE_WEBGPU=0 --use-port=emdawnwebgpu` to consumers.
+#   2. Or nothing — caller is expected to add the include path / flags
+#      themselves (xeus-lean's CMake is responsible for that step).
+#
+# This file's job is just to ship a `libhesper_wasm.a` that resolves
+# every `wgpu*` reference at xlean link time.  See
+# `docs/research/wasm-webgpu-plan.md` for the full plan.
+# ============================================================================
+if(EMSCRIPTEN)
+  message(STATUS "Hesper native: Emscripten build → libhesper_wasm.a (no Dawn)")
+
+  # M1 — link-only scaffold.  bridge_wasm_stub.cpp provides every
+  # `lean_hesper_*` extern as a stub that returns IO.Error("not wired
+  # yet").  This lets xeus-lean's wasm xlean link cleanly so we can
+  # iterate on the Lean side without having to ship the full bridge.cpp
+  # port (which depends on `dawn::native::Instance` and won't compile
+  # under emdawnwebgpu).  The real bridge port lands in M2/M3 — see
+  # docs/research/wasm-webgpu-plan.md.
+  add_library(hesper_wasm STATIC bridge_wasm_stub.cpp cuda_bridge_stub.cpp)
+  target_include_directories(hesper_wasm PRIVATE ${LEAN_INCLUDE_DIR})
+
+  # Marker for downstream detection.
+  file(WRITE "${CMAKE_BINARY_DIR}/hesper_wasm.found" "TRUE")
+  return()  # skip all the native (Dawn / GLFW / CUDA-driver) machinery below
+endif()
+
+# ----------------------------------------------------------------------------
+# Native (non-Emscripten) build path follows.
+# ----------------------------------------------------------------------------
+
+# Expect DAWN_SRC_DIR and DAWN_BUILD_DIR to be provided
+if(NOT DEFINED DAWN_SRC_DIR)
+    message(FATAL_ERROR "DAWN_SRC_DIR must be specified")
+endif()
+if(NOT DEFINED DAWN_BUILD_DIR)
+    message(FATAL_ERROR "DAWN_BUILD_DIR must be specified")
+endif()
+
 message(STATUS "Dawn source directory: ${DAWN_SRC_DIR}")
 message(STATUS "Dawn build directory: ${DAWN_BUILD_DIR}")
 
