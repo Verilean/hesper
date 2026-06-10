@@ -114,17 +114,46 @@ same way it currently does for `libsparkle_wasm.a`.
   (`llvm-nm | grep lean_hesper_init` succeeds), but we have not yet wired it into
   xeus-lean's xlean.
 
-### M2 — wire into xeus-lean's xlean (1–2 sessions)
+### M2 — move build inputs onto the hesper side, prep xeus-lean PR (1 session)
 
-- Submit a small PR to xeus-lean: mirror the existing sparkle path
-  (`xeus-lean/CMakeLists.txt:150-240`) for hesper.
-  - Detect `hesper/native/build-wasm/libhesper_wasm.a` next to the hesper checkout.
-  - `--whole-archive` it into xlean alongside the existing `libsparkle_wasm.a`
-    integration so DCE doesn't strip `lean_hesper_*`.
-- Update `xeus-lean/hesper-wasm/build-wasm.sh` to add `Hesper.WebGPU.Device` and
-  `Hesper.Compute` to its target list (no longer just `Hesper.WGSL.DSL`).
-- Goal at end of M2: in a JupyterLite cell, `#eval Hesper.init` returns a valid
-  `WebGPU.Instance` (proves bridge.cpp ↔ emdawnwebgpu ↔ `navigator.gpu` is wired).
+Direction change vs. M0/M1 design: rather than have xeus-lean own the build
+recipe (lakefile-wasm + patches + builder script under
+`xeus-lean/hesper-wasm/`), hesper itself ships them under `native/wasm/`.
+xeus-lean then only needs to call one script and link the result.
+
+What landed this milestone (hesper side):
+
+- `native/wasm/lakefile-wasm.lean` — WGSL-only Lake build that drops LSpec /
+  nativeDeps / Tests / Examples.
+- `native/wasm/build-wasm.sh <out-dir> [target ...]` — single script that
+  produces both halves in one staging directory:
+  - `<out-dir>/Hesper{,/**}.{olean,olean.server,olean.private,ir,ilean}`
+    via `lake build` against the WASM-only lakefile.
+  - `<out-dir>/lib/libhesper_wasm.a` via the existing
+    `native/CMakeLists.txt` EMSCRIPTEN branch (emcc).
+  - Env knobs: `LEAN_TOOLCHAIN_OVERRIDE` (pin Lean version for xeus-lean
+    integration), `SKIP_LIB` / `SKIP_OLEAN` (phase-only runs).
+- `native/wasm/build-libhesper-wasm.sh` removed — replaced by the unified
+  script above.
+
+What's left for the xeus-lean PR (follow-up, separate session):
+
+- Delete `xeus-lean/hesper/` submodule.
+- Delete `xeus-lean/hesper-wasm/` entirely (build-wasm.sh +
+  lakefile-wasm.lean + patches/). xeus-lean no longer owns hesper build
+  recipes.
+- Add `-DHESPER_WASM_DIR=<staging-dir>` option to xeus-lean's
+  `CMakeLists.txt`. If set, mirror the sparkle `--whole-archive` pattern
+  (`CMakeLists.txt:150-240`) for `${HESPER_WASM_DIR}/lib/libhesper_wasm.a`
+  and stage `${HESPER_WASM_DIR}/Hesper*` into `olean_assets`.
+- Update `xeus-lean`'s CI to run `hesper/native/wasm/build-wasm.sh
+  ${runner.temp}/hesper-wasm` (with the kernel's Lean toolchain pinned via
+  `LEAN_TOOLCHAIN_OVERRIDE`), then pass `-DHESPER_WASM_DIR=...` to the wasm
+  configure step.
+
+Goal at end of M2's xeus-lean PR: in a JupyterLite cell, `import Hesper.WGSL.DSL`
+elaborates and `#eval Hesper.init` returns an `IO.Error` from the stub (which
+proves the link path is correct end-to-end). The real `wgpu*` API wiring is M3.
 
 ### M3 — first `parallelForDSL` end-to-end (1–2 sessions)
 
