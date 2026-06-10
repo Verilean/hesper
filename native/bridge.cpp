@@ -6,8 +6,17 @@
 #endif
 #include <lean/lean.h>
 #include <webgpu/webgpu.h>
+// Native (Dawn) and Emscripten (emdawnwebgpu) split:
+//   - dawn_proc.h / DawnNative.h ship only with Dawn's native build.
+//   - emdawnwebgpu provides `wgpu*` symbols directly via JS shims and
+//     does not have a procs table, so neither header exists in the
+//     wasm sysroot.
+// `webgpu/webgpu.h` is the shared C header — both Dawn and
+// emdawnwebgpu install it at the same path.
+#ifndef __EMSCRIPTEN__
 #include <dawn/dawn_proc.h>
 #include <dawn/native/DawnNative.h>
+#endif
 #include <iostream>
 #include <vector>
 #include <array>
@@ -504,7 +513,15 @@ lean_obj_res lean_hesper_init(lean_obj_res /* unit */) {
     register_webgpu_external_classes();
 
     // 1. Setup ProcTable (Critical for Native Dawn)
+    //
+    // Skipped under Emscripten: emdawnwebgpu links every `wgpu*` C symbol
+    // directly to a JavaScript shim that forwards into the browser's
+    // `navigator.gpu`, so there is no procs table to install.  Calling
+    // dawnProcSetProcs / dawn::native::GetProcs here would also pull in
+    // libdawn_native bits that don't exist in the wasm build.
+#ifndef __EMSCRIPTEN__
     dawnProcSetProcs(&dawn::native::GetProcs());
+#endif
 
     // 2. Create Instance with timed wait support for WaitAny API
     WGPUInstanceFeatureName timedWaitFeature = WGPUInstanceFeatureName_TimedWaitAny;

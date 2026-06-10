@@ -1,0 +1,12 @@
+# Native build outputs — produced by lake's nativeDeps target (Linux /
+# macOS / Windows native paths) or by wasm/build-libhesper-wasm.sh
+# (Emscripten path).  Both are derived from sources in this directory
+# plus their respective CMake configuration.
+build/
+build-cmake/
+build-wasm/
+*.o
+*.so
+*.dylib
+*.dll
+*.a
