@@ -176,3 +176,8 @@ Apache-2.0. See [`LICENSE`](LICENSE).
 - [Google Highway](https://github.com/google/highway) — portable SIMD.
 - [Verilean / sparkle](https://github.com/Verilean/sparkle) — sister project
   bringing the same verification ideas to hardware description.
+
+## Community
+
+- **Discord**: [https://discord.gg/94Xueve8WD](https://discord.gg/94Xueve8WD)
+  — design discussion, weekly progress threads, beginner Q&A.
