@@ -5246,6 +5246,7 @@ def fusedQ4KMGateUpSubgroupKernel (config : Config) : ShaderM Unit := do
 inductive QuantFormat where
   | Q4_K   -- Q4_K_M: 144 bytes per 256 elements
   | Q6_K   -- Q6_K: 210 bytes per 256 elements
+  | Q8_0   -- Q8_0: 34 bytes per 32 elements (f16 scale + 32×int8)
   deriving Repr, BEq, Inhabited
 
 /-- Quantized linear layer (supports Q4_K and Q6_K) -/
@@ -5695,11 +5696,67 @@ def forwardBatchDP4A_fromQ8 [GPUBackend β] (ctx : β)
       { numWorkgroups := (layer.config.outDim, seqLen, 1), workgroupSize := { x := 32, y := 1, z := 1 } }
       cacheKey ref
 
-/-- Execute the linear layer: output = input @ weights^T
+/-- Read one byte (0..255) at a dynamic byte offset within a u32-array buffer. -/
+private def q8ReadByte (bufName : String) (n : Nat) (byteOff : Exp (.scalar .u32)) :
+    ShaderM (Exp (.scalar .u32)) := do
+  let u32idx := Exp.shiftRight byteOff (Exp.litU32 2)
+  let shift := Exp.mul (Exp.bitAnd byteOff (Exp.litU32 3)) (Exp.litU32 8)
+  let word ← ShaderM.readBuffer (ty := .scalar .u32) (n := n) bufName u32idx
+  pure (Exp.bitAnd (Exp.shiftRight word shift) (Exp.litU32 255))
 
-    Fast path: after the first call, the prepared dispatch is cached in
-    `layer.prepared` and subsequent calls bypass WGSL regeneration / hash
-    lookup entirely via `replayPreparedDispatch`. -/
+/-- Q8_0 fused matvec: `out[r] = Σ_c W[r][c]·x[c]`, dequantizing the packed
+    Q8_0 weights INLINE (f16 scale + 32×int8 per 32-elem block, 34 bytes) —
+    weights stay quantized in VRAM (no F32 expansion → preserves the
+    memory-bandwidth win).  One workgroup per output row, strided blocks,
+    tree reduction.  Mirrors `fusedQ4KMLinearKernel`. -/
+def fusedQ8_0LinearKernel (config : Config) (workgroupSize : Nat := 256) : ShaderM Unit := do
+  let wid ← ShaderM.workgroupId
+  let lid ← ShaderM.localId
+  let outIdx := Exp.vec3X wid
+  let tid := Exp.vec3X lid
+  let blocksPerRow := config.inDim / 32
+  let totalBytes := config.outDim * blocksPerRow * 34
+  let totalWeightU32 := (totalBytes + 3) / 4
+  let _weights ← ShaderM.declareReadOnlyBuffer "weights" (.array (.scalar .u32) totalWeightU32)
+  let _input ← ShaderM.declareReadOnlyBuffer "input" (.array (.scalar .f32) config.inDim)
+  let _output ← ShaderM.declareOutputBuffer "output" (.array (.scalar .f32) config.outDim)
+  ShaderM.sharedNamed "shared_partial" (.array (.scalar .f32) workgroupSize)
+  let inBounds := Exp.lt outIdx (Exp.litU32 config.outDim)
+  ShaderM.varNamed "acc" (.scalar .f32) (Exp.litF32 0.0)
+  let acc : Exp (.scalar .f32) := Exp.var "acc"
+  let rowBaseBytes := Exp.mul outIdx (Exp.litU32 (blocksPerRow * 34))
+  ShaderM.loop tid (Exp.litU32 blocksPerRow) (Exp.litU32 workgroupSize) fun blk => do
+    let blockByteBase := Exp.add rowBaseBytes (Exp.mul blk (Exp.litU32 34))
+    let elemBase := Exp.mul blk (Exp.litU32 32)
+    -- f16 scale (bytes 0..1 of the block)
+    let loByte ← q8ReadByte "weights" totalWeightU32 blockByteBase
+    let hiByte ← q8ReadByte "weights" totalWeightU32 (Exp.add blockByteBase (Exp.litU32 1))
+    let f16bits := Exp.add loByte (Exp.mul hiByte (Exp.litU32 256))
+    let d := Exp.vecX (Exp.unpack2x16float f16bits)
+    -- 32 int8 quants (bytes 2..33), dequant inline: w = d * signed(q)
+    for i in [0:32] do
+      let qb ← q8ReadByte "weights" totalWeightU32 (Exp.add blockByteBase (Exp.litU32 (2 + i)))
+      let sign := Exp.shiftRight qb (Exp.litU32 7)
+      let qSigned := Exp.sub (Exp.toF32 qb) (Exp.mul (Exp.litF32 256.0) (Exp.toF32 sign))
+      let w := Exp.mul d qSigned
+      let inVal ← ShaderM.readBuffer (ty := .scalar .f32) (n := config.inDim) "input" (Exp.add elemBase (Exp.litU32 i))
+      ShaderM.assign "acc" (Exp.add acc (Exp.mul w inVal))
+  ShaderM.writeWorkgroup (ty := .scalar .f32) "shared_partial" tid acc
+  ShaderM.barrier
+  let mut stride := workgroupSize / 2
+  while stride > 0 do
+    ShaderM.if_ (Exp.lt tid (Exp.litU32 stride)) (do
+      let a ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := workgroupSize) "shared_partial" tid
+      let b ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := workgroupSize) "shared_partial" (Exp.add tid (Exp.litU32 stride))
+      ShaderM.writeWorkgroup (ty := .scalar .f32) "shared_partial" tid (Exp.add a b)
+    ) (pure ())
+    ShaderM.barrier
+    stride := stride / 2
+  ShaderM.if_ (Exp.and (Exp.eq tid (Exp.litU32 0)) inBounds) (do
+    let totalSum ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := workgroupSize) "shared_partial" (Exp.litU32 0)
+    ShaderM.writeBuffer (ty := .scalar .f32) "output" outIdx totalSum
+  ) (pure ())
+
 def LinearLayer.forward [GPUBackend β] (ctx : β) (layer : LinearLayer (GPUBackend.Buf β) (GPUBackend.CachedDispatch β))
     (inputBuf outputBuf : GPUBackend.Buf β) : IO Unit := do
   let profiling ← profilingRef.get
@@ -5835,6 +5892,10 @@ def LinearLayer.forward [GPUBackend β] (ctx : β) (layer : LinearLayer (GPUBack
       (256,
        Hesper.Quantization.Q6_K.fusedQ6KLinearKernel layer.config.inDim layer.config.outDim,
        hash ("q6k-lin-blockcoop-swpipe", layer.config.inDim, layer.config.outDim, false))
+    | .Q8_0, _ =>
+      (256,
+       fusedQ8_0LinearKernel layer.config,
+       hash ("q8_0-lin", layer.config.inDim, layer.config.outDim))
   let execConfig : Hesper.ExecConfig := {
     numWorkgroups := (layer.config.outDim, 1, 1)
     workgroupSize := { x := wgSize, y := 1, z := 1 }

@@ -72,13 +72,11 @@ private def loadLinear [GPUBackend β] (ctx : β) (gguf : Hesper.GGUF.GGUFFile)
   -- Hesper.Layers.Linear does NOT yet support (only Q4_K/Q6_K).  Loading
   -- them as Q4_K mis-dequantizes → NaN.  Adding a Q8_0 dequant+matmul WGSL
   -- kernel is the gating item for the native forward (see task #5).
-  -- KNOWN GAP: Q8_0 tensors (ffn_down, ffn_down_exps) fall through to Q4_K
-  -- here, which mis-dequantizes → NaN.  Adding a Q8_0 dequant+matmul WGSL
-  -- kernel to Hesper.Layers.Linear is the gating item for a correct native
-  -- forward (task #5).  Kept as Q4_K so the *load* still completes for the
-  -- other (Q4_K/Q6_K) tensors during bring-up.
+  -- ffn_down / ffn_down_exps are Q8_0 (inline-dequant kernel added to
+  -- Hesper.Layers.Linear); everything else is Q4_K (or Q6_K for attn_v).
   let quantFormat : Linear.QuantFormat := match ti.ggmlType with
     | .Q6_K => .Q6_K
+    | .Q8_0 => .Q8_0
     | _ => .Q4_K
   let weightBuf ← uploadTensor ctx gguf name
   let prepared ← GPUBackend.newCacheRef (β := β)
