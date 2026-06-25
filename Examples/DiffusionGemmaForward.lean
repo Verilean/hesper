@@ -34,30 +34,46 @@ abbrev Cfg := Hesper.Models.Gemma4.Config
 def mkBuf (device : Device) (n : Nat) : IO Buffer :=
   createBuffer device { size := (n*4).toUSize, usage := [.storage, .copyDst, .copySrc], mappedAtCreation := false }
 
+-- Scratch-buffer pools (by element count) so per-op buffers are reused, not
+-- accumulated.  Separate in/out pools so a same-size op (e.g. RMSNorm dim→dim)
+-- never aliases input and output.  Values are read back to host between ops,
+-- so reuse across sequential ops is safe.
+initialize inPoolRef : IO.Ref (List (Nat × Buffer)) ← IO.mkRef []
+initialize outPoolRef : IO.Ref (List (Nat × Buffer)) ← IO.mkRef []
+
+def pooled (ref : IO.Ref (List (Nat × Buffer))) (device : Device) (n : Nat) : IO Buffer := do
+  let p ← ref.get
+  match p.find? (·.1 == n) with
+  | some (_, b) => pure b
+  | none => let b ← mkBuf device n; ref.set ((n, b) :: p); pure b
+
+@[inline] def inBuf  (device : Device) (n : Nat) : IO Buffer := pooled inPoolRef device n
+@[inline] def outBuf (device : Device) (n : Nat) : IO Buffer := pooled outPoolRef device n
+
 def dlBuf (device : Device) (b : Buffer) (n : Nat) : IO (Array Float) := do
   let r ← Hesper.Basic.bytesToFloatArray (← mapBufferRead device b 0 (n*4).toUSize)
   unmapBuffer b
   return r
 
 def linF (device : Device) (layer : Lin) (x : Array Float) (outDim : Nat) : IO (Array Float) := do
-  let ib ← mkBuf device x.size
+  let ib ← inBuf device x.size
   writeBuffer device ib 0 (← Hesper.Basic.floatArrayToBytes x)
-  let ob ← mkBuf device outDim
+  let ob ← outBuf device outDim
   Hesper.Layers.Linear.LinearLayer.forward device layer ib ob
   dlBuf device ob outDim
 
 def rmsF (device : Device) (norm : Nrm) (x : Array Float) : IO (Array Float) := do
-  let ib ← mkBuf device x.size
+  let ib ← inBuf device x.size
   writeBuffer device ib 0 (← Hesper.Basic.floatArrayToBytes x)
-  let ob ← mkBuf device x.size
+  let ob ← outBuf device x.size
   Hesper.Layers.RMSNorm.forward device norm ib ob
   dlBuf device ob x.size
 
 /-- Dispatch an expert-indexed kernel (weights already on GPU) on host input. -/
 def expF (device : Device) (weightsBuf : Buffer) (kern : Hesper.WGSL.Monad.ShaderM Unit) (x : Array Float) (outDim : Nat) : IO (Array Float) := do
-  let ib ← mkBuf device x.size
+  let ib ← inBuf device x.size
   writeBuffer device ib 0 (← Hesper.Basic.floatArrayToBytes x)
-  let ob ← mkBuf device outDim
+  let ob ← outBuf device outDim
   let bufs := ("weights", weightsBuf) :: ("input", ib) :: ("output", ob) :: List.nil
   let cfg : Hesper.ExecConfig := { numWorkgroups := (outDim, 1, 1), workgroupSize := { x := 256 } }
   Hesper.GPUBackend.execute device kern bufs cfg
