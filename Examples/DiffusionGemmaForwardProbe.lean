@@ -121,6 +121,33 @@ def main (args : List String) : IO Unit := do
   let downA ← Hesper.Basic.bytesToFloatArray (← mapBufferRead device downOutBuf 0 (dim*4).toUSize)
   unmapBuffer downOutBuf
 
+  -- MoE expert-0 FFN on the real expert tensors: gate_up (Q4_K-expert) → GeGLU → down (Q8_0-expert)
+  let some gateUpExps := blk.moeGateUpExps | throw (IO.userError "no moeGateUpExps")
+  let some downExps := blk.moeDownExps | throw (IO.userError "no moeDownExps")
+  let ffExp := cfg.expertFFSize
+  let gateUpBuf ← mkBuf (2*ffExp)
+  let euKern := Hesper.Layers.Linear.fusedQ4KMExpertKernel { inDim := dim, outDim := 2*ffExp } cfg.numExperts 0
+  let euBufs := ("weights", gateUpExps) :: ("input", ffnNormBuf) :: ("output", gateUpBuf) :: List.nil
+  let euCfg : Hesper.ExecConfig := { numWorkgroups := (2*ffExp, 1, 1), workgroupSize := { x := 256 } }
+  Hesper.GPUBackend.execute device euKern euBufs euCfg
+  let gu ← Hesper.Basic.bytesToFloatArray (← mapBufferRead device gateUpBuf 0 (2*ffExp*4).toUSize)
+  unmapBuffer gateUpBuf
+  -- GeGLU on the expert's gate (first ffExp) and up (next ffExp)
+  let mut egeglu := Array.replicate ffExp 0.0
+  for i in [0:ffExp] do
+    let g := gu[i]!
+    let gl := 0.5*g*(1.0 + Float.tanh (0.7978845608 * (g + 0.044715*g*g*g)))
+    egeglu := egeglu.set! i (gl * gu[ffExp + i]!)
+  let egegluBuf ← mkBuf ffExp
+  writeBuffer device egegluBuf 0 (← Hesper.Basic.floatArrayToBytes egeglu)
+  let edownBuf ← mkBuf dim
+  let edKern := Hesper.Layers.Linear.fusedQ8_0ExpertKernel { inDim := ffExp, outDim := dim } cfg.numExperts 0
+  let edBufs := ("weights", downExps) :: ("input", egegluBuf) :: ("output", edownBuf) :: List.nil
+  let edCfg : Hesper.ExecConfig := { numWorkgroups := (dim, 1, 1), workgroupSize := { x := 256 } }
+  Hesper.GPUBackend.execute device edKern edBufs edCfg
+  let edownA ← Hesper.Basic.bytesToFloatArray (← mapBufferRead device edownBuf 0 (dim*4).toUSize)
+  unmapBuffer edownBuf
+
   let normFinite := normed.all Float.isFinite
   let qFinite := q.all Float.isFinite
   let ffnFinite := gateA.all Float.isFinite && downA.all Float.isFinite
@@ -133,8 +160,10 @@ def main (args : List String) : IO Unit := do
   let woFinite := woOut.all Float.isFinite
   IO.println s!"  attn output wO(Q4_K): finite={woFinite} size={woOut.size}  [0..4]={(woOut.extract 0 4).toList}"
   IO.println s!"  dense FFN: gate/up(Q4_K)→GeGLU→down(Q8_0) finite={downA.all Float.isFinite} size={downA.size}  [0..4]={(downA.extract 0 4).toList}"
-  if normFinite && qFinite && kvFinite && qRopedFinite && woFinite && ffnFinite && q.size == qDim && kA.size == kvDim && woOut.size == dim && gateA.size == ffnDim && downA.size == dim then
-    IO.println "✓ native Metal: full attention path (norm→QKV→qk-norm→RoPE→V→wO) + FFN projections run on the real 26B model"
+  let moeFinite := edownA.all Float.isFinite
+  IO.println s!"  MoE expert-0: gate_up(Q4K-exp)→GeGLU→down(Q8-exp) finite={moeFinite} size={edownA.size}  [0..4]={(edownA.extract 0 4).toList}"
+  if normFinite && qFinite && kvFinite && qRopedFinite && woFinite && ffnFinite && moeFinite && q.size == qDim && kA.size == kvDim && woOut.size == dim && gateA.size == ffnDim && downA.size == dim && edownA.size == dim then
+    IO.println "✓ native Metal: attention forward + dense FFN + MoE expert FFN run on the real 26B model"
   else
     IO.println "✗ probe failed"
     throw (IO.userError "forward probe failed")
