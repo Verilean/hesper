@@ -14,3 +14,4 @@ dump_dg_rmsnorm_golden
 dump_dg_rope_golden
 dump_dg_softcap_golden
 dump_dg_softmax_golden
+dump_dg_q8mm_golden
