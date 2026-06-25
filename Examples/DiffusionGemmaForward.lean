@@ -70,11 +70,13 @@ def rmsF (device : Device) (norm : Nrm) (x : Array Float) : IO (Array Float) := 
   dlBuf device ob x.size
 
 /-- Dispatch an expert-indexed kernel (weights already on GPU) on host input. -/
-def expF (device : Device) (weightsBuf : Buffer) (kern : Hesper.WGSL.Monad.ShaderM Unit) (x : Array Float) (outDim : Nat) : IO (Array Float) := do
+def expF (device : Device) (weightsBuf : Buffer) (kern : Hesper.WGSL.Monad.ShaderM Unit) (x : Array Float) (outDim : Nat) (expertIdx : Nat) : IO (Array Float) := do
   let ib ← inBuf device x.size
   writeBuffer device ib 0 (← Hesper.Basic.floatArrayToBytes x)
   let ob ← outBuf device outDim
-  let bufs := ("weights", weightsBuf) :: ("input", ib) :: ("output", ob) :: List.nil
+  let pb ← inBuf device 1
+  writeBuffer device pb 0 (ByteArray.mk #[UInt8.ofNat expertIdx, 0, 0, 0])
+  let bufs := ("weights", weightsBuf) :: ("input", ib) :: ("params", pb) :: ("output", ob) :: List.nil
   let cfg : Hesper.ExecConfig := { numWorkgroups := (outDim, 1, 1), workgroupSize := { x := 256 } }
   Hesper.GPUBackend.execute device kern bufs cfg
   dlBuf device ob outDim
@@ -159,10 +161,10 @@ def forwardBlock (device : Device) (cfg : Cfg) (blk : Blk) (x : Array Float) : I
   let mut moeSum := Array.replicate dim 0.0
   for y in chosen do
     let e := y.1
-    let gu ← expF device gateUpExps (Hesper.Layers.Linear.fusedQ4KMExpertKernel { inDim := dim, outDim := 2*ffExp } nExp e) moeIn (2*ffExp)
+    let gu ← expF device gateUpExps (Hesper.Layers.Linear.fusedQ4KMExpertKernel { inDim := dim, outDim := 2*ffExp } nExp) moeIn (2*ffExp) e
     let mut eg := Array.replicate ffExp 0.0
     for i in [0:ffExp] do eg := eg.set! i (geluH gu[i]! * gu[ffExp + i]!)
-    let ed ← expF device downExps (Hesper.Layers.Linear.fusedQ8_0ExpertKernel { inDim := ffExp, outDim := dim } nExp e) eg dim
+    let ed ← expF device downExps (Hesper.Layers.Linear.fusedQ8_0ExpertKernel { inDim := ffExp, outDim := dim } nExp) eg dim e
     let ww := y.2 / wSum
     for i in [0:dim] do moeSum := moeSum.set! i (moeSum[i]! + ww * ed[i]!)
   let some pn2 := blk.moePostNorm2 | throw (IO.userError "no post_ffw_norm_2")
