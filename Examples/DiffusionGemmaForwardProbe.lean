@@ -44,9 +44,18 @@ def main (args : List String) : IO Unit := do
   let normBuf ← mkBuf dim
   Hesper.Layers.RMSNorm.forward device blk.attnNorm inBuf normBuf
 
-  -- layer-0 Q projection (Q4_K matmul) on Metal
+  -- layer-0 Q/K/V projections (Q4_K / Q6_K) on Metal
+  let kvDim := cfg.numKVHeads 0 * cfg.headDim 0
   let qBuf ← mkBuf qDim
   Hesper.Layers.Linear.LinearLayer.forward device blk.attention.wQ normBuf qBuf
+  let kBuf ← mkBuf kvDim
+  Hesper.Layers.Linear.LinearLayer.forward device blk.attention.wK normBuf kBuf
+  let vBuf ← mkBuf kvDim
+  Hesper.Layers.Linear.LinearLayer.forward device blk.attention.wV normBuf vBuf
+  let kA ← Hesper.Basic.bytesToFloatArray (← mapBufferRead device kBuf 0 (kvDim*4).toUSize)
+  unmapBuffer kBuf
+  let vA ← Hesper.Basic.bytesToFloatArray (← mapBufferRead device vBuf 0 (kvDim*4).toUSize)
+  unmapBuffer vBuf
 
   -- read back
   let normed ← Hesper.Basic.bytesToFloatArray (← mapBufferRead device normBuf 0 (dim*4).toUSize)
@@ -74,10 +83,11 @@ def main (args : List String) : IO Unit := do
   let ffnFinite := gateA.all Float.isFinite && downA.all Float.isFinite
   IO.println s!"  dim={dim} qDim={qDim} ffnDim={ffnDim} (heads={cfg.numAttentionHeads} headDim0={cfg.headDim 0})"
   IO.println s!"  attn_norm RMSNorm: finite={normFinite}  [0..4]={(normed.extract 0 4).toList}"
-  IO.println s!"  wQ (Q4_K): finite={qFinite}  size={q.size}  [0..4]={(q.extract 0 4).toList}"
-  IO.println s!"  FFN gate(Q4_K) finite={gateA.all Float.isFinite} size={gateA.size}; down(Q4_K) finite={downA.all Float.isFinite} size={downA.size}"
-  if normFinite && qFinite && ffnFinite && q.size == qDim && gateA.size == ffnDim && downA.size == dim then
-    IO.println "✓ native Metal: RMSNorm + Q4_K matmuls (attn-Q, FFN gate/up/down) run on the real 26B model"
+  let kvFinite := kA.all Float.isFinite && vA.all Float.isFinite
+  IO.println s!"  QKV: wQ(Q4_K) finite={qFinite} size={q.size}; wK finite={kA.all Float.isFinite} size={kA.size}; wV(Q6_K) finite={vA.all Float.isFinite} size={vA.size}"
+  IO.println s!"  FFN gate(Q4_K) finite={gateA.all Float.isFinite} size={gateA.size}; down(Q8_0) finite={downA.all Float.isFinite} size={downA.size}"
+  if normFinite && qFinite && kvFinite && ffnFinite && q.size == qDim && kA.size == kvDim && gateA.size == ffnDim && downA.size == dim then
+    IO.println "✓ native Metal: RMSNorm + Q4_K/Q6_K/Q8_0 matmuls (full QKV + FFN gate/up/down) run on the real 26B model"
   else
     IO.println "✗ probe failed"
     throw (IO.userError "forward probe failed")
