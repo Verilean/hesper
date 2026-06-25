@@ -1605,3 +1605,8 @@ lean_exe «diffusiongemma-q8exp-parity» where
   root := `Examples.DSL.DiffusionGemmaQ8ExpertParity
   supportInterpreter := false
   moreLinkArgs := stdLinkArgs
+
+lean_exe «diffusiongemma-forward» where
+  root := `Examples.DiffusionGemmaForward
+  supportInterpreter := false
+  moreLinkArgs := stdLinkArgs
