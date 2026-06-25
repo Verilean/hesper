@@ -1595,3 +1595,8 @@ lean_exe «diffusiongemma-gqa-attn-test» where
   root := `Examples.DSL.DiffusionGemmaGQAAttnTest
   supportInterpreter := false
   moreLinkArgs := stdLinkArgs
+
+lean_exe «diffusiongemma-q4kexp-parity» where
+  root := `Examples.DSL.DiffusionGemmaQ4KExpertParity
+  supportInterpreter := false
+  moreLinkArgs := stdLinkArgs
