@@ -83,3 +83,6 @@ data/gguf/
 # Local benchmark / profile outputs
 docs/research/llama-fusion-analysis/bench/*.txt
 docs/research/llama-fusion-analysis/ir-analysis-lmhead/*.json
+
+# Large model weights
+*.gguf

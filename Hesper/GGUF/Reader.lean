@@ -89,6 +89,42 @@ def loadGGUFMmap (path : String) : IO GGUFFile := do
     }
   | .error msg => throw <| IO.userError s!"Failed to parse GGUF file: {msg}"
 
+/-- Read up to `remaining` bytes from a handle, accumulating across reads
+    until EOF or the cap is hit (a single `Handle.read` may return fewer
+    bytes than requested). -/
+private partial def readPrefixLoop (h : IO.FS.Handle) (remaining : Nat)
+    (acc : ByteArray) : IO ByteArray := do
+  if remaining == 0 then return acc
+  let chunk ← h.read (min remaining (16 * 1024 * 1024)).toUSize
+  if chunk.isEmpty then return acc  -- EOF
+  readPrefixLoop h (remaining - chunk.size) (acc ++ chunk)
+
+/-- Load only the GGUF header (metadata + tensor infos) by reading a
+    bounded prefix of the file — without copying the tensor body.
+    `loadGGUF`/`loadGGUFMmap` both slurp the entire file into a ByteArray,
+    which is unsafe for very large models (a 16 GB file allocates 16 GB).
+
+    Tensor bodies live after the aligned data section, so a prefix that
+    covers metadata + tensor-infos is sufficient: `parseGGUF` sets
+    `dataBlob := ByteArray.empty` when the prefix ends before the data
+    section, and metadata + tensor infos still parse correctly.
+
+    Pure Lean IO (no CUDA/mmap), so it works on every backend.  Use for
+    introspection / validation (config, tensor presence, shapes); tensor
+    body uploads are NOT possible from the returned file.  `maxPrefixBytes`
+    must exceed the metadata+tensor-info size (a few MB even for huge
+    models). -/
+def loadGGUFHeader (path : String)
+    (maxPrefixBytes : Nat := 256 * 1024 * 1024) : IO GGUFFile := do
+  let h ← IO.FS.Handle.mk path .read
+  let prefixBytes ← readPrefixLoop h maxPrefixBytes ByteArray.empty
+  match Parser.parseGGUF prefixBytes with
+  | .ok gguf =>
+    pure { gguf with dataSectionOffset := 0, dataBlob := ByteArray.empty }
+  | .error msg =>
+    throw <| IO.userError
+      s!"Failed to parse GGUF header (read {prefixBytes.size} bytes; increase maxPrefixBytes?): {msg}"
+
 /-! ## Extended GGUFFile API -/
 
 namespace GGUFFile

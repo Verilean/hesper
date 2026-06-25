@@ -1408,6 +1408,61 @@ lean_exe «gemma4-validation» where
   supportInterpreter := false
   moreLinkArgs := stdLinkArgs
 
+lean_exe «diffusiongemma-validation» where
+  root := `Examples.DiffusionGemmaValidation
+  supportInterpreter := false
+  moreLinkArgs := stdLinkArgs
+
+lean_exe «diffusiongemma-tiny-test» where
+  root := `Examples.DiffusionGemmaTinyTest
+  supportInterpreter := false
+  moreLinkArgs := stdLinkArgs
+
+lean_exe «diffusiongemma-rmsnorm-parity» where
+  root := `Examples.DSL.DiffusionGemmaRMSNormParity
+  supportInterpreter := false
+  moreLinkArgs := stdLinkArgs
+
+lean_exe «diffusiongemma-rope-parity» where
+  root := `Examples.DSL.DiffusionGemmaRoPEParity
+  supportInterpreter := false
+  moreLinkArgs := stdLinkArgs
+
+lean_exe «diffusiongemma-geglu-parity» where
+  root := `Examples.DSL.DiffusionGemmaGeGLUParity
+  supportInterpreter := false
+  moreLinkArgs := stdLinkArgs
+
+lean_exe «diffusiongemma-softcap-parity» where
+  root := `Examples.DSL.DiffusionGemmaSoftcapParity
+  supportInterpreter := false
+  moreLinkArgs := stdLinkArgs
+
+lean_exe «diffusiongemma-matmul-parity» where
+  root := `Examples.DSL.DiffusionGemmaMatMulParity
+  supportInterpreter := false
+  moreLinkArgs := stdLinkArgs
+
+lean_exe «diffusiongemma-softmax-parity» where
+  root := `Examples.DSL.DiffusionGemmaSoftmaxParity
+  supportInterpreter := false
+  moreLinkArgs := stdLinkArgs
+
+lean_exe «diffusiongemma-attn-parity» where
+  root := `Examples.DSL.DiffusionGemmaAttnParity
+  supportInterpreter := false
+  moreLinkArgs := stdLinkArgs
+
+lean_exe «diffusiongemma-softcap-gpu-parity» where
+  root := `Examples.DSL.DiffusionGemmaSoftcapGPUParity
+  supportInterpreter := false
+  moreLinkArgs := stdLinkArgs
+
+lean_exe «diffusiongemma-gpu-parity» where
+  root := `Examples.DSL.DiffusionGemmaGPUParity
+  supportInterpreter := false
+  moreLinkArgs := stdLinkArgs
+
 lean_exe «gemma4-embd-test» where
   root := `Examples.Gemma4EmbdTest
   supportInterpreter := false
@@ -1518,5 +1573,10 @@ lean_exe «wmma-shaderm-test» where
 
 lean_exe «wmma-gpu-parity-test» where
   root := `Tests.CUDA.WmmaGPUParityTest
+  supportInterpreter := false
+  moreLinkArgs := stdLinkArgs
+
+lean_exe «diffusiongemma-load» where
+  root := `Examples.DiffusionGemmaLoad
   supportInterpreter := false
   moreLinkArgs := stdLinkArgs
