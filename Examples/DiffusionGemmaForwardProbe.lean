@@ -73,6 +73,22 @@ def main (args : List String) : IO Unit := do
   let qRoped ← Hesper.Basic.bytesToFloatArray (← mapBufferRead device qRopedBuf 0 (qDim*4).toUSize)
   unmapBuffer qRopedBuf
 
+  -- attention output projection: for seqLen=1 the softmax over the single key
+  -- is 1, so attn_head = V[kv_head(h)] (GQA broadcast); concat heads → wO.
+  -- (scores+softmax for seqLen>1 are validated separately in the GQA core test.)
+  let grp := cfg.numAttentionHeads / cfg.numKVHeads 0
+  let mut attnVec := Array.replicate qDim 0.0
+  for h in [0:cfg.numAttentionHeads] do
+    let kvh := h / grp
+    for d in [0:headDim0] do
+      attnVec := attnVec.set! (h*headDim0 + d) (vA[kvh*headDim0 + d]!)
+  let attnVecBuf ← mkBuf qDim
+  writeBuffer device attnVecBuf 0 (← Hesper.Basic.floatArrayToBytes attnVec)
+  let woOutBuf ← mkBuf dim
+  Hesper.Layers.Linear.LinearLayer.forward device blk.attention.wO attnVecBuf woOutBuf
+  let woOut ← Hesper.Basic.bytesToFloatArray (← mapBufferRead device woOutBuf 0 (dim*4).toUSize)
+  unmapBuffer woOutBuf
+
   -- read back
   let normed ← Hesper.Basic.bytesToFloatArray (← mapBufferRead device normBuf 0 (dim*4).toUSize)
   unmapBuffer normBuf
@@ -103,9 +119,11 @@ def main (args : List String) : IO Unit := do
   let qRopedFinite := qRoped.all Float.isFinite
   IO.println s!"  QKV: wQ(Q4_K) finite={qFinite} size={q.size}; wK finite={kA.all Float.isFinite} size={kA.size}; wV(Q6_K) finite={vA.all Float.isFinite} size={vA.size}"
   IO.println s!"  qk-norm + RoPE(Q): finite={qRopedFinite} size={qRoped.size} base={ropeBase}  [0..4]={(qRoped.extract 0 4).toList}"
+  let woFinite := woOut.all Float.isFinite
+  IO.println s!"  attn output wO(Q4_K): finite={woFinite} size={woOut.size}  [0..4]={(woOut.extract 0 4).toList}"
   IO.println s!"  FFN gate(Q4_K) finite={gateA.all Float.isFinite} size={gateA.size}; down(Q8_0) finite={downA.all Float.isFinite} size={downA.size}"
-  if normFinite && qFinite && kvFinite && ffnFinite && q.size == qDim && kA.size == kvDim && gateA.size == ffnDim && downA.size == dim then
-    IO.println "✓ native Metal: RMSNorm + Q4_K/Q6_K/Q8_0 matmuls (full QKV + FFN gate/up/down) run on the real 26B model"
+  if normFinite && qFinite && kvFinite && qRopedFinite && woFinite && ffnFinite && q.size == qDim && kA.size == kvDim && woOut.size == dim && gateA.size == ffnDim && downA.size == dim then
+    IO.println "✓ native Metal: full attention path (norm→QKV→qk-norm→RoPE→V→wO) + FFN projections run on the real 26B model"
   else
     IO.println "✗ probe failed"
     throw (IO.userError "forward probe failed")
