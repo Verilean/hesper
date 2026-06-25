@@ -121,32 +121,76 @@ def main (args : List String) : IO Unit := do
   let downA ← Hesper.Basic.bytesToFloatArray (← mapBufferRead device downOutBuf 0 (dim*4).toUSize)
   unmapBuffer downOutBuf
 
-  -- MoE expert-0 FFN on the real expert tensors: gate_up (Q4_K-expert) → GeGLU → down (Q8_0-expert)
+  -- MoE block: F32 router (host for bring-up) + softmax top-8 + weighted expert sum
   let some gateUpExps := blk.moeGateUpExps | throw (IO.userError "no moeGateUpExps")
   let some downExps := blk.moeDownExps | throw (IO.userError "no moeDownExps")
+  let some routerWb := blk.moeRouterWeight | throw (IO.userError "no router weight")
+  let some routerSb := blk.moeRouterScale | throw (IO.userError "no router scale")
   let ffExp := cfg.expertFFSize
-  let gateUpBuf ← mkBuf (2*ffExp)
-  let euKern := Hesper.Layers.Linear.fusedQ4KMExpertKernel { inDim := dim, outDim := 2*ffExp } cfg.numExperts 0
-  let euBufs := ("weights", gateUpExps) :: ("input", ffnNormBuf) :: ("output", gateUpBuf) :: List.nil
-  let euCfg : Hesper.ExecConfig := { numWorkgroups := (2*ffExp, 1, 1), workgroupSize := { x := 256 } }
-  Hesper.GPUBackend.execute device euKern euBufs euCfg
-  let gu ← Hesper.Basic.bytesToFloatArray (← mapBufferRead device gateUpBuf 0 (2*ffExp*4).toUSize)
-  unmapBuffer gateUpBuf
-  -- GeGLU on the expert's gate (first ffExp) and up (next ffExp)
-  let mut egeglu := Array.replicate ffExp 0.0
-  for i in [0:ffExp] do
-    let g := gu[i]!
-    let gl := 0.5*g*(1.0 + Float.tanh (0.7978845608 * (g + 0.044715*g*g*g)))
-    egeglu := egeglu.set! i (gl * gu[ffExp + i]!)
-  let egegluBuf ← mkBuf ffExp
-  writeBuffer device egegluBuf 0 (← Hesper.Basic.floatArrayToBytes egeglu)
-  let edownBuf ← mkBuf dim
-  let edKern := Hesper.Layers.Linear.fusedQ8_0ExpertKernel { inDim := ffExp, outDim := dim } cfg.numExperts 0
-  let edBufs := ("weights", downExps) :: ("input", egegluBuf) :: ("output", edownBuf) :: List.nil
-  let edCfg : Hesper.ExecConfig := { numWorkgroups := (dim, 1, 1), workgroupSize := { x := 256 } }
-  Hesper.GPUBackend.execute device edKern edBufs edCfg
-  let edownA ← Hesper.Basic.bytesToFloatArray (← mapBufferRead device edownBuf 0 (dim*4).toUSize)
-  unmapBuffer edownBuf
+  let nExp := cfg.numExperts
+  let routerWA ← Hesper.Basic.bytesToFloatArray (← mapBufferRead device routerWb 0 (nExp*dim*4).toUSize)
+  unmapBuffer routerWb
+  let routerSA ← Hesper.Basic.bytesToFloatArray (← mapBufferRead device routerSb 0 (dim*4).toUSize)
+  unmapBuffer routerSb
+  -- router prep: tmp = rmsnorm_noscale(moe_in) × 1/√d × gate_inp_s   (moe_in proxy = inArr)
+  let mut rss := 0.0
+  for i in [0:dim] do rss := rss + inArr[i]! * inArr[i]!
+  let invR := 1.0 / Float.sqrt (rss / dim.toFloat + cfg.rmsNormEps)
+  let invSqrtD := 1.0 / Float.sqrt dim.toFloat
+  let mut rtmp := Array.replicate dim 0.0
+  for i in [0:dim] do rtmp := rtmp.set! i (inArr[i]! * invR * invSqrtD * routerSA[i]!)
+  let mut rlogits := Array.replicate nExp 0.0
+  for e in [0:nExp] do
+    let mut s := 0.0
+    for i in [0:dim] do s := s + routerWA[e*dim+i]! * rtmp[i]!
+    rlogits := rlogits.set! e s
+  let mut rmx := rlogits[0]!
+  for e in [1:nExp] do if rlogits[e]! > rmx then rmx := rlogits[e]!
+  let mut rsum := 0.0
+  let mut rprob := Array.replicate nExp 0.0
+  for e in [0:nExp] do
+    let pe := Float.exp (rlogits[e]! - rmx); rprob := rprob.set! e pe; rsum := rsum + pe
+  for e in [0:nExp] do rprob := rprob.set! e (rprob[e]! / rsum)
+  -- top-8
+  let mut chosen : Array (Nat × Float) := #[]
+  let mut rused := Array.replicate nExp false
+  for _ in [0:cfg.numExpertsUsed] do
+    let mut bi := 0
+    let mut bv := -1.0
+    for e in [0:nExp] do
+      if !rused[e]! && rprob[e]! > bv then bv := rprob[e]!; bi := e
+    rused := rused.set! bi true
+    chosen := chosen.push (bi, bv)
+  let wSum := chosen.foldl (fun a x => a + x.2) 0.0
+  -- weighted sum over the 8 selected experts: gate_up(Q4K-exp)→GeGLU→down(Q8-exp)
+  let mut moeOut := Array.replicate dim 0.0
+  for x in chosen do
+    let e := x.1
+    let gateUpBuf ← mkBuf (2*ffExp)
+    let euKern := Hesper.Layers.Linear.fusedQ4KMExpertKernel { inDim := dim, outDim := 2*ffExp } nExp e
+    let euBufs := ("weights", gateUpExps) :: ("input", ffnNormBuf) :: ("output", gateUpBuf) :: List.nil
+    let euCfg : Hesper.ExecConfig := { numWorkgroups := (2*ffExp, 1, 1), workgroupSize := { x := 256 } }
+    Hesper.GPUBackend.execute device euKern euBufs euCfg
+    let gu ← Hesper.Basic.bytesToFloatArray (← mapBufferRead device gateUpBuf 0 (2*ffExp*4).toUSize)
+    unmapBuffer gateUpBuf
+    let mut egeglu := Array.replicate ffExp 0.0
+    for i in [0:ffExp] do
+      let g := gu[i]!
+      let gl := 0.5*g*(1.0 + Float.tanh (0.7978845608 * (g + 0.044715*g*g*g)))
+      egeglu := egeglu.set! i (gl * gu[ffExp + i]!)
+    let egegluBuf ← mkBuf ffExp
+    writeBuffer device egegluBuf 0 (← Hesper.Basic.floatArrayToBytes egeglu)
+    let edownBuf ← mkBuf dim
+    let edKern := Hesper.Layers.Linear.fusedQ8_0ExpertKernel { inDim := ffExp, outDim := dim } nExp e
+    let edBufs := ("weights", downExps) :: ("input", egegluBuf) :: ("output", edownBuf) :: List.nil
+    let edCfg : Hesper.ExecConfig := { numWorkgroups := (dim, 1, 1), workgroupSize := { x := 256 } }
+    Hesper.GPUBackend.execute device edKern edBufs edCfg
+    let edown ← Hesper.Basic.bytesToFloatArray (← mapBufferRead device edownBuf 0 (dim*4).toUSize)
+    unmapBuffer edownBuf
+    let ww := x.2 / wSum
+    for i in [0:dim] do moeOut := moeOut.set! i (moeOut[i]! + ww * edown[i]!)
+  let edownA := moeOut
+  let topIdx := chosen.map (·.1)
 
   let normFinite := normed.all Float.isFinite
   let qFinite := q.all Float.isFinite
@@ -161,9 +205,9 @@ def main (args : List String) : IO Unit := do
   IO.println s!"  attn output wO(Q4_K): finite={woFinite} size={woOut.size}  [0..4]={(woOut.extract 0 4).toList}"
   IO.println s!"  dense FFN: gate/up(Q4_K)→GeGLU→down(Q8_0) finite={downA.all Float.isFinite} size={downA.size}  [0..4]={(downA.extract 0 4).toList}"
   let moeFinite := edownA.all Float.isFinite
-  IO.println s!"  MoE expert-0: gate_up(Q4K-exp)→GeGLU→down(Q8-exp) finite={moeFinite} size={edownA.size}  [0..4]={(edownA.extract 0 4).toList}"
+  IO.println s!"  MoE block: router top-8 experts={topIdx.toList} → weighted gate_up/GeGLU/down  finite={moeFinite} size={edownA.size}  [0..4]={(edownA.extract 0 4).toList}"
   if normFinite && qFinite && kvFinite && qRopedFinite && woFinite && ffnFinite && moeFinite && q.size == qDim && kA.size == kvDim && woOut.size == dim && gateA.size == ffnDim && downA.size == dim && edownA.size == dim then
-    IO.println "✓ native Metal: attention forward + dense FFN + MoE expert FFN run on the real 26B model"
+    IO.println "✓ native Metal: attention forward + dense FFN + full MoE block (router+top-8+experts) run on the real 26B model"
   else
     IO.println "✗ probe failed"
     throw (IO.userError "forward probe failed")
