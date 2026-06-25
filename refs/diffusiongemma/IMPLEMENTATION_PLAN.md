@@ -62,3 +62,16 @@ On the Phase-0-fixed pattern, build `forwardBlock` GPU-resident:
 - geluMulKernel + dispatch verified CORRECT (1 thread/elem, buffers gate/up/output, dispatch ceil(ffn/256)×256). Kernel is not the bug.
 - So root cause = (b)/(c): a batch sync/barrier or dispatch-mechanism subtlety when mixing a raw `executeWithConfigCached` op (geluMul) with the `Layers.*` ops inside one `beginBatch`. Gemma4 routes its ENTIRE forward through `ce`; mixing paths breaks it.
 - NEXT: study `BitNet.forward` + `TransformerBlock.forward` to see how it sequences its block's geluMul-equivalent with matmuls in one batch (barriers? all-through-one-mechanism?), then route ALL custom ops through that. Likely: don't mix — build the whole block through one consistent ce-like dispatch wrapper + a shared CachedLayerBuffers, exactly like BitNet/Gemma4.
+
+## Phase 0 — SOLVED (commit 3a480a0)
+ROOT CAUSE: NOT batching/binding/sync. The gelu tanh-approx `tanh(0.798*(g+0.0447*g³))`
+feeds huge arguments for large gate values, and **Metal's tanh = (exp(2x)-1)/(exp(2x)+1)
+= Inf/Inf = NaN** for large x (doesn't saturate). The geglu parity test used small inputs
+so never triggered it. FIX: clamp the tanh argument to [-10,10] (tanh(±10)≈±1, negligible err).
+Debug path that pinned it: single-input copy works → both inputs individually finite →
+`g + 0*u` finite (binding/sync fine) → only the gelu *expression* NaNs → dumped WGSL (correct)
+→ tanh overflow.  Real dense FFN now GPU-resident, 3-layer finite.
+ACTION ITEM: audit ALL tanh-based kernels for Metal overflow — esp. **logit softcap**
+(`scale*tanh(x/scale)`); clamp `x/scale` similarly. Also the real GeGLU kernel used in
+Phase 1 must carry this clamp (don't reuse the unclamped Gemma4 geluMulKernel on Metal).
+30-layer still overflows = dense-only skeleton (no attention/out_scale) — that's Phase 1, not a bug.
