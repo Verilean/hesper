@@ -1580,3 +1580,8 @@ lean_exe «diffusiongemma-load» where
   root := `Examples.DiffusionGemmaLoad
   supportInterpreter := false
   moreLinkArgs := stdLinkArgs
+
+lean_exe «diffusiongemma-forward-probe» where
+  root := `Examples.DiffusionGemmaForwardProbe
+  supportInterpreter := false
+  moreLinkArgs := stdLinkArgs
