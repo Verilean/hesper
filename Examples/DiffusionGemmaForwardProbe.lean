@@ -103,10 +103,21 @@ def main (args : List String) : IO Unit := do
   Hesper.Layers.Linear.LinearLayer.forward device blk.ffn.gate ffnNormBuf gateBuf
   let upBuf ← mkBuf ffnDim
   Hesper.Layers.Linear.LinearLayer.forward device blk.ffn.up ffnNormBuf upBuf
-  let downOutBuf ← mkBuf dim
-  Hesper.Layers.Linear.LinearLayer.forward device blk.ffn.down gateBuf downOutBuf
   let gateA ← Hesper.Basic.bytesToFloatArray (← mapBufferRead device gateBuf 0 (ffnDim*4).toUSize)
   unmapBuffer gateBuf
+  let upA ← Hesper.Basic.bytesToFloatArray (← mapBufferRead device upBuf 0 (ffnDim*4).toUSize)
+  unmapBuffer upBuf
+  -- dense shared-expert GeGLU: gelu(gate)*up  (geglu kernel validated separately;
+  -- computed here on host for bring-up, down projection runs native Q8_0 on Metal)
+  let mut geglu := Array.replicate ffnDim 0.0
+  for i in [0:ffnDim] do
+    let g := gateA[i]!
+    let gl := 0.5*g*(1.0 + Float.tanh (0.7978845608 * (g + 0.044715*g*g*g)))
+    geglu := geglu.set! i (gl * upA[i]!)
+  let gegluBuf ← mkBuf ffnDim
+  writeBuffer device gegluBuf 0 (← Hesper.Basic.floatArrayToBytes geglu)
+  let downOutBuf ← mkBuf dim
+  Hesper.Layers.Linear.LinearLayer.forward device blk.ffn.down gegluBuf downOutBuf
   let downA ← Hesper.Basic.bytesToFloatArray (← mapBufferRead device downOutBuf 0 (dim*4).toUSize)
   unmapBuffer downOutBuf
 
@@ -121,7 +132,7 @@ def main (args : List String) : IO Unit := do
   IO.println s!"  qk-norm + RoPE(Q): finite={qRopedFinite} size={qRoped.size} base={ropeBase}  [0..4]={(qRoped.extract 0 4).toList}"
   let woFinite := woOut.all Float.isFinite
   IO.println s!"  attn output wO(Q4_K): finite={woFinite} size={woOut.size}  [0..4]={(woOut.extract 0 4).toList}"
-  IO.println s!"  FFN gate(Q4_K) finite={gateA.all Float.isFinite} size={gateA.size}; down(Q8_0) finite={downA.all Float.isFinite} size={downA.size}"
+  IO.println s!"  dense FFN: gate/up(Q4_K)→GeGLU→down(Q8_0) finite={downA.all Float.isFinite} size={downA.size}  [0..4]={(downA.extract 0 4).toList}"
   if normFinite && qFinite && kvFinite && qRopedFinite && woFinite && ffnFinite && q.size == qDim && kA.size == kvDim && woOut.size == dim && gateA.size == ffnDim && downA.size == dim then
     IO.println "✓ native Metal: full attention path (norm→QKV→qk-norm→RoPE→V→wO) + FFN projections run on the real 26B model"
   else
