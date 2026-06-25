@@ -16,15 +16,35 @@ keep data **GPU-resident** (no per-op host round-trips), ping-pong buffers
 across layers.  This fixes the per-op-dispatch resource accumulation that
 crashed the host-round-trip probe at ~layer 3.
 
-Structural skeleton (dense path: RMSNorm→gate→down→norm+residual per layer)
-to prove the 30-layer GPU-resident loop runs in one batch without crashing.
-Full attention V-reuse + GeGLU + MoE routing layer in next.
+Real dense FFN (RMSNorm→gate/up→GeGLU→down→postFFNNorm+residual) GPU-resident.
+Phase 0 SOLVED: the GeGLU-in-batch NaN was Metal's tanh overflowing to NaN for
+large args (not a batching/binding bug) — fixed by clamping the tanh argument.
+3-layer finite. 30-layer still overflows: dense-only, missing attention + out_scale
+(Phase 1).  GeGLU uses geluMulV2 (read-only-safe, clamped tanh).
 
 Run:  lake exe diffusiongemma-forward-gpu [path] [nLayers]
 -/
 
 open Hesper.WebGPU
+open Hesper.WGSL
+open Hesper.WGSL.Monad
 open Hesper.Models.DiffusionGemma
+
+/-- GeGLU mirroring BitNet's reluSqrMulKernel pattern: declareInputBuffer, unconditional reads, select-guarded write (no if_). -/
+def geluMulV2 (n : Nat) : Hesper.WGSL.Monad.ShaderM Unit := do
+  let gid ← ShaderM.globalId
+  let i := Exp.vec3X gid
+  let inB := Exp.lt i (Exp.litU32 n)
+  let _g ← ShaderM.declareInputBuffer "gate" (.array (.scalar .f32) n)
+  let _u ← ShaderM.declareInputBuffer "up" (.array (.scalar .f32) n)
+  let _o ← ShaderM.declareOutputBuffer "outp" (.array (.scalar .f32) n)
+  let g ← ShaderM.readBuffer (ty := .scalar .f32) (n := n) "gate" i
+  let u ← ShaderM.readBuffer (ty := .scalar .f32) (n := n) "up" i
+  let g3 := Exp.mul g (Exp.mul g g)
+  let inner := Exp.mul (Exp.litF32 0.7978845608) (Exp.add g (Exp.mul (Exp.litF32 0.044715) g3))
+  let innerC := Exp.max (Exp.litF32 (-10.0)) (Exp.min (Exp.litF32 10.0) inner)  -- avoid Metal tanh overflow→NaN
+  let gl := Exp.mul (Exp.mul (Exp.litF32 0.5) g) (Exp.add (Exp.litF32 1.0) (Exp.tanh innerC))
+  ShaderM.writeBuffer (ty := .scalar .f32) "outp" i (Exp.select inB (Exp.mul gl u) (Exp.litF32 0.0))
 
 abbrev B := Hesper.GPUBackend.Buf Device
 abbrev C := Hesper.GPUBackend.CachedDispatch Device
@@ -64,6 +84,8 @@ def main (args : List String) : IO Unit := do
   let b ← mkBuf device dim
   let sN ← mkBuf device dim
   let sG ← mkBuf device ffn
+  let sU ← mkBuf device ffn
+  let sGeglu ← mkBuf device ffn
   let sD ← mkBuf device dim
   let logitsBuf ← mkBuf device lmN
   let lmHead ← mkLin device model.inner.outputWeight dim lmN .Q6_K
@@ -82,7 +104,12 @@ def main (args : List String) : IO Unit := do
     -- dense path (structural): RMSNorm → gate → down → (postFFNNorm + residual)
     Hesper.Layers.RMSNorm.forward device blk.ffnNorm cur sN
     Hesper.Layers.Linear.LinearLayer.forward device blk.ffn.gate sN sG
-    Hesper.Layers.Linear.LinearLayer.forward device blk.ffn.down sG sD
+    Hesper.Layers.Linear.LinearLayer.forward device blk.ffn.up sN sU
+    let gpref ← IO.mkRef none
+    let gbufs := ("gate", sG) :: ("up", sU) :: ("outp", sGeglu) :: List.nil
+    let gcfg : Hesper.ExecConfig := { numWorkgroups := ((ffn + 255)/256, 1, 1), workgroupSize := { x := 256 } }
+    Hesper.GPUBackend.executeWithConfigCached device (geluMulV2 ffn) gbufs gcfg (hash ("dg-geglu2", ffn)) gpref
+    Hesper.Layers.Linear.LinearLayer.forward device blk.ffn.down sGeglu sD
     let pref ← IO.mkRef none
     Hesper.Layers.RMSNorm.forwardNormThenAdd device blk.postFFNNorm sD cur nxt pref
     let t := cur; cur := nxt; nxt := t
