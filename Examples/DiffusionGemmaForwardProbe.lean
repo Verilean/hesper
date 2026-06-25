@@ -89,6 +89,16 @@ def main (args : List String) : IO Unit := do
   let woOut ← Hesper.Basic.bytesToFloatArray (← mapBufferRead device woOutBuf 0 (dim*4).toUSize)
   unmapBuffer woOutBuf
 
+  -- attention residual: r = postAttnNorm(wO_out) + input  (correct sequential data flow)
+  let woReBuf ← mkBuf dim
+  writeBuffer device woReBuf 0 (← Hesper.Basic.floatArrayToBytes woOut)
+  let postAttnBuf ← mkBuf dim
+  Hesper.Layers.RMSNorm.forward device blk.postAttnNorm woReBuf postAttnBuf
+  let postAttn ← Hesper.Basic.bytesToFloatArray (← mapBufferRead device postAttnBuf 0 (dim*4).toUSize)
+  unmapBuffer postAttnBuf
+  let mut attnResid := Array.replicate dim 0.0
+  for i in [0:dim] do attnResid := attnResid.set! i (postAttn[i]! + inArr[i]!)
+
   -- read back
   let normed ← Hesper.Basic.bytesToFloatArray (← mapBufferRead device normBuf 0 (dim*4).toUSize)
   unmapBuffer normBuf
@@ -203,10 +213,12 @@ def main (args : List String) : IO Unit := do
   IO.println s!"  qk-norm + RoPE(Q): finite={qRopedFinite} size={qRoped.size} base={ropeBase}  [0..4]={(qRoped.extract 0 4).toList}"
   let woFinite := woOut.all Float.isFinite
   IO.println s!"  attn output wO(Q4_K): finite={woFinite} size={woOut.size}  [0..4]={(woOut.extract 0 4).toList}"
+  let residFinite := attnResid.all Float.isFinite
+  IO.println s!"  attn residual postAttnNorm(wO)+input: finite={residFinite} size={attnResid.size}  [0..4]={(attnResid.extract 0 4).toList}"
   IO.println s!"  dense FFN: gate/up(Q4_K)→GeGLU→down(Q8_0) finite={downA.all Float.isFinite} size={downA.size}  [0..4]={(downA.extract 0 4).toList}"
   let moeFinite := edownA.all Float.isFinite
   IO.println s!"  MoE block: router top-8 experts={topIdx.toList} → weighted gate_up/GeGLU/down  finite={moeFinite} size={edownA.size}  [0..4]={(edownA.extract 0 4).toList}"
-  if normFinite && qFinite && kvFinite && qRopedFinite && woFinite && ffnFinite && moeFinite && q.size == qDim && kA.size == kvDim && woOut.size == dim && gateA.size == ffnDim && downA.size == dim && edownA.size == dim then
+  if normFinite && qFinite && kvFinite && qRopedFinite && woFinite && residFinite && ffnFinite && moeFinite && q.size == qDim && kA.size == kvDim && woOut.size == dim && attnResid.size == dim && gateA.size == ffnDim && downA.size == dim && edownA.size == dim then
     IO.println "✓ native Metal: attention forward + dense FFN + full MoE block (router+top-8+experts) run on the real 26B model"
   else
     IO.println "✗ probe failed"
