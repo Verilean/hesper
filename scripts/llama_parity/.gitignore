@@ -16,3 +16,4 @@ dump_dg_softcap_golden
 dump_dg_softmax_golden
 dump_dg_q8mm_golden
 dump_dg_q4kexp_golden
+dump_dg_q8exp_golden
