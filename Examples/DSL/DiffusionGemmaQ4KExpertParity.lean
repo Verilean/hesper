@@ -45,8 +45,10 @@ def main : IO Unit := do
   writeBuffer device inBuf 0 (← Hesper.Basic.floatArrayToBytes x)
   let outBuf ← createBuffer device { size := (outD*4).toUSize, usage := [.storage, .copyDst, .copySrc], mappedAtCreation := false }
 
-  let kern := Hesper.Layers.Linear.fusedQ4KMExpertKernel { inDim := inD, outDim := outD } nExp e
-  let bufs := ("weights", wBuf) :: ("input", inBuf) :: ("output", outBuf) :: List.nil
+  let kern := Hesper.Layers.Linear.fusedQ4KMExpertKernel { inDim := inD, outDim := outD } nExp
+  let pBuf ← createBuffer device { size := (4 : Nat).toUSize, usage := [.storage, .copyDst, .copySrc], mappedAtCreation := false }
+  writeBuffer device pBuf 0 (ByteArray.mk #[UInt8.ofNat e, 0, 0, 0])
+  let bufs := ("weights", wBuf) :: ("input", inBuf) :: ("params", pBuf) :: ("output", outBuf) :: List.nil
   let cfg : Hesper.ExecConfig := { numWorkgroups := (outD, 1, 1), workgroupSize := { x := 256 } }
   Hesper.GPUBackend.execute device kern bufs cfg
 
