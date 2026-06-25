@@ -1610,3 +1610,8 @@ lean_exe «diffusiongemma-forward» where
   root := `Examples.DiffusionGemmaForward
   supportInterpreter := false
   moreLinkArgs := stdLinkArgs
+
+lean_exe «diffusiongemma-forward-gpu» where
+  root := `Examples.DiffusionGemmaForwardGPU
+  supportInterpreter := false
+  moreLinkArgs := stdLinkArgs
