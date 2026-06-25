@@ -2,8 +2,10 @@ import Hesper
 import Hesper.Backend
 import Hesper.WebGPU.Device
 import Hesper.Models.DiffusionGemma.Loader
+import Hesper.Models.Gemma4.Kernels
 import Hesper.Layers.Linear
 import Hesper.Layers.RMSNorm
+import Hesper.Layers.RoPE
 import Hesper.Basic
 
 /-!
@@ -57,6 +59,20 @@ def main (args : List String) : IO Unit := do
   let vA ← Hesper.Basic.bytesToFloatArray (← mapBufferRead device vBuf 0 (kvDim*4).toUSize)
   unmapBuffer vBuf
 
+  -- attention prologue: per-head qk-norm (Gemma) + RoPE on Q (Metal)
+  let headDim0 := cfg.headDim 0
+  let qNormBuf ← mkBuf qDim
+  let qnKern := Hesper.Models.Gemma4.perHeadRMSNormKernel cfg.numAttentionHeads headDim0 cfg.rmsNormEps
+  let qnBufs := ("input", qBuf) :: ("weight", blk.attention.qNormWeight) :: ("output", qNormBuf) :: List.nil
+  let qnCfg : Hesper.ExecConfig := { numWorkgroups := (cfg.numAttentionHeads, 1, 1), workgroupSize := { x := 256 } }
+  Hesper.GPUBackend.execute device qnKern qnBufs qnCfg
+  let ropeBase := if cfg.isFullAttention 0 then cfg.ropeTheta else cfg.ropeThetaSWA
+  let rope ← Hesper.Layers.RoPE.create { dim := qDim, maxSeqLen := 4096, base := ropeBase }
+  let qRopedBuf ← mkBuf qDim
+  Hesper.Layers.RoPE.forward device rope qNormBuf qRopedBuf 1 1 cfg.numAttentionHeads headDim0 0
+  let qRoped ← Hesper.Basic.bytesToFloatArray (← mapBufferRead device qRopedBuf 0 (qDim*4).toUSize)
+  unmapBuffer qRopedBuf
+
   -- read back
   let normed ← Hesper.Basic.bytesToFloatArray (← mapBufferRead device normBuf 0 (dim*4).toUSize)
   unmapBuffer normBuf
@@ -84,7 +100,9 @@ def main (args : List String) : IO Unit := do
   IO.println s!"  dim={dim} qDim={qDim} ffnDim={ffnDim} (heads={cfg.numAttentionHeads} headDim0={cfg.headDim 0})"
   IO.println s!"  attn_norm RMSNorm: finite={normFinite}  [0..4]={(normed.extract 0 4).toList}"
   let kvFinite := kA.all Float.isFinite && vA.all Float.isFinite
+  let qRopedFinite := qRoped.all Float.isFinite
   IO.println s!"  QKV: wQ(Q4_K) finite={qFinite} size={q.size}; wK finite={kA.all Float.isFinite} size={kA.size}; wV(Q6_K) finite={vA.all Float.isFinite} size={vA.size}"
+  IO.println s!"  qk-norm + RoPE(Q): finite={qRopedFinite} size={qRoped.size} base={ropeBase}  [0..4]={(qRoped.extract 0 4).toList}"
   IO.println s!"  FFN gate(Q4_K) finite={gateA.all Float.isFinite} size={gateA.size}; down(Q8_0) finite={downA.all Float.isFinite} size={downA.size}"
   if normFinite && qFinite && kvFinite && ffnFinite && q.size == qDim && kA.size == kvDim && gateA.size == ffnDim && downA.size == dim then
     IO.println "✓ native Metal: RMSNorm + Q4_K/Q6_K/Q8_0 matmuls (full QKV + FFN gate/up/down) run on the real 26B model"
