@@ -5761,7 +5761,7 @@ def fusedQ8_0LinearKernel (config : Config) (workgroupSize : Nat := 256) : Shade
     (DiffusionGemma ffn_down_exps).  Expert `e`'s weight = a Q8_0 `[inDim,outDim]`
     at byte base `e * outDim * (inDim/32) * 34`.  Validated-base Q8_0 math +
     expert offset; packed weights stay in VRAM. -/
-def fusedQ8_0ExpertKernel (config : Config) (nExpert : Nat) (workgroupSize : Nat := 256) : ShaderM Unit := do
+def fusedQ8_0ExpertKernel (config : Config) (nExpert : Nat) (paramsLen : Nat := 1) (slot : Nat := 0) (workgroupSize : Nat := 256) : ShaderM Unit := do
   let wid ← ShaderM.workgroupId
   let lid ← ShaderM.localId
   let outIdx := Exp.vec3X wid
@@ -5772,14 +5772,14 @@ def fusedQ8_0ExpertKernel (config : Config) (nExpert : Nat) (workgroupSize : Nat
   let totalWeightU32 := (totalBytes + 3) / 4
   let _weights ← ShaderM.declareReadOnlyBuffer "weights" (.array (.scalar .u32) totalWeightU32)
   let _input ← ShaderM.declareReadOnlyBuffer "input" (.array (.scalar .f32) config.inDim)
-  let _params ← ShaderM.declareReadOnlyBuffer "params" (.array (.scalar .u32) 1)
+  let _params ← ShaderM.declareReadOnlyBuffer "params" (.array (.scalar .u32) paramsLen)
   let _output ← ShaderM.declareOutputBuffer "output" (.array (.scalar .f32) config.outDim)
   ShaderM.sharedNamed "shared_partial" (.array (.scalar .f32) workgroupSize)
   let inBounds := Exp.lt outIdx (Exp.litU32 config.outDim)
   ShaderM.varNamed "acc" (.scalar .f32) (Exp.litF32 0.0)
   let acc : Exp (.scalar .f32) := Exp.var "acc"
   -- expert index read dynamically (one shader for all experts)
-  let expertIdx ← ShaderM.readBuffer (ty := .scalar .u32) (n := 1) "params" (Exp.litU32 0)
+  let expertIdx ← ShaderM.readBuffer (ty := .scalar .u32) (n := paramsLen) "params" (Exp.litU32 slot)
   let rowBaseBytes := Exp.add (Exp.mul expertIdx (Exp.litU32 perExpertBytes)) (Exp.mul outIdx (Exp.litU32 (blocksPerRow * 34)))
   ShaderM.loop tid (Exp.litU32 blocksPerRow) (Exp.litU32 workgroupSize) fun blk => do
     let blockByteBase := Exp.add rowBaseBytes (Exp.mul blk (Exp.litU32 34))
@@ -5817,7 +5817,7 @@ def fusedQ8_0ExpertKernel (config : Config) (nExpert : Nat) (workgroupSize : Nat
     `e * outDim * (inDim/256) * 36` u32.  Identical math to
     `fusedQ4KMLinearKernel` (validated) — only the row base adds the expert
     offset.  `weights` stays packed in VRAM (inline dequant). -/
-def fusedQ4KMExpertKernel (config : Config) (nExpert : Nat) (workgroupSize : Nat := 256) : ShaderM Unit := do
+def fusedQ4KMExpertKernel (config : Config) (nExpert : Nat) (paramsLen : Nat := 1) (slot : Nat := 0) (workgroupSize : Nat := 256) : ShaderM Unit := do
   let wid ← ShaderM.workgroupId
   let lid ← ShaderM.localId
   let outIdx := Exp.vec3X wid
@@ -5827,14 +5827,14 @@ def fusedQ4KMExpertKernel (config : Config) (nExpert : Nat) (workgroupSize : Nat
   let totalWeightU32 := nExpert * perExpertU32
   let _weights ← ShaderM.declareReadOnlyBuffer "weights" (.array (.scalar .u32) totalWeightU32)
   let _input ← ShaderM.declareReadOnlyBuffer "input" (.array (.scalar .f32) config.inDim)
-  let _params ← ShaderM.declareReadOnlyBuffer "params" (.array (.scalar .u32) 1)
+  let _params ← ShaderM.declareReadOnlyBuffer "params" (.array (.scalar .u32) paramsLen)
   let _output ← ShaderM.declareOutputBuffer "output" (.array (.scalar .f32) config.outDim)
   ShaderM.sharedNamed "shared_partial" (.array (.scalar .f32) workgroupSize)
   let inBounds := Exp.lt outIdx (Exp.litU32 config.outDim)
   ShaderM.varNamed "acc" (.scalar .f32) (Exp.litF32 0.0)
   let acc : Exp (.scalar .f32) := Exp.var "acc"
   -- expert index read dynamically (one shader for all experts → no pipeline explosion)
-  let expertIdx ← ShaderM.readBuffer (ty := .scalar .u32) (n := 1) "params" (Exp.litU32 0)
+  let expertIdx ← ShaderM.readBuffer (ty := .scalar .u32) (n := paramsLen) "params" (Exp.litU32 slot)
   let rowBaseU32 := Exp.add (Exp.mul expertIdx (Exp.litU32 perExpertU32)) (Exp.mul outIdx (Exp.litU32 (blocksPerRow * 36)))
   ShaderM.loop tid (Exp.litU32 blocksPerRow) (Exp.litU32 workgroupSize) fun blockLocalIdx => do
     let blockU32Base := Exp.add rowBaseU32 (Exp.mul blockLocalIdx (Exp.litU32 36))
