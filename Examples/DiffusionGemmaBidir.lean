@@ -53,14 +53,16 @@ def addB (n : Nat) : Hesper.WGSL.Monad.ShaderM Unit := do
   let bv := Exp.index (Exp.var "bin" : Exp (.array (.scalar .f32) n)) i
   ShaderM.writeBuffer (ty := .scalar .f32) "outc" i (Exp.select inB (Exp.add av bv) (Exp.litF32 0.0))
 
-/-- In-place scalar multiply: data[i]*=sc (n=N*dim). -/
-def scaleB (n : Nat) (sc : Float) : Hesper.WGSL.Monad.ShaderM Unit := do
+/-- Region-aware per-layer scale: data[r,i] *= (r≥P ? outSc : encSc). -/
+def scaleRegionB (N P dim : Nat) (outSc encSc : Float) : Hesper.WGSL.Monad.ShaderM Unit := do
   let gid ← ShaderM.globalId
-  let i := Exp.vec3X gid
-  let inB := Exp.lt i (Exp.litU32 n)
-  let _d ← ShaderM.declareOutputBuffer "data" (.array (.scalar .f32) n)
-  let v ← ShaderM.readBuffer (ty := .scalar .f32) (n := n) "data" i
-  ShaderM.writeBuffer (ty := .scalar .f32) "data" i (Exp.select inB (Exp.mul v (Exp.litF32 sc)) v)
+  let t := Exp.vec3X gid
+  let _d ← ShaderM.declareOutputBuffer "data" (.array (.scalar .f32) (N*dim))
+  ShaderM.if_ (Exp.lt t (Exp.litU32 (N*dim))) (do
+    let r := Exp.div t (Exp.litU32 dim)
+    let v ← ShaderM.readBuffer (ty := .scalar .f32) (n := N*dim) "data" t
+    let factor := Exp.select (Exp.ge r (Exp.litU32 P)) (Exp.litF32 outSc) (Exp.litF32 encSc)
+    ShaderM.writeBuffer (ty := .scalar .f32) "data" t (Exp.mul v factor)) (pure ())
 
 /-- Per-head qk-norm (RMS×weight) + RoPE; 1 thread per (pos=t/nHead, head). -/
 def qkNormRopeB (N nHead hd : Nat) (theta eps : Float) : Hesper.WGSL.Monad.ShaderM Unit := do
@@ -332,14 +334,16 @@ def main (args : List String) : IO Unit := do
   let cfg := model.inner.config
   let dim := cfg.hiddenSize; let ffn := cfg.intermediateSize; let nHead := cfg.numAttentionHeads
   let eps := 1e-6
-  -- per-layer out_scale
+  -- per-layer out_scale (canvas) + enc_out_scale (prompt)
+  let rd1 (bo : Option Buffer) : IO Float := match bo with
+    | none => pure 1.0
+    | some bf => do let a ← Hesper.Basic.bytesToFloatArray (← mapBufferRead device bf 0 (4:Nat).toUSize); unmapBuffer bf; pure a[0]!
   let mut scales : Array Float := #[]
+  let mut encScales : Array Float := #[]
   for li in [0:nLayers] do
     let some blk := model.inner.blocks[li]? | throw (IO.userError "blk")
-    let sc ← match blk.outScale with
-      | none => pure 1.0
-      | some bf => do let a ← Hesper.Basic.bytesToFloatArray (← mapBufferRead device bf 0 (4:Nat).toUSize); unmapBuffer bf; pure a[0]!
-    scales := scales.push sc
+    scales := scales.push (← rd1 blk.outScale)
+    encScales := encScales.push (← rd1 blk.encOutScale)
   -- preallocate [N, *]
   let a ← mkBuf device (N*dim); let b ← mkBuf device (N*dim)
   let sN ← mkBuf device (N*dim)
@@ -415,7 +419,7 @@ def main (args : List String) : IO Unit := do
     disp device (addB (N*dim)) (("ain",sCurMlp)::("bin",sCurMoe)::("outc",sComb)::List.nil) (N*dim) (hash ("ad",li))
     Hesper.Layers.RMSNorm.forward device blk.postFFNNorm sComb sR N
     disp device (addB (N*dim)) (("ain",sR)::("bin",sPA)::("outc",nxt)::List.nil) (N*dim) (hash ("rc",li))
-    disp device (scaleB (N*dim) (scales[li]!)) (("data",nxt)::List.nil) (N*dim) (hash ("sc",li))
+    disp device (scaleRegionB N P dim (scales[li]!) (encScales[li]!)) (("data",nxt)::List.nil) (N*dim) (hash ("sc",li))
     Hesper.GPUBackend.endBatch device
     let t := cur; cur := nxt; nxt := t
   -- final norm + tied Q6_K lm_head (sliced to lmN) + softcap
