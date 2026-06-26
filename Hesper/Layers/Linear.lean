@@ -207,6 +207,75 @@ def fusedQ4KMLinearKernel (config : Config) (workgroupSize : Nat := 256) : Shade
     ShaderM.writeBuffer (ty := .scalar .f32) "output" outIdx totalSum
   ) (pure ())
 
+/-- Batched Q4_K matmul: input `[M, inDim]` (row-major) × dequant(weights `[outDim, inDim]`)
+    → output `[M, outDim]`. Dispatch `(outDim, M, 1)` workgroups; workgroup `(outIdx, row)`
+    computes `output[row*outDim + outIdx]`. Same dequant as `fusedQ4KMLinearKernel`,
+    weights shared across rows. Metal-native (no DP4A). -/
+def fusedQ4KMBatchKernel (config : Config) (M : Nat) (workgroupSize : Nat := 256) : ShaderM Unit := do
+  let wid ← ShaderM.workgroupId
+  let lid ← ShaderM.localId
+  let outIdx := Exp.vec3X wid
+  let row := Exp.vec3Y wid
+  let tid := Exp.vec3X lid
+  let blocksPerRow := config.inDim / 256
+  let totalWeightU32 := config.outDim * blocksPerRow * 36
+  let _weights ← ShaderM.declareReadOnlyBuffer "weights" (.array (.scalar .u32) totalWeightU32)
+  let _input ← ShaderM.declareReadOnlyBuffer "input" (.array (.scalar .f32) (M * config.inDim))
+  let _output ← ShaderM.declareOutputBuffer "output" (.array (.scalar .f32) (M * config.outDim))
+  ShaderM.sharedNamed "shared_partial" (.array (.scalar .f32) workgroupSize)
+  let inBounds := Exp.lt outIdx (Exp.litU32 config.outDim)
+  ShaderM.varNamed "acc" (.scalar .f32) (Exp.litF32 0.0)
+  let acc : Exp (.scalar .f32) := Exp.var "acc"
+  let inRowBase := Exp.mul row (Exp.litU32 config.inDim)
+  let rowBaseU32 := Exp.mul outIdx (Exp.litU32 (blocksPerRow * 36))
+  ShaderM.loop tid (Exp.litU32 blocksPerRow) (Exp.litU32 workgroupSize) fun blockLocalIdx => do
+    let blockU32Base := Exp.add rowBaseU32 (Exp.mul blockLocalIdx (Exp.litU32 36))
+    let elemBase := Exp.mul blockLocalIdx (Exp.litU32 256)
+    let dmU32 ← ShaderM.readBuffer (ty := .scalar .u32) (n := totalWeightU32) "weights" blockU32Base
+    let d := Exp.vecX (Exp.unpack2x16float dmU32)
+    let dmin := Exp.vecY (Exp.unpack2x16float dmU32)
+    let sc0 ← ShaderM.readBuffer (ty := .scalar .u32) (n := totalWeightU32) "weights" (Exp.add blockU32Base (Exp.litU32 1))
+    let sc1 ← ShaderM.readBuffer (ty := .scalar .u32) (n := totalWeightU32) "weights" (Exp.add blockU32Base (Exp.litU32 2))
+    let sc2 ← ShaderM.readBuffer (ty := .scalar .u32) (n := totalWeightU32) "weights" (Exp.add blockU32Base (Exp.litU32 3))
+    for c in [0:4] do
+      let is0 := c * 2
+      let is1 := c * 2 + 1
+      let (scaleA, minA) := getScaleMin is0 sc0 sc1 sc2
+      let (scaleB, minB) := getScaleMin is1 sc0 sc1 sc2
+      let d1 := Exp.mul d scaleA
+      let m1 := Exp.mul dmin minA
+      let d2 := Exp.mul d scaleB
+      let m2 := Exp.mul dmin minB
+      let qsU32Base := Exp.add blockU32Base (Exp.litU32 (4 + c * 8))
+      for l32 in [0:8] do
+        let qsU32 ← ShaderM.readBuffer (ty := .scalar .u32) (n := totalWeightU32) "weights" (Exp.add qsU32Base (Exp.litU32 l32))
+        for b in [0:4] do
+          let byte := Exp.bitAnd (Exp.shiftRight qsU32 (Exp.litU32 (b * 8))) (Exp.litU32 0xFF)
+          let qLow := Exp.bitAnd byte (Exp.litU32 0xF)
+          let qHigh := Exp.shiftRight byte (Exp.litU32 4)
+          let elemIdxLow := Exp.add inRowBase (Exp.add elemBase (Exp.litU32 (c * 64 + l32 * 4 + b)))
+          let elemIdxHigh := Exp.add inRowBase (Exp.add elemBase (Exp.litU32 (c * 64 + 32 + l32 * 4 + b)))
+          let inLow ← ShaderM.readBuffer (ty := .scalar .f32) (n := M * config.inDim) "input" elemIdxLow
+          let inHigh ← ShaderM.readBuffer (ty := .scalar .f32) (n := M * config.inDim) "input" elemIdxHigh
+          let wLow := Exp.sub (Exp.mul d1 (Exp.toF32 qLow)) m1
+          let wHigh := Exp.sub (Exp.mul d2 (Exp.toF32 qHigh)) m2
+          ShaderM.assign "acc" (Exp.add acc (Exp.add (Exp.mul wLow inLow) (Exp.mul wHigh inHigh)))
+  ShaderM.writeWorkgroup (ty := .scalar .f32) "shared_partial" tid acc
+  ShaderM.barrier
+  let mut stride := workgroupSize / 2
+  while stride > 0 do
+    ShaderM.if_ (Exp.lt tid (Exp.litU32 stride)) (do
+      let a ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := workgroupSize) "shared_partial" tid
+      let b ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := workgroupSize) "shared_partial" (Exp.add tid (Exp.litU32 stride))
+      ShaderM.writeWorkgroup (ty := .scalar .f32) "shared_partial" tid (Exp.add a b)
+    ) (pure ())
+    ShaderM.barrier
+    stride := stride / 2
+  ShaderM.if_ (Exp.and (Exp.eq tid (Exp.litU32 0)) inBounds) (do
+    let totalSum ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := workgroupSize) "shared_partial" (Exp.litU32 0)
+    ShaderM.writeBuffer (ty := .scalar .f32) "output" (Exp.add (Exp.mul row (Exp.litU32 config.outDim)) outIdx) totalSum
+  ) (pure ())
+
 /-! ## Q4_K_M MatVec with Subgroup Reduction -/
 
 /-- Subgroup-reduction variant of `fusedQ4KMLinearKernel`.

@@ -1616,3 +1616,7 @@ lean_exe «diffusiongemma-forward-gpu» where
   supportInterpreter := false
   moreLinkArgs := stdLinkArgs
 
+
+lean_exe «diffusiongemma-q4kbatch-parity» where
+  root := `Examples.DSL.DiffusionGemmaQ4KBatchParity
+  moreLinkArgs := stdLinkArgs
