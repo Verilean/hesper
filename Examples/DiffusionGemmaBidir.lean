@@ -41,6 +41,14 @@ def geluMulB (n : Nat) : Hesper.WGSL.Monad.ShaderM Unit := do
   let gl := Exp.mul (Exp.mul (Exp.litF32 0.5) g) (Exp.add (Exp.litF32 1.0) (Exp.tanh innerC))
   ShaderM.writeBuffer (ty := .scalar .f32) "outp" i (Exp.select inB (Exp.mul gl u) (Exp.litF32 0.0))
 
+/-- Identity copy out[i]=in[i]. -/
+def copyB (n : Nat) : Hesper.WGSL.Monad.ShaderM Unit := do
+  let gid ← ShaderM.globalId
+  let i := Exp.vec3X gid
+  let _a ← ShaderM.declareReadOnlyBuffer "cin" (.array (.scalar .f32) n)
+  let _o ← ShaderM.declareOutputBuffer "cout" (.array (.scalar .f32) n)
+  ShaderM.if_ (Exp.lt i (Exp.litU32 n)) (ShaderM.writeBuffer (ty := .scalar .f32) "cout" i (Exp.index (Exp.var "cin" : Exp (.array (.scalar .f32) n)) i)) (pure ())
+
 /-- Elementwise add: out[i]=a[i]+b[i] (n=N*dim). -/
 def addB (n : Nat) : Hesper.WGSL.Monad.ShaderM Unit := do
   let gid ← ShaderM.globalId
@@ -357,7 +365,7 @@ def main (args : List String) : IO Unit := do
   let sCurMlp ← mkBuf device (N*dim); let sMoeN ← mkBuf device (N*dim); let sTmpS ← mkBuf device (N*dim)
   let sRLogits ← mkBuf device (N*nExpert); let sIdxs ← mkBuf device (N*nUsed); let sWts ← mkBuf device (N*nUsed)
   let sMoeAcc ← mkBuf device (N*dim); let sGateUp ← mkBuf device (N*2*expFF); let sEh ← mkBuf device (N*expFF)
-  let sDownE ← mkBuf device (N*dim); let sCurMoe ← mkBuf device (N*dim); let sComb ← mkBuf device (N*dim)
+  let sDownE ← mkBuf device (N*dim); let sCurMoe ← mkBuf device (N*dim); let sComb ← mkBuf device (N*dim); let sAttnDbg ← mkBuf device (N*dim)
   -- real token embedding: tokens = [prompt(3) | canvas(N-3) of mask=4]
   let tokens : Array Nat := #[2, 651, 1437] ++ Array.replicate (N - P) 4
   let tokBuf ← mkBuf device N
@@ -370,8 +378,13 @@ def main (args : List String) : IO Unit := do
   disp device (embNormCanvasK N P dim eps) (("emb",a)::List.nil) N (hash "embn")
   Hesper.GPUBackend.endBatch device
   IO.println "[dg-bidir] real Q6_K embedding + batched forward (attn+dense+MoE), per-layer sub-batch ..."
+  let injectK := (← IO.getEnv "DG_INJECT").bind (·.toNat?)
+  let inject := injectK.isSome
+  if let some k := injectK then
+    writeBuffer device a 0 (← IO.FS.readBinFile s!"/tmp/real_l_out-{k-1}.bin")
+    IO.println s!"[dg-bidir] DG_INJECT: loaded ggml l_out-{k-1}; running from layer {k}"
   let mut cur := a; let mut nxt := b
-  for li in [0:nLayers] do
+  for li in [(injectK.getD 0):nLayers] do
     Hesper.GPUBackend.beginBatch device   -- one submission per layer (bounds peak encoder memory)
     let some blk := model.inner.blocks[li]? | throw (IO.userError "blk")
     let qDim := blk.attention.wO.config.inDim; let kvDim := blk.attention.wV.config.outDim
@@ -379,6 +392,7 @@ def main (args : List String) : IO Unit := do
     let theta : Float := if li % 6 == 5 then 1000000.0 else 10000.0
     -- attention
     Hesper.Layers.RMSNorm.forward device blk.attnNorm cur sN N
+    disp device (copyB (N*dim)) (("cin",sN)::("cout",sAttnDbg)::List.nil) (N*dim) (hash ("cpN",li))
     bmm device blk.attention.wQ sN sQ N (hash ("wq",li))
     bmm device blk.attention.wK sN sK N (hash ("wk",li))
     bmm device blk.attention.wV sN sV N (hash ("wv",li))
@@ -441,6 +455,9 @@ def main (args : List String) : IO Unit := do
     dump sMoeAcc (N*dim) "/tmp/my_moeacc.bin"
     dump sWts (N*nUsed) "/tmp/my_wts.bin"
     dump sMoeN (N*dim) "/tmp/my_moen.bin"
+    dump sAttnDbg (N*dim) "/tmp/my_attnnorm.bin"
+    dump sKr (N*2048) "/tmp/my_kr.bin"
+    dump sVn (N*2048) "/tmp/my_vn.bin"
     let ib ← mapBufferRead device sIdxs 0 (N*nUsed*4).toUSize; unmapBuffer sIdxs
     IO.FS.writeBinFile "/tmp/my_idxs.bin" ib
     IO.println s!"[DG_DUMP] wrote ... gateup/geglu/moeacc/wts (last slot e={nUsed-1}); nUsed={nUsed} expFF={expFF}"

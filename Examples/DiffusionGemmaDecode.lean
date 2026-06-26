@@ -375,6 +375,7 @@ def main (args : List String) : IO Unit := do
   for step in [0:decodeSteps] do
     let remaining := masked.foldl (fun acc b => if b then acc+1 else acc) 0
     if remaining > 0 then
+      let t0 ← IO.monoMsNow
       writeBuffer device tokBuf 0 (u32Bytes toks)
       Hesper.GPUBackend.beginBatch device
       disp device (Hesper.Quantization.Q6_K.q6kEmbedGatherKernel N cfg.vocabSize dim embScale) (("token_ids",tokBuf)::("embedding_table",embTable)::("output",a)::List.nil) (N*dim) (hash "emb")
@@ -469,7 +470,8 @@ def main (args : List String) : IO Unit := do
         let (ci, pred, _) := cand[bi]!
         toks := toks.set! (P+ci) pred
         masked := masked.set! ci false
-      IO.println s!"[dg-decode] step {step}: committed {k}, remaining {remaining-k}"
+      let t1 ← IO.monoMsNow
+      IO.println s!"[dg-decode] step {step}: committed {k}, remaining {remaining-k} | forward+decode {t1-t0}ms ({(259000)/(max 1 (t1-t0))} pos-layer/s over 30L)"
   let outIds := toks.extract P (P+C)
   IO.println s!"[dg-decode] first canvas IDs: {(outIds.extract 0 (min 24 outIds.size)).toList}"
   let ggufTok ← Hesper.GGUF.loadGGUFHeader path
