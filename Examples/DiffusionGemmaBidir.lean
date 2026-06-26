@@ -422,6 +422,28 @@ def main (args : List String) : IO Unit := do
     disp device (scaleRegionB N P dim (scales[li]!) (encScales[li]!)) (("data",nxt)::List.nil) (N*dim) (hash ("sc",li))
     Hesper.GPUBackend.endBatch device
     let t := cur; cur := nxt; nxt := t
+  -- DEBUG: dump layer-0 intermediates (run with nLayers=1) to compare vs ggml
+  if (← IO.getEnv "DG_DUMP").isSome then
+    let dump (buf : Buffer) (n : Nat) (path : String) : IO Unit := do
+      let v ← Hesper.Basic.bytesToFloatArray (← mapBufferRead device buf 0 (n*4).toUSize); unmapBuffer buf
+      IO.FS.writeBinFile path (← Hesper.Basic.floatArrayToBytes v)
+    dump a (N*dim) "/tmp/my_emb.bin"
+    dump cur (N*dim) "/tmp/my_lout0.bin"
+    dump sQ (N*4096) "/tmp/my_q.bin"
+    dump sQr (N*4096) "/tmp/my_qpos.bin"
+    dump sCtx (N*4096) "/tmp/my_kqv.bin"
+    dump sPA (N*dim) "/tmp/my_pa.bin"
+    dump sRLogits (N*nExpert) "/tmp/my_rlogits.bin"
+    dump sCurMlp (N*dim) "/tmp/my_curmlp.bin"
+    dump sCurMoe (N*dim) "/tmp/my_curmoe.bin"
+    dump sGateUp (N*2*expFF) "/tmp/my_gateup.bin"   -- last expert slot (e=nUsed-1)
+    dump sEh (N*expFF) "/tmp/my_geglu.bin"
+    dump sMoeAcc (N*dim) "/tmp/my_moeacc.bin"
+    dump sWts (N*nUsed) "/tmp/my_wts.bin"
+    dump sMoeN (N*dim) "/tmp/my_moen.bin"
+    let ib ← mapBufferRead device sIdxs 0 (N*nUsed*4).toUSize; unmapBuffer sIdxs
+    IO.FS.writeBinFile "/tmp/my_idxs.bin" ib
+    IO.println s!"[DG_DUMP] wrote ... gateup/geglu/moeacc/wts (last slot e={nUsed-1}); nUsed={nUsed} expFF={expFF}"
   -- final norm + tied Q6_K lm_head (sliced to lmN) + softcap
   let lmN := min cfg.vocabSize 32768
   let cap := cfg.logitSoftcapScale
