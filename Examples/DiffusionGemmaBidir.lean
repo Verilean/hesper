@@ -326,10 +326,10 @@ def main (args : List String) : IO Unit := do
   -- synthetic input
   let inArr := (List.range (N*dim)).toArray.map (fun i => Float.sin (i.toFloat * 0.001) * 0.4)
   writeBuffer device a 0 (← Hesper.Basic.floatArrayToBytes inArr)
-  IO.println "[dg-bidir] batched forward (attn + dense) ..."
-  Hesper.GPUBackend.beginBatch device
+  IO.println "[dg-bidir] batched forward (attn + dense + MoE), per-layer sub-batch ..."
   let mut cur := a; let mut nxt := b
   for li in [0:nLayers] do
+    Hesper.GPUBackend.beginBatch device   -- one submission per layer (bounds peak encoder memory)
     let some blk := model.inner.blocks[li]? | throw (IO.userError "blk")
     let qDim := blk.attention.wO.config.inDim; let kvDim := blk.attention.wV.config.outDim
     let hd := qDim / nHead; let nKV := kvDim / hd
@@ -377,7 +377,9 @@ def main (args : List String) : IO Unit := do
     Hesper.Layers.RMSNorm.forward device blk.postFFNNorm sComb sR N
     disp device (addB (N*dim)) (("ain",sR)::("bin",sPA)::("outc",nxt)::List.nil) (N*dim) (hash ("rc",li))
     disp device (scaleB (N*dim) (scales[li]!)) (("data",nxt)::List.nil) (N*dim) (hash ("sc",li))
+    Hesper.GPUBackend.endBatch device
     let t := cur; cur := nxt; nxt := t
+  Hesper.GPUBackend.beginBatch device
   Hesper.Layers.RMSNorm.forward device model.inner.finalNorm cur sN N
   Hesper.GPUBackend.endBatch device
   let outv ← Hesper.Basic.bytesToFloatArray (← mapBufferRead device sN 0 (N*dim*4).toUSize)
