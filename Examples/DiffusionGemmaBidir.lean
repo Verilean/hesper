@@ -111,8 +111,8 @@ def vNormB (N nKV hd : Nat) (eps : Float) : Hesper.WGSL.Monad.ShaderM Unit := do
       let v := Exp.index (Exp.var "vin" : Exp (.array (.scalar .f32) (N*kvDim))) (Exp.add base d)
       ShaderM.assignIndex "vout" (Exp.add base d) (Exp.mul v inv)) (pure ())
 
-/-- Cross-position attention: wg per (head=wid.x, query=wid.y); scores+region-mask+softmax+weighted-V. -/
-def battnB (N P nHead hd nKV : Nat) (ws : Nat := 256) : Hesper.WGSL.Monad.ShaderM Unit := do
+/-- Cross-position attention: wg per (head=wid.x, query=wid.y); scores·scale+region-mask+softmax+weighted-V. -/
+def battnB (N P nHead hd nKV : Nat) (scale : Float) (ws : Nat := 256) : Hesper.WGSL.Monad.ShaderM Unit := do
   let wid ← ShaderM.workgroupId
   let lid ← ShaderM.localId
   let h := Exp.vec3X wid; let i := Exp.vec3Y wid; let tid := Exp.vec3X lid
@@ -133,7 +133,7 @@ def battnB (N P nHead hd nKV : Nat) (ws : Nat := 256) : Hesper.WGSL.Monad.Shader
       let qv := Exp.index (Exp.var "q" : Exp (.array (.scalar .f32) (N*qDim))) (Exp.add qBase d)
       let kv := Exp.index (Exp.var "k" : Exp (.array (.scalar .f32) (N*kvDim))) (Exp.add kBase d)
       ShaderM.assign sc (Exp.add (Exp.var sc) (Exp.mul qv kv))
-    ShaderM.assignIndex "sS" j (Exp.select allowed (Exp.var sc : Exp (.scalar .f32)) (Exp.litF32 (-1e30)))
+    ShaderM.assignIndex "sS" j (Exp.select allowed (Exp.mul (Exp.var sc : Exp (.scalar .f32)) (Exp.litF32 scale)) (Exp.litF32 (-1e30)))
   ShaderM.barrier
   ShaderM.if_ (Exp.eq tid (Exp.litU32 0)) (do
     let mx ← ShaderM.var (.scalar .f32) (Exp.litF32 (-1e30))
@@ -385,7 +385,7 @@ def main (args : List String) : IO Unit := do
     disp device (qkNormRopeB N nHead hd theta eps) (("qin",sQ)::("wnorm",blk.attention.qNormWeight)::("qout",sQr)::List.nil) (N*nHead) (hash ("qn",li))
     disp device (qkNormRopeB N nKV hd theta eps) (("qin",sK)::("wnorm",blk.attention.kNormWeight)::("qout",sKr)::List.nil) (N*nKV) (hash ("kn",li))
     disp device (vNormB N nKV hd eps) (("vin",sV)::("vout",sVn)::List.nil) (N*nKV) (hash ("vn",li))
-    disp2 device (battnB N P nHead hd nKV) (("q",sQr)::("k",sKr)::("v",sVn)::("ctx",sCtx)::List.nil) nHead N (hash ("at",li))
+    disp2 device (battnB N P nHead hd nKV 1.0) (("q",sQr)::("k",sKr)::("v",sVn)::("ctx",sCtx)::List.nil) nHead N (hash ("at",li))
     bmm device blk.attention.wO sCtx sAO N (hash ("wo",li))
     Hesper.Layers.RMSNorm.forward device blk.postAttnNorm sAO sR N
     disp device (addB (N*dim)) (("ain",sR)::("bin",cur)::("outc",sPA)::List.nil) (N*dim) (hash ("ra",li))
