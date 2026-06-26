@@ -75,3 +75,18 @@ ACTION ITEM: audit ALL tanh-based kernels for Metal overflow — esp. **logit so
 (`scale*tanh(x/scale)`); clamp `x/scale` similarly. Also the real GeGLU kernel used in
 Phase 1 must carry this clamp (don't reuse the unclamped Gemma4 geluMulKernel on Metal).
 30-layer still overflows = dense-only skeleton (no attention/out_scale) — that's Phase 1, not a bug.
+
+## Phase 1 — COMPLETE (commit, 23 commits)
+Full real block runs GPU-resident in ONE batch on Metal, 30-layer → FINITE logits.
+Block (seqLen=1): attn (V-reuse: wO(broadcastVNormK(wV(norm)))) + postAttnNorm residual;
+dense FFN (clamped GeGLU); MoE [routerPrepK→routerMatVecK(F32)→top8K(shared-mem softmax+top-8
+→idxs[8]+wts[8])→8×(fusedQ4KMExpertKernel gateup slot=e → gegluMergedK → fusedQ8_0ExpertKernel
+down slot=e → waccK)→moePostNorm2]; combine addK(curMlp+curMoe)→postFFNNorm→+residual→×out_scale.
+Expert kernels gained (paramsLen,slot) to read params[slot]=e-th top-8 index; parity unaffected.
+KEY: dense-only diverged (3 finite/5 NaN) because model runs dense+MoE in PARALLEL every layer.
+DISPATCH COUNT: ~38/layer ×30 ≈ 1140 — runs fine in one batch (no crash), but SLOW (router
+prep/matvec have per-thread O(dim) reductions). Phase 4 will optimize (batch 256 positions, fuse).
+NEXT: Phase 2 — validate logits vs llama-diffusion-gemma-eval. NOTE: current forward is
+seqLen=1 single-position; the golden is the full bidirectional canvas, so Phase 2 needs the
+batched bidirectional forward (all positions, region mask) — seqLen=1 won't match the golden.
+argmax(slice)=0 currently (unvalidated synthetic input; lm_head sliced to 32768).
