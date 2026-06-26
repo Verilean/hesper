@@ -5826,6 +5826,56 @@ def fusedQ8_0LinearKernel (config : Config) (workgroupSize : Nat := 256) : Shade
     ShaderM.writeBuffer (ty := .scalar .f32) "output" outIdx totalSum
   ) (pure ())
 
+/-- Batched Q8_0 matmul: input `[M, inDim]` × dequant(weights `[outDim, inDim]`) → `[M, outDim]`.
+    Dispatch `(outDim, M, 1)`; workgroup `(outIdx, row)` → `output[row*outDim+outIdx]`. Metal-native. -/
+def fusedQ8_0BatchKernel (config : Config) (M : Nat) (workgroupSize : Nat := 256) : ShaderM Unit := do
+  let wid ← ShaderM.workgroupId
+  let lid ← ShaderM.localId
+  let outIdx := Exp.vec3X wid
+  let row := Exp.vec3Y wid
+  let tid := Exp.vec3X lid
+  let blocksPerRow := config.inDim / 32
+  let totalBytes := config.outDim * blocksPerRow * 34
+  let totalWeightU32 := (totalBytes + 3) / 4
+  let _weights ← ShaderM.declareReadOnlyBuffer "weights" (.array (.scalar .u32) totalWeightU32)
+  let _input ← ShaderM.declareReadOnlyBuffer "input" (.array (.scalar .f32) (M * config.inDim))
+  let _output ← ShaderM.declareOutputBuffer "output" (.array (.scalar .f32) (M * config.outDim))
+  ShaderM.sharedNamed "shared_partial" (.array (.scalar .f32) workgroupSize)
+  let inBounds := Exp.lt outIdx (Exp.litU32 config.outDim)
+  ShaderM.varNamed "acc" (.scalar .f32) (Exp.litF32 0.0)
+  let acc : Exp (.scalar .f32) := Exp.var "acc"
+  let inRowBase := Exp.mul row (Exp.litU32 config.inDim)
+  let rowBaseBytes := Exp.mul outIdx (Exp.litU32 (blocksPerRow * 34))
+  ShaderM.loop tid (Exp.litU32 blocksPerRow) (Exp.litU32 workgroupSize) fun blk => do
+    let blockByteBase := Exp.add rowBaseBytes (Exp.mul blk (Exp.litU32 34))
+    let elemBase := Exp.mul blk (Exp.litU32 32)
+    let loByte ← q8ReadByte "weights" totalWeightU32 blockByteBase
+    let hiByte ← q8ReadByte "weights" totalWeightU32 (Exp.add blockByteBase (Exp.litU32 1))
+    let f16bits := Exp.add loByte (Exp.mul hiByte (Exp.litU32 256))
+    let d := Exp.vecX (Exp.unpack2x16float f16bits)
+    for i in [0:32] do
+      let qb ← q8ReadByte "weights" totalWeightU32 (Exp.add blockByteBase (Exp.litU32 (2 + i)))
+      let sign := Exp.shiftRight qb (Exp.litU32 7)
+      let qSigned := Exp.sub (Exp.toF32 qb) (Exp.mul (Exp.litF32 256.0) (Exp.toF32 sign))
+      let w := Exp.mul d qSigned
+      let inVal ← ShaderM.readBuffer (ty := .scalar .f32) (n := M * config.inDim) "input" (Exp.add inRowBase (Exp.add elemBase (Exp.litU32 i)))
+      ShaderM.assign "acc" (Exp.add acc (Exp.mul w inVal))
+  ShaderM.writeWorkgroup (ty := .scalar .f32) "shared_partial" tid acc
+  ShaderM.barrier
+  let mut stride := workgroupSize / 2
+  while stride > 0 do
+    ShaderM.if_ (Exp.lt tid (Exp.litU32 stride)) (do
+      let a ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := workgroupSize) "shared_partial" tid
+      let b ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := workgroupSize) "shared_partial" (Exp.add tid (Exp.litU32 stride))
+      ShaderM.writeWorkgroup (ty := .scalar .f32) "shared_partial" tid (Exp.add a b)
+    ) (pure ())
+    ShaderM.barrier
+    stride := stride / 2
+  ShaderM.if_ (Exp.and (Exp.eq tid (Exp.litU32 0)) inBounds) (do
+    let totalSum ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := workgroupSize) "shared_partial" (Exp.litU32 0)
+    ShaderM.writeBuffer (ty := .scalar .f32) "output" (Exp.add (Exp.mul row (Exp.litU32 config.outDim)) outIdx) totalSum
+  ) (pure ())
+
 /-- Expert-indexed Q8_0 matvec for an MoE expert tensor `[inDim, outDim, nExpert]`
     (DiffusionGemma ffn_down_exps).  Expert `e`'s weight = a Q8_0 `[inDim,outDim]`
     at byte base `e * outDim * (inDim/32) * 34`.  Validated-base Q8_0 math +
