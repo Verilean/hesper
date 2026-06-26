@@ -1641,3 +1641,8 @@ lean_exe «diffusiongemma-bidir» where
 lean_exe «diffusiongemma-q6kmm-parity» where
   root := `Examples.DSL.DiffusionGemmaQ6KMMParity
   moreLinkArgs := stdLinkArgs
+
+lean_exe «diffusiongemma-decode» where
+  root := `Examples.DiffusionGemmaDecode
+  supportInterpreter := false
+  moreLinkArgs := stdLinkArgs
