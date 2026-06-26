@@ -122,3 +122,21 @@ batched bidirectional forward. REMAINING for the bidirectional forward (same wor
     (N<sliding_window=1024). This is the one genuinely-new kernel (cross-position); rest is row-batching.
   - batched MoE: router/top-8 PER ROW (top8K → per-row idxs/wts), expert matmuls batched.
 Then assemble: embedding → 30× batched block → finalNorm → tiled lm_head → softcap → compare canvas rows vs golden.
+
+## Phase 2/4 — batched ATTENTION keystone done (commit, 28 commits)
+batchAttnKernel (Examples/DSL/DiffusionGemmaBatchAttnParity.lean): one workgroup per (head=wid.x,
+query=wid.y); scores S[j]=Q[i,h]·K[j,kvh] over keys, region mask allowed(i,j)=(i>=P)||(j<=i)
+[canvas bidir / prompt causal, valid for N<sliding_window=1024], masked softmax, ctx=Σ_j w·V[j,kvh]
+(GQA). scale=1.0. VALIDATED bit-exact (maxAbsErr=0) vs Lean CPU ref. Bug found: softmax pitfall
+(CLAUDE.md #5 — DSL inlines `let`, must split exp-store and sum into separate loops).
+BOTH keystones now validated: batched Q4_K matmul (fusedQ4KMBatchKernel) + batched attention.
+REMAINING for the bidirectional forward (mostly mechanical now):
+  - batched Q6_K matmul (lm_head; +tile outDim past 65535) & Q8_0 (down) — same workgroupId.y row dim
+  - token embedding gather (Q6_K row lookup ×√n_embd; canvas=rmsnorm-noscale, prompt=scaled)
+  - batched elementwise: RMSNorm has numRows; geglu/scale/add/router → add row stride (or move
+    batchAttnKernel + the qk-norm/RoPE-per-head batched steps into Linear.lean/a Attention module)
+  - batched MoE: top8K + router PER ROW (loop rows or row dim), expert matmuls batched
+  - ASSEMBLE: embed [N tokens] → 30× batched block (attn via batchAttnKernel + wO + FFN + MoE) →
+    finalNorm → tiled lm_head → softcap → compare canvas rows (P..P+256) vs /tmp/dg_golden/full/logits.bin
+Note: qk-norm + RoPE per-head are batched pointwise steps BEFORE batchAttnKernel (Q/K input to it
+are already normed+roped); build those as batched kernels too.
