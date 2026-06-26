@@ -107,3 +107,18 @@ bidirectional attention over all positions). So Phase 2 requires the BIDIRECTION
     this is ALSO the Phase 4 perf work — batched matmul kernels processing N rows/dispatch)
   - final norm + tied lm_head (TILED for full 262144 vocab) + softcap → compare canvas rows vs golden
 This is intertwined with Phase 4 (256-position batching). Largest remaining build (~Phase-1 sized).
+
+## Phase 2/4 — batched matmul KEYSTONE done (commit, 26 commits)
+fusedQ4KMBatchKernel (Linear.lean): single-row fusedQ4KMLinearKernel + a workgroupId.y row
+dimension → [M,inDim] × weights → [M,outDim] in ONE dispatch (numWorkgroups (outDim,M,1)).
+Metal-native, weights shared across rows. VALIDATED bit-exact (maxAbsErr=0) vs per-row single
+kernel (ggml-validated) → diffusiongemma-q4kbatch-parity. THE reusable building block for the
+batched bidirectional forward. REMAINING for the bidirectional forward (same workgroupId.y pattern):
+  - batched Q6_K (token embed lookup is gather not matmul; lm_head is Q6_K matmul → batch it + TILE outDim)
+  - batched Q8_0 (down_exps / ffn_down) — generalize fusedQ8_0 the same way
+  - batched elementwise (RMSNorm already takes numRows; geglu/scale/add/router: add row stride)
+  - NEW batched ATTENTION: Q/K/V batched matmul → per-head qk-norm+RoPE (batched) → scores S[h,i,j]=Q[i]·K[j]
+    (N×N per head) → region-masked softmax over j → ctx[i]=Σ_j softmax·V[j] → wO. N=259, full bidir
+    (N<sliding_window=1024). This is the one genuinely-new kernel (cross-position); rest is row-batching.
+  - batched MoE: router/top-8 PER ROW (top8K → per-row idxs/wts), expert matmuls batched.
+Then assemble: embedding → 30× batched block → finalNorm → tiled lm_head → softcap → compare canvas rows vs golden.
