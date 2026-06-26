@@ -90,3 +90,20 @@ NEXT: Phase 2 — validate logits vs llama-diffusion-gemma-eval. NOTE: current f
 seqLen=1 single-position; the golden is the full bidirectional canvas, so Phase 2 needs the
 batched bidirectional forward (all positions, region mask) — seqLen=1 won't match the golden.
 argmax(slice)=0 currently (unvalidated synthetic input; lm_head sliced to 32768).
+
+## Phase 2 — IN PROGRESS: golden established
+Golden generated (scripts/llama_parity/gen_dg_full_golden.py): llama-diffusion-gemma-eval
+needs NON-EMPTY prompt + canvas of EXACTLY 256 (diffusion.canvas_length); outputs 256 canvas
+positions × 262144 f32 logits (post-softcap). Sanity: all canvas argmax=4 (mask), maxlogit
+~24-25 — correct for an all-mask step-0 canvas. Target: /tmp/dg_golden/full/logits.bin.
+BLOCKER: the golden is the FULL BIDIRECTIONAL forward over [3 prompt | 256 canvas]=259 positions;
+my current forward is seqLen=1 single-position → CANNOT match (canvas logits depend on
+bidirectional attention over all positions). So Phase 2 requires the BIDIRECTIONAL BATCHED forward:
+  - embedding: P+256 tokens → Q6_K embed lookup × √n_embd; canvas rows = rmsnorm-noscale(scaled embd), prompt rows = scaled embd
+  - REAL attention over N positions (not V-reuse): batched Q/K/V + qk-norm + RoPE + scores(scale=1) +
+    region-masked softmax (prompt-causal / canvas-bidirectional; SWA band when n>sliding_window=1024,
+    but N=259<1024 so all layers = full bidirectional for this case) + weighted-V + wO
+  - batched dense FFN + MoE over all N positions (per-position dispatch count too high → MUST batch:
+    this is ALSO the Phase 4 perf work — batched matmul kernels processing N rows/dispatch)
+  - final norm + tied lm_head (TILED for full 262144 vocab) + softcap → compare canvas rows vs golden
+This is intertwined with Phase 4 (256-position batching). Largest remaining build (~Phase-1 sized).
