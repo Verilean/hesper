@@ -40,19 +40,26 @@ def geluMulV2 (n : Nat) : Hesper.WGSL.Monad.ShaderM Unit := do
   let gl := Exp.mul (Exp.mul (Exp.litF32 0.5) g) (Exp.add (Exp.litF32 1.0) (Exp.tanh innerC))
   ShaderM.writeBuffer (ty := .scalar .f32) "outp" i (Exp.select inB (Exp.mul gl u) (Exp.litF32 0.0))
 
-/-- GQA broadcast: vout[i] = vin[(i/hd/groupSize)*hd + i%hd]  (kvDim → qDim). -/
-def broadcastK (qDim hd groupSize kvDim : Nat) : Hesper.WGSL.Monad.ShaderM Unit := do
+/-- Per-head v-norm (RMS, no scale) + GQA broadcast: for output i (head h, dim d),
+    src head kvh=h/groupSize; vout[i] = vin[kvh*hd+d] / rms(vin[kvh*hd .. +hd]). -/
+def broadcastVNormK (qDim hd groupSize kvDim : Nat) (eps : Float) : Hesper.WGSL.Monad.ShaderM Unit := do
   let gid ← ShaderM.globalId
   let i := Exp.vec3X gid
-  let inB := Exp.lt i (Exp.litU32 qDim)
   let _v ← ShaderM.declareReadOnlyBuffer "vin" (.array (.scalar .f32) kvDim)
   let _o ← ShaderM.declareOutputBuffer "vout" (.array (.scalar .f32) qDim)
-  let h := Exp.div i (Exp.litU32 hd)
-  let kvh := Exp.div h (Exp.litU32 groupSize)
-  let d := Exp.sub i (Exp.mul h (Exp.litU32 hd))
-  let src := Exp.add (Exp.mul kvh (Exp.litU32 hd)) d
-  let val ← ShaderM.readBuffer (ty := .scalar .f32) (n := kvDim) "vin" src
-  ShaderM.writeBuffer (ty := .scalar .f32) "vout" i (Exp.select inB val (Exp.litF32 0.0))
+  ShaderM.if_ (Exp.lt i (Exp.litU32 qDim)) (do
+    let h := Exp.div i (Exp.litU32 hd)
+    let kvh := Exp.div h (Exp.litU32 groupSize)
+    let d := Exp.sub i (Exp.mul h (Exp.litU32 hd))
+    let base := Exp.mul kvh (Exp.litU32 hd)
+    let src := Exp.add base d
+    let sumVar ← ShaderM.var (.scalar .f32) (Exp.litF32 0.0)
+    ShaderM.loop (Exp.litU32 0) (Exp.litU32 hd) (Exp.litU32 1) fun j => do
+      let vj := Exp.index (Exp.var "vin" : Exp (.array (.scalar .f32) kvDim)) (Exp.add base j)
+      ShaderM.assign sumVar (Exp.add (Exp.var sumVar) (Exp.mul vj vj))
+    let rms := Exp.sqrt (Exp.add (Exp.div (Exp.var sumVar) (Exp.litF32 hd.toFloat)) (Exp.litF32 eps))
+    let val := Exp.index (Exp.var "vin" : Exp (.array (.scalar .f32) kvDim)) src
+    ShaderM.assignIndex "vout" i (Exp.div val rms)) (pure ())
 
 /-- In-place scalar multiply: data[i] *= sc. -/
 def scaleK (n : Nat) (sc : Float) : Hesper.WGSL.Monad.ShaderM Unit := do
@@ -148,7 +155,7 @@ def main (args : List String) : IO Unit := do
     -- attention (seqLen=1): attn = wO(broadcast(wV(norm(x)))) ; postAttnNorm + residual
     Hesper.Layers.RMSNorm.forward device blk.attnNorm cur sN
     Hesper.Layers.Linear.LinearLayer.forward device blk.attention.wV sN sV
-    disp device (broadcastK qDim hd groupSize kvDim) (("vin", sV) :: ("vout", sVc) :: List.nil) qDim (hash ("bc", li))
+    disp device (broadcastVNormK qDim hd groupSize kvDim 1e-6) (("vin", sV) :: ("vout", sVc) :: List.nil) qDim (hash ("bc", li))
     Hesper.Layers.Linear.LinearLayer.forward device blk.attention.wO sVc sAO
     let pref1 ← IO.mkRef none
     Hesper.Layers.RMSNorm.forwardNormThenAdd device blk.postAttnNorm sAO cur sPA pref1
