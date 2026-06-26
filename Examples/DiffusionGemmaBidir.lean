@@ -263,6 +263,28 @@ def zeroB (n : Nat) : Hesper.WGSL.Monad.ShaderM Unit := do
   let _d ← ShaderM.declareOutputBuffer "data" (.array (.scalar .f32) n)
   ShaderM.if_ (Exp.lt i (Exp.litU32 n)) (ShaderM.assignIndex "data" i (Exp.litF32 0.0)) (pure ())
 
+/-- Canvas embedding rms-norm (no scale): for rows p≥P, normalize emb[p] in place. 1 thread/row. -/
+def embNormCanvasK (N P dim : Nat) (eps : Float) : Hesper.WGSL.Monad.ShaderM Unit := do
+  let gid ← ShaderM.globalId; let p := Exp.vec3X gid
+  let _e ← ShaderM.declareOutputBuffer "emb" (.array (.scalar .f32) (N*dim))
+  ShaderM.if_ (Exp.and (Exp.lt p (Exp.litU32 N)) (Exp.ge p (Exp.litU32 P))) (do
+    let base := Exp.mul p (Exp.litU32 dim)
+    let ss ← ShaderM.var (.scalar .f32) (Exp.litF32 0.0)
+    ShaderM.loop (Exp.litU32 0) (Exp.litU32 dim) (Exp.litU32 1) fun d => do
+      let v ← ShaderM.readBuffer (ty := .scalar .f32) (n := N*dim) "emb" (Exp.add base d)
+      ShaderM.assign ss (Exp.add (Exp.var ss) (Exp.mul v v))
+    let inv := Exp.div (Exp.litF32 1.0) (Exp.sqrt (Exp.add (Exp.div (Exp.var ss) (Exp.litF32 dim.toFloat)) (Exp.litF32 eps)))
+    ShaderM.loop (Exp.litU32 0) (Exp.litU32 dim) (Exp.litU32 1) fun d => do
+      let v ← ShaderM.readBuffer (ty := .scalar .f32) (n := N*dim) "emb" (Exp.add base d)
+      ShaderM.writeBuffer (ty := .scalar .f32) "emb" (Exp.add base d) (Exp.mul v inv)) (pure ())
+
+/-- u32 little-endian ByteArray from a Nat array. -/
+def u32Bytes (xs : Array Nat) : ByteArray := Id.run do
+  let mut b := ByteArray.empty
+  for x in xs do
+    b := b.push (UInt8.ofNat (x % 256)) |>.push (UInt8.ofNat (x / 256 % 256)) |>.push (UInt8.ofNat (x / 65536 % 256)) |>.push (UInt8.ofNat (x / 16777216 % 256))
+  return b
+
 abbrev B := Hesper.GPUBackend.Buf Device
 abbrev C := Hesper.GPUBackend.CachedDispatch Device
 
@@ -323,10 +345,18 @@ def main (args : List String) : IO Unit := do
   let sRLogits ← mkBuf device (N*nExpert); let sIdxs ← mkBuf device (N*nUsed); let sWts ← mkBuf device (N*nUsed)
   let sMoeAcc ← mkBuf device (N*dim); let sGateUp ← mkBuf device (N*2*expFF); let sEh ← mkBuf device (N*expFF)
   let sDownE ← mkBuf device (N*dim); let sCurMoe ← mkBuf device (N*dim); let sComb ← mkBuf device (N*dim)
-  -- synthetic input
-  let inArr := (List.range (N*dim)).toArray.map (fun i => Float.sin (i.toFloat * 0.001) * 0.4)
-  writeBuffer device a 0 (← Hesper.Basic.floatArrayToBytes inArr)
-  IO.println "[dg-bidir] batched forward (attn + dense + MoE), per-layer sub-batch ..."
+  -- real token embedding: tokens = [prompt(3) | canvas(N-3) of mask=4]
+  let tokens : Array Nat := #[2, 651, 1437] ++ Array.replicate (N - P) 4
+  let tokBuf ← mkBuf device N
+  writeBuffer device tokBuf 0 (u32Bytes tokens)
+  let embScale := Float.sqrt dim.toFloat
+  let embTable := model.inner.embedding.embeddingTable
+  Hesper.GPUBackend.beginBatch device
+  disp device (Hesper.Quantization.Q6_K.q6kEmbedGatherKernel N cfg.vocabSize dim embScale)
+    (("token_ids",tokBuf)::("embedding_table",embTable)::("output",a)::List.nil) (N*dim) (hash "emb")
+  disp device (embNormCanvasK N P dim eps) (("emb",a)::List.nil) N (hash "embn")
+  Hesper.GPUBackend.endBatch device
+  IO.println "[dg-bidir] real Q6_K embedding + batched forward (attn+dense+MoE), per-layer sub-batch ..."
   let mut cur := a; let mut nxt := b
   for li in [0:nLayers] do
     Hesper.GPUBackend.beginBatch device   -- one submission per layer (bounds peak encoder memory)

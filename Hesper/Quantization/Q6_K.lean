@@ -907,6 +907,24 @@ def q6kEmbeddingLookupKernel (vocabSize dim : Nat) : ShaderM Unit := do
     ShaderM.writeBuffer (ty := .scalar .f32) "output" idx val
   ) (pure ())
 
+/-- Batched Q6_K embedding gather: for output element t = p*dim + d,
+    output[t] = scale · dequant(table[token_ids[p]], d).  1 thread per element. -/
+def q6kEmbedGatherKernel (N vocabSize dim : Nat) (scale : Float) : ShaderM Unit := do
+  let gid ← ShaderM.globalId
+  let t := Exp.vec3X gid
+  let blocksPerRow := dim / 256
+  let totalU32 := (vocabSize * blocksPerRow * blockSizeBytes + 3) / 4
+  let _tokenIds ← ShaderM.declareReadOnlyBuffer "token_ids" (.array (.scalar .u32) N)
+  let _table ← ShaderM.declareReadOnlyBuffer "embedding_table" (.array (.scalar .u32) totalU32)
+  let _output ← ShaderM.declareOutputBuffer "output" (.array (.scalar .f32) (N * dim))
+  ShaderM.if_ (Exp.lt t (Exp.litU32 (N * dim))) (do
+    let p := Exp.div t (Exp.litU32 dim)
+    let d := Exp.sub t (Exp.mul p (Exp.litU32 dim))
+    let tokenId ← ShaderM.readBuffer (ty := .scalar .u32) (n := N) "token_ids" p
+    let val ← dequantQ6KElement dim "embedding_table" totalU32 tokenId d
+    ShaderM.writeBuffer (ty := .scalar .f32) "output" t (Exp.mul val (Exp.litF32 scale))
+  ) (pure ())
+
 /-- Single-row Q6_K dequant with a compile-time scale. Used to replace
     the slow `dequantQ6KRowCPU` + map + upload pipeline in
     `forwardSingleToken`'s per-layer-embedding precompute: upload the
