@@ -6104,10 +6104,10 @@ def fusedQ4KMBatchExpertKernel (config : Config) (nExpert N nUsed slot : Nat) (w
           let byte := Exp.bitAnd (Exp.shiftRight qsU32 (Exp.litU32 (b * 8))) (Exp.litU32 0xFF)
           let qLow := Exp.bitAnd byte (Exp.litU32 0xF)
           let qHigh := Exp.shiftRight byte (Exp.litU32 4)
-          let elemIdxLow := Exp.add elemBase (Exp.litU32 (c * 64 + l32 * 4 + b))
-          let elemIdxHigh := Exp.add elemBase (Exp.litU32 (c * 64 + 32 + l32 * 4 + b))
-          let inLow ← ShaderM.readBuffer (ty := .scalar .f32) (n := config.inDim) "input" elemIdxLow
-          let inHigh ← ShaderM.readBuffer (ty := .scalar .f32) (n := config.inDim) "input" elemIdxHigh
+          let elemIdxLow := Exp.add (Exp.mul row (Exp.litU32 config.inDim)) (Exp.add elemBase (Exp.litU32 (c * 64 + l32 * 4 + b)))
+          let elemIdxHigh := Exp.add (Exp.mul row (Exp.litU32 config.inDim)) (Exp.add elemBase (Exp.litU32 (c * 64 + 32 + l32 * 4 + b)))
+          let inLow ← ShaderM.readBuffer (ty := .scalar .f32) (n := N * config.inDim) "input" elemIdxLow
+          let inHigh ← ShaderM.readBuffer (ty := .scalar .f32) (n := N * config.inDim) "input" elemIdxHigh
           let wLow := Exp.sub (Exp.mul d1 (Exp.toF32 qLow)) m1
           let wHigh := Exp.sub (Exp.mul d2 (Exp.toF32 qHigh)) m2
           ShaderM.assign "acc" (Exp.add acc (Exp.add (Exp.mul wLow inLow) (Exp.mul wHigh inHigh)))
