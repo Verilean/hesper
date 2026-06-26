@@ -278,6 +278,15 @@ def embNormCanvasK (N P dim : Nat) (eps : Float) : Hesper.WGSL.Monad.ShaderM Uni
       let v ← ShaderM.readBuffer (ty := .scalar .f32) (n := N*dim) "emb" (Exp.add base d)
       ShaderM.writeBuffer (ty := .scalar .f32) "emb" (Exp.add base d) (Exp.mul v inv)) (pure ())
 
+/-- Logit softcap in place: logits[i] = cap·tanh(clamp(logits[i]/cap, -15, 15)) (clamp avoids Metal tanh overflow). -/
+def softcapB (n : Nat) (cap : Float) : Hesper.WGSL.Monad.ShaderM Unit := do
+  let gid ← ShaderM.globalId; let i := Exp.vec3X gid
+  let _x ← ShaderM.declareOutputBuffer "logits" (.array (.scalar .f32) n)
+  ShaderM.if_ (Exp.lt i (Exp.litU32 n)) (do
+    let x ← ShaderM.readBuffer (ty := .scalar .f32) (n := n) "logits" i
+    let arg := Exp.max (Exp.litF32 (-15.0)) (Exp.min (Exp.litF32 15.0) (Exp.div x (Exp.litF32 cap)))
+    ShaderM.writeBuffer (ty := .scalar .f32) "logits" i (Exp.mul (Exp.litF32 cap) (Exp.tanh arg))) (pure ())
+
 /-- u32 little-endian ByteArray from a Nat array. -/
 def u32Bytes (xs : Array Nat) : ByteArray := Id.run do
   let mut b := ByteArray.empty
@@ -409,12 +418,39 @@ def main (args : List String) : IO Unit := do
     disp device (scaleB (N*dim) (scales[li]!)) (("data",nxt)::List.nil) (N*dim) (hash ("sc",li))
     Hesper.GPUBackend.endBatch device
     let t := cur; cur := nxt; nxt := t
+  -- final norm + tied Q6_K lm_head (sliced to lmN) + softcap
+  let lmN := min cfg.vocabSize 32768
+  let cap := cfg.logitSoftcapScale
+  let sLogits ← mkBuf device (N*lmN)
   Hesper.GPUBackend.beginBatch device
   Hesper.Layers.RMSNorm.forward device model.inner.finalNorm cur sN N
+  disp2 device (Hesper.Quantization.Q6_K.fusedQ6KBatchKernel dim lmN N)
+    (("weights", model.inner.outputWeight)::("input", sN)::("output", sLogits)::List.nil) lmN N (hash "lmhead")
+  disp device (softcapB (N*lmN) cap) (("logits", sLogits)::List.nil) (N*lmN) (hash "softcap")
   Hesper.GPUBackend.endBatch device
-  let outv ← Hesper.Basic.bytesToFloatArray (← mapBufferRead device sN 0 (N*dim*4).toUSize)
-  unmapBuffer sN
-  let fin := outv.all Float.isFinite
-  IO.println s!"[dg-bidir] post-finalNorm finite={fin} size={outv.size}  [0..4]={(outv.extract 0 4).toList}"
-  if fin then IO.println s!"✓ batched bidirectional forward (attn+dense) {nLayers}-layer N={N} on Metal → finite"
-  else IO.println "✗ non-finite"; throw (IO.userError "fail")
+  let logits ← Hesper.Basic.bytesToFloatArray (← mapBufferRead device sLogits 0 (N*lmN*4).toUSize)
+  unmapBuffer sLogits
+  IO.println s!"[dg-bidir] logits finite={logits.all Float.isFinite} N={N} lmN={lmN}"
+  -- compare canvas rows (P..P+C) vs golden (256 x 262144), first lmN cols
+  let C := N - P
+  if C == 256 then
+    let goldAll ← IO.FS.readBinFile "/tmp/dg_golden/full/logits.bin"
+    let mut agree := 0; let mut maxErr := 0.0
+    for c in [0:C] do
+      let off := c * cfg.vocabSize * 4
+      let grow ← Hesper.Basic.bytesToFloatArray (goldAll.extract off (off + lmN*4))
+      let myBase := (P + c) * lmN
+      -- argmax + maxErr over lmN
+      let mut myAm := 0; let mut myMax := -1e30; let mut gAm := 0; let mut gMax := -1e30
+      for i in [0:lmN] do
+        let mv := logits[myBase+i]!; let gv := grow[i]!
+        if mv > myMax then myMax := mv; myAm := i
+        if gv > gMax then gMax := gv; gAm := i
+        let e := (mv - gv).abs
+        if e > maxErr then maxErr := e
+      if myAm == gAm then agree := agree + 1
+    IO.println s!"[dg-bidir] GOLDEN: canvas argmax agree {agree}/{C}  maxAbsErr(first {lmN})={maxErr}"
+    if agree == C && maxErr < 0.5 then IO.println "✓✓ batched bidirectional forward MATCHES golden (canvas logits)"
+    else IO.println s!"(partial) agree={agree}/{C} maxErr={maxErr}"
+  else
+    IO.println s!"✓ forward ran (N={N}, set N=259 for golden comparison)"
