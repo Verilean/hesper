@@ -1628,3 +1628,7 @@ lean_exe «diffusiongemma-battn-parity» where
 lean_exe «diffusiongemma-q8batch-parity» where
   root := `Examples.DSL.DiffusionGemmaQ8BatchParity
   moreLinkArgs := stdLinkArgs
+
+lean_exe «diffusiongemma-qknormrope-parity» where
+  root := `Examples.DSL.DiffusionGemmaQKNormRopeParity
+  moreLinkArgs := stdLinkArgs
