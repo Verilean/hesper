@@ -153,6 +153,116 @@ def battnB (N P nHead hd nKV : Nat) (ws : Nat := 256) : Hesper.WGSL.Monad.Shader
       ShaderM.assign acc (Exp.add (Exp.var acc) (Exp.mul w vv))
     ShaderM.writeBuffer (ty := .scalar .f32) "ctx" (Exp.add qBase d) (Exp.var acc : Exp (.scalar .f32))
 
+/-- Router prep per row: tmps[r,i]=(x[r,i]/rms(x[r]))·invSqrt·rscale[i]. 1 thread/row. -/
+def routerPrepB (N dim : Nat) (invSqrt eps : Float) : Hesper.WGSL.Monad.ShaderM Unit := do
+  let gid ← ShaderM.globalId; let r := Exp.vec3X gid
+  let _x ← ShaderM.declareReadOnlyBuffer "xin" (.array (.scalar .f32) (N*dim))
+  let _rs ← ShaderM.declareReadOnlyBuffer "rscale" (.array (.scalar .f32) dim)
+  let _o ← ShaderM.declareOutputBuffer "tmps" (.array (.scalar .f32) (N*dim))
+  ShaderM.if_ (Exp.lt r (Exp.litU32 N)) (do
+    let base := Exp.mul r (Exp.litU32 dim)
+    let ss ← ShaderM.var (.scalar .f32) (Exp.litF32 0.0)
+    ShaderM.loop (Exp.litU32 0) (Exp.litU32 dim) (Exp.litU32 1) fun d => do
+      let v := Exp.index (Exp.var "xin" : Exp (.array (.scalar .f32) (N*dim))) (Exp.add base d)
+      ShaderM.assign ss (Exp.add (Exp.var ss) (Exp.mul v v))
+    let inv := Exp.div (Exp.litF32 1.0) (Exp.sqrt (Exp.add (Exp.div (Exp.var ss) (Exp.litF32 dim.toFloat)) (Exp.litF32 eps)))
+    ShaderM.loop (Exp.litU32 0) (Exp.litU32 dim) (Exp.litU32 1) fun d => do
+      let v := Exp.index (Exp.var "xin" : Exp (.array (.scalar .f32) (N*dim))) (Exp.add base d)
+      let rs := Exp.index (Exp.var "rscale" : Exp (.array (.scalar .f32) dim)) d
+      ShaderM.assignIndex "tmps" (Exp.add base d) (Exp.mul (Exp.mul (Exp.mul v inv) (Exp.litF32 invSqrt)) rs)) (pure ())
+
+/-- Router matmul per row: rlogits[r,e]=Σ_k rw[e,k]·tmps[r,k]. 1 thread per (r,e). -/
+def routerMatVecB (N nExpert dim : Nat) : Hesper.WGSL.Monad.ShaderM Unit := do
+  let gid ← ShaderM.globalId; let t := Exp.vec3X gid
+  let _w ← ShaderM.declareReadOnlyBuffer "rw" (.array (.scalar .f32) (nExpert*dim))
+  let _t ← ShaderM.declareReadOnlyBuffer "tmps" (.array (.scalar .f32) (N*dim))
+  let _o ← ShaderM.declareOutputBuffer "rlogits" (.array (.scalar .f32) (N*nExpert))
+  ShaderM.if_ (Exp.lt t (Exp.litU32 (N*nExpert))) (do
+    let r := Exp.div t (Exp.litU32 nExpert)
+    let e := Exp.sub t (Exp.mul r (Exp.litU32 nExpert))
+    let wbase := Exp.mul e (Exp.litU32 dim); let tbase := Exp.mul r (Exp.litU32 dim)
+    let sum ← ShaderM.var (.scalar .f32) (Exp.litF32 0.0)
+    ShaderM.loop (Exp.litU32 0) (Exp.litU32 dim) (Exp.litU32 1) fun k => do
+      let wv := Exp.index (Exp.var "rw" : Exp (.array (.scalar .f32) (nExpert*dim))) (Exp.add wbase k)
+      let tv := Exp.index (Exp.var "tmps" : Exp (.array (.scalar .f32) (N*dim))) (Exp.add tbase k)
+      ShaderM.assign sum (Exp.add (Exp.var sum) (Exp.mul wv tv))
+    ShaderM.assignIndex "rlogits" t (Exp.var sum : Exp (.scalar .f32))) (pure ())
+
+/-- Softmax + top-nUsed per row: 1 workgroup per row (wid.x=r). -/
+def top8B (N nExpert nUsed : Nat) : Hesper.WGSL.Monad.ShaderM Unit := do
+  let wid ← ShaderM.workgroupId; let lid ← ShaderM.localId
+  let r := Exp.vec3X wid; let tid := Exp.vec3X lid
+  let _rl ← ShaderM.declareReadOnlyBuffer "rlogits" (.array (.scalar .f32) (N*nExpert))
+  let _idxs ← ShaderM.declareOutputBuffer "idxs" (.array (.scalar .u32) (N*nUsed))
+  let _wts ← ShaderM.declareOutputBuffer "wts" (.array (.scalar .f32) (N*nUsed))
+  ShaderM.sharedNamed "sp" (.array (.scalar .f32) nExpert)
+  let rbase := Exp.mul r (Exp.litU32 nExpert)
+  let obase := Exp.mul r (Exp.litU32 nUsed)
+  ShaderM.if_ (Exp.lt tid (Exp.litU32 nExpert)) (do
+    ShaderM.assignIndex "sp" tid (Exp.index (Exp.var "rlogits" : Exp (.array (.scalar .f32) (N*nExpert))) (Exp.add rbase tid))) (pure ())
+  ShaderM.barrier
+  ShaderM.if_ (Exp.eq tid (Exp.litU32 0)) (do
+    let mx ← ShaderM.var (.scalar .f32) (Exp.litF32 (-1e30))
+    ShaderM.loop (Exp.litU32 0) (Exp.litU32 nExpert) (Exp.litU32 1) fun e => do
+      ShaderM.assign mx (Exp.max (Exp.var mx) (Exp.index (Exp.var "sp" : Exp (.array (.scalar .f32) nExpert)) e))
+    ShaderM.loop (Exp.litU32 0) (Exp.litU32 nExpert) (Exp.litU32 1) fun e => do
+      ShaderM.assignIndex "sp" e (Exp.exp (Exp.sub (Exp.index (Exp.var "sp" : Exp (.array (.scalar .f32) nExpert)) e) (Exp.var mx)))
+    let sm ← ShaderM.var (.scalar .f32) (Exp.litF32 0.0)
+    ShaderM.loop (Exp.litU32 0) (Exp.litU32 nExpert) (Exp.litU32 1) fun e => do
+      ShaderM.assign sm (Exp.add (Exp.var sm) (Exp.index (Exp.var "sp" : Exp (.array (.scalar .f32) nExpert)) e))
+    let wsum ← ShaderM.var (.scalar .f32) (Exp.litF32 0.0)
+    ShaderM.loop (Exp.litU32 0) (Exp.litU32 nUsed) (Exp.litU32 1) fun p => do
+      let bi ← ShaderM.var (.scalar .u32) (Exp.litU32 0)
+      let bv ← ShaderM.var (.scalar .f32) (Exp.litF32 (-1e30))
+      ShaderM.loop (Exp.litU32 0) (Exp.litU32 nExpert) (Exp.litU32 1) fun e => do
+        let v := Exp.index (Exp.var "sp" : Exp (.array (.scalar .f32) nExpert)) e
+        ShaderM.if_ (Exp.gt v (Exp.var bv)) (do
+          ShaderM.assign bv v; ShaderM.assign bi e) (pure ())
+      let prob := Exp.div (Exp.var bv : Exp (.scalar .f32)) (Exp.var sm : Exp (.scalar .f32))
+      ShaderM.assignIndex "idxs" (Exp.add obase p) (Exp.var bi : Exp (.scalar .u32))
+      ShaderM.assignIndex "wts" (Exp.add obase p) prob
+      ShaderM.assign wsum (Exp.add (Exp.var wsum) prob)
+      ShaderM.assignIndex "sp" (Exp.var bi : Exp (.scalar .u32)) (Exp.litF32 (-1e30))
+    ShaderM.loop (Exp.litU32 0) (Exp.litU32 nUsed) (Exp.litU32 1) fun p => do
+      let w := Exp.index (Exp.var "wts" : Exp (.array (.scalar .f32) (N*nUsed))) (Exp.add obase p)
+      ShaderM.assignIndex "wts" (Exp.add obase p) (Exp.div w (Exp.var wsum))) (pure ())
+
+/-- Merged-GeGLU per row: eh[r,i]=gelu(gu[r,i])·gu[r,i+ff]. 1 thread per (r,i). -/
+def gegluMergedB (N ff : Nat) : Hesper.WGSL.Monad.ShaderM Unit := do
+  let gid ← ShaderM.globalId; let t := Exp.vec3X gid
+  let _gu ← ShaderM.declareInputBuffer "gu" (.array (.scalar .f32) (N*2*ff))
+  let _o ← ShaderM.declareOutputBuffer "eh" (.array (.scalar .f32) (N*ff))
+  ShaderM.if_ (Exp.lt t (Exp.litU32 (N*ff))) (do
+    let rr := Exp.div t (Exp.litU32 ff)
+    let i := Exp.sub t (Exp.mul rr (Exp.litU32 ff))
+    let gbase := Exp.mul rr (Exp.litU32 (2*ff))
+    let g ← ShaderM.readBuffer (ty := .scalar .f32) (n := N*2*ff) "gu" (Exp.add gbase i)
+    let u ← ShaderM.readBuffer (ty := .scalar .f32) (n := N*2*ff) "gu" (Exp.add (Exp.add gbase i) (Exp.litU32 ff))
+    let g3 := Exp.mul g (Exp.mul g g)
+    let inner := Exp.mul (Exp.litF32 0.7978845608) (Exp.add g (Exp.mul (Exp.litF32 0.044715) g3))
+    let iC := Exp.max (Exp.litF32 (-10.0)) (Exp.min (Exp.litF32 10.0) inner)
+    let gl := Exp.mul (Exp.mul (Exp.litF32 0.5) g) (Exp.add (Exp.litF32 1.0) (Exp.tanh iC))
+    ShaderM.assignIndex "eh" t (Exp.mul gl u)) (pure ())
+
+/-- Weighted accumulate per row: acc[r,i]+=wts[r,slot]·din[r,i]. 1 thread per (r,i). -/
+def waccB (N dim slot nUsed : Nat) : Hesper.WGSL.Monad.ShaderM Unit := do
+  let gid ← ShaderM.globalId; let t := Exp.vec3X gid
+  let _acc ← ShaderM.declareOutputBuffer "acc" (.array (.scalar .f32) (N*dim))
+  let _d ← ShaderM.declareReadOnlyBuffer "din" (.array (.scalar .f32) (N*dim))
+  let _w ← ShaderM.declareReadOnlyBuffer "wts" (.array (.scalar .f32) (N*nUsed))
+  ShaderM.if_ (Exp.lt t (Exp.litU32 (N*dim))) (do
+    let rr := Exp.div t (Exp.litU32 dim)
+    let a ← ShaderM.readBuffer (ty := .scalar .f32) (n := N*dim) "acc" t
+    let dv := Exp.index (Exp.var "din" : Exp (.array (.scalar .f32) (N*dim))) t
+    let w := Exp.index (Exp.var "wts" : Exp (.array (.scalar .f32) (N*nUsed))) (Exp.add (Exp.mul rr (Exp.litU32 nUsed)) (Exp.litU32 slot))
+    ShaderM.writeBuffer (ty := .scalar .f32) "acc" t (Exp.add a (Exp.mul w dv))) (pure ())
+
+/-- Zero buffer. -/
+def zeroB (n : Nat) : Hesper.WGSL.Monad.ShaderM Unit := do
+  let gid ← ShaderM.globalId; let i := Exp.vec3X gid
+  let _d ← ShaderM.declareOutputBuffer "data" (.array (.scalar .f32) n)
+  ShaderM.if_ (Exp.lt i (Exp.litU32 n)) (ShaderM.assignIndex "data" i (Exp.litF32 0.0)) (pure ())
+
 abbrev B := Hesper.GPUBackend.Buf Device
 abbrev C := Hesper.GPUBackend.CachedDispatch Device
 
@@ -207,6 +317,12 @@ def main (args : List String) : IO Unit := do
   let sCtx ← mkBuf device (N*8192); let sAO ← mkBuf device (N*dim); let sPA ← mkBuf device (N*dim)
   let sG ← mkBuf device (N*ffn); let sU ← mkBuf device (N*ffn); let sGe ← mkBuf device (N*ffn); let sD ← mkBuf device (N*dim)
   let sR ← mkBuf device (N*dim)
+  let nExpert := cfg.numExperts; let nUsed := cfg.numExpertsUsed; let expFF := cfg.expertFFSize
+  let invSqrt := 1.0 / Float.sqrt dim.toFloat
+  let sCurMlp ← mkBuf device (N*dim); let sMoeN ← mkBuf device (N*dim); let sTmpS ← mkBuf device (N*dim)
+  let sRLogits ← mkBuf device (N*nExpert); let sIdxs ← mkBuf device (N*nUsed); let sWts ← mkBuf device (N*nUsed)
+  let sMoeAcc ← mkBuf device (N*dim); let sGateUp ← mkBuf device (N*2*expFF); let sEh ← mkBuf device (N*expFF)
+  let sDownE ← mkBuf device (N*dim); let sCurMoe ← mkBuf device (N*dim); let sComb ← mkBuf device (N*dim)
   -- synthetic input
   let inArr := (List.range (N*dim)).toArray.map (fun i => Float.sin (i.toFloat * 0.001) * 0.4)
   writeBuffer device a 0 (← Hesper.Basic.floatArrayToBytes inArr)
@@ -237,8 +353,28 @@ def main (args : List String) : IO Unit := do
     disp device (geluMulB (N*ffn)) (("gate",sG)::("up",sU)::("outp",sGe)::List.nil) (N*ffn) (hash ("gg",li))
     bmm device blk.ffn.down sGe sD N (hash ("dn",li))
     let some mpn1 := blk.moePostNorm1 | throw (IO.userError "mpn1")
-    Hesper.Layers.RMSNorm.forward device mpn1 sD sN N
-    Hesper.Layers.RMSNorm.forward device blk.postFFNNorm sN sR N
+    Hesper.Layers.RMSNorm.forward device mpn1 sD sCurMlp N        -- curMlp
+    -- MoE (router top-8 per row + batched experts)
+    let some mpn2pre := blk.moePreNorm2 | throw (IO.userError "mpn2pre")
+    let some mpn2post := blk.moePostNorm2 | throw (IO.userError "mpn2post")
+    let some rW := blk.moeRouterWeight | throw (IO.userError "rW")
+    let some rS := blk.moeRouterScale | throw (IO.userError "rS")
+    let some guE := blk.moeGateUpExps | throw (IO.userError "guE")
+    let some dnE := blk.moeDownExps | throw (IO.userError "dnE")
+    Hesper.Layers.RMSNorm.forward device mpn2pre sPA sMoeN N
+    disp device (routerPrepB N dim invSqrt eps) (("xin",sPA)::("rscale",rS)::("tmps",sTmpS)::List.nil) N (hash ("rp",li))
+    disp device (routerMatVecB N nExpert dim) (("rw",rW)::("tmps",sTmpS)::("rlogits",sRLogits)::List.nil) (N*nExpert) (hash ("rm",li))
+    disp2 device (top8B N nExpert nUsed) (("rlogits",sRLogits)::("idxs",sIdxs)::("wts",sWts)::List.nil) N 1 (hash ("t8",li))
+    disp device (zeroB (N*dim)) (("data",sMoeAcc)::List.nil) (N*dim) (hash ("z",li))
+    for e in [0:nUsed] do
+      disp2 device (Hesper.Layers.Linear.fusedQ4KMBatchExpertKernel { inDim:=dim, outDim:=2*expFF } nExpert N nUsed e) (("weights",guE)::("input",sMoeN)::("idxs",sIdxs)::("output",sGateUp)::List.nil) (2*expFF) N (hash ("eu",li,e))
+      disp device (gegluMergedB N expFF) (("gu",sGateUp)::("eh",sEh)::List.nil) (N*expFF) (hash ("gm",li,e))
+      disp2 device (Hesper.Layers.Linear.fusedQ8_0BatchExpertKernel { inDim:=expFF, outDim:=dim } nExpert N nUsed e) (("weights",dnE)::("input",sEh)::("idxs",sIdxs)::("output",sDownE)::List.nil) dim N (hash ("ed",li,e))
+      disp device (waccB N dim e nUsed) (("acc",sMoeAcc)::("din",sDownE)::("wts",sWts)::List.nil) (N*dim) (hash ("wa",li,e))
+    Hesper.Layers.RMSNorm.forward device mpn2post sMoeAcc sCurMoe N
+    -- combine: curMlp + curMoe → postFFNNorm → +residual → ×out_scale
+    disp device (addB (N*dim)) (("ain",sCurMlp)::("bin",sCurMoe)::("outc",sComb)::List.nil) (N*dim) (hash ("ad",li))
+    Hesper.Layers.RMSNorm.forward device blk.postFFNNorm sComb sR N
     disp device (addB (N*dim)) (("ain",sR)::("bin",sPA)::("outc",nxt)::List.nil) (N*dim) (hash ("rc",li))
     disp device (scaleB (N*dim) (scales[li]!)) (("data",nxt)::List.nil) (N*dim) (hash ("sc",li))
     let t := cur; cur := nxt; nxt := t
