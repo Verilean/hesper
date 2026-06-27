@@ -3848,16 +3848,18 @@ def fusedQ6KLinearDP4AKernel (inDim outDim : Nat) (gridX : Nat := 0) : ShaderM U
 
     seqLen=1 is supported for unification with the decode path; a real prefill
     has seqLen ≥ 2. -/
-def q6kMatmulBatchKernel (inDim outDim : Nat) (seqLen : Nat) : ShaderM Unit := do
+def q6kMatmulBatchKernel (inDim outDim : Nat) (seqLen : Nat)
+    (rowOffset : Nat := 0) (weightRows : Nat := 0) : ShaderM Unit := do
   let wid ← ShaderM.workgroupId
   let lid ← ShaderM.localId
-  let outIdx := Exp.vec3X wid     -- output row
+  let outIdx := Exp.vec3X wid     -- output row (chunk-local)
   let colIdx := Exp.vec3Y wid     -- sequence position
   let tid := Exp.vec3X lid
 
   let blocksPerRow := inDim / 256
   let blockSizeBytes : Nat := 210
-  let totalWeightBytes := outDim * blocksPerRow * blockSizeBytes
+  let wRows := if weightRows == 0 then outDim else weightRows
+  let totalWeightBytes := wRows * blocksPerRow * blockSizeBytes
   let totalWeightU32 := (totalWeightBytes + 3) / 4
   let q8BlocksPerRow := inDim / 32
   let q8InputU32Size := q8BlocksPerRow * 9 * seqLen
@@ -3883,7 +3885,7 @@ def q6kMatmulBatchKernel (inDim outDim : Nat) (seqLen : Nat) : ShaderM Unit := d
   let acc : Exp (.scalar .f32) := Exp.var "acc"
 
   ShaderM.varNamed "rowByteBase" (.scalar .u32)
-    (Exp.mul outIdx (Exp.litU32 (blocksPerRow * blockSizeBytes)))
+    (Exp.mul (Exp.add outIdx (Exp.litU32 rowOffset)) (Exp.litU32 (blocksPerRow * blockSizeBytes)))
   let rowByteBase : Exp (.scalar .u32) := Exp.var "rowByteBase"
 
   -- Per-column Q8_1 base offset: column `colIdx` lives at

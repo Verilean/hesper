@@ -558,6 +558,45 @@ def lmHeadArgmaxFullVocab (device : Device) (outputWeight sN sLogits logitsCanva
     if masked[i]! then cand := cand.push (i, ktokFlat[i*K]!, 1.0 / denomA[i]!)
   return (cand, ktokFlat, probFlat)
 
+/-- Phase-1 diagnostic: compute canvas-position-0 lm_head logits (chunk 0, tokens 0..32768)
+    with BOTH the f32 Q6_K kernel and the dp4a Q6_K kernel for the SAME raw hidden, and
+    compare — tells us whether the dp4a argmax-flip is a bug (systematically off) or precision
+    (near-tie flips). Tokens of interest: 9079='▁Paris', 506='▁the'. -/
+def lmHeadDiag (device : Device)
+    (finalNorm : Hesper.Layers.RMSNorm.RMSNorm (Hesper.GPUBackend.Buf Device) (Hesper.GPUBackend.CachedDispatch Device))
+    (outputWeight cur : Buffer) (dim vocabSize N P : Nat) : IO Unit := do
+  let lmChunk := 32768
+  let sN ← mkBuf device (N*dim)
+  let sL1 ← mkBuf device (N*lmChunk)
+  let sL2 ← mkBuf device (N*lmChunk)
+  let sNQ8 ← mkBuf device (N*(dim/32)*9)
+  Hesper.GPUBackend.beginBatch device
+  Hesper.Layers.RMSNorm.forward device finalNorm cur sN N
+  Hesper.GPUBackend.endBatch device
+  Hesper.GPUBackend.beginBatch device
+  disp2 device (Hesper.Quantization.Q6_K.fusedQ6KBatchKernel dim lmChunk N 256 0 vocabSize)
+    (("weights",outputWeight)::("input",sN)::("output",sL1)::List.nil) lmChunk N (hash "diagf32")
+  disp2w device (Hesper.Layers.Linear.quantizeQ8_1BatchKernel dim N) (("input",sN)::("output",sNQ8)::List.nil) (dim/32) N 32 (hash "diagq8")
+  disp2w device (Hesper.Layers.Linear.q6kMatmulBatchKernel dim lmChunk N 0 vocabSize)
+    (("weights",outputWeight)::("input_q8",sNQ8)::("output",sL2)::List.nil) lmChunk N 32 (hash "diagdp4a")
+  Hesper.GPUBackend.endBatch device
+  let f32L ← Hesper.Basic.bytesToFloatArray (← mapBufferRead device sL1 (P*lmChunk*4).toUSize (lmChunk*4).toUSize)
+  unmapBuffer sL1
+  let dpL ← Hesper.Basic.bytesToFloatArray (← mapBufferRead device sL2 (P*lmChunk*4).toUSize (lmChunk*4).toUSize)
+  unmapBuffer sL2
+  let argmaxEx (a : Array Float) : Nat × Float := Id.run do
+    let mut mx := -1e30; let mut am := 0
+    for v in [5:lmChunk] do if a[v]! > mx then mx := a[v]!; am := v
+    return (am, mx)
+  let (f32am, f32mx) := argmaxEx f32L
+  let (dpam, dpmx) := argmaxEx dpL
+  let mut em := 0.0; let mut vv := 0.0
+  for v in [0:lmChunk] do em := em + (f32L[v]! - dpL[v]!)^2; vv := vv + f32L[v]!^2
+  let rel := 100.0 * (em/lmChunk.toFloat).sqrt / ((vv/lmChunk.toFloat).sqrt + 1e-9)
+  IO.println s!"[lmdiag] f32 argmax={f32am} ({f32mx}) | dp4a argmax={dpam} ({dpmx})"
+  IO.println s!"[lmdiag] Paris(9079): f32={f32L[9079]!} dp4a={dpL[9079]!} | the(506): f32={f32L[506]!} dp4a={dpL[506]!}"
+  IO.println s!"[lmdiag] chunk-0 logit relRMS(dp4a vs f32)={rel}% → big=BUG, small=precision"
+
 def main (args : List String) : IO Unit := do
   let path := args.head?.getD "diffusiongemma-26B-A4B-it-Q4_K_M.gguf"
   let prompt := (args.drop 1).head?.getD "The capital of France is"
@@ -719,6 +758,8 @@ def main (args : List String) : IO Unit := do
         if li % lpb == lpb-1 || li == nLayers-1 then Hesper.GPUBackend.endBatch device
         let t := cur; cur := nxt; nxt := t
       let tFwd ← IO.monoMsNow
+      if step == 0 && (← IO.getEnv "DG_LMDIAG").isSome then
+        lmHeadDiag device model.inner.finalNorm model.inner.outputWeight cur dim cfg.vocabSize N P
       -- final norm + Q8 quant, then full-vocab tiled lm_head (helper, keeps `main` small)
       Hesper.GPUBackend.beginBatch device
       Hesper.Layers.RMSNorm.forward device model.inner.finalNorm cur sN N
