@@ -6128,6 +6128,90 @@ def fusedQ4KMBatchExpertKernel (config : Config) (nExpert N nUsed slot : Nat) (w
   ) (pure ())
 
 
+
+/-- Q4_K expert matmul via ggml-order INTEGER dot: recover q8=round(a/d_q8) from the already-Q8'd
+    activation, accumulate Σ q4·q8 (exact small-int sums) per sub-block, then combine with weight
+    scales as ggml does: acc += d_q8·(d·Σ scale·sumi − dmin·Σ min·bsum). Bit-closer than f32 dequant. -/
+def fusedQ4KMBatchExpertKernelInt (config : Config) (nExpert N nUsed slot : Nat) (workgroupSize : Nat := 256) : ShaderM Unit := do
+  let wid ← ShaderM.workgroupId
+  let lid ← ShaderM.localId
+  let outIdx := Exp.vec3X wid
+  let row := Exp.vec3Y wid
+  let tid := Exp.vec3X lid
+  let blocksPerRow := config.inDim / 256
+  let perExpertU32 := config.outDim * blocksPerRow * 36
+  let totalWeightU32 := nExpert * perExpertU32
+  let _weights ← ShaderM.declareReadOnlyBuffer "weights" (.array (.scalar .u32) totalWeightU32)
+  let _input ← ShaderM.declareReadOnlyBuffer "input" (.array (.scalar .f32) (N * config.inDim))
+  let _idxs ← ShaderM.declareReadOnlyBuffer "idxs" (.array (.scalar .u32) (N * nUsed))
+  let _output ← ShaderM.declareOutputBuffer "output" (.array (.scalar .f32) (N * config.outDim))
+  ShaderM.sharedNamed "shared_partial" (.array (.scalar .f32) workgroupSize)
+  let inBounds := Exp.lt outIdx (Exp.litU32 config.outDim)
+  ShaderM.varNamed "acc" (.scalar .f32) (Exp.litF32 0.0)
+  let acc : Exp (.scalar .f32) := Exp.var "acc"
+  let expertIdx ← ShaderM.readBuffer (ty := .scalar .u32) (n := N * nUsed) "idxs" (Exp.add (Exp.mul row (Exp.litU32 nUsed)) (Exp.litU32 slot))
+  let rowBaseU32 := Exp.add (Exp.mul expertIdx (Exp.litU32 perExpertU32)) (Exp.mul outIdx (Exp.litU32 (blocksPerRow * 36)))
+  ShaderM.loop tid (Exp.litU32 blocksPerRow) (Exp.litU32 workgroupSize) fun blockLocalIdx => do
+    let blockU32Base := Exp.add rowBaseU32 (Exp.mul blockLocalIdx (Exp.litU32 36))
+    let baseAct := Exp.add (Exp.mul row (Exp.litU32 config.inDim)) (Exp.mul blockLocalIdx (Exp.litU32 256))
+    -- pass 1: recover Q8_K block scale d_q8 from the already-Q8'd activation (signed max-abs / -127)
+    let amax ← ShaderM.var (.scalar .f32) (Exp.litF32 0.0)
+    let vmax ← ShaderM.var (.scalar .f32) (Exp.litF32 0.0)
+    ShaderM.loop (Exp.litU32 0) (Exp.litU32 256) (Exp.litU32 1) fun dd => do
+      let v ← ShaderM.readBuffer (ty := .scalar .f32) (n := N*config.inDim) "input" (Exp.add baseAct dd)
+      ShaderM.if_ (Exp.gt (Exp.abs v) (Exp.var amax)) (do
+        ShaderM.assign amax (Exp.abs v); ShaderM.assign vmax v) (pure ())
+    let dq8 := Exp.select (Exp.gt (Exp.var amax) (Exp.litF32 0.0)) (Exp.div (Exp.var vmax) (Exp.litF32 (-127.0))) (Exp.litF32 1.0)
+    let dmU32 ← ShaderM.readBuffer (ty := .scalar .u32) (n := totalWeightU32) "weights" blockU32Base
+    let d := Exp.vecX (Exp.unpack2x16float dmU32)
+    let dmin := Exp.vecY (Exp.unpack2x16float dmU32)
+    let sc0 ← ShaderM.readBuffer (ty := .scalar .u32) (n := totalWeightU32) "weights" (Exp.add blockU32Base (Exp.litU32 1))
+    let sc1 ← ShaderM.readBuffer (ty := .scalar .u32) (n := totalWeightU32) "weights" (Exp.add blockU32Base (Exp.litU32 2))
+    let sc2 ← ShaderM.readBuffer (ty := .scalar .u32) (n := totalWeightU32) "weights" (Exp.add blockU32Base (Exp.litU32 3))
+    let innerD ← ShaderM.var (.scalar .f32) (Exp.litF32 0.0)
+    let innerM ← ShaderM.var (.scalar .f32) (Exp.litF32 0.0)
+    for c in [0:4] do
+      let is0 := c * 2
+      let is1 := c * 2 + 1
+      let (scaleA, minA) := getScaleMin is0 sc0 sc1 sc2
+      let (scaleB, minB) := getScaleMin is1 sc0 sc1 sc2
+      let sumiA ← ShaderM.var (.scalar .f32) (Exp.litF32 0.0)
+      let bsumA ← ShaderM.var (.scalar .f32) (Exp.litF32 0.0)
+      let sumiB ← ShaderM.var (.scalar .f32) (Exp.litF32 0.0)
+      let bsumB ← ShaderM.var (.scalar .f32) (Exp.litF32 0.0)
+      let qsU32Base := Exp.add blockU32Base (Exp.litU32 (4 + c * 8))
+      for l32 in [0:8] do
+        let qsU32 ← ShaderM.readBuffer (ty := .scalar .u32) (n := totalWeightU32) "weights" (Exp.add qsU32Base (Exp.litU32 l32))
+        for b in [0:4] do
+          let byte := Exp.bitAnd (Exp.shiftRight qsU32 (Exp.litU32 (b * 8))) (Exp.litU32 0xFF)
+          let qLow := Exp.toF32 (Exp.bitAnd byte (Exp.litU32 0xF))
+          let qHigh := Exp.toF32 (Exp.shiftRight byte (Exp.litU32 4))
+          let aLow ← ShaderM.readBuffer (ty := .scalar .f32) (n := N * config.inDim) "input" (Exp.add baseAct (Exp.litU32 (c * 64 + l32 * 4 + b)))
+          let aHigh ← ShaderM.readBuffer (ty := .scalar .f32) (n := N * config.inDim) "input" (Exp.add baseAct (Exp.litU32 (c * 64 + 32 + l32 * 4 + b)))
+          let q8Low := Exp.round (Exp.div aLow dq8)
+          let q8High := Exp.round (Exp.div aHigh dq8)
+          ShaderM.assign sumiA (Exp.add (Exp.var sumiA) (Exp.mul qLow q8Low))
+          ShaderM.assign bsumA (Exp.add (Exp.var bsumA) q8Low)
+          ShaderM.assign sumiB (Exp.add (Exp.var sumiB) (Exp.mul qHigh q8High))
+          ShaderM.assign bsumB (Exp.add (Exp.var bsumB) q8High)
+      ShaderM.assign innerD (Exp.add (Exp.var innerD) (Exp.add (Exp.mul scaleA (Exp.var sumiA)) (Exp.mul scaleB (Exp.var sumiB))))
+      ShaderM.assign innerM (Exp.add (Exp.var innerM) (Exp.add (Exp.mul minA (Exp.var bsumA)) (Exp.mul minB (Exp.var bsumB))))
+    ShaderM.assign "acc" (Exp.add acc (Exp.mul dq8 (Exp.sub (Exp.mul d (Exp.var innerD)) (Exp.mul dmin (Exp.var innerM)))))
+  ShaderM.writeWorkgroup (ty := .scalar .f32) "shared_partial" tid acc
+  ShaderM.barrier
+  let mut stride := workgroupSize / 2
+  while stride > 0 do
+    ShaderM.if_ (Exp.lt tid (Exp.litU32 stride)) (do
+      let a ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := workgroupSize) "shared_partial" tid
+      let bb ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := workgroupSize) "shared_partial" (Exp.add tid (Exp.litU32 stride))
+      ShaderM.writeWorkgroup (ty := .scalar .f32) "shared_partial" tid (Exp.add a bb)) (pure ())
+    ShaderM.barrier
+    stride := stride / 2
+  ShaderM.if_ (Exp.and (Exp.eq tid (Exp.litU32 0)) inBounds) (do
+    let totalSum ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := workgroupSize) "shared_partial" (Exp.litU32 0)
+    ShaderM.writeBuffer (ty := .scalar .f32) "output" (Exp.add (Exp.mul row (Exp.litU32 config.outDim)) outIdx) totalSum
+  ) (pure ())
+
 def LinearLayer.forward [GPUBackend β] (ctx : β) (layer : LinearLayer (GPUBackend.Buf β) (GPUBackend.CachedDispatch β))
     (inputBuf outputBuf : GPUBackend.Buf β) : IO Unit := do
   let profiling ← profilingRef.get
