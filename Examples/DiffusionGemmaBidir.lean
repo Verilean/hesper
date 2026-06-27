@@ -118,8 +118,8 @@ def scaleRegionB (N P dim : Nat) (outSc encSc : Float) : Hesper.WGSL.Monad.Shade
     let factor := Exp.select (Exp.ge r (Exp.litU32 P)) (Exp.litF32 outSc) (Exp.litF32 encSc)
     ShaderM.writeBuffer (ty := .scalar .f32) "data" t (Exp.mul v factor)) (pure ())
 
-/-- Per-head qk-norm (RMS×weight) + RoPE; 1 thread per (pos=t/nHead, head). -/
-def qkNormRopeB (N nHead hd : Nat) (theta eps : Float) : Hesper.WGSL.Monad.ShaderM Unit := do
+/-- Per-head qk-norm (RMS×weight) + partial RoPE (rope only first `nRotHalf` pairs); 1 thread per (pos,head). -/
+def qkNormRopeB (N nHead hd nRotHalf : Nat) (theta eps : Float) : Hesper.WGSL.Monad.ShaderM Unit := do
   let gid ← ShaderM.globalId
   let t := Exp.vec3X gid
   let qDim := nHead*hd; let half := hd/2
@@ -146,7 +146,9 @@ def qkNormRopeB (N nHead hd : Nat) (theta eps : Float) : Hesper.WGSL.Monad.Shade
       let ang0 := Exp.mul pf freq
       -- range-reduce to [-π,π] so f32 cos/sin stay precise at high positions (large p·freq)
       let twoPi := Exp.litF32 6.283185307179586
-      let ang := Exp.sub ang0 (Exp.mul twoPi (Exp.round (Exp.div ang0 twoPi)))
+      let angRed := Exp.sub ang0 (Exp.mul twoPi (Exp.round (Exp.div ang0 twoPi)))
+      -- partial rope: pairs j ≥ nRotHalf pass through unrotated (ggml global layers rope only n_rot/2 pairs)
+      let ang := Exp.select (Exp.lt j (Exp.litU32 nRotHalf)) angRed (Exp.litF32 0.0)
       ShaderM.assignIndex "qout" (Exp.add base j) (Exp.sub (Exp.mul a (Exp.cos ang)) (Exp.mul b (Exp.sin ang)))
       ShaderM.assignIndex "qout" (Exp.add base jh) (Exp.add (Exp.mul a (Exp.sin ang)) (Exp.mul b (Exp.cos ang)))) (pure ())
 
@@ -444,6 +446,7 @@ def main (args : List String) : IO Unit := do
     let qDim := blk.attention.wO.config.inDim; let kvDim := blk.attention.wV.config.outDim
     let hd := qDim / nHead; let nKV := kvDim / hd
     let theta : Float := if li % 6 == 5 then 1000000.0 else 10000.0
+    let nRotHalf := if li % 6 == 5 then 64 else hd/2
     -- attention
     Hesper.Layers.RMSNorm.forward device blk.attnNorm cur sN N
     disp device (copyB (N*dim)) (("cin",sN)::("cout",sAttnDbg)::List.nil) (N*dim) (hash ("cpN",li))
@@ -451,8 +454,8 @@ def main (args : List String) : IO Unit := do
     bmm device blk.attention.wQ sN sQ N (hash ("wq",li))
     bmm device blk.attention.wK sN sK N (hash ("wk",li))
     bmm device blk.attention.wV sN sV N (hash ("wv",li))
-    disp device (qkNormRopeB N nHead hd theta eps) (("qin",sQ)::("wnorm",blk.attention.qNormWeight)::("qout",sQr)::List.nil) (N*nHead) (hash ("qn",li))
-    disp device (qkNormRopeB N nKV hd theta eps) (("qin",sK)::("wnorm",blk.attention.kNormWeight)::("qout",sKr)::List.nil) (N*nKV) (hash ("kn",li))
+    disp device (qkNormRopeB N nHead hd nRotHalf theta eps) (("qin",sQ)::("wnorm",blk.attention.qNormWeight)::("qout",sQr)::List.nil) (N*nHead) (hash ("qn",li))
+    disp device (qkNormRopeB N nKV hd nRotHalf theta eps) (("qin",sK)::("wnorm",blk.attention.kNormWeight)::("qout",sKr)::List.nil) (N*nKV) (hash ("kn",li))
     disp device (vNormB N nKV hd eps) (("vin",sV)::("vout",sVn)::List.nil) (N*nKV) (hash ("vn",li))
     disp2 device (battnB N P nHead hd nKV 1.0) (("q",sQr)::("k",sKr)::("v",sVn)::("ctx",sCtx)::List.nil) nHead N (hash ("at",li))
     qK device sCtx N qDim (hash ("qCtx",li))
