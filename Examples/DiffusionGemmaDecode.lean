@@ -386,6 +386,93 @@ def softcapB (n : Nat) (cap : Float) : Hesper.WGSL.Monad.ShaderM Unit := do
     let arg := Exp.max (Exp.litF32 (-15.0)) (Exp.min (Exp.litF32 15.0) (Exp.div x (Exp.litF32 cap)))
     ShaderM.writeBuffer (ty := .scalar .f32) "logits" i (Exp.mul (Exp.litF32 cap) (Exp.tanh arg))) (pure ())
 
+/-- Copy one lm_head chunk's CANVAS logits into the persistent full-vocab buffer.
+    dst[i*vocab + chunkOff + o] = src[(P+i)*lmChunk + o], for canvas i, vocab-slot o. -/
+def copyCanvasLogitsB (N C P vocab lmChunk chunkOff : Nat) : Hesper.WGSL.Monad.ShaderM Unit := do
+  let gid ← ShaderM.globalId; let t := Exp.vec3X gid
+  let _s ← ShaderM.declareReadOnlyBuffer "src" (.array (.scalar .f32) (N*lmChunk))
+  let _d ← ShaderM.declareOutputBuffer "dst" (.array (.scalar .f32) (C*vocab))
+  ShaderM.if_ (Exp.lt t (Exp.litU32 (C*lmChunk))) (do
+    let i := Exp.div t (Exp.litU32 lmChunk)
+    let o := Exp.sub t (Exp.mul i (Exp.litU32 lmChunk))
+    let v := Exp.index (Exp.var "src" : Exp (.array (.scalar .f32) (N*lmChunk))) (Exp.add (Exp.mul (Exp.add i (Exp.litU32 P)) (Exp.litU32 lmChunk)) o)
+    ShaderM.writeBuffer (ty := .scalar .f32) "dst" (Exp.add (Exp.add (Exp.mul i (Exp.litU32 vocab)) (Exp.litU32 chunkOff)) o) v) (pure ())
+
+/-- GPU argmax/softmax/top-K reduction over the full vocab (one workgroup per canvas
+    position).  Replaces the per-step Lean scan over 262144×C with on-device reductions:
+    K sequential max-passes (excluding specials <5 and already-found tokens) → top-K
+    tokens + logits; one sum-pass → softmax denom.  Outputs the K tokens + K softmax
+    probs + the denom per position.  `ws`=256 threads. -/
+def reduceTopKB (C vocab K ws : Nat) : Hesper.WGSL.Monad.ShaderM Unit := do
+  let wid ← ShaderM.workgroupId; let lid ← ShaderM.localId
+  let i := Exp.vec3X wid; let tid := Exp.vec3X lid
+  let _l ← ShaderM.declareReadOnlyBuffer "logits" (.array (.scalar .f32) (C*vocab))
+  let _od ← ShaderM.declareOutputBuffer "odenom" (.array (.scalar .f32) C)
+  let _ot ← ShaderM.declareOutputBuffer "otok" (.array (.scalar .u32) (C*K))
+  let _op ← ShaderM.declareOutputBuffer "oprob" (.array (.scalar .f32) (C*K))
+  ShaderM.sharedNamed "sVal" (.array (.scalar .f32) ws)
+  ShaderM.sharedNamed "sTok" (.array (.scalar .u32) ws)
+  ShaderM.sharedNamed "sFound" (.array (.scalar .u32) K)
+  ShaderM.sharedNamed "sLog" (.array (.scalar .f32) K)
+  let rowBase := Exp.mul i (Exp.litU32 vocab)
+  -- K sequential max-passes → top-K (excluding specials <5 and previously-found tokens)
+  for k in [0:K] do
+    let nm := s!"lmax{k}"; let nt := s!"ltok{k}"; let ni := s!"isf{k}"
+    ShaderM.varNamed nm (.scalar .f32) (Exp.litF32 (-1e30))
+    ShaderM.varNamed nt (.scalar .u32) (Exp.litU32 0)
+    ShaderM.loop tid (Exp.litU32 vocab) (Exp.litU32 ws) fun v => do
+      let l := Exp.index (Exp.var "logits" : Exp (.array (.scalar .f32) (C*vocab))) (Exp.add rowBase v)
+      ShaderM.varNamed ni (.scalar .u32) (Exp.litU32 0)
+      for kk in [0:k] do
+        let fv ← ShaderM.readWorkgroup (ty := .scalar .u32) (n := K) "sFound" (Exp.litU32 kk)
+        ShaderM.if_ (Exp.eq v fv) (ShaderM.assign ni (Exp.litU32 1)) (pure ())
+      ShaderM.if_ (Exp.and (Exp.and (Exp.ge v (Exp.litU32 5)) (Exp.eq (Exp.var ni) (Exp.litU32 0))) (Exp.gt l (Exp.var nm))) (do
+        ShaderM.assign nm l; ShaderM.assign nt v) (pure ())
+    ShaderM.writeWorkgroup (ty := .scalar .f32) "sVal" tid (Exp.var nm)
+    ShaderM.writeWorkgroup (ty := .scalar .u32) "sTok" tid (Exp.var nt)
+    ShaderM.barrier
+    let mut stride := ws / 2
+    while stride > 0 do
+      ShaderM.if_ (Exp.lt tid (Exp.litU32 stride)) (do
+        let a ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := ws) "sVal" tid
+        let bb ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := ws) "sVal" (Exp.add tid (Exp.litU32 stride))
+        ShaderM.if_ (Exp.gt bb a) (do
+          ShaderM.writeWorkgroup (ty := .scalar .f32) "sVal" tid bb
+          let bt ← ShaderM.readWorkgroup (ty := .scalar .u32) (n := ws) "sTok" (Exp.add tid (Exp.litU32 stride))
+          ShaderM.writeWorkgroup (ty := .scalar .u32) "sTok" tid bt) (pure ())) (pure ())
+      ShaderM.barrier
+      stride := stride / 2
+    ShaderM.if_ (Exp.eq tid (Exp.litU32 0)) (do
+      let mt ← ShaderM.readWorkgroup (ty := .scalar .u32) (n := ws) "sTok" (Exp.litU32 0)
+      let mv ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := ws) "sVal" (Exp.litU32 0)
+      ShaderM.writeWorkgroup (ty := .scalar .u32) "sFound" (Exp.litU32 k) mt
+      ShaderM.writeWorkgroup (ty := .scalar .f32) "sLog" (Exp.litU32 k) mv) (pure ())
+    ShaderM.barrier
+  -- denom: Σ_{v≥5} exp(logit - top0logit)
+  let mx ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := K) "sLog" (Exp.litU32 0)
+  ShaderM.varNamed "lsum" (.scalar .f32) (Exp.litF32 0.0)
+  ShaderM.loop tid (Exp.litU32 vocab) (Exp.litU32 ws) fun v => do
+    let l := Exp.index (Exp.var "logits" : Exp (.array (.scalar .f32) (C*vocab))) (Exp.add rowBase v)
+    ShaderM.if_ (Exp.ge v (Exp.litU32 5)) (ShaderM.assign "lsum" (Exp.add (Exp.var "lsum") (Exp.exp (Exp.sub l mx)))) (pure ())
+  ShaderM.writeWorkgroup (ty := .scalar .f32) "sVal" tid (Exp.var "lsum")
+  ShaderM.barrier
+  let mut stride := ws / 2
+  while stride > 0 do
+    ShaderM.if_ (Exp.lt tid (Exp.litU32 stride)) (do
+      let a ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := ws) "sVal" tid
+      let bb ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := ws) "sVal" (Exp.add tid (Exp.litU32 stride))
+      ShaderM.writeWorkgroup (ty := .scalar .f32) "sVal" tid (Exp.add a bb)) (pure ())
+    ShaderM.barrier
+    stride := stride / 2
+  ShaderM.if_ (Exp.eq tid (Exp.litU32 0)) (do
+    let denom ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := ws) "sVal" (Exp.litU32 0)
+    ShaderM.writeBuffer (ty := .scalar .f32) "odenom" i denom
+    for k in [0:K] do
+      let tk ← ShaderM.readWorkgroup (ty := .scalar .u32) (n := K) "sFound" (Exp.litU32 k)
+      let lg ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := K) "sLog" (Exp.litU32 k)
+      ShaderM.writeBuffer (ty := .scalar .u32) "otok" (Exp.add (Exp.mul i (Exp.litU32 K)) (Exp.litU32 k)) tk
+      ShaderM.writeBuffer (ty := .scalar .f32) "oprob" (Exp.add (Exp.mul i (Exp.litU32 K)) (Exp.litU32 k)) (Exp.div (Exp.exp (Exp.sub lg mx)) denom)) (pure ())
+
 /-- u32 little-endian ByteArray from a Nat array. -/
 def u32Bytes (xs : Array Nat) : ByteArray := Id.run do
   let mut b := ByteArray.empty
@@ -425,70 +512,39 @@ def bmm (device : Device) (layer : Hesper.Layers.Linear.LinearLayer B C) (inB ou
     | _     => Hesper.Layers.Linear.fusedQ4KMBatchKernel cfg N
   disp2 device k bufs cfg.outDim N key
 
-/-- Online-softmax + top-K merge of one lm_head chunk's logits for one position (pure, so
-    the triple-nested decode loop doesn't blow the elaborator's recursion depth).
-    Tracks the running (max, denom) AND the top-K (logit, token) sorted descending —
-    the top-K carry the softmax mass for the self-conditioning soft embedding. -/
-def mergeChunkTopK (logits : Array Float) (base oStart oEnd cbase K : Nat)
-    (mx0 sm0 : Float) (klog0 : Array Float) (ktok0 : Array Nat)
-    : (Float × Float × Array Float × Array Nat) := Id.run do
-  let mut mx := mx0; let mut sm := sm0
-  let mut klog := klog0; let mut ktok := ktok0
-  for o in [oStart:oEnd] do
-    let l := logits[base+o]!
-    let tok := cbase + o
-    if l > mx then sm := sm * Float.exp (mx - l) + 1.0; mx := l
-    else sm := sm + Float.exp (l - mx)
-    if l > klog[K-1]! then
-      let mut j := K - 1
-      while j > 0 && klog[j-1]! < l do
-        klog := klog.set! j (klog[j-1]!); ktok := ktok.set! j (ktok[j-1]!); j := j - 1
-      klog := klog.set! j l; ktok := ktok.set! j tok
-  return (mx, sm, klog, ktok)
-
-/-- Tied Q6_K lm_head over the FULL vocab, tiled into ≤65535-row chunks (WebGPU
-    workgroup limit).  Per masked position keeps an online-softmax running
-    (max, argmax, denom) over NON-special tokens (≥5), so the prediction can land
-    anywhere in the 262144 vocab (e.g. '▁'=236743) — matching ggml.  `sN` must
-    already be finalNorm'd + Q8-quantized.  Returns (canvasIdx, predToken, confidence). -/
-def lmHeadArgmaxFullVocab (device : Device) (outputWeight sN : Buffer)
-    (dim vocabSize N C P : Nat) (cap : Float) (masked : Array Bool) (dumpFirst : Bool := false) (K : Nat := 8)
+/-- Tied Q6_K lm_head over the FULL vocab (tiled ≤65535-row chunks → logitsCanvas),
+    then a GPU reduce (`reduceTopKB`, one workgroup/position) for argmax/softmax/top-K —
+    replaces the per-step 262144×C Lean scan.  Reads back only the tiny top-K result.
+    Returns (canvasIdx, predToken, confidence)·masked, top-K tokens [C·K], top-K probs [C·K]. -/
+def lmHeadArgmaxFullVocab (device : Device) (outputWeight sN sLogits logitsCanvas outDenom outTok outProb : Buffer)
+    (dim vocabSize N C P : Nat) (cap : Float) (masked : Array Bool) (K : Nat := 8)
     : IO (Array (Nat × Nat × Float) × Array Nat × Array Float) := do
   let lmChunk := 32768
   let nChunks := (vocabSize + lmChunk - 1) / lmChunk
-  let sLogits ← mkBuf device (N*lmChunk)
-  let mut mxArr : Array Float := Array.replicate C (-1e30)
-  let mut smArr : Array Float := Array.replicate C 0.0
-  let mut klogArr : Array (Array Float) := Array.replicate C (Array.replicate K (-1e30))
-  let mut ktokArr : Array (Array Nat) := Array.replicate C (Array.replicate K 0)
-  let mut p0logits : Array Float := if dumpFirst then Array.replicate vocabSize 0.0 else #[]
   for c in [0:nChunks] do
     Hesper.GPUBackend.beginBatch device
     disp2 device (Hesper.Quantization.Q6_K.fusedQ6KBatchKernel dim lmChunk N 256 (c*lmChunk) vocabSize)
       (("weights", outputWeight)::("input", sN)::("output", sLogits)::List.nil) lmChunk N (hash ("lmhead", c))
     disp device (softcapB (N*lmChunk) cap) (("logits", sLogits)::List.nil) (N*lmChunk) (hash ("softcap", c))
+    disp device (copyCanvasLogitsB N C P vocabSize lmChunk (c*lmChunk)) (("src",sLogits)::("dst",logitsCanvas)::List.nil) (C*lmChunk) (hash ("cpcv", c))
     Hesper.GPUBackend.endBatch device
-    let logits ← Hesper.Basic.bytesToFloatArray (← mapBufferRead device sLogits 0 (N*lmChunk*4).toUSize)
-    unmapBuffer sLogits
-    let oStart := if c == 0 then 5 else 0   -- skip specials 0..4 (only in chunk 0)
-    let oEnd := min lmChunk (vocabSize - c*lmChunk)
-    if dumpFirst then  -- accumulate canvas-position-0 (token P) full logits for golden verify
-      for o in [0:oEnd] do p0logits := p0logits.set! (c*lmChunk+o) logits[P*lmChunk+o]!
-    for i in [0:C] do   -- softmax(max,denom) + top-K over ALL canvas positions
-      let (mx, sm, kl, kt) := mergeChunkTopK logits ((P+i)*lmChunk) oStart oEnd (c*lmChunk) K mxArr[i]! smArr[i]! klogArr[i]! ktokArr[i]!
-      mxArr := mxArr.set! i mx; smArr := smArr.set! i sm; klogArr := klogArr.set! i kl; ktokArr := ktokArr.set! i kt
-  if dumpFirst then
-    IO.FS.writeBinFile "/tmp/my_logits_p0.bin" (← Hesper.Basic.floatArrayToBytes p0logits)
-    IO.println s!"[verify] dumped canvas-0 full logits ({vocabSize}) to /tmp/my_logits_p0.bin"
-  -- flatten top-K tokens + softmax probs (over the full vocab denom) for the SC soft embedding
+  Hesper.GPUBackend.beginBatch device
+  disp2 device (reduceTopKB C vocabSize K 256)
+    (("logits",logitsCanvas)::("odenom",outDenom)::("otok",outTok)::("oprob",outProb)::List.nil) C 1 (hash "reducetopk")
+  Hesper.GPUBackend.endBatch device
+  let tokBytes ← mapBufferRead device outTok 0 (C*K*4).toUSize
+  let probFlat ← Hesper.Basic.bytesToFloatArray (← mapBufferRead device outProb 0 (C*K*4).toUSize)
+  unmapBuffer outProb
+  let denomA ← Hesper.Basic.bytesToFloatArray (← mapBufferRead device outDenom 0 (C*4).toUSize)
+  unmapBuffer outDenom
+  unmapBuffer outTok
   let mut ktokFlat : Array Nat := Array.replicate (C*K) 0
-  let mut probFlat : Array Float := Array.replicate (C*K) 0.0
+  for j in [0:C*K] do
+    let b := j*4
+    ktokFlat := ktokFlat.set! j (tokBytes[b]!.toNat ||| (tokBytes[b+1]!.toNat <<< 8) ||| (tokBytes[b+2]!.toNat <<< 16) ||| (tokBytes[b+3]!.toNat <<< 24))
   let mut cand : Array (Nat × Nat × Float) := #[]
   for i in [0:C] do
-    for k in [0:K] do
-      ktokFlat := ktokFlat.set! (i*K+k) (ktokArr[i]![k]!)
-      probFlat := probFlat.set! (i*K+k) (Float.exp (klogArr[i]![k]! - mxArr[i]!) / smArr[i]!)
-    if masked[i]! then cand := cand.push (i, ktokArr[i]![0]!, 1.0 / smArr[i]!)
+    if masked[i]! then cand := cand.push (i, ktokFlat[i*K]!, 1.0 / denomA[i]!)
   return (cand, ktokFlat, probFlat)
 
 def main (args : List String) : IO Unit := do
@@ -553,6 +609,10 @@ def main (args : List String) : IO Unit := do
   let lmN := min cfg.vocabSize 32768
   let cap := cfg.logitSoftcapScale
   let sLogits ← mkBuf device (N*lmN)
+  let logitsCanvas ← mkBuf device (C*cfg.vocabSize)  -- full-vocab canvas logits for the GPU reduce
+  let outDenom ← mkBuf device C
+  let outTok ← mkBuf device (C*scK)
+  let outProb ← mkBuf device (C*scK)
   IO.println s!"[dg-decode] {decodeSteps} steps, N={N} P={P} C={C}"
   for step in [0:decodeSteps] do
     let remaining := masked.foldl (fun acc b => if b then acc+1 else acc) 0
@@ -649,7 +709,7 @@ def main (args : List String) : IO Unit := do
       Hesper.Layers.RMSNorm.forward device model.inner.finalNorm cur sN N
       qK device sN N dim (hash "qFinal")
       Hesper.GPUBackend.endBatch device
-      let (cand, ktokFlat, probFlat) ← lmHeadArgmaxFullVocab device model.inner.outputWeight sN dim cfg.vocabSize N C P cfg.logitSoftcapScale masked (step == 0 && (← IO.getEnv "DG_VERIFY").isSome) scK
+      let (cand, ktokFlat, probFlat) ← lmHeadArgmaxFullVocab device model.inner.outputWeight sN sLogits logitsCanvas outDenom outTok outProb dim cfg.vocabSize N C P cfg.logitSoftcapScale masked scK
       scTok := ktokFlat; scProb := probFlat   -- feed this step's top-K soft prediction into next step's SC
       let want := if step+1 ≥ decodeSteps then remaining else max 1 ((C + decodeSteps - 1) / decodeSteps)
       let k := min want cand.size
