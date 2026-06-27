@@ -70,7 +70,7 @@ def qActQ8K (N K : Nat) : Hesper.WGSL.Monad.ShaderM Unit := do
       ShaderM.loop (Exp.litU32 0) (Exp.litU32 256) (Exp.litU32 1) fun i => do
         let v ← ShaderM.readBuffer (ty := .scalar .f32) (n := N*K) "data" (Exp.add base i)
         let y := Exp.mul iscale v
-        let q := Exp.min (Exp.litF32 127.0) (Exp.mul (Exp.sign y) (Exp.floor (Exp.add (Exp.abs y) (Exp.litF32 0.5))))
+        let q := Exp.min (Exp.litF32 127.0) (Exp.round y)
         ShaderM.writeBuffer (ty := .scalar .f32) "data" (Exp.add base i) (Exp.mul q d)) (pure ())) (pure ())
 
 /-- Activation Q8_0 quant+dequant in-place (block 32 along K), matching ggml quantize_row_q8_0.
@@ -92,7 +92,7 @@ def qActQ80 (N K : Nat) : Hesper.WGSL.Monad.ShaderM Unit := do
       ShaderM.loop (Exp.litU32 0) (Exp.litU32 32) (Exp.litU32 1) fun i => do
         let v ← ShaderM.readBuffer (ty := .scalar .f32) (n := N*K) "data" (Exp.add base i)
         let y := Exp.mul idv v
-        let q := Exp.mul (Exp.sign y) (Exp.floor (Exp.add (Exp.abs y) (Exp.litF32 0.5)))
+        let q := Exp.round y
         ShaderM.writeBuffer (ty := .scalar .f32) "data" (Exp.add base i) (Exp.mul q d)) (pure ())) (pure ())
 
 /-- Elementwise add: out[i]=a[i]+b[i] (n=N*dim). -/
