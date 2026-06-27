@@ -643,8 +643,9 @@ def main (args : List String) : IO Unit := do
       disp device (embNormCanvasK N P dim eps) (("emb",a)::List.nil) N (hash "embn")
       Hesper.GPUBackend.endBatch device
       let mut cur := a; let mut nxt := b
+      let lpb := ((← IO.getEnv "DG_LPB").bind (·.toNat?)).getD 30  -- layers per GPU submission (1 batch/forward; ~12% faster)
       for li in [0:nLayers] do
-        Hesper.GPUBackend.beginBatch device   -- one submission per layer (bounds peak encoder memory)
+        if li % lpb == 0 then Hesper.GPUBackend.beginBatch device
         let some blk := model.inner.blocks[li]? | throw (IO.userError "blk")
         let qDim := blk.attention.wO.config.inDim; let kvDim := blk.attention.wV.config.outDim
         let hd := qDim / nHead; let nKV := kvDim / hd
@@ -702,14 +703,16 @@ def main (args : List String) : IO Unit := do
         Hesper.Layers.RMSNorm.forward device blk.postFFNNorm sComb sR N
         disp device (addB (N*dim)) (("ain",sR)::("bin",sPA)::("outc",nxt)::List.nil) (N*dim) (hash ("rc",li))
         disp device (scaleRegionB N P dim (scales[li]!) (encScales[li]!)) (("data",nxt)::List.nil) (N*dim) (hash ("sc",li))
-        Hesper.GPUBackend.endBatch device
+        if li % lpb == lpb-1 || li == nLayers-1 then Hesper.GPUBackend.endBatch device
         let t := cur; cur := nxt; nxt := t
+      let tFwd ← IO.monoMsNow
       -- final norm + Q8 quant, then full-vocab tiled lm_head (helper, keeps `main` small)
       Hesper.GPUBackend.beginBatch device
       Hesper.Layers.RMSNorm.forward device model.inner.finalNorm cur sN N
       qK device sN N dim (hash "qFinal")
       Hesper.GPUBackend.endBatch device
       let (cand, ktokFlat, probFlat) ← lmHeadArgmaxFullVocab device model.inner.outputWeight sN sLogits logitsCanvas outDenom outTok outProb dim cfg.vocabSize N C P cfg.logitSoftcapScale masked scK
+      let tLm ← IO.monoMsNow
       scTok := ktokFlat; scProb := probFlat   -- feed this step's top-K soft prediction into next step's SC
       let want := if step+1 ≥ decodeSteps then remaining else max 1 ((C + decodeSteps - 1) / decodeSteps)
       let k := min want cand.size
@@ -724,7 +727,7 @@ def main (args : List String) : IO Unit := do
         toks := toks.set! (P+ci) pred
         masked := masked.set! ci false
       let t1 ← IO.monoMsNow
-      IO.println s!"[dg-decode] step {step}: committed {k}, remaining {remaining-k} | forward+decode {t1-t0}ms ({(259000)/(max 1 (t1-t0))} pos-layer/s over 30L)"
+      IO.println s!"[dg-decode] step {step}: committed {k} | total {t1-t0}ms = emb+fwd {tFwd-t0}ms + lmhead+reduce {tLm-tFwd}ms + commit {t1-tLm}ms"
   let outIds := toks.extract P (P+C)
   IO.println s!"[dg-decode] first canvas IDs: {(outIds.extract 0 (min 24 outIds.size)).toList}"
   IO.println s!"[dg-decode] TEXT: {Hesper.Tokenizer.SentencePiece.decode tokenizer outIds}"
