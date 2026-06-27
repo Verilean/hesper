@@ -534,8 +534,8 @@ def lmHeadArgmaxFullVocab (device : Device) (outputWeight sN sLogits logitsCanva
   let nChunks := (vocabSize + lmChunk - 1) / lmChunk
   for c in [0:nChunks] do
     Hesper.GPUBackend.beginBatch device
-    disp2 device (Hesper.Quantization.Q6_K.fusedQ6KBatchKernel dim lmChunk N 256 (c*lmChunk) vocabSize)
-      (("weights", outputWeight)::("input", sN)::("output", sLogits)::List.nil) lmChunk N (hash ("lmhead", c))
+    disp2w device (Hesper.Layers.Linear.fusedQ6KBatchF32WarpKernel dim lmChunk N (c*lmChunk) vocabSize)
+      (("weights", outputWeight)::("input", sN)::("output", sLogits)::List.nil) lmChunk N 32 (hash ("lmheadw", c))
     disp device (softcapB (N*lmChunk) cap) (("logits", sLogits)::List.nil) (N*lmChunk) (hash ("softcap", c))
     disp device (copyCanvasLogitsB N C P vocabSize lmChunk (c*lmChunk)) (("src",sLogits)::("dst",logitsCanvas)::List.nil) (C*lmChunk) (hash ("cpcv", c))
     Hesper.GPUBackend.endBatch device
@@ -576,9 +576,8 @@ def lmHeadDiag (device : Device)
   Hesper.GPUBackend.beginBatch device
   disp2 device (Hesper.Quantization.Q6_K.fusedQ6KBatchKernel dim lmChunk N 256 0 vocabSize)
     (("weights",outputWeight)::("input",sN)::("output",sL1)::List.nil) lmChunk N (hash "diagf32")
-  disp2w device (Hesper.Layers.Linear.quantizeQ8_1BatchKernel dim N) (("input",sN)::("output",sNQ8)::List.nil) (dim/32) N 32 (hash "diagq8")
-  disp2w device (Hesper.Layers.Linear.q6kMatmulBatchKernel dim lmChunk N 0 vocabSize)
-    (("weights",outputWeight)::("input_q8",sNQ8)::("output",sL2)::List.nil) lmChunk N 32 (hash "diagdp4a")
+  disp2w device (Hesper.Layers.Linear.fusedQ6KBatchF32WarpKernel dim lmChunk N 0 vocabSize)
+    (("weights",outputWeight)::("input",sN)::("output",sL2)::List.nil) lmChunk N 32 (hash "diagwarp")
   Hesper.GPUBackend.endBatch device
   let f32L ← Hesper.Basic.bytesToFloatArray (← mapBufferRead device sL1 (P*lmChunk*4).toUSize (lmChunk*4).toUSize)
   unmapBuffer sL1
@@ -763,7 +762,8 @@ def main (args : List String) : IO Unit := do
       -- final norm + Q8 quant, then full-vocab tiled lm_head (helper, keeps `main` small)
       Hesper.GPUBackend.beginBatch device
       Hesper.Layers.RMSNorm.forward device model.inner.finalNorm cur sN N
-      qK device sN N dim (hash "qFinal")
+      -- lm_head reads the RAW f32 hidden (no qK): confirmed "Paris.", slightly more
+      -- accurate than Q8_K, and the planned f32-warp lm_head kernel reads f32 directly.
       Hesper.GPUBackend.endBatch device
       let (cand, ktokFlat, probFlat) ← lmHeadArgmaxFullVocab device model.inner.outputWeight sN sLogits logitsCanvas outDenom outTok outProb dim cfg.vocabSize N C P cfg.logitSoftcapScale masked scK
       let tLm ← IO.monoMsNow
