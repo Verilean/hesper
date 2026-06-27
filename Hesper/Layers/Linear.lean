@@ -3996,6 +3996,106 @@ def q6kMatmulBatchKernel (inDim outDim : Nat) (seqLen : Nat)
     ShaderM.writeBuffer (ty := .scalar .f32) "output" outOff total
   ) (pure ())
 
+/-- Batched Q6_K × **f32** matmul — same 32-lane-warp / subgroupAdd structure and Q6_K
+    weight decode as `q6kMatmulBatchKernel`, but reads the RAW f32 activation (no Q8_1
+    quant) and does an f32 dot. For the argmax-sensitive lm_head: keeps full f32 precision
+    (so the decode output is unchanged) while getting the warp occupancy/barrier win over
+    the block-parallel `fusedQ6KBatchKernel` (which uses only 11/256 threads).
+    The f32 element index matching q8 sub-block `i` is `colIdx*inDim + blockIdx*256 +
+    (bq8Off + 2*i)*32 + q8ElemOff*4 + k` (the Q8_1 was quantized in element order). -/
+def fusedQ6KBatchF32WarpKernel (inDim outDim seqLen : Nat)
+    (rowOffset : Nat := 0) (weightRows : Nat := 0) : ShaderM Unit := do
+  let wid ← ShaderM.workgroupId
+  let lid ← ShaderM.localId
+  let outIdx := Exp.vec3X wid
+  let colIdx := Exp.vec3Y wid
+  let tid := Exp.vec3X lid
+  let blocksPerRow := inDim / 256
+  let blockSizeBytes : Nat := 210
+  let wRows := if weightRows == 0 then outDim else weightRows
+  let totalWeightBytes := wRows * blocksPerRow * blockSizeBytes
+  let totalWeightU32 := (totalWeightBytes + 3) / 4
+  let totalInputSize := seqLen * inDim
+  let totalOutputSize := outDim * seqLen
+  let _weights ← ShaderM.declareReadOnlyBuffer "weights" (.array (.scalar .u32) totalWeightU32)
+  let _input ← ShaderM.declareReadOnlyBuffer "input" (.array (.scalar .f32) totalInputSize)
+  let _output ← ShaderM.declareOutputBuffer "output" (.array (.scalar .f32) totalOutputSize)
+  let inBounds := Exp.lt outIdx (Exp.litU32 outDim)
+  let iqs : Exp (.scalar .u32) := tid
+  let iqsDiv16 := Exp.shiftRight iqs (Exp.litU32 4)
+  let iqsMod16 := Exp.bitAnd iqs (Exp.litU32 15)
+  let bq8Off := Exp.add (Exp.mul iqsDiv16 (Exp.litU32 4)) (Exp.shiftRight iqsMod16 (Exp.litU32 3))
+  let scaleOff := Exp.add (Exp.mul iqsDiv16 (Exp.litU32 8)) (Exp.shiftRight iqsMod16 (Exp.litU32 2))
+  let vhShift := Exp.mul (Exp.shiftRight iqsMod16 (Exp.litU32 3)) (Exp.litU32 2)
+  let iqsMod8 := Exp.bitAnd iqs (Exp.litU32 7)
+  let vhIdx := Exp.add (Exp.mul iqsDiv16 (Exp.litU32 8)) iqsMod8
+  let q8ElemOff := iqsMod8
+  ShaderM.varNamed "acc" (.scalar .f32) (Exp.litF32 0.0)
+  let acc : Exp (.scalar .f32) := Exp.var "acc"
+  ShaderM.varNamed "rowByteBase" (.scalar .u32)
+    (Exp.mul (Exp.add outIdx (Exp.litU32 rowOffset)) (Exp.litU32 (blocksPerRow * blockSizeBytes)))
+  let rowByteBase : Exp (.scalar .u32) := Exp.var "rowByteBase"
+  let inColBase := Exp.mul colIdx (Exp.litU32 inDim)
+  let readByte (blockBase : Exp (.scalar .u32)) (offset : Exp (.scalar .u32)) : ShaderM (Exp (.scalar .u32)) := do
+    ShaderM.readBufferByte (n := totalWeightU32) "weights" (Exp.add blockBase offset)
+  let readU16 (blockBase : Exp (.scalar .u32)) (offset : Exp (.scalar .u32)) : ShaderM (Exp (.scalar .u32)) := do
+    ShaderM.readBufferU16 (n := totalWeightU32) "weights" (Exp.add blockBase offset)
+  let read4Bytes (blockBase : Exp (.scalar .u32)) (offset : Exp (.scalar .u32)) : ShaderM (Exp (.scalar .u32)) := do
+    let byteIdxName ← ShaderM.var (.scalar .u32) (Exp.add blockBase offset)
+    let byteIdx : Exp (.scalar .u32) := Exp.var byteIdxName
+    let u32IdxName ← ShaderM.var (.scalar .u32) (Exp.shiftRight byteIdx (Exp.litU32 2))
+    let u32Idx : Exp (.scalar .u32) := Exp.var u32IdxName
+    let byteOffName ← ShaderM.var (.scalar .u32) (Exp.bitAnd byteIdx (Exp.litU32 3))
+    let byteOff : Exp (.scalar .u32) := Exp.var byteOffName
+    let w0 ← ShaderM.readBuffer (ty := .scalar .u32) (n := totalWeightU32) "weights" u32Idx
+    let w1 ← ShaderM.readBuffer (ty := .scalar .u32) (n := totalWeightU32) "weights" (Exp.add u32Idx (Exp.litU32 1))
+    let lo := Exp.shiftRight w0 (Exp.mul byteOff (Exp.litU32 8))
+    let hi := Exp.select (Exp.eq byteOff (Exp.litU32 0)) (Exp.litU32 0)
+                (Exp.shiftLeft w1 (Exp.mul (Exp.sub (Exp.litU32 4) byteOff) (Exp.litU32 8)))
+    pure (Exp.bitOr lo hi)
+  let sub32PerByte (x : Exp (.scalar .u32)) : Exp (.scalar .u32) :=
+    Exp.bitXor (Exp.sub (Exp.bitOr x (Exp.litU32 0x80808080)) (Exp.litU32 0x20202020)) (Exp.litU32 0x80808080)
+  let signByteF32 (x : Exp (.scalar .u32)) (sh : Nat) : Exp (.scalar .f32) :=
+    let bb := Exp.bitAnd (Exp.shiftRight x (Exp.litU32 sh)) (Exp.litU32 0xFF)
+    Exp.select (Exp.ge bb (Exp.litU32 128)) (Exp.sub (Exp.toF32 bb) (Exp.litF32 256.0)) (Exp.toF32 bb)
+  let signExtI8 (b : Exp (.scalar .u32)) : Exp (.scalar .u32) :=
+    Exp.select (Exp.ge b (Exp.litU32 128)) (Exp.bitOr b (Exp.litU32 0xFFFFFF00)) b
+  ShaderM.loop (Exp.litU32 0) (Exp.litU32 blocksPerRow) (Exp.litU32 1) fun blockIdx => do
+    let blockByteBase := Exp.add rowByteBase (Exp.mul blockIdx (Exp.litU32 blockSizeBytes))
+    let dBitsName ← ShaderM.var (.scalar .u32) (← readU16 blockByteBase (Exp.litU32 208))
+    let d := Exp.vecX (Exp.unpack2x16float (Exp.var dBitsName))
+    let vlName ← ShaderM.var (.scalar .u32) (← read4Bytes blockByteBase (Exp.mul iqs (Exp.litU32 4)))
+    let vl : Exp (.scalar .u32) := Exp.var vlName
+    let vhRaw ← read4Bytes blockByteBase (Exp.add (Exp.litU32 128) (Exp.mul vhIdx (Exp.litU32 4)))
+    let vhName ← ShaderM.var (.scalar .u32) (Exp.shiftRight vhRaw vhShift)
+    let vh : Exp (.scalar .u32) := Exp.var vhName
+    let sc0Byte ← readByte blockByteBase (Exp.add (Exp.litU32 192) scaleOff)
+    let sc1Byte ← readByte blockByteBase (Exp.add (Exp.litU32 192) (Exp.add scaleOff (Exp.litU32 4)))
+    let scA := Exp.toF32 (Exp.toI32 (signExtI8 sc0Byte))
+    let scB := Exp.toF32 (Exp.toI32 (signExtI8 sc1Byte))
+    let inBase0 := Exp.add inColBase (Exp.add (Exp.mul blockIdx (Exp.litU32 256))
+      (Exp.add (Exp.mul bq8Off (Exp.litU32 32)) (Exp.mul q8ElemOff (Exp.litU32 4))))
+    let inBase1 := Exp.add inBase0 (Exp.litU32 64)
+    let rd (base : Exp (.scalar .u32)) (o : Nat) : ShaderM (Exp (.scalar .f32)) :=
+      ShaderM.readBuffer (ty := .scalar .f32) (n := totalInputSize) "input" (Exp.add base (Exp.litU32 o))
+    let i00 ← rd inBase0 0; let i01 ← rd inBase0 1; let i02 ← rd inBase0 2; let i03 ← rd inBase0 3
+    let i10 ← rd inBase1 0; let i11 ← rd inBase1 1; let i12 ← rd inBase1 2; let i13 ← rd inBase1 3
+    let vi_0 := sub32PerByte (Exp.bitOr (Exp.bitAnd vl (Exp.litU32 0x0F0F0F0F))
+      (Exp.bitAnd (Exp.shiftLeft vh (Exp.litU32 4)) (Exp.litU32 0x30303030)))
+    let dot_0 := Exp.add (Exp.add (Exp.mul (signByteF32 vi_0 0) i00) (Exp.mul (signByteF32 vi_0 8) i01))
+                         (Exp.add (Exp.mul (signByteF32 vi_0 16) i02) (Exp.mul (signByteF32 vi_0 24) i03))
+    let vi_1 := sub32PerByte (Exp.bitOr (Exp.bitAnd (Exp.shiftRight vl (Exp.litU32 4)) (Exp.litU32 0x0F0F0F0F))
+      (Exp.bitAnd (Exp.shiftLeft (Exp.shiftRight vh (Exp.litU32 4)) (Exp.litU32 4)) (Exp.litU32 0x30303030)))
+    let dot_1 := Exp.add (Exp.add (Exp.mul (signByteF32 vi_1 0) i10) (Exp.mul (signByteF32 vi_1 8) i11))
+                         (Exp.add (Exp.mul (signByteF32 vi_1 16) i12) (Exp.mul (signByteF32 vi_1 24) i13))
+    ShaderM.assign "acc" (Exp.fma d (Exp.add (Exp.mul scA dot_0) (Exp.mul scB dot_1)) acc)
+  ShaderM.varNamed "total" (.scalar .f32) (Exp.subgroupAdd acc)
+  let total : Exp (.scalar .f32) := Exp.var "total"
+  let valid := Exp.and (Exp.and (Exp.eq tid (Exp.litU32 0)) inBounds) (Exp.lt colIdx (Exp.litU32 seqLen))
+  ShaderM.if_ valid (do
+    ShaderM.writeBuffer (ty := .scalar .f32) "output" (Exp.add (Exp.mul colIdx (Exp.litU32 outDim)) outIdx) total
+  ) (pure ())
+
 /-- 4-warp coop K batched Q6_K matmul: `[outDim, inDim] × [inDim, seqLen]`.
 
     Mirror of `fusedQ6KLinearDP4A4WarpKernel` with a column axis. Each WG
