@@ -382,6 +382,7 @@ def bmm (device : Device) (layer : Hesper.Layers.Linear.LinearLayer B C) (inB ou
   let bufs := ("weights", layer.weightBuf)::("input", inB)::("output", outB)::List.nil
   let k := match layer.quantFormat with
     | .Q8_0 => Hesper.Layers.Linear.fusedQ8_0BatchKernel cfg N
+    | .Q5_0 => Hesper.Layers.Linear.fusedQ5_0BatchKernel cfg N
     | .Q6_K => Hesper.Quantization.Q6_K.fusedQ6KBatchKernel cfg.inDim cfg.outDim N
     | _     => Hesper.Layers.Linear.fusedQ4KMBatchKernel cfg N
   disp2 device k bufs cfg.outDim N key
@@ -440,8 +441,10 @@ def main (args : List String) : IO Unit := do
     writeBuffer device a 0 (← IO.FS.readBinFile s!"/tmp/real_l_out-{k-1}.bin")
     IO.println s!"[dg-bidir] DG_INJECT: loaded ggml l_out-{k-1}; running from layer {k}"
   let mut cur := a; let mut nxt := b
+  let unbatched := (← IO.getEnv "DG_UNBATCH").isSome
   for li in [(injectK.getD 0):nLayers] do
-    Hesper.GPUBackend.beginBatch device   -- one submission per layer (bounds peak encoder memory)
+    if !unbatched then
+      Hesper.GPUBackend.beginBatch device   -- one submission per layer (bounds peak encoder memory)
     let some blk := model.inner.blocks[li]? | throw (IO.userError "blk")
     let qDim := blk.attention.wO.config.inDim; let kvDim := blk.attention.wV.config.outDim
     let hd := qDim / nHead; let nKV := kvDim / hd
@@ -449,7 +452,6 @@ def main (args : List String) : IO Unit := do
     let nRotHalf := if li % 6 == 5 then 64 else hd/2
     -- attention
     Hesper.Layers.RMSNorm.forward device blk.attnNorm cur sN N
-    disp device (copyB (N*dim)) (("cin",sN)::("cout",sAttnDbg)::List.nil) (N*dim) (hash ("cpN",li))
     qK device sN N dim (hash ("qN",li))
     bmm device blk.attention.wQ sN sQ N (hash ("wq",li))
     bmm device blk.attention.wK sN sK N (hash ("wk",li))
@@ -489,7 +491,10 @@ def main (args : List String) : IO Unit := do
       disp2 device (Hesper.Layers.Linear.fusedQ4KMBatchExpertKernel { inDim:=dim, outDim:=2*expFF } nExpert N nUsed e) (("weights",guE)::("input",sMoeN)::("idxs",sIdxs)::("output",sGateUp)::List.nil) (2*expFF) N (hash ("eu",li,e))
       disp device (gegluMergedB N expFF) (("gu",sGateUp)::("eh",sEh)::List.nil) (N*expFF) (hash ("gm",li,e))
       q80 device sEh N expFF (hash ("qEh",li,e))
-      disp2 device (Hesper.Layers.Linear.fusedQ8_0BatchExpertKernel { inDim:=expFF, outDim:=dim } nExpert N nUsed e) (("weights",dnE)::("input",sEh)::("idxs",sIdxs)::("output",sDownE)::List.nil) dim N (hash ("ed",li,e))
+      let downExpKernel := match blk.ffn.down.quantFormat with
+        | .Q5_0 => Hesper.Layers.Linear.fusedQ5_0BatchExpertKernel { inDim:=expFF, outDim:=dim } nExpert N nUsed e
+        | _     => Hesper.Layers.Linear.fusedQ8_0BatchExpertKernel { inDim:=expFF, outDim:=dim } nExpert N nUsed e
+      disp2 device downExpKernel (("weights",dnE)::("input",sEh)::("idxs",sIdxs)::("output",sDownE)::List.nil) dim N (hash ("ed",li,e))
       disp device (waccB N dim e nUsed) (("acc",sMoeAcc)::("din",sDownE)::("wts",sWts)::List.nil) (N*dim) (hash ("wa",li,e))
     Hesper.Layers.RMSNorm.forward device mpn2post sMoeAcc sCurMoe N
     -- combine: curMlp + curMoe → postFFNNorm → +residual → ×out_scale
@@ -497,7 +502,8 @@ def main (args : List String) : IO Unit := do
     Hesper.Layers.RMSNorm.forward device blk.postFFNNorm sComb sR N
     disp device (addB (N*dim)) (("ain",sR)::("bin",sPA)::("outc",nxt)::List.nil) (N*dim) (hash ("rc",li))
     disp device (scaleRegionB N P dim (scales[li]!) (encScales[li]!)) (("data",nxt)::List.nil) (N*dim) (hash ("sc",li))
-    Hesper.GPUBackend.endBatch device
+    if !unbatched then
+      Hesper.GPUBackend.endBatch device
     let t := cur; cur := nxt; nxt := t
   -- DEBUG: dump layer-0 intermediates (run with nLayers=1) to compare vs ggml
   if (← IO.getEnv "DG_DUMP").isSome then
@@ -518,6 +524,10 @@ def main (args : List String) : IO Unit := do
     dump sMoeAcc (N*dim) "/tmp/my_moeacc.bin"
     dump sWts (N*nUsed) "/tmp/my_wts.bin"
     dump sMoeN (N*dim) "/tmp/my_moen.bin"
+    dump sAO (N*dim) "/tmp/my_ao.bin"
+    dump sPA (N*dim) "/tmp/my_pa.bin"
+    dump sComb (N*dim) "/tmp/my_comb.bin"
+    dump sR (N*dim) "/tmp/my_r.bin"
     dump sAttnDbg (N*dim) "/tmp/my_attnnorm.bin"
     dump sKr (N*2048) "/tmp/my_kr.bin"
     dump sVn (N*2048) "/tmp/my_vn.bin"

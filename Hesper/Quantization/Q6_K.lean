@@ -231,7 +231,12 @@ def fusedQ6KLinearKernel (inDim outDim : Nat) (workgroupSize : Nat := 256)
 
 
 /-- Batched Q6_K matmul: [M,inDim] x dequant(Q6_K weights) -> [M,outDim]. Dispatch (outDim,M,1). -/
-def fusedQ6KBatchKernel (inDim outDim M : Nat) (workgroupSize : Nat := 256) : ShaderM Unit := do
+def fusedQ6KBatchKernel (inDim outDim M : Nat) (workgroupSize : Nat := 256)
+    (rowOffset : Nat := 0) (weightRows : Nat := 0) : ShaderM Unit := do
+  -- `rowOffset`/`weightRows` enable tiling a wide weight (e.g. 262144-vocab lm_head)
+  -- past the 65535-workgroup limit: bind the FULL weight (weightRows rows), dispatch
+  -- `outDim` (≤65535) rows per chunk, the kernel reads weight row (outIdx+rowOffset)
+  -- and writes chunk-local output[row*outDim + outIdx].  Default (0,0) = old behavior.
   let wid ← ShaderM.workgroupId
   let lid ← ShaderM.localId
   let outIdx := Exp.vec3X wid
@@ -240,7 +245,8 @@ def fusedQ6KBatchKernel (inDim outDim M : Nat) (workgroupSize : Nat := 256) : Sh
   let inRowBase := Exp.mul row (Exp.litU32 inDim)
 
   let blocksPerRow := inDim / blockSize
-  let totalWeightBytes := outDim * blocksPerRow * blockSizeBytes
+  let wRows := if weightRows == 0 then outDim else weightRows
+  let totalWeightBytes := wRows * blocksPerRow * blockSizeBytes
   let totalWeightU32 := (totalWeightBytes + 3) / 4
 
   let _weights ← ShaderM.declareReadOnlyBuffer "weights" (.array (.scalar .u32) totalWeightU32)
@@ -250,7 +256,8 @@ def fusedQ6KBatchKernel (inDim outDim M : Nat) (workgroupSize : Nat := 256) : Sh
   ShaderM.sharedNamed "shared_partial" (.array (.scalar .f32) workgroupSize)
 
   ShaderM.if_ (Exp.lt outIdx (Exp.litU32 outDim)) (do
-    let rowByteBase := Exp.mul outIdx (Exp.litU32 (blocksPerRow * blockSizeBytes))
+    let weightRow := Exp.add outIdx (Exp.litU32 rowOffset)
+    let rowByteBase := Exp.mul weightRow (Exp.litU32 (blocksPerRow * blockSizeBytes))
 
     ShaderM.varNamed "acc" (.scalar .f32) (Exp.litF32 0.0)
     let acc : Exp (.scalar .f32) := Exp.var "acc"

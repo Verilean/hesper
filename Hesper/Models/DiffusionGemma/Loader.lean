@@ -40,6 +40,12 @@ open Hesper.Models.Gemma4 (Config Gemma4Model Gemma4Block Gemma4Attention Gemma4
 structure DiffusionGemmaModel (BufT CacheT : Type) where
   inner : Gemma4Model BufT CacheT
   dg : DiffusionConfig
+  -- self-conditioning MLP (global): pre_norm → GeGLU(gate,up) → down, fed the
+  -- previous step's soft-embedded prediction during the denoise loop.
+  scPreNorm : Option (RMSNorm.RMSNorm BufT CacheT) := none
+  scGate : Option (Linear.LinearLayer BufT CacheT) := none
+  scUp : Option (Linear.LinearLayer BufT CacheT) := none
+  scDown : Option (Linear.LinearLayer BufT CacheT) := none
 
 private def uploadBuffer [GPUBackend β] (ctx : β) (data : ByteArray) : IO (GPUBackend.Buf β) := do
   let bufSize := if data.size == 0 then 4 else data.size
@@ -77,6 +83,7 @@ private def loadLinear [GPUBackend β] (ctx : β) (gguf : Hesper.GGUF.GGUFFile)
   let quantFormat : Linear.QuantFormat := match ti.ggmlType with
     | .Q6_K => .Q6_K
     | .Q8_0 => .Q8_0
+    | .Q5_0 => .Q5_0
     | _ => .Q4_K
   let weightBuf ← uploadTensor ctx gguf name
   let prepared ← GPUBackend.newCacheRef (β := β)
@@ -201,8 +208,13 @@ def DiffusionGemmaModel.fromGGUFData [GPUBackend β] (ctx : β) (gguf : Hesper.G
     perLayerEmbdMmap := none, perLayerEmbdTableGPU := none, perLayerEmbdRowBytes := 0
     perLayerModelProj := none, perLayerProjNorm := none, perLayerBlocks := #[]
   }
-  IO.println s!"[DiffusionGemma] ✓ loaded {blocks.size} blocks"
-  return { inner, dg }
+  -- self-conditioning MLP (global, optional): pre_norm + gate/up (Q4_K) + down (Q5_0)
+  let scPreNorm ← loadNorm ctx gguf "self_cond_pre_norm.weight" normCfg
+  let scGate ← (do pure (some (← loadLinear ctx gguf "self_cond_gate.weight" cfg.hiddenSize cfg.intermediateSize))) <|> pure none
+  let scUp ← (do pure (some (← loadLinear ctx gguf "self_cond_up.weight" cfg.hiddenSize cfg.intermediateSize))) <|> pure none
+  let scDown ← (do pure (some (← loadLinear ctx gguf "self_cond_down.weight" cfg.intermediateSize cfg.hiddenSize))) <|> pure none
+  IO.println s!"[DiffusionGemma] ✓ loaded {blocks.size} blocks; SC={scGate.isSome}"
+  return { inner, dg, scPreNorm, scGate, scUp, scDown }
 
 /-- Load a DiffusionGemma model from a GGUF file path. -/
 def DiffusionGemmaModel.fromGGUF [GPUBackend β] (ctx : β) (path : String) :
