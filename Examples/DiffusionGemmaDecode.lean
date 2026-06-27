@@ -120,6 +120,42 @@ def scaleRegionB (N P dim : Nat) (outSc encSc : Float) : Hesper.WGSL.Monad.Shade
     let factor := Exp.select (Exp.ge r (Exp.litU32 P)) (Exp.litF32 outSc) (Exp.litF32 encSc)
     ShaderM.writeBuffer (ty := .scalar .f32) "data" t (Exp.mul v factor)) (pure ())
 
+/-- Soft-embedding for self-conditioning: sSC[(P+i),d] = embScale·Σ_{k<K} prob[i,k]·tempK[(i·K+k),d]
+    over the previous step's top-K tokens (the softmax mass); prompt rows = 0.
+    `tempK` is the gathered raw embeddings of the C·K top tokens; `prob` their softmax weights. -/
+def softReduceB (N P C dim K : Nat) (embScale : Float) : Hesper.WGSL.Monad.ShaderM Unit := do
+  let gid ← ShaderM.globalId
+  let t := Exp.vec3X gid
+  let _o ← ShaderM.declareOutputBuffer "ssc" (.array (.scalar .f32) (N*dim))
+  let _tk ← ShaderM.declareReadOnlyBuffer "tempk" (.array (.scalar .f32) ((C*K)*dim))
+  let _pr ← ShaderM.declareReadOnlyBuffer "prob" (.array (.scalar .f32) (C*K))
+  ShaderM.if_ (Exp.lt t (Exp.litU32 (N*dim))) (do
+    let r := Exp.div t (Exp.litU32 dim)
+    let d := Exp.mod t (Exp.litU32 dim)
+    ShaderM.if_ (Exp.ge r (Exp.litU32 P)) (do
+      let i := Exp.sub r (Exp.litU32 P)
+      let acc ← ShaderM.var (.scalar .f32) (Exp.litF32 0.0)
+      for k in [0:K] do
+        let slot := Exp.add (Exp.mul i (Exp.litU32 K)) (Exp.litU32 k)
+        let pv := Exp.index (Exp.var "prob" : Exp (.array (.scalar .f32) (N*K))) slot
+        let ev := Exp.index (Exp.var "tempk" : Exp (.array (.scalar .f32) ((N*K)*dim))) (Exp.add (Exp.mul slot (Exp.litU32 dim)) d)
+        ShaderM.assign acc (Exp.add (Exp.var acc) (Exp.mul pv ev))
+      ShaderM.writeBuffer (ty := .scalar .f32) "ssc" t (Exp.mul (Exp.litF32 embScale) (Exp.var acc)))
+      (ShaderM.writeBuffer (ty := .scalar .f32) "ssc" t (Exp.litF32 0.0))) (pure ())
+
+/-- Self-conditioning add (canvas rows only): a[t] += scUse * sig[t] for r≥P. -/
+def addCanvasB (N P dim : Nat) (scUse : Float) : Hesper.WGSL.Monad.ShaderM Unit := do
+  let gid ← ShaderM.globalId
+  let t := Exp.vec3X gid
+  let _a ← ShaderM.declareOutputBuffer "acanvas" (.array (.scalar .f32) (N*dim))
+  let _s ← ShaderM.declareReadOnlyBuffer "sig" (.array (.scalar .f32) (N*dim))
+  ShaderM.if_ (Exp.lt t (Exp.litU32 (N*dim))) (do
+    let r := Exp.div t (Exp.litU32 dim)
+    ShaderM.if_ (Exp.ge r (Exp.litU32 P)) (do
+      let av ← ShaderM.readBuffer (ty := .scalar .f32) (n := N*dim) "acanvas" t
+      let sv := Exp.index (Exp.var "sig" : Exp (.array (.scalar .f32) (N*dim))) t
+      ShaderM.writeBuffer (ty := .scalar .f32) "acanvas" t (Exp.add av (Exp.mul (Exp.litF32 scUse) sv))) (pure ())) (pure ())
+
 /-- Per-head qk-norm (RMS×weight) + partial RoPE (rope only first `nRotHalf` pairs); 1 thread per (pos,head). -/
 def qkNormRopeB (N nHead hd nRotHalf : Nat) (theta eps : Float) : Hesper.WGSL.Monad.ShaderM Unit := do
   let gid ← ShaderM.globalId
@@ -384,20 +420,96 @@ def bmm (device : Device) (layer : Hesper.Layers.Linear.LinearLayer B C) (inB ou
   let bufs := ("weights", layer.weightBuf)::("input", inB)::("output", outB)::List.nil
   let k := match layer.quantFormat with
     | .Q8_0 => Hesper.Layers.Linear.fusedQ8_0BatchKernel cfg N
+    | .Q5_0 => Hesper.Layers.Linear.fusedQ5_0BatchKernel cfg N
     | .Q6_K => Hesper.Quantization.Q6_K.fusedQ6KBatchKernel cfg.inDim cfg.outDim N
     | _     => Hesper.Layers.Linear.fusedQ4KMBatchKernel cfg N
   disp2 device k bufs cfg.outDim N key
 
+/-- Online-softmax + top-K merge of one lm_head chunk's logits for one position (pure, so
+    the triple-nested decode loop doesn't blow the elaborator's recursion depth).
+    Tracks the running (max, denom) AND the top-K (logit, token) sorted descending —
+    the top-K carry the softmax mass for the self-conditioning soft embedding. -/
+def mergeChunkTopK (logits : Array Float) (base oStart oEnd cbase K : Nat)
+    (mx0 sm0 : Float) (klog0 : Array Float) (ktok0 : Array Nat)
+    : (Float × Float × Array Float × Array Nat) := Id.run do
+  let mut mx := mx0; let mut sm := sm0
+  let mut klog := klog0; let mut ktok := ktok0
+  for o in [oStart:oEnd] do
+    let l := logits[base+o]!
+    let tok := cbase + o
+    if l > mx then sm := sm * Float.exp (mx - l) + 1.0; mx := l
+    else sm := sm + Float.exp (l - mx)
+    if l > klog[K-1]! then
+      let mut j := K - 1
+      while j > 0 && klog[j-1]! < l do
+        klog := klog.set! j (klog[j-1]!); ktok := ktok.set! j (ktok[j-1]!); j := j - 1
+      klog := klog.set! j l; ktok := ktok.set! j tok
+  return (mx, sm, klog, ktok)
+
+/-- Tied Q6_K lm_head over the FULL vocab, tiled into ≤65535-row chunks (WebGPU
+    workgroup limit).  Per masked position keeps an online-softmax running
+    (max, argmax, denom) over NON-special tokens (≥5), so the prediction can land
+    anywhere in the 262144 vocab (e.g. '▁'=236743) — matching ggml.  `sN` must
+    already be finalNorm'd + Q8-quantized.  Returns (canvasIdx, predToken, confidence). -/
+def lmHeadArgmaxFullVocab (device : Device) (outputWeight sN : Buffer)
+    (dim vocabSize N C P : Nat) (cap : Float) (masked : Array Bool) (dumpFirst : Bool := false) (K : Nat := 8)
+    : IO (Array (Nat × Nat × Float) × Array Nat × Array Float) := do
+  let lmChunk := 32768
+  let nChunks := (vocabSize + lmChunk - 1) / lmChunk
+  let sLogits ← mkBuf device (N*lmChunk)
+  let mut mxArr : Array Float := Array.replicate C (-1e30)
+  let mut smArr : Array Float := Array.replicate C 0.0
+  let mut klogArr : Array (Array Float) := Array.replicate C (Array.replicate K (-1e30))
+  let mut ktokArr : Array (Array Nat) := Array.replicate C (Array.replicate K 0)
+  let mut p0logits : Array Float := if dumpFirst then Array.replicate vocabSize 0.0 else #[]
+  for c in [0:nChunks] do
+    Hesper.GPUBackend.beginBatch device
+    disp2 device (Hesper.Quantization.Q6_K.fusedQ6KBatchKernel dim lmChunk N 256 (c*lmChunk) vocabSize)
+      (("weights", outputWeight)::("input", sN)::("output", sLogits)::List.nil) lmChunk N (hash ("lmhead", c))
+    disp device (softcapB (N*lmChunk) cap) (("logits", sLogits)::List.nil) (N*lmChunk) (hash ("softcap", c))
+    Hesper.GPUBackend.endBatch device
+    let logits ← Hesper.Basic.bytesToFloatArray (← mapBufferRead device sLogits 0 (N*lmChunk*4).toUSize)
+    unmapBuffer sLogits
+    let oStart := if c == 0 then 5 else 0   -- skip specials 0..4 (only in chunk 0)
+    let oEnd := min lmChunk (vocabSize - c*lmChunk)
+    if dumpFirst then  -- accumulate canvas-position-0 (token P) full logits for golden verify
+      for o in [0:oEnd] do p0logits := p0logits.set! (c*lmChunk+o) logits[P*lmChunk+o]!
+    for i in [0:C] do   -- softmax(max,denom) + top-K over ALL canvas positions
+      let (mx, sm, kl, kt) := mergeChunkTopK logits ((P+i)*lmChunk) oStart oEnd (c*lmChunk) K mxArr[i]! smArr[i]! klogArr[i]! ktokArr[i]!
+      mxArr := mxArr.set! i mx; smArr := smArr.set! i sm; klogArr := klogArr.set! i kl; ktokArr := ktokArr.set! i kt
+  if dumpFirst then
+    IO.FS.writeBinFile "/tmp/my_logits_p0.bin" (← Hesper.Basic.floatArrayToBytes p0logits)
+    IO.println s!"[verify] dumped canvas-0 full logits ({vocabSize}) to /tmp/my_logits_p0.bin"
+  -- flatten top-K tokens + softmax probs (over the full vocab denom) for the SC soft embedding
+  let mut ktokFlat : Array Nat := Array.replicate (C*K) 0
+  let mut probFlat : Array Float := Array.replicate (C*K) 0.0
+  let mut cand : Array (Nat × Nat × Float) := #[]
+  for i in [0:C] do
+    for k in [0:K] do
+      ktokFlat := ktokFlat.set! (i*K+k) (ktokArr[i]![k]!)
+      probFlat := probFlat.set! (i*K+k) (Float.exp (klogArr[i]![k]! - mxArr[i]!) / smArr[i]!)
+    if masked[i]! then cand := cand.push (i, ktokArr[i]![0]!, 1.0 / smArr[i]!)
+  return (cand, ktokFlat, probFlat)
+
 def main (args : List String) : IO Unit := do
   let path := args.head?.getD "diffusiongemma-26B-A4B-it-Q4_K_M.gguf"
-  let nLayers := (args.drop 1).head?.bind (·.toNat?) |>.getD 3
-  let N := (args.drop 2).head?.bind (·.toNat?) |>.getD 16
-  let P := 3
-  IO.println s!"[dg-bidir] init + load; N={N} P={P} layers={nLayers}"
+  let prompt := (args.drop 1).head?.getD "The capital of France is"
+  let nLayers := (args.drop 2).head?.bind (·.toNat?) |>.getD 30
+  IO.println s!"[dg-decode] init + load; layers={nLayers}  prompt={prompt.quote}"
   let inst ← Hesper.init
   let device ← getDevice inst
   let model ← DiffusionGemmaModel.fromGGUF (β := Device) device path
   let cfg := model.inner.config
+  -- tokenize the real prompt → P; canvas C from config.  This model's special
+  -- turn tokens are non-standard ('<|turn>'=105), so use the raw prompt
+  -- (completion-style: the model denoises the canvas as a continuation).
+  let tokenizer ← Hesper.Tokenizer.SentencePiece.fromGGUF (← Hesper.GGUF.loadGGUFHeader path)
+  let promptTokens := Hesper.Tokenizer.SentencePiece.encode tokenizer prompt
+  let P := promptTokens.size
+  let C := model.dg.canvasLength
+  let N := P + C
+  IO.println s!"[dg-decode] P={P} (prompt tokens) C={C} (canvas) N={N}"
+  IO.println s!"[dg-decode] prompt token ids: {(promptTokens.extract 0 (min 20 P)).toList}"
   let dim := cfg.hiddenSize; let ffn := cfg.intermediateSize; let nHead := cfg.numAttentionHeads
   let eps := 1e-6
   -- per-layer out_scale (canvas) + enc_out_scale (prompt)
@@ -424,12 +536,18 @@ def main (args : List String) : IO Unit := do
   let sRLogits ← mkBuf device (N*nExpert); let sIdxs ← mkBuf device (N*nUsed); let sWts ← mkBuf device (N*nUsed)
   let sMoeAcc ← mkBuf device (N*dim); let sGateUp ← mkBuf device (N*2*expFF); let sEh ← mkBuf device (N*expFF)
   let sDownE ← mkBuf device (N*dim); let sCurMoe ← mkBuf device (N*dim); let sComb ← mkBuf device (N*dim)
-  -- DECODE LOOP: fixed 3-token prompt + 256-mask canvas (N=259); diffusion confidence-commit
+  -- DECODE LOOP: real prompt + canvas of mask tokens; diffusion confidence-commit
   let decodeSteps := (args.drop 3).head?.bind (·.toNat?) |>.getD 13
-  let C := N - P
-  let mut toks : Array Nat := #[2, 651, 1437] ++ Array.replicate C 4
+  let mut toks : Array Nat := promptTokens ++ Array.replicate C model.dg.maskTokenId
   let mut masked : Array Bool := Array.replicate C true
+  let scK := 8   -- top-K tokens carrying the softmax mass for the SC soft embedding
+  let mut scTok : Array Nat := Array.replicate (C*scK) model.dg.maskTokenId  -- prev step's top-K tokens
+  let mut scProb : Array Float := Array.replicate (C*scK) 0.0                  -- their softmax probs
   let tokBuf ← mkBuf device N
+  let scTokBuf ← mkBuf device (C*scK)   -- self-cond top-K gather token ids
+  let scProbBuf ← mkBuf device (C*scK)  -- self-cond top-K softmax probs
+  let sTempK ← mkBuf device (C*scK*dim) -- gathered raw embeddings of the top-K tokens
+  let sSC ← mkBuf device (N*dim)        -- self-cond soft embedding
   let embScale := Float.sqrt dim.toFloat
   let embTable := model.inner.embedding.embeddingTable
   let lmN := min cfg.vocabSize 32768
@@ -441,8 +559,27 @@ def main (args : List String) : IO Unit := do
     if remaining > 0 then
       let t0 ← IO.monoMsNow
       writeBuffer device tokBuf 0 (u32Bytes toks)
+      if step > 0 then
+        writeBuffer device scTokBuf 0 (u32Bytes scTok)
+        writeBuffer device scProbBuf 0 (← Hesper.Basic.floatArrayToBytes scProb)
       Hesper.GPUBackend.beginBatch device
       disp device (Hesper.Quantization.Q6_K.q6kEmbedGatherKernel N cfg.vocabSize dim embScale) (("token_ids",tokBuf)::("embedding_table",embTable)::("output",a)::List.nil) (N*dim) (hash "emb")
+      -- self-conditioning: soft-embed the previous step's top-K prediction → SC-MLP → add to canvas (step>0)
+      if step > 0 then
+        match model.scPreNorm, model.scGate, model.scUp, model.scDown with
+        | some scPN, some scG, some scU, some scD =>
+          -- gather raw embeddings of the C·K top tokens, weighted-reduce by softmax probs → sSC
+          disp device (Hesper.Quantization.Q6_K.q6kEmbedGatherKernel (C*scK) cfg.vocabSize dim 1.0) (("token_ids",scTokBuf)::("embedding_table",embTable)::("output",sTempK)::List.nil) (C*scK*dim) (hash "scgath")
+          disp device (softReduceB N P C dim scK embScale) (("ssc",sSC)::("tempk",sTempK)::("prob",scProbBuf)::List.nil) (N*dim) (hash "scsoft")
+          Hesper.Layers.RMSNorm.forward device scPN sSC sN N
+          qK device sN N dim (hash "scqk")
+          bmm device scG sN sG N (hash "scg")
+          bmm device scU sN sU N (hash "scu")
+          disp device (geluMulB (N*ffn)) (("gate",sG)::("up",sU)::("outp",sGe)::List.nil) (N*ffn) (hash "scgg")
+          q80 device sGe N ffn (hash "scq80")
+          bmm device scD sGe sD N (hash "scd")
+          disp device (addCanvasB N P dim 1.0) (("acanvas",a)::("sig",sD)::List.nil) (N*dim) (hash "scadd")
+        | _, _, _, _ => pure ()
       disp device (embNormCanvasK N P dim eps) (("emb",a)::List.nil) N (hash "embn")
       Hesper.GPUBackend.endBatch device
       let mut cur := a; let mut nxt := b
@@ -494,7 +631,10 @@ def main (args : List String) : IO Unit := do
           disp2 device (Hesper.Layers.Linear.fusedQ4KMBatchExpertKernel { inDim:=dim, outDim:=2*expFF } nExpert N nUsed e) (("weights",guE)::("input",sMoeN)::("idxs",sIdxs)::("output",sGateUp)::List.nil) (2*expFF) N (hash ("eu",li,e))
           disp device (gegluMergedB N expFF) (("gu",sGateUp)::("eh",sEh)::List.nil) (N*expFF) (hash ("gm",li,e))
           q80 device sEh N expFF (hash ("qEh",li,e))
-          disp2 device (Hesper.Layers.Linear.fusedQ8_0BatchExpertKernel { inDim:=expFF, outDim:=dim } nExpert N nUsed e) (("weights",dnE)::("input",sEh)::("idxs",sIdxs)::("output",sDownE)::List.nil) dim N (hash ("ed",li,e))
+          let downExpKernel := match blk.ffn.down.quantFormat with
+            | .Q5_0 => Hesper.Layers.Linear.fusedQ5_0BatchExpertKernel { inDim:=expFF, outDim:=dim } nExpert N nUsed e
+            | _     => Hesper.Layers.Linear.fusedQ8_0BatchExpertKernel { inDim:=expFF, outDim:=dim } nExpert N nUsed e
+          disp2 device downExpKernel (("weights",dnE)::("input",sEh)::("idxs",sIdxs)::("output",sDownE)::List.nil) dim N (hash ("ed",li,e))
           disp device (waccB N dim e nUsed) (("acc",sMoeAcc)::("din",sDownE)::("wts",sWts)::List.nil) (N*dim) (hash ("wa",li,e))
         Hesper.Layers.RMSNorm.forward device mpn2post sMoeAcc sCurMoe N
         -- combine: curMlp + curMoe → postFFNNorm → +residual → ×out_scale
@@ -504,32 +644,13 @@ def main (args : List String) : IO Unit := do
         disp device (scaleRegionB N P dim (scales[li]!) (encScales[li]!)) (("data",nxt)::List.nil) (N*dim) (hash ("sc",li))
         Hesper.GPUBackend.endBatch device
         let t := cur; cur := nxt; nxt := t
-      -- final norm + tied Q6_K lm_head (sliced to lmN) + softcap
-      let lmN := min cfg.vocabSize 32768
-      let cap := cfg.logitSoftcapScale
-      let sLogits ← mkBuf device (N*lmN)
+      -- final norm + Q8 quant, then full-vocab tiled lm_head (helper, keeps `main` small)
       Hesper.GPUBackend.beginBatch device
       Hesper.Layers.RMSNorm.forward device model.inner.finalNorm cur sN N
       qK device sN N dim (hash "qFinal")
-      disp2 device (Hesper.Quantization.Q6_K.fusedQ6KBatchKernel dim lmN N)
-        (("weights", model.inner.outputWeight)::("input", sN)::("output", sLogits)::List.nil) lmN N (hash "lmhead")
-      disp device (softcapB (N*lmN) cap) (("logits", sLogits)::List.nil) (N*lmN) (hash "softcap")
       Hesper.GPUBackend.endBatch device
-      let logits ← Hesper.Basic.bytesToFloatArray (← mapBufferRead device sLogits 0 (N*lmN*4).toUSize)
-      unmapBuffer sLogits
-      IO.println s!"[dg-bidir] logits finite={logits.all Float.isFinite} N={N} lmN={lmN}"
-      let logits ← Hesper.Basic.bytesToFloatArray (← mapBufferRead device sLogits 0 (N*lmN*4).toUSize)
-      unmapBuffer sLogits
-      let mut cand : Array (Nat × Nat × Float) := #[]
-      for i in [0:C] do
-        if masked[i]! then
-          let base := (P+i)*lmN
-          let mut mx := -1e30; let mut am := 0
-          for v in [0:lmN] do
-            if logits[base+v]! > mx then mx := logits[base+v]!; am := v
-          let mut sm := 0.0
-          for v in [0:lmN] do sm := sm + Float.exp (logits[base+v]! - mx)
-          cand := cand.push (i, am, 1.0 / sm)
+      let (cand, ktokFlat, probFlat) ← lmHeadArgmaxFullVocab device model.inner.outputWeight sN dim cfg.vocabSize N C P cfg.logitSoftcapScale masked (step == 0 && (← IO.getEnv "DG_VERIFY").isSome) scK
+      scTok := ktokFlat; scProb := probFlat   -- feed this step's top-K soft prediction into next step's SC
       let want := if step+1 ≥ decodeSteps then remaining else max 1 ((C + decodeSteps - 1) / decodeSteps)
       let k := min want cand.size
       let mut picked := Array.replicate cand.size false
@@ -546,6 +667,4 @@ def main (args : List String) : IO Unit := do
       IO.println s!"[dg-decode] step {step}: committed {k}, remaining {remaining-k} | forward+decode {t1-t0}ms ({(259000)/(max 1 (t1-t0))} pos-layer/s over 30L)"
   let outIds := toks.extract P (P+C)
   IO.println s!"[dg-decode] first canvas IDs: {(outIds.extract 0 (min 24 outIds.size)).toList}"
-  let ggufTok ← Hesper.GGUF.loadGGUFHeader path
-  let tokenizer ← Hesper.Tokenizer.SentencePiece.fromGGUF ggufTok
   IO.println s!"[dg-decode] TEXT: {Hesper.Tokenizer.SentencePiece.decode tokenizer outIds}"
