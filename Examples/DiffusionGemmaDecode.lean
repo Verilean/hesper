@@ -503,6 +503,11 @@ def q80 (device : Device) (buf : Buffer) (N K : Nat) (key : UInt64) : IO Unit :=
   disp device (qActQ80 N K) (("data",buf)::List.nil) (N*(K/32)) key
 
 def bmm (device : Device) (layer : Hesper.Layers.Linear.LinearLayer B C) (inB outB : Buffer) (N : Nat) (key : UInt64) : IO Unit := do
+  -- Q4_K via Hesper's CUDA-style tiled dp4a MMQ kernel (MMQ5 at seqLen≥32) — int8
+  -- dot products + threadgroup tiling, far faster than the f32-dequant matmul.
+  if layer.quantFormat == .Q4_K then
+    Hesper.Layers.Linear.forwardBatchDP4A device layer inB outB N
+    return
   let cfg := layer.config
   let bufs := ("weights", layer.weightBuf)::("input", inB)::("output", outB)::List.nil
   let k := match layer.quantFormat with

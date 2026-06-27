@@ -643,7 +643,7 @@ static WGPULimits getMaxLimits(wgpu::Adapter& adapter) {
     limits.maxInterStageShaderVariables = atMost(16, adapterLimits.maxInterStageShaderVariables);
     limits.maxColorAttachments = atMost(8, adapterLimits.maxColorAttachments);
     limits.maxColorAttachmentBytesPerSample = atMost(32, adapterLimits.maxColorAttachmentBytesPerSample);
-    limits.maxComputeWorkgroupStorageSize = atMost(16384, adapterLimits.maxComputeWorkgroupStorageSize);
+    limits.maxComputeWorkgroupStorageSize = atMost(32768, adapterLimits.maxComputeWorkgroupStorageSize);
     limits.maxComputeInvocationsPerWorkgroup = atMost(256, adapterLimits.maxComputeInvocationsPerWorkgroup);
     limits.maxComputeWorkgroupSizeX = atMost(256, adapterLimits.maxComputeWorkgroupSizeX);
     limits.maxComputeWorkgroupSizeY = atMost(256, adapterLimits.maxComputeWorkgroupSizeY);
