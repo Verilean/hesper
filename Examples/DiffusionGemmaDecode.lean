@@ -27,6 +27,8 @@ open Hesper.WGSL
 open Hesper.WGSL.Monad
 open Hesper.Models.DiffusionGemma
 
+set_option maxRecDepth 8000
+
 /-- GeGLU gelu(gate)*up, clamped tanh (works for any n = N*ffn — elementwise). -/
 def geluMulB (n : Nat) : Hesper.WGSL.Monad.ShaderM Unit := do
   let gid ← ShaderM.globalId
@@ -496,6 +498,10 @@ def disp2 (device : Device) (k : Hesper.WGSL.Monad.ShaderM Unit) (bufs : List (S
   let r ← IO.mkRef none
   Hesper.GPUBackend.executeWithConfigCached device k bufs { numWorkgroups := (nx,ny,1), workgroupSize := {x:=256} } key r
 
+def disp2w (device : Device) (k : Hesper.WGSL.Monad.ShaderM Unit) (bufs : List (String × Buffer)) (nx ny ws : Nat) (key : UInt64) : IO Unit := do
+  let r ← IO.mkRef none
+  Hesper.GPUBackend.executeWithConfigCached device k bufs { numWorkgroups := (nx,ny,1), workgroupSize := {x:=ws} } key r
+
 /-- Batched matmul over N rows dispatching by the layer's quant format. -/
 def qK (device : Device) (buf : Buffer) (N K : Nat) (key : UInt64) : IO Unit :=
   disp device (qActQ8K N K) (("data",buf)::List.nil) (N*(K/256)) key
@@ -597,6 +603,7 @@ def main (args : List String) : IO Unit := do
   let sRLogits ← mkBuf device (N*nExpert); let sIdxs ← mkBuf device (N*nUsed); let sWts ← mkBuf device (N*nUsed)
   let sMoeAcc ← mkBuf device (N*dim); let sGateUp ← mkBuf device (N*2*expFF); let sEh ← mkBuf device (N*expFF)
   let sDownE ← mkBuf device (N*dim); let sCurMoe ← mkBuf device (N*dim); let sComb ← mkBuf device (N*dim)
+  let sMoeNQ8 ← mkBuf device (N*(dim/32)*9)  -- Q8_1 of the MoE input for the dp4a expert matmul
   -- DECODE LOOP: real prompt + canvas of mask tokens; diffusion confidence-commit
   let decodeSteps := (args.drop 3).head?.bind (·.toNat?) |>.getD 13
   let mut toks : Array Nat := promptTokens ++ Array.replicate C model.dg.maskTokenId
@@ -692,9 +699,10 @@ def main (args : List String) : IO Unit := do
         disp device (routerMatVecB N nExpert dim) (("rw",rW)::("tmps",sTmpS)::("rlogits",sRLogits)::List.nil) (N*nExpert) (hash ("rm",li))
         disp2 device (top8B N nExpert nUsed) (("rlogits",sRLogits)::("idxs",sIdxs)::("wts",sWts)::List.nil) N 1 (hash ("t8",li))
         disp device (zeroB (N*dim)) (("data",sMoeAcc)::List.nil) (N*dim) (hash ("z",li))
-        qK device sMoeN N dim (hash ("qMoeN",li))
+        -- Q8_1-quantize the MoE input once for the dp4a expert matmul (replaces qK)
+        disp2w device (Hesper.Layers.Linear.quantizeQ8_1BatchKernel dim N) (("input",sMoeN)::("output",sMoeNQ8)::List.nil) (dim/32) N 32 (hash ("qmoeq8",li))
         for e in [0:nUsed] do
-          disp2 device (Hesper.Layers.Linear.fusedQ4KMBatchExpertKernel { inDim:=dim, outDim:=2*expFF } nExpert N nUsed e) (("weights",guE)::("input",sMoeN)::("idxs",sIdxs)::("output",sGateUp)::List.nil) (2*expFF) N (hash ("eu",li,e))
+          disp2w device (Hesper.Layers.Linear.fusedQ4KMBatchExpertDP4AKernel { inDim:=dim, outDim:=2*expFF } nExpert N nUsed e) (("weights",guE)::("input_q8",sMoeNQ8)::("idxs",sIdxs)::("output",sGateUp)::List.nil) (2*expFF) N 32 (hash ("eu",li,e))
           disp device (gegluMergedB N expFF) (("gu",sGateUp)::("eh",sEh)::List.nil) (N*expFF) (hash ("gm",li,e))
           q80 device sEh N expFF (hash ("qEh",li,e))
           let downExpKernel := match blk.ffn.down.quantFormat with
