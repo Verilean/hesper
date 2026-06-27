@@ -49,6 +49,52 @@ def copyB (n : Nat) : Hesper.WGSL.Monad.ShaderM Unit := do
   let _o ← ShaderM.declareOutputBuffer "cout" (.array (.scalar .f32) n)
   ShaderM.if_ (Exp.lt i (Exp.litU32 n)) (ShaderM.writeBuffer (ty := .scalar .f32) "cout" i (Exp.index (Exp.var "cin" : Exp (.array (.scalar .f32) n)) i)) (pure ())
 
+/-- Activation Q8_K quant+dequant in-place (block 256 along K), matching ggml quantize_row_q8_K.
+    One thread per (row,block). iscale=-128/signedMaxAbs; q=min(127, nearest_int(iscale*x)); x:=q/iscale. -/
+def qActQ8K (N K : Nat) : Hesper.WGSL.Monad.ShaderM Unit := do
+  let gid ← ShaderM.globalId
+  let blk := Exp.vec3X gid
+  let nB := K / 256
+  let _d ← ShaderM.declareOutputBuffer "data" (.array (.scalar .f32) (N*K))
+  ShaderM.if_ (Exp.lt blk (Exp.litU32 (N*nB))) (do
+    let base := Exp.mul blk (Exp.litU32 256)
+    let amax ← ShaderM.var (.scalar .f32) (Exp.litF32 0.0)
+    let vmax ← ShaderM.var (.scalar .f32) (Exp.litF32 0.0)
+    ShaderM.loop (Exp.litU32 0) (Exp.litU32 256) (Exp.litU32 1) fun i => do
+      let v ← ShaderM.readBuffer (ty := .scalar .f32) (n := N*K) "data" (Exp.add base i)
+      ShaderM.if_ (Exp.gt (Exp.abs v) (Exp.var amax)) (do
+        ShaderM.assign amax (Exp.abs v); ShaderM.assign vmax v) (pure ())
+    ShaderM.if_ (Exp.gt (Exp.var amax) (Exp.litF32 0.0)) (do
+      let iscale := Exp.div (Exp.litF32 (-127.0)) (Exp.var vmax)
+      let d := Exp.div (Exp.var vmax) (Exp.litF32 (-127.0))
+      ShaderM.loop (Exp.litU32 0) (Exp.litU32 256) (Exp.litU32 1) fun i => do
+        let v ← ShaderM.readBuffer (ty := .scalar .f32) (n := N*K) "data" (Exp.add base i)
+        let y := Exp.mul iscale v
+        let q := Exp.min (Exp.litF32 127.0) (Exp.mul (Exp.sign y) (Exp.floor (Exp.add (Exp.abs y) (Exp.litF32 0.5))))
+        ShaderM.writeBuffer (ty := .scalar .f32) "data" (Exp.add base i) (Exp.mul q d)) (pure ())) (pure ())
+
+/-- Activation Q8_0 quant+dequant in-place (block 32 along K), matching ggml quantize_row_q8_0.
+    d=maxAbs/127; q=nearest_int(x*127/maxAbs); x:=q*d. -/
+def qActQ80 (N K : Nat) : Hesper.WGSL.Monad.ShaderM Unit := do
+  let gid ← ShaderM.globalId
+  let blk := Exp.vec3X gid
+  let nB := K / 32
+  let _d ← ShaderM.declareOutputBuffer "data" (.array (.scalar .f32) (N*K))
+  ShaderM.if_ (Exp.lt blk (Exp.litU32 (N*nB))) (do
+    let base := Exp.mul blk (Exp.litU32 32)
+    let amax ← ShaderM.var (.scalar .f32) (Exp.litF32 0.0)
+    ShaderM.loop (Exp.litU32 0) (Exp.litU32 32) (Exp.litU32 1) fun i => do
+      let v ← ShaderM.readBuffer (ty := .scalar .f32) (n := N*K) "data" (Exp.add base i)
+      ShaderM.assign amax (Exp.max (Exp.var amax) (Exp.abs v))
+    ShaderM.if_ (Exp.gt (Exp.var amax) (Exp.litF32 0.0)) (do
+      let d := Exp.div (Exp.var amax) (Exp.litF32 127.0)
+      let idv := Exp.div (Exp.litF32 127.0) (Exp.var amax)
+      ShaderM.loop (Exp.litU32 0) (Exp.litU32 32) (Exp.litU32 1) fun i => do
+        let v ← ShaderM.readBuffer (ty := .scalar .f32) (n := N*K) "data" (Exp.add base i)
+        let y := Exp.mul idv v
+        let q := Exp.mul (Exp.sign y) (Exp.floor (Exp.add (Exp.abs y) (Exp.litF32 0.5)))
+        ShaderM.writeBuffer (ty := .scalar .f32) "data" (Exp.add base i) (Exp.mul q d)) (pure ())) (pure ())
+
 /-- Elementwise add: out[i]=a[i]+b[i] (n=N*dim). -/
 def addB (n : Nat) : Hesper.WGSL.Monad.ShaderM Unit := do
   let gid ← ShaderM.globalId
@@ -97,7 +143,10 @@ def qkNormRopeB (N nHead hd : Nat) (theta eps : Float) : Hesper.WGSL.Monad.Shade
       let a := Exp.mul (Exp.mul (Exp.index qi (Exp.add base j)) inv) (Exp.index wn j)
       let b := Exp.mul (Exp.mul (Exp.index qi (Exp.add base jh)) inv) (Exp.index wn jh)
       let freq := Exp.exp (Exp.mul (Exp.litF32 coef) (Exp.toF32 j))
-      let ang := Exp.mul pf freq
+      let ang0 := Exp.mul pf freq
+      -- range-reduce to [-π,π] so f32 cos/sin stay precise at high positions (large p·freq)
+      let twoPi := Exp.litF32 6.283185307179586
+      let ang := Exp.sub ang0 (Exp.mul twoPi (Exp.round (Exp.div ang0 twoPi)))
       ShaderM.assignIndex "qout" (Exp.add base j) (Exp.sub (Exp.mul a (Exp.cos ang)) (Exp.mul b (Exp.sin ang)))
       ShaderM.assignIndex "qout" (Exp.add base jh) (Exp.add (Exp.mul a (Exp.sin ang)) (Exp.mul b (Exp.cos ang)))) (pure ())
 
@@ -321,6 +370,11 @@ def disp2 (device : Device) (k : Hesper.WGSL.Monad.ShaderM Unit) (bufs : List (S
   Hesper.GPUBackend.executeWithConfigCached device k bufs { numWorkgroups := (nx,ny,1), workgroupSize := {x:=256} } key r
 
 /-- Batched matmul over N rows dispatching by the layer's quant format. -/
+def qK (device : Device) (buf : Buffer) (N K : Nat) (key : UInt64) : IO Unit :=
+  disp device (qActQ8K N K) (("data",buf)::List.nil) (N*(K/256)) key
+def q80 (device : Device) (buf : Buffer) (N K : Nat) (key : UInt64) : IO Unit :=
+  disp device (qActQ80 N K) (("data",buf)::List.nil) (N*(K/32)) key
+
 def bmm (device : Device) (layer : Hesper.Layers.Linear.LinearLayer B C) (inB outB : Buffer) (N : Nat) (key : UInt64) : IO Unit := do
   let cfg := layer.config
   let bufs := ("weights", layer.weightBuf)::("input", inB)::("output", outB)::List.nil
@@ -393,6 +447,7 @@ def main (args : List String) : IO Unit := do
     -- attention
     Hesper.Layers.RMSNorm.forward device blk.attnNorm cur sN N
     disp device (copyB (N*dim)) (("cin",sN)::("cout",sAttnDbg)::List.nil) (N*dim) (hash ("cpN",li))
+    qK device sN N dim (hash ("qN",li))
     bmm device blk.attention.wQ sN sQ N (hash ("wq",li))
     bmm device blk.attention.wK sN sK N (hash ("wk",li))
     bmm device blk.attention.wV sN sV N (hash ("wv",li))
@@ -400,14 +455,17 @@ def main (args : List String) : IO Unit := do
     disp device (qkNormRopeB N nKV hd theta eps) (("qin",sK)::("wnorm",blk.attention.kNormWeight)::("qout",sKr)::List.nil) (N*nKV) (hash ("kn",li))
     disp device (vNormB N nKV hd eps) (("vin",sV)::("vout",sVn)::List.nil) (N*nKV) (hash ("vn",li))
     disp2 device (battnB N P nHead hd nKV 1.0) (("q",sQr)::("k",sKr)::("v",sVn)::("ctx",sCtx)::List.nil) nHead N (hash ("at",li))
+    qK device sCtx N qDim (hash ("qCtx",li))
     bmm device blk.attention.wO sCtx sAO N (hash ("wo",li))
     Hesper.Layers.RMSNorm.forward device blk.postAttnNorm sAO sR N
     disp device (addB (N*dim)) (("ain",sR)::("bin",cur)::("outc",sPA)::List.nil) (N*dim) (hash ("ra",li))
     -- dense FFN
     Hesper.Layers.RMSNorm.forward device blk.ffnNorm sPA sN N
+    qK device sN N dim (hash ("qNf",li))
     bmm device blk.ffn.gate sN sG N (hash ("g",li))
     bmm device blk.ffn.up sN sU N (hash ("u",li))
     disp device (geluMulB (N*ffn)) (("gate",sG)::("up",sU)::("outp",sGe)::List.nil) (N*ffn) (hash ("gg",li))
+    q80 device sGe N ffn (hash ("qGe",li))
     bmm device blk.ffn.down sGe sD N (hash ("dn",li))
     let some mpn1 := blk.moePostNorm1 | throw (IO.userError "mpn1")
     Hesper.Layers.RMSNorm.forward device mpn1 sD sCurMlp N        -- curMlp
@@ -423,9 +481,11 @@ def main (args : List String) : IO Unit := do
     disp device (routerMatVecB N nExpert dim) (("rw",rW)::("tmps",sTmpS)::("rlogits",sRLogits)::List.nil) (N*nExpert) (hash ("rm",li))
     disp2 device (top8B N nExpert nUsed) (("rlogits",sRLogits)::("idxs",sIdxs)::("wts",sWts)::List.nil) N 1 (hash ("t8",li))
     disp device (zeroB (N*dim)) (("data",sMoeAcc)::List.nil) (N*dim) (hash ("z",li))
+    qK device sMoeN N dim (hash ("qMoeN",li))
     for e in [0:nUsed] do
       disp2 device (Hesper.Layers.Linear.fusedQ4KMBatchExpertKernel { inDim:=dim, outDim:=2*expFF } nExpert N nUsed e) (("weights",guE)::("input",sMoeN)::("idxs",sIdxs)::("output",sGateUp)::List.nil) (2*expFF) N (hash ("eu",li,e))
       disp device (gegluMergedB N expFF) (("gu",sGateUp)::("eh",sEh)::List.nil) (N*expFF) (hash ("gm",li,e))
+      q80 device sEh N expFF (hash ("qEh",li,e))
       disp2 device (Hesper.Layers.Linear.fusedQ8_0BatchExpertKernel { inDim:=expFF, outDim:=dim } nExpert N nUsed e) (("weights",dnE)::("input",sEh)::("idxs",sIdxs)::("output",sDownE)::List.nil) dim N (hash ("ed",li,e))
       disp device (waccB N dim e nUsed) (("acc",sMoeAcc)::("din",sDownE)::("wts",sWts)::List.nil) (N*dim) (hash ("wa",li,e))
     Hesper.Layers.RMSNorm.forward device mpn2post sMoeAcc sCurMoe N
@@ -467,6 +527,7 @@ def main (args : List String) : IO Unit := do
   let sLogits ← mkBuf device (N*lmN)
   Hesper.GPUBackend.beginBatch device
   Hesper.Layers.RMSNorm.forward device model.inner.finalNorm cur sN N
+  qK device sN N dim (hash "qFinal")
   disp2 device (Hesper.Quantization.Q6_K.fusedQ6KBatchKernel dim lmN N)
     (("weights", model.inner.outputWeight)::("input", sN)::("output", sLogits)::List.nil) lmN N (hash "lmhead")
   disp device (softcapB (N*lmN) cap) (("logits", sLogits)::List.nil) (N*lmN) (hash "softcap")
