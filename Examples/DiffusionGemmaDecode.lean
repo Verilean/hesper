@@ -594,6 +594,15 @@ def disp2w (device : Device) (k : Hesper.WGSL.Monad.ShaderM Unit) (bufs : List (
   let r ← IO.mkRef none
   Hesper.GPUBackend.executeWithConfigCached device k bufs { numWorkgroups := (nx,ny,1), workgroupSize := {x:=ws} } key r
 
+/-- Dispatch a subgroup-matrix (WMMA) kernel: 128-thread workgroups + the f16/subgroup_matrix
+    extensions + the uniformity diagnostic the register-blocked matmul needs. -/
+def dispRB (device : Device) (k : Hesper.WGSL.Monad.ShaderM Unit) (bufs : List (String × Buffer)) (nx ny : Nat) (key : UInt64) : IO Unit := do
+  let r ← IO.mkRef none
+  Hesper.GPUBackend.executeWithConfigCached device k bufs
+    { numWorkgroups := (nx,ny,1), workgroupSize := {x:=128},
+      extensions := ["f16","chromium_experimental_subgroup_matrix"],
+      diagnostics := [("off","chromium.subgroup_matrix_uniformity")] } key r
+
 /-- Batched matmul over N rows dispatching by the layer's quant format. -/
 def qK (device : Device) (buf : Buffer) (N K : Nat) (key : UInt64) : IO Unit :=
   disp device (qActQ8K N K) (("data",buf)::List.nil) (N*(K/256)) key
@@ -619,15 +628,16 @@ def bmm (device : Device) (layer : Hesper.Layers.Linear.LinearLayer B C) (inB ou
     then a GPU reduce (`reduceTopKB`, one workgroup/position) for argmax/softmax/top-K —
     replaces the per-step 262144×C Lean scan.  Reads back only the tiny top-K result.
     Returns (canvasIdx, predToken, confidence)·masked, top-K tokens [C·K], top-K probs [C·K]. -/
-def lmHeadArgmaxFullVocab (device : Device) (outputWeight sN sLogits logitsCanvas outDenom outTok outProb : Buffer)
+def lmHeadArgmaxFullVocab (device : Device) (outputWeightF16 sN sLogits logitsCanvas outDenom outTok outProb : Buffer)
     (dim vocabSize N C P : Nat) (cap : Float) (masked : Array Bool) (K : Nat := 8)
     : IO (Array (Nat × Nat × Float) × Array Nat × Array Float) := do
   let lmChunk := 32768
   let nChunks := (vocabSize + lmChunk - 1) / lmChunk
   for c in [0:nChunks] do
     Hesper.GPUBackend.beginBatch device
-    disp2w device (Hesper.Layers.Linear.fusedQ6KBatchF32WarpKernel dim lmChunk N (c*lmChunk) vocabSize)
-      (("weights", outputWeight)::("input", sN)::("output", sLogits)::List.nil) lmChunk N 32 (hash ("lmheadw", c))
+    -- register-blocked WMMA matmul (f16 weight): logits[N, lmChunk] for this vocab chunk
+    dispRB device (Hesper.WGSL.MatMul.matMulTransposeF16WMMARegKernel { M := N, N := lmChunk, K := dim } (c*lmChunk) vocabSize)
+      (("a", sN)::("b", outputWeightF16)::("c", sLogits)::List.nil) ((lmChunk+31)/32) ((N+63)/64) (hash ("lmheadrb", c))
     disp device (softcapB (N*lmChunk) cap) (("logits", sLogits)::List.nil) (N*lmChunk) (hash ("softcap", c))
     disp device (copyCanvasLogitsB N C P vocabSize lmChunk (c*lmChunk)) (("src",sLogits)::("dst",logitsCanvas)::List.nil) (C*lmChunk) (hash ("cpcv", c))
     Hesper.GPUBackend.endBatch device
@@ -765,6 +775,46 @@ def main (args : List String) : IO Unit := do
   let embTable := model.inner.embedding.embeddingTable
   let lmN := min cfg.vocabSize 32768
   let cap := cfg.logitSoftcapScale
+  let outputWeightF16 ← match model.inner.outputWeightF16 with
+    | some b => pure b
+    | none => do
+      -- dequant the tied Q6_K lm_head (= token_embd) → packed f16 [vocab, dim/2] once.
+      -- totalBlocks (≈2.9M) exceeds the 65535 per-dimension grid limit → use a 2D grid.
+      let bpr := dim / 256
+      let totalBlocks := cfg.vocabSize * bpr
+      let gx := 65535
+      let gy := (totalBlocks + gx - 1) / gx
+      let buf ← mkBuf device (cfg.vocabSize * (dim / 2))
+      Hesper.GPUBackend.beginBatch device
+      disp2w device (Hesper.Quantization.Q6_K.q6kToF16Kernel dim cfg.vocabSize gx)
+        (("weights", model.inner.outputWeight)::("output", buf)::List.nil) gx gy 64 (hash "lmf16dq")
+      Hesper.GPUBackend.endBatch device
+      IO.println s!"[dg-decode] dequantized Q6_K lm_head → f16 ({(cfg.vocabSize * dim * 2)/(1024*1024)} MiB)"
+      pure buf
+  if (← IO.getEnv "DG_DQDIAG").isSome then
+    -- hidden row r = e_r ⇒ logits[r,v] = weight[v,r]; compare f32 Q6_K (outputWeight) vs reg (f16)
+    let Md := 64
+    let hid ← mkBuf device (Md*dim)
+    let mut hidA : Array Float := Array.replicate (Md*dim) 0.0
+    for r in [:Md] do hidA := hidA.set! (r*dim + r) 1.0
+    writeBuffer device hid 0 (← Hesper.Basic.floatArrayToBytes hidA)
+    let lF32 ← mkBuf device (Md*lmN); let lRB ← mkBuf device (Md*lmN)
+    Hesper.GPUBackend.beginBatch device
+    disp2 device (Hesper.Quantization.Q6_K.fusedQ6KBatchKernel dim lmN Md 256 0 cfg.vocabSize)
+      (("weights",model.inner.outputWeight)::("input",hid)::("output",lF32)::List.nil) lmN Md (hash "dqf32")
+    Hesper.GPUBackend.endBatch device
+    Hesper.GPUBackend.beginBatch device
+    dispRB device (Hesper.WGSL.MatMul.matMulTransposeF16WMMARegKernel { M := Md, N := lmN, K := dim } 0 cfg.vocabSize)
+      (("a",hid)::("b",outputWeightF16)::("c",lRB)::List.nil) ((lmN+31)/32) ((Md+63)/64) (hash "dqrb")
+    Hesper.GPUBackend.endBatch device
+    let f32A ← Hesper.Basic.bytesToFloatArray (← mapBufferRead device lF32 0 (Md*lmN*4).toUSize)
+    let rbA ← Hesper.Basic.bytesToFloatArray (← mapBufferRead device lRB 0 (Md*lmN*4).toUSize)
+    let mut maxDiff := 0.0; let mut nBad := 0
+    for r in [:Md] do for v in [:min lmN 2000] do
+      let d := (f32A.getD (r*lmN+v) 0.0 - rbA.getD (r*lmN+v) 0.0).abs
+      if d > maxDiff then maxDiff := d
+      if d > 0.05 then nBad := nBad+1
+    IO.println s!"[dqdiag] f32 vs reg(f16): maxDiff={maxDiff} nBad(>0.05)={nBad}/{Md*(min lmN 2000)}; samples (col,tok)=(0,0):{f32A.getD 0 0.0}/{rbA.getD 0 0.0} (1,5):{f32A.getD (1*lmN+5) 0.0}/{rbA.getD (1*lmN+5) 0.0}"
   let sLogits ← mkBuf device (N*lmN)
   let logitsCanvas ← mkBuf device (C*cfg.vocabSize)  -- full-vocab canvas logits for the GPU reduce
   let outDenom ← mkBuf device C
@@ -912,7 +962,7 @@ def main (args : List String) : IO Unit := do
       -- lm_head reads the RAW f32 hidden (no qK): confirmed "Paris.", slightly more
       -- accurate than Q8_K, and the planned f32-warp lm_head kernel reads f32 directly.
       Hesper.GPUBackend.endBatch device
-      let (cand, ktokFlat, probFlat) ← lmHeadArgmaxFullVocab device model.inner.outputWeight sN sLogits logitsCanvas outDenom outTok outProb dim cfg.vocabSize N C P cfg.logitSoftcapScale masked scK
+      let (cand, ktokFlat, probFlat) ← lmHeadArgmaxFullVocab device outputWeightF16 sN sLogits logitsCanvas outDenom outTok outProb dim cfg.vocabSize N C P cfg.logitSoftcapScale masked scK
       let tLm ← IO.monoMsNow
       scTok := ktokFlat; scProb := probFlat   -- feed this step's top-K soft prediction into next step's SC
       let want := if step+1 ≥ decodeSteps then remaining else max 1 ((C + decodeSteps - 1) / decodeSteps)
