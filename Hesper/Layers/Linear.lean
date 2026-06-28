@@ -1547,12 +1547,17 @@ def q4kMatmulBatchMMQ5Kernel (config : Config) (seqLen : Nat)
   let _input ← ShaderM.declareReadOnlyBuffer "input_q8" (.array (.scalar .u32) q8InputU32Size)
   let _output ← ShaderM.declareOutputBuffer "output" (.array (.scalar .f32) totalOutputSize)
   let perExpertU32 := config.outDim * blocksPerRow * 36
-  let weightBaseExp ← if grouped then do
+  let _texp ← if grouped then do
       let _te ← ShaderM.declareReadOnlyBuffer "tileExpert" (.array (.scalar .u32) (nCols / 32))
       let ex ← ShaderM.readBuffer (ty := .scalar .u32) (n := nCols / 32) "tileExpert" j_blk
-      ShaderM.var (.scalar .u32) (Exp.mul ex (Exp.litU32 perExpertU32))
-    else ShaderM.var (.scalar .u32) (Exp.litU32 weightBaseU32)
-  let weightBaseE : Exp (.scalar .u32) := Exp.var weightBaseExp
+      ShaderM.varNamed "tileExp" (.scalar .u32) ex
+    else ShaderM.varNamed "tileExp" (.scalar .u32) (Exp.litU32 0)
+  let weightBaseE : Exp (.scalar .u32) :=
+    if grouped then Exp.mul (Exp.var "tileExp") (Exp.litU32 perExpertU32) else Exp.litU32 weightBaseU32
+  -- dummy tiles (tileExpert = sentinel ≥ nExpertW) run the K-loop 0× (skip decode/dp4a; write 0s).
+  let kEnd : Exp (.scalar .u32) :=
+    if grouped then Exp.select (Exp.lt (Exp.var "tileExp") (Exp.litU32 nExpertW)) (Exp.litU32 blocksPerRow) (Exp.litU32 0)
+    else Exp.litU32 blocksPerRow
 
   -- launch_bounds(256, 2): force ptxas to fit ≥ 2 blocks/SM for occupancy.
   -- ncu measured MMQ5 at 75 reg/thread → 1 block/SM (17.8% occupancy).
@@ -1573,7 +1578,7 @@ def q4kMatmulBatchMMQ5Kernel (config : Config) (seqLen : Nat)
     for iIter in [0:2] do
       ShaderM.varNamed s!"acc_{jIter}_{iIter}" (.scalar .f32) (Exp.litF32 0.0)
 
-  ShaderM.loop (Exp.litU32 0) (Exp.litU32 blocksPerRow) (Exp.litU32 1) fun kbx0 => do
+  ShaderM.loop (Exp.litU32 0) kEnd (Exp.litU32 1) fun kbx0 => do
     -- Phase A: cooperative X load. 64 rows × 36 ints = 2304 ints, 256 threads × 9 iters.
     -- 256*9 = 2304 = 64*36 exactly, flatIdx never overshoots.
     -- Gemma 4 has all matrix dims (2048/2560/5120/8192/16384) divisible by 64,

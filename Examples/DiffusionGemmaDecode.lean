@@ -385,7 +385,7 @@ def offsetsExpB (nExpert maxPadded : Nat) : Hesper.WGSL.Monad.ShaderM Unit := do
         ShaderM.assign "tt" (Exp.add (Exp.var "tt") (Exp.litU32 1))
       ShaderM.assign "acc" (Exp.add (Exp.var "acc") pc)
     ShaderM.loop (Exp.div (Exp.var "acc") (Exp.litU32 32)) (Exp.litU32 (maxPadded/32)) (Exp.litU32 1) fun tt => do
-      ShaderM.writeBuffer (ty := .scalar .u32) "te" tt (Exp.litU32 0)) (pure ())
+      ShaderM.writeBuffer (ty := .scalar .u32) "te" tt (Exp.litU32 nExpert)) (pure ())
 
 /-- GPU grouping 3: scatter each (pos,slot) to off[expert]+rank (rank = #earlier same-expert). -/
 def scatterRankB (totalTok nExpert nUsed maxPadded : Nat) : Hesper.WGSL.Monad.ShaderM Unit := do
