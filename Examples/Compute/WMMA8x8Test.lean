@@ -365,6 +365,26 @@ def main : IO Unit := do
     let gf := 2.0 * sm.toFloat * sn.toFloat * sk.toFloat / secsF / 1.0e9
     IO.println s!"  [regblk {lbl}] {secsF*1000.0} ms → {gf} GFLOPS  (naive was ~200 at M=288)"
 
+  -- ---- Test 11: weightRowOffset path (chunked, like lm_head chunks 1-7) ----
+  -- N=64 split into 2 chunks of 32; reg kernel with weightRowOffset, compare to CPU
+  let mut ok11 := 0
+  for ch in [:2] do
+    let cBufC ← mkBuf (M*32*4).toUSize
+    let cfgC : MatMul.Config := { M := M, N := 32, K := K }   -- chunk width 32, K=64
+    let cfgCe : Execute.ExecutionConfig := {
+      funcName := "main", workgroupSize := { x := 128, y := 1, z := 1 }, numWorkgroups := ((32+31)/32, (M+63)/64, 1),
+      extensions := ["f16","chromium_experimental_subgroup_matrix"], diagnostics := [("off","chromium.subgroup_matrix_uniformity")] }
+    let bufsC : List (String × Buffer) := [("a",aBufT),("b",bBufT),("c",cBufC)]
+    -- weightRowOffset = ch*32, weightRows = N(=64 full)
+    Execute.executeShaderNamed device (MatMul.matMulTransposeF16WMMARegKernel cfgC (ch*32) N) bufsC cfgCe
+    let cC ← Hesper.Basic.bytesToFloatArray (← mapBufferRead device cBufC 0 (M*32*4).toUSize)
+    for m in [:M] do for n in [:32] do
+      let mut sm := 0.0
+      for k in [:K] do sm := sm + (af m k) * (bf (ch*32+n) k)
+      if (sm - cC.getD (m*32+n) 0.0).abs < 1.0 then ok11 := ok11+1
+  let v11 := if ok11==M*64 then "✅ weightRowOffset CORRECT" else "❌ weightRowOffset BUG"
+  IO.println s!"  [regblk chunked] {ok11}/{M*64} → {v11}"
+
 end Examples.Compute.WMMA8x8Test
 
 def main : IO Unit := Examples.Compute.WMMA8x8Test.main
