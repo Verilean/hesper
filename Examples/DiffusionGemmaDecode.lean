@@ -639,8 +639,11 @@ def main (args : List String) : IO Unit := do
   let invSqrt := 1.0 / Float.sqrt dim.toFloat
   let sCurMlp ← mkBuf device (N*dim); let sMoeN ← mkBuf device (N*dim); let sTmpS ← mkBuf device (N*dim)
   let sRLogits ← mkBuf device (N*nExpert); let sIdxs ← mkBuf device (N*nUsed); let sWts ← mkBuf device (N*nUsed)
-  let sMoeAcc ← mkBuf device (N*dim); let sGateUp ← mkBuf device (N*2*expFF); let sEh ← mkBuf device (N*expFF)
-  let sDownE ← mkBuf device (N*dim); let sCurMoe ← mkBuf device (N*dim); let sComb ← mkBuf device (N*dim)
+  let sMoeAcc ← mkBuf device (N*dim)
+  let sGateUps ← (List.range nUsed).mapM (fun _ => mkBuf device (N*2*expFF))  -- per-expert (race fix)
+  let sEhs ← (List.range nUsed).mapM (fun _ => mkBuf device (N*expFF))        -- per-expert (race fix)
+  let sDownEs ← (List.range nUsed).mapM (fun _ => mkBuf device (N*dim))  -- per-expert (was 1 reused buf — race test)
+  let sCurMoe ← mkBuf device (N*dim); let sComb ← mkBuf device (N*dim)
   let sMoeNQ8 ← mkBuf device (N*(dim/32)*9)  -- Q8_1 of the MoE input for the dp4a expert matmul
   -- DECODE LOOP: real prompt + canvas of mask tokens; diffusion confidence-commit
   let decodeSteps := (args.drop 3).head?.bind (·.toNat?) |>.getD 13
@@ -756,12 +759,15 @@ def main (args : List String) : IO Unit := do
         -- Q8_1-quantize the MoE input once for the dp4a expert matmul (replaces qK)
         disp2w device (Hesper.Layers.Linear.quantizeQ8_1BatchKernel dim N) (("input",sMoeN)::("output",sMoeNQ8)::List.nil) (dim/32) N 32 (hash ("qmoeq8",li))
         for e in [0:nUsed] do
+          let sGateUp := sGateUps[e]?.getD sMoeN
+          let sEh := sEhs[e]?.getD sMoeN
           disp2w device (Hesper.Layers.Linear.fusedQ4KMBatchExpertDP4AKernel { inDim:=dim, outDim:=2*expFF } nExpert N nUsed e) (("weights",guE)::("input_q8",sMoeNQ8)::("idxs",sIdxs)::("output",sGateUp)::List.nil) (2*expFF) N 32 (hash ("eu",li,e))
           disp device (gegluMergedB N expFF) (("gu",sGateUp)::("eh",sEh)::List.nil) (N*expFF) (hash ("gm",li,e))
           q80 device sEh N expFF (hash ("qEh",li,e))
           let downExpKernel := match blk.ffn.down.quantFormat with
             | .Q5_0 => Hesper.Layers.Linear.fusedQ5_0BatchExpertKernel { inDim:=expFF, outDim:=dim } nExpert N nUsed e
             | _     => Hesper.Layers.Linear.fusedQ8_0BatchExpertKernel { inDim:=expFF, outDim:=dim } nExpert N nUsed e
+          let sDownE := sDownEs[e]?.getD sEh
           disp2 device downExpKernel (("weights",dnE)::("input",sEh)::("idxs",sIdxs)::("output",sDownE)::List.nil) dim N (hash ("ed",li,e))
           disp device (waccB N dim e nUsed) (("acc",sMoeAcc)::("din",sDownE)::("wts",sWts)::List.nil) (N*dim) (hash ("wa",li,e))
         Hesper.Layers.RMSNorm.forward device mpn2post sMoeAcc sCurMoe N
