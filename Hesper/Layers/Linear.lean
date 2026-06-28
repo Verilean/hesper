@@ -6518,6 +6518,100 @@ def fusedQ4KMBatchExpertDP4AKernel (config : Config) (nExpert N nUsed slot : Nat
   ShaderM.if_ (Exp.and (Exp.eq tid (Exp.litU32 0)) inBounds) (do
     ShaderM.writeBuffer (ty := .scalar .f32) "output" (Exp.add (Exp.mul row (Exp.litU32 config.outDim)) outIdx) total) (pure ())
 
+/-- Phase-4 OUTPUT-TILED Q4_K expert dp4a: one 32-lane warp computes T output rows for ONE
+    position (so they share the same expert). The Q8_1 activation block (u0..u3, d8, sumU) is read
+    ONCE per K-block and reused across the T outputs; only the weight decode+dot is per-output. T×
+    fewer workgroups (the forward is overhead-bound) + T× less activation read. Requires
+    `outDim % T == 0`. Grid: (outDim/T, N) × 32. Math identical to `fusedQ4KMBatchExpertDP4AKernel`. -/
+def fusedQ4KMBatchExpertDP4ATiledKernel (config : Config) (nExpert N nUsed slot T : Nat) : ShaderM Unit := do
+  let wid ← ShaderM.workgroupId
+  let lid ← ShaderM.localId
+  let outTile := Exp.vec3X wid
+  let row := Exp.vec3Y wid
+  let tid := Exp.vec3X lid
+  let blocksPerRow := config.inDim / 256
+  let perExpertU32 := config.outDim * blocksPerRow * 36
+  let totalWeightU32 := nExpert * perExpertU32
+  let q8BlocksPerRow := config.inDim / 32
+  let q8InputU32Size := q8BlocksPerRow * 9
+  let nInQ8 := N * q8InputU32Size
+  let _weights ← ShaderM.declareReadOnlyBuffer "weights" (.array (.scalar .u32) totalWeightU32)
+  let _input ← ShaderM.declareReadOnlyBuffer "input_q8" (.array (.scalar .u32) nInQ8)
+  let _idxs ← ShaderM.declareReadOnlyBuffer "idxs" (.array (.scalar .u32) (N * nUsed))
+  let _output ← ShaderM.declareOutputBuffer "output" (.array (.scalar .f32) (N * config.outDim))
+  let expertIdx ← ShaderM.readBuffer (ty := .scalar .u32) (n := N*nUsed) "idxs" (Exp.add (Exp.mul row (Exp.litU32 nUsed)) (Exp.litU32 slot))
+  let expertBase := Exp.mul expertIdx (Exp.litU32 perExpertU32)
+  let outBase := Exp.mul outTile (Exp.litU32 T)
+  for t in [0:T] do
+    ShaderM.varNamed s!"acc{t}" (.scalar .f32) (Exp.litF32 0.0)
+  let q8RowBase := Exp.mul row (Exp.litU32 q8InputU32Size)
+  let laneLow := Exp.bitAnd tid (Exp.litU32 15)
+  let pairIdx := Exp.div laneLow (Exp.litU32 4)
+  let elemOff := Exp.sub laneLow (Exp.mul pairIdx (Exp.litU32 4))
+  let bq8Off := Exp.mul pairIdx (Exp.litU32 2)
+  ShaderM.loop (Exp.litU32 0) (Exp.litU32 blocksPerRow) (Exp.litU32 1) fun blockIdx => do
+    -- activation block — read ONCE, shared by all T outputs
+    let q8Sub0Base := Exp.add q8RowBase (Exp.add (Exp.mul blockIdx (Exp.litU32 (8*9))) (Exp.mul bq8Off (Exp.litU32 9)))
+    let q8Sub1Base := Exp.add q8Sub0Base (Exp.litU32 9)
+    let u0 ← ShaderM.readBuffer (ty := .scalar .u32) (n := nInQ8) "input_q8" (Exp.add q8Sub0Base (Exp.add (Exp.litU32 1) elemOff))
+    let u1 ← ShaderM.readBuffer (ty := .scalar .u32) (n := nInQ8) "input_q8" (Exp.add q8Sub0Base (Exp.add (Exp.litU32 5) elemOff))
+    let u2 ← ShaderM.readBuffer (ty := .scalar .u32) (n := nInQ8) "input_q8" (Exp.add q8Sub1Base (Exp.add (Exp.litU32 1) elemOff))
+    let u3 ← ShaderM.readBuffer (ty := .scalar .u32) (n := nInQ8) "input_q8" (Exp.add q8Sub1Base (Exp.add (Exp.litU32 5) elemOff))
+    let q8Hdr0 ← ShaderM.readBuffer (ty := .scalar .u32) (n := nInQ8) "input_q8" q8Sub0Base
+    let q8Hdr1 ← ShaderM.readBuffer (ty := .scalar .u32) (n := nInQ8) "input_q8" q8Sub1Base
+    let d8AName ← ShaderM.var (.scalar .f32) (Exp.vecX (Exp.unpack2x16float q8Hdr0))
+    let d8BName ← ShaderM.var (.scalar .f32) (Exp.vecX (Exp.unpack2x16float q8Hdr1))
+    let d8A : Exp (.scalar .f32) := Exp.var d8AName
+    let d8B : Exp (.scalar .f32) := Exp.var d8BName
+    let sumU_0 := Exp.add (Exp.dot4I8Packed (Exp.litU32 0x01010101) u0) (Exp.dot4I8Packed (Exp.litU32 0x01010101) u1)
+    let sumU_1 := Exp.add (Exp.dot4I8Packed (Exp.litU32 0x01010101) u2) (Exp.dot4I8Packed (Exp.litU32 0x01010101) u3)
+    for t in [0:T] do
+      let blockU32Base := Exp.add (Exp.add expertBase (Exp.mul (Exp.add outBase (Exp.litU32 t)) (Exp.litU32 (blocksPerRow * 36)))) (Exp.mul blockIdx (Exp.litU32 36))
+      let dmU32 ← ShaderM.readBuffer (ty := .scalar .u32) (n := totalWeightU32) "weights" blockU32Base
+      let dF := Exp.vecX (Exp.unpack2x16float dmU32)
+      let dminF := Exp.vecY (Exp.unpack2x16float dmU32)
+      let sc0 ← ShaderM.readBuffer (ty := .scalar .u32) (n := totalWeightU32) "weights" (Exp.add blockU32Base (Exp.litU32 1))
+      let sc1 ← ShaderM.readBuffer (ty := .scalar .u32) (n := totalWeightU32) "weights" (Exp.add blockU32Base (Exp.litU32 2))
+      let sc2 ← ShaderM.readBuffer (ty := .scalar .u32) (n := totalWeightU32) "weights" (Exp.add blockU32Base (Exp.litU32 3))
+      let extractScaleMin (is : Exp (.scalar .u32)) : Exp (.scalar .f32) × Exp (.scalar .f32) :=
+        let isLow := Exp.lt is (Exp.litU32 4)
+        let shift4 := Exp.mul is (Exp.litU32 8)
+        let scaleLow := Exp.bitAnd (Exp.shiftRight sc0 shift4) (Exp.litU32 0x3F)
+        let minLow   := Exp.bitAnd (Exp.shiftRight sc1 shift4) (Exp.litU32 0x3F)
+        let isHi := Exp.sub is (Exp.litU32 4)
+        let shiftHi := Exp.mul isHi (Exp.litU32 8)
+        let scaleHiLo := Exp.bitAnd (Exp.shiftRight sc2 shiftHi) (Exp.litU32 0x0F)
+        let scaleHiHi := Exp.shiftLeft (Exp.bitAnd (Exp.shiftRight sc0 (Exp.add shiftHi (Exp.litU32 6))) (Exp.litU32 0x03)) (Exp.litU32 4)
+        let scaleHigh := Exp.bitOr scaleHiLo scaleHiHi
+        let minHiLo := Exp.bitAnd (Exp.shiftRight sc2 (Exp.add shiftHi (Exp.litU32 4))) (Exp.litU32 0x0F)
+        let minHiHi := Exp.shiftLeft (Exp.bitAnd (Exp.shiftRight sc1 (Exp.add shiftHi (Exp.litU32 6))) (Exp.litU32 0x03)) (Exp.litU32 4)
+        let minHigh := Exp.bitOr minHiLo minHiHi
+        let scaleU := Exp.select isLow scaleLow scaleHigh
+        let minU   := Exp.select isLow minLow   minHigh
+        (Exp.toF32U scaleU, Exp.toF32U minU)
+      let (scA, mA) := extractScaleMin bq8Off
+      let (scB, mB) := extractScaleMin (Exp.add bq8Off (Exp.litU32 1))
+      let q4BaseIdx := Exp.add blockU32Base (Exp.add (Exp.litU32 4) (Exp.add (Exp.mul bq8Off (Exp.litU32 4)) elemOff))
+      let v0 ← ShaderM.readBuffer (ty := .scalar .u32) (n := totalWeightU32) "weights" q4BaseIdx
+      let v1 ← ShaderM.readBuffer (ty := .scalar .u32) (n := totalWeightU32) "weights" (Exp.add q4BaseIdx (Exp.litU32 4))
+      let v0i0 := Exp.bitAnd v0 (Exp.litU32 0x0F0F0F0F)
+      let v1i0 := Exp.bitAnd v1 (Exp.litU32 0x0F0F0F0F)
+      let dot1_0Combined := Exp.add (Exp.dot4I8Packed v0i0 u0) (Exp.dot4I8Packed v1i0 u1)
+      let sumfD_0 := Exp.mul d8A (Exp.mul (Exp.toF32 dot1_0Combined) scA)
+      let sumfM_0 := Exp.mul d8A (Exp.mul (Exp.toF32 sumU_0) mA)
+      let v0i1 := Exp.bitAnd (Exp.shiftRight v0 (Exp.litU32 4)) (Exp.litU32 0x0F0F0F0F)
+      let v1i1 := Exp.bitAnd (Exp.shiftRight v1 (Exp.litU32 4)) (Exp.litU32 0x0F0F0F0F)
+      let dot1_1Combined := Exp.add (Exp.dot4I8Packed v0i1 u2) (Exp.dot4I8Packed v1i1 u3)
+      let sumfD_1 := Exp.mul d8B (Exp.mul (Exp.toF32 dot1_1Combined) scB)
+      let sumfM_1 := Exp.mul d8B (Exp.mul (Exp.toF32 sumU_1) mB)
+      let blockContrib := Exp.sub (Exp.mul dF (Exp.add sumfD_0 sumfD_1)) (Exp.mul dminF (Exp.add sumfM_0 sumfM_1))
+      ShaderM.assign s!"acc{t}" (Exp.add (Exp.var s!"acc{t}") blockContrib)
+  for t in [0:T] do
+    ShaderM.varNamed s!"total{t}" (.scalar .f32) (Exp.mul (Exp.subgroupAdd (Exp.var s!"acc{t}")) (Exp.litF32 0.5))
+    let outIdx := Exp.add outBase (Exp.litU32 t)
+    ShaderM.if_ (Exp.and (Exp.eq tid (Exp.litU32 0)) (Exp.lt outIdx (Exp.litU32 config.outDim))) (do
+      ShaderM.writeBuffer (ty := .scalar .f32) "output" (Exp.add (Exp.mul row (Exp.litU32 config.outDim)) outIdx) (Exp.var s!"total{t}")) (pure ())
+
 /-- Q4_K expert matmul via ggml-order INTEGER dot: recover q8=round(a/d_q8) from the already-Q8'd
     activation, accumulate Σ q4·q8 (exact small-int sums) per sub-block, then combine with weight
     scales as ggml does: acc += d_q8·(d·Σ scale·sumi − dmin·Σ min·bsum). Bit-closer than f32 dequant. -/

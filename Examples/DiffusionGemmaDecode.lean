@@ -762,7 +762,7 @@ def main (args : List String) : IO Unit := do
           let sGateUp := sGateUps[e]?.getD sMoeN
           let sEh := sEhs[e]?.getD sMoeN
           unless (← IO.getEnv "DG_SKIPEGU").isSome do
-            disp2w device (Hesper.Layers.Linear.fusedQ4KMBatchExpertDP4AKernel { inDim:=dim, outDim:=2*expFF } nExpert N nUsed e) (("weights",guE)::("input_q8",sMoeNQ8)::("idxs",sIdxs)::("output",sGateUp)::List.nil) (2*expFF) N 32 (hash ("eu",li,e))
+            disp2w device (Hesper.Layers.Linear.fusedQ4KMBatchExpertDP4ATiledKernel { inDim:=dim, outDim:=2*expFF } nExpert N nUsed e 4) (("weights",guE)::("input_q8",sMoeNQ8)::("idxs",sIdxs)::("output",sGateUp)::List.nil) ((2*expFF)/4) N 32 (hash ("eut",li,e))
           disp device (gegluMergedB N expFF) (("gu",sGateUp)::("eh",sEh)::List.nil) (N*expFF) (hash ("gm",li,e))
           q80 device sEh N expFF (hash ("qEh",li,e))
           let downExpKernel := match blk.ffn.down.quantFormat with
