@@ -765,10 +765,10 @@ def main (args : List String) : IO Unit := do
           disp device (gegluMergedB N expFF) (("gu",sGateUp)::("eh",sEh)::List.nil) (N*expFF) (hash ("gm",li,e))
           q80 device sEh N expFF (hash ("qEh",li,e))
           let downExpKernel := match blk.ffn.down.quantFormat with
-            | .Q5_0 => Hesper.Layers.Linear.fusedQ5_0BatchExpertKernel { inDim:=expFF, outDim:=dim } nExpert N nUsed e
-            | _     => Hesper.Layers.Linear.fusedQ8_0BatchExpertKernel { inDim:=expFF, outDim:=dim } nExpert N nUsed e
+            | .Q5_0 => Hesper.Layers.Linear.fusedQ5_0BatchExpertF32WarpKernel { inDim:=expFF, outDim:=dim } nExpert N nUsed e
+            | _     => Hesper.Layers.Linear.fusedQ8_0BatchExpertF32WarpKernel { inDim:=expFF, outDim:=dim } nExpert N nUsed e
           let sDownE := sDownEs[e]?.getD sEh
-          disp2 device downExpKernel (("weights",dnE)::("input",sEh)::("idxs",sIdxs)::("output",sDownE)::List.nil) dim N (hash ("ed",li,e))
+          disp2w device downExpKernel (("weights",dnE)::("input",sEh)::("idxs",sIdxs)::("output",sDownE)::List.nil) dim N 32 (hash ("ed",li,e))
           disp device (waccB N dim e nUsed) (("acc",sMoeAcc)::("din",sDownE)::("wts",sWts)::List.nil) (N*dim) (hash ("wa",li,e))
         Hesper.Layers.RMSNorm.forward device mpn2post sMoeAcc sCurMoe N
         -- combine: curMlp + curMoe → postFFNNorm → +residual → ×out_scale
