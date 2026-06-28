@@ -736,6 +736,22 @@ def main (args : List String) : IO Unit := do
         disp device (routerPrepB N dim invSqrt eps) (("xin",sPA)::("rscale",rS)::("tmps",sTmpS)::List.nil) N (hash ("rp",li))
         disp device (routerMatVecB N nExpert dim) (("rw",rW)::("tmps",sTmpS)::("rlogits",sRLogits)::List.nil) (N*nExpert) (hash ("rm",li))
         disp2 device (top8B N nExpert nUsed) (("rlogits",sRLogits)::("idxs",sIdxs)::("wts",sWts)::List.nil) N 1 (hash ("t8",li))
+        if step == 0 && (li == 0 || li == 1 || li == 5 || li == 15) && (← IO.getEnv "DG_RDIAG").isSome then
+          Hesper.GPUBackend.endBatch device
+          let idxB ← mapBufferRead device sIdxs 0 (N*nUsed*4).toUSize
+          let rdU32 (a : ByteArray) (j : Nat) : Nat :=
+            a[j*4]!.toNat ||| (a[j*4+1]!.toNat <<< 8) ||| (a[j*4+2]!.toNat <<< 16) ||| (a[j*4+3]!.toNat <<< 24)
+          let mut idxSum := 0
+          for j in [0:N*nUsed] do idxSum := idxSum + rdU32 idxB j
+          let mut c0 : Array Nat := #[]
+          for k in [0:nUsed] do c0 := c0.push (rdU32 idxB (P*nUsed + k))
+          unmapBuffer sIdxs
+          let logF ← Hesper.Basic.bytesToFloatArray (← mapBufferRead device sRLogits 0 (N*nExpert*4).toUSize)
+          unmapBuffer sRLogits
+          let mut lsum := 0.0
+          for v in logF do lsum := lsum + v
+          IO.println s!"[rdiag] L{li} canvas0 top8={c0} | idxSum={idxSum} | rlogitSum={lsum}"
+          Hesper.GPUBackend.beginBatch device
         disp device (zeroB (N*dim)) (("data",sMoeAcc)::List.nil) (N*dim) (hash ("z",li))
         -- Q8_1-quantize the MoE input once for the dp4a expert matmul (replaces qK)
         disp2w device (Hesper.Layers.Linear.quantizeQ8_1BatchKernel dim N) (("input",sMoeN)::("output",sMoeNQ8)::List.nil) (dim/32) N 32 (hash ("qmoeq8",li))
