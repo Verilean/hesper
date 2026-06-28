@@ -33,11 +33,14 @@ open Hesper.WGSL
 open Hesper.WGSL.Monad
 
 /-- Q6_K → packed half2 dequantization. -/
-def q6kToF16Kernel (inDim outDim : Nat) : ShaderM Unit := do
+def q6kToF16Kernel (inDim outDim : Nat) (gridXWidth : Nat := 0) : ShaderM Unit := do
   let wid ← ShaderM.workgroupId
   let lid ← ShaderM.localId
-  -- 1D grid: workgroup_id.x = blockGlobalIdx in [0, outDim * blocksPerRow)
-  let blockGlobalIdx := Exp.vec3X wid
+  -- blockGlobalIdx in [0, outDim * blocksPerRow). 1D when gridXWidth=0; else 2D (x + y*gridXWidth)
+  -- so totalBlocks > the 65535 per-dimension limit can be covered by a single 2D dispatch.
+  let blockGlobalIdx :=
+    if gridXWidth > 0 then Exp.add (Exp.vec3X wid) (Exp.mul (Exp.vec3Y wid) (Exp.litU32 gridXWidth))
+    else Exp.vec3X wid
   let tid := Exp.vec3X lid  -- 0..63
 
   let blocksPerRow := inDim / blockSize
