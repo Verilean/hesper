@@ -837,13 +837,15 @@ def matMulTransposeF16WMMA8x8KbKernel (config : Config) (BK : Nat) : ShaderM Uni
     registers total: 8 result + 4 left + 2 right), reusing each loaded 8×8 tile 2-4 ways.
     A: f32 [M,K]; B: u32-packed f16 [N,K/2] (B^T); C: f32 [M,N]. Requires M%64=N%32=K%32=0.
     Grid: (N/32, M/64) × 128. -/
-def matMulTransposeF16WMMARegKernel (config : Config) : ShaderM Unit := do
+def matMulTransposeF16WMMARegKernel (config : Config)
+    (weightRowOffset weightRows : Nat := 0) : ShaderM Unit := do
   let wid ← ShaderM.workgroupId
   let lid ← ShaderM.localId
   let tid := Exp.vec3X lid
   let packedK := config.K / 2
+  let bRows := if weightRows > 0 then weightRows else config.N
   let _a ← ShaderM.declareInputBuffer "a" (.array (.scalar .f32) (config.M * config.K))
-  let _b ← ShaderM.declareInputBuffer "b" (.array (.scalar .u32) (config.N * packedK))
+  let _b ← ShaderM.declareInputBuffer "b" (.array (.scalar .u32) (bRows * packedK))
   let _c ← ShaderM.declareOutputBuffer "c" (.array (.scalar .f32) (config.M * config.N))
   -- shared stored as contiguous 8×8 tiles (stride 8) so simdgroup_load reads 64 contiguous f16
   ShaderM.sharedNamed "shared_A" (.array (.scalar .f16) (64 * 32))   -- 8 M-tiles × 4 K-tiles of 8×8
@@ -877,7 +879,7 @@ def matMulTransposeF16WMMARegKernel (config : Config) : ShaderM Unit := do
       let u := Exp.add tid (Exp.litU32 (s * 128))
       let n := Exp.div u (Exp.litU32 16)
       let kpair := Exp.mod u (Exp.litU32 16)
-      let row := Exp.add colBase n
+      let row := Exp.add (Exp.add (Exp.litU32 weightRowOffset) colBase) n  -- absolute weight row
       let u32Idx := Exp.add (Exp.mul row (Exp.litU32 packedK)) (Exp.add (Exp.div kBaseE (Exp.litU32 2)) kpair)
       let packed ← ShaderM.readBuffer (ty := .scalar .u32) (n := config.N * packedK) "b" u32Idx
       let unp := Exp.unpack2x16float packed
