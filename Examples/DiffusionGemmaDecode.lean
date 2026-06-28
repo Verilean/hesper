@@ -346,6 +346,66 @@ def gegluMergedB (N ff : Nat) (inOffset guElems : Nat := 0) : Hesper.WGSL.Monad.
     let gl := Exp.mul (Exp.mul (Exp.litF32 0.5) g) (Exp.add (Exp.litF32 1.0) (Exp.tanh iC))
     ShaderM.assignIndex "eh" t (Exp.mul gl u)) (pure ())
 
+/-- GPU grouping 0: clear sortedPos=0, sortedSlot=nUsed (dummy) over the padded buffer. -/
+def clearSortedB (maxPadded nUsed : Nat) : Hesper.WGSL.Monad.ShaderM Unit := do
+  let gid ← ShaderM.globalId; let k := Exp.vec3X gid
+  let _sp ← ShaderM.declareOutputBuffer "sp" (.array (.scalar .u32) maxPadded)
+  let _ss ← ShaderM.declareOutputBuffer "ss" (.array (.scalar .u32) maxPadded)
+  ShaderM.if_ (Exp.lt k (Exp.litU32 maxPadded)) (do
+    ShaderM.writeBuffer (ty := .scalar .u32) "sp" k (Exp.litU32 0)
+    ShaderM.writeBuffer (ty := .scalar .u32) "ss" k (Exp.litU32 nUsed)) (pure ())
+
+/-- GPU grouping 1: count tokens per expert. 1 thread per expert. -/
+def countExpB (totalTok nExpert : Nat) : Hesper.WGSL.Monad.ShaderM Unit := do
+  let gid ← ShaderM.globalId; let e := Exp.vec3X gid
+  let _idx ← ShaderM.declareReadOnlyBuffer "idxs" (.array (.scalar .u32) totalTok)
+  let _cnt ← ShaderM.declareOutputBuffer "cnt" (.array (.scalar .u32) nExpert)
+  ShaderM.if_ (Exp.lt e (Exp.litU32 nExpert)) (do
+    ShaderM.varNamed "c" (.scalar .u32) (Exp.litU32 0)
+    ShaderM.loop (Exp.litU32 0) (Exp.litU32 totalTok) (Exp.litU32 1) fun ps => do
+      let v ← ShaderM.readBuffer (ty := .scalar .u32) (n := totalTok) "idxs" ps
+      ShaderM.if_ (Exp.eq v e) (ShaderM.assign "c" (Exp.add (Exp.var "c") (Exp.litU32 1))) (pure ())
+    ShaderM.writeBuffer (ty := .scalar .u32) "cnt" e (Exp.var "c")) (pure ())
+
+/-- GPU grouping 2: prefix-sum padded offsets + fill tileExpert. Single thread (cheap). -/
+def offsetsExpB (nExpert maxPadded : Nat) : Hesper.WGSL.Monad.ShaderM Unit := do
+  let gid ← ShaderM.globalId; let t := Exp.vec3X gid
+  let _cnt ← ShaderM.declareReadOnlyBuffer "cnt" (.array (.scalar .u32) nExpert)
+  let _off ← ShaderM.declareOutputBuffer "off" (.array (.scalar .u32) nExpert)
+  let _te ← ShaderM.declareOutputBuffer "te" (.array (.scalar .u32) (maxPadded/32))
+  ShaderM.if_ (Exp.eq t (Exp.litU32 0)) (do
+    ShaderM.varNamed "acc" (.scalar .u32) (Exp.litU32 0)
+    ShaderM.loop (Exp.litU32 0) (Exp.litU32 nExpert) (Exp.litU32 1) fun e => do
+      let c ← ShaderM.readBuffer (ty := .scalar .u32) (n := nExpert) "cnt" e
+      let pc := Exp.mul (Exp.div (Exp.add c (Exp.litU32 31)) (Exp.litU32 32)) (Exp.litU32 32)
+      ShaderM.writeBuffer (ty := .scalar .u32) "off" e (Exp.var "acc")
+      ShaderM.varNamed "tt" (.scalar .u32) (Exp.div (Exp.var "acc") (Exp.litU32 32))
+      ShaderM.loop (Exp.litU32 0) (Exp.div pc (Exp.litU32 32)) (Exp.litU32 1) fun _z => do
+        ShaderM.writeBuffer (ty := .scalar .u32) "te" (Exp.var "tt") e
+        ShaderM.assign "tt" (Exp.add (Exp.var "tt") (Exp.litU32 1))
+      ShaderM.assign "acc" (Exp.add (Exp.var "acc") pc)
+    ShaderM.loop (Exp.div (Exp.var "acc") (Exp.litU32 32)) (Exp.litU32 (maxPadded/32)) (Exp.litU32 1) fun tt => do
+      ShaderM.writeBuffer (ty := .scalar .u32) "te" tt (Exp.litU32 0)) (pure ())
+
+/-- GPU grouping 3: scatter each (pos,slot) to off[expert]+rank (rank = #earlier same-expert). -/
+def scatterRankB (totalTok nExpert nUsed maxPadded : Nat) : Hesper.WGSL.Monad.ShaderM Unit := do
+  let gid ← ShaderM.globalId; let ps := Exp.vec3X gid
+  let _idx ← ShaderM.declareReadOnlyBuffer "idxs" (.array (.scalar .u32) totalTok)
+  let _off ← ShaderM.declareReadOnlyBuffer "off" (.array (.scalar .u32) nExpert)
+  let _sp ← ShaderM.declareOutputBuffer "sp" (.array (.scalar .u32) maxPadded)
+  let _ss ← ShaderM.declareOutputBuffer "ss" (.array (.scalar .u32) maxPadded)
+  ShaderM.if_ (Exp.lt ps (Exp.litU32 totalTok)) (do
+    let e ← ShaderM.readBuffer (ty := .scalar .u32) (n := totalTok) "idxs" ps
+    ShaderM.varNamed "rank" (.scalar .u32) (Exp.litU32 0)
+    ShaderM.loop (Exp.litU32 0) ps (Exp.litU32 1) fun ps2 => do
+      let v ← ShaderM.readBuffer (ty := .scalar .u32) (n := totalTok) "idxs" ps2
+      ShaderM.if_ (Exp.eq v e) (ShaderM.assign "rank" (Exp.add (Exp.var "rank") (Exp.litU32 1))) (pure ())
+    let o ← ShaderM.readBuffer (ty := .scalar .u32) (n := nExpert) "off" e
+    let si := Exp.add o (Exp.var "rank")
+    let pos := Exp.div ps (Exp.litU32 nUsed)
+    ShaderM.writeBuffer (ty := .scalar .u32) "sp" si pos
+    ShaderM.writeBuffer (ty := .scalar .u32) "ss" si (Exp.sub ps (Exp.mul pos (Exp.litU32 nUsed)))) (pure ())
+
 /-- expert-grouping gather: gathered[k,j] = srcQ8[idx[k], j]. 1 thread per (k,j) u32. -/
 def gatherQ8B (totalTok q8size srcRows : Nat) : Hesper.WGSL.Monad.ShaderM Unit := do
   let gid ← ShaderM.globalId; let flat := Exp.vec3X gid
@@ -687,6 +747,8 @@ def main (args : List String) : IO Unit := do
   let sGatheredQ8 ← mkBuf device (maxPadded*q8size)
   let sGatheredGU ← mkBuf device (maxPadded*2*expFF)
   let sGateUpAll ← mkBuf device (nUsed*N*2*expFF)
+  let sExpertCount ← mkBuf device nExpert
+  let sExpertOffset ← mkBuf device nExpert
   -- DECODE LOOP: real prompt + canvas of mask tokens; diffusion confidence-commit
   let decodeSteps := (args.drop 3).head?.bind (·.toNat?) |>.getD 13
   let mut toks : Array Nat := promptTokens ++ Array.replicate C model.dg.maskTokenId
@@ -801,29 +863,11 @@ def main (args : List String) : IO Unit := do
         -- Q8_1-quantize the MoE input once for the dp4a expert matmul (replaces qK)
         disp2w device (Hesper.Layers.Linear.quantizeQ8_1BatchKernel dim N) (("input",sMoeN)::("output",sMoeNQ8)::List.nil) (dim/32) N 32 (hash ("qmoeq8",li))
         if (← IO.getEnv "DG_GROUP").isSome then
-          -- expert-grouping (fused): sync, bucket+pad by expert, gather, ONE tile-expert MMQ5, scatter
-          Hesper.GPUBackend.endBatch device
-          let idxBg ← mapBufferRead device sIdxs 0 (totalTok*4).toUSize
-          let rdU32g (a : ByteArray) (j : Nat) : Nat :=
-            a[j*4]!.toNat ||| (a[j*4+1]!.toNat <<< 8) ||| (a[j*4+2]!.toNat <<< 16) ||| (a[j*4+3]!.toNat <<< 24)
-          let mut bk : Array (Array Nat) := Array.replicate nExpert #[]
-          for ps in [0:totalTok] do
-            let ex := rdU32g idxBg ps
-            bk := bk.set! ex ((bk[ex]!).push ps)
-          unmapBuffer sIdxs
-          let mut sPos : Array Nat := #[]; let mut sSlot : Array Nat := #[]; let mut sTile : Array Nat := #[]
-          for ex in [0:nExpert] do
-            let b := bk[ex]!
-            if b.size > 0 then
-              for psv in b do sPos := sPos.push (psv / nUsed); sSlot := sSlot.push (psv % nUsed)
-              while sPos.size % 32 != 0 do sPos := sPos.push 0; sSlot := sSlot.push nUsed
-              for _x in [0:(sPos.size / 32) - sTile.size] do sTile := sTile.push ex
-          while sPos.size < maxPadded do sPos := sPos.push 0; sSlot := sSlot.push nUsed
-          while sTile.size < maxPadded/32 do sTile := sTile.push 0
-          writeBuffer device sSortedPos 0 (u32Bytes sPos)
-          writeBuffer device sSortedSlot 0 (u32Bytes sSlot)
-          writeBuffer device sTileExpert 0 (u32Bytes sTile)
-          Hesper.GPUBackend.beginBatch device
+          -- expert-grouping (fused, GPU-side counting-sort grouping — no readback, stays batched)
+          disp device (clearSortedB maxPadded nUsed) (("sp",sSortedPos)::("ss",sSortedSlot)::List.nil) maxPadded (hash ("clr",li))
+          disp device (countExpB totalTok nExpert) (("idxs",sIdxs)::("cnt",sExpertCount)::List.nil) nExpert (hash ("cntk",li))
+          disp device (offsetsExpB nExpert maxPadded) (("cnt",sExpertCount)::("off",sExpertOffset)::("te",sTileExpert)::List.nil) 1 (hash ("offk",li))
+          disp device (scatterRankB totalTok nExpert nUsed maxPadded) (("idxs",sIdxs)::("off",sExpertOffset)::("sp",sSortedPos)::("ss",sSortedSlot)::List.nil) totalTok (hash ("srkk",li))
           disp device (gatherQ8B maxPadded q8size N) (("src",sMoeNQ8)::("idx",sSortedPos)::("gathered",sGatheredQ8)::List.nil) (maxPadded*q8size) (hash ("gthr",li))
           disp2 device (Hesper.Layers.Linear.q4kMatmulBatchMMQ5Kernel { inDim:=dim, outDim:=2*expFF } maxPadded 0 0 maxPadded true nExpert)
             (("weights",guE)::("input_q8",sGatheredQ8)::("output",sGatheredGU)::("tileExpert",sTileExpert)::List.nil) ((2*expFF)/64) (maxPadded/32) (hash ("emm",li))
