@@ -1518,7 +1518,11 @@ def q4kMatmulBatchMMQ2Kernel (config : Config) (seqLen : Nat) : ShaderM Unit := 
     Wired behind HESPER_PREFILL_MMQ5=1 (and auto-selected when seqLen >= 32).
     Old full-128/64 MMQ5 retired with this revision per smem 48-KB budget. -/
 def q4kMatmulBatchMMQ5Kernel (config : Config) (seqLen : Nat)
-    (weightBaseU32 colOffset totalCols : Nat := 0) : ShaderM Unit := do
+    (weightBaseU32 colOffset totalCols : Nat := 0) (grouped : Bool := false) (nExpertW : Nat := 1) : ShaderM Unit := do
+  -- grouped=true: fused MoE — read the per-tile expert from `tileExpert[j_blk]` (runtime) and use
+  -- weightBase = expert*outDim*blocksPerRow*36. ONE shader for all experts (no compile-time offset
+  -- explosion). Caller pads each expert's gathered tokens to a multiple of 32 so no 32-col tile
+  -- crosses an expert; totalCols = padded token count, colOffset = 0.
   -- expert-grouping params (default 0 = backward-compatible dense matmul):
   --   weightBaseU32 = expert weight base offset (= expert*outDim*blocksPerRow*36),
   --   colOffset     = first gathered token column this dispatch handles,
@@ -1535,13 +1539,20 @@ def q4kMatmulBatchMMQ5Kernel (config : Config) (seqLen : Nat)
   let blocksPerRow := config.inDim / 256
   let q8BlocksPerRow := config.inDim / 32
   let nCols := if totalCols == 0 then seqLen else totalCols
-  let totalWeightU32 := config.outDim * blocksPerRow * 36
+  let totalWeightU32 := nExpertW * config.outDim * blocksPerRow * 36
   let q8InputU32Size := q8BlocksPerRow * 9 * nCols
   let totalOutputSize := config.outDim * nCols
 
   let _weights ← ShaderM.declareReadOnlyBuffer "weights" (.array (.scalar .u32) totalWeightU32)
   let _input ← ShaderM.declareReadOnlyBuffer "input_q8" (.array (.scalar .u32) q8InputU32Size)
   let _output ← ShaderM.declareOutputBuffer "output" (.array (.scalar .f32) totalOutputSize)
+  let perExpertU32 := config.outDim * blocksPerRow * 36
+  let weightBaseExp ← if grouped then do
+      let _te ← ShaderM.declareReadOnlyBuffer "tileExpert" (.array (.scalar .u32) (nCols / 32))
+      let ex ← ShaderM.readBuffer (ty := .scalar .u32) (n := nCols / 32) "tileExpert" j_blk
+      ShaderM.var (.scalar .u32) (Exp.mul ex (Exp.litU32 perExpertU32))
+    else ShaderM.var (.scalar .u32) (Exp.litU32 weightBaseU32)
+  let weightBaseE : Exp (.scalar .u32) := Exp.var weightBaseExp
 
   -- launch_bounds(256, 2): force ptxas to fit ≥ 2 blocks/SM for occupancy.
   -- ncu measured MMQ5 at 75 reg/thread → 1 block/SM (17.8% occupancy).
@@ -1572,7 +1583,7 @@ def q4kMatmulBatchMMQ5Kernel (config : Config) (seqLen : Nat)
       let rowIdx := Exp.div flatIdx (Exp.litU32 36)
       let intInRow := Exp.sub flatIdx (Exp.mul rowIdx (Exp.litU32 36))
       let global_row := Exp.add (Exp.mul i_blk (Exp.litU32 64)) rowIdx
-      let blockBase := Exp.add (Exp.add (Exp.litU32 weightBaseU32)
+      let blockBase := Exp.add (Exp.add weightBaseE
                                 (Exp.mul global_row (Exp.litU32 (blocksPerRow * 36))))
                                 (Exp.mul kbx0 (Exp.litU32 36))
       let w ← ShaderM.readBuffer (ty := .scalar .u32) (n := totalWeightU32)
