@@ -820,7 +820,8 @@ def main (args : List String) : IO Unit := do
   let outDenom ← mkBuf device C
   let outTok ← mkBuf device (C*scK)
   let outProb ← mkBuf device (C*scK)
-  IO.println s!"[dg-decode] {decodeSteps} steps, N={N} P={P} C={C}"
+  let skipDense := (← IO.getEnv "DG_SKIPDENSE").isSome
+  IO.println s!"[dg-decode] {decodeSteps} steps, N={N} P={P} C={C}  skipDense={skipDense}"
   for step in [0:decodeSteps] do
     let remaining := masked.foldl (fun acc b => if b then acc+1 else acc) 0
     if remaining > 0 then
@@ -875,11 +876,12 @@ def main (args : List String) : IO Unit := do
         -- dense FFN
         Hesper.Layers.RMSNorm.forward device blk.ffnNorm sPA sN N
         qK device sN N dim (hash ("qNf",li))
-        bmm device blk.ffn.gate sN sG N (hash ("g",li))
-        bmm device blk.ffn.up sN sU N (hash ("u",li))
-        disp device (geluMulB (N*ffn)) (("gate",sG)::("up",sU)::("outp",sGe)::List.nil) (N*ffn) (hash ("gg",li))
-        q80 device sGe N ffn (hash ("qGe",li))
-        bmm device blk.ffn.down sGe sD N (hash ("dn",li))
+        unless skipDense do
+          bmm device blk.ffn.gate sN sG N (hash ("g",li))
+          bmm device blk.ffn.up sN sU N (hash ("u",li))
+          disp device (geluMulB (N*ffn)) (("gate",sG)::("up",sU)::("outp",sGe)::List.nil) (N*ffn) (hash ("gg",li))
+          q80 device sGe N ffn (hash ("qGe",li))
+          bmm device blk.ffn.down sGe sD N (hash ("dn",li))
         let some mpn1 := blk.moePostNorm1 | throw (IO.userError "mpn1")
         Hesper.Layers.RMSNorm.forward device mpn1 sD sCurMlp N        -- curMlp
         -- MoE (router top-8 per row + batched experts)
