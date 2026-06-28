@@ -15,6 +15,8 @@ open Hesper.WGSL.Monad.ShaderM (
   declareMatrixLeftArray declareMatrixRightArray declareMatrixResultArray
   loadMatrixLeft loadMatrixRight matrixMultiplyAccumulate storeMatrixResult)
 
+set_option maxRecDepth 8000
+
 namespace Examples.Compute.WMMA8x8Test
 
 /-- One 8×8 × 8×8 → 8×8 f16 subgroup matmul (confirms 8×8 is supported on this device). -/
@@ -165,6 +167,68 @@ def main : IO Unit := do
   let secsR := (t3 - t2).toFloat / 1000.0 / iters.toFloat
   let gflopsR := flop / secsR / 1.0e9
   IO.println s!"  [reg-bench 1024³ × {iters}] {secsR*1000.0} ms/iter → {gflopsR} GFLOPS (naive was ~503; f16 peak ~34000)"
+
+  -- ---- Test 5: subgroup-blocked WMMA ----
+  let STM := 2; let STN := 2
+  let cBufS ← mkBuf (M*N*4).toUSize
+  let cfgRunS64 : Execute.ExecutionConfig := {
+    funcName := "main", workgroupSize := { x := STM*STN*32, y := 1, z := 1 },
+    numWorkgroups := (N/(8*STN), M/(8*STM), 1),
+    extensions := ["f16", "chromium_experimental_subgroup_matrix"],
+    diagnostics := [("off", "chromium.subgroup_matrix_uniformity")] }
+  let bufsS : List (String × Buffer) := [("a",aBufT),("b",bBufT),("c",cBufS)]
+  Execute.executeShaderNamed device (MatMul.matMulTransposeF16WMMA8x8SgKernel cfgT STM STN) bufsS cfgRunS64
+  let cS ← Hesper.Basic.bytesToFloatArray (← mapBufferRead device cBufS 0 (M*N*4).toUSize)
+  let mut ok5 := 0
+  for m in [:M] do for n in [:N] do
+    let mut sm := 0.0
+    for k in [:K] do sm := sm + (af m k) * (bf n k)
+    if (sm - cS.getD (m*N+n) 0.0).abs < 1.0 then ok5 := ok5+1
+  let v5 := if ok5==M*N then "✅ subgroup-blocked CORRECT" else "❌"
+  IO.println s!"  [sg 64³] {ok5}/{M*N} → {v5}"
+  let cfgRunSB : Execute.ExecutionConfig := {
+    funcName := "main", workgroupSize := { x := STM*STN*32, y := 1, z := 1 },
+    numWorkgroups := (MB/(8*STN), MB/(8*STM), 1),
+    extensions := ["f16", "chromium_experimental_subgroup_matrix"],
+    diagnostics := [("off", "chromium.subgroup_matrix_uniformity")] }
+  Execute.executeShaderNamed device (MatMul.matMulTransposeF16WMMA8x8SgKernel cfgB STM STN) bufsB cfgRunSB
+  let t4 ← IO.monoMsNow
+  for _ in [0:iters] do
+    Execute.executeShaderNamed device (MatMul.matMulTransposeF16WMMA8x8SgKernel cfgB STM STN) bufsB cfgRunSB
+  let t5 ← IO.monoMsNow
+  let secsS := (t5 - t4).toFloat / 1000.0 / iters.toFloat
+  let gflopsS := flop / secsS / 1.0e9
+  IO.println s!"  [sg-bench 1024³ × {iters}] {secsS*1000.0} ms/iter → {gflopsS} GFLOPS (naive ~503, reg slower)"
+
+  -- ---- Test 6: K-batched WMMA (BK=8) ----
+  let BK := 8
+  let cBufK ← mkBuf (M*N*4).toUSize
+  let cfgRunK64 : Execute.ExecutionConfig := {
+    funcName := "main", workgroupSize := { x := 32, y := 1, z := 1 }, numWorkgroups := (N/8, M/8, 1),
+    extensions := ["f16", "chromium_experimental_subgroup_matrix"],
+    diagnostics := [("off", "chromium.subgroup_matrix_uniformity")] }
+  let bufsK : List (String × Buffer) := [("a",aBufT),("b",bBufT),("c",cBufK)]
+  Execute.executeShaderNamed device (MatMul.matMulTransposeF16WMMA8x8KbKernel cfgT BK) bufsK cfgRunK64
+  let cK ← Hesper.Basic.bytesToFloatArray (← mapBufferRead device cBufK 0 (M*N*4).toUSize)
+  let mut ok6 := 0
+  for m in [:M] do for n in [:N] do
+    let mut sm := 0.0
+    for k in [:K] do sm := sm + (af m k) * (bf n k)
+    if (sm - cK.getD (m*N+n) 0.0).abs < 1.0 then ok6 := ok6+1
+  let v6 := if ok6==M*N then "✅ K-batched CORRECT" else "❌"
+  IO.println s!"  [kb 64³] {ok6}/{M*N} → {v6}"
+  let cfgRunKB : Execute.ExecutionConfig := {
+    funcName := "main", workgroupSize := { x := 32, y := 1, z := 1 }, numWorkgroups := (MB/8, MB/8, 1),
+    extensions := ["f16", "chromium_experimental_subgroup_matrix"],
+    diagnostics := [("off", "chromium.subgroup_matrix_uniformity")] }
+  Execute.executeShaderNamed device (MatMul.matMulTransposeF16WMMA8x8KbKernel cfgB BK) bufsB cfgRunKB
+  let t6 ← IO.monoMsNow
+  for _ in [0:iters] do
+    Execute.executeShaderNamed device (MatMul.matMulTransposeF16WMMA8x8KbKernel cfgB BK) bufsB cfgRunKB
+  let t7 ← IO.monoMsNow
+  let secsK := (t7 - t6).toFloat / 1000.0 / iters.toFloat
+  let gflopsK := flop / secsK / 1.0e9
+  IO.println s!"  [kb-bench 1024³ × {iters}] {secsK*1000.0} ms/iter → {gflopsK} GFLOPS (naive ~555)"
 
 end Examples.Compute.WMMA8x8Test
 
