@@ -385,6 +385,40 @@ def main : IO Unit := do
   let v11 := if ok11==M*64 then "✅ weightRowOffset CORRECT" else "❌ weightRowOffset BUG"
   IO.println s!"  [regblk chunked] {ok11}/{M*64} → {v11}"
 
+  -- ---- Test 12: small-M kernel (BM=16) for MoE — correctness M=16 + MoE-shape GFLOPS ----
+  let cfgSm : MatMul.Config := { M := 16, N := 64, K := 64 }
+  let cBufSm ← mkBuf (16*64*4).toUSize
+  let cfgSmE : Execute.ExecutionConfig := {
+    funcName := "main", workgroupSize := { x := 128, y := 1, z := 1 }, numWorkgroups := (64/64, 16/16, 1),
+    extensions := ["f16","chromium_experimental_subgroup_matrix"], diagnostics := [("off","chromium.subgroup_matrix_uniformity")] }
+  let bufsSm : List (String × Buffer) := [("a",aBufT),("b",bBufT),("c",cBufSm)]
+  Execute.executeShaderNamed device (MatMul.matMulTransposeF16WMMARegSmallMKernel cfgSm) bufsSm cfgSmE
+  let cSm ← Hesper.Basic.bytesToFloatArray (← mapBufferRead device cBufSm 0 (16*64*4).toUSize)
+  let mut ok12 := 0
+  for m in [:16] do for n in [:64] do
+    let mut sm := 0.0
+    for k in [:64] do sm := sm + (af m k) * (bf n k)
+    if (sm - cSm.getD (m*64+n) 0.0).abs < 1.0 then ok12 := ok12+1
+  let v12 := if ok12==16*64 then "✅ small-M CORRECT" else "❌"
+  IO.println s!"  [smallM 16×64] {ok12}/{16*64} → {v12}"
+  -- MoE-shape GFLOPS: M=16 and M=32, N=1408, K=2816 (vs 64-tile 254, dp4a ~540)
+  for mm in [16, 32] do
+    let cf : MatMul.Config := { M := mm, N := 1408, K := 2816 }
+    let aF ← mkBuf (mm*2816*4).toUSize; let bF ← mkBuf (1408*2816*2).toUSize; let cF ← mkBuf (mm*1408*4).toUSize
+    writeBuffer device aF 0 (← Hesper.Basic.floatArrayToBytes (Array.replicate (mm*2816) 0.01))
+    writeBuffer device bF 0 (← floatsToF16Bytes (Array.replicate (1408*2816) 0.01))
+    let cfgF : Execute.ExecutionConfig := {
+      funcName := "main", workgroupSize := { x := 128, y := 1, z := 1 }, numWorkgroups := ((1408+63)/64, (mm+15)/16, 1),
+      extensions := ["f16","chromium_experimental_subgroup_matrix"], diagnostics := [("off","chromium.subgroup_matrix_uniformity")] }
+    let bufsF : List (String × Buffer) := [("a",aF),("b",bF),("c",cF)]
+    Execute.executeShaderNamed device (MatMul.matMulTransposeF16WMMARegSmallMKernel cf) bufsF cfgF
+    let tf0 ← IO.monoMsNow
+    for _ in [0:20] do Execute.executeShaderNamed device (MatMul.matMulTransposeF16WMMARegSmallMKernel cf) bufsF cfgF
+    let tf1 ← IO.monoMsNow
+    let secsF := (tf1 - tf0).toFloat / 1000.0 / 20.0
+    let gf := 2.0 * mm.toFloat * 1408.0 * 2816.0 / secsF / 1.0e9
+    IO.println s!"  [smallM MoE M={mm}] {secsF*1000.0} ms → {gf} GFLOPS  (64-tile was 254, dp4a ~540)"
+
 end Examples.Compute.WMMA8x8Test
 
 def main : IO Unit := Examples.Compute.WMMA8x8Test.main
