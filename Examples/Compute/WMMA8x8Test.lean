@@ -52,6 +52,13 @@ def main : IO Unit := do
   let hasF16 ← Execute.hasShaderF16Support device
   IO.println s!"  SubgroupMatrix={hasSm} ShaderF16={hasF16}"
   if !hasSm || !hasF16 then IO.println "  ✗ features missing"; return
+  let cfgDump : Execute.ExecutionConfig := {
+    funcName := "main", workgroupSize := { x := 128, y := 1, z := 1 }, numWorkgroups := (1,1,1),
+    extensions := ["f16","chromium_experimental_subgroup_matrix"],
+    diagnostics := [("off","chromium.subgroup_matrix_uniformity")] }
+  let wgslRB := Execute.compileToWGSL (MatMul.matMulTransposeF16WMMARegKernel { M := 1024, N := 1024, K := 1024 }) cfgDump.funcName cfgDump.workgroupSize cfgDump.extensions cfgDump.diagnostics
+  IO.FS.writeFile "/tmp/regblk.wgsl" wgslRB
+  IO.println "  (wrote /tmp/regblk.wgsl)"
   let mkBuf (usz : USize) : IO Buffer := createBuffer device {
     size := usz, usage := [.storage, .copyDst, .copySrc], mappedAtCreation := false }
   let cfg8 : Execute.ExecutionConfig := {
@@ -229,6 +236,89 @@ def main : IO Unit := do
   let secsK := (t7 - t6).toFloat / 1000.0 / iters.toFloat
   let gflopsK := flop / secsK / 1.0e9
   IO.println s!"  [kb-bench 1024³ × {iters}] {secsK*1000.0} ms/iter → {gflopsK} GFLOPS (naive ~555)"
+
+  -- ---- Test 7: forward shapes (does the 1024³ rate hold at the real matmul sizes?) ----
+  let shapes : List (Nat × Nat × Nat × String) :=
+    [(288, 4224, 2816, "dense gate/up M=288"),
+     (288, 2816, 2112, "dense down     M=288"),
+     (32,  4224, 2816, "MoE expert  M=32 (per-expert-ish)"),
+     (288, 262144, 2816, "lm_head     M=288 (big N)")]
+  for shp in shapes do
+    let (sm, sn, sk, lbl) := shp
+    let cf : MatMul.Config := { M := sm, N := sn, K := sk }
+    let aBy ← Hesper.Basic.floatArrayToBytes (Array.replicate (sm*sk) 0.01)
+    let bBy ← floatsToF16Bytes (Array.replicate (sn*sk) 0.01)
+    let aF ← mkBuf (sm*sk*4).toUSize; let bF ← mkBuf (sn*sk*2).toUSize; let cF ← mkBuf (sm*sn*4).toUSize
+    writeBuffer device aF 0 aBy; writeBuffer device bF 0 bBy
+    let cfgF : Execute.ExecutionConfig := {
+      funcName := "main", workgroupSize := { x := 32, y := 1, z := 1 }, numWorkgroups := (sn/8, sm/8, 1),
+      extensions := ["f16", "chromium_experimental_subgroup_matrix"],
+      diagnostics := [("off", "chromium.subgroup_matrix_uniformity")] }
+    let bufsF : List (String × Buffer) := [("a",aF),("b",bF),("c",cF)]
+    Execute.executeShaderNamed device (MatMul.matMulTransposeF16WMMA8x8Kernel cf) bufsF cfgF
+    let tF0 ← IO.monoMsNow
+    for _ in [0:10] do Execute.executeShaderNamed device (MatMul.matMulTransposeF16WMMA8x8Kernel cf) bufsF cfgF
+    let tF1 ← IO.monoMsNow
+    let secsF := (tF1 - tF0).toFloat / 1000.0 / 10.0
+    let gf := 2.0 * sm.toFloat * sn.toFloat * sk.toFloat / secsF / 1.0e9
+    IO.println s!"  [{lbl}] {secsF*1000.0} ms → {gf} GFLOPS"
+
+  -- ---- Test 8: dispatch-overhead floor (is fusion worth it?) ----
+  let trivialK : SM Unit := do
+    let _x ← declareInputBuffer "x" (.array (.scalar .f32) 64)
+    let _y ← declareOutputBuffer "y" (.array (.scalar .f32) 64)
+    let gid ← Hesper.WGSL.Monad.ShaderM.globalId
+    let i := Exp.vec3X gid
+    Hesper.WGSL.Monad.ShaderM.if_ (Exp.lt i (Exp.litU32 64)) (do
+      let v ← Hesper.WGSL.Monad.ShaderM.readBuffer (ty := .scalar .f32) (n := 64) "x" i
+      Hesper.WGSL.Monad.ShaderM.writeBuffer (ty := .scalar .f32) "y" i v) (pure ())
+  let xB ← mkBuf 256; let yB ← mkBuf 256
+  let cfgTriv : Execute.ExecutionConfig := {
+    funcName := "main", workgroupSize := { x := 64, y := 1, z := 1 }, numWorkgroups := (1, 1, 1),
+    extensions := [], diagnostics := [] }
+  let bufsTriv : List (String × Buffer) := [("x",xB),("y",yB)]
+  let nDisp := 1500
+  -- warm (compile pipeline)
+  Execute.beginBatch device
+  Execute.executeShaderNamed device trivialK bufsTriv cfgTriv
+  Execute.endBatch device
+  let td0 ← IO.monoMsNow
+  Execute.beginBatch device
+  for _ in [0:nDisp] do Execute.executeShaderNamed device trivialK bufsTriv cfgTriv
+  Execute.endBatch device
+  let td1 ← IO.monoMsNow
+  let perDisp := (td1 - td0).toFloat / nDisp.toFloat
+  IO.println s!"  [dispatch floor] {nDisp} trivial dispatches in 1 batch = {(td1-td0)} ms total → {perDisp} ms/dispatch"
+  IO.println s!"  → forward has ~1500 dispatches/step; estimated dispatch-overhead floor = {perDisp * 1500.0} ms of the ~2500 ms step"
+
+  -- ---- Test 9: llama.cpp-style register-blocked WMMA (64x32 tile, 4 sg, 4x2 reg block) ----
+  let cBufRB ← mkBuf (M*N*4).toUSize
+  let cfgRB64 : Execute.ExecutionConfig := {
+    funcName := "main", workgroupSize := { x := 128, y := 1, z := 1 }, numWorkgroups := (N/32, M/64, 1),
+    extensions := ["f16", "chromium_experimental_subgroup_matrix"],
+    diagnostics := [("off", "chromium.subgroup_matrix_uniformity")] }
+  let bufsRB : List (String × Buffer) := [("a",aBufT),("b",bBufT),("c",cBufRB)]
+  Execute.executeShaderNamed device (MatMul.matMulTransposeF16WMMARegKernel cfgT) bufsRB cfgRB64
+  let cRB ← Hesper.Basic.bytesToFloatArray (← mapBufferRead device cBufRB 0 (M*N*4).toUSize)
+  let mut ok9 := 0
+  for m in [:M] do for n in [:N] do
+    let mut sm := 0.0
+    for k in [:K] do sm := sm + (af m k) * (bf n k)
+    if (sm - cRB.getD (m*N+n) 0.0).abs < 1.0 then ok9 := ok9+1
+  let v9 := if ok9==M*N then "✅ reg-blocked(llama.cpp構造) CORRECT" else "❌"
+  IO.println s!"  [regblk 64³] {ok9}/{M*N} → {v9}"
+  if ok9 == M*N then
+    let cfgRBB : Execute.ExecutionConfig := {
+      funcName := "main", workgroupSize := { x := 128, y := 1, z := 1 }, numWorkgroups := (MB/32, MB/64, 1),
+      extensions := ["f16", "chromium_experimental_subgroup_matrix"],
+      diagnostics := [("off", "chromium.subgroup_matrix_uniformity")] }
+    Execute.executeShaderNamed device (MatMul.matMulTransposeF16WMMARegKernel cfgB) bufsB cfgRBB
+    let tr0 ← IO.monoMsNow
+    for _ in [0:iters] do Execute.executeShaderNamed device (MatMul.matMulTransposeF16WMMARegKernel cfgB) bufsB cfgRBB
+    let tr1 ← IO.monoMsNow
+    let secsRB := (tr1 - tr0).toFloat / 1000.0 / iters.toFloat
+    let gflopsRB := flop / secsRB / 1.0e9
+    IO.println s!"  [regblk 1024³ × {iters}] {secsRB*1000.0} ms/iter → {gflopsRB} GFLOPS  (naive ~500; 8× = ~4000)"
 
 end Examples.Compute.WMMA8x8Test
 
