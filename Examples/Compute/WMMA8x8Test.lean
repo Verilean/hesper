@@ -104,6 +104,68 @@ def main : IO Unit := do
   let v2 := if ok2==M*N then "✅ matMulTransposeF16WMMA8x8Kernel CORRECT" else "❌"
   IO.println s!"  [tiled 64³] {ok2}/{M*N} match → {v2}"
 
+  -- ---- Test 3: GFLOPS benchmark (proof the matrix units are fast) ----
+  let MB := 1024
+  let cfgB : MatMul.Config := { M := MB, N := MB, K := MB }
+  let mut aB : Array Float := #[]; let mut bB : Array Float := #[]
+  for _i in [:MB*MB] do aB := aB.push 0.01
+  for _i in [:MB*MB] do bB := bB.push 0.01
+  let aBufB ← mkBuf (MB*MB*4).toUSize
+  let bBufB ← mkBuf (MB*MB*2).toUSize
+  let cBufB ← mkBuf (MB*MB*4).toUSize
+  writeBuffer device aBufB 0 (← Hesper.Basic.floatArrayToBytes aB)
+  writeBuffer device bBufB 0 (← floatsToF16Bytes bB)
+  let cfgRunB : Execute.ExecutionConfig := {
+    funcName := "main", workgroupSize := { x := 32, y := 1, z := 1 }, numWorkgroups := (MB/8, MB/8, 1),
+    extensions := ["f16", "chromium_experimental_subgroup_matrix"],
+    diagnostics := [("off", "chromium.subgroup_matrix_uniformity")] }
+  let bufsB : List (String × Buffer) := [("a",aBufB),("b",bBufB),("c",cBufB)]
+  -- warmup
+  Execute.executeShaderNamed device (MatMul.matMulTransposeF16WMMA8x8Kernel cfgB) bufsB cfgRunB
+  let iters := 30
+  let t0 ← IO.monoMsNow
+  for _ in [0:iters] do
+    Execute.executeShaderNamed device (MatMul.matMulTransposeF16WMMA8x8Kernel cfgB) bufsB cfgRunB
+  let t1 ← IO.monoMsNow
+  let secs := (t1 - t0).toFloat / 1000.0 / iters.toFloat
+  let flop := 2.0 * MB.toFloat * MB.toFloat * MB.toFloat
+  let gflops := flop / secs / 1.0e9
+  IO.println s!"  [bench 1024³ × {iters}] {secs*1000.0} ms/iter → {gflops} GFLOPS (M4 Max f16 peak ~34000; forward currently ~170 effective)"
+
+  -- ---- Test 4: register-blocked WMMA (TM=TN=4 → 32×32 output/workgroup) ----
+  let TM := 2; let TN := 2
+  -- correctness on 64³ (reuse aBufT/bBufT)
+  let cBufR ← mkBuf (M*N*4).toUSize
+  let cfgRunR64 : Execute.ExecutionConfig := {
+    funcName := "main", workgroupSize := { x := 32, y := 1, z := 1 },
+    numWorkgroups := (N/(8*TN), M/(8*TM), 1),
+    extensions := ["f16", "chromium_experimental_subgroup_matrix"],
+    diagnostics := [("off", "chromium.subgroup_matrix_uniformity")] }
+  let bufsR : List (String × Buffer) := [("a",aBufT),("b",bBufT),("c",cBufR)]
+  Execute.executeShaderNamed device (MatMul.matMulTransposeF16WMMA8x8RegKernel cfgT TM TN) bufsR cfgRunR64
+  let cR ← Hesper.Basic.bytesToFloatArray (← mapBufferRead device cBufR 0 (M*N*4).toUSize)
+  let mut ok4 := 0
+  for m in [:M] do for n in [:N] do
+    let mut sm := 0.0
+    for k in [:K] do sm := sm + (af m k) * (bf n k)
+    if (sm - cR.getD (m*N+n) 0.0).abs < 1.0 then ok4 := ok4+1
+  let v4 := if ok4==M*N then "✅ reg-blocked CORRECT" else "❌"
+  IO.println s!"  [reg 64³] {ok4}/{M*N} → {v4}"
+  -- benchmark on 1024³
+  let cfgRunRB : Execute.ExecutionConfig := {
+    funcName := "main", workgroupSize := { x := 32, y := 1, z := 1 },
+    numWorkgroups := (MB/(8*TN), MB/(8*TM), 1),
+    extensions := ["f16", "chromium_experimental_subgroup_matrix"],
+    diagnostics := [("off", "chromium.subgroup_matrix_uniformity")] }
+  Execute.executeShaderNamed device (MatMul.matMulTransposeF16WMMA8x8RegKernel cfgB TM TN) bufsB cfgRunRB
+  let t2 ← IO.monoMsNow
+  for _ in [0:iters] do
+    Execute.executeShaderNamed device (MatMul.matMulTransposeF16WMMA8x8RegKernel cfgB TM TN) bufsB cfgRunRB
+  let t3 ← IO.monoMsNow
+  let secsR := (t3 - t2).toFloat / 1000.0 / iters.toFloat
+  let gflopsR := flop / secsR / 1.0e9
+  IO.println s!"  [reg-bench 1024³ × {iters}] {secsR*1000.0} ms/iter → {gflopsR} GFLOPS (naive was ~503; f16 peak ~34000)"
+
 end Examples.Compute.WMMA8x8Test
 
 def main : IO Unit := Examples.Compute.WMMA8x8Test.main
