@@ -739,7 +739,7 @@ def main (args : List String) : IO Unit := do
         disp device (routerPrepB N dim invSqrt eps) (("xin",sPA)::("rscale",rS)::("tmps",sTmpS)::List.nil) N (hash ("rp",li))
         disp device (routerMatVecB N nExpert dim) (("rw",rW)::("tmps",sTmpS)::("rlogits",sRLogits)::List.nil) (N*nExpert) (hash ("rm",li))
         disp2 device (top8B N nExpert nUsed) (("rlogits",sRLogits)::("idxs",sIdxs)::("wts",sWts)::List.nil) N 1 (hash ("t8",li))
-        if step == 0 && (li == 0 || li == 1 || li == 5 || li == 15) && (← IO.getEnv "DG_RDIAG").isSome then
+        if step == 0 && (li == 0 || li == 1 || li == 5 || li == 10 || li == 15 || li == 22 || li == 29) && (← IO.getEnv "DG_RDIAG").isSome then
           Hesper.GPUBackend.endBatch device
           let idxB ← mapBufferRead device sIdxs 0 (N*nUsed*4).toUSize
           let rdU32 (a : ByteArray) (j : Nat) : Nat :=
