@@ -438,15 +438,16 @@ def scatterGUB (totalTok outDim N nUsed : Nat) : Hesper.WGSL.Monad.ShaderM Unit 
       ShaderM.writeBuffer (ty := .scalar .f32) "dst" dstIdx v) (pure ())) (pure ())
 
 /-- Weighted accumulate per row: acc[r,i]+=wts[r,slot]·din[r,i]. 1 thread per (r,i). -/
-def waccB (N dim slot nUsed : Nat) : Hesper.WGSL.Monad.ShaderM Unit := do
+def waccB (N dim slot nUsed : Nat) (dinOffset dinElems : Nat := 0) : Hesper.WGSL.Monad.ShaderM Unit := do
+  let dE := if dinElems == 0 then N*dim else dinElems
   let gid ← ShaderM.globalId; let t := Exp.vec3X gid
   let _acc ← ShaderM.declareOutputBuffer "acc" (.array (.scalar .f32) (N*dim))
-  let _d ← ShaderM.declareReadOnlyBuffer "din" (.array (.scalar .f32) (N*dim))
+  let _d ← ShaderM.declareReadOnlyBuffer "din" (.array (.scalar .f32) dE)
   let _w ← ShaderM.declareReadOnlyBuffer "wts" (.array (.scalar .f32) (N*nUsed))
   ShaderM.if_ (Exp.lt t (Exp.litU32 (N*dim))) (do
     let rr := Exp.div t (Exp.litU32 dim)
     let a ← ShaderM.readBuffer (ty := .scalar .f32) (n := N*dim) "acc" t
-    let dv := Exp.index (Exp.var "din" : Exp (.array (.scalar .f32) (N*dim))) t
+    let dv := Exp.index (Exp.var "din" : Exp (.array (.scalar .f32) dE)) (Exp.add (Exp.litU32 dinOffset) t)
     let w := Exp.index (Exp.var "wts" : Exp (.array (.scalar .f32) (N*nUsed))) (Exp.add (Exp.mul rr (Exp.litU32 nUsed)) (Exp.litU32 slot))
     ShaderM.writeBuffer (ty := .scalar .f32) "acc" t (Exp.add a (Exp.mul w dv))) (pure ())
 
@@ -757,6 +758,9 @@ def main (args : List String) : IO Unit := do
   let sGatheredQ8 ← mkBuf device (maxPadded*q8size)
   let sGatheredGU ← mkBuf device (maxPadded*2*expFF)
   let sGateUpAll ← mkBuf device (nUsed*N*2*expFF)
+  let sGatheredEh ← mkBuf device (maxPadded*expFF)   -- grouped geglu output (down input)
+  let sGatheredDown ← mkBuf device (maxPadded*dim)   -- grouped down output
+  let sDownAll ← mkBuf device (nUsed*N*dim)          -- scattered down [slot,N,dim] for wacc
   let sExpertCount ← mkBuf device nExpert
   let sExpertOffset ← mkBuf device nExpert
   -- DECODE LOOP: real prompt + canvas of mask tokens; diffusion confidence-commit
@@ -923,17 +927,15 @@ def main (args : List String) : IO Unit := do
           disp device (gatherQ8B maxPadded q8size N) (("src",sMoeNQ8)::("idx",sSortedPos)::("gathered",sGatheredQ8)::List.nil) (maxPadded*q8size) (hash ("gthr",li))
           disp2 device (Hesper.Layers.Linear.q4kMatmulBatchMMQ5Kernel { inDim:=dim, outDim:=2*expFF } maxPadded 0 0 maxPadded true nExpert)
             (("weights",guE)::("input_q8",sGatheredQ8)::("output",sGatheredGU)::("tileExpert",sTileExpert)::List.nil) ((2*expFF)/64) (maxPadded/32) (hash ("emm",li))
-          disp device (scatterGUB maxPadded (2*expFF) N nUsed) (("gathered",sGatheredGU)::("pos",sSortedPos)::("slot",sSortedSlot)::("dst",sGateUpAll)::List.nil) (maxPadded*2*expFF) (hash ("sctr",li))
+          -- GROUPED down: geglu on the grouped gate/up → grouped down (tileExpert) → scatter → wacc
+          disp device (gegluMergedB maxPadded expFF 0 (maxPadded*2*expFF)) (("gu",sGatheredGU)::("eh",sGatheredEh)::List.nil) (maxPadded*expFF) (hash ("gmg",li))
+          let downGrpKernel := match blk.ffn.down.quantFormat with
+            | .Q5_0 => Hesper.Layers.Linear.fusedQ5_0BatchExpertF32WarpGroupedKernel { inDim:=expFF, outDim:=dim } nExpert maxPadded
+            | _     => Hesper.Layers.Linear.fusedQ8_0BatchExpertF32WarpGroupedKernel { inDim:=expFF, outDim:=dim } nExpert maxPadded
+          disp2w device downGrpKernel (("weights",dnE)::("input",sGatheredEh)::("tileExpert",sTileExpert)::("output",sGatheredDown)::List.nil) dim maxPadded 32 (hash ("edg",li))
+          disp device (scatterGUB maxPadded dim N nUsed) (("gathered",sGatheredDown)::("pos",sSortedPos)::("slot",sSortedSlot)::("dst",sDownAll)::List.nil) (maxPadded*dim) (hash ("sctrd",li))
           for e in [0:nUsed] do
-            let sEh := sEhs[e]?.getD sMoeN
-            disp device (gegluMergedB N expFF (e*N*2*expFF) (nUsed*N*2*expFF)) (("gu",sGateUpAll)::("eh",sEh)::List.nil) (N*expFF) (hash ("gm",li,e))
-            q80 device sEh N expFF (hash ("qEh",li,e))
-            let downExpKernel := match blk.ffn.down.quantFormat with
-              | .Q5_0 => Hesper.Layers.Linear.fusedQ5_0BatchExpertF32WarpKernel { inDim:=expFF, outDim:=dim } nExpert N nUsed e
-              | _     => Hesper.Layers.Linear.fusedQ8_0BatchExpertF32WarpKernel { inDim:=expFF, outDim:=dim } nExpert N nUsed e
-            let sDownE := sDownEs[e]?.getD sEh
-            disp2w device downExpKernel (("weights",dnE)::("input",sEh)::("idxs",sIdxs)::("output",sDownE)::List.nil) dim N 32 (hash ("ed",li,e))
-            disp device (waccB N dim e nUsed) (("acc",sMoeAcc)::("din",sDownE)::("wts",sWts)::List.nil) (N*dim) (hash ("wa",li,e))
+            disp device (waccB N dim e nUsed (e*N*dim) (nUsed*N*dim)) (("acc",sMoeAcc)::("din",sDownAll)::("wts",sWts)::List.nil) (N*dim) (hash ("wa",li,e))
         else do
           for e in [0:nUsed] do
             let sGateUp := sGateUps[e]?.getD sMoeN
