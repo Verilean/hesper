@@ -1383,6 +1383,11 @@ lean_exe «subgroup-matrix-f16-probe» where
   supportInterpreter := false
   moreLinkArgs := stdLinkArgs
 
+lean_exe «wmma8x8-test» where
+  root := `Examples.Compute.WMMA8x8Test
+  supportInterpreter := false
+  moreLinkArgs := stdLinkArgs
+
 lean_exe «bitnet-validation» where
   root := `Tests.BitNetValidation
   supportInterpreter := false

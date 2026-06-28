@@ -533,6 +533,77 @@ def matMulTransposeF16WMMAKernel (config : Config) : ShaderM Unit := do
     let outIdx := Exp.add (Exp.mul row (Exp.litU32 config.N)) col
     ShaderM.writeBuffer (ty := .scalar .f32) "c" outIdx v
 
+/-- 8×8×8 variant of `matMulTransposeF16WMMAKernel` for hardware that only supports 8×8 subgroup
+    matrices (Apple M-series / Metal: probe reports M=N=K=8 only; the 16×16 kernel crashes at
+    pipeline creation). A: f32 [M,K]; B: u32-packed f16 [N, K/2] (i.e. B^T); C: f32 [M,N].
+    One subgroup (32 lanes) per 8×8 output tile. Requires M,N,K multiples of 8. -/
+def matMulTransposeF16WMMA8x8Kernel (config : Config) : ShaderM Unit := do
+  let wid ← ShaderM.workgroupId
+  let lid ← ShaderM.localId
+  let wgN := Exp.vec3X wid
+  let wgM := Exp.vec3Y wid
+  let tid := Exp.vec3X lid
+  let packedK := config.K / 2
+  let totalOut := config.M * config.N
+  let _a ← ShaderM.declareInputBuffer "a" (.array (.scalar .f32) (config.M * config.K))
+  let _b ← ShaderM.declareInputBuffer "b" (.array (.scalar .u32) (config.N * packedK))
+  let _c ← ShaderM.declareOutputBuffer "c" (.array (.scalar .f32) totalOut)
+  ShaderM.sharedNamed "shared_A" (.array (.scalar .f16) 64)
+  ShaderM.sharedNamed "shared_B" (.array (.scalar .f16) 64)
+  ShaderM.sharedNamed "shared_C" (.array (.scalar .f32) 64)
+  ShaderM.declareMatrixLeftArray  "Ax" .f16 8 8 1 Exp.subgroupMatrixZeroLeft
+  ShaderM.declareMatrixRightArray "Bx" .f16 8 8 1 Exp.subgroupMatrixZeroRight
+  ShaderM.declareMatrixResultArray "Cx" .f32 8 8 1 Exp.subgroupMatrixZeroResult
+  let rowBase := Exp.mul wgM (Exp.litU32 8)
+  let colBase := Exp.mul wgN (Exp.litU32 8)
+  -- Load 8×8 f16 A tile (64 elems, 32 lanes → 2 each).
+  let loadTileA (kBase : Exp (.scalar .u32)) : ShaderM Unit := do
+    for s in [0:2] do
+      let e := Exp.add tid (Exp.litU32 (s * 32))
+      let mi := Exp.div e (Exp.litU32 8)
+      let ki := Exp.mod e (Exp.litU32 8)
+      let row := Exp.add rowBase mi
+      let col := Exp.add kBase ki
+      let inIdx := Exp.add (Exp.mul row (Exp.litU32 config.K)) col
+      let xf32 ← ShaderM.readBuffer (ty := .scalar .f32) (n := config.M * config.K) "a" inIdx
+      ShaderM.writeWorkgroup (ty := .scalar .f16) "shared_A" e (Exp.toF16 xf32)
+  -- Load 8×8 f16 B tile (64 elems = 32 u32, one u32 per lane = 2 K entries for one N row).
+  let loadTileB (kBase : Exp (.scalar .u32)) : ShaderM Unit := do
+    let pairIdx := Exp.mod tid (Exp.litU32 4)   -- K-pair 0..3
+    let ni := Exp.div tid (Exp.litU32 4)         -- N row 0..7
+    let row := Exp.add colBase ni
+    let kLocal := Exp.mul pairIdx (Exp.litU32 2)
+    let kGlobal := Exp.add kBase kLocal
+    let kPairGlobal := Exp.div kGlobal (Exp.litU32 2)
+    let bIdx := Exp.add (Exp.mul row (Exp.litU32 packedK)) kPairGlobal
+    let packed ← ShaderM.readBuffer (ty := .scalar .u32) (n := config.N * packedK) "b" bIdx
+    let unpacked := Exp.unpack2x16float packed
+    let idx0 := Exp.add (Exp.mul kLocal (Exp.litU32 8)) ni
+    let idx1 := Exp.add (Exp.mul (Exp.add kLocal (Exp.litU32 1)) (Exp.litU32 8)) ni
+    ShaderM.writeWorkgroup (ty := .scalar .f16) "shared_B" idx0 (Exp.toF16 (Exp.vecX unpacked))
+    ShaderM.writeWorkgroup (ty := .scalar .f16) "shared_B" idx1 (Exp.toF16 (Exp.vecY unpacked))
+  let numKTiles := config.K / 8
+  for kTile in [0:numKTiles] do
+    let kBase := Exp.litU32 (kTile * 8)
+    loadTileA kBase
+    loadTileB kBase
+    ShaderM.barrier
+    ShaderM.loadMatrixLeft (st := .f16) (m := 8) (k := 8) "Ax" 0 "shared_A" (Exp.litU32 0) (Exp.litU32 8)
+    ShaderM.loadMatrixRight (st := .f16) (k := 8) (n := 8) "Bx" 0 "shared_B" (Exp.litU32 0) (Exp.litU32 8)
+    ShaderM.matrixMultiplyAccumulateMixed (inSt := .f16) (outSt := .f32) (m := 8) (k := 8) (n := 8) "Cx" 0 "Ax" 0 "Bx" 0
+    ShaderM.barrier
+  ShaderM.storeMatrixResult (st := .f32) (m := 8) (n := 8) "Cx" 0 "shared_C" (Exp.litU32 0) (Exp.litU32 8)
+  ShaderM.barrier
+  for s in [0:2] do
+    let e := Exp.add tid (Exp.litU32 (s * 32))
+    let mi := Exp.div e (Exp.litU32 8)
+    let ni := Exp.mod e (Exp.litU32 8)
+    let row := Exp.add rowBase mi
+    let col := Exp.add colBase ni
+    let v ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := 64) "shared_C" e
+    let outIdx := Exp.add (Exp.mul row (Exp.litU32 config.N)) col
+    ShaderM.writeBuffer (ty := .scalar .f32) "c" outIdx v
+
 /-! ## Scaled Matrix Multiply (for Attention) -/
 
 /-- Scaled matrix multiply: C = (A @ B) / scale
