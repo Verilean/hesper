@@ -1517,7 +1517,13 @@ def q4kMatmulBatchMMQ2Kernel (config : Config) (seqLen : Nat) : ShaderM Unit := 
 
     Wired behind HESPER_PREFILL_MMQ5=1 (and auto-selected when seqLen >= 32).
     Old full-128/64 MMQ5 retired with this revision per smem 48-KB budget. -/
-def q4kMatmulBatchMMQ5Kernel (config : Config) (seqLen : Nat) : ShaderM Unit := do
+def q4kMatmulBatchMMQ5Kernel (config : Config) (seqLen : Nat)
+    (weightBaseU32 colOffset totalCols : Nat := 0) : ShaderM Unit := do
+  -- expert-grouping params (default 0 = backward-compatible dense matmul):
+  --   weightBaseU32 = expert weight base offset (= expert*outDim*blocksPerRow*36),
+  --   colOffset     = first gathered token column this dispatch handles,
+  --   totalCols     = total columns in the (gathered) input/output buffers (0 ⇒ seqLen).
+  -- This dispatch computes `seqLen` columns starting at `colOffset`.
   let wid ← ShaderM.workgroupId
   let lid ← ShaderM.localId
   let i_blk := Exp.vec3X wid       -- block of 64 rows
@@ -1528,9 +1534,10 @@ def q4kMatmulBatchMMQ5Kernel (config : Config) (seqLen : Nat) : ShaderM Unit := 
 
   let blocksPerRow := config.inDim / 256
   let q8BlocksPerRow := config.inDim / 32
+  let nCols := if totalCols == 0 then seqLen else totalCols
   let totalWeightU32 := config.outDim * blocksPerRow * 36
-  let q8InputU32Size := q8BlocksPerRow * 9 * seqLen
-  let totalOutputSize := config.outDim * seqLen
+  let q8InputU32Size := q8BlocksPerRow * 9 * nCols
+  let totalOutputSize := config.outDim * nCols
 
   let _weights ← ShaderM.declareReadOnlyBuffer "weights" (.array (.scalar .u32) totalWeightU32)
   let _input ← ShaderM.declareReadOnlyBuffer "input_q8" (.array (.scalar .u32) q8InputU32Size)
@@ -1565,7 +1572,8 @@ def q4kMatmulBatchMMQ5Kernel (config : Config) (seqLen : Nat) : ShaderM Unit := 
       let rowIdx := Exp.div flatIdx (Exp.litU32 36)
       let intInRow := Exp.sub flatIdx (Exp.mul rowIdx (Exp.litU32 36))
       let global_row := Exp.add (Exp.mul i_blk (Exp.litU32 64)) rowIdx
-      let blockBase := Exp.add (Exp.mul global_row (Exp.litU32 (blocksPerRow * 36)))
+      let blockBase := Exp.add (Exp.add (Exp.litU32 weightBaseU32)
+                                (Exp.mul global_row (Exp.litU32 (blocksPerRow * 36))))
                                 (Exp.mul kbx0 (Exp.litU32 36))
       let w ← ShaderM.readBuffer (ty := .scalar .u32) (n := totalWeightU32)
                 "weights" (Exp.add blockBase intInRow)
@@ -1582,7 +1590,7 @@ def q4kMatmulBatchMMQ5Kernel (config : Config) (seqLen : Nat) : ShaderM Unit := 
       let global_col := Exp.add (Exp.mul j_blk (Exp.litU32 32)) yColIdx
       let colInBounds := Exp.lt global_col (Exp.litU32 seqLen)
       ShaderM.if_ colInBounds (do
-        let yColBase := Exp.add (Exp.mul global_col (Exp.litU32 (q8BlocksPerRow * 9)))
+        let yColBase := Exp.add (Exp.mul (Exp.add (Exp.litU32 colOffset) global_col) (Exp.litU32 (q8BlocksPerRow * 9)))
                                  (Exp.mul kbx0 (Exp.litU32 (8 * 9)))
         let v ← ShaderM.readBuffer (ty := .scalar .u32) (n := q8InputU32Size)
                   "input_q8" (Exp.add yColBase intInY)
@@ -1723,7 +1731,7 @@ def q4kMatmulBatchMMQ5Kernel (config : Config) (seqLen : Nat) : ShaderM Unit := 
       let j_global := Exp.add (Exp.mul j_blk (Exp.litU32 32)) j_local
       let j_in := Exp.lt j_global (Exp.litU32 seqLen)
       ShaderM.if_ j_in (do
-        let outOff := Exp.add (Exp.mul j_global (Exp.litU32 config.outDim)) i_global
+        let outOff := Exp.add (Exp.mul (Exp.add (Exp.litU32 colOffset) j_global) (Exp.litU32 config.outDim)) i_global
         let accExp : Exp (.scalar .f32) := Exp.var s!"acc_{jIter}_{iIter}"
         ShaderM.writeBuffer (ty := .scalar .f32) "output" outOff accExp
       ) (pure ())
