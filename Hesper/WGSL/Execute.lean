@@ -259,6 +259,9 @@ initialize batchDispatchCountRef : IO.Ref Nat ← IO.mkRef 0
 /-- Begin command buffer batching. All subsequent `executeShaderNamed` calls
     will record into a shared encoder instead of submitting individually. -/
 def beginBatch (device : Device) : IO Unit := do
+  -- DG_NOBATCH: no-op batching so each dispatch submits+waits individually (fully serialized).
+  -- Diagnostic for the batch buffer-reuse race + a deterministic (slow) reference mode.
+  if (← IO.getEnv "DG_NOBATCH").isSome then return
   let existing ← batchEncoderRef.get
   if existing.isSome then
     throw <| IO.userError "beginBatch: already in batch mode"
@@ -268,6 +271,7 @@ def beginBatch (device : Device) : IO Unit := do
 
 /-- End command buffer batching. Submits all recorded dispatches and waits. -/
 def endBatch (device : Device) : IO Unit := do
+  if (← IO.getEnv "DG_NOBATCH").isSome then return
   match ← batchEncoderRef.get with
   | none => throw <| IO.userError "endBatch: not in batch mode"
   | some encoder => do
