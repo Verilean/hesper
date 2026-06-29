@@ -5,6 +5,7 @@ import Hesper.WebGPU.Buffer
 import Hesper.WebGPU.BufferOps
 import Hesper.Basic
 import Hesper.WGSL.MatMul
+import Hesper.Quantization.Q4_K_M
 
 open Hesper.WebGPU
 open Hesper.WGSL (Exp)
@@ -190,10 +191,59 @@ def benchPeak (device : Device) : IO Unit := do
     let tflops := flop / (ms/1000.0) / 1.0e12
     IO.println s!"  nAcc={nAcc}: {ms} ms → {tflops} TFLOP/s ({100.0*tflops/34.0}% of 34 f16-ALU peak)"
 
+/-- Golden for the FUSED Q4_K-dequant grouped reg-matmul: build valid Q4_K weight bytes, get the
+    reference f32 weights via the (already-validated) dequantQ4KMKernel, CPU-matmul them, and compare
+    to the fused kernel (which dequants the SAME bytes in-kernel). f16 weight-rounding tolerance. -/
+def checkFusedQ4KCorrect (device : Device) : IO Unit := do
+  let M := 128; let N := 32; let K := 256; let nE := 2     -- 2 M-tiles → experts 0,1; 1 Q4_K block/row
+  let bRows := nE * N
+  let mut bytes : ByteArray := ByteArray.empty
+  for r in [0:bRows] do
+    bytes := (((bytes.push 0x00).push 0x3C).push 0x00).push 0x30   -- d=1.0 (0x3C00), dmin=0.125 (0x3000)
+    for i in [0:12]  do bytes := bytes.push (((r + i*3) % 12 + 1).toUInt8)    -- 6-bit sub-scales/mins
+    for i in [0:128] do bytes := bytes.push (((r*7 + i*13) % 256).toUInt8)    -- 4-bit quants
+  let qbuf ← mkBuf device (bytes.size / 4)
+  writeBuffer device qbuf 0 bytes
+  let wbuf ← mkBuf device (bRows*K)
+  let rd ← IO.mkRef none
+  Hesper.GPUBackend.executeWithConfigCached device (Hesper.Quantization.Q4_K_M.dequantQ4KMKernel (bRows*K))
+    (("data",qbuf)::("output",wbuf)::List.nil) { numWorkgroups := ((bRows*K+255)/256,1,1), workgroupSize := {x:=256} } 1 rd
+  let wF32 ← Hesper.Basic.bytesToFloatArray (← mapBufferRead device wbuf 0 (bRows*K*4).toUSize)
+  let af := fun (m k : Nat) => (((m*2+k) % 5 : Nat).toFloat) - 2.0
+  let mut aA : Array Float := #[]
+  for m in [0:M] do for k in [0:K] do aA := aA.push (af m k)
+  let aBuf ← mkBuf device (M*K); writeBuffer device aBuf 0 (← Hesper.Basic.floatArrayToBytes aA)
+  let teBuf ← mkBuf device (M/64)
+  let mut teB : ByteArray := ByteArray.empty
+  for t in [0:M/64] do teB := (((teB.push (t.toUInt8)).push 0).push 0).push 0
+  writeBuffer device teBuf 0 teB
+  let cBuf ← mkBuf device (M*N)
+  let cfg : Hesper.ExecConfig := {
+    numWorkgroups := ((N+31)/32, (M+63)/64, 1), workgroupSize := {x:=128},
+    extensions := ["f16","chromium_experimental_subgroup_matrix"],
+    diagnostics := [("off","chromium.subgroup_matrix_uniformity")] }
+  let rr ← IO.mkRef none
+  Hesper.GPUBackend.executeWithConfigCached device (Hesper.Quantization.Q4_K_M.q4kMatmulGroupedRegKernel M N K nE)
+    (("a",aBuf)::("b",qbuf)::("c",cBuf)::("tileExpert",teBuf)::List.nil) cfg 1 rr
+  let gpu ← Hesper.Basic.bytesToFloatArray (← mapBufferRead device cBuf 0 (M*N*4).toUSize)
+  let mut md := 0.0; let mut maxRel := 0.0; let mut bad := 0
+  for m in [0:M] do for n in [0:N] do
+    let e := m/64
+    let mut g := 0.0
+    for k in [0:K] do g := g + (af m k) * (wF32.getD ((e*N+n)*K + k) 0.0)
+    let d := (gpu.getD (m*N+n) 0.0 - g).abs
+    let rel := d / (g.abs + 1.0)
+    if d > md then md := d
+    if rel > maxRel then maxRel := rel
+    if rel > 0.02 then bad := bad+1
+  let v := if bad==0 then "✅ fused Q4_K reg CORRECT (f16-round tol)" else "❌ WRONG"
+  IO.println s!"[fused-q4k M={M} N={N} K={K} nE={nE}] maxDiff={md} maxRel={maxRel} bad(rel>2%)={bad}/{M*N} → {v}; sample m0={gpu.getD 0 0.0} m64={gpu.getD (64*N) 0.0}"
+
 def main : IO Unit := do
   IO.println "=== reg-matmul roofline micro-bench (DiffusionGemma forward shapes, M=262 tokens) ==="
   let inst ← Hesper.init
   let device ← getDevice inst
+  checkFusedQ4KCorrect device
   benchPeak device
   checkCorrect device
   checkGroupedCorrect device
