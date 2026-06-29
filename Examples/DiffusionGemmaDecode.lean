@@ -828,19 +828,21 @@ def main (args : List String) : IO Unit := do
   -- can use the ~11.6× faster subgroup-matrix reg-matmul instead of MMQ5 dp4a.
   let qkvRB := (← IO.getEnv "DG_QKVRB").isSome
   let mut qF16s : Array Buffer := #[]; let mut kF16s : Array Buffer := #[]; let mut vF16s : Array Buffer := #[]
+  let mut oF16s : Array Buffer := #[]
   if qkvRB then
-    let sDqTmp ← mkBuf device (8192*dim)   -- max f32 dequant scratch (outDim 8192 × dim)
+    let sDqTmp ← mkBuf device (8192*dim)   -- max f32 dequant scratch (≥ max outDim×inDim)
     -- branch on the weight's quant: Q4_K → dequantQ4KMKernel+pack; Q6_K → q6kToF16Kernel (direct).
-    -- (SWA layers store wV as Q6_K, others Q4_K — dequanting Q6_K as Q4_K gave NaN.)
-    let dq := fun (wbuf : Buffer) (od : Nat) (qfmt : Hesper.Layers.Linear.QuantFormat) (key : UInt64) => do
-      let ne := od * dim
+    -- (SWA layers store wV as Q6_K, others Q4_K — dequanting Q6_K as Q4_K gave NaN.) idim = the
+    -- weight's input dim (= dim for Q/K/V, = qDim for the O-proj).
+    let dq := fun (wbuf : Buffer) (od idim : Nat) (qfmt : Hesper.Layers.Linear.QuantFormat) (key : UInt64) => do
+      let ne := od * idim
       let f16buf ← mkBuf device (ne/2)
       match qfmt with
       | .Q6_K =>
-        let totalBlocks := od * (dim / 256)
+        let totalBlocks := od * (idim / 256)
         let gx := min totalBlocks 65535; let gy := (totalBlocks + gx - 1) / gx
         Hesper.GPUBackend.beginBatch device
-        disp2w device (Hesper.Quantization.Q6_K.q6kToF16Kernel dim od gx) (("weights",wbuf)::("output",f16buf)::List.nil) gx gy 64 key
+        disp2w device (Hesper.Quantization.Q6_K.q6kToF16Kernel idim od gx) (("weights",wbuf)::("output",f16buf)::List.nil) gx gy 64 key
         Hesper.GPUBackend.endBatch device
       | _ =>   -- Q4_K
         let wg := (ne+255)/256; let nx := min wg 65535; let ny := (wg+nx-1)/nx
@@ -852,9 +854,10 @@ def main (args : List String) : IO Unit := do
       pure f16buf
     for li in [0:nLayers] do
       let some blk := model.inner.blocks[li]? | throw (IO.userError "blk-dq")
-      qF16s := qF16s.push (← dq blk.attention.wQ.weightBuf blk.attention.wQ.config.outDim blk.attention.wQ.quantFormat (hash ("dqq",li)))
-      kF16s := kF16s.push (← dq blk.attention.wK.weightBuf blk.attention.wK.config.outDim blk.attention.wK.quantFormat (hash ("dqk",li)))
-      vF16s := vF16s.push (← dq blk.attention.wV.weightBuf blk.attention.wV.config.outDim blk.attention.wV.quantFormat (hash ("dqv",li)))
+      qF16s := qF16s.push (← dq blk.attention.wQ.weightBuf blk.attention.wQ.config.outDim dim blk.attention.wQ.quantFormat (hash ("dqq",li)))
+      kF16s := kF16s.push (← dq blk.attention.wK.weightBuf blk.attention.wK.config.outDim dim blk.attention.wK.quantFormat (hash ("dqk",li)))
+      vF16s := vF16s.push (← dq blk.attention.wV.weightBuf blk.attention.wV.config.outDim dim blk.attention.wV.quantFormat (hash ("dqv",li)))
+      oF16s := oF16s.push (← dq blk.attention.wO.weightBuf blk.attention.wO.config.outDim blk.attention.wO.config.inDim blk.attention.wO.quantFormat (hash ("dqo",li)))
     IO.println s!"[dg-decode] dequantized Q4_K Q/K/V → f16 ({nLayers} layers)"
   if (← IO.getEnv "DG_DQDIAG").isSome then
     -- hidden row r = e_r ⇒ logits[r,v] = weight[v,r]; compare f32 Q6_K (outputWeight) vs reg (f16)
@@ -974,8 +977,14 @@ def main (args : List String) : IO Unit := do
         pmark rQkn    -- qk-norm + RoPE + v-norm
         disp2 device (battnB N P nHead hd nKV 1.0) (("q",sQr)::("k",sKr)::("v",sVn)::("ctx",sCtx)::List.nil) nHead N (hash ("at",li))
         pmark rBattn  -- battnB: QK^T + softmax + weighted-V (matrix-vector per query)
-        qK device sCtx N qDim (hash ("qCtx",li))
-        bmm device blk.attention.wO sCtx sAO N (hash ("wo",li))
+        if qkvRB then
+          -- O-proj reg-matmul: A = f32 sCtx [N, qDim], B = wO f16 [dim, qDim/2], C = sAO. K=qDim.
+          dispRB device (Hesper.WGSL.MatMul.matMulTransposeF16WMMARegKernel { M := N, N := dim, K := qDim } 0 dim)
+            (("a",sCtx)::("b",oF16s[li]?.getD sAO)::("c",sAO)::List.nil) ((dim+31)/32) ((N+63)/64) (hash ("rbo",li))
+          Hesper.WGSL.Execute.flushBatch device
+        else
+          qK device sCtx N qDim (hash ("qCtx",li))
+          bmm device blk.attention.wO sCtx sAO N (hash ("wo",li))
         Hesper.Layers.RMSNorm.forward device blk.postAttnNorm sAO sR N
         disp device (addB (N*dim)) (("ain",sR)::("bin",cur)::("outc",sPA)::List.nil) (N*dim) (hash ("ra",li))
         pmark rAttnO  -- O projection + post-norm + residual
