@@ -810,7 +810,7 @@ def main (args : List String) : IO Unit := do
   -- DG_MOERB: fused Q4_K reg-matmul for the MoE gate/up. The reg M-tile is 64 ⇒ each expert block must
   -- be 64-aligned ⇒ pad to 64 (vs 32 for MMQ). Gated: the default MMQ path keeps its 32-pad.
   let moeRB := (← IO.getEnv "DG_MOERB").isSome
-  let padTo := if moeRB then 64 else 32
+  let padTo := 32   -- BM=32 fused reg aligns with the 32-pad grouping (no 64-pad penalty)
   let maxPadded := (((totalTok + padTo*nExpert) + (padTo-1))/padTo)*padTo
   let sSortedPos ← mkBuf device maxPadded
   let sSortedSlot ← mkBuf device maxPadded
@@ -1101,9 +1101,8 @@ def main (args : List String) : IO Unit := do
             -- (in-kernel dequant, no f16 buffer). A=sGatheredF32 [maxPadded,dim], B=guE Q4_K, C=sGatheredGU.
             let gN := maxPadded*dim; let gWG := (gN+255)/256; let gnx := min gWG 32768; let gny := (gWG + gnx - 1)/gnx
             disp2 device (gatherF32B maxPadded dim N (gnx*256)) (("src",sMoeN)::("idx",sSortedPos)::("gathered",sGatheredF32)::List.nil) gnx gny (hash ("gthrf",li))
-            disp device (deriveTE64 (maxPadded/64)) (("te",sTileExpert)::("te64",sTileExpert64)::List.nil) (maxPadded/64) (hash ("dte64",li))
             dispRB device (Hesper.Quantization.Q4_K_M.q4kMatmulGroupedRegKernel maxPadded (2*expFF) dim nExpert)
-              (("a",sGatheredF32)::("b",guE)::("c",sGatheredGU)::("tileExpert",sTileExpert64)::List.nil) ((2*expFF+31)/32) ((maxPadded+63)/64) (hash ("emmrb",li))
+              (("a",sGatheredF32)::("b",guE)::("c",sGatheredGU)::("tileExpert",sTileExpert)::List.nil) ((2*expFF+31)/32) ((maxPadded+31)/32) (hash ("emmrb",li))
           else
             disp device (gatherQ8B maxPadded q8size N) (("src",sMoeNQ8)::("idx",sSortedPos)::("gathered",sGatheredQ8)::List.nil) (maxPadded*q8size) (hash ("gthr",li))
             disp2 device (Hesper.Layers.Linear.q4kMatmulBatchMMQ5Kernel { inDim:=dim, outDim:=2*expFF } maxPadded 0 0 maxPadded true nExpert)
