@@ -937,6 +937,19 @@ def main (args : List String) : IO Unit := do
             dispRB device (Hesper.WGSL.MatMul.matMulTransposeF16WMMARegKernel { M := N, N := od, K := dim } 0 od)
               (("a",sN)::("b",wf16)::("c",outB)::List.nil) ((od+31)/32) ((N+63)/64) key
           rb (qF16s[li]?.getD sQ) sQ qDim (hash ("rbq",li)); rb (kF16s[li]?.getD sK) sK kvDim (hash ("rbk",li)); rb (vF16s[li]?.getD sV) sV kvDim (hash ("rbv",li))
+          if (li == 0 || li == 5) && (← IO.getEnv "DG_QKVDIAG").isSome then
+            qK device sN N dim (hash ("dqk0",li))
+            bmm device blk.attention.wQ sN sCtx N (hash ("dbmm0",li))   -- MMQ5 reference for wQ → sCtx
+            Hesper.GPUBackend.endBatch device
+            let regQ ← Hesper.Basic.bytesToFloatArray (← mapBufferRead device sQ 0 (N*qDim*4).toUSize)
+            let refQ ← Hesper.Basic.bytesToFloatArray (← mapBufferRead device sCtx 0 (N*qDim*4).toUSize)
+            let mut md := 0.0; let mut sr := 0.0; let mut sg := 0.0
+            for i in [0:N*qDim] do
+              let d := (regQ.getD i 0.0 - refQ.getD i 0.0).abs
+              if d > md then md := d
+              sg := sg + (regQ.getD i 0.0).abs; sr := sr + (refQ.getD i 0.0).abs
+            IO.println s!"[qkvdiag] wQ reg vs MMQ5: maxDiff={md} Σ|reg|={sg} Σ|ref|={sr}; sample reg={regQ.getD 100 0.0} ref={refQ.getD 100 0.0}"
+            Hesper.GPUBackend.beginBatch device
         else
           qK device sN N dim (hash ("qN",li))
           bmm device blk.attention.wQ sN sQ N (hash ("wq",li))
