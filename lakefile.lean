@@ -1398,6 +1398,11 @@ lean_exe «grouped-down-test» where
   supportInterpreter := false
   moreLinkArgs := stdLinkArgs
 
+lean_exe «matmul-bench» where
+  root := `Examples.Compute.MatmulBench
+  supportInterpreter := false
+  moreLinkArgs := stdLinkArgs
+
 lean_exe «bitnet-validation» where
   root := `Tests.BitNetValidation
   supportInterpreter := false
