@@ -75,10 +75,13 @@ def main : IO Unit := do
       { numWorkgroups := (outDim, maxPadded/32, 1), workgroupSize := {x:=32} } (run.toUInt64+777) r
     let gpu ← Hesper.Basic.bytesToFloatArray (← mapBufferRead device outBuf 0 (maxPadded*outDim*4).toUSize)
     let mut maxd := 0.0; let mut bad := 0
+    -- tiles 0,1 are valid (expert 0,1); tile 2 is a SENTINEL (≥nExpert) → the kernel now SKIPS it,
+    -- so only check the 2 valid tiles' rows (g < 64).
     for i in [0:maxPadded*outDim] do
-      let d := (gpu.getD i 0.0 - cpuRef.getD i 0.0).abs
-      if d > maxd then maxd := d
-      if d > 0.5 then bad := bad+1
+      if i / outDim < 64 then
+        let d := (gpu.getD i 0.0 - cpuRef.getD i 0.0).abs
+        if d > maxd then maxd := d
+        if d > 0.5 then bad := bad+1
     let v := if bad==0 then "✅ matches CPU" else "❌ WRONG"
     IO.println s!"  [run {run}] maxDiff={maxd} bad={bad}/{maxPadded*outDim} → {v}; sample g0o0 gpu={gpu.getD 0 0.0} cpu={cpuRef.getD 0 0.0}; g40o0 gpu={gpu.getD (40*outDim) 0.0} cpu={cpuRef.getD (40*outDim) 0.0}"
 

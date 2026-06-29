@@ -941,6 +941,19 @@ def main (args : List String) : IO Unit := do
           disp device (clearSortedB maxPadded nUsed) (("sp",sSortedPos)::("ss",sSortedSlot)::List.nil) maxPadded (hash ("clr",li))
           disp device (countExpB totalTok nExpert) (("idxs",sIdxs)::("cnt",sExpertCount)::List.nil) nExpert (hash ("cntk",li))
           disp device (offsetsExpB nExpert maxPadded) (("cnt",sExpertCount)::("off",sExpertOffset)::("te",sTileExpert)::List.nil) 1 (hash ("offk",li))
+          if li == 0 && (← IO.getEnv "DG_TILEDIAG").isSome then
+            Hesper.GPUBackend.endBatch device
+            let teA ← Hesper.Basic.bytesToFloatArray (← mapBufferRead device sTileExpert 0 (maxPadded/32*4).toUSize)
+            -- te is u32; reinterpret the f32 bytes as raw — count entries that are NOT the sentinel (nExpert)
+            let teRaw ← mapBufferRead device sTileExpert 0 (maxPadded/32*4).toUSize
+            let mut active := 0
+            for tIdx in [0:maxPadded/32] do
+              let b0 := teRaw.get! (tIdx*4); let b1 := teRaw.get! (tIdx*4+1)
+              let v := b0.toNat + b1.toNat*256
+              if v < nExpert then active := active+1
+            IO.println s!"[tilediag] active tiles={active} / maxPadded tiles={maxPadded/32} (rows: {active*32} real / {maxPadded} dispatched); waste={maxPadded - active*32} rows ({100*(maxPadded-active*32)/maxPadded}%)"
+            let _ := teA
+            Hesper.GPUBackend.beginBatch device
           disp device (scatterRankB totalTok nExpert nUsed maxPadded) (("idxs",sIdxs)::("off",sExpertOffset)::("sp",sSortedPos)::("ss",sSortedSlot)::List.nil) totalTok (hash ("srkk",li))
           disp device (gatherQ8B maxPadded q8size N) (("src",sMoeNQ8)::("idx",sSortedPos)::("gathered",sGatheredQ8)::List.nil) (maxPadded*q8size) (hash ("gthr",li))
           disp2 device (Hesper.Layers.Linear.q4kMatmulBatchMMQ5Kernel { inDim:=dim, outDim:=2*expFF } maxPadded 0 0 maxPadded true nExpert)
