@@ -6343,8 +6343,8 @@ def fusedQ8_0BatchExpertF32WarpGroupedKernel (config : Config) (nExpert maxPadde
   ShaderM.varNamed "total" (.scalar .f32) (Exp.litF32 0.0)
   let accE : Exp (.scalar .f32) := Exp.var "acc"
   let totalE : Exp (.scalar .f32) := Exp.var "total"
-  ShaderM.loop (Exp.litU32 0) (Exp.litU32 32) (Exp.litU32 1) fun r => do
-    let row := Exp.add (Exp.mul rowTile (Exp.litU32 32)) r
+  for r in [0:32] do
+    let row := Exp.add (Exp.mul rowTile (Exp.litU32 32)) (Exp.litU32 r)
     ShaderM.assign "acc" (Exp.litF32 0.0)
     for blk in [0:blocksPerRow] do
       let w ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := 32*blocksPerRow) "wcache" (Exp.add (Exp.mul tid (Exp.litU32 blocksPerRow)) (Exp.litU32 blk))
@@ -6395,8 +6395,8 @@ def fusedQ5_0BatchExpertF32WarpGroupedKernel (config : Config) (nExpert maxPadde
   ShaderM.varNamed "total" (.scalar .f32) (Exp.litF32 0.0)
   let accE : Exp (.scalar .f32) := Exp.var "acc"
   let totalE : Exp (.scalar .f32) := Exp.var "total"
-  ShaderM.loop (Exp.litU32 0) (Exp.litU32 32) (Exp.litU32 1) fun r => do
-    let row := Exp.add (Exp.mul rowTile (Exp.litU32 32)) r
+  for r in [0:32] do
+    let row := Exp.add (Exp.mul rowTile (Exp.litU32 32)) (Exp.litU32 r)
     ShaderM.assign "acc" (Exp.litF32 0.0)
     for blk in [0:blocksPerRow] do
       let w ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := 32*blocksPerRow) "wcache" (Exp.add (Exp.mul tid (Exp.litU32 blocksPerRow)) (Exp.litU32 blk))
