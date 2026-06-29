@@ -753,6 +753,9 @@ def main (args : List String) : IO Unit := do
   let sN ← mkBuf device (N*dim)
   let sQ ← mkBuf device (N*8192); let sK ← mkBuf device (N*2048); let sV ← mkBuf device (N*2048)
   let sQr ← mkBuf device (N*8192); let sKr ← mkBuf device (N*2048); let sVn ← mkBuf device (N*2048)
+  -- DG_QKVRB timing probe: f16-packed QKV weight scratch (garbage values — measures reg-matmul
+  -- TIMING for the QKV shapes, which is weight-value-independent). [outDim, dim/2] u32.
+  let sQf16 ← mkBuf device (8192*(dim/2)); let sKf16 ← mkBuf device (2048*(dim/2)); let sVf16 ← mkBuf device (2048*(dim/2))
   let sCtx ← mkBuf device (N*8192); let sAO ← mkBuf device (N*dim); let sPA ← mkBuf device (N*dim)
   let sG ← mkBuf device (N*ffn); let sU ← mkBuf device (N*ffn); let sGe ← mkBuf device (N*ffn); let sD ← mkBuf device (N*dim)
   let sR ← mkBuf device (N*dim)
@@ -846,6 +849,7 @@ def main (args : List String) : IO Unit := do
   IO.println s!"[dg-decode] {decodeSteps} steps, N={N} P={P} C={C}  skipDense={skipDense}"
   -- DG_PROF: per-phase GPU time (endBatch syncs + timestamps at each phase boundary, accumulated).
   let prof := (← IO.getEnv "DG_PROF").isSome
+  let qkvRB := (← IO.getEnv "DG_QKVRB").isSome   -- timing probe: QKV via reg-matmul (garbage output)
   let rAttn ← IO.mkRef (0:Nat); let rDense ← IO.mkRef (0:Nat)
   let rMoe ← IO.mkRef (0:Nat); let rRest ← IO.mkRef (0:Nat); let tPrev ← IO.mkRef (0:Nat)
   let rBattn ← IO.mkRef (0:Nat); let rAttnO ← IO.mkRef (0:Nat)   -- attention sub-phases: QK^T+softmax+V, and O-proj
@@ -898,10 +902,17 @@ def main (args : List String) : IO Unit := do
         let nRotHalf := if li % 6 == 5 then 64 else hd/2
         -- attention
         Hesper.Layers.RMSNorm.forward device blk.attnNorm cur sN N
-        qK device sN N dim (hash ("qN",li))
-        bmm device blk.attention.wQ sN sQ N (hash ("wq",li))
-        bmm device blk.attention.wK sN sK N (hash ("wk",li))
-        bmm device blk.attention.wV sN sV N (hash ("wv",li))
+        if qkvRB then
+          -- reg-matmul QKV on f32 sN (garbage f16 weights — TIMING probe only). N=outDim, K=dim.
+          let rb := fun (wf16 outB : Buffer) (od : Nat) (key : UInt64) =>
+            dispRB device (Hesper.WGSL.MatMul.matMulTransposeF16WMMARegKernel { M := N, N := od, K := dim } 0 od)
+              (("a",sN)::("b",wf16)::("c",outB)::List.nil) ((od+31)/32) ((N+63)/64) key
+          rb sQf16 sQ qDim (hash ("rbq",li)); rb sKf16 sK kvDim (hash ("rbk",li)); rb sVf16 sV kvDim (hash ("rbv",li))
+        else
+          qK device sN N dim (hash ("qN",li))
+          bmm device blk.attention.wQ sN sQ N (hash ("wq",li))
+          bmm device blk.attention.wK sN sK N (hash ("wk",li))
+          bmm device blk.attention.wV sN sV N (hash ("wv",li))
         pmark rAttn   -- attnNorm + qK + Q/K/V matmuls (Q4_K MMQ5)
         disp device (qkNormRopeB N nHead hd nRotHalf theta eps) (("qin",sQ)::("wnorm",blk.attention.qNormWeight)::("qout",sQr)::List.nil) (N*nHead) (hash ("qn",li))
         disp device (qkNormRopeB N nKV hd nRotHalf theta eps) (("qin",sK)::("wnorm",blk.attention.kNormWeight)::("qout",sKr)::List.nil) (N*nKV) (hash ("kn",li))
