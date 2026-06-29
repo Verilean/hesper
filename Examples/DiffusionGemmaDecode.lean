@@ -844,7 +844,19 @@ def main (args : List String) : IO Unit := do
   let outProb ← mkBuf device (C*scK)
   let skipDense := (← IO.getEnv "DG_SKIPDENSE").isSome
   IO.println s!"[dg-decode] {decodeSteps} steps, N={N} P={P} C={C}  skipDense={skipDense}"
+  -- DG_PROF: per-phase GPU time (endBatch syncs + timestamps at each phase boundary, accumulated).
+  let prof := (← IO.getEnv "DG_PROF").isSome
+  let rAttn ← IO.mkRef (0:Nat); let rDense ← IO.mkRef (0:Nat)
+  let rMoe ← IO.mkRef (0:Nat); let rRest ← IO.mkRef (0:Nat); let tPrev ← IO.mkRef (0:Nat)
+  let pmark := fun (r : IO.Ref Nat) => do
+    if prof then
+      Hesper.GPUBackend.endBatch device
+      let n ← IO.monoMsNow
+      r.modify (· + (n - (← tPrev.get)))
+      tPrev.set n
+      Hesper.GPUBackend.beginBatch device
   for step in [0:decodeSteps] do
+    if prof then rAttn.set 0; rDense.set 0; rMoe.set 0; rRest.set 0
     let remaining := masked.foldl (fun acc b => if b then acc+1 else acc) 0
     if remaining > 0 then
       let t0 ← IO.monoMsNow
@@ -874,6 +886,7 @@ def main (args : List String) : IO Unit := do
       Hesper.GPUBackend.endBatch device
       let mut cur := a; let mut nxt := b
       let lpb := ((← IO.getEnv "DG_LPB").bind (·.toNat?)).getD 30  -- layers per GPU submission (1 batch/forward; ~12% faster)
+      if prof then tPrev.set (← IO.monoMsNow)
       for li in [0:nLayers] do
         if li % lpb == 0 then Hesper.GPUBackend.beginBatch device
         let some blk := model.inner.blocks[li]? | throw (IO.userError "blk")
@@ -895,6 +908,7 @@ def main (args : List String) : IO Unit := do
         bmm device blk.attention.wO sCtx sAO N (hash ("wo",li))
         Hesper.Layers.RMSNorm.forward device blk.postAttnNorm sAO sR N
         disp device (addB (N*dim)) (("ain",sR)::("bin",cur)::("outc",sPA)::List.nil) (N*dim) (hash ("ra",li))
+        pmark rAttn
         -- dense FFN
         if li == 0 && (← IO.getEnv "DG_QFMT").isSome then
           let qfs := fun (q : Hesper.Layers.Linear.QuantFormat) => match q with
@@ -908,6 +922,7 @@ def main (args : List String) : IO Unit := do
           disp device (geluMulB (N*ffn)) (("gate",sG)::("up",sU)::("outp",sGe)::List.nil) (N*ffn) (hash ("gg",li))
           q80 device sGe N ffn (hash ("qGe",li))
           bmm device blk.ffn.down sGe sD N (hash ("dn",li))
+        pmark rDense
         let some mpn1 := blk.moePostNorm1 | throw (IO.userError "mpn1")
         Hesper.Layers.RMSNorm.forward device mpn1 sD sCurMlp N        -- curMlp
         -- MoE (router top-8 per row + batched experts)
@@ -1070,13 +1085,17 @@ def main (args : List String) : IO Unit := do
             disp2w device downExpKernel (("weights",dnE)::("input",sEh)::("idxs",sIdxs)::("output",sDownE)::List.nil) dim N 32 (hash ("ed",li,e))
             disp device (waccB N dim e nUsed) (("acc",sMoeAcc)::("din",sDownE)::("wts",sWts)::List.nil) (N*dim) (hash ("wa",li,e))
         Hesper.Layers.RMSNorm.forward device mpn2post sMoeAcc sCurMoe N
+        pmark rMoe
         -- combine: curMlp + curMoe → postFFNNorm → +residual → ×out_scale
         disp device (addB (N*dim)) (("ain",sCurMlp)::("bin",sCurMoe)::("outc",sComb)::List.nil) (N*dim) (hash ("ad",li))
         Hesper.Layers.RMSNorm.forward device blk.postFFNNorm sComb sR N
         disp device (addB (N*dim)) (("ain",sR)::("bin",sPA)::("outc",nxt)::List.nil) (N*dim) (hash ("rc",li))
         disp device (scaleRegionB N P dim (scales[li]!) (encScales[li]!)) (("data",nxt)::List.nil) (N*dim) (hash ("sc",li))
+        pmark rRest
         if li % lpb == lpb-1 || li == nLayers-1 then Hesper.GPUBackend.endBatch device
         let t := cur; cur := nxt; nxt := t
+      if prof then
+        IO.println s!"[prof step {step}] attn={← rAttn.get}ms dense={← rDense.get}ms moe={← rMoe.get}ms rest(combine+norms)={← rRest.get}ms (sum={(← rAttn.get)+(← rDense.get)+(← rMoe.get)+(← rRest.get)}ms)"
       let tFwd ← IO.monoMsNow
       if step == 0 && (← IO.getEnv "DG_LMDIAG").isSome then
         lmHeadDiag device model.inner.finalNorm model.inner.outputWeight cur dim cfg.vocabSize N P
