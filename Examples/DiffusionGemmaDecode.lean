@@ -942,6 +942,10 @@ def main (args : List String) : IO Unit := do
           disp device (gatherQ8B maxPadded q8size N) (("src",sMoeNQ8)::("idx",sSortedPos)::("gathered",sGatheredQ8)::List.nil) (maxPadded*q8size) (hash ("gthr",li))
           disp2 device (Hesper.Layers.Linear.q4kMatmulBatchMMQ5Kernel { inDim:=dim, outDim:=2*expFF } maxPadded 0 0 maxPadded true nExpert)
             (("weights",guE)::("input_q8",sGatheredQ8)::("output",sGatheredGU)::("tileExpert",sTileExpert)::List.nil) ((2*expFF)/64) (maxPadded/32) (hash ("emm",li))
+          -- BATCH SPLIT (cheap, no CPU wait): the grouped gate/up MMQ→scatter→geglu races in a too-
+          -- large single encoder (Dawn-on-Metal drops an inter-pass barrier at scale); a no-wait
+          -- submit + fresh encoder here keeps Dawn's barriers correct without a sync round-trip.
+          Hesper.WGSL.Execute.flushBatch device
           if li == 0 && (← IO.getEnv "DG_GUDIAG").isSome then
             -- un-group the grouped gate/up + compute the per-slot reference, compare
             disp device (scatterGUB maxPadded (2*expFF) N nUsed) (("gathered",sGatheredGU)::("pos",sSortedPos)::("slot",sSortedSlot)::("dst",sGateUpAll)::List.nil) (maxPadded*2*expFF) (hash ("gudsc",li))
@@ -970,6 +974,7 @@ def main (args : List String) : IO Unit := do
           if (← IO.getEnv "DG_GROUPEDDOWN").isNone then
             -- ISOLATION: gate/up grouped, down per-slot (the pre-grouped-down state)
             disp device (scatterGUB maxPadded (2*expFF) N nUsed) (("gathered",sGatheredGU)::("pos",sSortedPos)::("slot",sSortedSlot)::("dst",sGateUpAll)::List.nil) (maxPadded*2*expFF) (hash ("sctr",li))
+            Hesper.WGSL.Execute.flushBatch device   -- flush gate/up scatter→geglu (no-wait split)
             for e in [0:nUsed] do
               let sEh := sEhs[e]?.getD sMoeN
               disp device (gegluMergedB N expFF (e*N*2*expFF) (nUsed*N*2*expFF)) (("gu",sGateUpAll)::("eh",sEh)::List.nil) (N*expFF) (hash ("gm",li,e))

@@ -93,4 +93,11 @@ opaque recordDispatch
 @[extern "lean_hesper_submit_and_wait"]
 opaque submitAndWait (device : @& Device) (encoder : @& CommandEncoder) : IO Unit
 
+/-- Finish the command encoder and submit to queue WITHOUT waiting. Queue submits are ordered, and
+    cross-command-buffer buffer hazards are tracked by the driver, so this is a cheap batch split:
+    it lets Dawn-on-Metal keep its per-encoder inter-pass barriers correct (which it drops in a
+    very large single encoder) without paying a CPU round-trip per split. -/
+@[extern "lean_hesper_submit_no_wait"]
+opaque submitNoWait (device : @& Device) (encoder : @& CommandEncoder) : IO Unit
+
 end Hesper.WebGPU
