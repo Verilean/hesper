@@ -6306,14 +6306,15 @@ def fusedQ5_0BatchExpertF32WarpKernel (config : Config) (nExpert N nUsed slot : 
     ShaderM.writeBuffer (ty := .scalar .f32) "output" (Exp.add (Exp.mul row (Exp.litU32 config.outDim)) outIdx) total
   ) (pure ())
 
-/-- GROUPED Q8_0 MoE expert down: like `fusedQ8_0BatchExpertF32WarpKernel` but over `maxPadded`
-    expert-grouped rows, reading the row's expert from `tileExpert[g/32]` (sentinel ≥ nExpert
-    clamped) instead of `idxs`. input/output are gathered [maxPadded, dim]. Grid (outDim, maxPadded). -/
+/-- TILED grouped Q8_0 MoE expert down. One workgroup (32 lanes) computes ONE output for a 32-row
+    expert-grouped tile, caching the dequantized weight row in shared and reusing it across the 32
+    rows. Grid (outDim, maxPadded/32) — 32× fewer workgroups than warp-per-output (which timed out),
+    and the weight read is amortized 32×. tileExpert[rowTile] = the tile's expert (sentinel clamped). -/
 def fusedQ8_0BatchExpertF32WarpGroupedKernel (config : Config) (nExpert maxPadded : Nat) : ShaderM Unit := do
   let wid ← ShaderM.workgroupId
   let lid ← ShaderM.localId
   let outIdx := Exp.vec3X wid
-  let row := Exp.vec3Y wid
+  let rowTile := Exp.vec3Y wid
   let tid := Exp.vec3X lid
   let blocksPerRow := config.inDim / 32
   let perExpertBytes := config.outDim * blocksPerRow * 34
@@ -6322,34 +6323,43 @@ def fusedQ8_0BatchExpertF32WarpGroupedKernel (config : Config) (nExpert maxPadde
   let _input ← ShaderM.declareReadOnlyBuffer "input" (.array (.scalar .f32) (maxPadded * config.inDim))
   let _te ← ShaderM.declareReadOnlyBuffer "tileExpert" (.array (.scalar .u32) (maxPadded / 32))
   let _output ← ShaderM.declareOutputBuffer "output" (.array (.scalar .f32) (maxPadded * config.outDim))
+  ShaderM.sharedNamed "wcache" (.array (.scalar .f32) (32 * blocksPerRow))
   let inBounds := Exp.lt outIdx (Exp.litU32 config.outDim)
-  ShaderM.varNamed "acc" (.scalar .f32) (Exp.litF32 0.0)
-  let acc : Exp (.scalar .f32) := Exp.var "acc"
-  let teRaw ← ShaderM.readBuffer (ty := .scalar .u32) (n := maxPadded/32) "tileExpert" (Exp.div row (Exp.litU32 32))
+  let teRaw ← ShaderM.readBuffer (ty := .scalar .u32) (n := maxPadded/32) "tileExpert" rowTile
   let expertIdx := Exp.select (Exp.lt teRaw (Exp.litU32 nExpert)) teRaw (Exp.litU32 (nExpert-1))
   let rowBaseBytes := Exp.add (Exp.mul expertIdx (Exp.litU32 perExpertBytes)) (Exp.mul outIdx (Exp.litU32 (blocksPerRow * 34)))
-  let inRowBase := Exp.mul row (Exp.litU32 config.inDim)
-  ShaderM.loop (Exp.litU32 0) (Exp.litU32 blocksPerRow) (Exp.litU32 1) fun blk => do
-    let blockByteBase := Exp.add rowBaseBytes (Exp.mul blk (Exp.litU32 34))
+  -- cache lane tid's weight element for each K-block
+  for blk in [0:blocksPerRow] do
+    let blockByteBase := Exp.add rowBaseBytes (Exp.litU32 (blk * 34))
     let loByte ← q8ReadByte "weights" totalWeightU32 blockByteBase
     let hiByte ← q8ReadByte "weights" totalWeightU32 (Exp.add blockByteBase (Exp.litU32 1))
     let d := Exp.vecX (Exp.unpack2x16float (Exp.add loByte (Exp.mul hiByte (Exp.litU32 256))))
     let qb ← q8ReadByte "weights" totalWeightU32 (Exp.add blockByteBase (Exp.add (Exp.litU32 2) tid))
     let sign := Exp.shiftRight qb (Exp.litU32 7)
     let qSigned := Exp.sub (Exp.toF32 qb) (Exp.mul (Exp.litF32 256.0) (Exp.toF32 sign))
-    let inVal ← ShaderM.readBuffer (ty := .scalar .f32) (n := maxPadded * config.inDim) "input" (Exp.add inRowBase (Exp.add (Exp.mul blk (Exp.litU32 32)) tid))
-    ShaderM.assign "acc" (Exp.add acc (Exp.mul (Exp.mul d qSigned) inVal))
-  ShaderM.varNamed "total" (.scalar .f32) (Exp.subgroupAdd acc)
-  let total : Exp (.scalar .f32) := Exp.var "total"
-  ShaderM.if_ (Exp.and (Exp.eq tid (Exp.litU32 0)) inBounds) (do
-    ShaderM.writeBuffer (ty := .scalar .f32) "output" (Exp.add (Exp.mul row (Exp.litU32 config.outDim)) outIdx) total) (pure ())
+    ShaderM.writeWorkgroup (ty := .scalar .f32) "wcache" (Exp.add (Exp.mul tid (Exp.litU32 blocksPerRow)) (Exp.litU32 blk)) (Exp.mul d qSigned)
+  ShaderM.barrier
+  ShaderM.varNamed "acc" (.scalar .f32) (Exp.litF32 0.0)
+  ShaderM.varNamed "total" (.scalar .f32) (Exp.litF32 0.0)
+  let accE : Exp (.scalar .f32) := Exp.var "acc"
+  let totalE : Exp (.scalar .f32) := Exp.var "total"
+  ShaderM.loop (Exp.litU32 0) (Exp.litU32 32) (Exp.litU32 1) fun r => do
+    let row := Exp.add (Exp.mul rowTile (Exp.litU32 32)) r
+    ShaderM.assign "acc" (Exp.litF32 0.0)
+    for blk in [0:blocksPerRow] do
+      let w ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := 32*blocksPerRow) "wcache" (Exp.add (Exp.mul tid (Exp.litU32 blocksPerRow)) (Exp.litU32 blk))
+      let inVal ← ShaderM.readBuffer (ty := .scalar .f32) (n := maxPadded * config.inDim) "input" (Exp.add (Exp.mul row (Exp.litU32 config.inDim)) (Exp.add (Exp.litU32 (blk*32)) tid))
+      ShaderM.assign "acc" (Exp.add accE (Exp.mul w inVal))
+    ShaderM.assign "total" (Exp.subgroupAdd accE)
+    ShaderM.if_ (Exp.and (Exp.eq tid (Exp.litU32 0)) inBounds) (do
+      ShaderM.writeBuffer (ty := .scalar .f32) "output" (Exp.add (Exp.mul row (Exp.litU32 config.outDim)) outIdx) totalE) (pure ())
 
-/-- GROUPED Q5_0 MoE expert down — Q5_0 (22-byte blocks) analogue of the grouped Q8_0 kernel. -/
+/-- TILED grouped Q5_0 MoE expert down — Q5_0 (22-byte blocks) analogue of the tiled Q8_0 kernel. -/
 def fusedQ5_0BatchExpertF32WarpGroupedKernel (config : Config) (nExpert maxPadded : Nat) : ShaderM Unit := do
   let wid ← ShaderM.workgroupId
   let lid ← ShaderM.localId
   let outIdx := Exp.vec3X wid
-  let row := Exp.vec3Y wid
+  let rowTile := Exp.vec3Y wid
   let tid := Exp.vec3X lid
   let blocksPerRow := config.inDim / 32
   let perExpertBytes := config.outDim * blocksPerRow * 22
@@ -6358,15 +6368,13 @@ def fusedQ5_0BatchExpertF32WarpGroupedKernel (config : Config) (nExpert maxPadde
   let _input ← ShaderM.declareReadOnlyBuffer "input" (.array (.scalar .f32) (maxPadded * config.inDim))
   let _te ← ShaderM.declareReadOnlyBuffer "tileExpert" (.array (.scalar .u32) (maxPadded / 32))
   let _output ← ShaderM.declareOutputBuffer "output" (.array (.scalar .f32) (maxPadded * config.outDim))
+  ShaderM.sharedNamed "wcache" (.array (.scalar .f32) (32 * blocksPerRow))
   let inBounds := Exp.lt outIdx (Exp.litU32 config.outDim)
-  ShaderM.varNamed "acc" (.scalar .f32) (Exp.litF32 0.0)
-  let acc : Exp (.scalar .f32) := Exp.var "acc"
-  let teRaw ← ShaderM.readBuffer (ty := .scalar .u32) (n := maxPadded/32) "tileExpert" (Exp.div row (Exp.litU32 32))
+  let teRaw ← ShaderM.readBuffer (ty := .scalar .u32) (n := maxPadded/32) "tileExpert" rowTile
   let expertIdx := Exp.select (Exp.lt teRaw (Exp.litU32 nExpert)) teRaw (Exp.litU32 (nExpert-1))
   let rowBaseBytes := Exp.add (Exp.mul expertIdx (Exp.litU32 perExpertBytes)) (Exp.mul outIdx (Exp.litU32 (blocksPerRow * 22)))
-  let inRowBase := Exp.mul row (Exp.litU32 config.inDim)
-  ShaderM.loop (Exp.litU32 0) (Exp.litU32 blocksPerRow) (Exp.litU32 1) fun blk => do
-    let blockByteBase := Exp.add rowBaseBytes (Exp.mul blk (Exp.litU32 22))
+  for blk in [0:blocksPerRow] do
+    let blockByteBase := Exp.add rowBaseBytes (Exp.litU32 (blk * 22))
     let loByte ← q8ReadByte "weights" totalWeightU32 blockByteBase
     let hiByte ← q8ReadByte "weights" totalWeightU32 (Exp.add blockByteBase (Exp.litU32 1))
     let d := Exp.vecX (Exp.unpack2x16float (Exp.add loByte (Exp.mul hiByte (Exp.litU32 256))))
@@ -6381,13 +6389,22 @@ def fusedQ5_0BatchExpertF32WarpGroupedKernel (config : Config) (nExpert maxPadde
                     (Exp.bitAnd (Exp.shiftRight qb (Exp.litU32 4)) (Exp.litU32 15))
     let hbit := Exp.bitAnd (Exp.shiftRight qh tid) (Exp.litU32 1)
     let q5 := Exp.add nibble (Exp.mul hbit (Exp.litU32 16))
-    let w := Exp.mul d (Exp.sub (Exp.toF32 q5) (Exp.litF32 16.0))
-    let inVal ← ShaderM.readBuffer (ty := .scalar .f32) (n := maxPadded * config.inDim) "input" (Exp.add inRowBase (Exp.add (Exp.mul blk (Exp.litU32 32)) tid))
-    ShaderM.assign "acc" (Exp.add acc (Exp.mul w inVal))
-  ShaderM.varNamed "total" (.scalar .f32) (Exp.subgroupAdd acc)
-  let total : Exp (.scalar .f32) := Exp.var "total"
-  ShaderM.if_ (Exp.and (Exp.eq tid (Exp.litU32 0)) inBounds) (do
-    ShaderM.writeBuffer (ty := .scalar .f32) "output" (Exp.add (Exp.mul row (Exp.litU32 config.outDim)) outIdx) total) (pure ())
+    ShaderM.writeWorkgroup (ty := .scalar .f32) "wcache" (Exp.add (Exp.mul tid (Exp.litU32 blocksPerRow)) (Exp.litU32 blk)) (Exp.mul d (Exp.sub (Exp.toF32 q5) (Exp.litF32 16.0)))
+  ShaderM.barrier
+  ShaderM.varNamed "acc" (.scalar .f32) (Exp.litF32 0.0)
+  ShaderM.varNamed "total" (.scalar .f32) (Exp.litF32 0.0)
+  let accE : Exp (.scalar .f32) := Exp.var "acc"
+  let totalE : Exp (.scalar .f32) := Exp.var "total"
+  ShaderM.loop (Exp.litU32 0) (Exp.litU32 32) (Exp.litU32 1) fun r => do
+    let row := Exp.add (Exp.mul rowTile (Exp.litU32 32)) r
+    ShaderM.assign "acc" (Exp.litF32 0.0)
+    for blk in [0:blocksPerRow] do
+      let w ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := 32*blocksPerRow) "wcache" (Exp.add (Exp.mul tid (Exp.litU32 blocksPerRow)) (Exp.litU32 blk))
+      let inVal ← ShaderM.readBuffer (ty := .scalar .f32) (n := maxPadded * config.inDim) "input" (Exp.add (Exp.mul row (Exp.litU32 config.inDim)) (Exp.add (Exp.litU32 (blk*32)) tid))
+      ShaderM.assign "acc" (Exp.add accE (Exp.mul w inVal))
+    ShaderM.assign "total" (Exp.subgroupAdd accE)
+    ShaderM.if_ (Exp.and (Exp.eq tid (Exp.litU32 0)) inBounds) (do
+      ShaderM.writeBuffer (ty := .scalar .f32) "output" (Exp.add (Exp.mul row (Exp.litU32 config.outDim)) outIdx) totalE) (pure ())
 
 /-- Expert-indexed Q4_K matvec for an MoE expert tensor `[inDim, outDim, nExpert]`
     (ne0=inDim quantized, ne1=outDim, ne2=expert).  Expert `e`'s weight is a
