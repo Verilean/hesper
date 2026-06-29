@@ -828,7 +828,7 @@ def main (args : List String) : IO Unit := do
   -- can use the ~11.6× faster subgroup-matrix reg-matmul instead of MMQ5 dp4a.
   let qkvRB := (← IO.getEnv "DG_QKVRB").isSome
   let mut qF16s : Array Buffer := #[]; let mut kF16s : Array Buffer := #[]; let mut vF16s : Array Buffer := #[]
-  let mut oF16s : Array Buffer := #[]
+  let mut oF16s : Array Buffer := #[]; let mut gateF16s : Array Buffer := #[]; let mut upF16s : Array Buffer := #[]
   if qkvRB then
     let sDqTmp ← mkBuf device (8192*dim)   -- max f32 dequant scratch (≥ max outDim×inDim)
     -- branch on the weight's quant: Q4_K → dequantQ4KMKernel+pack; Q6_K → q6kToF16Kernel (direct).
@@ -858,6 +858,8 @@ def main (args : List String) : IO Unit := do
       kF16s := kF16s.push (← dq blk.attention.wK.weightBuf blk.attention.wK.config.outDim dim blk.attention.wK.quantFormat (hash ("dqk",li)))
       vF16s := vF16s.push (← dq blk.attention.wV.weightBuf blk.attention.wV.config.outDim dim blk.attention.wV.quantFormat (hash ("dqv",li)))
       oF16s := oF16s.push (← dq blk.attention.wO.weightBuf blk.attention.wO.config.outDim blk.attention.wO.config.inDim blk.attention.wO.quantFormat (hash ("dqo",li)))
+      gateF16s := gateF16s.push (← dq blk.ffn.gate.weightBuf blk.ffn.gate.config.outDim blk.ffn.gate.config.inDim blk.ffn.gate.quantFormat (hash ("dqg",li)))
+      upF16s := upF16s.push (← dq blk.ffn.up.weightBuf blk.ffn.up.config.outDim blk.ffn.up.config.inDim blk.ffn.up.quantFormat (hash ("dqu",li)))
     IO.println s!"[dg-decode] dequantized Q4_K Q/K/V → f16 ({nLayers} layers)"
   if (← IO.getEnv "DG_DQDIAG").isSome then
     -- hidden row r = e_r ⇒ logits[r,v] = weight[v,r]; compare f32 Q6_K (outputWeight) vs reg (f16)
@@ -994,10 +996,18 @@ def main (args : List String) : IO Unit := do
             | .Q4_K => "Q4_K" | .Q8_0 => "Q8_0" | .Q5_0 => "Q5_0" | .Q6_K => "Q6_K"
           IO.println s!"[qfmt L{li}] wQ={qfs blk.attention.wQ.quantFormat} wK={qfs blk.attention.wK.quantFormat} wV={qfs blk.attention.wV.quantFormat} wO={qfs blk.attention.wO.quantFormat} | dense gate={qfs blk.ffn.gate.quantFormat} down={qfs blk.ffn.down.quantFormat}"
         Hesper.Layers.RMSNorm.forward device blk.ffnNorm sPA sN N
-        qK device sN N dim (hash ("qNf",li))
+        unless qkvRB do qK device sN N dim (hash ("qNf",li))
         unless skipDense do
-          bmm device blk.ffn.gate sN sG N (hash ("g",li))
-          bmm device blk.ffn.up sN sU N (hash ("u",li))
+          if qkvRB then
+            -- dense gate/up reg-matmul on f32 sN. N=ffn, K=dim.
+            dispRB device (Hesper.WGSL.MatMul.matMulTransposeF16WMMARegKernel { M := N, N := ffn, K := dim } 0 ffn)
+              (("a",sN)::("b",gateF16s[li]?.getD sG)::("c",sG)::List.nil) ((ffn+31)/32) ((N+63)/64) (hash ("rbg",li))
+            dispRB device (Hesper.WGSL.MatMul.matMulTransposeF16WMMARegKernel { M := N, N := ffn, K := dim } 0 ffn)
+              (("a",sN)::("b",upF16s[li]?.getD sU)::("c",sU)::List.nil) ((ffn+31)/32) ((N+63)/64) (hash ("rbu",li))
+            Hesper.WGSL.Execute.flushBatch device
+          else
+            bmm device blk.ffn.gate sN sG N (hash ("g",li))
+            bmm device blk.ffn.up sN sU N (hash ("u",li))
           disp device (geluMulB (N*ffn)) (("gate",sG)::("up",sU)::("outp",sGe)::List.nil) (N*ffn) (hash ("gg",li))
           q80 device sGe N ffn (hash ("qGe",li))
           bmm device blk.ffn.down sGe sD N (hash ("dn",li))

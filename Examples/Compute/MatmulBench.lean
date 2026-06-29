@@ -34,7 +34,7 @@ def mkBuf (device : Device) (n : Nat) : IO Buffer :=
 def peakFlops : Float := 34.0e12
 def peakBW    : Float := 400.0e9
 
-def benchShape (device : Device) (name : String) (M N K : Nat) : IO Unit := do
+def benchShape (device : Device) (name : String) (M N K : Nat) : IO Float := do
   let aBuf ← mkBuf device (M*K)        -- A: f32 [M,K]   (activation)
   let bBuf ← mkBuf device (N*(K/2))    -- B: f16-packed [N,K/2] u32  (weight)
   let cBuf ← mkBuf device (M*N)        -- C: f32 [M,N]   (output)
@@ -59,6 +59,7 @@ def benchShape (device : Device) (name : String) (M N K : Nat) : IO Unit := do
   let floor := max floorMemMs floorCompMs
   let bound := if floorMemMs > floorCompMs then "MEM" else "COMPUTE"
   IO.println s!"{name} [M={M} N={N} K={K}]: {ms} ms/iter, {gflops} GFLOPS ({100.0*gflops*1.0e9/peakFlops}% peak) | floor={floor}ms ({bound}: mem {floorMemMs} / comp {floorCompMs}) → {ms/floor}× above floor"
+  pure ms
 
 /-- Golden correctness: known f32 W → GPU pack → f16 → reg-matmul, vs a CPU matmul. Tests the
     pack + reg-matmul + B-layout path (same path the QKV reg uses, minus the Q4_K dequant). -/
@@ -140,13 +141,24 @@ def main : IO Unit := do
   let device ← getDevice inst
   checkCorrect device
   checkGroupedCorrect device
-  benchShape device "QKV wQ (full) " 262 8192 2816
-  benchShape device "QKV wQ (SWA)  " 262 4096 2816
-  benchShape device "QKV wK/V (SWA)" 262 2048 2816
-  benchShape device "O-proj (full) " 262 2816 8192
-  benchShape device "dense gate/up " 262 2112 2816
-  benchShape device "dense down    " 262 2816 2112
-  benchShape device "lm_head chunk " 262 32768 2816
+  -- per-shape time; then the per-step forward SUM (5 full-attn layers + 25 SWA + lm_head),
+  -- = the integration ceiling: the real forward can't beat the sum of its matmul GPU times.
+  let qF  ← benchShape device "QKV wQ (full) " 262 8192 2816
+  let qS  ← benchShape device "QKV wQ (SWA)  " 262 4096 2816
+  let kvF ← benchShape device "QKV wK/V(full)" 262 1024 2816
+  let kvS ← benchShape device "QKV wK/V (SWA)" 262 2048 2816
+  let oF  ← benchShape device "O-proj (full) " 262 2816 8192
+  let oS  ← benchShape device "O-proj (SWA)  " 262 2816 4096
+  let gu  ← benchShape device "dense gate/up " 262 2112 2816
+  let mge ← benchShape device "MoE gate/up   " 6400 1408 2816   -- grouped: maxPadded(~64-pad) rows
+  let lm  ← benchShape device "lm_head chunk " 262 32768 2816
+  let attn := 5.0*(qF + 2.0*kvF + oF) + 25.0*(qS + 2.0*kvS + oS)
+  let dense := 30.0*(2.0*gu)
+  let moe := 30.0*mge
+  let lmTot := 8.0*lm
+  IO.println s!"=== per-step matmul SUM (integration ceiling) ==="
+  IO.println s!"  attention QKV+O = {attn} ms | dense gate/up = {dense} ms | MoE gate/up = {moe} ms | lm_head = {lmTot} ms"
+  IO.println s!"  TOTAL forward matmul = {attn+dense+moe} ms (+ lm_head {lmTot}) — best case if ALL reg-matmul"
 
 end Examples.Compute.MatmulBench
 
