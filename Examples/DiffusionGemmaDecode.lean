@@ -830,21 +830,31 @@ def main (args : List String) : IO Unit := do
   let mut qF16s : Array Buffer := #[]; let mut kF16s : Array Buffer := #[]; let mut vF16s : Array Buffer := #[]
   if qkvRB then
     let sDqTmp ← mkBuf device (8192*dim)   -- max f32 dequant scratch (outDim 8192 × dim)
-    let dq := fun (wbuf : Buffer) (od : Nat) (key : UInt64) => do
+    -- branch on the weight's quant: Q4_K → dequantQ4KMKernel+pack; Q6_K → q6kToF16Kernel (direct).
+    -- (SWA layers store wV as Q6_K, others Q4_K — dequanting Q6_K as Q4_K gave NaN.)
+    let dq := fun (wbuf : Buffer) (od : Nat) (qfmt : Hesper.Layers.Linear.QuantFormat) (key : UInt64) => do
       let ne := od * dim
-      let wg := (ne+255)/256; let nx := min wg 65535; let ny := (wg+nx-1)/nx
       let f16buf ← mkBuf device (ne/2)
-      Hesper.GPUBackend.beginBatch device
-      disp2 device (Hesper.Quantization.Q4_K_M.dequantQ4KMKernel ne (nx*256)) (("data",wbuf)::("output",sDqTmp)::List.nil) nx ny key
-      Hesper.WGSL.Execute.flushBatch device
-      disp device (packF32ToF16B (ne/2)) (("fin",sDqTmp)::("fout",f16buf)::List.nil) (ne/2) (key+1)
-      Hesper.GPUBackend.endBatch device
+      match qfmt with
+      | .Q6_K =>
+        let totalBlocks := od * (dim / 256)
+        let gx := min totalBlocks 65535; let gy := (totalBlocks + gx - 1) / gx
+        Hesper.GPUBackend.beginBatch device
+        disp2w device (Hesper.Quantization.Q6_K.q6kToF16Kernel dim od gx) (("weights",wbuf)::("output",f16buf)::List.nil) gx gy 64 key
+        Hesper.GPUBackend.endBatch device
+      | _ =>   -- Q4_K
+        let wg := (ne+255)/256; let nx := min wg 65535; let ny := (wg+nx-1)/nx
+        Hesper.GPUBackend.beginBatch device
+        disp2 device (Hesper.Quantization.Q4_K_M.dequantQ4KMKernel ne (nx*256)) (("data",wbuf)::("output",sDqTmp)::List.nil) nx ny key
+        Hesper.WGSL.Execute.flushBatch device
+        disp device (packF32ToF16B (ne/2)) (("fin",sDqTmp)::("fout",f16buf)::List.nil) (ne/2) (key+1)
+        Hesper.GPUBackend.endBatch device
       pure f16buf
     for li in [0:nLayers] do
       let some blk := model.inner.blocks[li]? | throw (IO.userError "blk-dq")
-      qF16s := qF16s.push (← dq blk.attention.wQ.weightBuf blk.attention.wQ.config.outDim (hash ("dqq",li)))
-      kF16s := kF16s.push (← dq blk.attention.wK.weightBuf blk.attention.wK.config.outDim (hash ("dqk",li)))
-      vF16s := vF16s.push (← dq blk.attention.wV.weightBuf blk.attention.wV.config.outDim (hash ("dqv",li)))
+      qF16s := qF16s.push (← dq blk.attention.wQ.weightBuf blk.attention.wQ.config.outDim blk.attention.wQ.quantFormat (hash ("dqq",li)))
+      kF16s := kF16s.push (← dq blk.attention.wK.weightBuf blk.attention.wK.config.outDim blk.attention.wK.quantFormat (hash ("dqk",li)))
+      vF16s := vF16s.push (← dq blk.attention.wV.weightBuf blk.attention.wV.config.outDim blk.attention.wV.quantFormat (hash ("dqv",li)))
     IO.println s!"[dg-decode] dequantized Q4_K Q/K/V → f16 ({nLayers} layers)"
   if (← IO.getEnv "DG_DQDIAG").isSome then
     -- hidden row r = e_r ⇒ logits[r,v] = weight[v,r]; compare f32 Q6_K (outputWeight) vs reg (f16)
@@ -932,11 +942,13 @@ def main (args : List String) : IO Unit := do
         -- attention
         Hesper.Layers.RMSNorm.forward device blk.attnNorm cur sN N
         if qkvRB then
+          Hesper.WGSL.Execute.flushBatch device   -- RMSNorm → reg-matmul: batch split
           -- reg-matmul QKV on f32 sN (real dequantized f16 weights). N=outDim, K=dim.
           let rb := fun (wf16 outB : Buffer) (od : Nat) (key : UInt64) =>
             dispRB device (Hesper.WGSL.MatMul.matMulTransposeF16WMMARegKernel { M := N, N := od, K := dim } 0 od)
               (("a",sN)::("b",wf16)::("c",outB)::List.nil) ((od+31)/32) ((N+63)/64) key
           rb (qF16s[li]?.getD sQ) sQ qDim (hash ("rbq",li)); rb (kF16s[li]?.getD sK) sK kvDim (hash ("rbk",li)); rb (vF16s[li]?.getD sV) sV kvDim (hash ("rbv",li))
+          Hesper.WGSL.Execute.flushBatch device   -- reg-matmul QKV → qknorm: batch split (Dawn drops the inter-pass barrier for subgroup_matrix at scale)
           if (li == 0 || li == 5) && (← IO.getEnv "DG_QKVDIAG").isSome then
             qK device sN N dim (hash ("dqk0",li))
             bmm device blk.attention.wQ sN sCtx N (hash ("dbmm0",li))   -- MMQ5 reference for wQ → sCtx
@@ -968,10 +980,10 @@ def main (args : List String) : IO Unit := do
         disp device (addB (N*dim)) (("ain",sR)::("bin",cur)::("outc",sPA)::List.nil) (N*dim) (hash ("ra",li))
         pmark rAttnO  -- O projection + post-norm + residual
         -- dense FFN
-        if li == 0 && (← IO.getEnv "DG_QFMT").isSome then
+        if (li == 0 || li == 5) && (← IO.getEnv "DG_QFMT").isSome then
           let qfs := fun (q : Hesper.Layers.Linear.QuantFormat) => match q with
             | .Q4_K => "Q4_K" | .Q8_0 => "Q8_0" | .Q5_0 => "Q5_0" | .Q6_K => "Q6_K"
-          IO.println s!"[qfmt] dense gate={qfs blk.ffn.gate.quantFormat} up={qfs blk.ffn.up.quantFormat} down={qfs blk.ffn.down.quantFormat}"
+          IO.println s!"[qfmt L{li}] wQ={qfs blk.attention.wQ.quantFormat} wK={qfs blk.attention.wK.quantFormat} wV={qfs blk.attention.wV.quantFormat} wO={qfs blk.attention.wO.quantFormat} | dense gate={qfs blk.ffn.gate.quantFormat} down={qfs blk.ffn.down.quantFormat}"
         Hesper.Layers.RMSNorm.forward device blk.ffnNorm sPA sN N
         qK device sN N dim (hash ("qNf",li))
         unless skipDense do
