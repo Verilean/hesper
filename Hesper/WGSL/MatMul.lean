@@ -838,15 +838,20 @@ def matMulTransposeF16WMMA8x8KbKernel (config : Config) (BK : Nat) : ShaderM Uni
     A: f32 [M,K]; B: u32-packed f16 [N,K/2] (B^T); C: f32 [M,N]. Requires M%64=N%32=K%32=0.
     Grid: (N/32, M/64) × 128. -/
 def matMulTransposeF16WMMARegKernel (config : Config)
-    (weightRowOffset weightRows : Nat := 0) : ShaderM Unit := do
+    (weightRowOffset weightRows : Nat := 0) (grouped : Bool := false) (nExpert : Nat := 0) : ShaderM Unit := do
   let wid ← ShaderM.workgroupId
   let lid ← ShaderM.localId
   let tid := Exp.vec3X lid
   let packedK := config.K / 2
-  let bRows := if weightRows > 0 then weightRows else config.N
+  -- grouped MoE: B holds all nExpert weights [nExpert·N, K/2]; each 64-row M-tile is ONE expert
+  -- (the grouping pads experts to 64 rows), and tileExpert[M-tile] selects it.
+  let bRows := if grouped then nExpert * config.N else if weightRows > 0 then weightRows else config.N
   let _a ← ShaderM.declareInputBuffer "a" (.array (.scalar .f32) (config.M * config.K))
   let _b ← ShaderM.declareInputBuffer "b" (.array (.scalar .u32) (bRows * packedK))
   let _c ← ShaderM.declareOutputBuffer "c" (.array (.scalar .f32) (config.M * config.N))
+  if grouped then
+    let _te ← ShaderM.declareInputBuffer "tileExpert" (.array (.scalar .u32) (config.M / 64))
+    pure ()
   -- shared stored as contiguous 8×8 tiles (stride 8) so simdgroup_load reads 64 contiguous f16
   ShaderM.sharedNamed "shared_A" (.array (.scalar .f16) (64 * 32))   -- 8 M-tiles × 4 K-tiles of 8×8
   ShaderM.sharedNamed "shared_B" (.array (.scalar .f16) (32 * 32))   -- 4 K-tiles × 4 N-tiles of 8×8
@@ -860,6 +865,12 @@ def matMulTransposeF16WMMARegKernel (config : Config)
   let sgCol := Exp.div sgitg (Exp.litU32 2)     -- 0/1 → N offset 16·sgCol
   let mOff := Exp.mul sgRow (Exp.litU32 32)
   let nOff := Exp.mul sgCol (Exp.litU32 16)
+  -- per-tile weight-row base: grouped → tileExpert[M-tile]·N (runtime); else the compile-time offset.
+  let weightRowOffsetE ← if grouped then do
+      let teRaw ← ShaderM.readBuffer (ty := .scalar .u32) (n := config.M / 64) "tileExpert" (Exp.vec3Y wid)
+      let e := Exp.select (Exp.lt teRaw (Exp.litU32 nExpert)) teRaw (Exp.litU32 (nExpert-1))
+      pure (Exp.mul e (Exp.litU32 config.N))
+    else pure (Exp.litU32 weightRowOffset)
   let numKB := config.K / 32
   ShaderM.loop (Exp.litU32 0) (Exp.litU32 numKB) (Exp.litU32 1) fun batchV => do
     let kBaseE := Exp.mul batchV (Exp.litU32 32)
@@ -879,7 +890,7 @@ def matMulTransposeF16WMMARegKernel (config : Config)
       let u := Exp.add tid (Exp.litU32 (s * 128))
       let n := Exp.div u (Exp.litU32 16)
       let kpair := Exp.mod u (Exp.litU32 16)
-      let row := Exp.add (Exp.add (Exp.litU32 weightRowOffset) colBase) n  -- absolute weight row
+      let row := Exp.add (Exp.add weightRowOffsetE colBase) n  -- absolute weight row (runtime in grouped mode)
       let u32Idx := Exp.add (Exp.mul row (Exp.litU32 packedK)) (Exp.add (Exp.div kBaseE (Exp.litU32 2)) kpair)
       let packed ← ShaderM.readBuffer (ty := .scalar .u32) (n := config.N * packedK) "b" u32Idx
       let unp := Exp.unpack2x16float packed
