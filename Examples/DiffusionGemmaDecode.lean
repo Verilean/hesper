@@ -987,17 +987,17 @@ def main (args : List String) : IO Unit := do
               disp device (waccB N dim e nUsed) (("acc",sMoeAcc)::("din",sDownE)::("wts",sWts)::List.nil) (N*dim) (hash ("wa",li,e))
           else do
             -- GROUPED down: geglu on the grouped gate/up → grouped down (tileExpert) → scatter → wacc
-            Hesper.GPUBackend.endBatch device; Hesper.GPUBackend.beginBatch device
             disp device (gegluMergedB maxPadded expFF 0 (maxPadded*2*expFF)) (("gu",sGatheredGU)::("eh",sGatheredEh)::List.nil) (maxPadded*expFF) (hash ("gmg",li))
+            Hesper.WGSL.Execute.flushBatch device   -- geglu → in-place q80
             q80 device sGatheredEh maxPadded expFF (hash ("qgeh",li))   -- match the per-slot Q8 rounding
             let downGrpKernel := match blk.ffn.down.quantFormat with
               | .Q5_0 => Hesper.Layers.Linear.fusedQ5_0BatchExpertF32WarpGroupedKernel { inDim:=expFF, outDim:=dim } nExpert maxPadded
               | _     => Hesper.Layers.Linear.fusedQ8_0BatchExpertF32WarpGroupedKernel { inDim:=expFF, outDim:=dim } nExpert maxPadded
-            Hesper.GPUBackend.endBatch device; Hesper.GPUBackend.beginBatch device
+            Hesper.WGSL.Execute.flushBatch device
             disp2w device downGrpKernel (("weights",dnE)::("input",sGatheredEh)::("tileExpert",sTileExpert)::("output",sGatheredDown)::List.nil) dim (maxPadded/32) 32 (hash ("edg",li))
-            Hesper.GPUBackend.endBatch device; Hesper.GPUBackend.beginBatch device
+            Hesper.WGSL.Execute.flushBatch device
             disp device (scatterGUB maxPadded dim N nUsed) (("gathered",sGatheredDown)::("pos",sSortedPos)::("slot",sSortedSlot)::("dst",sDownAll)::List.nil) (maxPadded*dim) (hash ("sctrd",li))
-            Hesper.GPUBackend.endBatch device; Hesper.GPUBackend.beginBatch device   -- sync scatter→wacc
+            Hesper.WGSL.Execute.flushBatch device   -- sync scatter→wacc
             if li == 0 && (← IO.getEnv "DG_MOEDIAG").isSome then
               -- compute the per-slot down reference (into sDownEs) and compare to the grouped sDownAll
               disp device (scatterGUB maxPadded (2*expFF) N nUsed) (("gathered",sGatheredGU)::("pos",sSortedPos)::("slot",sSortedSlot)::("dst",sGateUpAll)::List.nil) (maxPadded*2*expFF) (hash ("mdsc",li))
