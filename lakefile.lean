@@ -1388,6 +1388,11 @@ lean_exe «wmma8x8-test» where
   supportInterpreter := false
   moreLinkArgs := stdLinkArgs
 
+lean_exe «buffer-coherency-test» where
+  root := `Examples.Compute.BufferCoherencyTest
+  supportInterpreter := false
+  moreLinkArgs := stdLinkArgs
+
 lean_exe «bitnet-validation» where
   root := `Tests.BitNetValidation
   supportInterpreter := false
