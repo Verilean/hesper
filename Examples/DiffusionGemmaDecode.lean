@@ -751,7 +751,7 @@ def main (args : List String) : IO Unit := do
   -- expert-grouping (fused gate/up) buffers — FIXED maxPadded ⇒ one shader for the run
   let totalTok := N*nUsed
   let q8size := (dim/32)*9
-  let maxPadded := totalTok + 32*nExpert
+  let maxPadded := (((totalTok + 32*nExpert) + 31)/32)*32   -- round to a multiple of 32 (MMQ tile)
   let sSortedPos ← mkBuf device maxPadded
   let sSortedSlot ← mkBuf device maxPadded
   let sTileExpert ← mkBuf device (maxPadded/32)
@@ -927,12 +927,35 @@ def main (args : List String) : IO Unit := do
           disp device (gatherQ8B maxPadded q8size N) (("src",sMoeNQ8)::("idx",sSortedPos)::("gathered",sGatheredQ8)::List.nil) (maxPadded*q8size) (hash ("gthr",li))
           disp2 device (Hesper.Layers.Linear.q4kMatmulBatchMMQ5Kernel { inDim:=dim, outDim:=2*expFF } maxPadded 0 0 maxPadded true nExpert)
             (("weights",guE)::("input_q8",sGatheredQ8)::("output",sGatheredGU)::("tileExpert",sTileExpert)::List.nil) ((2*expFF)/64) (maxPadded/32) (hash ("emm",li))
+          if li == 0 && (← IO.getEnv "DG_GUDIAG").isSome then
+            -- un-group the grouped gate/up + compute the per-slot reference, compare
+            disp device (scatterGUB maxPadded (2*expFF) N nUsed) (("gathered",sGatheredGU)::("pos",sSortedPos)::("slot",sSortedSlot)::("dst",sGateUpAll)::List.nil) (maxPadded*2*expFF) (hash ("gudsc",li))
+            for e in [0:nUsed] do
+              disp2w device (Hesper.Layers.Linear.fusedQ4KMBatchExpertDP4ATiledKernel { inDim:=dim, outDim:=2*expFF } nExpert N nUsed e 4) (("weights",guE)::("input_q8",sMoeNQ8)::("idxs",sIdxs)::("output",(sGateUps[e]?.getD sMoeN))::List.nil) ((2*expFF)/4) N 32 (hash ("gudref",li,e))
+            Hesper.GPUBackend.endBatch device
+            let gAll ← Hesper.Basic.bytesToFloatArray (← mapBufferRead device sGateUpAll 0 (nUsed*N*2*expFF*4).toUSize)
+            let mut maxd := 0.0; let mut cnt := 0
+            let mut s0g := 0.0; let mut s0r := 0.0
+            for e in [0:nUsed] do
+              let ref ← Hesper.Basic.bytesToFloatArray (← mapBufferRead device (sGateUps[e]?.getD sMoeN) 0 (N*2*expFF*4).toUSize)
+              for pos in [P:N] do
+                for j in [0:2*expFF] do
+                  let g := gAll.getD (e*N*2*expFF + pos*2*expFF + j) 0.0
+                  let r := ref.getD (pos*2*expFF + j) 0.0
+                  if e==0 && pos==P && j==0 then s0g := g
+                  if e==0 && pos==P && j==0 then s0r := r
+                  let d := (g - r).abs
+                  if d > maxd then maxd := d
+                  if d > 0.1 then cnt := cnt+1
+            IO.println s!"[gudiag] grouped sGateUpAll vs per-slot ref: maxDiff={maxd} nBad(>0.1)={cnt}; sample e0p{P}j0 grouped={s0g} ref={s0r}"
+            Hesper.GPUBackend.beginBatch device
           if (← IO.getEnv "DG_PERSLOTDOWN").isSome then
             -- ISOLATION: gate/up grouped, down per-slot (the pre-grouped-down state)
             disp device (scatterGUB maxPadded (2*expFF) N nUsed) (("gathered",sGatheredGU)::("pos",sSortedPos)::("slot",sSortedSlot)::("dst",sGateUpAll)::List.nil) (maxPadded*2*expFF) (hash ("sctr",li))
             for e in [0:nUsed] do
               let sEh := sEhs[e]?.getD sMoeN
               disp device (gegluMergedB N expFF (e*N*2*expFF) (nUsed*N*2*expFF)) (("gu",sGateUpAll)::("eh",sEh)::List.nil) (N*expFF) (hash ("gm",li,e))
+              q80 device sEh N expFF (hash ("qEh",li,e))
               let downExpKernel := match blk.ffn.down.quantFormat with
                 | .Q5_0 => Hesper.Layers.Linear.fusedQ5_0BatchExpertF32WarpKernel { inDim:=expFF, outDim:=dim } nExpert N nUsed e
                 | _     => Hesper.Layers.Linear.fusedQ8_0BatchExpertF32WarpKernel { inDim:=expFF, outDim:=dim } nExpert N nUsed e
@@ -942,6 +965,7 @@ def main (args : List String) : IO Unit := do
           else do
             -- GROUPED down: geglu on the grouped gate/up → grouped down (tileExpert) → scatter → wacc
             disp device (gegluMergedB maxPadded expFF 0 (maxPadded*2*expFF)) (("gu",sGatheredGU)::("eh",sGatheredEh)::List.nil) (maxPadded*expFF) (hash ("gmg",li))
+          q80 device sGatheredEh maxPadded expFF (hash ("qgeh",li))   -- match the per-slot Q8 rounding
             let downGrpKernel := match blk.ffn.down.quantFormat with
               | .Q5_0 => Hesper.Layers.Linear.fusedQ5_0BatchExpertF32WarpGroupedKernel { inDim:=expFF, outDim:=dim } nExpert maxPadded
               | _     => Hesper.Layers.Linear.fusedQ8_0BatchExpertF32WarpGroupedKernel { inDim:=expFF, outDim:=dim } nExpert maxPadded
