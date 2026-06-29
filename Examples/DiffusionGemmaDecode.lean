@@ -440,6 +440,17 @@ def scatterGUB (totalTok outDim N nUsed : Nat) (gridXWidth : Nat := 0) : Hesper.
       let dstIdx := Exp.add (Exp.add (Exp.mul slotK (Exp.litU32 (N*outDim))) (Exp.mul posK (Exp.litU32 outDim))) o
       ShaderM.writeBuffer (ty := .scalar .f32) "dst" dstIdx v) (pure ())) (pure ())
 
+/-- Pack f32 → f16 half2 u32: out[i] = pack2x16float(fin[2i], fin[2i+1]).  Used to convert a
+    dequantized-to-f32 weight into the reg-matmul B format [outDim, inDim/2] u32. nOut = total f32/2. -/
+def packF32ToF16B (nOut : Nat) : Hesper.WGSL.Monad.ShaderM Unit := do
+  let gid ← ShaderM.globalId; let i := Exp.vec3X gid
+  let _in ← ShaderM.declareReadOnlyBuffer "fin" (.array (.scalar .f32) (nOut*2))
+  let _out ← ShaderM.declareOutputBuffer "fout" (.array (.scalar .u32) nOut)
+  ShaderM.if_ (Exp.lt i (Exp.litU32 nOut)) (do
+    let a := Exp.index (Exp.var "fin" : Exp (.array (.scalar .f32) (nOut*2))) (Exp.mul i (Exp.litU32 2))
+    let b := Exp.index (Exp.var "fin" : Exp (.array (.scalar .f32) (nOut*2))) (Exp.add (Exp.mul i (Exp.litU32 2)) (Exp.litU32 1))
+    ShaderM.writeBuffer (ty := .scalar .u32) "fout" i (Exp.pack2x16float (Exp.vec2 a b))) (pure ())
+
 /-- Combined weighted-accumulate over ALL nUsed experts in ONE pass (no 8-way race on `acc`):
     acc[pos,o] = Σ_slot wts[pos,slot] · din[slot,pos,o].  din = sDownAll [nUsed,N,dim]. -/
 def waccAllB (N dim nUsed : Nat) : Hesper.WGSL.Monad.ShaderM Unit := do
@@ -753,9 +764,6 @@ def main (args : List String) : IO Unit := do
   let sN ← mkBuf device (N*dim)
   let sQ ← mkBuf device (N*8192); let sK ← mkBuf device (N*2048); let sV ← mkBuf device (N*2048)
   let sQr ← mkBuf device (N*8192); let sKr ← mkBuf device (N*2048); let sVn ← mkBuf device (N*2048)
-  -- DG_QKVRB timing probe: f16-packed QKV weight scratch (garbage values — measures reg-matmul
-  -- TIMING for the QKV shapes, which is weight-value-independent). [outDim, dim/2] u32.
-  let sQf16 ← mkBuf device (8192*(dim/2)); let sKf16 ← mkBuf device (2048*(dim/2)); let sVf16 ← mkBuf device (2048*(dim/2))
   let sCtx ← mkBuf device (N*8192); let sAO ← mkBuf device (N*dim); let sPA ← mkBuf device (N*dim)
   let sG ← mkBuf device (N*ffn); let sU ← mkBuf device (N*ffn); let sGe ← mkBuf device (N*ffn); let sD ← mkBuf device (N*dim)
   let sR ← mkBuf device (N*dim)
@@ -816,6 +824,28 @@ def main (args : List String) : IO Unit := do
       Hesper.GPUBackend.endBatch device
       IO.println s!"[dg-decode] dequantized Q6_K lm_head → f16 ({(cfg.vocabSize * dim * 2)/(1024*1024)} MiB)"
       pure buf
+  -- DG_QKVRB: dequant the Q4_K Q/K/V projection weights → f16 [outDim, dim/2] once, so attention
+  -- can use the ~11.6× faster subgroup-matrix reg-matmul instead of MMQ5 dp4a.
+  let qkvRB := (← IO.getEnv "DG_QKVRB").isSome
+  let mut qF16s : Array Buffer := #[]; let mut kF16s : Array Buffer := #[]; let mut vF16s : Array Buffer := #[]
+  if qkvRB then
+    let sDqTmp ← mkBuf device (8192*dim)   -- max f32 dequant scratch (outDim 8192 × dim)
+    let dq := fun (wbuf : Buffer) (od : Nat) (key : UInt64) => do
+      let ne := od * dim
+      let wg := (ne+255)/256; let nx := min wg 65535; let ny := (wg+nx-1)/nx
+      let f16buf ← mkBuf device (ne/2)
+      Hesper.GPUBackend.beginBatch device
+      disp2 device (Hesper.Quantization.Q4_K_M.dequantQ4KMKernel ne (nx*256)) (("data",wbuf)::("output",sDqTmp)::List.nil) nx ny key
+      Hesper.WGSL.Execute.flushBatch device
+      disp device (packF32ToF16B (ne/2)) (("fin",sDqTmp)::("fout",f16buf)::List.nil) (ne/2) (key+1)
+      Hesper.GPUBackend.endBatch device
+      pure f16buf
+    for li in [0:nLayers] do
+      let some blk := model.inner.blocks[li]? | throw (IO.userError "blk-dq")
+      qF16s := qF16s.push (← dq blk.attention.wQ.weightBuf blk.attention.wQ.config.outDim (hash ("dqq",li)))
+      kF16s := kF16s.push (← dq blk.attention.wK.weightBuf blk.attention.wK.config.outDim (hash ("dqk",li)))
+      vF16s := vF16s.push (← dq blk.attention.wV.weightBuf blk.attention.wV.config.outDim (hash ("dqv",li)))
+    IO.println s!"[dg-decode] dequantized Q4_K Q/K/V → f16 ({nLayers} layers)"
   if (← IO.getEnv "DG_DQDIAG").isSome then
     -- hidden row r = e_r ⇒ logits[r,v] = weight[v,r]; compare f32 Q6_K (outputWeight) vs reg (f16)
     let Md := 64
@@ -849,7 +879,6 @@ def main (args : List String) : IO Unit := do
   IO.println s!"[dg-decode] {decodeSteps} steps, N={N} P={P} C={C}  skipDense={skipDense}"
   -- DG_PROF: per-phase GPU time (endBatch syncs + timestamps at each phase boundary, accumulated).
   let prof := (← IO.getEnv "DG_PROF").isSome
-  let qkvRB := (← IO.getEnv "DG_QKVRB").isSome   -- timing probe: QKV via reg-matmul (garbage output)
   let rAttn ← IO.mkRef (0:Nat); let rDense ← IO.mkRef (0:Nat)
   let rMoe ← IO.mkRef (0:Nat); let rRest ← IO.mkRef (0:Nat); let tPrev ← IO.mkRef (0:Nat)
   let rBattn ← IO.mkRef (0:Nat); let rAttnO ← IO.mkRef (0:Nat)   -- attention sub-phases: QK^T+softmax+V, and O-proj
@@ -903,11 +932,11 @@ def main (args : List String) : IO Unit := do
         -- attention
         Hesper.Layers.RMSNorm.forward device blk.attnNorm cur sN N
         if qkvRB then
-          -- reg-matmul QKV on f32 sN (garbage f16 weights — TIMING probe only). N=outDim, K=dim.
+          -- reg-matmul QKV on f32 sN (real dequantized f16 weights). N=outDim, K=dim.
           let rb := fun (wf16 outB : Buffer) (od : Nat) (key : UInt64) =>
             dispRB device (Hesper.WGSL.MatMul.matMulTransposeF16WMMARegKernel { M := N, N := od, K := dim } 0 od)
               (("a",sN)::("b",wf16)::("c",outB)::List.nil) ((od+31)/32) ((N+63)/64) key
-          rb sQf16 sQ qDim (hash ("rbq",li)); rb sKf16 sK kvDim (hash ("rbk",li)); rb sVf16 sV kvDim (hash ("rbv",li))
+          rb (qF16s[li]?.getD sQ) sQ qDim (hash ("rbq",li)); rb (kF16s[li]?.getD sK) sK kvDim (hash ("rbk",li)); rb (vF16s[li]?.getD sV) sV kvDim (hash ("rbv",li))
         else
           qK device sN N dim (hash ("qN",li))
           bmm device blk.attention.wQ sN sQ N (hash ("wq",li))
