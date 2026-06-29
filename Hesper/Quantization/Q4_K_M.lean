@@ -310,27 +310,27 @@ def q4kMatmulGroupedRegKernel (M N K nExpert : Nat) : ShaderM Unit := do
   let _a ← ShaderM.declareInputBuffer "a" (.array (.scalar .f32) (M * K))
   let _b ← ShaderM.declareInputBuffer "b" (.array (.scalar .u32) bU32)
   let _c ← ShaderM.declareOutputBuffer "c" (.array (.scalar .f32) (M * N))
-  let _te ← ShaderM.declareInputBuffer "tileExpert" (.array (.scalar .u32) (M / 64))
-  ShaderM.sharedNamed "shared_A" (.array (.scalar .f16) (64 * 32))
+  let _te ← ShaderM.declareInputBuffer "tileExpert" (.array (.scalar .u32) (M / 32))
+  ShaderM.sharedNamed "shared_A" (.array (.scalar .f16) (32 * 32))
   ShaderM.sharedNamed "shared_B" (.array (.scalar .f16) (32 * 32))
-  ShaderM.declareMatrixLeftArray  "Ax" .f16 8 8 4 Exp.subgroupMatrixZeroLeft
+  ShaderM.declareMatrixLeftArray  "Ax" .f16 8 8 2 Exp.subgroupMatrixZeroLeft
   ShaderM.declareMatrixRightArray "Bx" .f16 8 8 2 Exp.subgroupMatrixZeroRight
-  ShaderM.declareMatrixResultArray "Cx" .f32 8 8 8 Exp.subgroupMatrixZeroResult
-  let rowBase := Exp.mul (Exp.vec3Y wid) (Exp.litU32 64)
+  ShaderM.declareMatrixResultArray "Cx" .f32 8 8 4 Exp.subgroupMatrixZeroResult
+  let rowBase := Exp.mul (Exp.vec3Y wid) (Exp.litU32 32)
   let colBase := Exp.mul (Exp.vec3X wid) (Exp.litU32 32)
   let sgitg := Exp.div tid (Exp.litU32 32)
   let sgRow := Exp.mod sgitg (Exp.litU32 2)
   let sgCol := Exp.div sgitg (Exp.litU32 2)
-  let mOff := Exp.mul sgRow (Exp.litU32 32)
+  let mOff := Exp.mul sgRow (Exp.litU32 16)
   let nOff := Exp.mul sgCol (Exp.litU32 16)
-  let teRaw ← ShaderM.readBuffer (ty := .scalar .u32) (n := M / 64) "tileExpert" (Exp.vec3Y wid)
+  let teRaw ← ShaderM.readBuffer (ty := .scalar .u32) (n := M / 32) "tileExpert" (Exp.vec3Y wid)
   let e := Exp.select (Exp.lt teRaw (Exp.litU32 nExpert)) teRaw (Exp.litU32 (nExpert - 1))
   let weightRowOffsetE := Exp.mul e (Exp.litU32 N)
   let numKB := K / 32
   ShaderM.loop (Exp.litU32 0) (Exp.litU32 numKB) (Exp.litU32 1) fun batchV => do
     let kBaseE := Exp.mul batchV (Exp.litU32 32)
     -- A-load [64,32] f16 (M-major 8×8 tiled), identical to the f16 reg kernel
-    for s in [0:16] do
+    for s in [0:8] do
       let idx := Exp.add tid (Exp.litU32 (s * 128))
       let m := Exp.div idx (Exp.litU32 32)
       let k := Exp.mod idx (Exp.litU32 32)
@@ -398,19 +398,19 @@ def q4kMatmulGroupedRegKernel (M N K nExpert : Nat) : ShaderM Unit := do
       ShaderM.writeWorkgroup (ty := .scalar .f16) "shared_B" (Exp.add baseB (Exp.mul (Exp.add kr (Exp.litU32 1)) (Exp.litU32 8))) (Exp.toF16 y1)
     ShaderM.barrier
     for k8 in [0:4] do
-      for mt in [0:4] do
-        let mtileG := Exp.add (Exp.mul sgRow (Exp.litU32 4)) (Exp.litU32 mt)
+      for mt in [0:2] do
+        let mtileG := Exp.add (Exp.mul sgRow (Exp.litU32 2)) (Exp.litU32 mt)
         let blkA := Exp.add (Exp.mul mtileG (Exp.litU32 4)) (Exp.litU32 k8)
         ShaderM.loadMatrixLeft (st := .f16) (m := 8) (k := 8) "Ax" mt "shared_A" (Exp.mul blkA (Exp.litU32 64)) (Exp.litU32 8)
       for nt in [0:2] do
         let ntileG := Exp.add (Exp.mul sgCol (Exp.litU32 2)) (Exp.litU32 nt)
         let blkB := Exp.add (Exp.mul (Exp.litU32 (k8 * 4)) (Exp.litU32 1)) ntileG
         ShaderM.loadMatrixRight (st := .f16) (k := 8) (n := 8) "Bx" nt "shared_B" (Exp.mul blkB (Exp.litU32 64)) (Exp.litU32 8)
-      for mt in [0:4] do
+      for mt in [0:2] do
         for nt in [0:2] do
           ShaderM.matrixMultiplyAccumulateMixed (inSt := .f16) (outSt := .f32) (m := 8) (k := 8) (n := 8) "Cx" (mt * 2 + nt) "Ax" mt "Bx" nt
     ShaderM.barrier
-  for mt in [0:4] do
+  for mt in [0:2] do
     for nt in [0:2] do
       let row := Exp.add (Exp.add rowBase mOff) (Exp.litU32 (mt * 8))
       let col := Exp.add (Exp.add colBase nOff) (Exp.litU32 (nt * 8))

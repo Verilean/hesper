@@ -214,13 +214,13 @@ def checkFusedQ4KCorrect (device : Device) : IO Unit := do
   let mut aA : Array Float := #[]
   for m in [0:M] do for k in [0:K] do aA := aA.push (af m k)
   let aBuf ← mkBuf device (M*K); writeBuffer device aBuf 0 (← Hesper.Basic.floatArrayToBytes aA)
-  let teBuf ← mkBuf device (M/64)
+  let teBuf ← mkBuf device (M/32)
   let mut teB : ByteArray := ByteArray.empty
-  for t in [0:M/64] do teB := (((teB.push (t.toUInt8)).push 0).push 0).push 0
+  for t in [0:M/32] do teB := ((((teB.push ((t/2).toUInt8)).push 0).push 0).push 0)   -- per-32 tile → expert t/2 (BM=32)
   writeBuffer device teBuf 0 teB
   let cBuf ← mkBuf device (M*N)
   let cfg : Hesper.ExecConfig := {
-    numWorkgroups := ((N+31)/32, (M+63)/64, 1), workgroupSize := {x:=128},
+    numWorkgroups := ((N+31)/32, (M+31)/32, 1), workgroupSize := {x:=128},
     extensions := ["f16","chromium_experimental_subgroup_matrix"],
     diagnostics := [("off","chromium.subgroup_matrix_uniformity")] }
   let rr ← IO.mkRef none
