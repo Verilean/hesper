@@ -368,7 +368,7 @@ def countExpB (totalTok nExpert : Nat) : Hesper.WGSL.Monad.ShaderM Unit := do
     ShaderM.writeBuffer (ty := .scalar .u32) "cnt" e (Exp.var "c")) (pure ())
 
 /-- GPU grouping 2: prefix-sum padded offsets + fill tileExpert. Single thread (cheap). -/
-def offsetsExpB (nExpert maxPadded : Nat) : Hesper.WGSL.Monad.ShaderM Unit := do
+def offsetsExpB (nExpert maxPadded : Nat) (padTo : Nat := 32) : Hesper.WGSL.Monad.ShaderM Unit := do
   let gid ← ShaderM.globalId; let t := Exp.vec3X gid
   let _cnt ← ShaderM.declareReadOnlyBuffer "cnt" (.array (.scalar .u32) nExpert)
   let _off ← ShaderM.declareOutputBuffer "off" (.array (.scalar .u32) nExpert)
@@ -377,7 +377,7 @@ def offsetsExpB (nExpert maxPadded : Nat) : Hesper.WGSL.Monad.ShaderM Unit := do
     ShaderM.varNamed "acc" (.scalar .u32) (Exp.litU32 0)
     ShaderM.loop (Exp.litU32 0) (Exp.litU32 nExpert) (Exp.litU32 1) fun e => do
       let c ← ShaderM.readBuffer (ty := .scalar .u32) (n := nExpert) "cnt" e
-      let pc := Exp.mul (Exp.div (Exp.add c (Exp.litU32 31)) (Exp.litU32 32)) (Exp.litU32 32)
+      let pc := Exp.mul (Exp.div (Exp.add c (Exp.litU32 (padTo-1))) (Exp.litU32 padTo)) (Exp.litU32 padTo)
       ShaderM.writeBuffer (ty := .scalar .u32) "off" e (Exp.var "acc")
       ShaderM.varNamed "tt" (.scalar .u32) (Exp.div (Exp.var "acc") (Exp.litU32 32))
       ShaderM.loop (Exp.litU32 0) (Exp.div pc (Exp.litU32 32)) (Exp.litU32 1) fun _z => do
@@ -418,6 +418,33 @@ def gatherQ8B (totalTok q8size srcRows : Nat) : Hesper.WGSL.Monad.ShaderM Unit :
     let srcRow ← ShaderM.readBuffer (ty := .scalar .u32) (n := totalTok) "idx" k
     let v ← ShaderM.readBuffer (ty := .scalar .u32) (n := srcRows*q8size) "src" (Exp.add (Exp.mul srcRow (Exp.litU32 q8size)) j)
     ShaderM.writeBuffer (ty := .scalar .u32) "gathered" flat v) (pure ())
+
+/-- f32 expert-grouping gather (for the fused Q4_K reg gate/up): gathered[k,j] = src[idx[k], j].
+    maxPadded·dim ≈ 29M elements > 65535·256 ⇒ needs a 2D grid (same trap as the down scatter). -/
+def gatherF32B (totalTok dim srcRows : Nat) (gridXWidth : Nat := 0) : Hesper.WGSL.Monad.ShaderM Unit := do
+  let gid ← ShaderM.globalId
+  let flat := if gridXWidth > 0
+    then Exp.add (Exp.vec3X gid) (Exp.mul (Exp.vec3Y gid) (Exp.litU32 gridXWidth))
+    else Exp.vec3X gid
+  let _src ← ShaderM.declareReadOnlyBuffer "src" (.array (.scalar .f32) (srcRows*dim))
+  let _idx ← ShaderM.declareReadOnlyBuffer "idx" (.array (.scalar .u32) totalTok)
+  let _out ← ShaderM.declareOutputBuffer "gathered" (.array (.scalar .f32) (totalTok*dim))
+  ShaderM.if_ (Exp.lt flat (Exp.litU32 (totalTok*dim))) (do
+    let k := Exp.div flat (Exp.litU32 dim)
+    let j := Exp.sub flat (Exp.mul k (Exp.litU32 dim))
+    let srcRow ← ShaderM.readBuffer (ty := .scalar .u32) (n := totalTok) "idx" k
+    let v ← ShaderM.readBuffer (ty := .scalar .f32) (n := srcRows*dim) "src" (Exp.add (Exp.mul srcRow (Exp.litU32 dim)) j)
+    ShaderM.writeBuffer (ty := .scalar .f32) "gathered" flat v) (pure ())
+
+/-- per-64 tileExpert for the reg gate/up: te64[t] = te32[2t] (each 64-row reg M-tile = 2 same-expert
+    32-tiles, since DG_MOERB pads experts to 64). 1 thread per 64-tile. -/
+def deriveTE64 (nTiles64 : Nat) : Hesper.WGSL.Monad.ShaderM Unit := do
+  let gid ← ShaderM.globalId; let t := Exp.vec3X gid
+  let _te ← ShaderM.declareReadOnlyBuffer "te" (.array (.scalar .u32) (nTiles64*2))
+  let _te64 ← ShaderM.declareOutputBuffer "te64" (.array (.scalar .u32) nTiles64)
+  ShaderM.if_ (Exp.lt t (Exp.litU32 nTiles64)) (do
+    let v ← ShaderM.readBuffer (ty := .scalar .u32) (n := nTiles64*2) "te" (Exp.mul t (Exp.litU32 2))
+    ShaderM.writeBuffer (ty := .scalar .u32) "te64" t v) (pure ())
 
 /-- expert-grouping scatter: dst[slot[k]·N·outDim + pos[k]·outDim + o] = gathered[k,o]; skip dummies
     (slot ≥ nUsed). 1 thread per (k,o). -/
@@ -780,10 +807,16 @@ def main (args : List String) : IO Unit := do
   -- expert-grouping (fused gate/up) buffers — FIXED maxPadded ⇒ one shader for the run
   let totalTok := N*nUsed
   let q8size := (dim/32)*9
-  let maxPadded := (((totalTok + 32*nExpert) + 31)/32)*32   -- round to a multiple of 32 (MMQ tile)
+  -- DG_MOERB: fused Q4_K reg-matmul for the MoE gate/up. The reg M-tile is 64 ⇒ each expert block must
+  -- be 64-aligned ⇒ pad to 64 (vs 32 for MMQ). Gated: the default MMQ path keeps its 32-pad.
+  let moeRB := (← IO.getEnv "DG_MOERB").isSome
+  let padTo := if moeRB then 64 else 32
+  let maxPadded := (((totalTok + padTo*nExpert) + (padTo-1))/padTo)*padTo
   let sSortedPos ← mkBuf device maxPadded
   let sSortedSlot ← mkBuf device maxPadded
   let sTileExpert ← mkBuf device (maxPadded/32)
+  let sTileExpert64 ← mkBuf device (if moeRB then maxPadded/64 else 1)   -- per-64 tileExpert for the reg gate/up
+  let sGatheredF32 ← mkBuf device (if moeRB then maxPadded*dim else 1)   -- f32 gathered MoE input (reg A)
   let sGatheredQ8 ← mkBuf device (maxPadded*q8size)
   let sGatheredGU ← mkBuf device (maxPadded*2*expFF)
   let sGateUpAll ← mkBuf device (nUsed*N*2*expFF)
@@ -1048,7 +1081,7 @@ def main (args : List String) : IO Unit := do
           -- expert-grouping (fused, GPU-side counting-sort grouping — no readback, stays batched)
           disp device (clearSortedB maxPadded nUsed) (("sp",sSortedPos)::("ss",sSortedSlot)::List.nil) maxPadded (hash ("clr",li))
           disp device (countExpB totalTok nExpert) (("idxs",sIdxs)::("cnt",sExpertCount)::List.nil) nExpert (hash ("cntk",li))
-          disp device (offsetsExpB nExpert maxPadded) (("cnt",sExpertCount)::("off",sExpertOffset)::("te",sTileExpert)::List.nil) 1 (hash ("offk",li))
+          disp device (offsetsExpB nExpert maxPadded padTo) (("cnt",sExpertCount)::("off",sExpertOffset)::("te",sTileExpert)::List.nil) 1 (hash ("offk",li))
           if li == 0 && (← IO.getEnv "DG_TILEDIAG").isSome then
             Hesper.GPUBackend.endBatch device
             let teA ← Hesper.Basic.bytesToFloatArray (← mapBufferRead device sTileExpert 0 (maxPadded/32*4).toUSize)
@@ -1063,9 +1096,18 @@ def main (args : List String) : IO Unit := do
             let _ := teA
             Hesper.GPUBackend.beginBatch device
           disp device (scatterRankB totalTok nExpert nUsed maxPadded) (("idxs",sIdxs)::("off",sExpertOffset)::("sp",sSortedPos)::("ss",sSortedSlot)::List.nil) totalTok (hash ("srkk",li))
-          disp device (gatherQ8B maxPadded q8size N) (("src",sMoeNQ8)::("idx",sSortedPos)::("gathered",sGatheredQ8)::List.nil) (maxPadded*q8size) (hash ("gthr",li))
-          disp2 device (Hesper.Layers.Linear.q4kMatmulBatchMMQ5Kernel { inDim:=dim, outDim:=2*expFF } maxPadded 0 0 maxPadded true nExpert)
-            (("weights",guE)::("input_q8",sGatheredQ8)::("output",sGatheredGU)::("tileExpert",sTileExpert)::List.nil) ((2*expFF)/64) (maxPadded/32) (hash ("emm",li))
+          if moeRB then
+            -- FUSED Q4_K reg-matmul gate/up: f32 gather + per-64 tileExpert + read guE Q4_K directly
+            -- (in-kernel dequant, no f16 buffer). A=sGatheredF32 [maxPadded,dim], B=guE Q4_K, C=sGatheredGU.
+            let gN := maxPadded*dim; let gWG := (gN+255)/256; let gnx := min gWG 32768; let gny := (gWG + gnx - 1)/gnx
+            disp2 device (gatherF32B maxPadded dim N (gnx*256)) (("src",sMoeN)::("idx",sSortedPos)::("gathered",sGatheredF32)::List.nil) gnx gny (hash ("gthrf",li))
+            disp device (deriveTE64 (maxPadded/64)) (("te",sTileExpert)::("te64",sTileExpert64)::List.nil) (maxPadded/64) (hash ("dte64",li))
+            dispRB device (Hesper.Quantization.Q4_K_M.q4kMatmulGroupedRegKernel maxPadded (2*expFF) dim nExpert)
+              (("a",sGatheredF32)::("b",guE)::("c",sGatheredGU)::("tileExpert",sTileExpert64)::List.nil) ((2*expFF+31)/32) ((maxPadded+63)/64) (hash ("emmrb",li))
+          else
+            disp device (gatherQ8B maxPadded q8size N) (("src",sMoeNQ8)::("idx",sSortedPos)::("gathered",sGatheredQ8)::List.nil) (maxPadded*q8size) (hash ("gthr",li))
+            disp2 device (Hesper.Layers.Linear.q4kMatmulBatchMMQ5Kernel { inDim:=dim, outDim:=2*expFF } maxPadded 0 0 maxPadded true nExpert)
+              (("weights",guE)::("input_q8",sGatheredQ8)::("output",sGatheredGU)::("tileExpert",sTileExpert)::List.nil) ((2*expFF)/64) (maxPadded/32) (hash ("emm",li))
           -- BATCH SPLIT (cheap, no CPU wait): the grouped gate/up MMQ→scatter→geglu races in a too-
           -- large single encoder (Dawn-on-Metal drops an inter-pass barrier at scale); a no-wait
           -- submit + fresh encoder here keeps Dawn's barriers correct without a sync round-trip.
