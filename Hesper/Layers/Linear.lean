@@ -6346,10 +6346,14 @@ def fusedQ8_0BatchExpertF32WarpGroupedKernel (config : Config) (nExpert maxPadde
   for r in [0:32] do
     let row := Exp.add (Exp.mul rowTile (Exp.litU32 32)) (Exp.litU32 r)
     ShaderM.assign "acc" (Exp.litF32 0.0)
-    for blk in [0:blocksPerRow] do
-      let w ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := 32*blocksPerRow) "wcache" (Exp.add (Exp.mul tid (Exp.litU32 blocksPerRow)) (Exp.litU32 blk))
-      let inVal ← ShaderM.readBuffer (ty := .scalar .f32) (n := maxPadded * config.inDim) "input" (Exp.add (Exp.mul row (Exp.litU32 config.inDim)) (Exp.add (Exp.litU32 (blk*32)) tid))
-      ShaderM.assign "acc" (Exp.add accE (Exp.mul w inVal))
+    -- skip the expensive 22×32 input reads for sentinel/dummy tiles (~48% of tiles are padding and
+    -- scatter nowhere). Plain buffer reads tolerate non-uniform control flow; the subgroupAdd below
+    -- stays OUTSIDE this branch so it remains uniform (acc=0 for skipped tiles).
+    ShaderM.if_ (Exp.lt teRaw (Exp.litU32 nExpert)) (do
+      for blk in [0:blocksPerRow] do
+        let w ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := 32*blocksPerRow) "wcache" (Exp.add (Exp.mul tid (Exp.litU32 blocksPerRow)) (Exp.litU32 blk))
+        let inVal ← ShaderM.readBuffer (ty := .scalar .f32) (n := maxPadded * config.inDim) "input" (Exp.add (Exp.mul row (Exp.litU32 config.inDim)) (Exp.add (Exp.litU32 (blk*32)) tid))
+        ShaderM.assign "acc" (Exp.add accE (Exp.mul w inVal))) (pure ())
     ShaderM.assign "total" (Exp.subgroupAdd accE)
     ShaderM.if_ (Exp.and (Exp.eq tid (Exp.litU32 0)) inBounds) (do
       ShaderM.writeBuffer (ty := .scalar .f32) "output" (Exp.add (Exp.mul row (Exp.litU32 config.outDim)) outIdx) totalE) (pure ())
@@ -6398,10 +6402,11 @@ def fusedQ5_0BatchExpertF32WarpGroupedKernel (config : Config) (nExpert maxPadde
   for r in [0:32] do
     let row := Exp.add (Exp.mul rowTile (Exp.litU32 32)) (Exp.litU32 r)
     ShaderM.assign "acc" (Exp.litF32 0.0)
-    for blk in [0:blocksPerRow] do
-      let w ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := 32*blocksPerRow) "wcache" (Exp.add (Exp.mul tid (Exp.litU32 blocksPerRow)) (Exp.litU32 blk))
-      let inVal ← ShaderM.readBuffer (ty := .scalar .f32) (n := maxPadded * config.inDim) "input" (Exp.add (Exp.mul row (Exp.litU32 config.inDim)) (Exp.add (Exp.litU32 (blk*32)) tid))
-      ShaderM.assign "acc" (Exp.add accE (Exp.mul w inVal))
+    ShaderM.if_ (Exp.lt teRaw (Exp.litU32 nExpert)) (do   -- skip sentinel input reads (subgroupAdd stays uniform)
+      for blk in [0:blocksPerRow] do
+        let w ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := 32*blocksPerRow) "wcache" (Exp.add (Exp.mul tid (Exp.litU32 blocksPerRow)) (Exp.litU32 blk))
+        let inVal ← ShaderM.readBuffer (ty := .scalar .f32) (n := maxPadded * config.inDim) "input" (Exp.add (Exp.mul row (Exp.litU32 config.inDim)) (Exp.add (Exp.litU32 (blk*32)) tid))
+        ShaderM.assign "acc" (Exp.add accE (Exp.mul w inVal))) (pure ())
     ShaderM.assign "total" (Exp.subgroupAdd accE)
     ShaderM.if_ (Exp.and (Exp.eq tid (Exp.litU32 0)) inBounds) (do
       ShaderM.writeBuffer (ty := .scalar .f32) "output" (Exp.add (Exp.mul row (Exp.litU32 config.outDim)) outIdx) totalE) (pure ())
