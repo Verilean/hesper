@@ -46,9 +46,13 @@ def benchShape (device : Device) (name : String) (M N K : Nat) : IO Float := do
     diagnostics := [("off","chromium.subgroup_matrix_uniformity")] }
   let r ← IO.mkRef none
   Hesper.GPUBackend.executeWithConfigCached device kern bufs cfg 1 r   -- warmup (compile)
-  let iters := 50
+  let iters := 100
+  -- batch the iterations (one submit, no per-call sync) so the time reflects the kernel, not the
+  -- submit+wait round-trip — closer to how the matmul runs inside the batched forward.
   let t0 ← IO.monoMsNow
+  Hesper.GPUBackend.beginBatch device
   for _ in [0:iters] do Hesper.GPUBackend.executeWithConfigCached device kern bufs cfg 1 r
+  Hesper.GPUBackend.endBatch device
   let t1 ← IO.monoMsNow
   let ms := (t1-t0).toFloat / iters.toFloat
   let flops := 2.0 * M.toFloat * N.toFloat * K.toFloat
