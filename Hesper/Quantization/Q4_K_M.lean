@@ -313,6 +313,7 @@ def q4kMatmulGroupedRegKernel (M N K nExpert : Nat) : ShaderM Unit := do
   let _te ← ShaderM.declareInputBuffer "tileExpert" (.array (.scalar .u32) (M / 32))
   ShaderM.sharedNamed "shared_A" (.array (.scalar .f16) (32 * 32))
   ShaderM.sharedNamed "shared_B" (.array (.scalar .f16) (32 * 32))
+  ShaderM.sharedNamed "shared_dq" (.array (.scalar .f32) (32 * 4))   -- per-N-tile-row (d,dmin,sc,m) for this K-tile
   ShaderM.declareMatrixLeftArray  "Ax" .f16 8 8 2 Exp.subgroupMatrixZeroLeft
   ShaderM.declareMatrixRightArray "Bx" .f16 8 8 2 Exp.subgroupMatrixZeroRight
   ShaderM.declareMatrixResultArray "Cx" .f32 8 8 4 Exp.subgroupMatrixZeroResult
@@ -329,33 +330,22 @@ def q4kMatmulGroupedRegKernel (M N K nExpert : Nat) : ShaderM Unit := do
   let numKB := K / 32
   ShaderM.loop (Exp.litU32 0) (Exp.litU32 numKB) (Exp.litU32 1) fun batchV => do
     let kBaseE := Exp.mul batchV (Exp.litU32 32)
-    -- A-load [64,32] f16 (M-major 8×8 tiled), identical to the f16 reg kernel
-    for s in [0:8] do
-      let idx := Exp.add tid (Exp.litU32 (s * 128))
-      let m := Exp.div idx (Exp.litU32 32)
-      let k := Exp.mod idx (Exp.litU32 32)
-      let aIdx := Exp.add (Exp.mul (Exp.add rowBase m) (Exp.litU32 K)) (Exp.add kBaseE k)
-      let xf32 ← ShaderM.readBuffer (ty := .scalar .f32) (n := M * K) "a" aIdx
-      let blk := Exp.add (Exp.mul (Exp.div m (Exp.litU32 8)) (Exp.litU32 4)) (Exp.div k (Exp.litU32 8))
-      let within := Exp.add (Exp.mul (Exp.mod m (Exp.litU32 8)) (Exp.litU32 8)) (Exp.mod k (Exp.litU32 8))
-      ShaderM.writeWorkgroup (ty := .scalar .f16) "shared_A" (Exp.add (Exp.mul blk (Exp.litU32 64)) within) (Exp.toF16 xf32)
-    -- B-load: dequant Q4_K in-kernel. This K-tile = sub-block jSub of block blockIdx (both runtime).
     let blockIdx := Exp.div kBaseE (Exp.litU32 256)
     let jSub := Exp.div (Exp.mod kBaseE (Exp.litU32 256)) (Exp.litU32 32)
     let chunk := Exp.div jSub (Exp.litU32 2)
     let isHigh := Exp.eq (Exp.mod jSub (Exp.litU32 2)) (Exp.litU32 1)
-    for s in [0:4] do
-      let u := Exp.add tid (Exp.litU32 (s * 128))
-      let n := Exp.div u (Exp.litU32 16)
-      let kpair := Exp.mod u (Exp.litU32 16)
-      let row := Exp.add (Exp.add weightRowOffsetE colBase) n
-      let blockBaseU32 := Exp.add (Exp.mul row (Exp.litU32 rowStrideU32)) (Exp.mul blockIdx (Exp.litU32 36))
-      let dmU32 ← ShaderM.readBuffer (ty := .scalar .u32) (n := bU32) "b" blockBaseU32
+    -- COOPERATIVE per-row dequant header: 32 threads each load ONE N-tile row's (d,dmin,sc,m) for this
+    -- K-tile's sub-block into shared_dq (jSub is workgroup-uniform), so the B-load below avoids the
+    -- per-(n,kpair) redundant header reads + 8× getScaleMin cascade (~16× fewer than before).
+    ShaderM.if_ (Exp.lt tid (Exp.litU32 32)) (do
+      let row := Exp.add (Exp.add weightRowOffsetE colBase) tid
+      let bb := Exp.add (Exp.mul row (Exp.litU32 rowStrideU32)) (Exp.mul blockIdx (Exp.litU32 36))
+      let dmU32 ← ShaderM.readBuffer (ty := .scalar .u32) (n := bU32) "b" bb
       let d := fp16ToF32 (Exp.bitAnd dmU32 (Exp.litU32 0xFFFF))
       let dmin := fp16ToF32 (Exp.shiftRight dmU32 (Exp.litU32 16))
-      let sca0 ← ShaderM.readBuffer (ty := .scalar .u32) (n := bU32) "b" (Exp.add blockBaseU32 (Exp.litU32 1))
-      let sca1 ← ShaderM.readBuffer (ty := .scalar .u32) (n := bU32) "b" (Exp.add blockBaseU32 (Exp.litU32 2))
-      let sca2 ← ShaderM.readBuffer (ty := .scalar .u32) (n := bU32) "b" (Exp.add blockBaseU32 (Exp.litU32 3))
+      let sca0 ← ShaderM.readBuffer (ty := .scalar .u32) (n := bU32) "b" (Exp.add bb (Exp.litU32 1))
+      let sca1 ← ShaderM.readBuffer (ty := .scalar .u32) (n := bU32) "b" (Exp.add bb (Exp.litU32 2))
+      let sca2 ← ShaderM.readBuffer (ty := .scalar .u32) (n := bU32) "b" (Exp.add bb (Exp.litU32 3))
       let (sc0, mm0) := getScaleMin 0 sca0 sca1 sca2
       let (sc1, mm1) := getScaleMin 1 sca0 sca1 sca2
       let (sc2, mm2) := getScaleMin 2 sca0 sca1 sca2
@@ -365,19 +355,42 @@ def q4kMatmulGroupedRegKernel (M N K nExpert : Nat) : ShaderM Unit := do
       let (sc6, mm6) := getScaleMin 6 sca0 sca1 sca2
       let (sc7, mm7) := getScaleMin 7 sca0 sca1 sca2
       let scV := Exp.select (Exp.eq jSub (Exp.litU32 0)) sc0
-        (Exp.select (Exp.eq jSub (Exp.litU32 1)) sc1
-        (Exp.select (Exp.eq jSub (Exp.litU32 2)) sc2
-        (Exp.select (Exp.eq jSub (Exp.litU32 3)) sc3
-        (Exp.select (Exp.eq jSub (Exp.litU32 4)) sc4
-        (Exp.select (Exp.eq jSub (Exp.litU32 5)) sc5
-        (Exp.select (Exp.eq jSub (Exp.litU32 6)) sc6 sc7))))))
+        (Exp.select (Exp.eq jSub (Exp.litU32 1)) sc1 (Exp.select (Exp.eq jSub (Exp.litU32 2)) sc2
+        (Exp.select (Exp.eq jSub (Exp.litU32 3)) sc3 (Exp.select (Exp.eq jSub (Exp.litU32 4)) sc4
+        (Exp.select (Exp.eq jSub (Exp.litU32 5)) sc5 (Exp.select (Exp.eq jSub (Exp.litU32 6)) sc6 sc7))))))
       let mV := Exp.select (Exp.eq jSub (Exp.litU32 0)) mm0
-        (Exp.select (Exp.eq jSub (Exp.litU32 1)) mm1
-        (Exp.select (Exp.eq jSub (Exp.litU32 2)) mm2
-        (Exp.select (Exp.eq jSub (Exp.litU32 3)) mm3
-        (Exp.select (Exp.eq jSub (Exp.litU32 4)) mm4
-        (Exp.select (Exp.eq jSub (Exp.litU32 5)) mm5
-        (Exp.select (Exp.eq jSub (Exp.litU32 6)) mm6 mm7))))))
+        (Exp.select (Exp.eq jSub (Exp.litU32 1)) mm1 (Exp.select (Exp.eq jSub (Exp.litU32 2)) mm2
+        (Exp.select (Exp.eq jSub (Exp.litU32 3)) mm3 (Exp.select (Exp.eq jSub (Exp.litU32 4)) mm4
+        (Exp.select (Exp.eq jSub (Exp.litU32 5)) mm5 (Exp.select (Exp.eq jSub (Exp.litU32 6)) mm6 mm7))))))
+      let base := Exp.mul tid (Exp.litU32 4)
+      ShaderM.writeWorkgroup (ty := .scalar .f32) "shared_dq" base d
+      ShaderM.writeWorkgroup (ty := .scalar .f32) "shared_dq" (Exp.add base (Exp.litU32 1)) dmin
+      ShaderM.writeWorkgroup (ty := .scalar .f32) "shared_dq" (Exp.add base (Exp.litU32 2)) scV
+      ShaderM.writeWorkgroup (ty := .scalar .f32) "shared_dq" (Exp.add base (Exp.litU32 3)) mV) (pure ())
+    ShaderM.barrier
+    -- A-load [32,32] f16 (M-major 8×8 tiled), identical to the f16 reg kernel
+    for s in [0:8] do
+      let idx := Exp.add tid (Exp.litU32 (s * 128))
+      let m := Exp.div idx (Exp.litU32 32)
+      let k := Exp.mod idx (Exp.litU32 32)
+      let aIdx := Exp.add (Exp.mul (Exp.add rowBase m) (Exp.litU32 K)) (Exp.add kBaseE k)
+      let xf32 ← ShaderM.readBuffer (ty := .scalar .f32) (n := M * K) "a" aIdx
+      let blk := Exp.add (Exp.mul (Exp.div m (Exp.litU32 8)) (Exp.litU32 4)) (Exp.div k (Exp.litU32 8))
+      let within := Exp.add (Exp.mul (Exp.mod m (Exp.litU32 8)) (Exp.litU32 8)) (Exp.mod k (Exp.litU32 8))
+      ShaderM.writeWorkgroup (ty := .scalar .f16) "shared_A" (Exp.add (Exp.mul blk (Exp.litU32 64)) within) (Exp.toF16 xf32)
+    -- B-load: read this row's (d,dmin,sc,m) from the cooperatively-filled shared_dq; only the 4-bit
+    -- quants are fetched per element here (the header/scales were done once per row above).
+    for s in [0:4] do
+      let u := Exp.add tid (Exp.litU32 (s * 128))
+      let n := Exp.div u (Exp.litU32 16)
+      let kpair := Exp.mod u (Exp.litU32 16)
+      let row := Exp.add (Exp.add weightRowOffsetE colBase) n
+      let blockBaseU32 := Exp.add (Exp.mul row (Exp.litU32 rowStrideU32)) (Exp.mul blockIdx (Exp.litU32 36))
+      let dqBase := Exp.mul n (Exp.litU32 4)
+      let d ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := 32*4) "shared_dq" dqBase
+      let dmin ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := 32*4) "shared_dq" (Exp.add dqBase (Exp.litU32 1))
+      let scV ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := 32*4) "shared_dq" (Exp.add dqBase (Exp.litU32 2))
+      let mV ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := 32*4) "shared_dq" (Exp.add dqBase (Exp.litU32 3))
       let k0 := Exp.mul kpair (Exp.litU32 2)
       let readQ := fun (p : Exp (.scalar .u32)) => do
         let qsByteIdx := Exp.add (Exp.mul chunk (Exp.litU32 32)) p
