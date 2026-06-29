@@ -848,6 +848,8 @@ def main (args : List String) : IO Unit := do
   let prof := (← IO.getEnv "DG_PROF").isSome
   let rAttn ← IO.mkRef (0:Nat); let rDense ← IO.mkRef (0:Nat)
   let rMoe ← IO.mkRef (0:Nat); let rRest ← IO.mkRef (0:Nat); let tPrev ← IO.mkRef (0:Nat)
+  let rBattn ← IO.mkRef (0:Nat); let rAttnO ← IO.mkRef (0:Nat)   -- attention sub-phases: QK^T+softmax+V, and O-proj
+  let rQkn ← IO.mkRef (0:Nat)   -- qk-norm + RoPE + v-norm (to split it from the Q/K/V matmuls)
   let pmark := fun (r : IO.Ref Nat) => do
     if prof then
       Hesper.GPUBackend.endBatch device
@@ -856,7 +858,7 @@ def main (args : List String) : IO Unit := do
       tPrev.set n
       Hesper.GPUBackend.beginBatch device
   for step in [0:decodeSteps] do
-    if prof then rAttn.set 0; rDense.set 0; rMoe.set 0; rRest.set 0
+    if prof then rAttn.set 0; rDense.set 0; rMoe.set 0; rRest.set 0; rBattn.set 0; rAttnO.set 0; rQkn.set 0
     let remaining := masked.foldl (fun acc b => if b then acc+1 else acc) 0
     if remaining > 0 then
       let t0 ← IO.monoMsNow
@@ -900,15 +902,18 @@ def main (args : List String) : IO Unit := do
         bmm device blk.attention.wQ sN sQ N (hash ("wq",li))
         bmm device blk.attention.wK sN sK N (hash ("wk",li))
         bmm device blk.attention.wV sN sV N (hash ("wv",li))
+        pmark rAttn   -- attnNorm + qK + Q/K/V matmuls (Q4_K MMQ5)
         disp device (qkNormRopeB N nHead hd nRotHalf theta eps) (("qin",sQ)::("wnorm",blk.attention.qNormWeight)::("qout",sQr)::List.nil) (N*nHead) (hash ("qn",li))
         disp device (qkNormRopeB N nKV hd nRotHalf theta eps) (("qin",sK)::("wnorm",blk.attention.kNormWeight)::("qout",sKr)::List.nil) (N*nKV) (hash ("kn",li))
         disp device (vNormB N nKV hd eps) (("vin",sV)::("vout",sVn)::List.nil) (N*nKV) (hash ("vn",li))
+        pmark rQkn    -- qk-norm + RoPE + v-norm
         disp2 device (battnB N P nHead hd nKV 1.0) (("q",sQr)::("k",sKr)::("v",sVn)::("ctx",sCtx)::List.nil) nHead N (hash ("at",li))
+        pmark rBattn  -- battnB: QK^T + softmax + weighted-V (matrix-vector per query)
         qK device sCtx N qDim (hash ("qCtx",li))
         bmm device blk.attention.wO sCtx sAO N (hash ("wo",li))
         Hesper.Layers.RMSNorm.forward device blk.postAttnNorm sAO sR N
         disp device (addB (N*dim)) (("ain",sR)::("bin",cur)::("outc",sPA)::List.nil) (N*dim) (hash ("ra",li))
-        pmark rAttn
+        pmark rAttnO  -- O projection + post-norm + residual
         -- dense FFN
         if li == 0 && (← IO.getEnv "DG_QFMT").isSome then
           let qfs := fun (q : Hesper.Layers.Linear.QuantFormat) => match q with
@@ -1095,7 +1100,7 @@ def main (args : List String) : IO Unit := do
         if li % lpb == lpb-1 || li == nLayers-1 then Hesper.GPUBackend.endBatch device
         let t := cur; cur := nxt; nxt := t
       if prof then
-        IO.println s!"[prof step {step}] attn={← rAttn.get}ms dense={← rDense.get}ms moe={← rMoe.get}ms rest(combine+norms)={← rRest.get}ms (sum={(← rAttn.get)+(← rDense.get)+(← rMoe.get)+(← rRest.get)}ms)"
+        IO.println s!"[prof step {step}] qkv-mm={← rAttn.get}ms qknorm={← rQkn.get}ms battnB={← rBattn.get}ms attnO={← rAttnO.get}ms dense={← rDense.get}ms moe={← rMoe.get}ms rest={← rRest.get}ms"
       let tFwd ← IO.monoMsNow
       if step == 0 && (← IO.getEnv "DG_LMDIAG").isSome then
         lmHeadDiag device model.inner.finalNorm model.inner.outputWeight cur dim cfg.vocabSize N P
