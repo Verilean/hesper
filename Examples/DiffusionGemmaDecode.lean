@@ -927,15 +927,28 @@ def main (args : List String) : IO Unit := do
           disp device (gatherQ8B maxPadded q8size N) (("src",sMoeNQ8)::("idx",sSortedPos)::("gathered",sGatheredQ8)::List.nil) (maxPadded*q8size) (hash ("gthr",li))
           disp2 device (Hesper.Layers.Linear.q4kMatmulBatchMMQ5Kernel { inDim:=dim, outDim:=2*expFF } maxPadded 0 0 maxPadded true nExpert)
             (("weights",guE)::("input_q8",sGatheredQ8)::("output",sGatheredGU)::("tileExpert",sTileExpert)::List.nil) ((2*expFF)/64) (maxPadded/32) (hash ("emm",li))
-          -- GROUPED down: geglu on the grouped gate/up → grouped down (tileExpert) → scatter → wacc
-          disp device (gegluMergedB maxPadded expFF 0 (maxPadded*2*expFF)) (("gu",sGatheredGU)::("eh",sGatheredEh)::List.nil) (maxPadded*expFF) (hash ("gmg",li))
-          let downGrpKernel := match blk.ffn.down.quantFormat with
-            | .Q5_0 => Hesper.Layers.Linear.fusedQ5_0BatchExpertF32WarpGroupedKernel { inDim:=expFF, outDim:=dim } nExpert maxPadded
-            | _     => Hesper.Layers.Linear.fusedQ8_0BatchExpertF32WarpGroupedKernel { inDim:=expFF, outDim:=dim } nExpert maxPadded
-          disp2w device downGrpKernel (("weights",dnE)::("input",sGatheredEh)::("tileExpert",sTileExpert)::("output",sGatheredDown)::List.nil) dim maxPadded 32 (hash ("edg",li))
-          disp device (scatterGUB maxPadded dim N nUsed) (("gathered",sGatheredDown)::("pos",sSortedPos)::("slot",sSortedSlot)::("dst",sDownAll)::List.nil) (maxPadded*dim) (hash ("sctrd",li))
-          for e in [0:nUsed] do
-            disp device (waccB N dim e nUsed (e*N*dim) (nUsed*N*dim)) (("acc",sMoeAcc)::("din",sDownAll)::("wts",sWts)::List.nil) (N*dim) (hash ("wa",li,e))
+          if (← IO.getEnv "DG_PERSLOTDOWN").isSome then
+            -- ISOLATION: gate/up grouped, down per-slot (the pre-grouped-down state)
+            disp device (scatterGUB maxPadded (2*expFF) N nUsed) (("gathered",sGatheredGU)::("pos",sSortedPos)::("slot",sSortedSlot)::("dst",sGateUpAll)::List.nil) (maxPadded*2*expFF) (hash ("sctr",li))
+            for e in [0:nUsed] do
+              let sEh := sEhs[e]?.getD sMoeN
+              disp device (gegluMergedB N expFF (e*N*2*expFF) (nUsed*N*2*expFF)) (("gu",sGateUpAll)::("eh",sEh)::List.nil) (N*expFF) (hash ("gm",li,e))
+              let downExpKernel := match blk.ffn.down.quantFormat with
+                | .Q5_0 => Hesper.Layers.Linear.fusedQ5_0BatchExpertF32WarpKernel { inDim:=expFF, outDim:=dim } nExpert N nUsed e
+                | _     => Hesper.Layers.Linear.fusedQ8_0BatchExpertF32WarpKernel { inDim:=expFF, outDim:=dim } nExpert N nUsed e
+              let sDownE := sDownEs[e]?.getD sEh
+              disp2w device downExpKernel (("weights",dnE)::("input",sEh)::("idxs",sIdxs)::("output",sDownE)::List.nil) dim N 32 (hash ("ed",li,e))
+              disp device (waccB N dim e nUsed) (("acc",sMoeAcc)::("din",sDownE)::("wts",sWts)::List.nil) (N*dim) (hash ("wa",li,e))
+          else do
+            -- GROUPED down: geglu on the grouped gate/up → grouped down (tileExpert) → scatter → wacc
+            disp device (gegluMergedB maxPadded expFF 0 (maxPadded*2*expFF)) (("gu",sGatheredGU)::("eh",sGatheredEh)::List.nil) (maxPadded*expFF) (hash ("gmg",li))
+            let downGrpKernel := match blk.ffn.down.quantFormat with
+              | .Q5_0 => Hesper.Layers.Linear.fusedQ5_0BatchExpertF32WarpGroupedKernel { inDim:=expFF, outDim:=dim } nExpert maxPadded
+              | _     => Hesper.Layers.Linear.fusedQ8_0BatchExpertF32WarpGroupedKernel { inDim:=expFF, outDim:=dim } nExpert maxPadded
+            disp2w device downGrpKernel (("weights",dnE)::("input",sGatheredEh)::("tileExpert",sTileExpert)::("output",sGatheredDown)::List.nil) dim (maxPadded/32) 32 (hash ("edg",li))
+            disp device (scatterGUB maxPadded dim N nUsed) (("gathered",sGatheredDown)::("pos",sSortedPos)::("slot",sSortedSlot)::("dst",sDownAll)::List.nil) (maxPadded*dim) (hash ("sctrd",li))
+            for e in [0:nUsed] do
+              disp device (waccB N dim e nUsed (e*N*dim) (nUsed*N*dim)) (("acc",sMoeAcc)::("din",sDownAll)::("wts",sWts)::List.nil) (N*dim) (hash ("wa",li,e))
         else do
           for e in [0:nUsed] do
             let sGateUp := sGateUps[e]?.getD sMoeN
