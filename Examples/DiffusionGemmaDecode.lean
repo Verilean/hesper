@@ -438,6 +438,22 @@ def scatterGUB (totalTok outDim N nUsed : Nat) : Hesper.WGSL.Monad.ShaderM Unit 
       ShaderM.writeBuffer (ty := .scalar .f32) "dst" dstIdx v) (pure ())) (pure ())
 
 /-- Weighted accumulate per row: acc[r,i]+=wts[r,slot]·din[r,i]. 1 thread per (r,i). -/
+/-- Combined weighted-accumulate over ALL nUsed experts in ONE pass (no 8-way race on `acc`):
+    acc[pos,o] = Σ_slot wts[pos,slot] · din[slot,pos,o].  din = sDownAll [nUsed,N,dim]. -/
+def waccAllB (N dim nUsed : Nat) : Hesper.WGSL.Monad.ShaderM Unit := do
+  let gid ← ShaderM.globalId; let t := Exp.vec3X gid
+  let _d ← ShaderM.declareReadOnlyBuffer "din" (.array (.scalar .f32) (nUsed*N*dim))
+  let _w ← ShaderM.declareReadOnlyBuffer "wts" (.array (.scalar .f32) (N*nUsed))
+  let _acc ← ShaderM.declareOutputBuffer "acc" (.array (.scalar .f32) (N*dim))
+  ShaderM.if_ (Exp.lt t (Exp.litU32 (N*dim))) (do
+    let rr := Exp.div t (Exp.litU32 dim)
+    ShaderM.varNamed "sum" (.scalar .f32) (Exp.litF32 0.0)
+    for slot in [0:nUsed] do
+      let dv := Exp.index (Exp.var "din" : Exp (.array (.scalar .f32) (nUsed*N*dim))) (Exp.add (Exp.litU32 (slot*N*dim)) t)
+      let w := Exp.index (Exp.var "wts" : Exp (.array (.scalar .f32) (N*nUsed))) (Exp.add (Exp.mul rr (Exp.litU32 nUsed)) (Exp.litU32 slot))
+      ShaderM.assign "sum" (Exp.add (Exp.var "sum" : Exp (.scalar .f32)) (Exp.mul w dv))
+    ShaderM.writeBuffer (ty := .scalar .f32) "acc" t (Exp.var "sum")) (pure ())
+
 def waccB (N dim slot nUsed : Nat) (dinOffset dinElems : Nat := 0) : Hesper.WGSL.Monad.ShaderM Unit := do
   let dE := if dinElems == 0 then N*dim else dinElems
   let gid ← ShaderM.globalId; let t := Exp.vec3X gid
@@ -965,14 +981,13 @@ def main (args : List String) : IO Unit := do
           else do
             -- GROUPED down: geglu on the grouped gate/up → grouped down (tileExpert) → scatter → wacc
             disp device (gegluMergedB maxPadded expFF 0 (maxPadded*2*expFF)) (("gu",sGatheredGU)::("eh",sGatheredEh)::List.nil) (maxPadded*expFF) (hash ("gmg",li))
-          q80 device sGatheredEh maxPadded expFF (hash ("qgeh",li))   -- match the per-slot Q8 rounding
+            q80 device sGatheredEh maxPadded expFF (hash ("qgeh",li))   -- match the per-slot Q8 rounding
             let downGrpKernel := match blk.ffn.down.quantFormat with
               | .Q5_0 => Hesper.Layers.Linear.fusedQ5_0BatchExpertF32WarpGroupedKernel { inDim:=expFF, outDim:=dim } nExpert maxPadded
               | _     => Hesper.Layers.Linear.fusedQ8_0BatchExpertF32WarpGroupedKernel { inDim:=expFF, outDim:=dim } nExpert maxPadded
             disp2w device downGrpKernel (("weights",dnE)::("input",sGatheredEh)::("tileExpert",sTileExpert)::("output",sGatheredDown)::List.nil) dim (maxPadded/32) 32 (hash ("edg",li))
             disp device (scatterGUB maxPadded dim N nUsed) (("gathered",sGatheredDown)::("pos",sSortedPos)::("slot",sSortedSlot)::("dst",sDownAll)::List.nil) (maxPadded*dim) (hash ("sctrd",li))
-            for e in [0:nUsed] do
-              disp device (waccB N dim e nUsed (e*N*dim) (nUsed*N*dim)) (("acc",sMoeAcc)::("din",sDownAll)::("wts",sWts)::List.nil) (N*dim) (hash ("wa",li,e))
+            disp device (waccAllB N dim nUsed) (("din",sDownAll)::("wts",sWts)::("acc",sMoeAcc)::List.nil) (N*dim) (hash ("waall",li))
         else do
           for e in [0:nUsed] do
             let sGateUp := sGateUps[e]?.getD sMoeN
