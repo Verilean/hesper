@@ -896,6 +896,10 @@ def main (args : List String) : IO Unit := do
         Hesper.Layers.RMSNorm.forward device blk.postAttnNorm sAO sR N
         disp device (addB (N*dim)) (("ain",sR)::("bin",cur)::("outc",sPA)::List.nil) (N*dim) (hash ("ra",li))
         -- dense FFN
+        if li == 0 && (← IO.getEnv "DG_QFMT").isSome then
+          let qfs := fun (q : Hesper.Layers.Linear.QuantFormat) => match q with
+            | .Q4_K => "Q4_K" | .Q8_0 => "Q8_0" | .Q5_0 => "Q5_0" | .Q6_K => "Q6_K"
+          IO.println s!"[qfmt] dense gate={qfs blk.ffn.gate.quantFormat} up={qfs blk.ffn.up.quantFormat} down={qfs blk.ffn.down.quantFormat}"
         Hesper.Layers.RMSNorm.forward device blk.ffnNorm sPA sN N
         qK device sN N dim (hash ("qNf",li))
         unless skipDense do
