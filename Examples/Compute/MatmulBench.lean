@@ -31,7 +31,8 @@ def mkBuf (device : Device) (n : Nat) : IO Buffer :=
   createBuffer device { size := (n*4).toUSize, usage := [.storage, .copyDst, .copySrc], mappedAtCreation := false }
 
 -- M4 Max: ~34 TFLOP/s f16 (matrix units), ~400 GB/s unified memory.
-def peakFlops : Float := 34.0e12
+def peakFlops : Float := 15.5e12   -- MEASURED simdgroup_matrix peak (probe plateaus ~15.5; the 34
+                                   -- f16-ALU figure is regular FMA, which the matrix instruction can't reach)
 def peakBW    : Float := 400.0e9
 
 def benchShape (device : Device) (name : String) (M N K : Nat) : IO Float := do
@@ -142,10 +143,58 @@ def checkGroupedCorrect (device : Device) : IO Unit := do
   let v := if bad==0 then "✅ grouped reg-matmul CORRECT" else "❌ WRONG"
   IO.println s!"[grouped M={M} N={N} K={K} nE={nE}] maxDiff={md} bad={bad}/{M*N} → {v}; sample m0={gpu.getD 0 0.0} m64={gpu.getD (64*N) 0.0}"
 
+/-- Pure-MMA throughput probe: load one A,B 8×8 tile, then do `iters` back-to-back
+    matrixMultiplyAccumulate into 8 INDEPENDENT accumulators (no memory in the loop) → the raw
+    subgroup-matrix peak GFLOPS, to calibrate what % the real kernels hit. -/
+def mmaPeakProbe (iters nAcc : Nat) : Hesper.WGSL.Monad.ShaderM Unit := do
+  let lid ← Hesper.WGSL.Monad.ShaderM.localId; let tid := Exp.vec3X lid
+  let _a ← Hesper.WGSL.Monad.ShaderM.declareInputBuffer "a" (.array (.scalar .f32) 64)
+  let _c ← Hesper.WGSL.Monad.ShaderM.declareOutputBuffer "c" (.array (.scalar .f32) 64)
+  Hesper.WGSL.Monad.ShaderM.sharedNamed "sA" (.array (.scalar .f16) 64)
+  Hesper.WGSL.Monad.ShaderM.sharedNamed "sB" (.array (.scalar .f16) 64)
+  Hesper.WGSL.Monad.ShaderM.if_ (Exp.lt tid (Exp.litU32 64)) (do
+    let v ← Hesper.WGSL.Monad.ShaderM.readBuffer (ty := .scalar .f32) (n := 64) "a" tid
+    Hesper.WGSL.Monad.ShaderM.writeWorkgroup (ty := .scalar .f16) "sA" tid (Exp.toF16 v)
+    Hesper.WGSL.Monad.ShaderM.writeWorkgroup (ty := .scalar .f16) "sB" tid (Exp.toF16 v)) (pure ())
+  Hesper.WGSL.Monad.ShaderM.barrier
+  Hesper.WGSL.Monad.ShaderM.declareMatrixLeftArray  "Ax" .f16 8 8 1 Exp.subgroupMatrixZeroLeft
+  Hesper.WGSL.Monad.ShaderM.declareMatrixRightArray "Bx" .f16 8 8 1 Exp.subgroupMatrixZeroRight
+  Hesper.WGSL.Monad.ShaderM.declareMatrixResultArray "Cx" .f32 8 8 nAcc Exp.subgroupMatrixZeroResult
+  Hesper.WGSL.Monad.ShaderM.loadMatrixLeft  (st := .f16) (m := 8) (k := 8) "Ax" 0 "sA" (Exp.litU32 0) (Exp.litU32 8)
+  Hesper.WGSL.Monad.ShaderM.loadMatrixRight (st := .f16) (k := 8) (n := 8) "Bx" 0 "sB" (Exp.litU32 0) (Exp.litU32 8)
+  Hesper.WGSL.Monad.ShaderM.loop (Exp.litU32 0) (Exp.litU32 iters) (Exp.litU32 1) fun _ => do
+    for i in [0:nAcc] do
+      Hesper.WGSL.Monad.ShaderM.matrixMultiplyAccumulateMixed (inSt := .f16) (outSt := .f32) (m := 8) (k := 8) (n := 8) "Cx" i "Ax" 0 "Bx" 0
+  for i in [0:nAcc] do
+    Hesper.WGSL.Monad.ShaderM.storeMatrixResult (st := .f32) (m := 8) (n := 8) "Cx" i "c" (Exp.litU32 0) (Exp.litU32 8)
+
+def benchPeak (device : Device) : IO Unit := do
+  let iters := 2048; let nWg := 1024; let wgThreads := 128
+  let aBuf ← mkBuf device 64; let cBuf ← mkBuf device 64
+  let cfg : Hesper.ExecConfig := {
+    numWorkgroups := (nWg,1,1), workgroupSize := {x:=wgThreads},
+    extensions := ["f16","chromium_experimental_subgroup_matrix"],
+    diagnostics := [("off","chromium.subgroup_matrix_uniformity")] }
+  IO.println "=== MMA PEAK PROBE (pure subgroup-matrix, no memory in loop) — sweep accumulators ==="
+  for nAcc in [2, 4, 8, 16, 32] do
+    let r ← IO.mkRef none
+    Hesper.GPUBackend.executeWithConfigCached device (mmaPeakProbe iters nAcc) (("a",aBuf)::("c",cBuf)::List.nil) cfg 1 r
+    let reps := 30
+    let t0 ← IO.monoMsNow
+    Hesper.GPUBackend.beginBatch device
+    for _ in [0:reps] do Hesper.GPUBackend.executeWithConfigCached device (mmaPeakProbe iters nAcc) (("a",aBuf)::("c",cBuf)::List.nil) cfg 1 r
+    Hesper.GPUBackend.endBatch device
+    let t1 ← IO.monoMsNow
+    let ms := (t1-t0).toFloat / reps.toFloat
+    let flop := iters.toFloat * nAcc.toFloat * (8.0*8.0*8.0*2.0) * nWg.toFloat * (wgThreads.toFloat/32.0)
+    let tflops := flop / (ms/1000.0) / 1.0e12
+    IO.println s!"  nAcc={nAcc}: {ms} ms → {tflops} TFLOP/s ({100.0*tflops/34.0}% of 34 f16-ALU peak)"
+
 def main : IO Unit := do
   IO.println "=== reg-matmul roofline micro-bench (DiffusionGemma forward shapes, M=262 tokens) ==="
   let inst ← Hesper.init
   let device ← getDevice inst
+  benchPeak device
   checkCorrect device
   checkGroupedCorrect device
   IO.println "=== SIZE SWEEP (square) — does efficiency climb toward 80% as size grows? ==="
