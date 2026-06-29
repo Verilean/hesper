@@ -421,8 +421,11 @@ def gatherQ8B (totalTok q8size srcRows : Nat) : Hesper.WGSL.Monad.ShaderM Unit :
 
 /-- expert-grouping scatter: dst[slot[k]·N·outDim + pos[k]·outDim + o] = gathered[k,o]; skip dummies
     (slot ≥ nUsed). 1 thread per (k,o). -/
-def scatterGUB (totalTok outDim N nUsed : Nat) : Hesper.WGSL.Monad.ShaderM Unit := do
-  let gid ← ShaderM.globalId; let flat := Exp.vec3X gid
+def scatterGUB (totalTok outDim N nUsed : Nat) (gridXWidth : Nat := 0) : Hesper.WGSL.Monad.ShaderM Unit := do
+  let gid ← ShaderM.globalId
+  let flat := if gridXWidth > 0
+    then Exp.add (Exp.vec3X gid) (Exp.mul (Exp.vec3Y gid) (Exp.litU32 gridXWidth))
+    else Exp.vec3X gid
   let _g ← ShaderM.declareReadOnlyBuffer "gathered" (.array (.scalar .f32) (totalTok*outDim))
   let _pos ← ShaderM.declareReadOnlyBuffer "pos" (.array (.scalar .u32) totalTok)
   let _slot ← ShaderM.declareReadOnlyBuffer "slot" (.array (.scalar .u32) totalTok)
@@ -996,7 +999,13 @@ def main (args : List String) : IO Unit := do
             Hesper.WGSL.Execute.flushBatch device
             disp2w device downGrpKernel (("weights",dnE)::("input",sGatheredEh)::("tileExpert",sTileExpert)::("output",sGatheredDown)::List.nil) dim (maxPadded/32) 32 (hash ("edg",li))
             Hesper.WGSL.Execute.flushBatch device
-            disp device (scatterGUB maxPadded dim N nUsed) (("gathered",sGatheredDown)::("pos",sSortedPos)::("slot",sSortedSlot)::("dst",sDownAll)::List.nil) (maxPadded*dim) (hash ("sctrd",li))
+            -- down scatter is maxPadded*dim = ~17.5M elems → ~68k workgroups > 65535 limit (silently
+            -- dropped → sDownAll stayed 0). Use a 2D grid: flat = gid.x + gid.y*(nx*256).
+            let scN := maxPadded*dim
+            let scWG := (scN + 255)/256
+            let scNx := min scWG 32768
+            let scNy := (scWG + scNx - 1)/scNx
+            disp2 device (scatterGUB maxPadded dim N nUsed (scNx*256)) (("gathered",sGatheredDown)::("pos",sSortedPos)::("slot",sSortedSlot)::("dst",sDownAll)::List.nil) scNx scNy (hash ("sctrd",li))
             Hesper.WGSL.Execute.flushBatch device   -- sync scatter→wacc
             if li == 0 && (← IO.getEnv "DG_MOEDIAG").isSome then
               -- compute the per-slot down reference (into sDownEs) and compare to the grouped sDownAll
@@ -1010,6 +1019,10 @@ def main (args : List String) : IO Unit := do
                   | _     => Hesper.Layers.Linear.fusedQ8_0BatchExpertF32WarpKernel { inDim:=expFF, outDim:=dim } nExpert N nUsed e
                 disp2w device dk (("weights",dnE)::("input",sEh)::("idxs",sIdxs)::("output",(sDownEs[e]?.getD sMoeN))::List.nil) dim N 32 (hash ("mdd",li,e))
               Hesper.GPUBackend.endBatch device
+              let sgd ← Hesper.Basic.bytesToFloatArray (← mapBufferRead device sGatheredDown 0 (maxPadded*dim*4).toUSize)
+              let mut sumGD := 0.0
+              for v in sgd do sumGD := sumGD + v.abs
+              IO.println s!"[moediag] Σ|sGatheredDown| (grouped down output, pre-scatter) = {sumGD}"
               let gAll ← Hesper.Basic.bytesToFloatArray (← mapBufferRead device sDownAll 0 (nUsed*N*dim*4).toUSize)
               let mut maxd := 0.0; let mut cnt := 0; let mut sumG := 0.0; let mut sumR := 0.0
               for e in [0:nUsed] do
@@ -1024,8 +1037,8 @@ def main (args : List String) : IO Unit := do
                     if d > 0.1 then cnt := cnt+1
               IO.println s!"[moediag] grouped sDownAll vs per-slot down: maxDiff={maxd} nBad={cnt} | Σ|grouped|={sumG} Σ|ref|={sumR}"
               Hesper.GPUBackend.beginBatch device
-            for e in [0:nUsed] do
-              disp device (waccB N dim e nUsed (e*N*dim) (nUsed*N*dim)) (("acc",sMoeAcc)::("din",sDownAll)::("wts",sWts)::List.nil) (N*dim) (hash ("wa",li,e))
+            -- single-pass weighted-accumulate (no 8-way read-modify-write race on sMoeAcc)
+            disp device (waccAllB N dim nUsed) (("din",sDownAll)::("wts",sWts)::("acc",sMoeAcc)::List.nil) (N*dim) (hash ("waA",li))
         else do
           for e in [0:nUsed] do
             let sGateUp := sGateUps[e]?.getD sMoeN
