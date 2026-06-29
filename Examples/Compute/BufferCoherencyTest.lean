@@ -8,7 +8,7 @@ import Hesper.WGSL.Monad
 
 open Hesper.WebGPU
 abbrev SM := Hesper.WGSL.Monad.ShaderM
-open Hesper.WGSL.Monad.ShaderM (declareOutputBuffer declareReadOnlyBuffer globalId readBuffer writeBuffer if_)
+open Hesper.WGSL.Monad.ShaderM (declareOutputBuffer declareReadOnlyBuffer globalId localId readBuffer writeBuffer if_ sharedNamed writeWorkgroup readWorkgroup barrier)
 open Hesper.WGSL (Exp)
 
 namespace Examples.Compute.BufferCoherencyTest
@@ -47,6 +47,19 @@ def inplaceK (n : Nat) : SM Unit := do
   if_ (Exp.lt i (Exp.litU32 n)) (do
     let v ← readBuffer (ty := .scalar .f32) (n := n) "data" i
     writeBuffer (ty := .scalar .f32) "data" i (Exp.add v (Exp.litF32 100.0))) (pure ())
+
+/-- shared-mem + barrier (the wcache pattern): out[i] = (sh[tid]=src[i]; barrier; sh[tid])*2 -/
+def sharedK (n : Nat) : SM Unit := do
+  let _s ← declareReadOnlyBuffer "src" (.array (.scalar .f32) n)
+  let _o ← declareOutputBuffer "out" (.array (.scalar .f32) n)
+  sharedNamed "sh" (.array (.scalar .f32) 256)
+  let lid ← localId; let tid := Exp.vec3X lid
+  let gid ← globalId; let i := Exp.vec3X gid
+  let v ← readBuffer (ty := .scalar .f32) (n := n) "src" i
+  writeWorkgroup (ty := .scalar .f32) "sh" tid v
+  barrier
+  let w ← readWorkgroup (ty := .scalar .f32) (n := 256) "sh" tid
+  writeBuffer (ty := .scalar .f32) "out" i (Exp.mul w (Exp.litF32 2.0))
 
 def mkBuf (device : Device) (n : Nat) : IO Buffer :=
   createBuffer device { size := (n*4).toUSize, usage := [.storage, .copyDst, .copySrc], mappedAtCreation := false }
@@ -139,6 +152,19 @@ def main : IO Unit := do
     if ok != n then fails := fails+1
   let v6 := if fails==0 then "✅ stable" else "❌ non-deterministic"
   IO.println s!"  [indirect ×20 non-determinism] {fails}/20 runs failed → {v6}"
+  -- Test 7: shared-mem + barrier kernel (wcache pattern), A→sharedK in one batch, ×20
+  let mut sf := 0
+  for t in [0:20] do
+    Hesper.GPUBackend.beginBatch device
+    disp device (writeK n) bW n (2000+t.toUInt64*2)
+    disp device (sharedK n) bRD n (2001+t.toUInt64*2)
+    Hesper.GPUBackend.endBatch device
+    let a ← Hesper.Basic.bytesToFloatArray (← mapBufferRead device out 0 (n*4).toUSize)
+    let mut ok := 0
+    for i in [0:n] do if (a.getD i 0.0 - ((i+1)*2 : Nat).toFloat).abs < 0.5 then ok := ok+1
+    if ok != n then sf := sf+1
+  let v7 := if sf==0 then "✅ stable" else "❌ non-deterministic (shared-mem race!)"
+  IO.println s!"  [shared-mem+barrier ×20] {sf}/20 runs failed → {v7}"
 
 end Examples.Compute.BufferCoherencyTest
 
