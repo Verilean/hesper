@@ -2441,4 +2441,21 @@ lean_obj_res lean_hesper_submit_and_wait(b_lean_obj_arg device_obj, b_lean_obj_a
     return lean_io_result_mk_ok(lean_box(0));
 }
 
+// Finish + submit the encoder WITHOUT waiting (cheap batch split; queue order + driver
+// cross-command-buffer hazard tracking preserve correctness).
+lean_obj_res lean_hesper_submit_no_wait(b_lean_obj_arg device_obj, b_lean_obj_arg encoder_obj, lean_obj_res /* unit */) {
+    wgpu::Device* device = EXTRACT_DEVICE_PTR(device_obj);
+    wgpu::CommandEncoder* encoder = EXTRACT_COMMAND_ENCODER_PTR(encoder_obj);
+    if (!device || !device->Get()) {
+        return lean_io_result_mk_error(lean_mk_string("Device is invalid"));
+    }
+    if (!encoder || !encoder->Get()) {
+        return lean_io_result_mk_error(lean_mk_string("CommandEncoder is invalid"));
+    }
+    WGPUCommandBuffer commandBuffer = wgpuCommandEncoderFinish(encoder->Get(), nullptr);
+    wgpuQueueSubmit(device->GetQueue().Get(), 1, &commandBuffer);
+    wgpuCommandBufferRelease(commandBuffer);
+    return lean_io_result_mk_ok(lean_box(0));
+}
+
 }

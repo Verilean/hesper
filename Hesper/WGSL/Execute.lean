@@ -281,6 +281,20 @@ def endBatch (device : Device) : IO Unit := do
     batchEncoderRef.set none
     batchDispatchCountRef.set 0
 
+/-- Split the current batch WITHOUT a CPU sync: submit the recorded encoder (no wait) and start a
+    fresh one. Keeps Dawn-on-Metal's per-encoder inter-pass barriers correct (it drops them in a
+    very large single encoder) at a fraction of `endBatch`'s cost. Cross-encoder buffer hazards are
+    handled by queue ordering + the driver. -/
+def flushBatch (device : Device) : IO Unit := do
+  if (← IO.getEnv "DG_NOBATCH").isSome then return
+  match ← batchEncoderRef.get with
+  | none => throw <| IO.userError "flushBatch: not in batch mode"
+  | some encoder => do
+    submitNoWait device encoder
+    let enc ← createCommandEncoder device
+    batchEncoderRef.set (some enc)
+    batchDispatchCountRef.set 0
+
 /-- Check if currently in batch mode -/
 def isBatching : IO Bool := do
   return (← batchEncoderRef.get).isSome
