@@ -195,13 +195,14 @@ def benchPeak (device : Device) : IO Unit := do
     reference f32 weights via the (already-validated) dequantQ4KMKernel, CPU-matmul them, and compare
     to the fused kernel (which dequants the SAME bytes in-kernel). f16 weight-rounding tolerance. -/
 def checkFusedQ4KCorrect (device : Device) : IO Unit := do
-  let M := 128; let N := 32; let K := 256; let nE := 2     -- 2 M-tiles → experts 0,1; 1 Q4_K block/row
+  let M := 128; let N := 32; let K := 512; let nE := 2     -- K=512 ⇒ 2 Q4_K blocks/row (tests blockIdx>0)
   let bRows := nE * N
   let mut bytes : ByteArray := ByteArray.empty
   for r in [0:bRows] do
+   for blk in [0:K/256] do
     bytes := (((bytes.push 0x00).push 0x3C).push 0x00).push 0x30   -- d=1.0 (0x3C00), dmin=0.125 (0x3000)
-    for i in [0:12]  do bytes := bytes.push (((r + i*3) % 12 + 1).toUInt8)    -- 6-bit sub-scales/mins
-    for i in [0:128] do bytes := bytes.push (((r*7 + i*13) % 256).toUInt8)    -- 4-bit quants
+    for i in [0:12]  do bytes := bytes.push (((r + blk*5 + i*3) % 12 + 1).toUInt8)    -- 6-bit sub-scales/mins
+    for i in [0:128] do bytes := bytes.push (((r*7 + blk*11 + i*13) % 256).toUInt8)   -- 4-bit quants
   let qbuf ← mkBuf device (bytes.size / 4)
   writeBuffer device qbuf 0 bytes
   let wbuf ← mkBuf device (bRows*K)
