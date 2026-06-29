@@ -437,7 +437,6 @@ def scatterGUB (totalTok outDim N nUsed : Nat) : Hesper.WGSL.Monad.ShaderM Unit 
       let dstIdx := Exp.add (Exp.add (Exp.mul slotK (Exp.litU32 (N*outDim))) (Exp.mul posK (Exp.litU32 outDim))) o
       ShaderM.writeBuffer (ty := .scalar .f32) "dst" dstIdx v) (pure ())) (pure ())
 
-/-- Weighted accumulate per row: acc[r,i]+=wts[r,slot]·din[r,i]. 1 thread per (r,i). -/
 /-- Combined weighted-accumulate over ALL nUsed experts in ONE pass (no 8-way race on `acc`):
     acc[pos,o] = Σ_slot wts[pos,slot] · din[slot,pos,o].  din = sDownAll [nUsed,N,dim]. -/
 def waccAllB (N dim nUsed : Nat) : Hesper.WGSL.Monad.ShaderM Unit := do
@@ -965,7 +964,10 @@ def main (args : List String) : IO Unit := do
                   if d > 0.1 then cnt := cnt+1
             IO.println s!"[gudiag] grouped sGateUpAll vs per-slot ref: maxDiff={maxd} nBad(>0.1)={cnt}; sample e0p{P}j0 grouped={s0g} ref={s0r}"
             Hesper.GPUBackend.beginBatch device
-          if (← IO.getEnv "DG_PERSLOTDOWN").isSome then
+          -- DEFAULT: gate/up grouped + per-slot down (CORRECT, "Paris", ~0.23s win). The TILED grouped
+          -- down (DG_GROUPEDDOWN) is faster but currently emits 0 (sGatheredGU reads 0 in its geglu —
+          -- an unresolved barrier/race when the gate/up scatter is skipped). See PERF_PLAN / commits.
+          if (← IO.getEnv "DG_GROUPEDDOWN").isNone then
             -- ISOLATION: gate/up grouped, down per-slot (the pre-grouped-down state)
             disp device (scatterGUB maxPadded (2*expFF) N nUsed) (("gathered",sGatheredGU)::("pos",sSortedPos)::("slot",sSortedSlot)::("dst",sGateUpAll)::List.nil) (maxPadded*2*expFF) (hash ("sctr",li))
             for e in [0:nUsed] do
@@ -987,7 +989,34 @@ def main (args : List String) : IO Unit := do
               | _     => Hesper.Layers.Linear.fusedQ8_0BatchExpertF32WarpGroupedKernel { inDim:=expFF, outDim:=dim } nExpert maxPadded
             disp2w device downGrpKernel (("weights",dnE)::("input",sGatheredEh)::("tileExpert",sTileExpert)::("output",sGatheredDown)::List.nil) dim (maxPadded/32) 32 (hash ("edg",li))
             disp device (scatterGUB maxPadded dim N nUsed) (("gathered",sGatheredDown)::("pos",sSortedPos)::("slot",sSortedSlot)::("dst",sDownAll)::List.nil) (maxPadded*dim) (hash ("sctrd",li))
-            disp device (waccAllB N dim nUsed) (("din",sDownAll)::("wts",sWts)::("acc",sMoeAcc)::List.nil) (N*dim) (hash ("waall",li))
+            if li == 0 && (← IO.getEnv "DG_MOEDIAG").isSome then
+              -- compute the per-slot down reference (into sDownEs) and compare to the grouped sDownAll
+              disp device (scatterGUB maxPadded (2*expFF) N nUsed) (("gathered",sGatheredGU)::("pos",sSortedPos)::("slot",sSortedSlot)::("dst",sGateUpAll)::List.nil) (maxPadded*2*expFF) (hash ("mdsc",li))
+              for e in [0:nUsed] do
+                let sEh := sEhs[e]?.getD sMoeN
+                disp device (gegluMergedB N expFF (e*N*2*expFF) (nUsed*N*2*expFF)) (("gu",sGateUpAll)::("eh",sEh)::List.nil) (N*expFF) (hash ("mdgm",li,e))
+                q80 device sEh N expFF (hash ("mdq",li,e))
+                let dk := match blk.ffn.down.quantFormat with
+                  | .Q5_0 => Hesper.Layers.Linear.fusedQ5_0BatchExpertF32WarpKernel { inDim:=expFF, outDim:=dim } nExpert N nUsed e
+                  | _     => Hesper.Layers.Linear.fusedQ8_0BatchExpertF32WarpKernel { inDim:=expFF, outDim:=dim } nExpert N nUsed e
+                disp2w device dk (("weights",dnE)::("input",sEh)::("idxs",sIdxs)::("output",(sDownEs[e]?.getD sMoeN))::List.nil) dim N 32 (hash ("mdd",li,e))
+              Hesper.GPUBackend.endBatch device
+              let gAll ← Hesper.Basic.bytesToFloatArray (← mapBufferRead device sDownAll 0 (nUsed*N*dim*4).toUSize)
+              let mut maxd := 0.0; let mut cnt := 0; let mut sumG := 0.0; let mut sumR := 0.0
+              for e in [0:nUsed] do
+                let ref ← Hesper.Basic.bytesToFloatArray (← mapBufferRead device (sDownEs[e]?.getD sMoeN) 0 (N*dim*4).toUSize)
+                for pos in [P:N] do
+                  for o in [0:dim] do
+                    let g := gAll.getD (e*N*dim + pos*dim + o) 0.0
+                    let r := ref.getD (pos*dim + o) 0.0
+                    sumG := sumG + g.abs; sumR := sumR + r.abs
+                    let d := (g - r).abs
+                    if d > maxd then maxd := d
+                    if d > 0.1 then cnt := cnt+1
+              IO.println s!"[moediag] grouped sDownAll vs per-slot down: maxDiff={maxd} nBad={cnt} | Σ|grouped|={sumG} Σ|ref|={sumR}"
+              Hesper.GPUBackend.beginBatch device
+            for e in [0:nUsed] do
+              disp device (waccB N dim e nUsed (e*N*dim) (nUsed*N*dim)) (("acc",sMoeAcc)::("din",sDownAll)::("wts",sWts)::List.nil) (N*dim) (hash ("wa",li,e))
         else do
           for e in [0:nUsed] do
             let sGateUp := sGateUps[e]?.getD sMoeN
