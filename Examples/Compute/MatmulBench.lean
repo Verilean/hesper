@@ -62,7 +62,10 @@ def benchShape (device : Device) (name : String) (M N K : Nat) : IO Float := do
   let floorCompMs := flops / peakFlops * 1000.0
   let floor := max floorMemMs floorCompMs
   let bound := if floorMemMs > floorCompMs then "MEM" else "COMPUTE"
-  IO.println s!"{name} [M={M} N={N} K={K}]: {ms} ms/iter, {gflops} GFLOPS ({100.0*gflops*1.0e9/peakFlops}% peak) | floor={floor}ms ({bound}: mem {floorMemMs} / comp {floorCompMs}) → {ms/floor}× above floor"
+  let gbs := bytes / (ms/1000.0) / 1.0e9
+  let compPct := 100.0*gflops*1.0e9/peakFlops
+  let memPct := 100.0*gbs/(peakBW/1.0e9)
+  IO.println s!"{name} [M={M} N={N} K={K}]: {ms}ms | compute {compPct}% ({gflops} GFLOPS) | memory {memPct}% ({gbs} GB/s) | {bound}-bound, {ms/floor}× above floor"
   pure ms
 
 /-- Golden correctness: known f32 W → GPU pack → f16 → reg-matmul, vs a CPU matmul. Tests the
@@ -145,6 +148,13 @@ def main : IO Unit := do
   let device ← getDevice inst
   checkCorrect device
   checkGroupedCorrect device
+  IO.println "=== SIZE SWEEP (square) — does efficiency climb toward 80% as size grows? ==="
+  let _ ← benchShape device "512^3 " 512 512 512
+  let _ ← benchShape device "1024^3" 1024 1024 1024
+  let _ ← benchShape device "2048^3" 2048 2048 2048
+  let _ ← benchShape device "3072^3" 3072 3072 3072
+  let _ ← benchShape device "4096^3" 4096 4096 4096
+  IO.println "=== forward shapes ==="
   -- per-shape time; then the per-step forward SUM (5 full-attn layers + 25 SWA + lm_head),
   -- = the integration ceiling: the real forward can't beat the sum of its matmul GPU times.
   let qF  ← benchShape device "QKV wQ (full) " 262 8192 2816
