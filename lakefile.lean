@@ -1393,6 +1393,11 @@ lean_exe «buffer-coherency-test» where
   supportInterpreter := false
   moreLinkArgs := stdLinkArgs
 
+lean_exe «grouped-down-test» where
+  root := `Examples.Compute.GroupedDownTest
+  supportInterpreter := false
+  moreLinkArgs := stdLinkArgs
+
 lean_exe «bitnet-validation» where
   root := `Tests.BitNetValidation
   supportInterpreter := false
