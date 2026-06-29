@@ -156,9 +156,13 @@ def getScaleMin (j : Nat)
 
     @param numElements Total number of elements to dequantize
 -/
-def dequantQ4KMKernel (numElements : Nat) : ShaderM Unit := do
+def dequantQ4KMKernel (numElements : Nat) (gridXWidth : Nat := 0) : ShaderM Unit := do
   let gid ← ShaderM.globalId
-  let idx := Exp.vec3X gid
+  -- 1D when gridXWidth=0; else 2D (idx = x + y*gridXWidth) so numElements/256 > the 65535
+  -- per-dimension workgroup limit can be covered by a single 2D dispatch.
+  let idx := if gridXWidth > 0
+    then Exp.add (Exp.vec3X gid) (Exp.mul (Exp.vec3Y gid) (Exp.litU32 gridXWidth))
+    else Exp.vec3X gid
 
   -- Bounds check
   let inBounds := Exp.lt idx (Exp.litU32 numElements)
