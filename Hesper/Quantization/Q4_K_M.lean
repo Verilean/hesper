@@ -452,6 +452,9 @@ def q8MatmulGroupedRegKernel (M N K nExpert : Nat) : ShaderM Unit := do
     let w ← ShaderM.readBuffer (ty := .scalar .u32) (n := bU32) "b" (Exp.shiftRight bo (Exp.litU32 2))
     pure (Exp.bitAnd (Exp.shiftRight w (Exp.mul (Exp.bitAnd bo (Exp.litU32 3)) (Exp.litU32 8))) (Exp.litU32 0xFF))
   let numKB := K / 32
+  -- NOTE: padding tiles (tileExpert ≥ nExpert) clamp e=nExpert-1 and compute garbage, but the grouped
+  -- scatter skips padding rows (only real tokens are scattered) so it's ignored. A kEnd-based skip
+  -- breaks WGSL barrier-uniformity (runtime loop bound) — not worth it; the scatter already drops them.
   ShaderM.loop (Exp.litU32 0) (Exp.litU32 numKB) (Exp.litU32 1) fun batchV => do
     let blkByte := Exp.mul batchV (Exp.litU32 34)
     -- COOPERATIVE: 32 threads each load ONE N-tile row's Q8_0 scale for this block → shared_d

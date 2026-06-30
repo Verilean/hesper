@@ -372,6 +372,18 @@ def benchWarpDown (device : Device) (dim expFF maxPadded nExpert : Nat) : IO Flo
   let kern := Hesper.Layers.Linear.fusedQ8_0BatchExpertF32WarpGroupedKernel { inDim:=expFF, outDim:=dim } nExpert maxPadded
   benchKernelMs device kern (("weights",w)::("input",inp)::("tileExpert",te)::("output",out)::List.nil) cfg
 
+/-- Bench the matrix-unit Q8_0 reg down (q8MatmulGroupedRegKernel) at the real down shape — to compare
+    CLEANLY against the warp-per-output kernel (the decode was too noisy to tell them apart). -/
+def benchQ8RegDown (device : Device) (dim expFF maxPadded nExpert : Nat) : IO Float := do
+  let M := maxPadded; let N := dim; let K := expFF
+  let rowByteStride := (K/32)*34
+  let bU32 := (nExpert*N*rowByteStride+3)/4
+  let a ← mkBuf device (M*K); let b ← mkBuf device bU32
+  let c ← mkBuf device (M*N); let te ← mkBuf device (M/32)
+  let cfg : Hesper.ExecConfig := { numWorkgroups := ((N+31)/32, (M+31)/32, 1), workgroupSize := {x:=128}, extensions := ["f16","chromium_experimental_subgroup_matrix"], diagnostics := [("off","chromium.subgroup_matrix_uniformity")] }
+  let kern := Hesper.Quantization.Q4_K_M.q8MatmulGroupedRegKernel M N K nExpert
+  benchKernelMs device kern (("a",a)::("b",b)::("c",c)::("tileExpert",te)::List.nil) cfg
+
 /-- ★ The automated headroom (余力) evaluator: micro-bench every forward matmul stage at its real shape,
     compute each stage's achievable floor from its FLOP, and rank by RECOVERABLE per-step time
     (= actual − achievable). This replaces the manual DG_SKIP / profile-and-guess loop: the worst
@@ -398,7 +410,10 @@ def forwardRoofline : IO Unit := do
   -- ACTUAL production MoE kernels (MMQ5 dp4a gate/up, warp-per-output down):
   let amge ← benchMMQ5GateUp device dim expFF maxPadded 128
   let amdn ← benchWarpDown device dim expFF maxPadded 128
+  let qrdn ← benchQ8RegDown device dim expFF maxPadded 128
+  let cmp := if qrdn < amdn then "FASTER" else "SLOWER"
   IO.println s!"  [ACTUAL] MoE g/up MMQ5 = {amge}ms/call (reg-floor {bmge}) | MoE down warp = {amdn}ms/call (reg-floor {bmdn}) → warp is {amdn/bmdn}× the reg-floor"
+  IO.println s!"  [DOWN VARIANTS] warp = {amdn}ms/call | q8 matrix-reg = {qrdn}ms/call (f16 reg-floor = {bmdn}) → reg is {amdn/qrdn}× {cmp} than warp"
   -- per-step aggregation: 5 full-attn layers + 25 SWA layers, 30 dense/MoE, lm_head separate.
   -- MoE kernels run at maxPadded=6208 but the decode sentinel-skips the padding tiles (~48% inactive),
   -- so the decode per-step MoE ≈ 0.52× the full-load bench. Apply that for decode-realistic absolute ms.
