@@ -288,7 +288,57 @@ def checkFusedQ8Correct (device : Device) : IO Unit := do
   let v := if bad==0 then "✅ fused Q8_0 reg CORRECT" else "❌ WRONG"
   IO.println s!"[fused-q8 M={M} N={N} K={K} nE={nE}] maxDiff={md} maxRel={maxRel} bad={bad}/{M*N} → {v}; sample m0={gpu.getD 0 0.0} m64={gpu.getD (64*N) 0.0}"
 
+/-- Golden at nE=128 with a HIGH expert (127) — the decode routes to all 128 experts, but checkFusedQ8Correct
+    only used nE=2 (low experts). If the q8 reg mis-addresses high-expert weights this fails (the routing-
+    dependent bug suspected from "Paris" passing but "planet" producing garbage). -/
+def checkFusedQ8HighExpert (device : Device) : IO Unit := do
+  let M := 128; let N := 32; let K := 64; let nE := 128
+  let bRows := nE * N
+  let scaleBits := #[0x3400, 0x3800, 0x3000, 0x3C00]
+  let scaleVal := #[0.25, 0.5, 0.125, 1.0]
+  let i8 := fun (r blk k : Nat) => let b := (r*7 + blk*11 + k*13) % 256; if b ≥ 128 then (b:Int) - 256 else (b:Int)
+  let mut bytes : ByteArray := ByteArray.empty
+  for r in [0:bRows] do
+   for blk in [0:K/32] do
+    let sb := scaleBits[(r+blk)%4]!
+    bytes := (bytes.push (UInt8.ofNat (sb % 256))).push (UInt8.ofNat (sb / 256))
+    for k in [0:32] do bytes := bytes.push (UInt8.ofNat (((r*7 + blk*11 + k*13) % 256)))
+  let qbuf ← mkBuf device ((bytes.size + 3) / 4); writeBuffer device qbuf 0 bytes
+  let wf := fun (row k : Nat) => (scaleVal[(row + k/32)%4]!) * (Float.ofInt (i8 row (k/32) (k%32)))
+  let af := fun (m k : Nat) => (((m*2+k) % 5 : Nat).toFloat) - 2.0
+  let mut aA : Array Float := #[]
+  for m in [0:M] do for k in [0:K] do aA := aA.push (af m k)
+  let aBuf ← mkBuf device (M*K); writeBuffer device aBuf 0 (← Hesper.Basic.floatArrayToBytes aA)
+  -- tiles 0,1 → expert 0 (low); tiles 2,3 → expert 127 (HIGH). The bug, if real, hits the expert-127 rows.
+  let expertOf := fun (t : Nat) => if t < 2 then 0 else 127
+  let teBuf ← mkBuf device (M/32)
+  let mut teB : ByteArray := ByteArray.empty
+  for t in [0:M/32] do teB := ((((teB.push ((expertOf t).toUInt8)).push 0).push 0).push 0)
+  writeBuffer device teBuf 0 teB
+  let cBuf ← mkBuf device (M*N)
+  let cfg : Hesper.ExecConfig := { numWorkgroups := ((N+31)/32, (M+31)/32, 1), workgroupSize := {x:=128}, extensions := ["f16","chromium_experimental_subgroup_matrix"], diagnostics := [("off","chromium.subgroup_matrix_uniformity")] }
+  let rr ← IO.mkRef none
+  Hesper.GPUBackend.executeWithConfigCached device (Hesper.Quantization.Q4_K_M.q8MatmulGroupedRegKernel M N K nE)
+    (("a",aBuf)::("b",qbuf)::("c",cBuf)::("tileExpert",teBuf)::List.nil) cfg 1 rr
+  let gpu ← Hesper.Basic.bytesToFloatArray (← mapBufferRead device cBuf 0 (M*N*4).toUSize)
+  let mut md := 0.0; let mut bad := 0; let mut badLo := 0; let mut badHi := 0
+  for m in [0:M] do for n in [0:N] do
+    let e := expertOf (m/32)
+    let mut g := 0.0
+    for k in [0:K] do g := g + (af m k) * (wf (e*N+n) k)
+    let rel := (gpu.getD (m*N+n) 0.0 - g).abs / (g.abs + 1.0)
+    if (gpu.getD (m*N+n) 0.0 - g).abs > md then md := (gpu.getD (m*N+n) 0.0 - g).abs
+    if rel > 0.02 then
+      bad := bad+1
+      if e == 0 then badLo := badLo+1 else badHi := badHi+1
+  let v := if bad==0 then "✅ high-expert CORRECT" else "❌ WRONG"
+  IO.println s!"[fused-q8 HIGH-EXPERT nE=128, experts 0 & 127] maxDiff={md} bad={bad} (lo-expert {badLo}, HI-expert {badHi}) → {v}"
+
 def main : IO Unit := do
+  if (← IO.getEnv "Q8HI").isSome then
+    let inst ← Hesper.init; let device ← getDevice inst
+    Examples.Compute.MatmulBench.checkFusedQ8HighExpert device
+    return
   IO.println "=== reg-matmul roofline micro-bench (DiffusionGemma forward shapes, M=262 tokens) ==="
   let inst ← Hesper.init
   let device ← getDevice inst

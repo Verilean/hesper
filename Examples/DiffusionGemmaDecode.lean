@@ -1210,6 +1210,11 @@ def main (args : List String) : IO Unit := do
             let scNx := min scWG 32768
             let scNy := (scWG + scNx - 1)/scNx
             disp2 device (scatterGUB maxPadded dim N nUsed (scNx*256)) (("gathered",sGatheredDown)::("pos",sSortedPos)::("slot",sSortedSlot)::("dst",sDownAll)::List.nil) scNx scNy (hash ("sctrd",li))
+            -- NOTE: the grouped-down chain (geglu→q80→down→scatter→wacc) is NUMERICALLY correct (DG_MOEDIAG
+            -- maxDiff 4e-6) but Dawn drops these no-wait flushes at batch scale → a routing-dependent RACE
+            -- ("Paris" passes, harder prompts → garbage). endBatch here fixes ONE link but the chain has
+            -- several races AND endBatch mid-batch is catastrophically expensive (3-4s/step) — so the grouped
+            -- reg/warp down is NOT usable; the per-slot down (default) avoids the long racy chain.
             Hesper.WGSL.Execute.flushBatch device   -- sync scatter→wacc
             if li == 0 && (← IO.getEnv "DG_MOEDIAG").isSome then
               -- compute the per-slot down reference (into sDownEs) and compare to the grouped sDownAll
