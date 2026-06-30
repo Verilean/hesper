@@ -929,6 +929,7 @@ def main (args : List String) : IO Unit := do
   let prof := (← IO.getEnv "DG_PROF").isSome
   let rAttn ← IO.mkRef (0:Nat); let rDense ← IO.mkRef (0:Nat)
   let rMoe ← IO.mkRef (0:Nat); let rRest ← IO.mkRef (0:Nat); let tPrev ← IO.mkRef (0:Nat)
+  let rMoeGrp ← IO.mkRef (0:Nat); let rMoeGU ← IO.mkRef (0:Nat)   -- MoE sub-timers: router+grouping / gate-up
   let rBattn ← IO.mkRef (0:Nat); let rAttnO ← IO.mkRef (0:Nat)   -- attention sub-phases: QK^T+softmax+V, and O-proj
   let rQkn ← IO.mkRef (0:Nat)   -- qk-norm + RoPE + v-norm (to split it from the Q/K/V matmuls)
   let pmark := fun (r : IO.Ref Nat) => do
@@ -939,7 +940,7 @@ def main (args : List String) : IO Unit := do
       tPrev.set n
       Hesper.GPUBackend.beginBatch device
   for step in [0:decodeSteps] do
-    if prof then rAttn.set 0; rDense.set 0; rMoe.set 0; rRest.set 0; rBattn.set 0; rAttnO.set 0; rQkn.set 0
+    if prof then rAttn.set 0; rDense.set 0; rMoe.set 0; rRest.set 0; rBattn.set 0; rAttnO.set 0; rQkn.set 0; rMoeGrp.set 0; rMoeGU.set 0
     let remaining := masked.foldl (fun acc b => if b then acc+1 else acc) 0
     if remaining > 0 then
       let t0 ← IO.monoMsNow
@@ -1096,6 +1097,7 @@ def main (args : List String) : IO Unit := do
             let _ := teA
             Hesper.GPUBackend.beginBatch device
           disp device (scatterRankB totalTok nExpert nUsed maxPadded) (("idxs",sIdxs)::("off",sExpertOffset)::("sp",sSortedPos)::("ss",sSortedSlot)::List.nil) totalTok (hash ("srkk",li))
+          pmark rMoeGrp   -- router + counting-sort grouping (clear/count/offsets/scatterRank)
           if moeRB then
             -- FUSED Q4_K reg-matmul gate/up: f32 gather + per-64 tileExpert + read guE Q4_K directly
             -- (in-kernel dequant, no f16 buffer). A=sGatheredF32 [maxPadded,dim], B=guE Q4_K, C=sGatheredGU.
@@ -1111,6 +1113,7 @@ def main (args : List String) : IO Unit := do
           -- large single encoder (Dawn-on-Metal drops an inter-pass barrier at scale); a no-wait
           -- submit + fresh encoder here keeps Dawn's barriers correct without a sync round-trip.
           Hesper.WGSL.Execute.flushBatch device
+          pmark rMoeGU   -- gather + gate/up matmul (MMQ5 or fused reg)
           if li == 0 && (← IO.getEnv "DG_GUDIAG").isSome then
             -- un-group the grouped gate/up + compute the per-slot reference, compare
             disp device (scatterGUB maxPadded (2*expFF) N nUsed) (("gathered",sGatheredGU)::("pos",sSortedPos)::("slot",sSortedSlot)::("dst",sGateUpAll)::List.nil) (maxPadded*2*expFF) (hash ("gudsc",li))
@@ -1225,7 +1228,7 @@ def main (args : List String) : IO Unit := do
         if li % lpb == lpb-1 || li == nLayers-1 then Hesper.GPUBackend.endBatch device
         let t := cur; cur := nxt; nxt := t
       if prof then
-        IO.println s!"[prof step {step}] qkv-mm={← rAttn.get}ms qknorm={← rQkn.get}ms battnB={← rBattn.get}ms attnO={← rAttnO.get}ms dense={← rDense.get}ms moe={← rMoe.get}ms rest={← rRest.get}ms"
+        IO.println s!"[prof step {step}] qkv-mm={← rAttn.get}ms qknorm={← rQkn.get}ms battnB={← rBattn.get}ms attnO={← rAttnO.get}ms dense={← rDense.get}ms | MoE[router+grp={← rMoeGrp.get} gateup={← rMoeGU.get} down+rest={← rMoe.get}] rest={← rRest.get}ms"
       let tFwd ← IO.monoMsNow
       if step == 0 && (← IO.getEnv "DG_LMDIAG").isSome then
         lmHeadDiag device model.inner.finalNorm model.inner.outputWeight cur dim cfg.vocabSize N P
