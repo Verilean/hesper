@@ -816,6 +816,10 @@ def main (args : List String) : IO Unit := do
   let skGU := (← IO.getEnv "DG_SKIP_GATEUP").isSome; let skGeg := (← IO.getEnv "DG_SKIP_GEGLU").isSome
   let skQ80 := (← IO.getEnv "DG_SKIP_Q80").isSome; let skDn := (← IO.getEnv "DG_SKIP_DOWN").isSome
   let skSc := (← IO.getEnv "DG_SKIP_SCATTER").isSome; let skWa := (← IO.getEnv "DG_SKIP_WACC").isSome
+  -- DG_MOEDOWNRB: tile the MoE down with the fused Q8_0 reg-matmul (matrix units) instead of the
+  -- warp-per-output kernel — the down was the biggest MoE cost (DG_SKIP: ~600ms, ~7× less efficient
+  -- per FLOP than the tiled gate/up). Uses the grouped down structure (geglu grouped → reg → scatter).
+  let moeDownRB := (← IO.getEnv "DG_MOEDOWNRB").isSome
   let padTo := 32   -- BM=32 fused reg aligns with the 32-pad grouping (no 64-pad penalty)
   let maxPadded := (((totalTok + padTo*nExpert) + (padTo-1))/padTo)*padTo
   let sSortedPos ← mkBuf device maxPadded
@@ -1146,7 +1150,7 @@ def main (args : List String) : IO Unit := do
           -- DEFAULT: gate/up grouped + per-slot down (CORRECT, "Paris", ~0.23s win). The TILED grouped
           -- down (DG_GROUPEDDOWN) is faster but currently emits 0 (sGatheredGU reads 0 in its geglu —
           -- an unresolved barrier/race when the gate/up scatter is skipped). See PERF_PLAN / commits.
-          if (← IO.getEnv "DG_GROUPEDDOWN").isNone then
+          if (← IO.getEnv "DG_GROUPEDDOWN").isNone && !moeDownRB then
             -- ISOLATION: gate/up grouped, down per-slot (the pre-grouped-down state)
             unless skSc do disp device (scatterGUB maxPadded (2*expFF) N nUsed) (("gathered",sGatheredGU)::("pos",sSortedPos)::("slot",sSortedSlot)::("dst",sGateUpAll)::List.nil) (maxPadded*2*expFF) (hash ("sctr",li))
             Hesper.WGSL.Execute.flushBatch device   -- flush gate/up scatter→geglu (no-wait split)
@@ -1163,13 +1167,18 @@ def main (args : List String) : IO Unit := do
           else do
             -- GROUPED down: geglu on the grouped gate/up → grouped down (tileExpert) → scatter → wacc
             disp device (gegluMergedB maxPadded expFF 0 (maxPadded*2*expFF)) (("gu",sGatheredGU)::("eh",sGatheredEh)::List.nil) (maxPadded*expFF) (hash ("gmg",li))
-            Hesper.WGSL.Execute.flushBatch device   -- geglu → in-place q80
-            q80 device sGatheredEh maxPadded expFF (hash ("qgeh",li))   -- match the per-slot Q8 rounding
-            let downGrpKernel := match blk.ffn.down.quantFormat with
-              | .Q5_0 => Hesper.Layers.Linear.fusedQ5_0BatchExpertF32WarpGroupedKernel { inDim:=expFF, outDim:=dim } nExpert maxPadded
-              | _     => Hesper.Layers.Linear.fusedQ8_0BatchExpertF32WarpGroupedKernel { inDim:=expFF, outDim:=dim } nExpert maxPadded
             Hesper.WGSL.Execute.flushBatch device
-            disp2w device downGrpKernel (("weights",dnE)::("input",sGatheredEh)::("tileExpert",sTileExpert)::("output",sGatheredDown)::List.nil) dim (maxPadded/32) 32 (hash ("edg",li))
+            if moeDownRB && blk.ffn.down.quantFormat != .Q5_0 then
+              -- TILED reg-matmul down (matrix units, in-kernel Q8_0 dequant); reads f32 geglu directly (no q80).
+              dispRB device (Hesper.Quantization.Q4_K_M.q8MatmulGroupedRegKernel maxPadded dim expFF nExpert)
+                (("a",sGatheredEh)::("b",dnE)::("c",sGatheredDown)::("tileExpert",sTileExpert)::List.nil) ((dim+31)/32) ((maxPadded+31)/32) (hash ("edrb",li))
+            else
+              q80 device sGatheredEh maxPadded expFF (hash ("qgeh",li))   -- match the per-slot Q8 rounding
+              let downGrpKernel := match blk.ffn.down.quantFormat with
+                | .Q5_0 => Hesper.Layers.Linear.fusedQ5_0BatchExpertF32WarpGroupedKernel { inDim:=expFF, outDim:=dim } nExpert maxPadded
+                | _     => Hesper.Layers.Linear.fusedQ8_0BatchExpertF32WarpGroupedKernel { inDim:=expFF, outDim:=dim } nExpert maxPadded
+              Hesper.WGSL.Execute.flushBatch device
+              disp2w device downGrpKernel (("weights",dnE)::("input",sGatheredEh)::("tileExpert",sTileExpert)::("output",sGatheredDown)::List.nil) dim (maxPadded/32) 32 (hash ("edg",li))
             Hesper.WGSL.Execute.flushBatch device
             -- down scatter is maxPadded*dim = ~17.5M elems → ~68k workgroups > 65535 limit (silently
             -- dropped → sDownAll stayed 0). Use a 2D grid: flat = gid.x + gid.y*(nx*256).

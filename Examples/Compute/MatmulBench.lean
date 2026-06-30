@@ -240,11 +240,59 @@ def checkFusedQ4KCorrect (device : Device) : IO Unit := do
   let v := if bad==0 then "✅ fused Q4_K reg CORRECT (f16-round tol)" else "❌ WRONG"
   IO.println s!"[fused-q4k M={M} N={N} K={K} nE={nE}] maxDiff={md} maxRel={maxRel} bad(rel>2%)={bad}/{M*N} → {v}; sample m0={gpu.getD 0 0.0} m64={gpu.getD (64*N) 0.0}"
 
+/-- Golden for the fused Q8_0 reg down kernel. Q8_0 = 34 bytes/block (f16 scale + 32 int8); dequant is
+    just scale·int8, so we build known bytes (exact-f16 scales) and compute the reference directly. -/
+def checkFusedQ8Correct (device : Device) : IO Unit := do
+  let M := 128; let N := 32; let K := 64; let nE := 2     -- K=64 ⇒ 2 Q8_0 blocks/row
+  let bRows := nE * N
+  let scaleBits := #[0x3400, 0x3800, 0x3000, 0x3C00]   -- 0.25, 0.5, 0.125, 1.0 (exact f16)
+  let scaleVal := #[0.25, 0.5, 0.125, 1.0]
+  let i8 := fun (r blk k : Nat) => let b := (r*7 + blk*11 + k*13) % 256; if b ≥ 128 then (b:Int) - 256 else (b:Int)
+  let mut bytes : ByteArray := ByteArray.empty
+  for r in [0:bRows] do
+   for blk in [0:K/32] do
+    let sb := scaleBits[(r+blk)%4]!
+    bytes := (bytes.push (UInt8.ofNat (sb % 256))).push (UInt8.ofNat (sb / 256))
+    for k in [0:32] do bytes := bytes.push (UInt8.ofNat (((r*7 + blk*11 + k*13) % 256)))
+  let qbuf ← mkBuf device ((bytes.size + 3) / 4)
+  writeBuffer device qbuf 0 bytes
+  let wf := fun (row k : Nat) => (scaleVal[(row + k/32)%4]!) * (Float.ofInt (i8 row (k/32) (k%32)))
+  let af := fun (m k : Nat) => (((m*2+k) % 5 : Nat).toFloat) - 2.0
+  let mut aA : Array Float := #[]
+  for m in [0:M] do for k in [0:K] do aA := aA.push (af m k)
+  let aBuf ← mkBuf device (M*K); writeBuffer device aBuf 0 (← Hesper.Basic.floatArrayToBytes aA)
+  let teBuf ← mkBuf device (M/32)
+  let mut teB : ByteArray := ByteArray.empty
+  for t in [0:M/32] do teB := ((((teB.push ((t/2).toUInt8)).push 0).push 0).push 0)
+  writeBuffer device teBuf 0 teB
+  let cBuf ← mkBuf device (M*N)
+  let cfg : Hesper.ExecConfig := {
+    numWorkgroups := ((N+31)/32, (M+31)/32, 1), workgroupSize := {x:=128},
+    extensions := ["f16","chromium_experimental_subgroup_matrix"],
+    diagnostics := [("off","chromium.subgroup_matrix_uniformity")] }
+  let rr ← IO.mkRef none
+  Hesper.GPUBackend.executeWithConfigCached device (Hesper.Quantization.Q4_K_M.q8MatmulGroupedRegKernel M N K nE)
+    (("a",aBuf)::("b",qbuf)::("c",cBuf)::("tileExpert",teBuf)::List.nil) cfg 1 rr
+  let gpu ← Hesper.Basic.bytesToFloatArray (← mapBufferRead device cBuf 0 (M*N*4).toUSize)
+  let mut md := 0.0; let mut maxRel := 0.0; let mut bad := 0
+  for m in [0:M] do for n in [0:N] do
+    let e := m/64
+    let mut g := 0.0
+    for k in [0:K] do g := g + (af m k) * (wf (e*N+n) k)
+    let d := (gpu.getD (m*N+n) 0.0 - g).abs
+    let rel := d / (g.abs + 1.0)
+    if d > md then md := d
+    if rel > maxRel then maxRel := rel
+    if rel > 0.02 then bad := bad+1
+  let v := if bad==0 then "✅ fused Q8_0 reg CORRECT" else "❌ WRONG"
+  IO.println s!"[fused-q8 M={M} N={N} K={K} nE={nE}] maxDiff={md} maxRel={maxRel} bad={bad}/{M*N} → {v}; sample m0={gpu.getD 0 0.0} m64={gpu.getD (64*N) 0.0}"
+
 def main : IO Unit := do
   IO.println "=== reg-matmul roofline micro-bench (DiffusionGemma forward shapes, M=262 tokens) ==="
   let inst ← Hesper.init
   let device ← getDevice inst
   checkFusedQ4KCorrect device
+  checkFusedQ8Correct device
   benchPeak device
   checkCorrect device
   checkGroupedCorrect device

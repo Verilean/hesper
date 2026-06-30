@@ -414,4 +414,105 @@ def q4kMatmulGroupedRegKernel (M N K nExpert : Nat) : ShaderM Unit := do
       let off := Exp.add (Exp.mul row (Exp.litU32 N)) col
       ShaderM.storeMatrixResult (st := .f32) (m := 8) (n := 8) "Cx" (mt * 2 + nt) "c" off (Exp.litU32 N)
 
+/-- FUSED Q8_0-dequant grouped reg-matmul (MoE DOWN): the matrix-unit analogue of the warp-per-output
+    down kernel (which is ~7× less efficient/FLOP than the tiled gate/up — the real MoE bottleneck per
+    the DG_SKIP measurement). Reads the expert down weights as Q8_0 bytes DIRECTLY and dequants to f16
+    in the B-load. A = f32 [M,K] grouped geglu output; B = Q8_0 bytes for [nExpert·N, K] (34 bytes/block
+    = f16 scale + 32 int8); C = f32 [M,N]; tileExpert[M/32] picks the expert. BK=32 = exactly one Q8_0
+    block ⇒ one scale per K-tile (no sub-blocks — simpler than Q4_K). A-load/MMA/store identical to the
+    Q4_K reg (BM=32); only the B-load differs. Grid (N/32, M/32)×128. -/
+def q8MatmulGroupedRegKernel (M N K nExpert : Nat) : ShaderM Unit := do
+  let wid ← ShaderM.workgroupId
+  let lid ← ShaderM.localId
+  let tid := Exp.vec3X lid
+  let rowByteStride := (K / 32) * 34       -- bytes per weight row: (K/32) Q8_0 blocks × 34 bytes
+  let bRows := nExpert * N
+  let bU32 := (bRows * rowByteStride + 3) / 4
+  let _a ← ShaderM.declareInputBuffer "a" (.array (.scalar .f32) (M * K))
+  let _b ← ShaderM.declareInputBuffer "b" (.array (.scalar .u32) bU32)
+  let _c ← ShaderM.declareOutputBuffer "c" (.array (.scalar .f32) (M * N))
+  let _te ← ShaderM.declareInputBuffer "tileExpert" (.array (.scalar .u32) (M / 32))
+  ShaderM.sharedNamed "shared_A" (.array (.scalar .f16) (32 * 32))
+  ShaderM.sharedNamed "shared_B" (.array (.scalar .f16) (32 * 32))
+  ShaderM.sharedNamed "shared_d" (.array (.scalar .f32) 32)   -- per-row Q8_0 scale for this K-tile's block
+  ShaderM.declareMatrixLeftArray  "Ax" .f16 8 8 2 Exp.subgroupMatrixZeroLeft
+  ShaderM.declareMatrixRightArray "Bx" .f16 8 8 2 Exp.subgroupMatrixZeroRight
+  ShaderM.declareMatrixResultArray "Cx" .f32 8 8 4 Exp.subgroupMatrixZeroResult
+  let rowBase := Exp.mul (Exp.vec3Y wid) (Exp.litU32 32)
+  let colBase := Exp.mul (Exp.vec3X wid) (Exp.litU32 32)
+  let sgitg := Exp.div tid (Exp.litU32 32)
+  let sgRow := Exp.mod sgitg (Exp.litU32 2)
+  let sgCol := Exp.div sgitg (Exp.litU32 2)
+  let mOff := Exp.mul sgRow (Exp.litU32 16)
+  let nOff := Exp.mul sgCol (Exp.litU32 16)
+  let teRaw ← ShaderM.readBuffer (ty := .scalar .u32) (n := M / 32) "tileExpert" (Exp.vec3Y wid)
+  let e := Exp.select (Exp.lt teRaw (Exp.litU32 nExpert)) teRaw (Exp.litU32 (nExpert - 1))
+  let weightRowOffsetE := Exp.mul e (Exp.litU32 N)
+  let rdByte := fun (bo : Exp (.scalar .u32)) => do
+    let w ← ShaderM.readBuffer (ty := .scalar .u32) (n := bU32) "b" (Exp.shiftRight bo (Exp.litU32 2))
+    pure (Exp.bitAnd (Exp.shiftRight w (Exp.mul (Exp.bitAnd bo (Exp.litU32 3)) (Exp.litU32 8))) (Exp.litU32 0xFF))
+  let numKB := K / 32
+  ShaderM.loop (Exp.litU32 0) (Exp.litU32 numKB) (Exp.litU32 1) fun batchV => do
+    let blkByte := Exp.mul batchV (Exp.litU32 34)
+    -- COOPERATIVE: 32 threads each load ONE N-tile row's Q8_0 scale for this block → shared_d
+    ShaderM.if_ (Exp.lt tid (Exp.litU32 32)) (do
+      let row := Exp.add (Exp.add weightRowOffsetE colBase) tid
+      let bb := Exp.add (Exp.mul row (Exp.litU32 rowByteStride)) blkByte
+      let lo ← rdByte bb
+      let hi ← rdByte (Exp.add bb (Exp.litU32 1))
+      let d := fp16ToF32 (Exp.add lo (Exp.mul hi (Exp.litU32 256)))
+      ShaderM.writeWorkgroup (ty := .scalar .f32) "shared_d" tid d) (pure ())
+    ShaderM.barrier
+    -- A-load [32,32] f16
+    for s in [0:8] do
+      let idx := Exp.add tid (Exp.litU32 (s * 128))
+      let m := Exp.div idx (Exp.litU32 32)
+      let k := Exp.mod idx (Exp.litU32 32)
+      let aIdx := Exp.add (Exp.mul (Exp.add rowBase m) (Exp.litU32 K)) (Exp.add (Exp.mul batchV (Exp.litU32 32)) k)
+      let xf32 ← ShaderM.readBuffer (ty := .scalar .f32) (n := M * K) "a" aIdx
+      let blk := Exp.add (Exp.mul (Exp.div m (Exp.litU32 8)) (Exp.litU32 4)) (Exp.div k (Exp.litU32 8))
+      let within := Exp.add (Exp.mul (Exp.mod m (Exp.litU32 8)) (Exp.litU32 8)) (Exp.mod k (Exp.litU32 8))
+      ShaderM.writeWorkgroup (ty := .scalar .f16) "shared_A" (Exp.add (Exp.mul blk (Exp.litU32 64)) within) (Exp.toF16 xf32)
+    -- B-load: Q8_0 dequant (scale from shared_d, two int8 quants per thread)
+    for s in [0:4] do
+      let u := Exp.add tid (Exp.litU32 (s * 128))
+      let n := Exp.div u (Exp.litU32 16)
+      let kpair := Exp.mod u (Exp.litU32 16)
+      let row := Exp.add (Exp.add weightRowOffsetE colBase) n
+      let bb := Exp.add (Exp.mul row (Exp.litU32 rowByteStride)) blkByte
+      let d ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := 32) "shared_d" n
+      let k0 := Exp.mul kpair (Exp.litU32 2)
+      let deq := fun (qb : Exp (.scalar .u32)) =>
+        Exp.mul d (Exp.sub (Exp.toF32 qb) (Exp.mul (Exp.litF32 256.0) (Exp.toF32 (Exp.shiftRight qb (Exp.litU32 7)))))
+      let q0b ← rdByte (Exp.add bb (Exp.add (Exp.litU32 2) k0))
+      let q1b ← rdByte (Exp.add bb (Exp.add (Exp.litU32 3) k0))
+      let y0 := deq q0b
+      let y1 := deq q1b
+      let ktile := Exp.div k0 (Exp.litU32 8)
+      let kr := Exp.mod k0 (Exp.litU32 8)
+      let blkB := Exp.add (Exp.mul ktile (Exp.litU32 4)) (Exp.div n (Exp.litU32 8))
+      let baseB := Exp.add (Exp.mul blkB (Exp.litU32 64)) (Exp.mod n (Exp.litU32 8))
+      ShaderM.writeWorkgroup (ty := .scalar .f16) "shared_B" (Exp.add baseB (Exp.mul kr (Exp.litU32 8))) (Exp.toF16 y0)
+      ShaderM.writeWorkgroup (ty := .scalar .f16) "shared_B" (Exp.add baseB (Exp.mul (Exp.add kr (Exp.litU32 1)) (Exp.litU32 8))) (Exp.toF16 y1)
+    ShaderM.barrier
+    for k8 in [0:4] do
+      for mt in [0:2] do
+        let mtileG := Exp.add (Exp.mul sgRow (Exp.litU32 2)) (Exp.litU32 mt)
+        let blkA := Exp.add (Exp.mul mtileG (Exp.litU32 4)) (Exp.litU32 k8)
+        ShaderM.loadMatrixLeft (st := .f16) (m := 8) (k := 8) "Ax" mt "shared_A" (Exp.mul blkA (Exp.litU32 64)) (Exp.litU32 8)
+      for nt in [0:2] do
+        let ntileG := Exp.add (Exp.mul sgCol (Exp.litU32 2)) (Exp.litU32 nt)
+        let blkB := Exp.add (Exp.mul (Exp.litU32 (k8 * 4)) (Exp.litU32 1)) ntileG
+        ShaderM.loadMatrixRight (st := .f16) (k := 8) (n := 8) "Bx" nt "shared_B" (Exp.mul blkB (Exp.litU32 64)) (Exp.litU32 8)
+      for mt in [0:2] do
+        for nt in [0:2] do
+          ShaderM.matrixMultiplyAccumulateMixed (inSt := .f16) (outSt := .f32) (m := 8) (k := 8) (n := 8) "Cx" (mt * 2 + nt) "Ax" mt "Bx" nt
+    ShaderM.barrier
+  for mt in [0:2] do
+    for nt in [0:2] do
+      let row := Exp.add (Exp.add rowBase mOff) (Exp.litU32 (mt * 8))
+      let col := Exp.add (Exp.add colBase nOff) (Exp.litU32 (nt * 8))
+      let off := Exp.add (Exp.mul row (Exp.litU32 N)) col
+      ShaderM.storeMatrixResult (st := .f32) (m := 8) (n := 8) "Cx" (mt * 2 + nt) "c" off (Exp.litU32 N)
+
 end Hesper.Quantization.Q4_K_M
