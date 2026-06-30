@@ -522,4 +522,127 @@ def q8MatmulGroupedRegKernel (M N K nExpert : Nat) : ShaderM Unit := do
       let off := Exp.add (Exp.mul row (Exp.litU32 N)) col
       ShaderM.storeMatrixResult (st := .f32) (m := 8) (n := 8) "Cx" (mt * 2 + nt) "c" off (Exp.litU32 N)
 
+/-- FUSED geglu + Q8_0 down matmul + scatter in ONE kernel — removes the inter-pass flushes
+    (geglu→q80→down→scatter) that Dawn drops at batch scale (the grouped-down RACE). Reads sGatheredGU
+    (grouped gate/up [maxPadded, 2·expFF]), computes the tanh-GELU geglu on-the-fly into the A-tile, runs
+    the matrix-reg Q8_0 down matmul, stores the 32×32 result tile to shared, then scatters each row to
+    sDownAll via pos/slot (padding rows = slot≥nUsed are skipped). Only fused→wacc stays a sync point. -/
+def q8FusedGegluDownScatterKernel (maxPadded dim expFF nExpert nUsed nTok : Nat) : ShaderM Unit := do
+  let M := maxPadded; let N := dim; let K := expFF
+  let wid ← ShaderM.workgroupId
+  let lid ← ShaderM.localId
+  let tid := Exp.vec3X lid
+  let rowByteStride := (K / 32) * 34
+  let bU32 := (nExpert * N * rowByteStride + 3) / 4
+  let guSize := M * 2 * K
+  let _gu ← ShaderM.declareInputBuffer "gu" (.array (.scalar .f32) guSize)
+  let _b ← ShaderM.declareInputBuffer "b" (.array (.scalar .u32) bU32)
+  let _te ← ShaderM.declareInputBuffer "tileExpert" (.array (.scalar .u32) (M / 32))
+  let _pos ← ShaderM.declareInputBuffer "pos" (.array (.scalar .u32) M)
+  let _slot ← ShaderM.declareInputBuffer "slot" (.array (.scalar .u32) M)
+  let _dst ← ShaderM.declareOutputBuffer "dst" (.array (.scalar .f32) (nUsed * nTok * N))
+  ShaderM.sharedNamed "shared_A" (.array (.scalar .f16) (32 * 32))
+  ShaderM.sharedNamed "shared_B" (.array (.scalar .f16) (32 * 32))
+  ShaderM.sharedNamed "shared_d" (.array (.scalar .f32) 32)
+  ShaderM.sharedNamed "shared_C" (.array (.scalar .f32) (32 * 32))
+  ShaderM.declareMatrixLeftArray  "Ax" .f16 8 8 2 Exp.subgroupMatrixZeroLeft
+  ShaderM.declareMatrixRightArray "Bx" .f16 8 8 2 Exp.subgroupMatrixZeroRight
+  ShaderM.declareMatrixResultArray "Cx" .f32 8 8 4 Exp.subgroupMatrixZeroResult
+  let rowBase := Exp.mul (Exp.vec3Y wid) (Exp.litU32 32)
+  let colBase := Exp.mul (Exp.vec3X wid) (Exp.litU32 32)
+  let sgitg := Exp.div tid (Exp.litU32 32)
+  let sgRow := Exp.mod sgitg (Exp.litU32 2)
+  let sgCol := Exp.div sgitg (Exp.litU32 2)
+  let mOff := Exp.mul sgRow (Exp.litU32 16)
+  let nOff := Exp.mul sgCol (Exp.litU32 16)
+  let teRaw ← ShaderM.readBuffer (ty := .scalar .u32) (n := M / 32) "tileExpert" (Exp.vec3Y wid)
+  let e := Exp.select (Exp.lt teRaw (Exp.litU32 nExpert)) teRaw (Exp.litU32 (nExpert - 1))
+  let weightRowOffsetE := Exp.mul e (Exp.litU32 N)
+  let rdByte := fun (bo : Exp (.scalar .u32)) => do
+    let w ← ShaderM.readBuffer (ty := .scalar .u32) (n := bU32) "b" (Exp.shiftRight bo (Exp.litU32 2))
+    pure (Exp.bitAnd (Exp.shiftRight w (Exp.mul (Exp.bitAnd bo (Exp.litU32 3)) (Exp.litU32 8))) (Exp.litU32 0xFF))
+  let numKB := K / 32
+  ShaderM.loop (Exp.litU32 0) (Exp.litU32 numKB) (Exp.litU32 1) fun batchV => do
+    let blkByte := Exp.mul batchV (Exp.litU32 34)
+    ShaderM.if_ (Exp.lt tid (Exp.litU32 32)) (do
+      let row := Exp.add (Exp.add weightRowOffsetE colBase) tid
+      let bb := Exp.add (Exp.mul row (Exp.litU32 rowByteStride)) blkByte
+      let lo ← rdByte bb
+      let hi ← rdByte (Exp.add bb (Exp.litU32 1))
+      let d := fp16ToF32 (Exp.add lo (Exp.mul hi (Exp.litU32 256)))
+      ShaderM.writeWorkgroup (ty := .scalar .f32) "shared_d" tid d) (pure ())
+    ShaderM.barrier
+    -- A-load: geglu(gu) on-the-fly → shared_A (tanh-GELU, matches gegluMergedB)
+    for s in [0:8] do
+      let idx := Exp.add tid (Exp.litU32 (s * 128))
+      let m := Exp.div idx (Exp.litU32 32)
+      let k := Exp.mod idx (Exp.litU32 32)
+      let row := Exp.add rowBase m
+      let kGlobal := Exp.add (Exp.mul batchV (Exp.litU32 32)) k
+      let gbase := Exp.mul row (Exp.litU32 (2 * K))
+      let gate ← ShaderM.readBuffer (ty := .scalar .f32) (n := guSize) "gu" (Exp.add gbase kGlobal)
+      let up ← ShaderM.readBuffer (ty := .scalar .f32) (n := guSize) "gu" (Exp.add (Exp.add gbase kGlobal) (Exp.litU32 K))
+      let g3 := Exp.mul gate (Exp.mul gate gate)
+      let inner := Exp.mul (Exp.litF32 0.7978845608) (Exp.add gate (Exp.mul (Exp.litF32 0.044715) g3))
+      let iC := Exp.max (Exp.litF32 (-10.0)) (Exp.min (Exp.litF32 10.0) inner)
+      let gl := Exp.mul (Exp.mul (Exp.litF32 0.5) gate) (Exp.add (Exp.litF32 1.0) (Exp.tanh iC))
+      let eh := Exp.mul gl up
+      let blk := Exp.add (Exp.mul (Exp.div m (Exp.litU32 8)) (Exp.litU32 4)) (Exp.div k (Exp.litU32 8))
+      let within := Exp.add (Exp.mul (Exp.mod m (Exp.litU32 8)) (Exp.litU32 8)) (Exp.mod k (Exp.litU32 8))
+      ShaderM.writeWorkgroup (ty := .scalar .f16) "shared_A" (Exp.add (Exp.mul blk (Exp.litU32 64)) within) (Exp.toF16 eh)
+    for s in [0:4] do
+      let u := Exp.add tid (Exp.litU32 (s * 128))
+      let n := Exp.div u (Exp.litU32 16)
+      let kpair := Exp.mod u (Exp.litU32 16)
+      let row := Exp.add (Exp.add weightRowOffsetE colBase) n
+      let bb := Exp.add (Exp.mul row (Exp.litU32 rowByteStride)) blkByte
+      let d ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := 32) "shared_d" n
+      let k0 := Exp.mul kpair (Exp.litU32 2)
+      let deq := fun (qb : Exp (.scalar .u32)) =>
+        Exp.mul d (Exp.sub (Exp.toF32 qb) (Exp.mul (Exp.litF32 256.0) (Exp.toF32 (Exp.shiftRight qb (Exp.litU32 7)))))
+      let q0b ← rdByte (Exp.add bb (Exp.add (Exp.litU32 2) k0))
+      let q1b ← rdByte (Exp.add bb (Exp.add (Exp.litU32 3) k0))
+      let y0 := deq q0b
+      let y1 := deq q1b
+      let ktile := Exp.div k0 (Exp.litU32 8)
+      let kr := Exp.mod k0 (Exp.litU32 8)
+      let blkB := Exp.add (Exp.mul ktile (Exp.litU32 4)) (Exp.div n (Exp.litU32 8))
+      let baseB := Exp.add (Exp.mul blkB (Exp.litU32 64)) (Exp.mod n (Exp.litU32 8))
+      ShaderM.writeWorkgroup (ty := .scalar .f16) "shared_B" (Exp.add baseB (Exp.mul kr (Exp.litU32 8))) (Exp.toF16 y0)
+      ShaderM.writeWorkgroup (ty := .scalar .f16) "shared_B" (Exp.add baseB (Exp.mul (Exp.add kr (Exp.litU32 1)) (Exp.litU32 8))) (Exp.toF16 y1)
+    ShaderM.barrier
+    for k8 in [0:4] do
+      for mt in [0:2] do
+        let mtileG := Exp.add (Exp.mul sgRow (Exp.litU32 2)) (Exp.litU32 mt)
+        let blkA := Exp.add (Exp.mul mtileG (Exp.litU32 4)) (Exp.litU32 k8)
+        ShaderM.loadMatrixLeft (st := .f16) (m := 8) (k := 8) "Ax" mt "shared_A" (Exp.mul blkA (Exp.litU32 64)) (Exp.litU32 8)
+      for nt in [0:2] do
+        let ntileG := Exp.add (Exp.mul sgCol (Exp.litU32 2)) (Exp.litU32 nt)
+        let blkB := Exp.add (Exp.mul (Exp.litU32 (k8 * 4)) (Exp.litU32 1)) ntileG
+        ShaderM.loadMatrixRight (st := .f16) (k := 8) (n := 8) "Bx" nt "shared_B" (Exp.mul blkB (Exp.litU32 64)) (Exp.litU32 8)
+      for mt in [0:2] do
+        for nt in [0:2] do
+          ShaderM.matrixMultiplyAccumulateMixed (inSt := .f16) (outSt := .f32) (m := 8) (k := 8) (n := 8) "Cx" (mt * 2 + nt) "Ax" mt "Bx" nt
+    ShaderM.barrier
+  -- store the 32×32 result tile to shared_C
+  for mt in [0:2] do
+    for nt in [0:2] do
+      let rOff := Exp.add mOff (Exp.litU32 (mt * 8))
+      let cOff := Exp.add nOff (Exp.litU32 (nt * 8))
+      ShaderM.storeMatrixResult (st := .f32) (m := 8) (n := 8) "Cx" (mt * 2 + nt) "shared_C" (Exp.add (Exp.mul rOff (Exp.litU32 32)) cOff) (Exp.litU32 32)
+  ShaderM.barrier
+  -- scatter shared_C [32,32] → dst[slot, pos, col]; skip padding (slot ≥ nUsed)
+  for s in [0:8] do
+    let idx := Exp.add tid (Exp.litU32 (s * 128))
+    let r := Exp.div idx (Exp.litU32 32)
+    let c := Exp.mod idx (Exp.litU32 32)
+    let rowGlobal := Exp.add rowBase r
+    let slotR ← ShaderM.readBuffer (ty := .scalar .u32) (n := M) "slot" rowGlobal
+    ShaderM.if_ (Exp.lt slotR (Exp.litU32 nUsed)) (do
+      let posR ← ShaderM.readBuffer (ty := .scalar .u32) (n := M) "pos" rowGlobal
+      let v ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := 32 * 32) "shared_C" (Exp.add (Exp.mul r (Exp.litU32 32)) c)
+      let colGlobal := Exp.add colBase c
+      let dstIdx := Exp.add (Exp.add (Exp.mul slotR (Exp.litU32 (nTok * N))) (Exp.mul posR (Exp.litU32 N))) colGlobal
+      ShaderM.writeBuffer (ty := .scalar .f32) "dst" dstIdx v) (pure ())
+
 end Hesper.Quantization.Q4_K_M
