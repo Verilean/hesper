@@ -1177,8 +1177,14 @@ def main (args : List String) : IO Unit := do
               unless skDn do disp2w device downExpKernel (("weights",dnE)::("input",sEh)::("idxs",sIdxs)::("output",sDownE)::List.nil) dim N 32 (hash ("ed",li,e))
               unless skWa do disp device (waccB N dim e nUsed) (("acc",sMoeAcc)::("din",sDownE)::("wts",sWts)::List.nil) (N*dim) (hash ("wa",li,e))
           else do
-            -- GROUPED down: geglu on the grouped gate/up → grouped down (tileExpert) → scatter → wacc
-            disp device (gegluMergedB maxPadded expFF 0 (maxPadded*2*expFF)) (("gu",sGatheredGU)::("eh",sGatheredEh)::List.nil) (maxPadded*expFF) (hash ("gmg",li))
+            -- GROUPED down: the FUSED single-kernel (geglu+down+scatter in one dispatch — no inter-pass
+            -- flushes → no Dawn race, DG_MOEDOWNFUSED) OR the staged geglu→down→scatter chain.
+            let moeDownFused := (← IO.getEnv "DG_MOEDOWNFUSED").isSome && blk.ffn.down.quantFormat == .Q8_0
+            if moeDownFused then
+              dispRB device (Hesper.Quantization.Q4_K_M.q8FusedGegluDownScatterKernel maxPadded dim expFF nExpert nUsed N)
+                (("gu",sGatheredGU)::("b",dnE)::("tileExpert",sTileExpert)::("pos",sSortedPos)::("slot",sSortedSlot)::("dst",sDownAll)::List.nil) ((dim+31)/32) ((maxPadded+31)/32) (hash ("fdg",li))
+            else
+              disp device (gegluMergedB maxPadded expFF 0 (maxPadded*2*expFF)) (("gu",sGatheredGU)::("eh",sGatheredEh)::List.nil) (maxPadded*expFF) (hash ("gmg",li))
             Hesper.WGSL.Execute.flushBatch device
             if li == 0 && (← IO.getEnv "DG_MOEDOWNDIAG").isSome then
               Hesper.GPUBackend.endBatch device
@@ -1187,7 +1193,8 @@ def main (args : List String) : IO Unit := do
               for i in [0:maxPadded*expFF] do let v := (eh.getD i 0.0).abs; if v > mx then mx := v
               IO.println s!"[moedowndiag] max|geglu A (down input)| = {mx}  (f16 max = 65504 → overflow if larger)"
               Hesper.GPUBackend.beginBatch device
-            if moeDownRB && blk.ffn.down.quantFormat != .Q5_0 then
+            if moeDownFused then pure ()   -- the fused kernel already did geglu+down+scatter → sDownAll
+            else if moeDownRB && blk.ffn.down.quantFormat != .Q5_0 then
               -- TILED reg-matmul down (matrix units, in-kernel Q8_0 dequant). The q80 round-trip both matches
               -- the warp's Q8 rounding AND acts as the geglu→down sync (its in-place read of sGatheredEh forces
               -- the geglu to complete — the plain flushBatch is dropped by Dawn in the long grouped batch).
@@ -1209,13 +1216,21 @@ def main (args : List String) : IO Unit := do
             let scWG := (scN + 255)/256
             let scNx := min scWG 32768
             let scNy := (scWG + scNx - 1)/scNx
-            disp2 device (scatterGUB maxPadded dim N nUsed (scNx*256)) (("gathered",sGatheredDown)::("pos",sSortedPos)::("slot",sSortedSlot)::("dst",sDownAll)::List.nil) scNx scNy (hash ("sctrd",li))
+            -- when fused, sDownAll is already written by the fused kernel — skip the staged scatter.
+            unless moeDownFused do
+              disp2 device (scatterGUB maxPadded dim N nUsed (scNx*256)) (("gathered",sGatheredDown)::("pos",sSortedPos)::("slot",sSortedSlot)::("dst",sDownAll)::List.nil) scNx scNy (hash ("sctrd",li))
             -- NOTE: the grouped-down chain (geglu→q80→down→scatter→wacc) is NUMERICALLY correct (DG_MOEDIAG
             -- maxDiff 4e-6) but Dawn drops these no-wait flushes at batch scale → a routing-dependent RACE
             -- ("Paris" passes, harder prompts → garbage). endBatch here fixes ONE link but the chain has
             -- several races AND endBatch mid-batch is catastrophically expensive (3-4s/step) — so the grouped
             -- reg/warp down is NOT usable; the per-slot down (default) avoids the long racy chain.
-            Hesper.WGSL.Execute.flushBatch device   -- sync scatter→wacc
+            -- fused→wacc: the no-wait flush is dropped by Dawn for the big fused dispatch (the wacc reads
+            -- sDownAll partial → garbage). A real barrier (endBatch) is the only reliable sync (cost TBD).
+            if moeDownFused then
+              Hesper.GPUBackend.endBatch device
+              Hesper.GPUBackend.beginBatch device
+            else
+              Hesper.WGSL.Execute.flushBatch device   -- sync scatter→wacc
             if li == 0 && (← IO.getEnv "DG_MOEDIAG").isSome then
               -- compute the per-slot down reference (into sDownEs) and compare to the grouped sDownAll
               disp device (scatterGUB maxPadded (2*expFF) N nUsed) (("gathered",sGatheredGU)::("pos",sSortedPos)::("slot",sSortedSlot)::("dst",sGateUpAll)::List.nil) (maxPadded*2*expFF) (hash ("mdsc",li))
