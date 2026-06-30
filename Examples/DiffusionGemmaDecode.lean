@@ -820,6 +820,12 @@ def main (args : List String) : IO Unit := do
   -- warp-per-output kernel — the down was the biggest MoE cost (DG_SKIP: ~600ms, ~7× less efficient
   -- per FLOP than the tiled gate/up). Uses the grouped down structure (geglu grouped → reg → scatter).
   let moeDownRB := (← IO.getEnv "DG_MOEDOWNRB").isSome
+  -- DG_DENSEDOWNRB: tile the DENSE FFN down with the fused Q8_0 reg-matmul (single weight ⇒ nExpert=1,
+  -- a zero tileExpert). The dense down was also on the warp kernel (~186ms). No grouping ⇒ no grouped-
+  -- path issues; reuses the golden-validated q8MatmulGroupedRegKernel.
+  let denseDownRB := (← IO.getEnv "DG_DENSEDOWNRB").isSome
+  let sZeroTE ← mkBuf device 16
+  writeBuffer device sZeroTE 0 (← Hesper.Basic.floatArrayToBytes (Array.replicate 16 (0.0:Float)))
   let padTo := 32   -- BM=32 fused reg aligns with the 32-pad grouping (no 64-pad penalty)
   let maxPadded := (((totalTok + padTo*nExpert) + (padTo-1))/padTo)*padTo
   let sSortedPos ← mkBuf device maxPadded
@@ -1053,8 +1059,14 @@ def main (args : List String) : IO Unit := do
             bmm device blk.ffn.gate sN sG N (hash ("g",li))
             bmm device blk.ffn.up sN sU N (hash ("u",li))
           disp device (geluMulB (N*ffn)) (("gate",sG)::("up",sU)::("outp",sGe)::List.nil) (N*ffn) (hash ("gg",li))
-          q80 device sGe N ffn (hash ("qGe",li))
-          bmm device blk.ffn.down sGe sD N (hash ("dn",li))
+          if denseDownRB && blk.ffn.down.quantFormat == .Q8_0 then
+            -- TILED reg-matmul dense down (matrix units, in-kernel Q8_0 dequant). A=f32 geglu sGe [N,ffn],
+            -- B=down Q8_0 [dim,ffn], C=sD [N,dim]. Single weight ⇒ nExpert=1, zero tileExpert.
+            dispRB device (Hesper.Quantization.Q4_K_M.q8MatmulGroupedRegKernel N dim ffn 1)
+              (("a",sGe)::("b",blk.ffn.down.weightBuf)::("c",sD)::("tileExpert",sZeroTE)::List.nil) ((dim+31)/32) ((N+31)/32) (hash ("ddrb",li))
+          else
+            q80 device sGe N ffn (hash ("qGe",li))
+            bmm device blk.ffn.down sGe sD N (hash ("dn",li))
         pmark rDense
         let some mpn1 := blk.moePostNorm1 | throw (IO.userError "mpn1")
         Hesper.Layers.RMSNorm.forward device mpn1 sD sCurMlp N        -- curMlp
@@ -1168,6 +1180,13 @@ def main (args : List String) : IO Unit := do
             -- GROUPED down: geglu on the grouped gate/up → grouped down (tileExpert) → scatter → wacc
             disp device (gegluMergedB maxPadded expFF 0 (maxPadded*2*expFF)) (("gu",sGatheredGU)::("eh",sGatheredEh)::List.nil) (maxPadded*expFF) (hash ("gmg",li))
             Hesper.WGSL.Execute.flushBatch device
+            if li == 0 && (← IO.getEnv "DG_MOEDOWNDIAG").isSome then
+              Hesper.GPUBackend.endBatch device
+              let eh ← Hesper.Basic.bytesToFloatArray (← mapBufferRead device sGatheredEh 0 (maxPadded*expFF*4).toUSize)
+              let mut mx := 0.0
+              for i in [0:maxPadded*expFF] do let v := (eh.getD i 0.0).abs; if v > mx then mx := v
+              IO.println s!"[moedowndiag] max|geglu A (down input)| = {mx}  (f16 max = 65504 → overflow if larger)"
+              Hesper.GPUBackend.beginBatch device
             if moeDownRB && blk.ffn.down.quantFormat != .Q5_0 then
               -- TILED reg-matmul down (matrix units, in-kernel Q8_0 dequant); reads f32 geglu directly (no q80).
               dispRB device (Hesper.Quantization.Q4_K_M.q8MatmulGroupedRegKernel maxPadded dim expFF nExpert)
