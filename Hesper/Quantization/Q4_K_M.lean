@@ -446,7 +446,8 @@ def q8MatmulGroupedRegKernel (M N K nExpert : Nat) : ShaderM Unit := do
   let mOff := Exp.mul sgRow (Exp.litU32 16)
   let nOff := Exp.mul sgCol (Exp.litU32 16)
   let teRaw ← ShaderM.readBuffer (ty := .scalar .u32) (n := M / 32) "tileExpert" (Exp.vec3Y wid)
-  let e := Exp.select (Exp.lt teRaw (Exp.litU32 nExpert)) teRaw (Exp.litU32 (nExpert - 1))
+  let isActive := Exp.lt teRaw (Exp.litU32 nExpert)
+  let e := Exp.select isActive teRaw (Exp.litU32 (nExpert - 1))
   let weightRowOffsetE := Exp.mul e (Exp.litU32 N)
   let rdByte := fun (bo : Exp (.scalar .u32)) => do
     let w ← ShaderM.readBuffer (ty := .scalar .u32) (n := bU32) "b" (Exp.shiftRight bo (Exp.litU32 2))
@@ -475,7 +476,10 @@ def q8MatmulGroupedRegKernel (M N K nExpert : Nat) : ShaderM Unit := do
       let xf32 ← ShaderM.readBuffer (ty := .scalar .f32) (n := M * K) "a" aIdx
       let blk := Exp.add (Exp.mul (Exp.div m (Exp.litU32 8)) (Exp.litU32 4)) (Exp.div k (Exp.litU32 8))
       let within := Exp.add (Exp.mul (Exp.mod m (Exp.litU32 8)) (Exp.litU32 8)) (Exp.mod k (Exp.litU32 8))
-      ShaderM.writeWorkgroup (ty := .scalar .f16) "shared_A" (Exp.add (Exp.mul blk (Exp.litU32 64)) within) (Exp.toF16 xf32)
+      -- sentinel-skip (correctness): padding tiles (tileExpert ≥ nExpert) zero their A-input → C=0×B=0 →
+      -- output 0, so the grouped scatter (which DOES scatter padding rows at pos=0/slot=0) writes 0 not
+      -- garbage. A data-select, NOT a runtime loop bound, so WGSL barrier-uniformity is preserved.
+      ShaderM.writeWorkgroup (ty := .scalar .f16) "shared_A" (Exp.add (Exp.mul blk (Exp.litU32 64)) within) (Exp.toF16 (Exp.select isActive xf32 (Exp.litF32 0.0)))
     -- B-load: Q8_0 dequant (scale from shared_d, two int8 quants per thread)
     for s in [0:4] do
       let u := Exp.add tid (Exp.litU32 (s * 128))

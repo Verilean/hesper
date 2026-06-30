@@ -1188,7 +1188,11 @@ def main (args : List String) : IO Unit := do
               IO.println s!"[moedowndiag] max|geglu A (down input)| = {mx}  (f16 max = 65504 → overflow if larger)"
               Hesper.GPUBackend.beginBatch device
             if moeDownRB && blk.ffn.down.quantFormat != .Q5_0 then
-              -- TILED reg-matmul down (matrix units, in-kernel Q8_0 dequant); reads f32 geglu directly (no q80).
+              -- TILED reg-matmul down (matrix units, in-kernel Q8_0 dequant). The q80 round-trip both matches
+              -- the warp's Q8 rounding AND acts as the geglu→down sync (its in-place read of sGatheredEh forces
+              -- the geglu to complete — the plain flushBatch is dropped by Dawn in the long grouped batch).
+              q80 device sGatheredEh maxPadded expFF (hash ("qgehrb",li))
+              Hesper.WGSL.Execute.flushBatch device
               dispRB device (Hesper.Quantization.Q4_K_M.q8MatmulGroupedRegKernel maxPadded dim expFF nExpert)
                 (("a",sGatheredEh)::("b",dnE)::("c",sGatheredDown)::("tileExpert",sTileExpert)::List.nil) ((dim+31)/32) ((maxPadded+31)/32) (hash ("edrb",li))
             else
