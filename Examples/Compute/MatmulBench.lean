@@ -334,7 +334,55 @@ def checkFusedQ8HighExpert (device : Device) : IO Unit := do
   let v := if bad==0 then "✅ high-expert CORRECT" else "❌ WRONG"
   IO.println s!"[fused-q8 HIGH-EXPERT nE=128, experts 0 & 127] maxDiff={md} bad={bad} (lo-expert {badLo}, HI-expert {badHi}) → {v}"
 
+/-- Generic memory-bound element-wise kernel (read 2, write 1) — the non-matmul stages (geglu/q80/scatter/
+    wacc) are all memory-bound, so this estimates their cost floor at a given element count. -/
+def genRW3 (nElem gridXWidth : Nat) : Hesper.WGSL.Monad.ShaderM Unit := do
+  let _a ← Hesper.WGSL.Monad.ShaderM.declareInputBuffer "ina" (.array (.scalar .f32) nElem)
+  let _b ← Hesper.WGSL.Monad.ShaderM.declareInputBuffer "inb" (.array (.scalar .f32) nElem)
+  let _c ← Hesper.WGSL.Monad.ShaderM.declareOutputBuffer "outc" (.array (.scalar .f32) nElem)
+  let gid ← Hesper.WGSL.Monad.ShaderM.globalId
+  let t := Exp.add (Exp.vec3X gid) (Exp.mul (Exp.vec3Y gid) (Exp.litU32 gridXWidth))
+  Hesper.WGSL.Monad.ShaderM.if_ (Exp.lt t (Exp.litU32 nElem)) (do
+    let a ← Hesper.WGSL.Monad.ShaderM.readBuffer (ty := .scalar .f32) (n := nElem) "ina" t
+    let b ← Hesper.WGSL.Monad.ShaderM.readBuffer (ty := .scalar .f32) (n := nElem) "inb" t
+    Hesper.WGSL.Monad.ShaderM.writeBuffer (ty := .scalar .f32) "outc" t (Exp.mul a b)) (pure ())
+
+/-- ★ The harness blind spot: estimate the NON-matmul (element-wise + grouping) per-step overhead — the
+    ~408ms the matmul-only roofline missed (HALF the 2.5× gap). All memory-bound, so genRW3 at each stage's
+    element count is a good floor. llama.cpp's equivalent ≈ 0 (fused element-wise, INDEXED mul_mat_id = no
+    gather/scatter, flash-attn). -/
+def benchNonMatmul : IO Unit := do
+  let inst ← Hesper.init
+  let device ← getDevice inst
+  let dim := 2816; let expFF := 704; let N := 262; let maxPadded := 6208; let nUsed := 8
+  let benchRW3 := fun (nElem : Nat) => do
+    let a ← mkBuf device nElem; let b ← mkBuf device nElem; let c ← mkBuf device nElem
+    let wg := (nElem+255)/256; let nx := min wg 32768; let ny := (wg+nx-1)/nx
+    let cfg : Hesper.ExecConfig := { numWorkgroups := (nx,ny,1), workgroupSize := {x:=256}, extensions := [], diagnostics := [] }
+    let bufs := (("ina",a)::("inb",b)::("outc",c)::List.nil)
+    let r ← IO.mkRef none
+    Hesper.GPUBackend.executeWithConfigCached device (genRW3 nElem (nx*256)) bufs cfg 1 r
+    let t0 ← IO.monoMsNow
+    Hesper.GPUBackend.beginBatch device
+    for _ in [0:50] do Hesper.GPUBackend.executeWithConfigCached device (genRW3 nElem (nx*256)) bufs cfg 1 r
+    Hesper.GPUBackend.endBatch device
+    let t1 ← IO.monoMsNow
+    pure ((t1-t0).toFloat / 50.0)
+  let geglu ← benchRW3 (maxPadded*expFF)
+  let scatter ← benchRW3 (maxPadded*dim)
+  let wacc ← benchRW3 (nUsed*N*dim)
+  IO.println "\n=== ★ NON-matmul (element-wise + grouping) per-step — the matmul-roofline blind spot ==="
+  IO.println s!"geglu-class (maxPadded·expFF) ≈ {geglu}ms/call × 30 = {30.0*geglu}ms/step  (geglu + q80)"
+  IO.println s!"scatter-class (maxPadded·dim) ≈ {scatter}ms/call × 30 = {30.0*scatter}ms/step  (down scatter + input gather)"
+  IO.println s!"wacc-class (nUsed·N·dim)      ≈ {wacc}ms/call × 30 = {30.0*wacc}ms/step"
+  IO.println s!"  rough non-matmul ≈ {30.0*(2.0*geglu + 2.0*scatter + wacc)}ms/step (+ counting-sort + RMSNorm + attn-compute)"
+  IO.println "  ⇒ llama.cpp's equivalent ≈ 0 (fused element-wise, INDEXED mul_mat_id = no gather/scatter, flash-attn)."
+  IO.println "  ~HALF the 2.5× gap. The indexed-MoE redesign (MOE_INDEXED_DESIGN.md) removes the grouping/scatter."
+
 def main : IO Unit := do
+  if (← IO.getEnv "NONMM").isSome then
+    Examples.Compute.MatmulBench.benchNonMatmul
+    return
   if (← IO.getEnv "Q8HI").isSome then
     let inst ← Hesper.init; let device ← getDevice inst
     Examples.Compute.MatmulBench.checkFusedQ8HighExpert device
