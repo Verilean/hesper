@@ -384,6 +384,17 @@ def benchQ8RegDown (device : Device) (dim expFF maxPadded nExpert : Nat) : IO Fl
   let kern := Hesper.Quantization.Q4_K_M.q8MatmulGroupedRegKernel M N K nExpert
   benchKernelMs device kern (("a",a)::("b",b)::("c",c)::("tileExpert",te)::List.nil) cfg
 
+/-- Bench the matrix-unit Q4_K reg gate/up (q4kMatmulGroupedRegKernel) at the real shape — to compare
+    CLEANLY against the MMQ5 dp4a kernel (same question as the down: is matrix-unit faster than dp4a here?). -/
+def benchQ4kRegGateUp (device : Device) (dim expFF maxPadded nExpert : Nat) : IO Float := do
+  let M := maxPadded; let N := 2*expFF; let K := dim
+  let bU32 := nExpert*N*(K/256)*36
+  let a ← mkBuf device (M*K); let b ← mkBuf device bU32
+  let c ← mkBuf device (M*N); let te ← mkBuf device (M/32)
+  let cfg : Hesper.ExecConfig := { numWorkgroups := ((N+31)/32, (M+31)/32, 1), workgroupSize := {x:=128}, extensions := ["f16","chromium_experimental_subgroup_matrix"], diagnostics := [("off","chromium.subgroup_matrix_uniformity")] }
+  let kern := Hesper.Quantization.Q4_K_M.q4kMatmulGroupedRegKernel M N K nExpert
+  benchKernelMs device kern (("a",a)::("b",b)::("c",c)::("tileExpert",te)::List.nil) cfg
+
 /-- ★ The automated headroom (余力) evaluator: micro-bench every forward matmul stage at its real shape,
     compute each stage's achievable floor from its FLOP, and rank by RECOVERABLE per-step time
     (= actual − achievable). This replaces the manual DG_SKIP / profile-and-guess loop: the worst
@@ -411,6 +422,9 @@ def forwardRoofline : IO Unit := do
   let amge ← benchMMQ5GateUp device dim expFF maxPadded 128
   let amdn ← benchWarpDown device dim expFF maxPadded 128
   let qrdn ← benchQ8RegDown device dim expFF maxPadded 128
+  let qrgu ← benchQ4kRegGateUp device dim expFF maxPadded 128
+  let cmpgu := if qrgu < amge then "FASTER" else "SLOWER"
+  IO.println s!"  [GATEUP VARIANTS] MMQ5 = {amge}ms/call | q4k matrix-reg = {qrgu}ms/call → reg is {amge/qrgu}× {cmpgu} than MMQ5"
   let cmp := if qrdn < amdn then "FASTER" else "SLOWER"
   IO.println s!"  [ACTUAL] MoE g/up MMQ5 = {amge}ms/call (reg-floor {bmge}) | MoE down warp = {amdn}ms/call (reg-floor {bmdn}) → warp is {amdn/bmdn}× the reg-floor"
   IO.println s!"  [DOWN VARIANTS] warp = {amdn}ms/call | q8 matrix-reg = {qrdn}ms/call (f16 reg-floor = {bmdn}) → reg is {amdn/qrdn}× {cmp} than warp"
