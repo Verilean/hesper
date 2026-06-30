@@ -322,6 +322,69 @@ def main : IO Unit := do
   IO.println s!"  attention QKV+O = {attn} ms | dense gate/up = {dense} ms | MoE gate/up = {moe} ms | lm_head = {lmTot} ms"
   IO.println s!"  TOTAL forward matmul = {attn+dense+moe} ms (+ lm_head {lmTot}) — best case if ALL reg-matmul"
 
+/-- One forward matmul stage: its per-step wall time + FLOP, used to compute the headroom (余力). -/
+structure KStat where
+  name : String
+  perStepMs : Float
+  perStepFlop : Float
+deriving Inhabited
+
+/-- Realistic achievable fraction of the simdgroup-matrix peak for a well-tuned matmul (the size sweep
+    plateaus near here). Headroom is measured against THIS, not the theoretical 100%. -/
+def achievableFrac : Float := 0.70
+
+/-- ★ The automated headroom (余力) evaluator: micro-bench every forward matmul stage at its real shape,
+    compute each stage's achievable floor from its FLOP, and rank by RECOVERABLE per-step time
+    (= actual − achievable). This replaces the manual DG_SKIP / profile-and-guess loop: the worst
+    offender (where the余力 is) falls out automatically. Reg-matmul shapes here are the *achievable*
+    floor; attention/dense use the reg in production so their number is *actual*. -/
+def forwardRoofline : IO Unit := do
+  let inst ← Hesper.init
+  let device ← getDevice inst
+  let dim := 2816; let ffn := 2112; let expFF := 704
+  let N := 262; let maxPadded := 6208
+  let qF := 8192; let kvF := 1024; let qS := 4096; let kvS := 2048
+  let flop := fun (M Nn K : Nat) => 2.0*M.toFloat*Nn.toFloat*K.toFloat
+  IO.println "\n=== ★ forward roofline (per-call ms; reg = achievable floor) ==="
+  let bqF  ← benchShape device "QKV-Q  full" N qF dim
+  let bkvF ← benchShape device "QKV-KV full" N kvF dim
+  let boF  ← benchShape device "O-proj full" N dim qF
+  let bqS  ← benchShape device "QKV-Q  SWA " N qS dim
+  let bkvS ← benchShape device "QKV-KV SWA " N kvS dim
+  let boS  ← benchShape device "O-proj SWA " N dim qS
+  let bgu  ← benchShape device "dense g/up " N ffn dim
+  let bdn  ← benchShape device "dense down " N dim ffn
+  let bmge ← benchShape device "MoE g/up   " maxPadded (2*expFF) dim
+  let bmdn ← benchShape device "MoE down   " maxPadded dim expFF
+  -- per-step aggregation: 5 full-attn layers + 25 SWA layers, 30 dense/MoE, lm_head separate.
+  let stats : Array KStat := #[
+    { name := "attention QKV+O", perStepMs := 5.0*(bqF+2.0*bkvF+boF) + 25.0*(bqS+2.0*bkvS+boS),
+      perStepFlop := 5.0*(flop N qF dim + 2.0*flop N kvF dim + flop N dim qF)
+                   + 25.0*(flop N qS dim + 2.0*flop N kvS dim + flop N dim qS) },
+    { name := "dense gate/up  ", perStepMs := 30.0*2.0*bgu, perStepFlop := 30.0*2.0*flop N ffn dim },
+    { name := "dense down     ", perStepMs := 30.0*bdn,     perStepFlop := 30.0*flop N dim ffn },
+    { name := "MoE gate/up    ", perStepMs := 30.0*bmge,    perStepFlop := 30.0*flop maxPadded (2*expFF) dim },
+    { name := "MoE down       ", perStepMs := 30.0*bmdn,    perStepFlop := 30.0*flop maxPadded dim expFF } ]
+  -- recoverable = actual − achievable(= flop / (achievableFrac·peak)); rank by it.
+  let scored := stats.map (fun s =>
+    let achMs := s.perStepFlop / (achievableFrac*peakFlops) * 1000.0
+    let recov := s.perStepMs - achMs
+    (s.name, s.perStepMs, achMs, recov, 100.0*achMs/s.perStepMs))
+  let ranked := scored.qsort (fun a b => a.2.2.2.1 > b.2.2.2.1)  -- by recoverable desc (.2.2.2.1 = recov)
+  IO.println "\n=== ★ per-step headroom (余力), ranked by RECOVERABLE time — work the top row first ==="
+  IO.println "stage            | actual ms | achievable ms | RECOVERABLE ms | efficiency"
+  let mut totRecov := 0.0; let mut totActual := 0.0
+  for (nm, act, ach, recov, eff) in ranked do
+    totRecov := totRecov + recov; totActual := totActual + act
+    IO.println s!"{nm} |   {act}   |   {ach}   |   {recov}   |  {eff}%"
+  IO.println s!"\nTOTAL forward matmul ≈ {totActual} ms/step | recoverable ≈ {totRecov} ms (→ floor ≈ {totActual-totRecov} ms)"
+  IO.println "NOTE: MoE g/up (MMQ5) & MoE down (warp) run their OWN kernels in production — bench above is the"
+  IO.println "      reg achievable-floor; their ACTUAL is slower, so their real recoverable is LARGER (next: bench actual)."
+
 end Examples.Compute.MatmulBench
 
-def main : IO Unit := Examples.Compute.MatmulBench.main
+def main : IO Unit := do
+  if (← IO.getEnv "ROOFLINE").isSome then
+    Examples.Compute.MatmulBench.forwardRoofline
+  else
+    Examples.Compute.MatmulBench.main
