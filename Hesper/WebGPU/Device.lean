@@ -49,6 +49,12 @@ opaque deviceHasSubgroups (device : @& Device) : IO Bool
 @[extern "lean_hesper_mtl_device_name"]
 opaque mtlDeviceName (device : @& Device) : IO String
 
+/-- metal_replacer STEP 4: Apple's tuned MPS f16 matmul (C=A·Bᵀ, our reg-matmul shape) as the CEILING —
+    returns "ms/call | GFLOPS | %peak". Diff vs the WGSL reg (harness) at the same shape to quantify the
+    WGSL→Tint→Metal gap. macOS DEBUG/REFERENCE only. See METAL_REPLACER_INTEGRATION.md. -/
+@[extern "lean_hesper_mps_matmul_bench"]
+opaque mpsMatmulBench (device : @& Device) (M N K iters : UInt32) : IO String
+
 /-- Check if the device was created with the Chromium experimental
     subgroup matrix feature. `subgroup_matrix_left/right/result` types
     and `subgroupMatrixLoad/Store/MultiplyAccumulate` are available iff
