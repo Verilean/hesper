@@ -6,20 +6,32 @@ import Hesper.Basic
 
 open Hesper.WebGPU
 
-/-- metal_replacer STEP 1+2 PoC — validate the Dawn→Metal interop foundation:
-    STEP 1: the MTLDevice behind the WGPUDevice (GetMTLDevice).
-    STEP 2: the MTLBuffer behind a Dawn buffer (reinterpret to metal::Buffer + GetMTLBuffer) — the length
-            must match our allocation, proving we can hand our data to llama.cpp's Metal kernels with no
-            copies. See METAL_REPLACER_INTEGRATION.md. -/
+/-- metal_replacer STEP 1+2+3 PoC — validate the Dawn→Metal interop end-to-end:
+    STEP 1: MTLDevice behind the WGPUDevice.  STEP 2: MTLBuffer behind a Dawn buffer.
+    STEP 3: run a hand-written custom Metal kernel (out[i]=in[i]*2) on our Dawn buffers.
+    Proves we can dispatch tuned Metal kernels on our data (macOS DEBUG/REFERENCE tool — not shipped).
+    See METAL_REPLACER_INTEGRATION.md. -/
 def main : IO Unit := do
-  IO.println "=== metal_replacer STEP 1+2 PoC — Dawn → Metal interop ==="
+  IO.println "=== metal_replacer STEP 1+2+3 PoC — Dawn → Metal interop ==="
   let inst ← Hesper.init
   let device ← getDevice inst
   let info ← mtlDeviceName device
   IO.println s!"✅ STEP 1  MTLDevice: {info}"
-  -- STEP 2: create a 16-float buffer, write known data, probe the underlying MTLBuffer.
-  let buf ← createBuffer device { size := (16*4).toUSize, usage := [.storage, .copyDst, .copySrc], mappedAtCreation := false }
-  let data ← Hesper.Basic.floatArrayToBytes #[1.0,2.0,3.0,4.0,5.0,6.0,7.0,8.0,9.0,10.0,11.0,12.0,13.0,14.0,15.0,16.0]
-  writeBuffer device buf 0 data
-  let probe ← mtlBufferProbe buf
+  let n : Nat := 16
+  let inArr : Array Float := #[1.0,2.0,3.0,4.0,5.0,6.0,7.0,8.0,9.0,10.0,11.0,12.0,13.0,14.0,15.0,16.0]
+  let inB ← createBuffer device { size := (n*4).toUSize, usage := [.storage, .copyDst, .copySrc], mappedAtCreation := false }
+  let outB ← createBuffer device { size := (n*4).toUSize, usage := [.storage, .copyDst, .copySrc], mappedAtCreation := false }
+  writeBuffer device inB 0 (← Hesper.Basic.floatArrayToBytes inArr)
+  -- write outB too: marks it INITIALIZED in Dawn so its lazy-clear doesn't zero the custom kernel's output
+  -- on the subsequent mapBufferRead.
+  writeBuffer device outB 0 (← Hesper.Basic.floatArrayToBytes (Array.replicate n (0.0:Float)))
+  let probe ← mtlBufferProbe inB
   IO.println s!"✅ STEP 2  buffer bridge (expect length=64): {probe}"
+  -- sync the Dawn writes before the custom Metal kernel reads `in`; also verify the input round-trips.
+  let inCheck ← Hesper.Basic.bytesToFloatArray (← mapBufferRead device inB 0 (n*4).toUSize)
+  IO.println s!"   (input readback: {inCheck.getD 0 0.0},{inCheck.getD 1 0.0},{inCheck.getD 2 0.0})"
+  metalDispatchMul2 device inB outB n.toUInt32
+  let outArr ← Hesper.Basic.bytesToFloatArray (← mapBufferRead device outB 0 (n*4).toUSize)
+  let ok := (List.range n).all (fun i => (outArr.getD i 0.0) == (inArr.getD i 0.0) * 2.0)
+  let verdict := if ok then "✅ CORRECT" else "❌ WRONG"
+  IO.println s!"STEP 3  custom Metal (out=in*2): out[0..3]={outArr.getD 0 0.0},{outArr.getD 1 0.0},{outArr.getD 2 0.0},{outArr.getD 3 0.0} → {verdict}"

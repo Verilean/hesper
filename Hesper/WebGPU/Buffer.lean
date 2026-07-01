@@ -53,6 +53,12 @@ opaque getBufferId (buffer : @& Buffer) : IO UInt64
 @[extern "lean_hesper_mtl_buffer_probe"]
 opaque mtlBufferProbe (buffer : @& Buffer) : IO String
 
+/-- metal_replacer STEP 3: dispatch a CUSTOM Metal kernel (out[i] = in[i]*2) on our Dawn-backed MTLBuffers.
+    Validates running a hand-written Metal kernel on our data end-to-end. Caller syncs the `in` write first
+    (a mapBufferRead) and reads `out` after. See METAL_REPLACER_INTEGRATION.md. -/
+@[extern "lean_hesper_metal_dispatch_mul2"]
+opaque metalDispatchMul2 (device : @& Device) (inBuf : @& Buffer) (outBuf : @& Buffer) (n : UInt32) : IO Unit
+
 /-- Hash an array of buffers into a single UInt64 key in one FFI call.
     Avoids N separate `getBufferId` calls per dispatch. -/
 @[extern "lean_hesper_hash_buffer_array"]
