@@ -1,10 +1,21 @@
-# metal_replacer integration — swap llama.cpp's tuned Metal kernels for our WGSL hot kernels
+# metal_replacer — DEBUG / REFERENCE tool (macOS-only), NOT the production path
 
-## Goal
+## Scope (important)
+This is **macOS/Metal-specific — it does NOT work on Linux (Vulkan) or WebGPU/browser**, so it is
+**NOT a shipping feature**. Production stays 100% WGSL (the portable, verifiable path — the project's whole
+value). metal_replacer is a **diagnostic/reference tool** with three uses:
+1. **Measure the ceiling** — run llama.cpp's ACTUAL tuned Metal kernel inside OUR pipeline (our data path,
+   our buffers). That tells us the fastest a hot kernel CAN go here, i.e. the real recoverable per kernel.
+2. **Confirm the bottleneck** — if the tuned kernel is fast in our pipeline, the pipeline/overhead is fine
+   and the WGSL kernel is the bottleneck (not Dawn, not the element-wise, not the routing).
+3. **A reference to study** — the exact Metal the WGSL kernel should aim to match (or prove it can't, so we
+   stop chasing it and accept the gap / go structural / autotune).
+It complements the ROOFLINE/NONMM harness: those give the FLOOR; this gives the ACHIEVABLE-with-tuned-Metal.
+
+## Mechanism goal
 Replace the 2-3 hottest generated WGSL→Tint→Metal kernels (MoE `mul_mat_id`, dense `mul_mm`, flash-attn)
-with llama.cpp's hand-tuned Metal kernels — getting their efficiency directly and bypassing the WGSL/Tint
-limits (occupancy control, coalescing) that this session hit repeatedly. Keep the WGSL DSL + verification +
-portability for everything else.
+with llama.cpp's hand-tuned Metal — but only to MEASURE/reference on macOS, never shipped. The WGSL kernels
+remain the real target; this quantifies exactly how far they are and whether closing it is worth it.
 
 ## Feasibility (CONFIRMED)
 Our pipeline is WGSL → Dawn (Tint→Metal internally) → `wgpu::ComputePipeline` (native/bridge.cpp:1441,1722).
