@@ -97,7 +97,7 @@ message(STATUS "Dawn build directory: ${DAWN_BUILD_DIR}")
 # their symbols (`dawnProcSetProcs`, `wgpuInstance*`, the entire Dawn
 # native runtime) are present in libhesper_native.so.  Consumers link
 # with `-lhesper_native` only — Dawn becomes an implementation detail.
-add_library(hesper_native SHARED bridge.cpp glfw_bridge.cpp)
+add_library(hesper_native SHARED bridge.cpp glfw_bridge.cpp metal_replace.mm)
 
 # macOS: bridge.cpp references Lean runtime symbols (lean_alloc_object,
 # lean_mk_string, lean_inc_heartbeat, mi_malloc_small, ...) but the

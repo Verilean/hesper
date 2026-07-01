@@ -1403,6 +1403,11 @@ lean_exe «matmul-bench» where
   supportInterpreter := false
   moreLinkArgs := stdLinkArgs
 
+lean_exe «metal-replace-test» where
+  root := `Examples.Compute.MetalReplaceTest
+  supportInterpreter := false
+  moreLinkArgs := stdLinkArgs
+
 lean_exe «bitnet-validation» where
   root := `Tests.BitNetValidation
   supportInterpreter := false

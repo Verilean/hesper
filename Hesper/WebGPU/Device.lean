@@ -43,6 +43,12 @@ opaque getDeviceByIndex (inst : @& Instance) (gpuIdx : @& UInt32) : IO Device
 @[extern "lean_hesper_device_has_subgroups"]
 opaque deviceHasSubgroups (device : @& Device) : IO Bool
 
+/-- metal_replacer STEP 1 PoC: the name/props of the MTLDevice behind this WGPUDevice (via Dawn's
+    GetMTLDevice). Proves the Metal interop is live — the foundation for swapping in llama.cpp's Metal
+    kernels. See METAL_REPLACER_INTEGRATION.md. -/
+@[extern "lean_hesper_mtl_device_name"]
+opaque mtlDeviceName (device : @& Device) : IO String
+
 /-- Check if the device was created with the Chromium experimental
     subgroup matrix feature. `subgroup_matrix_left/right/result` types
     and `subgroupMatrixLoad/Store/MultiplyAccumulate` are available iff
