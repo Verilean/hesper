@@ -304,6 +304,9 @@ def parseGGUF (data : ByteArray) : Except String GGUFFile := do
   else
     data.extract dataStart data.size
 
-  .ok { header, metadata, tensors, dataBlob, alignment }
+  -- Record the aligned data-section start so mmap loaders can locate tensor
+  -- bodies without deriving it from `dataBlob.size` (which is wrong when only a
+  -- metadata prefix was parsed).
+  .ok { header, metadata, tensors, dataBlob, alignment, dataSectionOffset := dataStart.toUSize }
 
 end Hesper.GGUF.Parser
