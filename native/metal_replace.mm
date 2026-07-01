@@ -60,6 +60,52 @@ extern "C" lean_obj_res lean_hesper_mtl_buffer_probe(b_lean_obj_arg buffer_obj, 
     return lean_io_result_mk_ok(lean_mk_string(b));
 }
 
+// STEP 3: dispatch a CUSTOM Metal kernel (out[i] = in[i]*2) on the Dawn-backed MTLBuffers. Validates
+// mechanism (A) end-to-end — a hand-written Metal kernel running on OUR data. Caller must sync the Dawn
+// write of `in` first (e.g. a mapBufferRead), and read `out` back via Dawn afterwards; we waitUntilCompleted
+// so the output is materialized before returning.
+extern "C" lean_obj_res lean_hesper_metal_dispatch_mul2(
+    b_lean_obj_arg device_obj, b_lean_obj_arg inBuf_obj, b_lean_obj_arg outBuf_obj,
+    uint32_t n, lean_obj_res /* unit */) {
+    wgpu::Device* device = mr_extract_device(device_obj);
+    wgpu::Buffer* inB = mr_extract_buffer(inBuf_obj);
+    wgpu::Buffer* outB = mr_extract_buffer(outBuf_obj);
+    if (!device || !device->Get() || !inB || !inB->Get() || !outB || !outB->Get()) {
+        return lean_io_result_mk_error(lean_mk_string("metal_dispatch: invalid args"));
+    }
+    id<MTLDevice> mtl = dawn::native::metal::GetMTLDevice(device->Get());
+    id<MTLBuffer> mIn  = reinterpret_cast<dawn::native::metal::Buffer*>(inB->Get())->GetMTLBuffer();
+    id<MTLBuffer> mOut = reinterpret_cast<dawn::native::metal::Buffer*>(outB->Get())->GetMTLBuffer();
+    if (!mtl || !mIn || !mOut) {
+        return lean_io_result_mk_error(lean_mk_string("metal_dispatch: null Metal objects"));
+    }
+    NSError* err = nil;
+    NSString* src = @"#include <metal_stdlib>\nusing namespace metal;\n"
+        "kernel void mul2(device const float* inp [[buffer(0)]], device float* outp [[buffer(1)]], "
+        "uint i [[thread_position_in_grid]]) { outp[i] = inp[i] * 2.0f; }";
+    id<MTLLibrary> lib = [mtl newLibraryWithSource:src options:nil error:&err];
+    if (!lib) {
+        return lean_io_result_mk_error(lean_mk_string([[NSString stringWithFormat:@"metal_dispatch: compile failed: %@", err] UTF8String]));
+    }
+    id<MTLFunction> fn = [lib newFunctionWithName:@"mul2"];
+    id<MTLComputePipelineState> pso = [mtl newComputePipelineStateWithFunction:fn error:&err];
+    if (!pso) {
+        return lean_io_result_mk_error(lean_mk_string("metal_dispatch: pipeline failed"));
+    }
+    id<MTLCommandQueue> q = [mtl newCommandQueue];
+    id<MTLCommandBuffer> cb = [q commandBuffer];
+    id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+    [enc setComputePipelineState:pso];
+    [enc setBuffer:mIn  offset:0 atIndex:0];
+    [enc setBuffer:mOut offset:0 atIndex:1];
+    NSUInteger tg = MIN((NSUInteger)n, pso.maxTotalThreadsPerThreadgroup);
+    [enc dispatchThreads:MTLSizeMake(n, 1, 1) threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
+    [enc endEncoding];
+    [cb commit];
+    [cb waitUntilCompleted];
+    return lean_io_result_mk_ok(lean_box(0));
+}
+
 extern "C" lean_obj_res lean_hesper_mtl_device_name(b_lean_obj_arg device_obj, lean_obj_res /* unit */) {
     wgpu::Device* device = mr_extract_device(device_obj);
     if (!device || !device->Get()) {
