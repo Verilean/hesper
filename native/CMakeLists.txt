@@ -193,6 +193,7 @@ if(APPLE)
   find_library(QUARTZCORE_LIB QuartzCore REQUIRED)
   find_library(IOKIT_LIB IOKit REQUIRED)
   find_library(IOSURFACE_LIB IOSurface REQUIRED)
+  find_library(MPS_LIB MetalPerformanceShaders REQUIRED)   # metal_replacer step 4: MPS matmul ceiling
   target_link_libraries(hesper_native PRIVATE
     "-Wl,-force_load,${DAWN_BUILD_DIR}/src/dawn/libdawn_proc.a"
     ${DAWN_BUILD_DIR}/src/dawn/glfw/libdawn_glfw.a
@@ -206,6 +207,7 @@ if(APPLE)
     ${IOKIT_LIB}
     ${IOSURFACE_LIB}
     ${COCOA_LIB}
+    ${MPS_LIB}
   )
 else()
   target_link_libraries(hesper_native PRIVATE

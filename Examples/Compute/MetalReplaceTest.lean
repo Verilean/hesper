@@ -35,3 +35,11 @@ def main : IO Unit := do
   let ok := (List.range n).all (fun i => (outArr.getD i 0.0) == (inArr.getD i 0.0) * 2.0)
   let verdict := if ok then "✅ CORRECT" else "❌ WRONG"
   IO.println s!"STEP 3  custom Metal (out=in*2): out[0..3]={outArr.getD 0 0.0},{outArr.getD 1 0.0},{outArr.getD 2 0.0},{outArr.getD 3 0.0} → {verdict}"
+  -- STEP 4: the CEILING — Apple's tuned MPS f16 matmul at our forward shapes, vs the WGSL reg.
+  IO.println "\n=== STEP 4  MPS f16 matmul CEILING (vs WGSL reg) ==="
+  let shapes : List (String × Nat × Nat × Nat) :=
+    [("QKV-Q   ", 262, 8192, 2816), ("MoE g/up ", 6208, 1408, 2816), ("MoE down ", 6208, 2816, 704)]
+  for (nm, m, nn, k) in shapes do
+    let r ← mpsMatmulBench device m.toUInt32 nn.toUInt32 k.toUInt32 50
+    IO.println s!"  MPS {nm}[M={m} N={nn} K={k}]: {r}"
+  IO.println "  WGSL reg (harness): QKV-Q 1.75ms/44% | MoE g/up 4.75ms/67% | MoE down 2.4ms/66%"

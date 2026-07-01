@@ -11,6 +11,8 @@
 #include <webgpu/webgpu_cpp.h>
 #include <dawn/native/MetalBackend.h>
 #import <Metal/Metal.h>
+#import <MetalPerformanceShaders/MetalPerformanceShaders.h>
+#include <chrono>
 
 // Same extraction as bridge.cpp's EXTRACT_DEVICE_PTR: the device Lean struct holds the wgpu::Device* as its
 // external data at ctor field 0.
@@ -104,6 +106,44 @@ extern "C" lean_obj_res lean_hesper_metal_dispatch_mul2(
     [cb commit];
     [cb waitUntilCompleted];
     return lean_io_result_mk_ok(lean_box(0));
+}
+
+// STEP 4 (measurement): the CEILING — Apple's tuned MPS f16 matmul (C = A · Bᵀ, matching our reg-matmul's
+// A[M,K] × B[N,K]) on the MTLDevice behind our WGPUDevice. Batched `iters` encodes in one command buffer
+// (like our batched WGSL bench). Returns "ms/call | GFLOPS | %of15.5peak" so we can diff vs the WGSL reg
+// (harness benchShape) at the same shape — quantifies how far WGSL→Tint→Metal is from tuned Metal.
+extern "C" lean_obj_res lean_hesper_mps_matmul_bench(
+    b_lean_obj_arg device_obj, uint32_t M, uint32_t N, uint32_t K, uint32_t iters, lean_obj_res /* unit */) {
+    wgpu::Device* device = mr_extract_device(device_obj);
+    if (!device || !device->Get()) return lean_io_result_mk_error(lean_mk_string("mps: invalid device"));
+    id<MTLDevice> mtl = dawn::native::metal::GetMTLDevice(device->Get());
+    if (!mtl) return lean_io_result_mk_error(lean_mk_string("mps: null MTLDevice"));
+    id<MTLCommandQueue> q = [mtl newCommandQueue];
+    id<MTLBuffer> bA = [mtl newBufferWithLength:(NSUInteger)M*K*2 options:MTLResourceStorageModePrivate];
+    id<MTLBuffer> bB = [mtl newBufferWithLength:(NSUInteger)N*K*2 options:MTLResourceStorageModePrivate];
+    id<MTLBuffer> bC = [mtl newBufferWithLength:(NSUInteger)M*N*2 options:MTLResourceStorageModePrivate];
+    MPSMatrixDescriptor* dA = [MPSMatrixDescriptor matrixDescriptorWithRows:M columns:K rowBytes:(NSUInteger)K*2 dataType:MPSDataTypeFloat16];
+    MPSMatrixDescriptor* dB = [MPSMatrixDescriptor matrixDescriptorWithRows:N columns:K rowBytes:(NSUInteger)K*2 dataType:MPSDataTypeFloat16];
+    MPSMatrixDescriptor* dC = [MPSMatrixDescriptor matrixDescriptorWithRows:M columns:N rowBytes:(NSUInteger)N*2 dataType:MPSDataTypeFloat16];
+    MPSMatrix* mA = [[MPSMatrix alloc] initWithBuffer:bA descriptor:dA];
+    MPSMatrix* mB = [[MPSMatrix alloc] initWithBuffer:bB descriptor:dB];
+    MPSMatrix* mC = [[MPSMatrix alloc] initWithBuffer:bC descriptor:dC];
+    MPSMatrixMultiplication* mm = [[MPSMatrixMultiplication alloc]
+        initWithDevice:mtl transposeLeft:NO transposeRight:YES
+        resultRows:M resultColumns:N interiorColumns:K alpha:1.0 beta:0.0];
+    // warmup
+    { id<MTLCommandBuffer> cb = [q commandBuffer]; [mm encodeToCommandBuffer:cb leftMatrix:mA rightMatrix:mB resultMatrix:mC]; [cb commit]; [cb waitUntilCompleted]; }
+    auto t0 = std::chrono::high_resolution_clock::now();
+    { id<MTLCommandBuffer> cb = [q commandBuffer];
+      for (uint32_t i = 0; i < iters; i++) [mm encodeToCommandBuffer:cb leftMatrix:mA rightMatrix:mB resultMatrix:mC];
+      [cb commit]; [cb waitUntilCompleted]; }
+    auto t1 = std::chrono::high_resolution_clock::now();
+    double ms = std::chrono::duration<double, std::milli>(t1 - t0).count() / (double)iters;
+    double gflops = 2.0 * (double)M * N * K / (ms / 1000.0) / 1e9;
+    double pct = gflops * 1e9 / 15.5e12 * 100.0;
+    char b[256];
+    snprintf(b, sizeof(b), "%.4f ms/call | %.1f GFLOPS | %.1f%% of 15.5T peak", ms, gflops, pct);
+    return lean_io_result_mk_ok(lean_mk_string(b));
 }
 
 extern "C" lean_obj_res lean_hesper_mtl_device_name(b_lean_obj_arg device_obj, lean_obj_res /* unit */) {
