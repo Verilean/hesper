@@ -1416,9 +1416,19 @@ def main (args : List String) : IO Unit := do
         | none => 0
       let k := min (max want nHigh) cand.size
       let maskId := model.dg.maskTokenId
+      -- DG_MINCONF=<percent>: near-tie floor for the FORCED commits. The fixed schedule (`want`)
+      -- otherwise freezes low-confidence/near-tie predictions early — the root of the "the."-style
+      -- degenerations AND of kernel-swap fragility (two independent dense-down rounding profiles
+      -- flipped the same near-tie prompts). Picks are in descending confidence, so once a pick
+      -- falls below the floor we defer the rest to a later step. The FIRST pick always commits
+      -- (progress guarantee; the 32-step ceiling bounds total time); the LAST step commits all.
+      let minConf : Float := (((← IO.getEnv "DG_MINCONF").bind (·.toNat?)).getD 0).toFloat / 100.0
+      let confDbg := (← IO.getEnv "DG_CONFDBG").isSome
+      let lastStep := step+1 ≥ decodeSteps
       let mut picked := Array.replicate cand.size false
       let mut nCommitted := 0
-      for _ in [0:k] do
+      let mut committedCfs : Array Float := #[]
+      for i in [0:k] do
         let mut bi := 0; let mut bv := -1.0
         for c in [0:cand.size] do
           let (_, pr, cf) := cand[c]!
@@ -1428,11 +1438,16 @@ def main (args : List String) : IO Unit := do
           -- mask predictions into the top-k.
           if !picked[c]! && pr != maskId && cf > bv then bv := cf; bi := c
         if bv < 0.0 then break
+        if i > 0 && !lastStep && bv < minConf then break
         picked := picked.set! bi true
         let (ci, pred, _) := cand[bi]!
         toks := toks.set! (P+ci) pred
         masked := masked.set! ci false
         nCommitted := nCommitted + 1
+        committedCfs := committedCfs.push bv
+      if confDbg && committedCfs.size > 0 then
+        let sorted := committedCfs.qsort (· < ·)
+        IO.println s!"[confdbg step {step}] n={sorted.size} min={sorted[0]!} med={sorted[sorted.size/2]!} max={sorted[sorted.size-1]!}"
       -- EOS early-stop: once everything BEFORE the first committed end-of-generation token is
       -- committed, the canvas positions after it are irrelevant — unmask them so the next step
       -- sees remaining=0 and the loop skips (llama.cpp stops at EOG the same way).
