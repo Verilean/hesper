@@ -472,6 +472,33 @@ def scatterGUB (totalTok outDim N nUsed : Nat) (gridXWidth : Nat := 0) : Hesper.
       let dstIdx := Exp.add (Exp.add (Exp.mul slotK (Exp.litU32 (N*outDim))) (Exp.mul posK (Exp.litU32 outDim))) o
       ShaderM.writeBuffer (ty := .scalar .f32) "dst" dstIdx v) (pure ())) (pure ())
 
+/-- Q8_0 → f32 dequant (for the dense-down f16 pre-dequant): out[e] = d(block)·q(int8).
+    Row-major [od, idim], Q8_0 row stride = (idim/32)·34 bytes (f16 scale + 32 int8 per block).
+    1 thread per element; the write is bounds-guarded (grid-roundup excess threads must not
+    clamp-write — today's race class). 2D-grid aware via gridXWidth. -/
+def q8ToF32B (od idim : Nat) (gridXWidth : Nat := 0) : Hesper.WGSL.Monad.ShaderM Unit := do
+  let gid ← ShaderM.globalId
+  let e := if gridXWidth == 0 then Exp.vec3X gid
+           else Exp.add (Exp.vec3X gid) (Exp.mul (Exp.vec3Y gid) (Exp.litU32 gridXWidth))
+  let ne := od * idim
+  let rowBytes := (idim / 32) * 34
+  let nU32 := (od * rowBytes + 3) / 4
+  let _w ← ShaderM.declareReadOnlyBuffer "data" (.array (.scalar .u32) nU32)
+  let _o ← ShaderM.declareOutputBuffer "output" (.array (.scalar .f32) ne)
+  ShaderM.if_ (Exp.lt e (Exp.litU32 ne)) (do
+    let r := Exp.div e (Exp.litU32 idim)
+    let c := Exp.mod e (Exp.litU32 idim)
+    let bb := Exp.add (Exp.mul r (Exp.litU32 rowBytes)) (Exp.mul (Exp.div c (Exp.litU32 32)) (Exp.litU32 34))
+    let rd := fun (bo : Exp (.scalar .u32)) => do
+      let w ← ShaderM.readBuffer (ty := .scalar .u32) (n := nU32) "data" (Exp.shiftRight bo (Exp.litU32 2))
+      pure (Exp.bitAnd (Exp.shiftRight w (Exp.mul (Exp.bitAnd bo (Exp.litU32 3)) (Exp.litU32 8))) (Exp.litU32 0xFF))
+    let lo ← rd bb
+    let hi ← rd (Exp.add bb (Exp.litU32 1))
+    let d := Hesper.Quantization.Q4_K_M.fp16ToF32 (Exp.add lo (Exp.mul hi (Exp.litU32 256)))
+    let qb ← rd (Exp.add (Exp.add bb (Exp.litU32 2)) (Exp.mod c (Exp.litU32 32)))
+    let q := Exp.sub (Exp.toF32 qb) (Exp.mul (Exp.litF32 256.0) (Exp.toF32 (Exp.shiftRight qb (Exp.litU32 7))))
+    ShaderM.writeBuffer (ty := .scalar .f32) "output" e (Exp.mul d q)) (pure ())
+
 /-- Pack f32 → f16 half2 u32: out[i] = pack2x16float(fin[2i], fin[2i+1]).  Used to convert a
     dequantized-to-f32 weight into the reg-matmul B format [outDim, inDim/2] u32. nOut = total f32/2. -/
 def packF32ToF16B (nOut : Nat) : Hesper.WGSL.Monad.ShaderM Unit := do
@@ -894,8 +921,13 @@ def main (args : List String) : IO Unit := do
   -- DG_QKVRB: dequant the Q4_K Q/K/V projection weights → f16 [outDim, dim/2] once, so attention
   -- can use the ~11.6× faster subgroup-matrix reg-matmul instead of MMQ5 dp4a.
   let qkvRB := (← IO.getEnv "DG_NOQKVRB").isNone   -- DEFAULT ON (validated); DG_NOQKVRB=1 opts out
+  -- DG_DENSEF16: pre-dequant the DENSE ffn_down (Q8_0) → f16 and use the same WMMA reg matmul as the
+  -- dense gate/up (the QKVRB rounding profile — DISTINCT from the rejected DG_DENSEDOWNRB int-dequant
+  -- reg kernel). ~357MB f16 (dim·ffn·2B·30). Non-Q8_0 layers fall back to q80+bmm.
+  let denseF16 := (← IO.getEnv "DG_DENSEF16").isSome
   let mut qF16s : Array Buffer := #[]; let mut kF16s : Array Buffer := #[]; let mut vF16s : Array Buffer := #[]
   let mut oF16s : Array Buffer := #[]; let mut gateF16s : Array Buffer := #[]; let mut upF16s : Array Buffer := #[]
+  let mut downF16s : Array (Option Buffer) := #[]
   if qkvRB then
     let sDqTmp ← mkBuf device (8192*dim)   -- max f32 dequant scratch (≥ max outDim×inDim)
     -- branch on the weight's quant: Q4_K → dequantQ4KMKernel+pack; Q6_K → q6kToF16Kernel (direct).
@@ -927,7 +959,22 @@ def main (args : List String) : IO Unit := do
       oF16s := oF16s.push (← dq blk.attention.wO.weightBuf blk.attention.wO.config.outDim blk.attention.wO.config.inDim blk.attention.wO.quantFormat (hash ("dqo",li)))
       gateF16s := gateF16s.push (← dq blk.ffn.gate.weightBuf blk.ffn.gate.config.outDim blk.ffn.gate.config.inDim blk.ffn.gate.quantFormat (hash ("dqg",li)))
       upF16s := upF16s.push (← dq blk.ffn.up.weightBuf blk.ffn.up.config.outDim blk.ffn.up.config.inDim blk.ffn.up.quantFormat (hash ("dqu",li)))
-    IO.println s!"[dg-decode] dequantized Q4_K Q/K/V → f16 ({nLayers} layers)"
+      -- DG_DENSEF16: dense down (Q8_0) → f16 via q8ToF32B + pack (the same two-stage shape as Q4_K)
+      if denseF16 && blk.ffn.down.quantFormat == .Q8_0 then
+        let od := blk.ffn.down.config.outDim; let idim := blk.ffn.down.config.inDim
+        let ne := od * idim
+        let f16buf ← mkBuf device (ne/2)
+        let wg := (ne+255)/256; let nx := min wg 65535; let ny := (wg+nx-1)/nx
+        Hesper.GPUBackend.beginBatch device
+        disp2 device (q8ToF32B od idim (nx*256)) (("data",blk.ffn.down.weightBuf)::("output",sDqTmp)::List.nil) nx ny (hash ("dqd",li))
+        Hesper.WGSL.Execute.flushBatch device
+        disp device (packF32ToF16B (ne/2)) (("fin",sDqTmp)::("fout",f16buf)::List.nil) (ne/2) (hash ("dqdp",li))
+        Hesper.GPUBackend.endBatch device
+        downF16s := downF16s.push (some f16buf)
+      else
+        downF16s := downF16s.push none
+    let dfMsg := if denseF16 then s!" + dense down f16 ({(downF16s.filter (·.isSome)).size}/{nLayers} Q8_0 layers)" else ""
+    IO.println s!"[dg-decode] dequantized Q4_K Q/K/V → f16 ({nLayers} layers){dfMsg}"
   if (← IO.getEnv "DG_DQDIAG").isSome then
     -- hidden row r = e_r ⇒ logits[r,v] = weight[v,r]; compare f32 Q6_K (outputWeight) vs reg (f16)
     let Md := 64
@@ -1089,7 +1136,14 @@ def main (args : List String) : IO Unit := do
             bmm device blk.ffn.gate sN sG N (hash ("g",li))
             bmm device blk.ffn.up sN sU N (hash ("u",li))
           disp device (geluMulB (N*ffn)) (("gate",sG)::("up",sU)::("outp",sGe)::List.nil) (N*ffn) (hash ("gg",li))
-          if denseDownRB && blk.ffn.down.quantFormat == .Q8_0 then
+          if denseF16 && (downF16s[li]?.getD none).isSome then
+            -- dense down f16 WMMA reg (QKVRB rounding profile): A = f32 geglu sGe [N,ffn], B = down
+            -- f16 [dim,ffn/2], C = sD [N,dim] (64-row padded alloc). No q80 needed (A read as f32).
+            let some dbuf := downF16s[li]?.getD none | throw (IO.userError "downF16")
+            dispRB device (Hesper.WGSL.MatMul.matMulTransposeF16WMMARegKernel { M := N, N := dim, K := ffn } 0 dim)
+              (("a",sGe)::("b",dbuf)::("c",sD)::List.nil) ((dim+31)/32) ((N+63)/64) (hash ("rbd",li))
+            Hesper.WGSL.Execute.flushBatch device   -- WMMA → next reader: batch split (Dawn barrier drop)
+          else if denseDownRB && blk.ffn.down.quantFormat == .Q8_0 then
             -- TILED reg-matmul dense down (matrix units, in-kernel Q8_0 dequant). A=f32 geglu sGe [N,ffn],
             -- B=down Q8_0 [dim,ffn], C=sD [N,dim]. Single weight ⇒ nExpert=1, zero tileExpert.
             dispRB device (Hesper.Quantization.Q4_K_M.q8MatmulGroupedRegKernel N dim ffn 1)
