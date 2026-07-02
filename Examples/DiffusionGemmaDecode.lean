@@ -823,7 +823,7 @@ def main (args : List String) : IO Unit := do
   let q8size := (dim/32)*9
   -- DG_MOERB: fused Q4_K reg-matmul for the MoE gate/up. The reg M-tile is 64 ⇒ each expert block must
   -- be 64-aligned ⇒ pad to 64 (vs 32 for MMQ). Gated: the default MMQ path keeps its 32-pad.
-  let moeRB := (← IO.getEnv "DG_MOERB").isSome
+  let moeRB := (← IO.getEnv "DG_NOMOERB").isNone   -- DEFAULT ON (validated); DG_NOMOERB=1 opts out
   -- DG_MOENOFLUSH: drop the MoE chain's per-layer flushBatch splits. Those were added to fight a
   -- "Dawn drops barriers at scale" race — but that race may have been the kill-9 GPU wedge / swap
   -- corruption all along (post-reboot experiment). If correct without them: faster AND simpler.
@@ -837,7 +837,7 @@ def main (args : List String) : IO Unit := do
   -- DG_MOEDOWNRB: tile the MoE down with the fused Q8_0 reg-matmul (matrix units) instead of the
   -- warp-per-output kernel — the down was the biggest MoE cost (DG_SKIP: ~600ms, ~7× less efficient
   -- per FLOP than the tiled gate/up). Uses the grouped down structure (geglu grouped → reg → scatter).
-  let moeDownRB := (← IO.getEnv "DG_MOEDOWNRB").isSome
+  let moeDownRB := (← IO.getEnv "DG_NOMOEDOWNRB").isNone   -- DEFAULT ON (validated); DG_NOMOEDOWNRB=1 opts out
   -- DG_DENSEDOWNRB: tile the DENSE FFN down with the fused Q8_0 reg-matmul (single weight ⇒ nExpert=1,
   -- a zero tileExpert). The dense down was also on the warp kernel (~186ms). No grouping ⇒ no grouped-
   -- path issues; reuses the golden-validated q8MatmulGroupedRegKernel.
@@ -860,7 +860,7 @@ def main (args : List String) : IO Unit := do
   let sExpertCount ← mkBuf device nExpert
   let sExpertOffset ← mkBuf device nExpert
   -- DECODE LOOP: real prompt + canvas of mask tokens; diffusion confidence-commit
-  let decodeSteps := (args.drop 3).head?.bind (·.toNat?) |>.getD 13
+  let decodeSteps := (args.drop 3).head?.bind (·.toNat?) |>.getD 32   -- default 32: gentle floor (C/32=8/step); with the CONF bulk-commit the EFFECTIVE steps stay low
   let mut toks : Array Nat := promptTokens ++ Array.replicate C model.dg.maskTokenId
   let mut masked : Array Bool := Array.replicate C true
   let scK := 8   -- top-K tokens carrying the softmax mass for the SC soft embedding
@@ -893,7 +893,7 @@ def main (args : List String) : IO Unit := do
       pure buf
   -- DG_QKVRB: dequant the Q4_K Q/K/V projection weights → f16 [outDim, dim/2] once, so attention
   -- can use the ~11.6× faster subgroup-matrix reg-matmul instead of MMQ5 dp4a.
-  let qkvRB := (← IO.getEnv "DG_QKVRB").isSome
+  let qkvRB := (← IO.getEnv "DG_NOQKVRB").isNone   -- DEFAULT ON (validated); DG_NOQKVRB=1 opts out
   let mut qF16s : Array Buffer := #[]; let mut kF16s : Array Buffer := #[]; let mut vF16s : Array Buffer := #[]
   let mut oF16s : Array Buffer := #[]; let mut gateF16s : Array Buffer := #[]; let mut upF16s : Array Buffer := #[]
   if qkvRB then
@@ -961,7 +961,7 @@ def main (args : List String) : IO Unit := do
   IO.println s!"[dg-decode] {decodeSteps} steps, N={N} P={P} C={C}  skipDense={skipDense}"
   -- DG_CONF=<percent>: confidence threshold for bulk-commit early stop (e.g. DG_CONF=90 → commit all
   -- candidates with confidence ≥ 0.90 each step; loop skips once every position is committed).
-  let confThreshPct : Option Nat := (← IO.getEnv "DG_CONF").bind (·.toNat?)
+  let confThreshPct : Option Nat := some (((← IO.getEnv "DG_CONF").bind (·.toNat?)).getD 90)   -- DEFAULT 90%: bulk-commit confident tokens (llama.cpp-style); DG_CONF=101 disables
   -- DG_LAYERSUM: per-layer hidden checksum (Σ|h|, max|h|) printed each step — cross-run diff localizes
   -- the first non-deterministic layer. Use with DG_LPB=1 so each layer's batch closes before readback.
   let layerSum := (← IO.getEnv "DG_LAYERSUM").isSome
@@ -979,6 +979,12 @@ def main (args : List String) : IO Unit := do
       r.modify (· + (n - (← tPrev.get)))
       tPrev.set n
       Hesper.GPUBackend.beginBatch device
+  -- end-of-generation token set: Gemma4 <turn|>=106 (end-of-turn) + the tokenizer's EOS if any.
+  -- Used for the EOS early-stop (in the commit section) and the display trim (llama.cpp behavior).
+  let eogIds : List Nat := 106 :: (match Hesper.Tokenizer.SentencePiece.eosToken tokenizer with
+    | some e => [e] | none => [])
+  let mut loopTotalMs : Nat := 0
+  let mut effSteps : Nat := 0
   for step in [0:decodeSteps] do
     if prof then rAttn.set 0; rDense.set 0; rMoe.set 0; rRest.set 0; rBattn.set 0; rAttnO.set 0; rQkn.set 0; rMoeGrp.set 0; rMoeGU.set 0
     let remaining := masked.foldl (fun acc b => if b then acc+1 else acc) 0
@@ -1124,7 +1130,7 @@ def main (args : List String) : IO Unit := do
         disp device (zeroB (N*dim)) (("data",sMoeAcc)::List.nil) (N*dim) (hash ("z",li))
         -- Q8_1-quantize the MoE input once for the dp4a expert matmul (replaces qK)
         disp2w device (Hesper.Layers.Linear.quantizeQ8_1BatchKernel dim N) (("input",sMoeN)::("output",sMoeNQ8)::List.nil) (dim/32) N 32 (hash ("qmoeq8",li))
-        if (← IO.getEnv "DG_GROUP").isSome then
+        if (← IO.getEnv "DG_NOGROUP").isNone then   -- grouped MoE DEFAULT ON (validated); DG_NOGROUP=1 opts out
           -- expert-grouping (fused, GPU-side counting-sort grouping — no readback, stays batched)
           unless skGrp do disp device (clearSortedB maxPadded nUsed) (("sp",sSortedPos)::("ss",sSortedSlot)::List.nil) maxPadded (hash ("clr",li))
           unless skGrp do disp device (countExpB totalTok nExpert) (("idxs",sIdxs)::("cnt",sExpertCount)::List.nil) nExpert (hash ("cntk",li))
@@ -1373,8 +1379,42 @@ def main (args : List String) : IO Unit := do
         toks := toks.set! (P+ci) pred
         masked := masked.set! ci false
         nCommitted := nCommitted + 1
+      -- EOS early-stop: once everything BEFORE the first committed end-of-generation token is
+      -- committed, the canvas positions after it are irrelevant — unmask them so the next step
+      -- sees remaining=0 and the loop skips (llama.cpp stops at EOG the same way).
+      let mut eogPos := C
+      for i in [0:C] do
+        if eogPos == C && !masked[i]! && eogIds.contains (toks[P+i]!) then eogPos := i
+      if eogPos < C then
+        let mut allBefore := true
+        for j in [0:eogPos] do
+          if masked[j]! then allBefore := false
+        if allBefore then
+          for j in [eogPos:C] do masked := masked.set! j false
+          IO.println s!"[dg-decode] EOS early-stop: eog at canvas {eogPos}, tail unmasked"
       let t1 ← IO.monoMsNow
+      loopTotalMs := loopTotalMs + (t1 - t0)
+      effSteps := effSteps + 1
       IO.println s!"[dg-decode] step {step}: committed {nCommitted} | total {t1-t0}ms = emb+fwd {tFwd-t0}ms + lmhead+reduce {tLm-tFwd}ms + commit {t1-tLm}ms"
   let outIds := toks.extract P (P+C)
+  -- Display trim (llama.cpp diffusion-cli behavior): cut at the first EOG token, else at the
+  -- onset of a repetition loop (a token recurring at stride 1-2 for ≥6 reps — checkpoints often
+  -- emit no stop token and pad the tail with spam).
+  let mut cut := outIds.size
+  for i in [0:outIds.size] do
+    if cut == outIds.size && eogIds.contains (outIds[i]!) then cut := i
+  let eogCut := cut
+  for i in [0:eogCut] do
+    if cut == eogCut then   -- only the FIRST loop onset
+      for stride in [1:3] do
+        let mut reps := 0
+        let mut j := i
+        while j + stride < eogCut && outIds[j]! == outIds[j+stride]! do
+          reps := reps + 1; j := j + stride
+        if reps ≥ 6 && cut == eogCut then cut := i
+  let trimmed := outIds.extract 0 cut
   IO.println s!"[dg-decode] first canvas IDs: {(outIds.extract 0 (min 24 outIds.size)).toList}"
-  IO.println s!"[dg-decode] TEXT: {Hesper.Tokenizer.SentencePiece.decode tokenizer outIds}"
+  let toks256 := (256.0 * 1000.0) / (max loopTotalMs 1).toFloat
+  let toksUse := (cut.toFloat * 1000.0) / (max loopTotalMs 1).toFloat
+  IO.println s!"[dg-decode] TPS: {effSteps} eff-steps × {loopTotalMs/(max effSteps 1)}ms avg = {loopTotalMs}ms total | canvas {toks256} tok/s | useful({cut} tok) {toksUse} tok/s"
+  IO.println s!"[dg-decode] TEXT(raw {outIds.size} → cut {cut}): {Hesper.Tokenizer.SentencePiece.decode tokenizer trimmed}"
