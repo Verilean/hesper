@@ -940,7 +940,7 @@ def main (args : List String) : IO Unit := do
   -- DG_DENSEF16: pre-dequant the DENSE ffn_down (Q8_0) → f16 and use the same WMMA reg matmul as the
   -- dense gate/up (the QKVRB rounding profile — DISTINCT from the rejected DG_DENSEDOWNRB int-dequant
   -- reg kernel). ~357MB f16 (dim·ffn·2B·30). Non-Q8_0 layers fall back to q80+bmm.
-  let denseF16 := (← IO.getEnv "DG_DENSEF16").isSome
+  let denseF16 := (← IO.getEnv "DG_NODENSEF16").isNone   -- DEFAULT ON (8/8 @ 802ms under the chat template — the raw-prompt misframing that blocked it is cured); DG_NODENSEF16=1 opts out
   let mut qF16s : Array Buffer := #[]; let mut kF16s : Array Buffer := #[]; let mut vF16s : Array Buffer := #[]
   let mut oF16s : Array Buffer := #[]; let mut gateF16s : Array Buffer := #[]; let mut upF16s : Array Buffer := #[]
   let mut downF16s : Array (Option Buffer) := #[]
