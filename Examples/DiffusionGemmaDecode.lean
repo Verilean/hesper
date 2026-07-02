@@ -903,8 +903,39 @@ def main (args : List String) : IO Unit := do
   let sExpertCount ← mkBuf device nExpert
   let sExpertOffset ← mkBuf device nExpert
   -- DECODE LOOP: real prompt + canvas of mask tokens; diffusion confidence-commit
-  let decodeSteps := (args.drop 3).head?.bind (·.toNat?) |>.getD 32   -- default 32: gentle floor (C/32=8/step); with the CONF bulk-commit the EFFECTIVE steps stay low
+  -- default steps: 32 for the mask-commit schedule (gentle floor, CONF bulk-commit keeps EFFECTIVE
+  -- steps low); 13 for the entropy-bound denoiser (its t-annealing spans S — S=13 converges clean,
+  -- S=32 anneals too slowly, matching llama.cpp's --diffusion-steps 13 reference run).
+  let decodeSteps := (args.drop 3).head?.bind (·.toNat?)
+    |>.getD (if ((← IO.getEnv "DG_SCHED").getD "fixed") == "eb" then 20 else 32)
+  -- DG_SCHED=eb: llama.cpp's ENTROPY-BOUND denoiser (examples/diffusion/diffusion.cpp:442) — the
+  -- canvas is RANDOM-initialized (not masks) and re-noised every step: per position compute the
+  -- temperature-adjusted distribution, its entropy H, the argmax and a multinomial sample; ACCEPT the
+  -- lowest-entropy positions whose strictly-earlier cumulative H ≤ entropy_bound (accepted keep their
+  -- sampled token, the rest get a fresh RANDOM token); stop when the argmax canvas is stable for
+  -- `stability` steps AND mean H < confidence threshold. Output = the argmax canvas. Nothing is ever
+  -- irreversibly committed — llama.cpp finishes France in 8 steps with this. We approximate the
+  -- per-position distribution from the GPU top-K (K=8) probs: q ∝ p^(1/t) renormalized (accepted
+  -- positions are low-entropy ⇒ top-8 carries ≈all their mass; high-H positions are rejected anyway).
+  let schedEB := ((← IO.getEnv "DG_SCHED").getD "fixed") == "eb"
+  let ebTmax := ((((← IO.getEnv "DG_EB_TMAX").bind (·.toNat?)).getD 80).toFloat) / 100.0   -- t at step 0
+  let ebTmin := ((((← IO.getEnv "DG_EB_TMIN").bind (·.toNat?)).getD 40).toFloat) / 100.0   -- t at last step
+  let ebBound := ((((← IO.getEnv "DG_EB_BOUND").bind (·.toNat?)).getD 10).toFloat) / 100.0 -- MI bound (0.1)
+  -- stop rule, adapted to the top-K H scale: llama.cpp stops at meanH<0.005 (its full-vocab H → ~0
+  -- when every position is ultra-confident); our top-8+tail H floors well above that, so the binding
+  -- condition here is ARGMAX STABILITY (held ≥ 2) with meanH<0.9 as a sanity ceiling.
+  let ebConfTh := ((((← IO.getEnv "DG_EB_CONF").bind (·.toNat?)).getD 900).toFloat) / 1000.0
+  let ebStab := (((← IO.getEnv "DG_EB_STAB").bind (·.toNat?)).getD 2)                       -- stability steps
+  -- deterministic LCG (llama.cpp uses mt19937(seed); exact stream differs, semantics match)
+  let mut ebRng : UInt64 := (((← IO.getEnv "DG_SEED").bind (·.toNat?)).getD 12345).toUInt64
+  let mut ebPrevArgmax : Array Nat := Array.replicate C 0
+  let mut ebHeld : Nat := 0
+  let mut ebFirstStep := true
   let mut toks : Array Nat := promptTokens ++ Array.replicate C model.dg.maskTokenId
+  if schedEB then
+    for i in [0:C] do
+      ebRng := ebRng * 6364136223846793005 + 1442695040888963407
+      toks := toks.set! (P+i) ((ebRng >>> 33).toNat % cfg.vocabSize)
   let mut masked : Array Bool := Array.replicate C true
   let scK := 8   -- top-K tokens carrying the softmax mass for the SC soft embedding
   let mut scTok : Array Nat := Array.replicate (C*scK) model.dg.maskTokenId  -- prev step's top-K tokens
@@ -1419,6 +1450,91 @@ def main (args : List String) : IO Unit := do
           unmapBuffer sLogits
           IO.println s!"[logitdump] step-0 logits [C={C} x vocab={cfg.vocabSize}] → {dumpPath} ({bytes.size} bytes); maskTokenId={model.dg.maskTokenId} N={N} P={P}"
       let tLm ← IO.monoMsNow
+      if schedEB then
+        -- ===== ENTROPY-BOUND step (llama.cpp port; see the schedEB comment at the canvas init) =====
+        let S := decodeSteps
+        let tCur := ebTmin + (ebTmax - ebTmin) * ((S - step).toFloat / S.toFloat)
+        let tInv := 1.0 / tCur
+        -- per position: tempered top-K distribution q ∝ p^(1/t), entropy, argmax, multinomial sample
+        let mut entH : Array Float := Array.replicate C 0.0
+        let mut argmaxT : Array Nat := Array.replicate C 0
+        let mut sampledT : Array Nat := Array.replicate C 0
+        let mut qFlat : Array Float := Array.replicate (C*scK) 0.0
+        for pos in [0:C] do
+          let base := pos*scK
+          -- full-vocab approximation from the top-K: model the tail (1-Σp) as nTail pseudo-tokens of
+          -- mass p_K each (the K-th prob). Without this, renormalizing over K inflates uncertain
+          -- positions' junk 20×+ in the SC and caps H at ln K (llama.cpp's uncertain H ≈ 10+).
+          let mut sumP := 0.0
+          let mut zTop := 0.0
+          for j in [0:scK] do
+            sumP := sumP + probFlat[base+j]!
+            zTop := zTop + Float.pow (max (probFlat[base+j]!) 1e-30) tInv
+          let pK := max (probFlat[base+scK-1]!) 1e-30
+          let nTail := (max (1.0 - sumP) 0.0) / pK
+          let qTail1 := Float.pow pK tInv
+          let zAll := zTop + nTail * qTail1
+          ebRng := ebRng * 6364136223846793005 + 1442695040888963407
+          let u : Float := ((ebRng >>> 11).toNat.toFloat) / 9007199254740992.0
+          let target := u * zAll
+          let mut hh := 0.0
+          let mut cum := 0.0
+          let mut samp := ktokFlat[base]!
+          let mut donePick := false
+          for j in [0:scK] do
+            let q := Float.pow (max (probFlat[base+j]!) 1e-30) tInv / zAll
+            qFlat := qFlat.set! (base+j) q
+            if q > 0.0 then hh := hh - q * Float.log q
+            cum := cum + q * zAll
+            if !donePick && cum ≥ target then samp := ktokFlat[base+j]!; donePick := true
+          if !donePick then
+            -- tail draw: proxy with a fresh random token (llama.cpp samples the true tail)
+            ebRng := ebRng * 6364136223846793005 + 1442695040888963407
+            samp := (ebRng >>> 33).toNat % cfg.vocabSize
+          let qT := qTail1 / zAll
+          if nTail > 0.0 && qT > 0.0 then hh := hh - nTail * qT * Float.log qT
+          entH := entH.set! pos hh
+          argmaxT := argmaxT.set! pos (ktokFlat[base]!)
+          sampledT := sampledT.set! pos samp
+        -- accept the lowest-entropy positions within the MI bound (strictly-earlier cum ≤ bound)
+        let mut order : Array (Float × Nat) := Array.replicate C (0.0, 0)
+        for pos in [0:C] do order := order.set! pos (entH[pos]!, pos)
+        let sorted := order.qsort (fun a b => a.1 < b.1)
+        let mut accepted : Array Bool := Array.replicate C false
+        let mut cumE := 0.0
+        let mut nAcc := 0
+        for k2 in [0:C] do
+          let (h, pos) := sorted[k2]!
+          if cumE ≤ ebBound then accepted := accepted.set! pos true; nAcc := nAcc + 1
+          cumE := cumE + h
+        -- renoise: accepted → sampled, rest → fresh random; the OUTPUT canvas is the argmax
+        let mut entSum := 0.0
+        for pos in [0:C] do
+          entSum := entSum + entH[pos]!
+          if accepted[pos]! then
+            toks := toks.set! (P+pos) (sampledT[pos]!)
+          else
+            ebRng := ebRng * 6364136223846793005 + 1442695040888963407
+            toks := toks.set! (P+pos) ((ebRng >>> 33).toNat % cfg.vocabSize)
+        -- SC = softmax(prev logits / prev t): feed the TEMPERED top-K as next step's soft prediction
+        scTok := ktokFlat; scProb := qFlat
+        -- adaptive stop: argmax stable ≥ stab steps AND mean entropy < threshold (llama.cpp rule)
+        let stable := !ebFirstStep && argmaxT == ebPrevArgmax
+        ebHeld := if stable then ebHeld + 1 else 0
+        ebPrevArgmax := argmaxT
+        ebFirstStep := false
+        let meanH := entSum / C.toFloat
+        let finish := (ebHeld ≥ ebStab && meanH < ebConfTh) || step+1 ≥ decodeSteps
+        if finish then
+          for i in [0:C] do
+            toks := toks.set! (P+i) (argmaxT[i]!)
+            masked := masked.set! i false
+        let t1 ← IO.monoMsNow
+        loopTotalMs := loopTotalMs + (t1 - t0)
+        effSteps := effSteps + 1
+        let stopStr := if finish then " | STOP" else ""
+        IO.println s!"[dg-decode] step {step}: eb acc={nAcc} meanH={meanH} held={ebHeld} t={tCur} | total {t1-t0}ms = emb+fwd {tFwd-t0}ms + lmhead+reduce {tLm-tFwd}ms{stopStr}"
+        continue
       scTok := ktokFlat; scProb := probFlat   -- feed this step's top-K soft prediction into next step's SC
       let want := if step+1 ≥ decodeSteps then remaining else max 1 ((C + decodeSteps - 1) / decodeSteps)
       -- DG_CONF=<percent>: confidence-based bulk commit (llama.cpp-style early stop). Commit every
