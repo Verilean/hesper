@@ -6328,16 +6328,18 @@ def fusedQ8_0BatchExpertF32WarpGroupedKernel (config : Config) (nExpert maxPadde
   let teRaw ← ShaderM.readBuffer (ty := .scalar .u32) (n := maxPadded/32) "tileExpert" rowTile
   let expertIdx := Exp.select (Exp.lt teRaw (Exp.litU32 nExpert)) teRaw (Exp.litU32 (nExpert-1))
   let rowBaseBytes := Exp.add (Exp.mul expertIdx (Exp.litU32 perExpertBytes)) (Exp.mul outIdx (Exp.litU32 (blocksPerRow * 34)))
-  -- cache lane tid's weight element for each K-block
-  for blk in [0:blocksPerRow] do
-    let blockByteBase := Exp.add rowBaseBytes (Exp.litU32 (blk * 34))
-    let loByte ← q8ReadByte "weights" totalWeightU32 blockByteBase
-    let hiByte ← q8ReadByte "weights" totalWeightU32 (Exp.add blockByteBase (Exp.litU32 1))
-    let d := Exp.vecX (Exp.unpack2x16float (Exp.add loByte (Exp.mul hiByte (Exp.litU32 256))))
-    let qb ← q8ReadByte "weights" totalWeightU32 (Exp.add blockByteBase (Exp.add (Exp.litU32 2) tid))
-    let sign := Exp.shiftRight qb (Exp.litU32 7)
-    let qSigned := Exp.sub (Exp.toF32 qb) (Exp.mul (Exp.litF32 256.0) (Exp.toF32 sign))
-    ShaderM.writeWorkgroup (ty := .scalar .f32) "wcache" (Exp.add (Exp.mul tid (Exp.litU32 blocksPerRow)) (Exp.litU32 blk)) (Exp.mul d qSigned)
+  -- cache lane tid's weight element for each K-block (sentinel tiles skip the weight reads — the
+  -- inner dot-product is already guarded so wcache is never read for them; barrier stays outside)
+  ShaderM.if_ (Exp.lt teRaw (Exp.litU32 nExpert)) (do
+    for blk in [0:blocksPerRow] do
+      let blockByteBase := Exp.add rowBaseBytes (Exp.litU32 (blk * 34))
+      let loByte ← q8ReadByte "weights" totalWeightU32 blockByteBase
+      let hiByte ← q8ReadByte "weights" totalWeightU32 (Exp.add blockByteBase (Exp.litU32 1))
+      let d := Exp.vecX (Exp.unpack2x16float (Exp.add loByte (Exp.mul hiByte (Exp.litU32 256))))
+      let qb ← q8ReadByte "weights" totalWeightU32 (Exp.add blockByteBase (Exp.add (Exp.litU32 2) tid))
+      let sign := Exp.shiftRight qb (Exp.litU32 7)
+      let qSigned := Exp.sub (Exp.toF32 qb) (Exp.mul (Exp.litF32 256.0) (Exp.toF32 sign))
+      ShaderM.writeWorkgroup (ty := .scalar .f32) "wcache" (Exp.add (Exp.mul tid (Exp.litU32 blocksPerRow)) (Exp.litU32 blk)) (Exp.mul d qSigned)) (pure ())
   ShaderM.barrier
   ShaderM.varNamed "acc" (.scalar .f32) (Exp.litF32 0.0)
   ShaderM.varNamed "total" (.scalar .f32) (Exp.litF32 0.0)
@@ -6377,23 +6379,25 @@ def fusedQ5_0BatchExpertF32WarpGroupedKernel (config : Config) (nExpert maxPadde
   let teRaw ← ShaderM.readBuffer (ty := .scalar .u32) (n := maxPadded/32) "tileExpert" rowTile
   let expertIdx := Exp.select (Exp.lt teRaw (Exp.litU32 nExpert)) teRaw (Exp.litU32 (nExpert-1))
   let rowBaseBytes := Exp.add (Exp.mul expertIdx (Exp.litU32 perExpertBytes)) (Exp.mul outIdx (Exp.litU32 (blocksPerRow * 22)))
-  for blk in [0:blocksPerRow] do
-    let blockByteBase := Exp.add rowBaseBytes (Exp.litU32 (blk * 22))
-    let loByte ← q8ReadByte "weights" totalWeightU32 blockByteBase
-    let hiByte ← q8ReadByte "weights" totalWeightU32 (Exp.add blockByteBase (Exp.litU32 1))
-    let d := Exp.vecX (Exp.unpack2x16float (Exp.add loByte (Exp.mul hiByte (Exp.litU32 256))))
-    let qh0 ← q8ReadByte "weights" totalWeightU32 (Exp.add blockByteBase (Exp.litU32 2))
-    let qh1 ← q8ReadByte "weights" totalWeightU32 (Exp.add blockByteBase (Exp.litU32 3))
-    let qh2 ← q8ReadByte "weights" totalWeightU32 (Exp.add blockByteBase (Exp.litU32 4))
-    let qh3 ← q8ReadByte "weights" totalWeightU32 (Exp.add blockByteBase (Exp.litU32 5))
-    let qh := Exp.add qh0 (Exp.add (Exp.mul qh1 (Exp.litU32 256)) (Exp.add (Exp.mul qh2 (Exp.litU32 65536)) (Exp.mul qh3 (Exp.litU32 16777216))))
-    let qsByteIdx := Exp.select (Exp.lt tid (Exp.litU32 16)) tid (Exp.sub tid (Exp.litU32 16))
-    let qb ← q8ReadByte "weights" totalWeightU32 (Exp.add blockByteBase (Exp.add (Exp.litU32 6) qsByteIdx))
-    let nibble := Exp.select (Exp.lt tid (Exp.litU32 16)) (Exp.bitAnd qb (Exp.litU32 15))
-                    (Exp.bitAnd (Exp.shiftRight qb (Exp.litU32 4)) (Exp.litU32 15))
-    let hbit := Exp.bitAnd (Exp.shiftRight qh tid) (Exp.litU32 1)
-    let q5 := Exp.add nibble (Exp.mul hbit (Exp.litU32 16))
-    ShaderM.writeWorkgroup (ty := .scalar .f32) "wcache" (Exp.add (Exp.mul tid (Exp.litU32 blocksPerRow)) (Exp.litU32 blk)) (Exp.mul d (Exp.sub (Exp.toF32 q5) (Exp.litF32 16.0)))
+  -- sentinel tiles skip the weight reads (inner dot-product already guarded; barrier stays outside)
+  ShaderM.if_ (Exp.lt teRaw (Exp.litU32 nExpert)) (do
+    for blk in [0:blocksPerRow] do
+      let blockByteBase := Exp.add rowBaseBytes (Exp.litU32 (blk * 22))
+      let loByte ← q8ReadByte "weights" totalWeightU32 blockByteBase
+      let hiByte ← q8ReadByte "weights" totalWeightU32 (Exp.add blockByteBase (Exp.litU32 1))
+      let d := Exp.vecX (Exp.unpack2x16float (Exp.add loByte (Exp.mul hiByte (Exp.litU32 256))))
+      let qh0 ← q8ReadByte "weights" totalWeightU32 (Exp.add blockByteBase (Exp.litU32 2))
+      let qh1 ← q8ReadByte "weights" totalWeightU32 (Exp.add blockByteBase (Exp.litU32 3))
+      let qh2 ← q8ReadByte "weights" totalWeightU32 (Exp.add blockByteBase (Exp.litU32 4))
+      let qh3 ← q8ReadByte "weights" totalWeightU32 (Exp.add blockByteBase (Exp.litU32 5))
+      let qh := Exp.add qh0 (Exp.add (Exp.mul qh1 (Exp.litU32 256)) (Exp.add (Exp.mul qh2 (Exp.litU32 65536)) (Exp.mul qh3 (Exp.litU32 16777216))))
+      let qsByteIdx := Exp.select (Exp.lt tid (Exp.litU32 16)) tid (Exp.sub tid (Exp.litU32 16))
+      let qb ← q8ReadByte "weights" totalWeightU32 (Exp.add blockByteBase (Exp.add (Exp.litU32 6) qsByteIdx))
+      let nibble := Exp.select (Exp.lt tid (Exp.litU32 16)) (Exp.bitAnd qb (Exp.litU32 15))
+                      (Exp.bitAnd (Exp.shiftRight qb (Exp.litU32 4)) (Exp.litU32 15))
+      let hbit := Exp.bitAnd (Exp.shiftRight qh tid) (Exp.litU32 1)
+      let q5 := Exp.add nibble (Exp.mul hbit (Exp.litU32 16))
+      ShaderM.writeWorkgroup (ty := .scalar .f32) "wcache" (Exp.add (Exp.mul tid (Exp.litU32 blocksPerRow)) (Exp.litU32 blk)) (Exp.mul d (Exp.sub (Exp.toF32 q5) (Exp.litF32 16.0)))) (pure ())
   ShaderM.barrier
   ShaderM.varNamed "acc" (.scalar .f32) (Exp.litF32 0.0)
   ShaderM.varNamed "total" (.scalar .f32) (Exp.litF32 0.0)
