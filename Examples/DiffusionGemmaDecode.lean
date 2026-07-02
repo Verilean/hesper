@@ -150,6 +150,98 @@ def softReduceB (N P C dim K : Nat) (embScale : Float) : Hesper.WGSL.Monad.Shade
       ShaderM.writeBuffer (ty := .scalar .f32) "ssc" t (Exp.mul (Exp.litF32 embScale) (Exp.var acc)))
       (ShaderM.writeBuffer (ty := .scalar .f32) "ssc" t (Exp.litF32 0.0))) (pure ())
 
+/-- Full-vocab SC softmax (llama.cpp fidelity): probs[i,v] = S·exp((logits[i,v]−max)/t)/Z over the
+    ENTIRE vocab, one workgroup per canvas position (ws threads stride the vocab). t is read from
+    tbuf[0] (annealed 0.8→0.4 per llama.cpp). S=1024 keeps tail probs in f16-normal range for the
+    WMMA A-load; the SC RMSNorm right after is scale-invariant so S (and embScale) cancel. -/
+def scSoftmaxTempB (Cc vocab ws : Nat) (S : Float) : Hesper.WGSL.Monad.ShaderM Unit := do
+  let wid ← ShaderM.workgroupId; let lid ← ShaderM.localId
+  let i := Exp.vec3X wid; let tid := Exp.vec3X lid
+  let _l ← ShaderM.declareReadOnlyBuffer "logits" (.array (.scalar .f32) (Cc*vocab))
+  let _t ← ShaderM.declareReadOnlyBuffer "tbuf" (.array (.scalar .f32) 4)
+  let _p ← ShaderM.declareOutputBuffer "probs" (.array (.scalar .f32) (Cc*vocab))
+  ShaderM.sharedNamed "sRed" (.array (.scalar .f32) ws)
+  let rowBase := Exp.mul i (Exp.litU32 vocab)
+  let tv := Exp.index (Exp.var "tbuf" : Exp (.array (.scalar .f32) 4)) (Exp.litU32 0)
+  ShaderM.varNamed "inv" (.scalar .f32) (Exp.div (Exp.litF32 1.0) tv)
+  -- pass 1: row max
+  ShaderM.varNamed "m" (.scalar .f32) (Exp.litF32 (-1e30))
+  ShaderM.loop tid (Exp.litU32 vocab) (Exp.litU32 ws) fun v => do
+    let l := Exp.index (Exp.var "logits" : Exp (.array (.scalar .f32) (Cc*vocab))) (Exp.add rowBase v)
+    ShaderM.if_ (Exp.gt l (Exp.var "m")) (ShaderM.assign "m" l) (pure ())
+  ShaderM.writeWorkgroup (ty := .scalar .f32) "sRed" tid (Exp.var "m")
+  ShaderM.barrier
+  let mut stride := ws / 2
+  while stride > 0 do
+    ShaderM.if_ (Exp.lt tid (Exp.litU32 stride)) (do
+      let a ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := ws) "sRed" tid
+      let b ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := ws) "sRed" (Exp.add tid (Exp.litU32 stride))
+      ShaderM.if_ (Exp.gt b a) (ShaderM.writeWorkgroup (ty := .scalar .f32) "sRed" tid b) (pure ())) (pure ())
+    ShaderM.barrier
+    stride := stride / 2
+  let mx ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := ws) "sRed" (Exp.litU32 0)
+  ShaderM.varNamed "mxv" (.scalar .f32) mx
+  ShaderM.barrier   -- all threads have read sRed[0] before pass 2 reuses the shared array
+  -- pass 2: Z = Σ exp((l−mx)·inv)
+  ShaderM.varNamed "s" (.scalar .f32) (Exp.litF32 0.0)
+  ShaderM.loop tid (Exp.litU32 vocab) (Exp.litU32 ws) fun v => do
+    let l := Exp.index (Exp.var "logits" : Exp (.array (.scalar .f32) (Cc*vocab))) (Exp.add rowBase v)
+    ShaderM.assign "s" (Exp.add (Exp.var "s") (Exp.exp (Exp.mul (Exp.sub l (Exp.var "mxv")) (Exp.var "inv"))))
+  ShaderM.writeWorkgroup (ty := .scalar .f32) "sRed" tid (Exp.var "s")
+  ShaderM.barrier
+  stride := ws / 2
+  while stride > 0 do
+    ShaderM.if_ (Exp.lt tid (Exp.litU32 stride)) (do
+      let a ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := ws) "sRed" tid
+      let b ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := ws) "sRed" (Exp.add tid (Exp.litU32 stride))
+      ShaderM.writeWorkgroup (ty := .scalar .f32) "sRed" tid (Exp.add a b)) (pure ())
+    ShaderM.barrier
+    stride := stride / 2
+  let z ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := ws) "sRed" (Exp.litU32 0)
+  ShaderM.varNamed "sOverZ" (.scalar .f32) (Exp.div (Exp.litF32 S) (Exp.max z (Exp.litF32 1e-30)))
+  -- pass 3: write scaled probs
+  ShaderM.loop tid (Exp.litU32 vocab) (Exp.litU32 ws) fun v => do
+    let l := Exp.index (Exp.var "logits" : Exp (.array (.scalar .f32) (Cc*vocab))) (Exp.add rowBase v)
+    ShaderM.writeBuffer (ty := .scalar .f32) "probs" (Exp.add rowBase v)
+      (Exp.mul (Exp.exp (Exp.mul (Exp.sub l (Exp.var "mxv")) (Exp.var "inv"))) (Exp.var "sOverZ"))
+
+/-- One-time bit-level transpose of the f16 embed/lm_head table W[vocab, dim/2 u32-pairs] →
+    WT[dim, vocab/2 u32-pairs], so the full-SC `probs @ W` runs on the existing transpose-B WMMA
+    kernel (B must be [N=dim, K=vocab] row-major). Pure u32 shuffles, bounds-guarded, 2D grid. -/
+def transposeEmbF16B (vocab dim gridXWidth : Nat) : Hesper.WGSL.Monad.ShaderM Unit := do
+  let gid ← ShaderM.globalId
+  let flat := Exp.add (Exp.vec3X gid) (Exp.mul (Exp.vec3Y gid) (Exp.litU32 gridXWidth))
+  let nOut := dim * (vocab/2)
+  let _s ← ShaderM.declareReadOnlyBuffer "src" (.array (.scalar .u32) (vocab*(dim/2)))
+  let _d ← ShaderM.declareOutputBuffer "dst" (.array (.scalar .u32) nOut)
+  ShaderM.if_ (Exp.lt flat (Exp.litU32 nOut)) (do
+    let d := Exp.div flat (Exp.litU32 (vocab/2))
+    let vp := Exp.mod flat (Exp.litU32 (vocab/2))
+    let v0 := Exp.mul vp (Exp.litU32 2)
+    let sh := Exp.mul (Exp.mod d (Exp.litU32 2)) (Exp.litU32 16)
+    let dHalf := Exp.div d (Exp.litU32 2)
+    let w0 ← ShaderM.readBuffer (ty := .scalar .u32) (n := vocab*(dim/2)) "src" (Exp.add (Exp.mul v0 (Exp.litU32 (dim/2))) dHalf)
+    let w1 ← ShaderM.readBuffer (ty := .scalar .u32) (n := vocab*(dim/2)) "src" (Exp.add (Exp.mul (Exp.add v0 (Exp.litU32 1)) (Exp.litU32 (dim/2))) dHalf)
+    let h0 := Exp.bitAnd (Exp.shiftRight w0 sh) (Exp.litU32 0xFFFF)
+    let h1 := Exp.bitAnd (Exp.shiftRight w1 sh) (Exp.litU32 0xFFFF)
+    ShaderM.writeBuffer (ty := .scalar .u32) "dst" flat (Exp.bitOr h0 (Exp.shiftLeft h1 (Exp.litU32 16)))) (pure ())
+
+/-- Spread the full-SC matmul output into the N-row sSC layout: sSC[r,d] = r≥P ? sSCC[r−P,d] : 0. -/
+def scSpreadB (N P dim : Nat) : Hesper.WGSL.Monad.ShaderM Unit := do
+  let gid ← ShaderM.globalId
+  let t := Exp.vec3X gid
+  let _o ← ShaderM.declareOutputBuffer "ssc" (.array (.scalar .f32) (N*dim))
+  let _i ← ShaderM.declareReadOnlyBuffer "sccc" (.array (.scalar .f32) ((N-P)*dim))
+  ShaderM.if_ (Exp.lt t (Exp.litU32 (N*dim))) (do
+    let r := Exp.div t (Exp.litU32 dim)
+    let d := Exp.mod t (Exp.litU32 dim)
+    ShaderM.if_ (Exp.ge r (Exp.litU32 P))
+      (do
+        let src := Exp.add (Exp.mul (Exp.sub r (Exp.litU32 P)) (Exp.litU32 dim)) d
+        let v := Exp.index (Exp.var "sccc" : Exp (.array (.scalar .f32) ((N-P)*dim))) src
+        ShaderM.writeBuffer (ty := .scalar .f32) "ssc" t v)
+      (ShaderM.writeBuffer (ty := .scalar .f32) "ssc" t (Exp.litF32 0.0))) (pure ())
+
 /-- Self-conditioning add (canvas rows only): a[t] += scUse * sig[t] for r≥P. -/
 def addCanvasB (N P dim : Nat) (scUse : Float) : Hesper.WGSL.Monad.ShaderM Unit := do
   let gid ← ShaderM.globalId
@@ -823,7 +915,11 @@ def main (args : List String) : IO Unit := do
     else
       pure <| enc prompt
   let P := promptTokens.size
-  let C := model.dg.canvasLength
+  -- DG_CANVAS=<n>: override the canvas length (default = GGUF diffusion.canvas_length, 256).
+  -- Bigger canvas ⇒ bigger M ⇒ matmuls move from the medium-M ceiling (~47%) into the large-M band
+  -- (67-91%) and per-step weight reads amortize over more tokens — the in-step-parallel throughput
+  -- lever behind the big diffusion-TPS demos. NOTE: logitsCanvas is [C, vocab] f32 (~1GB at C=1024).
+  let C := ((← IO.getEnv "DG_CANVAS").bind (·.toNat?)).getD model.dg.canvasLength
   let N := P + C
   IO.println s!"[dg-decode] P={P} (prompt tokens) C={C} (canvas) N={N}"
   IO.println s!"[dg-decode] prompt token ids: {(promptTokens.extract 0 (min 20 P)).toList}"
@@ -1051,6 +1147,23 @@ def main (args : List String) : IO Unit := do
   let outDenom ← mkBuf device C
   let outTok ← mkBuf device (C*scK)
   let outProb ← mkBuf device (C*scK)
+  -- DG_FULLSC: full-vocab self-conditioning (llama.cpp fidelity). Instead of the top-8 soft-embed,
+  -- softmax(prev step's FULL logitsCanvas / t) on GPU (t annealed 0.8→0.4) then ONE WMMA matmul
+  -- probs[C,vocab] @ Wᵀ[dim,vocab] → sSC. Needs a one-time transpose of the f16 embed table (+1.5GB)
+  -- and a probs buffer (+268MB). The top-8 sliver is a biased approximation at high-entropy positions —
+  -- full-vocab SC is the denoiser's trained conditioning signal (llama.cpp converges in 8-11 steps).
+  let fullSC := (← IO.getEnv "DG_FULLSC").isSome
+  let sScProbs ← mkBuf device (if fullSC then C*cfg.vocabSize else 1)
+  let embTT ← mkBuf device (if fullSC then dim*(cfg.vocabSize/2) else 1)
+  let sSCC ← mkBuf device (if fullSC then C*dim else 1)
+  let scTBuf ← mkBuf device 4
+  if fullSC then
+    Hesper.GPUBackend.beginBatch device
+    let nT := dim*(cfg.vocabSize/2)
+    let wgT := (nT+255)/256; let gxT := min wgT 32768; let gyT := (wgT+gxT-1)/gxT
+    disp2 device (transposeEmbF16B cfg.vocabSize dim (gxT*256)) (("src",outputWeightF16)::("dst",embTT)::List.nil) gxT gyT (hash "embtt")
+    Hesper.GPUBackend.endBatch device
+    IO.println s!"[dg-decode] full-vocab SC: transposed embT [dim={dim}, vocab={cfg.vocabSize}] ({dim*cfg.vocabSize*2/(1024*1024)} MiB)"
   let skipDense := (← IO.getEnv "DG_SKIPDENSE").isSome
   IO.println s!"[dg-decode] {decodeSteps} steps, N={N} P={P} C={C}  skipDense={skipDense}"
   -- DG_CONF=<percent>: confidence threshold for bulk-commit early stop (e.g. DG_CONF=90 → commit all
@@ -1088,15 +1201,41 @@ def main (args : List String) : IO Unit := do
       if step > 0 then
         writeBuffer device scTokBuf 0 (u32Bytes scTok)
         writeBuffer device scProbBuf 0 (← Hesper.Basic.floatArrayToBytes scProb)
+        if fullSC then
+          -- SC softmax temperature: llama.cpp uses temp_inv = 1.0 (NO temperature — verified at every
+          -- llama_diffusion_set_sc call site; the 0.8→0.4 anneal is the canvas RE-NOISING sampling
+          -- temperature, a different mechanism). An annealed t here over-sharpens the SC → hard
+          -- self-reinforcement loops ("thoughtthought", "and and and"). DG_SCTEMP=<percent> tunes.
+          let tSC := (((← IO.getEnv "DG_SCTEMP").bind (·.toNat?)).getD 100).toFloat / 100.0
+          writeBuffer device scTBuf 0 (← Hesper.Basic.floatArrayToBytes #[tSC])
       Hesper.GPUBackend.beginBatch device
       disp device (Hesper.Quantization.Q6_K.q6kEmbedGatherKernel N cfg.vocabSize dim embScale) (("token_ids",tokBuf)::("embedding_table",embTable)::("output",a)::List.nil) (N*dim) (hash "emb")
       -- self-conditioning: soft-embed the previous step's top-K prediction → SC-MLP → add to canvas (step>0)
       if step > 0 then
         match model.scPreNorm, model.scGate, model.scUp, model.scDown with
         | some scPN, some scG, some scU, some scD =>
-          -- gather raw embeddings of the C·K top tokens, weighted-reduce by softmax probs → sSC
-          disp device (Hesper.Quantization.Q6_K.q6kEmbedGatherKernel (C*scK) cfg.vocabSize dim 1.0) (("token_ids",scTokBuf)::("embedding_table",embTable)::("output",sTempK)::List.nil) (C*scK*dim) (hash "scgath")
-          disp device (softReduceB N P C dim scK embScale) (("ssc",sSC)::("tempk",sTempK)::("prob",scProbBuf)::List.nil) (N*dim) (hash "scsoft")
+          if fullSC then
+            -- FULL-VOCAB SC (llama.cpp fidelity): softmax(prev logitsCanvas / t) on GPU, then one
+            -- WMMA matmul probs[C,vocab] @ embTTᵀ[dim,vocab] → sSCC, spread into the N-row sSC.
+            -- logitsCanvas still holds the PREVIOUS step's post-softcap logits (written at its end).
+            disp2 device (scSoftmaxTempB C cfg.vocabSize 256 1024.0)
+              (("logits",logitsCanvas)::("tbuf",scTBuf)::("probs",sScProbs)::List.nil) C 1 (hash "scsm")
+            Hesper.WGSL.Execute.flushBatch device   -- softmax → WMMA: batch split
+            dispRB device (Hesper.WGSL.MatMul.matMulTransposeF16WMMARegKernel { M := C, N := dim, K := cfg.vocabSize } 0 dim)
+              (("a",sScProbs)::("b",embTT)::("c",sSCC)::List.nil) ((dim+31)/32) ((C+63)/64) (hash "scmm")
+            Hesper.WGSL.Execute.flushBatch device   -- WMMA → spread (Dawn drops the inter-pass barrier after subgroup-matrix at scale)
+            disp device (scSpreadB N P dim) (("ssc",sSC)::("sccc",sSCC)::List.nil) (N*dim) (hash "scspread")
+          else
+            -- gather raw embeddings of the C·K top tokens, weighted-reduce by softmax probs → sSC
+            disp device (Hesper.Quantization.Q6_K.q6kEmbedGatherKernel (C*scK) cfg.vocabSize dim 1.0) (("token_ids",scTokBuf)::("embedding_table",embTable)::("output",sTempK)::List.nil) (C*scK*dim) (hash "scgath")
+            disp device (softReduceB N P C dim scK embScale) (("ssc",sSC)::("tempk",sTempK)::("prob",scProbBuf)::List.nil) (N*dim) (hash "scsoft")
+          if step == 1 && (← IO.getEnv "DG_SCDBG").isSome then
+            Hesper.GPUBackend.endBatch device
+            let sc ← Hesper.Basic.bytesToFloatArray (← mapBufferRead device sSC 0 (N*dim*4).toUSize)
+            let mut sabs := 0.0
+            for v in sc do sabs := sabs + v.abs
+            IO.println s!"[scdbg] step1 Σ|sSC| = {sabs} (fullSC={fullSC})"
+            Hesper.GPUBackend.beginBatch device
           Hesper.Layers.RMSNorm.forward device scPN sSC sN N
           qK device sN N dim (hash "scqk")
           bmm device scG sN sG N (hash "scg")
