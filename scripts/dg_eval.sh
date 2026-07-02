@@ -48,13 +48,16 @@ echo "=== dg_eval  ENV='${ENV}' ==="
 for i in "${!PROMPTS[@]}"; do
   p="${PROMPTS[$i]}"; ex="${EXPECTS[$i]}"
   out=$(env $ENV timeout 400 "$BIN" "$MODEL" "$p" 2>&1)
-  text=$(echo "$out" | grep -a "TEXT" | tail -1 | sed 's/^.*TEXT[^:]*: //')
+  # multi-line capture: everything from the TEXT marker to EOF (channel-structured outputs
+  # span multiple lines; grabbing just the marker line scored templated runs 0/8 falsely)
+  text=$(echo "$out" | awk '/TEXT\(raw/{found=1; sub(/^.*TEXT[^:]*: /,""); print; next} found{print}')
+  textflat=$(echo "$text" | tr '\n' ' ')
   # avg emb+fwd over steps 2.. (skip warmup step 0/1)
   ms=$(echo "$out" | grep -aE "step [0-9]+:" | tail -n +3 | grep -oaE "emb\+fwd [0-9]+" | grep -oaE "[0-9]+" | awk '{s+=$1;n++} END{if(n>0) printf "%d", s/n; else print 0}')
   nsteps=$(echo "$out" | grep -acE "step [0-9]+:")
-  if echo "$text" | grep -qaE "$ex"; then verdict="PASS"; score=$((score+1)); else verdict="FAIL"; fi
+  if echo "$textflat" | grep -qaE "$ex"; then verdict="PASS"; score=$((score+1)); else verdict="FAIL"; fi
   [ -n "$ms" ] && [ "$ms" != "0" ] && { stepms_total=$((stepms_total+ms)); stepms_n=$((stepms_n+1)); }
-  printf "%s [%2d steps, %4sms/step] %-45s → %.80s\n" "$verdict" "$nsteps" "$ms" "\"$p\"" "$text"
+  printf "%s [%2d steps, %4sms/step] %-45s → %.80s\n" "$verdict" "$nsteps" "$ms" "\"$p\"" "$textflat"
 done
 avg=0; [ $stepms_n -gt 0 ] && avg=$((stepms_total/stepms_n))
 echo "=== TOTAL: $score/${#PROMPTS[@]}  avg emb+fwd ${avg}ms/step ==="
