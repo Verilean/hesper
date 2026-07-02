@@ -801,11 +801,27 @@ def main (args : List String) : IO Unit := do
   let device ← getDevice inst
   let model ← DiffusionGemmaModel.fromGGUF (β := Device) device path
   let cfg := model.inner.config
-  -- tokenize the real prompt → P; canvas C from config.  This model's special
-  -- turn tokens are non-standard ('<|turn>'=105), so use the raw prompt
-  -- (completion-style: the model denoises the canvas as a continuation).
+  -- tokenize the real prompt → P; canvas C from config.
   let tokenizer ← Hesper.Tokenizer.SentencePiece.fromGGUF (← Hesper.GGUF.loadGGUFHeader path)
-  let promptTokens := Hesper.Tokenizer.SentencePiece.encode tokenizer prompt
+  -- DG_TEMPLATE=1: llama.cpp-parity input. llama-diffusion-cli applies the GGUF chat template
+  -- (rendered, enable_thinking=true):  <bos><|turn>system\n<|think|>\n<turn|>\n<|turn>user\n{P}
+  -- <turn|>\n<|turn>model\n   with specials parsed to single ids (<bos>=2 <|think|>=98 <|turn>=105
+  -- <turn|>=106, from the GGUF vocab) and add_bos_token=true. Without it (default) we feed the raw
+  -- prompt completion-style — which llama.cpp never does, and which makes the model commit
+  -- confidently-wrong framings on knowledge prompts (Au/Shakespeare/Armstrong all fail raw,
+  -- all pass templated in llama.cpp).
+  let enc := Hesper.Tokenizer.SentencePiece.encode tokenizer
+  -- segment encoder for the template: encode WITHOUT the tokenizer's automatic BOS (the template
+  -- carries exactly one explicit BOS up front, like llama.cpp's add_special on the whole string)
+  let encRaw := fun (s : String) =>
+    let t := enc s
+    if t.size > 0 && t[0]! == 2 then t.extract 1 t.size else t
+  let promptTokens ←
+    if (← IO.getEnv "DG_NOTEMPLATE").isNone then   -- DEFAULT ON (8/8 vs raw 5/8); DG_NOTEMPLATE=1 opts out
+      pure <| #[2, 105] ++ encRaw "system\n" ++ #[98] ++ encRaw "\n" ++ #[106] ++ encRaw "\n"
+        ++ #[105] ++ encRaw ("user\n" ++ prompt) ++ #[106] ++ encRaw "\n" ++ #[105] ++ encRaw "model\n"
+    else
+      pure <| enc prompt
   let P := promptTokens.size
   let C := model.dg.canvasLength
   let N := P + C
