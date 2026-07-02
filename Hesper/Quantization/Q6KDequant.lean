@@ -178,6 +178,14 @@ def q6kToF16Kernel (inDim outDim : Nat) (gridXWidth : Nat := 0) : ShaderM Unit :
     let rowU32Base := Exp.mul nIdx (Exp.litU32 (inDim / 2))
     let pairInRow  := Exp.add (Exp.mul blkInRowSafe (Exp.litU32 (blockSize / 2))) pairIdx
     let outU32Idx  := Exp.add rowU32Base pairInRow
-    ShaderM.writeBuffer (ty := .scalar .u32) "output" outU32Idx packed
+    -- BOUNDS GUARD (critical): a 2D grid rounds workgroups UP (e.g. the lm_head's 65535×45 =
+    -- 2,949,075 wgs for 2,883,584 blocks) — the ~65k EXCESS workgroups compute nIdx ≥ outDim and
+    -- their writes all robustness-clamp onto the buffer's LAST u32 = the final vocab row's last
+    -- f16 pair. 65k racing garbage writes → the last writer wins → when the garbage f16 is huge,
+    -- EVERY decode position argmaxes to that tail <unused…> token (the <unused6226>×N failure),
+    -- non-deterministically per run. Guard the write so excess workgroups write nothing.
+    ShaderM.if_ (Exp.lt blockGlobalIdx (Exp.litU32 (outDim * blocksPerRow)))
+      (ShaderM.writeBuffer (ty := .scalar .u32) "output" outU32Idx packed)
+      (pure ())
 
 end Hesper.Quantization.Q6_K
