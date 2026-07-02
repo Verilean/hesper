@@ -1330,6 +1330,18 @@ def main (args : List String) : IO Unit := do
       -- accurate than Q8_K, and the planned f32-warp lm_head kernel reads f32 directly.
       Hesper.GPUBackend.endBatch device
       let (cand, ktokFlat, probFlat) ← lmHeadArgmaxFullVocab device outputWeightF16 sN sLogits logitsCanvas outDenom outTok outProb dim cfg.vocabSize N C P cfg.logitSoftcapScale masked scK
+      -- DG_LOGITDUMP=<path>: dump the step-0 full-canvas post-softcap logits [C, vocab] f32 for a
+      -- golden diff vs llama-diffusion-gemma-eval on the same prompt+all-mask canvas.
+      if step == 0 then
+        if let some dumpPath ← IO.getEnv "DG_LOGITDUMP" then
+          let bytes ← mapBufferRead device logitsCanvas 0 (C*cfg.vocabSize*4).toUSize
+          IO.FS.writeBinFile dumpPath bytes
+          unmapBuffer logitsCanvas
+          -- also dump raw sLogits (holds the LAST vocab chunk) to separate WMMA-vs-copy for missing rows
+          let sBytes ← mapBufferRead device sLogits 0 (N*32768*4).toUSize
+          IO.FS.writeBinFile (dumpPath ++ ".slogits") sBytes
+          unmapBuffer sLogits
+          IO.println s!"[logitdump] step-0 logits [C={C} x vocab={cfg.vocabSize}] → {dumpPath} ({bytes.size} bytes); maskTokenId={model.dg.maskTokenId} N={N} P={P}"
       let tLm ← IO.monoMsNow
       scTok := ktokFlat; scProb := probFlat   -- feed this step's top-K soft prediction into next step's SC
       let want := if step+1 ≥ decodeSteps then remaining else max 1 ((C + decodeSteps - 1) / decodeSteps)
@@ -1343,18 +1355,26 @@ def main (args : List String) : IO Unit := do
           cand.foldl (fun n (c : Nat × Nat × Float) => if c.2.2 ≥ th then n+1 else n) 0
         | none => 0
       let k := min (max want nHigh) cand.size
+      let maskId := model.dg.maskTokenId
       let mut picked := Array.replicate cand.size false
+      let mut nCommitted := 0
       for _ in [0:k] do
         let mut bi := 0; let mut bv := -1.0
         for c in [0:cand.size] do
-          let (_,_,cf) := cand[c]!
-          if !picked[c]! && cf > bv then bv := cf; bi := c
+          let (_, pr, cf) := cand[c]!
+          -- never commit the MASK token itself: an argmax of "still masked" must stay uncommitted for
+          -- a later step. Committing it freezes a mask into the text (掩 in the output) and the decode
+          -- collapses — this is what degenerated the grouped-MoE path, whose few-% numeric drift ranked
+          -- mask predictions into the top-k.
+          if !picked[c]! && pr != maskId && cf > bv then bv := cf; bi := c
+        if bv < 0.0 then break
         picked := picked.set! bi true
         let (ci, pred, _) := cand[bi]!
         toks := toks.set! (P+ci) pred
         masked := masked.set! ci false
+        nCommitted := nCommitted + 1
       let t1 ← IO.monoMsNow
-      IO.println s!"[dg-decode] step {step}: committed {k} | total {t1-t0}ms = emb+fwd {tFwd-t0}ms + lmhead+reduce {tLm-tFwd}ms + commit {t1-tLm}ms"
+      IO.println s!"[dg-decode] step {step}: committed {nCommitted} | total {t1-t0}ms = emb+fwd {tFwd-t0}ms + lmhead+reduce {tLm-tFwd}ms + commit {t1-tLm}ms"
   let outIds := toks.extract P (P+C)
   IO.println s!"[dg-decode] first canvas IDs: {(outIds.extract 0 (min 24 outIds.size)).toList}"
   IO.println s!"[dg-decode] TEXT: {Hesper.Tokenizer.SentencePiece.decode tokenizer outIds}"
