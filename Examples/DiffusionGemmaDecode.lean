@@ -748,6 +748,133 @@ def reduceTopKB (C vocab K ws : Nat) : Hesper.WGSL.Monad.ShaderM Unit := do
       ShaderM.writeBuffer (ty := .scalar .u32) "otok" (Exp.add (Exp.mul i (Exp.litU32 K)) (Exp.litU32 k)) tk
       ShaderM.writeBuffer (ty := .scalar .f32) "oprob" (Exp.add (Exp.mul i (Exp.litU32 K)) (Exp.litU32 k)) (Exp.div (Exp.exp (Exp.sub lg mx)) denom)) (pure ())
 
+/-- DG_MODE=renoise: per-position FULL-VOCAB sampler (llama.cpp EB fidelity, examples/diffusion/
+    diffusion.cpp:582-607). One workgroup per canvas position i, over z = logits[i,·]·(1/t):
+    argmax(z) → oamax; H(softmax z) = lnZ − Σ(z−m)e^{z−m}/Z → oh; multinomial = first v in VOCAB
+    ORDER with cumulative e^{z−m} ≥ u·Z → osamp ("uin"[i] pre-drawn CPU-side, clamped > 0).
+    t comes from "params"[0] (written per step — the 0.8→0.4 anneal). FULL vocab, no specials
+    exclusion (llama.cpp samples the whole row). Grid = C workgroups exactly; all writes indexed
+    by i < C (bounds-safe). Phases A/B stride for coalescing; phase C uses CONTIGUOUS per-thread
+    chunks so the cumulative walk matches llama.cpp's sequential vocab order. -/
+def ebSampleFullB (Cc vocab ws : Nat) : Hesper.WGSL.Monad.ShaderM Unit := do
+  let wid ← ShaderM.workgroupId; let lid ← ShaderM.localId
+  let i := Exp.vec3X wid; let tid := Exp.vec3X lid
+  let _l ← ShaderM.declareReadOnlyBuffer "logits" (.array (.scalar .f32) (Cc*vocab))
+  let _u ← ShaderM.declareReadOnlyBuffer "uin" (.array (.scalar .f32) Cc)
+  let _pb ← ShaderM.declareReadOnlyBuffer "params" (.array (.scalar .f32) 4)
+  let _oa ← ShaderM.declareOutputBuffer "oamax" (.array (.scalar .u32) Cc)
+  let _os ← ShaderM.declareOutputBuffer "osamp" (.array (.scalar .u32) Cc)
+  let _oh ← ShaderM.declareOutputBuffer "oh" (.array (.scalar .f32) Cc)
+  ShaderM.sharedNamed "sVal" (.array (.scalar .f32) ws)
+  ShaderM.sharedNamed "sTok" (.array (.scalar .u32) ws)
+  ShaderM.sharedNamed "sSum" (.array (.scalar .f32) ws)
+  ShaderM.sharedNamed "sPfx" (.array (.scalar .f32) ws)
+  ShaderM.sharedNamed "sPick" (.array (.scalar .u32) ws)
+  ShaderM.sharedNamed "sScal" (.array (.scalar .f32) 2)
+  let rowBase := Exp.mul i (Exp.litU32 vocab)
+  let tv := Exp.index (Exp.var "params" : Exp (.array (.scalar .f32) 4)) (Exp.litU32 0)
+  ShaderM.varNamed "tinv" (.scalar .f32) (Exp.div (Exp.litF32 1.0) tv)
+  let zAt := fun (v : Exp (.scalar .u32)) =>
+    Exp.mul (Exp.index (Exp.var "logits" : Exp (.array (.scalar .f32) (Cc*vocab))) (Exp.add rowBase v)) (Exp.var "tinv")
+  -- Phase A: max + argmax of z (strided, coalesced)
+  ShaderM.varNamed "lm" (.scalar .f32) (Exp.litF32 (-1e30))
+  ShaderM.varNamed "lt" (.scalar .u32) (Exp.litU32 0)
+  ShaderM.loop tid (Exp.litU32 vocab) (Exp.litU32 ws) fun v => do
+    let z := zAt v
+    ShaderM.if_ (Exp.gt z (Exp.var "lm")) (do
+      ShaderM.assign "lm" z; ShaderM.assign "lt" v) (pure ())
+  ShaderM.writeWorkgroup (ty := .scalar .f32) "sVal" tid (Exp.var "lm")
+  ShaderM.writeWorkgroup (ty := .scalar .u32) "sTok" tid (Exp.var "lt")
+  ShaderM.barrier
+  let mut strideA := ws / 2
+  while strideA > 0 do
+    ShaderM.if_ (Exp.lt tid (Exp.litU32 strideA)) (do
+      let a ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := ws) "sVal" tid
+      let bb ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := ws) "sVal" (Exp.add tid (Exp.litU32 strideA))
+      ShaderM.if_ (Exp.gt bb a) (do
+        ShaderM.writeWorkgroup (ty := .scalar .f32) "sVal" tid bb
+        let bt ← ShaderM.readWorkgroup (ty := .scalar .u32) (n := ws) "sTok" (Exp.add tid (Exp.litU32 strideA))
+        ShaderM.writeWorkgroup (ty := .scalar .u32) "sTok" tid bt) (pure ())) (pure ())
+    ShaderM.barrier
+    strideA := strideA / 2
+  ShaderM.if_ (Exp.eq tid (Exp.litU32 0)) (do
+    let mv ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := ws) "sVal" (Exp.litU32 0)
+    let mt ← ShaderM.readWorkgroup (ty := .scalar .u32) (n := ws) "sTok" (Exp.litU32 0)
+    ShaderM.writeWorkgroup (ty := .scalar .f32) "sScal" (Exp.litU32 0) mv
+    ShaderM.writeBuffer (ty := .scalar .u32) "oamax" i mt) (pure ())
+  ShaderM.barrier
+  let m ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := 2) "sScal" (Exp.litU32 0)
+  -- Phase B: Z = Σe^{z−m} and SZ = Σ(z−m)e^{z−m} (strided; H = lnZ − SZ/Z)
+  ShaderM.varNamed "se" (.scalar .f32) (Exp.litF32 0.0)
+  ShaderM.varNamed "sz" (.scalar .f32) (Exp.litF32 0.0)
+  ShaderM.loop tid (Exp.litU32 vocab) (Exp.litU32 ws) fun v => do
+    let d := Exp.sub (zAt v) m
+    let e := Exp.exp d
+    ShaderM.assign "se" (Exp.add (Exp.var "se") e)
+    ShaderM.assign "sz" (Exp.add (Exp.var "sz") (Exp.mul d e))
+  ShaderM.writeWorkgroup (ty := .scalar .f32) "sVal" tid (Exp.var "se")
+  ShaderM.writeWorkgroup (ty := .scalar .f32) "sSum" tid (Exp.var "sz")
+  ShaderM.barrier
+  let mut strideB := ws / 2
+  while strideB > 0 do
+    ShaderM.if_ (Exp.lt tid (Exp.litU32 strideB)) (do
+      let a ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := ws) "sVal" tid
+      let bb ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := ws) "sVal" (Exp.add tid (Exp.litU32 strideB))
+      ShaderM.writeWorkgroup (ty := .scalar .f32) "sVal" tid (Exp.add a bb)
+      let a2 ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := ws) "sSum" tid
+      let b2 ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := ws) "sSum" (Exp.add tid (Exp.litU32 strideB))
+      ShaderM.writeWorkgroup (ty := .scalar .f32) "sSum" tid (Exp.add a2 b2)) (pure ())
+    ShaderM.barrier
+    strideB := strideB / 2
+  ShaderM.if_ (Exp.eq tid (Exp.litU32 0)) (do
+    let zz ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := ws) "sVal" (Exp.litU32 0)
+    let szz ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := ws) "sSum" (Exp.litU32 0)
+    ShaderM.writeBuffer (ty := .scalar .f32) "oh" i (Exp.sub (Exp.log zz) (Exp.div szz zz))
+    ShaderM.writeWorkgroup (ty := .scalar .f32) "sScal" (Exp.litU32 1) zz) (pure ())
+  ShaderM.barrier
+  let zAll ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := 2) "sScal" (Exp.litU32 1)
+  let target := Exp.mul (Exp.index (Exp.var "uin" : Exp (.array (.scalar .f32) Cc)) i) zAll
+  -- Phase C: multinomial via contiguous chunks (vocab order = llama.cpp's sequential walk)
+  let chunk := (vocab + ws - 1) / ws
+  ShaderM.varNamed "cs" (.scalar .f32) (Exp.litF32 0.0)
+  ShaderM.loop (Exp.litU32 0) (Exp.litU32 chunk) (Exp.litU32 1) fun j => do
+    let v := Exp.add (Exp.mul tid (Exp.litU32 chunk)) j
+    ShaderM.if_ (Exp.lt v (Exp.litU32 vocab))
+      (ShaderM.assign "cs" (Exp.add (Exp.var "cs") (Exp.exp (Exp.sub (zAt v) m)))) (pure ())
+  ShaderM.writeWorkgroup (ty := .scalar .f32) "sVal" tid (Exp.var "cs")
+  ShaderM.writeWorkgroup (ty := .scalar .u32) "sPick" tid (Exp.litU32 0xFFFFFFFF)
+  ShaderM.barrier
+  ShaderM.if_ (Exp.eq tid (Exp.litU32 0)) (do
+    ShaderM.varNamed "acc" (.scalar .f32) (Exp.litF32 0.0)
+    ShaderM.loop (Exp.litU32 0) (Exp.litU32 ws) (Exp.litU32 1) fun k => do
+      ShaderM.writeWorkgroup (ty := .scalar .f32) "sPfx" k (Exp.var "acc")
+      let ck ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := ws) "sVal" k
+      ShaderM.assign "acc" (Exp.add (Exp.var "acc") ck)) (pure ())
+  ShaderM.barrier
+  let myStart ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := ws) "sPfx" tid
+  let myCs ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := ws) "sVal" tid
+  ShaderM.if_ (Exp.and (Exp.ge (Exp.add myStart myCs) target) (Exp.lt myStart target)) (do
+    ShaderM.varNamed "cum" (.scalar .f32) myStart
+    ShaderM.varNamed "done" (.scalar .u32) (Exp.litU32 0)
+    ShaderM.varNamed "pv" (.scalar .u32) (Exp.litU32 (vocab - 1))
+    ShaderM.loop (Exp.litU32 0) (Exp.litU32 chunk) (Exp.litU32 1) fun j => do
+      let v := Exp.add (Exp.mul tid (Exp.litU32 chunk)) j
+      ShaderM.if_ (Exp.and (Exp.lt v (Exp.litU32 vocab)) (Exp.eq (Exp.var "done") (Exp.litU32 0))) (do
+        ShaderM.assign "cum" (Exp.add (Exp.var "cum") (Exp.exp (Exp.sub (zAt v) m)))
+        ShaderM.if_ (Exp.ge (Exp.var "cum") target) (do
+          ShaderM.assign "pv" v; ShaderM.assign "done" (Exp.litU32 1)) (pure ())) (pure ())
+    ShaderM.writeWorkgroup (ty := .scalar .u32) "sPick" tid (Exp.var "pv")) (pure ())
+  ShaderM.barrier
+  ShaderM.if_ (Exp.eq tid (Exp.litU32 0)) (do
+    ShaderM.varNamed "res" (.scalar .u32) (Exp.litU32 (vocab - 1))
+    ShaderM.varNamed "found" (.scalar .u32) (Exp.litU32 0)
+    ShaderM.loop (Exp.litU32 0) (Exp.litU32 ws) (Exp.litU32 1) fun k => do
+      let pk ← ShaderM.readWorkgroup (ty := .scalar .u32) (n := ws) "sPick" k
+      ShaderM.if_ (Exp.eq (Exp.var "found") (Exp.litU32 0))
+        (ShaderM.if_ (Exp.eq pk (Exp.litU32 0xFFFFFFFF)) (pure ()) (do
+          ShaderM.assign "res" pk; ShaderM.assign "found" (Exp.litU32 1))) (pure ())
+    ShaderM.writeBuffer (ty := .scalar .u32) "osamp" i (Exp.var "res")) (pure ())
+
 /-- u32 little-endian ByteArray from a Nat array. -/
 def u32Bytes (xs : Array Nat) : ByteArray := Id.run do
   let mut b := ByteArray.empty
@@ -1003,7 +1130,7 @@ def main (args : List String) : IO Unit := do
   -- steps low); 13 for the entropy-bound denoiser (its t-annealing spans S — S=13 converges clean,
   -- S=32 anneals too slowly, matching llama.cpp's --diffusion-steps 13 reference run).
   let decodeSteps := (args.drop 3).head?.bind (·.toNat?)
-    |>.getD (if ((← IO.getEnv "DG_SCHED").getD "fixed") == "eb" then 20 else 32)
+    |>.getD (if ((← IO.getEnv "DG_SCHED").getD "fixed") == "eb" || ((← IO.getEnv "DG_MODE").getD "") == "renoise" then 20 else 32)
   -- DG_SCHED=eb: llama.cpp's ENTROPY-BOUND denoiser (examples/diffusion/diffusion.cpp:442) — the
   -- canvas is RANDOM-initialized (not masks) and re-noised every step: per position compute the
   -- temperature-adjusted distribution, its entropy H, the argmax and a multinomial sample; ACCEPT the
@@ -1013,18 +1140,26 @@ def main (args : List String) : IO Unit := do
   -- irreversibly committed — llama.cpp finishes France in 8 steps with this. We approximate the
   -- per-position distribution from the GPU top-K (K=8) probs: q ∝ p^(1/t) renormalized (accepted
   -- positions are low-entropy ⇒ top-8 carries ≈all their mass; high-H positions are rejected anyway).
-  let schedEB := ((← IO.getEnv "DG_SCHED").getD "fixed") == "eb"
+  -- DG_MODE=renoise: the FULL llama.cpp decode mode — the eb machinery below but with the
+  -- per-position distribution/entropy/multinomial computed on GPU over the FULL vocab
+  -- (ebSampleFullB) instead of the top-8+tail approximation, SC = full-vocab softmax(prev
+  -- logits / prev t) (the FULLSC path with the ANNEALED prev t — verified: diffusion.cpp:557
+  -- passes prev_temp_inv into set_sc, and diffusion-gemma.cpp:408 applies it), and llama.cpp's
+  -- TRUE stop constants (meanH < 0.005, stability 1) — valid now that H is the real full-vocab H.
+  let modeRenoise := ((← IO.getEnv "DG_MODE").getD "") == "renoise"
+  let schedEB := (((← IO.getEnv "DG_SCHED").getD "fixed") == "eb") || modeRenoise
   let ebTmax := ((((← IO.getEnv "DG_EB_TMAX").bind (·.toNat?)).getD 80).toFloat) / 100.0   -- t at step 0
   let ebTmin := ((((← IO.getEnv "DG_EB_TMIN").bind (·.toNat?)).getD 40).toFloat) / 100.0   -- t at last step
   let ebBound := ((((← IO.getEnv "DG_EB_BOUND").bind (·.toNat?)).getD 10).toFloat) / 100.0 -- MI bound (0.1)
   -- stop rule, adapted to the top-K H scale: llama.cpp stops at meanH<0.005 (its full-vocab H → ~0
   -- when every position is ultra-confident); our top-8+tail H floors well above that, so the binding
   -- condition here is ARGMAX STABILITY (held ≥ 2) with meanH<0.9 as a sanity ceiling.
-  let ebConfTh := ((((← IO.getEnv "DG_EB_CONF").bind (·.toNat?)).getD 900).toFloat) / 1000.0
-  let ebStab := (((← IO.getEnv "DG_EB_STAB").bind (·.toNat?)).getD 2)                       -- stability steps
+  let ebConfTh := ((((← IO.getEnv "DG_EB_CONF").bind (·.toNat?)).getD (if modeRenoise then 5 else 900)).toFloat) / 1000.0
+  let ebStab := (((← IO.getEnv "DG_EB_STAB").bind (·.toNat?)).getD (if modeRenoise then 1 else 2))   -- stability steps
   -- deterministic LCG (llama.cpp uses mt19937(seed); exact stream differs, semantics match)
   let mut ebRng : UInt64 := (((← IO.getEnv "DG_SEED").bind (·.toNat?)).getD 12345).toUInt64
   let mut ebPrevArgmax : Array Nat := Array.replicate C 0
+  let mut ebPrevT : Float := 1.0   -- renoise: prev step's anneal t, fed to the SC softmax (llama.cpp prev_temp_inv)
   let mut ebHeld : Nat := 0
   let mut ebFirstStep := true
   let mut toks : Array Nat := promptTokens ++ Array.replicate C model.dg.maskTokenId
@@ -1144,6 +1279,12 @@ def main (args : List String) : IO Unit := do
     IO.println s!"[dqdiag] f32 vs reg(f16): maxDiff={maxDiff} nBad(>0.05)={nBad}/{Md*(min lmN 2000)}; samples (col,tok)=(0,0):{f32A.getD 0 0.0}/{rbA.getD 0 0.0} (1,5):{f32A.getD (1*lmN+5) 0.0}/{rbA.getD (1*lmN+5) 0.0}"
   let sLogits ← mkBuf device ((((N + 63) / 64) * 64)*lmN)   -- 64-row padded: WMMA tail tiles write past row N
   let logitsCanvas ← mkBuf device (C*cfg.vocabSize)  -- full-vocab canvas logits for the GPU reduce
+  -- renoise-mode sampler I/O (tiny; allocated unconditionally)
+  let ebUBuf ← mkBuf device C        -- pre-drawn multinomial u per position
+  let ebPBuf ← mkBuf device 4        -- [0] = anneal t for this step
+  let ebAmaxBuf ← mkBuf device C     -- per-position argmax token
+  let ebSampBuf ← mkBuf device C     -- per-position multinomial sample
+  let ebHBuf ← mkBuf device C        -- per-position full-vocab entropy
   let outDenom ← mkBuf device C
   let outTok ← mkBuf device (C*scK)
   let outProb ← mkBuf device (C*scK)
@@ -1152,7 +1293,7 @@ def main (args : List String) : IO Unit := do
   -- probs[C,vocab] @ Wᵀ[dim,vocab] → sSC. Needs a one-time transpose of the f16 embed table (+1.5GB)
   -- and a probs buffer (+268MB). The top-8 sliver is a biased approximation at high-entropy positions —
   -- full-vocab SC is the denoiser's trained conditioning signal (llama.cpp converges in 8-11 steps).
-  let fullSC := (← IO.getEnv "DG_FULLSC").isSome
+  let fullSC := (← IO.getEnv "DG_FULLSC").isSome || modeRenoise
   let sScProbs ← mkBuf device (if fullSC then C*cfg.vocabSize else 1)
   let embTT ← mkBuf device (if fullSC then dim*(cfg.vocabSize/2) else 1)
   let sSCC ← mkBuf device (if fullSC then C*dim else 1)
@@ -1206,7 +1347,10 @@ def main (args : List String) : IO Unit := do
           -- llama_diffusion_set_sc call site; the 0.8→0.4 anneal is the canvas RE-NOISING sampling
           -- temperature, a different mechanism). An annealed t here over-sharpens the SC → hard
           -- self-reinforcement loops ("thoughtthought", "and and and"). DG_SCTEMP=<percent> tunes.
-          let tSC := (((← IO.getEnv "DG_SCTEMP").bind (·.toNat?)).getD 100).toFloat / 100.0
+          -- renoise mode: llama.cpp feeds softmax(prev logits · prev_temp_inv) — the ANNEALED prev t
+          -- (diffusion.cpp:557 + diffusion-gemma.cpp:408). Mask-mode keeps DG_SCTEMP (default 1.0).
+          let scTempEnv := (((← IO.getEnv "DG_SCTEMP").bind (·.toNat?)).getD 100).toFloat / 100.0
+          let tSC := if modeRenoise then ebPrevT else scTempEnv
           writeBuffer device scTBuf 0 (← Hesper.Basic.floatArrayToBytes #[tSC])
       Hesper.GPUBackend.beginBatch device
       disp device (Hesper.Quantization.Q6_K.q6kEmbedGatherKernel N cfg.vocabSize dim embScale) (("token_ids",tokBuf)::("embedding_table",embTable)::("output",a)::List.nil) (N*dim) (hash "emb")
@@ -1594,12 +1738,34 @@ def main (args : List String) : IO Unit := do
         let S := decodeSteps
         let tCur := ebTmin + (ebTmax - ebTmin) * ((S - step).toFloat / S.toFloat)
         let tInv := 1.0 / tCur
-        -- per position: tempered top-K distribution q ∝ p^(1/t), entropy, argmax, multinomial sample
+        -- per position: distribution/entropy/argmax/multinomial — GPU full-vocab (renoise mode,
+        -- llama.cpp fidelity) or the CPU top-K+tail approximation (DG_SCHED=eb).
         let mut entH : Array Float := Array.replicate C 0.0
         let mut argmaxT : Array Nat := Array.replicate C 0
         let mut sampledT : Array Nat := Array.replicate C 0
         let mut qFlat : Array Float := Array.replicate (C*scK) 0.0
-        for pos in [0:C] do
+        if modeRenoise then
+          -- pre-draw u (llama.cpp pre-draws single-threaded for seed reproducibility); clamp > 0 so
+          -- the sampler's "first chunk with cum ≥ u·Z" rule is well-defined at u=0
+          let mut uArr : Array Float := Array.replicate C 0.0
+          for pos in [0:C] do
+            ebRng := ebRng * 6364136223846793005 + 1442695040888963407
+            let u : Float := ((ebRng >>> 11).toNat.toFloat) / 9007199254740992.0
+            uArr := uArr.set! pos (max u 1e-12)
+          writeBuffer device ebUBuf 0 (← Hesper.Basic.floatArrayToBytes uArr)
+          writeBuffer device ebPBuf 0 (← Hesper.Basic.floatArrayToBytes #[tCur, 0.0, 0.0, 0.0])
+          disp2 device (ebSampleFullB C cfg.vocabSize 256)
+            (("logits",logitsCanvas)::("uin",ebUBuf)::("params",ebPBuf)::("oamax",ebAmaxBuf)::("osamp",ebSampBuf)::("oh",ebHBuf)::List.nil) C 1 (hash "ebsample")
+          let rdU := fun (a : ByteArray) (j : Nat) =>
+            a[j*4]!.toNat ||| (a[j*4+1]!.toNat <<< 8) ||| (a[j*4+2]!.toNat <<< 16) ||| (a[j*4+3]!.toNat <<< 24)
+          let amaxB ← mapBufferRead device ebAmaxBuf 0 (C*4).toUSize
+          let sampB ← mapBufferRead device ebSampBuf 0 (C*4).toUSize
+          let hArr ← Hesper.Basic.bytesToFloatArray (← mapBufferRead device ebHBuf 0 (C*4).toUSize)
+          for pos in [0:C] do
+            argmaxT := argmaxT.set! pos (rdU amaxB pos)
+            sampledT := sampledT.set! pos (rdU sampB pos)
+            entH := entH.set! pos (hArr[pos]!)
+        else for pos in [0:C] do
           let base := pos*scK
           -- full-vocab approximation from the top-K: model the tail (1-Σp) as nTail pseudo-tokens of
           -- mass p_K each (the K-th prob). Without this, renormalizing over K inflates uncertain
@@ -1662,6 +1828,7 @@ def main (args : List String) : IO Unit := do
         ebHeld := if stable then ebHeld + 1 else 0
         ebPrevArgmax := argmaxT
         ebFirstStep := false
+        ebPrevT := tCur   -- renoise SC uses the PREV step's anneal t (llama.cpp prev_temp_inv)
         let meanH := entSum / C.toFloat
         let finish := (ebHeld ≥ ebStab && meanH < ebConfTh) || step+1 ≥ decodeSteps
         if finish then
