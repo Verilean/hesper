@@ -43,7 +43,10 @@ def geluMulB (n : Nat) : Hesper.WGSL.Monad.ShaderM Unit := do
   let inner := Exp.mul (Exp.litF32 0.7978845608) (Exp.add g (Exp.mul (Exp.litF32 0.044715) g3))
   let innerC := Exp.max (Exp.litF32 (-10.0)) (Exp.min (Exp.litF32 10.0) inner)
   let gl := Exp.mul (Exp.mul (Exp.litF32 0.5) g) (Exp.add (Exp.litF32 1.0) (Exp.tanh innerC))
-  ShaderM.writeBuffer (ty := .scalar .f32) "outp" i (Exp.select inB (Exp.mul gl u) (Exp.litF32 0.0))
+  -- GUARD the write, don't select the value: with n=N*ffn=262·2112 not divisible by 256, the 128
+  -- excess threads' writes CLAMP onto the last element and race the owner (last canvas position's
+  -- activation flips real/0.0 per run → chaotic layer amplification → non-deterministic decode).
+  ShaderM.if_ inB (ShaderM.writeBuffer (ty := .scalar .f32) "outp" i (Exp.mul gl u)) (pure ())
 
 /-- Identity copy out[i]=in[i]. -/
 def copyB (n : Nat) : Hesper.WGSL.Monad.ShaderM Unit := do
@@ -109,7 +112,9 @@ def addB (n : Nat) : Hesper.WGSL.Monad.ShaderM Unit := do
   let _o ← ShaderM.declareOutputBuffer "outc" (.array (.scalar .f32) n)
   let av := Exp.index (Exp.var "ain" : Exp (.array (.scalar .f32) n)) i
   let bv := Exp.index (Exp.var "bin" : Exp (.array (.scalar .f32) n)) i
-  ShaderM.writeBuffer (ty := .scalar .f32) "outc" i (Exp.select inB (Exp.add av bv) (Exp.litF32 0.0))
+  -- guard the write (same excess-thread clamp-race class as geluMulB; here n=N*dim is currently
+  -- 256-divisible so it's latent, but don't rely on dimensional luck)
+  ShaderM.if_ inB (ShaderM.writeBuffer (ty := .scalar .f32) "outc" i (Exp.add av bv)) (pure ())
 
 /-- Region-aware per-layer scale: data[r,i] *= (r≥P ? outSc : encSc). -/
 def scaleRegionB (N P dim : Nat) (outSc encSc : Float) : Hesper.WGSL.Monad.ShaderM Unit := do
@@ -695,6 +700,11 @@ def lmHeadArgmaxFullVocab (device : Device) (outputWeightF16 sN sLogits logitsCa
     -- register-blocked WMMA matmul (f16 weight): logits[N, lmChunk] for this vocab chunk
     dispRB device (Hesper.WGSL.MatMul.matMulTransposeF16WMMARegKernel { M := N, N := lmChunk, K := dim } (c*lmChunk) vocabSize)
       (("a", sN)::("b", outputWeightF16)::("c", sLogits)::List.nil) ((lmChunk+31)/32) ((N+63)/64) (hash ("lmheadrb", c))
+    -- batch split after the subgroup-matrix kernel: Dawn-on-Metal drops the inter-pass barrier after
+    -- WMMA dispatches at scale (same pattern as the QKV/attnO/dense reg calls). Without it, softcap/
+    -- copyCanvas read STALE sLogits → every canvas position argmaxes to the same garbage token
+    -- (the <unused6226>×N failure). Hidden states were verified clean — the corruption was here.
+    Hesper.WGSL.Execute.flushBatch device
     disp device (softcapB (N*lmChunk) cap) (("logits", sLogits)::List.nil) (N*lmChunk) (hash ("softcap", c))
     disp device (copyCanvasLogitsB N C P vocabSize lmChunk (c*lmChunk)) (("src",sLogits)::("dst",logitsCanvas)::List.nil) (C*lmChunk) (hash ("cpcv", c))
     Hesper.GPUBackend.endBatch device
@@ -786,13 +796,17 @@ def main (args : List String) : IO Unit := do
     let some blk := model.inner.blocks[li]? | throw (IO.userError "blk")
     scales := scales.push (← rd1 blk.outScale)
     encScales := encScales.push (← rd1 blk.encOutScale)
-  -- preallocate [N, *]
-  let a ← mkBuf device (N*dim); let b ← mkBuf device (N*dim)
-  let sN ← mkBuf device (N*dim)
-  let sQ ← mkBuf device (N*8192); let sK ← mkBuf device (N*2048); let sV ← mkBuf device (N*2048)
-  let sQr ← mkBuf device (N*8192); let sKr ← mkBuf device (N*2048); let sVn ← mkBuf device (N*2048)
-  let sCtx ← mkBuf device (N*8192); let sAO ← mkBuf device (N*dim); let sPA ← mkBuf device (N*dim)
-  let sG ← mkBuf device (N*ffn); let sU ← mkBuf device (N*ffn); let sGe ← mkBuf device (N*ffn); let sD ← mkBuf device (N*dim)
+  -- preallocate [N, *].  Buffers read ("a") or written ("c") by the WMMA reg-matmuls are padded to a
+  -- 64-row multiple: the reg grid runs ceil(M/64)·64 rows and `subgroupMatrixStore` writes the tail
+  -- tiles PAST row M — an OOB write into whatever Dawn allocated next (heap stomp → non-deterministic
+  -- garbage). Padding keeps those tail-tile writes inside this allocation, where they're ignored.
+  let nP := ((N + 63) / 64) * 64
+  let a ← mkBuf device (nP*dim); let b ← mkBuf device (nP*dim)
+  let sN ← mkBuf device (nP*dim)
+  let sQ ← mkBuf device (nP*8192); let sK ← mkBuf device (nP*2048); let sV ← mkBuf device (nP*2048)
+  let sQr ← mkBuf device (nP*8192); let sKr ← mkBuf device (nP*2048); let sVn ← mkBuf device (nP*2048)
+  let sCtx ← mkBuf device (nP*8192); let sAO ← mkBuf device (nP*dim); let sPA ← mkBuf device (nP*dim)
+  let sG ← mkBuf device (nP*ffn); let sU ← mkBuf device (nP*ffn); let sGe ← mkBuf device (nP*ffn); let sD ← mkBuf device (nP*dim)
   let sR ← mkBuf device (N*dim)
   let nExpert := cfg.numExperts; let nUsed := cfg.numExpertsUsed; let expFF := cfg.expertFFSize
   let invSqrt := 1.0 / Float.sqrt dim.toFloat
@@ -810,6 +824,10 @@ def main (args : List String) : IO Unit := do
   -- DG_MOERB: fused Q4_K reg-matmul for the MoE gate/up. The reg M-tile is 64 ⇒ each expert block must
   -- be 64-aligned ⇒ pad to 64 (vs 32 for MMQ). Gated: the default MMQ path keeps its 32-pad.
   let moeRB := (← IO.getEnv "DG_MOERB").isSome
+  -- DG_MOENOFLUSH: drop the MoE chain's per-layer flushBatch splits. Those were added to fight a
+  -- "Dawn drops barriers at scale" race — but that race may have been the kill-9 GPU wedge / swap
+  -- corruption all along (post-reboot experiment). If correct without them: faster AND simpler.
+  let moeNoFlush := (← IO.getEnv "DG_MOENOFLUSH").isSome
   -- DG_SKIP_*: drop one MoE component's dispatch(es) to measure its REAL cost = emb+fwd delta vs
   -- baseline (no endBatch sync, unlike DG_PROF). Output is garbage; we only read the timing.
   let skGrp := (← IO.getEnv "DG_SKIP_GROUP").isSome; let skGat := (← IO.getEnv "DG_SKIP_GATHER").isSome
@@ -934,13 +952,19 @@ def main (args : List String) : IO Unit := do
       if d > maxDiff then maxDiff := d
       if d > 0.05 then nBad := nBad+1
     IO.println s!"[dqdiag] f32 vs reg(f16): maxDiff={maxDiff} nBad(>0.05)={nBad}/{Md*(min lmN 2000)}; samples (col,tok)=(0,0):{f32A.getD 0 0.0}/{rbA.getD 0 0.0} (1,5):{f32A.getD (1*lmN+5) 0.0}/{rbA.getD (1*lmN+5) 0.0}"
-  let sLogits ← mkBuf device (N*lmN)
+  let sLogits ← mkBuf device ((((N + 63) / 64) * 64)*lmN)   -- 64-row padded: WMMA tail tiles write past row N
   let logitsCanvas ← mkBuf device (C*cfg.vocabSize)  -- full-vocab canvas logits for the GPU reduce
   let outDenom ← mkBuf device C
   let outTok ← mkBuf device (C*scK)
   let outProb ← mkBuf device (C*scK)
   let skipDense := (← IO.getEnv "DG_SKIPDENSE").isSome
   IO.println s!"[dg-decode] {decodeSteps} steps, N={N} P={P} C={C}  skipDense={skipDense}"
+  -- DG_CONF=<percent>: confidence threshold for bulk-commit early stop (e.g. DG_CONF=90 → commit all
+  -- candidates with confidence ≥ 0.90 each step; loop skips once every position is committed).
+  let confThreshPct : Option Nat := (← IO.getEnv "DG_CONF").bind (·.toNat?)
+  -- DG_LAYERSUM: per-layer hidden checksum (Σ|h|, max|h|) printed each step — cross-run diff localizes
+  -- the first non-deterministic layer. Use with DG_LPB=1 so each layer's batch closes before readback.
+  let layerSum := (← IO.getEnv "DG_LAYERSUM").isSome
   -- DG_PROF: per-phase GPU time (endBatch syncs + timestamps at each phase boundary, accumulated).
   let prof := (← IO.getEnv "DG_PROF").isSome
   let rAttn ← IO.mkRef (0:Nat); let rDense ← IO.mkRef (0:Nat)
@@ -1041,7 +1065,7 @@ def main (args : List String) : IO Unit := do
         disp device (addB (N*dim)) (("ain",sR)::("bin",cur)::("outc",sPA)::List.nil) (N*dim) (hash ("ra",li))
         pmark rAttnO  -- O projection + post-norm + residual
         -- dense FFN
-        if (li == 0 || li == 5) && (← IO.getEnv "DG_QFMT").isSome then
+        if step == 0 && (← IO.getEnv "DG_QFMT").isSome then
           let qfs := fun (q : Hesper.Layers.Linear.QuantFormat) => match q with
             | .Q4_K => "Q4_K" | .Q8_0 => "Q8_0" | .Q5_0 => "Q5_0" | .Q6_K => "Q6_K"
           IO.println s!"[qfmt L{li}] wQ={qfs blk.attention.wQ.quantFormat} wK={qfs blk.attention.wK.quantFormat} wV={qfs blk.attention.wV.quantFormat} wO={qfs blk.attention.wO.quantFormat} | dense gate={qfs blk.ffn.gate.quantFormat} down={qfs blk.ffn.down.quantFormat}"
@@ -1135,7 +1159,7 @@ def main (args : List String) : IO Unit := do
           -- BATCH SPLIT (cheap, no CPU wait): the grouped gate/up MMQ→scatter→geglu races in a too-
           -- large single encoder (Dawn-on-Metal drops an inter-pass barrier at scale); a no-wait
           -- submit + fresh encoder here keeps Dawn's barriers correct without a sync round-trip.
-          Hesper.WGSL.Execute.flushBatch device
+          unless moeNoFlush do Hesper.WGSL.Execute.flushBatch device
           pmark rMoeGU   -- gather + gate/up matmul (MMQ5 or fused reg)
           if li == 0 && (← IO.getEnv "DG_GUDIAG").isSome then
             -- un-group the grouped gate/up + compute the per-slot reference, compare
@@ -1165,7 +1189,7 @@ def main (args : List String) : IO Unit := do
           if (← IO.getEnv "DG_GROUPEDDOWN").isNone && !moeDownRB then
             -- ISOLATION: gate/up grouped, down per-slot (the pre-grouped-down state)
             unless skSc do disp device (scatterGUB maxPadded (2*expFF) N nUsed) (("gathered",sGatheredGU)::("pos",sSortedPos)::("slot",sSortedSlot)::("dst",sGateUpAll)::List.nil) (maxPadded*2*expFF) (hash ("sctr",li))
-            Hesper.WGSL.Execute.flushBatch device   -- flush gate/up scatter→geglu (no-wait split)
+            unless moeNoFlush do Hesper.WGSL.Execute.flushBatch device   -- flush gate/up scatter→geglu (no-wait split)
             for e in [0:nUsed] do
               let sEh := sEhs[e]?.getD sMoeN
               unless skGeg do disp device (gegluMergedB N expFF (e*N*2*expFF) (nUsed*N*2*expFF)) (("gu",sGateUpAll)::("eh",sEh)::List.nil) (N*expFF) (hash ("gm",li,e))
@@ -1185,7 +1209,7 @@ def main (args : List String) : IO Unit := do
                 (("gu",sGatheredGU)::("b",dnE)::("tileExpert",sTileExpert)::("pos",sSortedPos)::("slot",sSortedSlot)::("dst",sDownAll)::List.nil) ((dim+31)/32) ((maxPadded+31)/32) (hash ("fdg",li))
             else
               disp device (gegluMergedB maxPadded expFF 0 (maxPadded*2*expFF)) (("gu",sGatheredGU)::("eh",sGatheredEh)::List.nil) (maxPadded*expFF) (hash ("gmg",li))
-            Hesper.WGSL.Execute.flushBatch device
+            unless moeNoFlush do Hesper.WGSL.Execute.flushBatch device
             if li == 0 && (← IO.getEnv "DG_MOEDOWNDIAG").isSome then
               Hesper.GPUBackend.endBatch device
               let eh ← Hesper.Basic.bytesToFloatArray (← mapBufferRead device sGatheredEh 0 (maxPadded*expFF*4).toUSize)
@@ -1199,7 +1223,7 @@ def main (args : List String) : IO Unit := do
               -- the warp's Q8 rounding AND acts as the geglu→down sync (its in-place read of sGatheredEh forces
               -- the geglu to complete — the plain flushBatch is dropped by Dawn in the long grouped batch).
               q80 device sGatheredEh maxPadded expFF (hash ("qgehrb",li))
-              Hesper.WGSL.Execute.flushBatch device
+              unless moeNoFlush do Hesper.WGSL.Execute.flushBatch device
               dispRB device (Hesper.Quantization.Q4_K_M.q8MatmulGroupedRegKernel maxPadded dim expFF nExpert)
                 (("a",sGatheredEh)::("b",dnE)::("c",sGatheredDown)::("tileExpert",sTileExpert)::List.nil) ((dim+31)/32) ((maxPadded+31)/32) (hash ("edrb",li))
             else
@@ -1207,9 +1231,9 @@ def main (args : List String) : IO Unit := do
               let downGrpKernel := match blk.ffn.down.quantFormat with
                 | .Q5_0 => Hesper.Layers.Linear.fusedQ5_0BatchExpertF32WarpGroupedKernel { inDim:=expFF, outDim:=dim } nExpert maxPadded
                 | _     => Hesper.Layers.Linear.fusedQ8_0BatchExpertF32WarpGroupedKernel { inDim:=expFF, outDim:=dim } nExpert maxPadded
-              Hesper.WGSL.Execute.flushBatch device
+              unless moeNoFlush do Hesper.WGSL.Execute.flushBatch device
               disp2w device downGrpKernel (("weights",dnE)::("input",sGatheredEh)::("tileExpert",sTileExpert)::("output",sGatheredDown)::List.nil) dim (maxPadded/32) 32 (hash ("edg",li))
-            Hesper.WGSL.Execute.flushBatch device
+            unless moeNoFlush do Hesper.WGSL.Execute.flushBatch device
             -- down scatter is maxPadded*dim = ~17.5M elems → ~68k workgroups > 65535 limit (silently
             -- dropped → sDownAll stayed 0). Use a 2D grid: flat = gid.x + gid.y*(nx*256).
             let scN := maxPadded*dim
@@ -1230,7 +1254,7 @@ def main (args : List String) : IO Unit := do
               Hesper.GPUBackend.endBatch device
               Hesper.GPUBackend.beginBatch device
             else
-              Hesper.WGSL.Execute.flushBatch device   -- sync scatter→wacc
+              unless moeNoFlush do Hesper.WGSL.Execute.flushBatch device   -- sync scatter→wacc
             if li == 0 && (← IO.getEnv "DG_MOEDIAG").isSome then
               -- compute the per-slot down reference (into sDownEs) and compare to the grouped sDownAll
               disp device (scatterGUB maxPadded (2*expFF) N nUsed) (("gathered",sGatheredGU)::("pos",sSortedPos)::("slot",sSortedSlot)::("dst",sGateUpAll)::List.nil) (maxPadded*2*expFF) (hash ("mdsc",li))
@@ -1286,6 +1310,14 @@ def main (args : List String) : IO Unit := do
         pmark rRest
         if li % lpb == lpb-1 || li == nLayers-1 then Hesper.GPUBackend.endBatch device
         let t := cur; cur := nxt; nxt := t
+        if layerSum && (li % lpb == lpb-1 || li == nLayers-1) then
+          let h ← Hesper.Basic.bytesToFloatArray (← mapBufferRead device cur 0 (N*dim*4).toUSize)
+          let mut s := 0.0; let mut mx := 0.0
+          for v in h do
+            let av := v.abs
+            s := s + av
+            if av > mx then mx := av
+          IO.println s!"[lsum s{step} l{li}] sum={s} max={mx}"
       if prof then
         IO.println s!"[prof step {step}] qkv-mm={← rAttn.get}ms qknorm={← rQkn.get}ms battnB={← rBattn.get}ms attnO={← rAttnO.get}ms dense={← rDense.get}ms | MoE[router+grp={← rMoeGrp.get} gateup={← rMoeGU.get} down+rest={← rMoe.get}] rest={← rRest.get}ms"
       let tFwd ← IO.monoMsNow
@@ -1301,7 +1333,16 @@ def main (args : List String) : IO Unit := do
       let tLm ← IO.monoMsNow
       scTok := ktokFlat; scProb := probFlat   -- feed this step's top-K soft prediction into next step's SC
       let want := if step+1 ≥ decodeSteps then remaining else max 1 ((C + decodeSteps - 1) / decodeSteps)
-      let k := min want cand.size
+      -- DG_CONF=<percent>: confidence-based bulk commit (llama.cpp-style early stop). Commit every
+      -- candidate whose confidence ≥ threshold (in addition to the fixed schedule's `want`). Once all
+      -- positions commit, the remaining steps are skipped (the `remaining > 0` guard) → fewer effective
+      -- steps on easy prompts, same quality floor via `want`.
+      let nHigh := match confThreshPct with
+        | some pct =>
+          let th := pct.toFloat / 100.0
+          cand.foldl (fun n (c : Nat × Nat × Float) => if c.2.2 ≥ th then n+1 else n) 0
+        | none => 0
+      let k := min (max want nHigh) cand.size
       let mut picked := Array.replicate cand.size false
       for _ in [0:k] do
         let mut bi := 0; let mut bv := -1.0
