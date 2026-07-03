@@ -336,6 +336,19 @@ extern "C" lean_obj_res lean_hesper_msl_q4k_bench(
     };
     subst("@M@", Mv); subst("@N@", Nv); subst("@K@", Kv);
     subst("@NEXP@", nExpert); subst("@SRCROWS@", srcRows);
+    // MSL_PROBE: timing diagnostic — stub the Q4_K qs global reads + bit-extract in the B-load so
+    // shared_B is filled from the cached scale only. Removes the per-jSub qs global traffic + dequant
+    // math but keeps the loop structure, A-load, and simdgroup compute. probe<<real ⇒ dequant-bound
+    // (headroom via shared-qs hoist / async load); probe≈real ⇒ compute/A-load-bound (near ceiling).
+    if (getenv("MSL_PROBE")) {
+        const std::string needle =
+            "          uint qsByteIdx0 = chunk*32u + k0;";
+        const std::string upto =
+            "          float q1 = float(isHigh ? (qsByte1 >> 4u) : (qsByte1 & 0xFu));";
+        size_t a = msl.find(needle), z = msl.find(upto);
+        if (a != std::string::npos && z != std::string::npos)
+            msl.replace(a, (z + upto.size()) - a, "          float q0 = 1.0f, q1 = 1.0f;");
+    }
     NSError* err = nil;
     MTLCompileOptions* opts = [MTLCompileOptions new];
     id<MTLLibrary> lib = [mtl newLibraryWithSource:[NSString stringWithUTF8String:msl.c_str()] options:opts error:&err];
