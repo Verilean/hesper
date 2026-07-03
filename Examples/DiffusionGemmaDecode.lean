@@ -351,6 +351,94 @@ def battnB (N P nHead hd nKV : Nat) (scale : Float) (ws : Nat := 256) : Hesper.W
       ShaderM.assign acc (Exp.add (Exp.var acc) (Exp.mul w vv))
     ShaderM.writeBuffer (ty := .scalar .f32) "ctx" (Exp.add qBase d) (Exp.var acc : Exp (.scalar .f32))
 
+/-- battnB2 — battnB with its two serialization flaws fixed (the "flash" win at N≈277 is NOT
+    tiling — the score row already lives in shared — it is (1) the thread-0 SERIAL softmax that
+    idles 255 threads across 4 shared-memory passes, and (2) re-reading the 512-f32 Q row from
+    global for every key j). Fix: hoist Q into shared once, and do max/sum via a shared-memory
+    tree reduction (portable, no subgroup dependency). Same math, reduction order differs
+    (f32-associativity-class diffs only). Grid/bindings identical to battnB. -/
+def battnB2 (N P nHead hd nKV : Nat) (scale : Float) (ws : Nat := 256) : Hesper.WGSL.Monad.ShaderM Unit := do
+  let wid ← ShaderM.workgroupId
+  let lid ← ShaderM.localId
+  let h := Exp.vec3X wid; let i := Exp.vec3Y wid; let tid := Exp.vec3X lid
+  let qDim := nHead*hd; let kvDim := nKV*hd; let groupSize := nHead/nKV
+  let _q ← ShaderM.declareReadOnlyBuffer "q" (.array (.scalar .f32) (N*qDim))
+  let _k ← ShaderM.declareReadOnlyBuffer "k" (.array (.scalar .f32) (N*kvDim))
+  let _v ← ShaderM.declareReadOnlyBuffer "v" (.array (.scalar .f32) (N*kvDim))
+  let _o ← ShaderM.declareOutputBuffer "ctx" (.array (.scalar .f32) (N*qDim))
+  ShaderM.sharedNamed "sS" (.array (.scalar .f32) N)
+  ShaderM.sharedNamed "sQ" (.array (.scalar .f32) hd)
+  ShaderM.sharedNamed "sRed" (.array (.scalar .f32) ws)
+  let kvhE := Exp.div h (Exp.litU32 groupSize)
+  let qBase := Exp.add (Exp.mul i (Exp.litU32 qDim)) (Exp.mul h (Exp.litU32 hd))
+  let kvB0 := Exp.mul kvhE (Exp.litU32 hd)
+  -- Phase 1: hoist this (i,h)'s Q row into shared (read global ONCE, not once per key).
+  ShaderM.loop tid (Exp.litU32 hd) (Exp.litU32 ws) fun d => do
+    ShaderM.assignIndex "sQ" d (Exp.index (Exp.var "q" : Exp (.array (.scalar .f32) (N*qDim))) (Exp.add qBase d))
+  ShaderM.barrier
+  -- Phase 2: scores from shared Q.
+  ShaderM.loop tid (Exp.litU32 N) (Exp.litU32 ws) fun j => do
+    let allowed := Exp.or (Exp.ge i (Exp.litU32 P)) (Exp.ge i j)
+    let kBase := Exp.add (Exp.mul j (Exp.litU32 kvDim)) kvB0
+    let sc ← ShaderM.var (.scalar .f32) (Exp.litF32 0.0)
+    ShaderM.loop (Exp.litU32 0) (Exp.litU32 hd) (Exp.litU32 1) fun d => do
+      let qv := Exp.index (Exp.var "sQ" : Exp (.array (.scalar .f32) hd)) d
+      let kv := Exp.index (Exp.var "k" : Exp (.array (.scalar .f32) (N*kvDim))) (Exp.add kBase d)
+      ShaderM.assign sc (Exp.add (Exp.var sc) (Exp.mul qv kv))
+    ShaderM.assignIndex "sS" j (Exp.select allowed (Exp.mul (Exp.var sc : Exp (.scalar .f32)) (Exp.litF32 scale)) (Exp.litF32 (-1e30)))
+  ShaderM.barrier
+  -- Phase 3a: parallel max — per-thread partial over its j-stride, then shared tree reduction.
+  let pmx ← ShaderM.var (.scalar .f32) (Exp.litF32 (-1e30))
+  ShaderM.loop tid (Exp.litU32 N) (Exp.litU32 ws) fun j => do
+    ShaderM.assign pmx (Exp.max (Exp.var pmx) (Exp.index (Exp.var "sS" : Exp (.array (.scalar .f32) N)) j))
+  ShaderM.assignIndex "sRed" tid (Exp.var pmx : Exp (.scalar .f32))
+  ShaderM.barrier
+  let mut stride := ws / 2
+  while stride ≥ 1 do
+    ShaderM.if_ (Exp.lt tid (Exp.litU32 stride)) (do
+      let a ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := ws) "sRed" tid
+      let b ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := ws) "sRed" (Exp.add tid (Exp.litU32 stride))
+      ShaderM.writeWorkgroup (ty := .scalar .f32) "sRed" tid (Exp.max a b)) (pure ())
+    ShaderM.barrier
+    stride := stride / 2
+  let mxAll ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := ws) "sRed" (Exp.litU32 0)
+  let mxV ← ShaderM.var (.scalar .f32) mxAll
+  ShaderM.barrier
+  -- Phase 3b: exp in parallel + per-thread partial sums.
+  let psm ← ShaderM.var (.scalar .f32) (Exp.litF32 0.0)
+  ShaderM.loop tid (Exp.litU32 N) (Exp.litU32 ws) fun j => do
+    -- SNAPSHOT exp(x−mx) into a WGSL var BEFORE the in-place write: Exp is a pure AST, so reusing
+    -- `e` after `sS[j] ← e` re-inlines it against the OVERWRITTEN sS[j] = the classic double-exp
+    -- softmax bug (CLAUDE.md).
+    let ev ← ShaderM.var (.scalar .f32) (Exp.exp (Exp.sub (Exp.index (Exp.var "sS" : Exp (.array (.scalar .f32) N)) j) (Exp.var mxV)))
+    ShaderM.assignIndex "sS" j (Exp.var ev : Exp (.scalar .f32))
+    ShaderM.assign psm (Exp.add (Exp.var psm) (Exp.var ev : Exp (.scalar .f32)))
+  ShaderM.assignIndex "sRed" tid (Exp.var psm : Exp (.scalar .f32))
+  ShaderM.barrier
+  let mut stride2 := ws / 2
+  while stride2 ≥ 1 do
+    ShaderM.if_ (Exp.lt tid (Exp.litU32 stride2)) (do
+      let a ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := ws) "sRed" tid
+      let b ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := ws) "sRed" (Exp.add tid (Exp.litU32 stride2))
+      ShaderM.writeWorkgroup (ty := .scalar .f32) "sRed" tid (Exp.add a b)) (pure ())
+    ShaderM.barrier
+    stride2 := stride2 / 2
+  let smAll ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := ws) "sRed" (Exp.litU32 0)
+  let smV ← ShaderM.var (.scalar .f32) smAll
+  ShaderM.barrier
+  -- Phase 3c: normalize in parallel.
+  ShaderM.loop tid (Exp.litU32 N) (Exp.litU32 ws) fun j => do
+    ShaderM.assignIndex "sS" j (Exp.div (Exp.index (Exp.var "sS" : Exp (.array (.scalar .f32) N)) j) (Exp.var smV))
+  ShaderM.barrier
+  -- Phase 4: weighted-V (unchanged from battnB).
+  ShaderM.loop tid (Exp.litU32 hd) (Exp.litU32 ws) fun d => do
+    let acc ← ShaderM.var (.scalar .f32) (Exp.litF32 0.0)
+    ShaderM.loop (Exp.litU32 0) (Exp.litU32 N) (Exp.litU32 1) fun j => do
+      let w := Exp.index (Exp.var "sS" : Exp (.array (.scalar .f32) N)) j
+      let vv := Exp.index (Exp.var "v" : Exp (.array (.scalar .f32) (N*kvDim))) (Exp.add (Exp.add (Exp.mul j (Exp.litU32 kvDim)) kvB0) d)
+      ShaderM.assign acc (Exp.add (Exp.var acc) (Exp.mul w vv))
+    ShaderM.writeBuffer (ty := .scalar .f32) "ctx" (Exp.add qBase d) (Exp.var acc : Exp (.scalar .f32))
+
 /-- Router prep per row: tmps[r,i]=(x[r,i]/rms(x[r]))·invSqrt·rscale[i]. 1 thread/row. -/
 def routerPrepB (N dim : Nat) (invSqrt eps : Float) : Hesper.WGSL.Monad.ShaderM Unit := do
   let gid ← ShaderM.globalId; let r := Exp.vec3X gid
@@ -1452,7 +1540,11 @@ def main (args : List String) : IO Unit := do
         disp device (qkNormRopeB N nKV hd nRotHalf theta eps) (("qin",sK)::("wnorm",blk.attention.kNormWeight)::("qout",sKr)::List.nil) (N*nKV) (hash ("kn",li))
         disp device (vNormB N nKV hd eps) (("vin",sV)::("vout",sVn)::List.nil) (N*nKV) (hash ("vn",li))
         pmark rQkn    -- qk-norm + RoPE + v-norm
-        disp2 device (battnB N P nHead hd nKV 1.0) (("q",sQr)::("k",sKr)::("v",sVn)::("ctx",sCtx)::List.nil) nHead N (hash ("at",li))
+        -- battnB2 (shared-Q + parallel-reduction softmax) DEFAULT; DG_NOFLASH=1 restores battnB.
+        if (← IO.getEnv "DG_NOFLASH").isSome then
+          disp2 device (battnB N P nHead hd nKV 1.0) (("q",sQr)::("k",sKr)::("v",sVn)::("ctx",sCtx)::List.nil) nHead N (hash ("at",li))
+        else
+          disp2 device (battnB2 N P nHead hd nKV 1.0) (("q",sQr)::("k",sKr)::("v",sVn)::("ctx",sCtx)::List.nil) nHead N (hash ("at2",li))
         pmark rBattn  -- battnB: QK^T + softmax + weighted-V (matrix-vector per query)
         if qkvRB then
           -- O-proj reg-matmul: A = f32 sCtx [N, qDim], B = wO f16 [dim, qDim/2], C = sAO. K=qDim.
