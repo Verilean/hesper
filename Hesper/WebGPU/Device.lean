@@ -55,6 +55,14 @@ opaque mtlDeviceName (device : @& Device) : IO String
 @[extern "lean_hesper_mps_matmul_bench"]
 opaque mpsMatmulBench (device : @& Device) (M N K iters : UInt32) : IO String
 
+/-- metal_replacer MSL PoC: bench the hand-written native-Metal port of
+    q4kMatmulGroupedRegIndexedKernel on the given Dawn buffers (same algorithm as the WGSL kernel).
+    Returns ms/iter from MTLCommandBuffer GPU timestamps. Caller syncs input writes first and
+    writes `c` once (Dawn lazy-clear). macOS DEBUG/REFERENCE only. -/
+@[extern "lean_hesper_msl_q4k_bench"]
+opaque mslQ4kBench (device : @& Device) (src idx b c te tr : @& Buffer)
+    (M N K nExpert srcRows iters : UInt32) : IO String
+
 /-- Check if the device was created with the Chromium experimental
     subgroup matrix feature. `subgroup_matrix_left/right/result` types
     and `subgroupMatrixLoad/Store/MultiplyAccumulate` are available iff
