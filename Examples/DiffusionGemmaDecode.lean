@@ -470,6 +470,10 @@ def offsetsExpB (nExpert maxPadded : Nat) (padTo : Nat := 32) : Hesper.WGSL.Mona
   let _cnt ← ShaderM.declareReadOnlyBuffer "cnt" (.array (.scalar .u32) nExpert)
   let _off ← ShaderM.declareOutputBuffer "off" (.array (.scalar .u32) nExpert)
   let _te ← ShaderM.declareOutputBuffer "te" (.array (.scalar .u32) (maxPadded/32))
+  -- trs[tile] = REAL rows in the tile (1-32; 0 for sentinel tiles): lets the reg kernels skip
+  -- fully-phantom 8-row WMMA sub-tiles (avg ~17 real rows/expert ⇒ ~46% of the MMA is phantom;
+  -- ~33% recoverable at 8-row granularity with the per-expert B-panel reuse untouched).
+  let _trs ← ShaderM.declareOutputBuffer "trs" (.array (.scalar .u32) (maxPadded/32))
   ShaderM.if_ (Exp.eq t (Exp.litU32 0)) (do
     ShaderM.varNamed "acc" (.scalar .u32) (Exp.litU32 0)
     ShaderM.loop (Exp.litU32 0) (Exp.litU32 nExpert) (Exp.litU32 1) fun e => do
@@ -477,12 +481,16 @@ def offsetsExpB (nExpert maxPadded : Nat) (padTo : Nat := 32) : Hesper.WGSL.Mona
       let pc := Exp.mul (Exp.div (Exp.add c (Exp.litU32 (padTo-1))) (Exp.litU32 padTo)) (Exp.litU32 padTo)
       ShaderM.writeBuffer (ty := .scalar .u32) "off" e (Exp.var "acc")
       ShaderM.varNamed "tt" (.scalar .u32) (Exp.div (Exp.var "acc") (Exp.litU32 32))
-      ShaderM.loop (Exp.litU32 0) (Exp.div pc (Exp.litU32 32)) (Exp.litU32 1) fun _z => do
+      ShaderM.loop (Exp.litU32 0) (Exp.div pc (Exp.litU32 32)) (Exp.litU32 1) fun z => do
         ShaderM.writeBuffer (ty := .scalar .u32) "te" (Exp.var "tt") e
+        let zRows := Exp.sub c (Exp.mul z (Exp.litU32 32))   -- c > z*32 for z < pc/32 ⇒ no underflow
+        let real := Exp.select (Exp.lt zRows (Exp.litU32 32)) zRows (Exp.litU32 32)
+        ShaderM.writeBuffer (ty := .scalar .u32) "trs" (Exp.var "tt") real
         ShaderM.assign "tt" (Exp.add (Exp.var "tt") (Exp.litU32 1))
       ShaderM.assign "acc" (Exp.add (Exp.var "acc") pc)
     ShaderM.loop (Exp.div (Exp.var "acc") (Exp.litU32 32)) (Exp.litU32 (maxPadded/32)) (Exp.litU32 1) fun tt => do
-      ShaderM.writeBuffer (ty := .scalar .u32) "te" tt (Exp.litU32 nExpert)) (pure ())
+      ShaderM.writeBuffer (ty := .scalar .u32) "te" tt (Exp.litU32 nExpert)
+      ShaderM.writeBuffer (ty := .scalar .u32) "trs" tt (Exp.litU32 0)) (pure ())
 
 /-- GPU grouping 3: scatter each (pos,slot) to off[expert]+rank (rank = #earlier same-expert). -/
 def scatterRankB (totalTok nExpert nUsed maxPadded : Nat) : Hesper.WGSL.Monad.ShaderM Unit := do
@@ -1115,6 +1123,12 @@ def main (args : List String) : IO Unit := do
   let sSortedPos ← mkBuf device maxPadded
   let sSortedSlot ← mkBuf device maxPadded
   let sTileExpert ← mkBuf device (maxPadded/32)
+  -- ragged 8-row sub-tile skip: per-tile REAL row count from offsetsExpB. DG_NORAGGED=1 binds the
+  -- all-32 buffer instead → same kernel computes every row (the clean A/B for the ragged skip).
+  let sTileRows ← mkBuf device (maxPadded/32)
+  let sTileRowsFull ← mkBuf device (maxPadded/32)
+  writeBuffer device sTileRowsFull 0 (u32Bytes (Array.replicate (maxPadded/32) 32))
+  let raggedRows := if (← IO.getEnv "DG_NORAGGED").isSome then sTileRowsFull else sTileRows
   let sTileExpert64 ← mkBuf device (if moeRB then maxPadded/64 else 1)   -- per-64 tileExpert for the reg gate/up
   let sGatheredF32 ← mkBuf device (if moeRB then maxPadded*dim else 1)   -- f32 gathered MoE input (reg A)
   let sGatheredQ8 ← mkBuf device (maxPadded*q8size)
@@ -1522,7 +1536,7 @@ def main (args : List String) : IO Unit := do
           -- expert-grouping (fused, GPU-side counting-sort grouping — no readback, stays batched)
           unless skGrp do disp device (clearSortedB maxPadded nUsed) (("sp",sSortedPos)::("ss",sSortedSlot)::List.nil) maxPadded (hash ("clr",li))
           unless skGrp do disp device (countExpB totalTok nExpert) (("idxs",sIdxs)::("cnt",sExpertCount)::List.nil) nExpert (hash ("cntk",li))
-          unless skGrp do disp device (offsetsExpB nExpert maxPadded padTo) (("cnt",sExpertCount)::("off",sExpertOffset)::("te",sTileExpert)::List.nil) 1 (hash ("offk",li))
+          unless skGrp do disp device (offsetsExpB nExpert maxPadded padTo) (("cnt",sExpertCount)::("off",sExpertOffset)::("te",sTileExpert)::("trs",sTileRows)::List.nil) 1 (hash ("offk",li))
           if li == 0 && (← IO.getEnv "DG_TILEDIAG").isSome then
             Hesper.GPUBackend.endBatch device
             let teA ← Hesper.Basic.bytesToFloatArray (← mapBufferRead device sTileExpert 0 (maxPadded/32*4).toUSize)
@@ -1542,7 +1556,7 @@ def main (args : List String) : IO Unit := do
             -- INDEXED Q4_K reg-matmul gate/up (mul_mat_id-style): the A-load reads token rows IN PLACE
             -- through sSortedPos — no physical gatherF32B pass. src=sMoeN [N,dim], B=guE Q4_K, C=sGatheredGU.
             dispRB device (Hesper.Quantization.Q4_K_M.q4kMatmulGroupedRegIndexedKernel maxPadded (2*expFF) dim nExpert N)
-              (("src",sMoeN)::("idx",sSortedPos)::("b",guE)::("c",sGatheredGU)::("tileExpert",sTileExpert)::List.nil) ((2*expFF+31)/32) ((maxPadded+31)/32) (hash ("emmrbi",li))
+              (("src",sMoeN)::("idx",sSortedPos)::("b",guE)::("c",sGatheredGU)::("tileExpert",sTileExpert)::("tileRows",raggedRows)::List.nil) ((2*expFF+31)/32) ((maxPadded+31)/32) (hash ("emmrbi",li))
           else
             unless skGat do disp device (gatherQ8B maxPadded q8size N) (("src",sMoeNQ8)::("idx",sSortedPos)::("gathered",sGatheredQ8)::List.nil) (maxPadded*q8size) (hash ("gthr",li))
             unless skGU do
@@ -1617,7 +1631,7 @@ def main (args : List String) : IO Unit := do
               q80 device sGatheredEh maxPadded expFF (hash ("qgehrb",li))
               unless moeNoFlush do Hesper.WGSL.Execute.flushBatch device
               dispRB device (Hesper.Quantization.Q4_K_M.q8MatmulGroupedRegIndexedScatterKernel maxPadded dim expFF nExpert nUsed N)
-                (("a",sGatheredEh)::("b",dnE)::("tileExpert",sTileExpert)::("pos",sSortedPos)::("slot",sSortedSlot)::("dst",sDownAll)::List.nil) ((dim+31)/32) ((maxPadded+31)/32) (hash ("edrbi",li))
+                (("a",sGatheredEh)::("b",dnE)::("tileExpert",sTileExpert)::("tileRows",raggedRows)::("pos",sSortedPos)::("slot",sSortedSlot)::("dst",sDownAll)::List.nil) ((dim+31)/32) ((maxPadded+31)/32) (hash ("edrbi",li))
             else
               q80 device sGatheredEh maxPadded expFF (hash ("qgeh",li))   -- match the per-slot Q8 rounding
               let downGrpKernel := match blk.ffn.down.quantFormat with
