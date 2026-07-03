@@ -944,7 +944,7 @@ def lmHeadArgmaxFullVocab (device : Device) (outputWeightF16 sN sLogits logitsCa
   for c in [0:nChunks] do
     Hesper.GPUBackend.beginBatch device
     -- register-blocked WMMA matmul (f16 weight): logits[N, lmChunk] for this vocab chunk
-    dispRB device (Hesper.WGSL.MatMul.matMulTransposeF16WMMARegKernel { M := N, N := lmChunk, K := dim } (c*lmChunk) vocabSize)
+    dispRB device (Hesper.WGSL.MatMul.matMulTransposeF16WMMARegKernel { M := ((N+63)/64)*64, N := lmChunk, K := dim } (c*lmChunk) vocabSize)
       (("a", sN)::("b", outputWeightF16)::("c", sLogits)::List.nil) ((lmChunk+31)/32) ((N+63)/64) (hash ("lmheadrb", c))
     -- batch split after the subgroup-matrix kernel: Dawn-on-Metal drops the inter-pass barrier after
     -- WMMA dispatches at scale (same pattern as the QKV/attnO/dense reg calls). Without it, softcap/
@@ -1407,7 +1407,7 @@ def main (args : List String) : IO Unit := do
           Hesper.WGSL.Execute.flushBatch device   -- RMSNorm → reg-matmul: batch split
           -- reg-matmul QKV on f32 sN (real dequantized f16 weights). N=outDim, K=dim.
           let rb := fun (wf16 outB : Buffer) (od : Nat) (key : UInt64) =>
-            dispRB device (Hesper.WGSL.MatMul.matMulTransposeF16WMMARegKernel { M := N, N := od, K := dim } 0 od)
+            dispRB device (Hesper.WGSL.MatMul.matMulTransposeF16WMMARegKernel { M := nP, N := od, K := dim } 0 od)
               (("a",sN)::("b",wf16)::("c",outB)::List.nil) ((od+31)/32) ((N+63)/64) key
           rb (qF16s[li]?.getD sQ) sQ qDim (hash ("rbq",li)); rb (kF16s[li]?.getD sK) sK kvDim (hash ("rbk",li)); rb (vF16s[li]?.getD sV) sV kvDim (hash ("rbv",li))
           Hesper.WGSL.Execute.flushBatch device   -- reg-matmul QKV → qknorm: batch split (Dawn drops the inter-pass barrier for subgroup_matrix at scale)
@@ -1438,7 +1438,7 @@ def main (args : List String) : IO Unit := do
         pmark rBattn  -- battnB: QK^T + softmax + weighted-V (matrix-vector per query)
         if qkvRB then
           -- O-proj reg-matmul: A = f32 sCtx [N, qDim], B = wO f16 [dim, qDim/2], C = sAO. K=qDim.
-          dispRB device (Hesper.WGSL.MatMul.matMulTransposeF16WMMARegKernel { M := N, N := dim, K := qDim } 0 dim)
+          dispRB device (Hesper.WGSL.MatMul.matMulTransposeF16WMMARegKernel { M := nP, N := dim, K := qDim } 0 dim)
             (("a",sCtx)::("b",oF16s[li]?.getD sAO)::("c",sAO)::List.nil) ((dim+31)/32) ((N+63)/64) (hash ("rbo",li))
           Hesper.WGSL.Execute.flushBatch device
         else
@@ -1457,9 +1457,9 @@ def main (args : List String) : IO Unit := do
         unless skipDense do
           if qkvRB then
             -- dense gate/up reg-matmul on f32 sN. N=ffn, K=dim.
-            dispRB device (Hesper.WGSL.MatMul.matMulTransposeF16WMMARegKernel { M := N, N := ffn, K := dim } 0 ffn)
+            dispRB device (Hesper.WGSL.MatMul.matMulTransposeF16WMMARegKernel { M := nP, N := ffn, K := dim } 0 ffn)
               (("a",sN)::("b",gateF16s[li]?.getD sG)::("c",sG)::List.nil) ((ffn+31)/32) ((N+63)/64) (hash ("rbg",li))
-            dispRB device (Hesper.WGSL.MatMul.matMulTransposeF16WMMARegKernel { M := N, N := ffn, K := dim } 0 ffn)
+            dispRB device (Hesper.WGSL.MatMul.matMulTransposeF16WMMARegKernel { M := nP, N := ffn, K := dim } 0 ffn)
               (("a",sN)::("b",upF16s[li]?.getD sU)::("c",sU)::List.nil) ((ffn+31)/32) ((N+63)/64) (hash ("rbu",li))
             Hesper.WGSL.Execute.flushBatch device
           else
@@ -1470,7 +1470,7 @@ def main (args : List String) : IO Unit := do
             -- dense down f16 WMMA reg (QKVRB rounding profile): A = f32 geglu sGe [N,ffn], B = down
             -- f16 [dim,ffn/2], C = sD [N,dim] (64-row padded alloc). No q80 needed (A read as f32).
             let some dbuf := downF16s[li]?.getD none | throw (IO.userError "downF16")
-            dispRB device (Hesper.WGSL.MatMul.matMulTransposeF16WMMARegKernel { M := N, N := dim, K := ffn } 0 dim)
+            dispRB device (Hesper.WGSL.MatMul.matMulTransposeF16WMMARegKernel { M := nP, N := dim, K := ffn } 0 dim)
               (("a",sGe)::("b",dbuf)::("c",sD)::List.nil) ((dim+31)/32) ((N+63)/64) (hash ("rbd",li))
             Hesper.WGSL.Execute.flushBatch device   -- WMMA → next reader: batch split (Dawn barrier drop)
           else if denseDownRB && blk.ffn.down.quantFormat == .Q8_0 then
