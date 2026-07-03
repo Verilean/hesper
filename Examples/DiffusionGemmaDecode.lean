@@ -1539,12 +1539,10 @@ def main (args : List String) : IO Unit := do
           unless skGrp do disp device (scatterRankB totalTok nExpert nUsed maxPadded) (("idxs",sIdxs)::("off",sExpertOffset)::("sp",sSortedPos)::("ss",sSortedSlot)::List.nil) totalTok (hash ("srkk",li))
           pmark rMoeGrp   -- router + counting-sort grouping (clear/count/offsets/scatterRank)
           if moeRB then
-            -- FUSED Q4_K reg-matmul gate/up: f32 gather + per-64 tileExpert + read guE Q4_K directly
-            -- (in-kernel dequant, no f16 buffer). A=sGatheredF32 [maxPadded,dim], B=guE Q4_K, C=sGatheredGU.
-            let gN := maxPadded*dim; let gWG := (gN+255)/256; let gnx := min gWG 32768; let gny := (gWG + gnx - 1)/gnx
-            disp2 device (gatherF32B maxPadded dim N (gnx*256)) (("src",sMoeN)::("idx",sSortedPos)::("gathered",sGatheredF32)::List.nil) gnx gny (hash ("gthrf",li))
-            dispRB device (Hesper.Quantization.Q4_K_M.q4kMatmulGroupedRegKernel maxPadded (2*expFF) dim nExpert)
-              (("a",sGatheredF32)::("b",guE)::("c",sGatheredGU)::("tileExpert",sTileExpert)::List.nil) ((2*expFF+31)/32) ((maxPadded+31)/32) (hash ("emmrb",li))
+            -- INDEXED Q4_K reg-matmul gate/up (mul_mat_id-style): the A-load reads token rows IN PLACE
+            -- through sSortedPos — no physical gatherF32B pass. src=sMoeN [N,dim], B=guE Q4_K, C=sGatheredGU.
+            dispRB device (Hesper.Quantization.Q4_K_M.q4kMatmulGroupedRegIndexedKernel maxPadded (2*expFF) dim nExpert N)
+              (("src",sMoeN)::("idx",sSortedPos)::("b",guE)::("c",sGatheredGU)::("tileExpert",sTileExpert)::List.nil) ((2*expFF+31)/32) ((maxPadded+31)/32) (hash ("emmrbi",li))
           else
             unless skGat do disp device (gatherQ8B maxPadded q8size N) (("src",sMoeNQ8)::("idx",sSortedPos)::("gathered",sGatheredQ8)::List.nil) (maxPadded*q8size) (hash ("gthr",li))
             unless skGU do
@@ -1613,13 +1611,13 @@ def main (args : List String) : IO Unit := do
               Hesper.GPUBackend.beginBatch device
             if moeDownFused then pure ()   -- the fused kernel already did geglu+down+scatter → sDownAll
             else if moeDownRB && blk.ffn.down.quantFormat != .Q5_0 then
-              -- TILED reg-matmul down (matrix units, in-kernel Q8_0 dequant). The q80 round-trip both matches
-              -- the warp's Q8 rounding AND acts as the geglu→down sync (its in-place read of sGatheredEh forces
-              -- the geglu to complete — the plain flushBatch is dropped by Dawn in the long grouped batch).
+              -- INDEXED-SCATTER reg-matmul down (matrix units, in-kernel Q8_0 dequant): the C store
+              -- scatters dst[slot,pos,col] IN-KERNEL — no 17.5M-element scatterGUB pass. The q80
+              -- round-trip both matches the warp's Q8 rounding AND acts as the geglu→down sync.
               q80 device sGatheredEh maxPadded expFF (hash ("qgehrb",li))
               unless moeNoFlush do Hesper.WGSL.Execute.flushBatch device
-              dispRB device (Hesper.Quantization.Q4_K_M.q8MatmulGroupedRegKernel maxPadded dim expFF nExpert)
-                (("a",sGatheredEh)::("b",dnE)::("c",sGatheredDown)::("tileExpert",sTileExpert)::List.nil) ((dim+31)/32) ((maxPadded+31)/32) (hash ("edrb",li))
+              dispRB device (Hesper.Quantization.Q4_K_M.q8MatmulGroupedRegIndexedScatterKernel maxPadded dim expFF nExpert nUsed N)
+                (("a",sGatheredEh)::("b",dnE)::("tileExpert",sTileExpert)::("pos",sSortedPos)::("slot",sSortedSlot)::("dst",sDownAll)::List.nil) ((dim+31)/32) ((maxPadded+31)/32) (hash ("edrbi",li))
             else
               q80 device sGatheredEh maxPadded expFF (hash ("qgeh",li))   -- match the per-slot Q8 rounding
               let downGrpKernel := match blk.ffn.down.quantFormat with
@@ -1634,8 +1632,9 @@ def main (args : List String) : IO Unit := do
             let scWG := (scN + 255)/256
             let scNx := min scWG 32768
             let scNy := (scWG + scNx - 1)/scNx
-            -- when fused, sDownAll is already written by the fused kernel — skip the staged scatter.
-            unless moeDownFused do
+            -- when fused OR indexed-scatter down ran, sDownAll is already written in-kernel — skip
+            -- the staged scatter (it only remains for the Q5_0 warp-grouped fallback path).
+            unless (moeDownFused || (moeDownRB && blk.ffn.down.quantFormat != .Q5_0)) do
               disp2 device (scatterGUB maxPadded dim N nUsed (scNx*256)) (("gathered",sGatheredDown)::("pos",sSortedPos)::("slot",sSortedSlot)::("dst",sDownAll)::List.nil) scNx scNy (hash ("sctrd",li))
             -- NOTE: the grouped-down chain (geglu→q80→down→scatter→wacc) is NUMERICALLY correct (DG_MOEDIAG
             -- maxDiff 4e-6) but Dawn drops these no-wait flushes at batch scale → a routing-dependent RACE
