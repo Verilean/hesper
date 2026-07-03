@@ -1130,7 +1130,11 @@ def main (args : List String) : IO Unit := do
   -- steps low); 13 for the entropy-bound denoiser (its t-annealing spans S — S=13 converges clean,
   -- S=32 anneals too slowly, matching llama.cpp's --diffusion-steps 13 reference run).
   let decodeSteps := (args.drop 3).head?.bind (·.toNat?)
-    |>.getD (if ((← IO.getEnv "DG_SCHED").getD "fixed") == "eb" || ((← IO.getEnv "DG_MODE").getD "") == "renoise" then 20 else 32)
+    |>.getD (if ((← IO.getEnv "DG_SCHED").getD "fixed") == "eb" || ((← IO.getEnv "DG_MODE").getD "renoise") == "renoise" then 48 else 32)
+    -- eb/renoise anneal horizon S = 48 = llama.cpp's max_denoising_steps default (diffusion.h:68).
+    -- S=20 annealed t 2.4× too fast → softmax over-sharpened → meanH crossed 0.005 prematurely on
+    -- hard prompts (Jupiter stopped "confident" at step 7 in a WRONG canvas). The stop rule, not the
+    -- cap, ends the run early (France ~10 steps); S only sets the anneal slope + worst-case bound.
   -- DG_SCHED=eb: llama.cpp's ENTROPY-BOUND denoiser (examples/diffusion/diffusion.cpp:442) — the
   -- canvas is RANDOM-initialized (not masks) and re-noised every step: per position compute the
   -- temperature-adjusted distribution, its entropy H, the argmax and a multinomial sample; ACCEPT the
@@ -1146,7 +1150,7 @@ def main (args : List String) : IO Unit := do
   -- logits / prev t) (the FULLSC path with the ANNEALED prev t — verified: diffusion.cpp:557
   -- passes prev_temp_inv into set_sc, and diffusion-gemma.cpp:408 applies it), and llama.cpp's
   -- TRUE stop constants (meanH < 0.005, stability 1) — valid now that H is the real full-vocab H.
-  let modeRenoise := ((← IO.getEnv "DG_MODE").getD "") == "renoise"
+  let modeRenoise := ((← IO.getEnv "DG_MODE").getD "renoise") == "renoise"   -- DEFAULT: renoise (8/8 @ 6-11 steps, ~40 tok/s avg); DG_MODE=mask restores the mask-commit path
   let schedEB := (((← IO.getEnv "DG_SCHED").getD "fixed") == "eb") || modeRenoise
   let ebTmax := ((((← IO.getEnv "DG_EB_TMAX").bind (·.toNat?)).getD 80).toFloat) / 100.0   -- t at step 0
   let ebTmin := ((((← IO.getEnv "DG_EB_TMIN").bind (·.toNat?)).getD 40).toFloat) / 100.0   -- t at last step
@@ -1914,9 +1918,13 @@ def main (args : List String) : IO Unit := do
   for i in [0:eogCut] do
     if cut == eogCut then   -- only the FIRST loop onset
       for stride in [1:3] do
+        -- FULL-PERIOD repetition: block [j..j+stride) must equal [j+stride..j+2·stride). A single
+        -- repeating rail (e.g. the COMMA in "Mercury, Venus, Earth, …") is a legitimate list, not
+        -- spam — the old one-rail check cut planet enumerations right before the answer.
         let mut reps := 0
         let mut j := i
-        while j + stride < eogCut && outIds[j]! == outIds[j+stride]! do
+        while j + 2*stride ≤ eogCut &&
+              (List.range stride).all (fun k => outIds[j+k]! == outIds[j+k+stride]!) do
           reps := reps + 1; j := j + stride
         if reps ≥ 6 && cut == eogCut then cut := i
   let trimmed := outIds.extract 0 cut
