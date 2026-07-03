@@ -1189,6 +1189,9 @@ def main (args : List String) : IO Unit := do
   -- DG_MSL=1: dispatch the hand-MSL gate/up (native Metal, 1.61× vs WGSL/Tint, commit 8332c90)
   -- via the Dawn→Metal interop instead of the WGSL kernel. macOS only; opt-in until judged.
   let useMsl := (← IO.getEnv "DG_NOMSL").isNone   -- DEFAULT ON (8/8, -68ms/step adjacent A/B); DG_NOMSL=1 restores the WGSL kernel (non-macOS/portable path)
+  -- DG_MSLDOWN: MSL port of the Q8_0 MoE down (same recipe as the gate/up). Separate opt-out so
+  -- the two can be A/B'd independently; both share the portable-WGSL fallback semantics.
+  let useMslDown := (← IO.getEnv "DG_NOMSLDOWN").isNone
   -- DG_MOENOFLUSH: drop the MoE chain's per-layer flushBatch splits. Those were added to fight a
   -- "Dawn drops barriers at scale" race — but that race may have been the kill-9 GPU wedge / swap
   -- corruption all along (post-reboot experiment). If correct without them: faster AND simpler.
@@ -1234,6 +1237,10 @@ def main (args : List String) : IO Unit := do
   let sGatheredEh ← mkBuf device (maxPadded*expFF)   -- grouped geglu output (down input)
   let sGatheredDown ← mkBuf device (maxPadded*dim)   -- grouped down output
   let sDownAll ← mkBuf device (nUsed*N*dim)          -- scattered down [slot,N,dim] for wacc
+  -- DG_MSLDOWN: sDownAll becomes MSL-written on Q8_0 layers — mark it Dawn-initialized once
+  -- (the same lazy-clear gotcha as sGatheredGU above).
+  if useMslDown then
+    writeBuffer device sDownAll 0 (← Hesper.Basic.floatArrayToBytes #[(0.0:Float)])
   let sExpertCount ← mkBuf device nExpert
   let sExpertOffset ← mkBuf device nExpert
   -- DECODE LOOP: real prompt + canvas of mask tokens; diffusion confidence-commit
@@ -1739,9 +1746,16 @@ def main (args : List String) : IO Unit := do
               -- scatters dst[slot,pos,col] IN-KERNEL — no 17.5M-element scatterGUB pass. The q80
               -- round-trip both matches the warp's Q8 rounding AND acts as the geglu→down sync.
               q80 device sGatheredEh maxPadded expFF (hash ("qgehrb",li))
-              unless moeNoFlush do Hesper.WGSL.Execute.flushBatch device
-              dispRB device (Hesper.Quantization.Q4_K_M.q8MatmulGroupedRegIndexedScatterKernel maxPadded dim expFF nExpert nUsed N)
-                (("a",sGatheredEh)::("b",dnE)::("tileExpert",sTileExpert)::("tileRows",raggedRows)::("pos",sSortedPos)::("slot",sSortedSlot)::("dst",sDownAll)::List.nil) ((dim+31)/32) ((maxPadded+31)/32) (hash ("edrbi",li))
+              if useMslDown then
+                -- DG_MSLDOWN: hand-MSL port (same ordering contract as the gate/up: flushBatch
+                -- commits the producers, the MSL cb commits next, hazard tracking orders them).
+                Hesper.WGSL.Execute.flushBatch device
+                mslQ8DownDispatch device sGatheredEh dnE sTileExpert raggedRows sSortedPos sSortedSlot sDownAll
+                  maxPadded.toUInt32 dim.toUInt32 expFF.toUInt32 nExpert.toUInt32 nUsed.toUInt32 N.toUInt32
+              else do
+                unless moeNoFlush do Hesper.WGSL.Execute.flushBatch device
+                dispRB device (Hesper.Quantization.Q4_K_M.q8MatmulGroupedRegIndexedScatterKernel maxPadded dim expFF nExpert nUsed N)
+                  (("a",sGatheredEh)::("b",dnE)::("tileExpert",sTileExpert)::("tileRows",raggedRows)::("pos",sSortedPos)::("slot",sSortedSlot)::("dst",sDownAll)::List.nil) ((dim+31)/32) ((maxPadded+31)/32) (hash ("edrbi",li))
             else
               q80 device sGatheredEh maxPadded expFF (hash ("qgeh",li))   -- match the per-slot Q8 rounding
               let downGrpKernel := match blk.ffn.down.quantFormat with

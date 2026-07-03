@@ -71,6 +71,14 @@ opaque mslQ4kBench (device : @& Device) (src idx b c te tr : @& Buffer)
 opaque mslQ4kDispatch (device : @& Device) (src idx b c te tr : @& Buffer)
     (M N K nExpert srcRows : UInt32) : IO Unit
 
+/-- HOT-PATH MSL Q8_0 MoE-down dispatch (DG_MSLDOWN): the native port of
+    q8MatmulGroupedRegIndexedScatterKernel (A read direct from the grouped geglu output, ragged
+    sub-tile skip, C scatter-on-store through pos/slot into dst[slot,NTOK,N]). Same ordering
+    contract as mslQ4kDispatch (flushBatch before; hazard-tracked commit order). macOS only. -/
+@[extern "lean_hesper_msl_q8down_dispatch"]
+opaque mslQ8DownDispatch (device : @& Device) (a b te tr pos slot dst : @& Buffer)
+    (M N K nExpert nUsed nTok : UInt32) : IO Unit
+
 /-- Check if the device was created with the Chromium experimental
     subgroup matrix feature. `subgroup_matrix_left/right/result` types
     and `subgroupMatrixLoad/Store/MultiplyAccumulate` are available iff
