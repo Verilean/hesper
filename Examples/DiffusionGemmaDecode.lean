@@ -1186,6 +1186,9 @@ def main (args : List String) : IO Unit := do
   -- DG_MOERB: fused Q4_K reg-matmul for the MoE gate/up. The reg M-tile is 64 ⇒ each expert block must
   -- be 64-aligned ⇒ pad to 64 (vs 32 for MMQ). Gated: the default MMQ path keeps its 32-pad.
   let moeRB := (← IO.getEnv "DG_NOMOERB").isNone   -- DEFAULT ON (validated); DG_NOMOERB=1 opts out
+  -- DG_MSL=1: dispatch the hand-MSL gate/up (native Metal, 1.61× vs WGSL/Tint, commit 8332c90)
+  -- via the Dawn→Metal interop instead of the WGSL kernel. macOS only; opt-in until judged.
+  let useMsl := (← IO.getEnv "DG_NOMSL").isNone   -- DEFAULT ON (8/8, -68ms/step adjacent A/B); DG_NOMSL=1 restores the WGSL kernel (non-macOS/portable path)
   -- DG_MOENOFLUSH: drop the MoE chain's per-layer flushBatch splits. Those were added to fight a
   -- "Dawn drops barriers at scale" race — but that race may have been the kill-9 GPU wedge / swap
   -- corruption all along (post-reboot experiment). If correct without them: faster AND simpler.
@@ -1221,6 +1224,12 @@ def main (args : List String) : IO Unit := do
   let sGatheredF32 ← mkBuf device (if moeRB then maxPadded*dim else 1)   -- f32 gathered MoE input (reg A)
   let sGatheredQ8 ← mkBuf device (maxPadded*q8size)
   let sGatheredGU ← mkBuf device (maxPadded*2*expFF)
+  -- DG_MSL: sGatheredGU becomes MSL-only-written; Dawn would lazy-clear it (thinking it
+  -- uninitialized) on its first own use, zeroing the MSL output — write it once so Dawn
+  -- marks it initialized (the documented metal_replacer gotcha).
+  -- (a 4-byte partial write suffices: Dawn clears the remainder and marks the buffer initialized)
+  if useMsl then
+    writeBuffer device sGatheredGU 0 (← Hesper.Basic.floatArrayToBytes #[(0.0:Float)])
   let sGateUpAll ← mkBuf device (nUsed*N*2*expFF)
   let sGatheredEh ← mkBuf device (maxPadded*expFF)   -- grouped geglu output (down input)
   let sGatheredDown ← mkBuf device (maxPadded*dim)   -- grouped down output
@@ -1645,6 +1654,15 @@ def main (args : List String) : IO Unit := do
           unless skGrp do disp device (scatterRankB totalTok nExpert nUsed maxPadded) (("idxs",sIdxs)::("off",sExpertOffset)::("sp",sSortedPos)::("ss",sSortedSlot)::List.nil) totalTok (hash ("srkk",li))
           pmark rMoeGrp   -- router + counting-sort grouping (clear/count/offsets/scatterRank)
           if moeRB then
+            if useMsl then
+              -- DG_MSL: the hand-MSL port of the indexed gate/up (1.61× vs WGSL/Tint, commit 8332c90).
+              -- flushBatch commits the Dawn producers (grouping chain + sMoeN); the MSL cb commits
+              -- next; Dawn's consumers commit at the following flush — hazard-tracked buffers give
+              -- Metal commit-order execution on the shared buffers, so NO CPU wait is needed.
+              Hesper.WGSL.Execute.flushBatch device
+              mslQ4kDispatch device sMoeN sSortedPos guE sGatheredGU sTileExpert raggedRows
+                maxPadded.toUInt32 (2*expFF).toUInt32 dim.toUInt32 nExpert.toUInt32 N.toUInt32
+            else
             -- INDEXED Q4_K reg-matmul gate/up (mul_mat_id-style): the A-load reads token rows IN PLACE
             -- through sSortedPos — no physical gatherF32B pass. src=sMoeN [N,dim], B=guE Q4_K, C=sGatheredGU.
             dispRB device (Hesper.Quantization.Q4_K_M.q4kMatmulGroupedRegIndexedKernel maxPadded (2*expFF) dim nExpert N)
