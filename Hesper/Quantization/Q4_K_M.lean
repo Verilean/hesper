@@ -679,6 +679,7 @@ def q4kMatmulGroupedRegIndexedKernel (M N K nExpert srcRows : Nat) : ShaderM Uni
   let _b ← ShaderM.declareInputBuffer "b" (.array (.scalar .u32) bU32)
   let _c ← ShaderM.declareOutputBuffer "c" (.array (.scalar .f32) (M * N))
   let _te ← ShaderM.declareInputBuffer "tileExpert" (.array (.scalar .u32) (M / 32))
+  let _trs ← ShaderM.declareInputBuffer "tileRows" (.array (.scalar .u32) (M / 32))
   ShaderM.sharedNamed "shared_A" (.array (.scalar .f16) (32 * 32))
   ShaderM.sharedNamed "shared_B" (.array (.scalar .f16) (32 * 32))
   ShaderM.sharedNamed "shared_dq" (.array (.scalar .f32) (32 * 18))
@@ -696,6 +697,15 @@ def q4kMatmulGroupedRegIndexedKernel (M N K nExpert srcRows : Nat) : ShaderM Uni
   let isActive := Exp.lt teRaw (Exp.litU32 nExpert)
   let e := Exp.select isActive teRaw (Exp.litU32 (nExpert - 1))
   let weightRowOffsetE := Exp.mul e (Exp.litU32 N)
+  -- RAGGED 8-ROW SUB-TILE SKIP: tileRows[tile] = real rows (1-32). An 8-row WMMA fragment mt of
+  -- simdgroup-half sgRow covers rows sgRow*16 + mt*8 .. +7 — fully phantom iff its start ≥ tr.
+  -- Guards are WORKGROUP-uniform (trRaw, sgRow uniform per simdgroup) so subgroup-matrix ops stay
+  -- uniform; barriers remain unconditional outside all guards. Skipped rows leave stale c/shared —
+  -- dropped downstream exactly like the sentinel-tile skip (slot=nUsed / scatter drops them).
+  let trRaw ← ShaderM.readBuffer (ty := .scalar .u32) (n := M / 32) "tileRows" (Exp.vec3Y wid)
+  let frag0 := Exp.and isActive (Exp.lt (Exp.mul sgRow (Exp.litU32 16)) trRaw)
+  let frag1 := Exp.and isActive (Exp.lt (Exp.add (Exp.mul sgRow (Exp.litU32 16)) (Exp.litU32 8)) trRaw)
+  let tr8 := Exp.mul (Exp.div (Exp.add trRaw (Exp.litU32 7)) (Exp.litU32 8)) (Exp.litU32 8)
   let numBlk := K / 256
   ShaderM.loop (Exp.litU32 0) (Exp.litU32 numBlk) (Exp.litU32 1) fun blockIdx => do
     ShaderM.if_ (Exp.and (Exp.lt tid (Exp.litU32 32)) isActive) (do
@@ -719,18 +729,20 @@ def q4kMatmulGroupedRegIndexedKernel (M N K nExpert srcRows : Nat) : ShaderM Uni
       let kBaseE := Exp.add (Exp.mul blockIdx (Exp.litU32 256)) (Exp.mul jSub (Exp.litU32 32))
       let chunk := Exp.div jSub (Exp.litU32 2)
       let isHigh := Exp.eq (Exp.mod jSub (Exp.litU32 2)) (Exp.litU32 1)
-      -- INDEXED A-load [32,32] f16: row m reads src[idx[rowBase+m], k] in place (no gather pass)
+      -- INDEXED A-load [32,32] f16: row m reads src[idx[rowBase+m], k] in place (no gather pass).
+      -- Ragged: rows ≥ tr8 (fully-phantom 8-blocks) are neither read nor written.
       ShaderM.if_ isActive (do
         for s in [0:8] do
           let flat := Exp.add tid (Exp.litU32 (s * 128))
           let m := Exp.div flat (Exp.litU32 32)
           let k := Exp.mod flat (Exp.litU32 32)
-          let tok ← ShaderM.readBuffer (ty := .scalar .u32) (n := M) "idx" (Exp.add rowBase m)
-          let aIdx := Exp.add (Exp.mul tok (Exp.litU32 K)) (Exp.add kBaseE k)
-          let xf32 ← ShaderM.readBuffer (ty := .scalar .f32) (n := srcRows * K) "src" aIdx
-          let blk := Exp.add (Exp.mul (Exp.div m (Exp.litU32 8)) (Exp.litU32 4)) (Exp.div k (Exp.litU32 8))
-          let within := Exp.add (Exp.mul (Exp.mod m (Exp.litU32 8)) (Exp.litU32 8)) (Exp.mod k (Exp.litU32 8))
-          ShaderM.writeWorkgroup (ty := .scalar .f16) "shared_A" (Exp.add (Exp.mul blk (Exp.litU32 64)) within) (Exp.toF16 xf32)) (pure ())
+          ShaderM.if_ (Exp.lt m tr8) (do
+            let tok ← ShaderM.readBuffer (ty := .scalar .u32) (n := M) "idx" (Exp.add rowBase m)
+            let aIdx := Exp.add (Exp.mul tok (Exp.litU32 K)) (Exp.add kBaseE k)
+            let xf32 ← ShaderM.readBuffer (ty := .scalar .f32) (n := srcRows * K) "src" aIdx
+            let blk := Exp.add (Exp.mul (Exp.div m (Exp.litU32 8)) (Exp.litU32 4)) (Exp.div k (Exp.litU32 8))
+            let within := Exp.add (Exp.mul (Exp.mod m (Exp.litU32 8)) (Exp.litU32 8)) (Exp.mod k (Exp.litU32 8))
+            ShaderM.writeWorkgroup (ty := .scalar .f16) "shared_A" (Exp.add (Exp.mul blk (Exp.litU32 64)) within) (Exp.toF16 xf32)) (pure ())) (pure ())
       ShaderM.if_ isActive (do
         for s in [0:4] do
           let u := Exp.add tid (Exp.litU32 (s * 128))
@@ -762,27 +774,38 @@ def q4kMatmulGroupedRegIndexedKernel (M N K nExpert srcRows : Nat) : ShaderM Uni
           ShaderM.writeWorkgroup (ty := .scalar .f16) "shared_B" (Exp.add baseB (Exp.mul kr (Exp.litU32 8))) (Exp.toF16 y0)
           ShaderM.writeWorkgroup (ty := .scalar .f16) "shared_B" (Exp.add baseB (Exp.mul (Exp.add kr (Exp.litU32 1)) (Exp.litU32 8))) (Exp.toF16 y1)) (pure ())
       ShaderM.barrier
-      ShaderM.if_ isActive (do
-        for k8 in [0:4] do
-          for mt in [0:2] do
-            let mtileG := Exp.add (Exp.mul sgRow (Exp.litU32 2)) (Exp.litU32 mt)
-            let blkA := Exp.add (Exp.mul mtileG (Exp.litU32 4)) (Exp.litU32 k8)
-            ShaderM.loadMatrixLeft (st := .f16) (m := 8) (k := 8) "Ax" mt "shared_A" (Exp.mul blkA (Exp.litU32 64)) (Exp.litU32 8)
+      -- WMMA, ragged: frag mt runs only if its 8-row block has a real row (frag1 ⊆ frag0).
+      -- B loads live under frag0 (shared by both frags within the same k8 iteration).
+      for k8 in [0:4] do
+        ShaderM.if_ frag0 (do
+          let mtileG0 := Exp.mul sgRow (Exp.litU32 2)
+          let blkA0 := Exp.add (Exp.mul mtileG0 (Exp.litU32 4)) (Exp.litU32 k8)
+          ShaderM.loadMatrixLeft (st := .f16) (m := 8) (k := 8) "Ax" 0 "shared_A" (Exp.mul blkA0 (Exp.litU32 64)) (Exp.litU32 8)
           for nt in [0:2] do
             let ntileG := Exp.add (Exp.mul sgCol (Exp.litU32 2)) (Exp.litU32 nt)
             let blkB := Exp.add (Exp.mul (Exp.litU32 (k8 * 4)) (Exp.litU32 1)) ntileG
             ShaderM.loadMatrixRight (st := .f16) (k := 8) (n := 8) "Bx" nt "shared_B" (Exp.mul blkB (Exp.litU32 64)) (Exp.litU32 8)
-          for mt in [0:2] do
-            for nt in [0:2] do
-              ShaderM.matrixMultiplyAccumulateMixed (inSt := .f16) (outSt := .f32) (m := 8) (k := 8) (n := 8) "Cx" (mt * 2 + nt) "Ax" mt "Bx" nt) (pure ())
+          for nt in [0:2] do
+            ShaderM.matrixMultiplyAccumulateMixed (inSt := .f16) (outSt := .f32) (m := 8) (k := 8) (n := 8) "Cx" nt "Ax" 0 "Bx" nt) (pure ())
+        ShaderM.if_ frag1 (do
+          let mtileG1 := Exp.add (Exp.mul sgRow (Exp.litU32 2)) (Exp.litU32 1)
+          let blkA1 := Exp.add (Exp.mul mtileG1 (Exp.litU32 4)) (Exp.litU32 k8)
+          ShaderM.loadMatrixLeft (st := .f16) (m := 8) (k := 8) "Ax" 1 "shared_A" (Exp.mul blkA1 (Exp.litU32 64)) (Exp.litU32 8)
+          for nt in [0:2] do
+            ShaderM.matrixMultiplyAccumulateMixed (inSt := .f16) (outSt := .f32) (m := 8) (k := 8) (n := 8) "Cx" (2 + nt) "Ax" 1 "Bx" nt) (pure ())
       ShaderM.barrier
-  ShaderM.if_ isActive (do
-    for mt in [0:2] do
-      for nt in [0:2] do
-        let row := Exp.add (Exp.add rowBase mOff) (Exp.litU32 (mt * 8))
-        let col := Exp.add (Exp.add colBase nOff) (Exp.litU32 (nt * 8))
-        let off := Exp.add (Exp.mul row (Exp.litU32 N)) col
-        ShaderM.storeMatrixResult (st := .f32) (m := 8) (n := 8) "Cx" (mt * 2 + nt) "c" off (Exp.litU32 N)) (pure ())
+  ShaderM.if_ frag0 (do
+    for nt in [0:2] do
+      let row := Exp.add rowBase mOff
+      let col := Exp.add (Exp.add colBase nOff) (Exp.litU32 (nt * 8))
+      let off := Exp.add (Exp.mul row (Exp.litU32 N)) col
+      ShaderM.storeMatrixResult (st := .f32) (m := 8) (n := 8) "Cx" nt "c" off (Exp.litU32 N)) (pure ())
+  ShaderM.if_ frag1 (do
+    for nt in [0:2] do
+      let row := Exp.add (Exp.add rowBase mOff) (Exp.litU32 8)
+      let col := Exp.add (Exp.add colBase nOff) (Exp.litU32 (nt * 8))
+      let off := Exp.add (Exp.mul row (Exp.litU32 N)) col
+      ShaderM.storeMatrixResult (st := .f32) (m := 8) (n := 8) "Cx" (2 + nt) "c" off (Exp.litU32 N)) (pure ())
 
 /-- INDEXED-SCATTER Q8_0 grouped reg down (mul_mat_id-style): identical to q8MatmulGroupedRegKernel
     except the C store goes matrix→shared_C→scattered `dst[slot, pos, col]` in-kernel (the
@@ -798,6 +821,7 @@ def q8MatmulGroupedRegIndexedScatterKernel (M N K nExpert nUsed nTok : Nat) : Sh
   let _a ← ShaderM.declareInputBuffer "a" (.array (.scalar .f32) (M * K))
   let _b ← ShaderM.declareInputBuffer "b" (.array (.scalar .u32) bU32)
   let _te ← ShaderM.declareInputBuffer "tileExpert" (.array (.scalar .u32) (M / 32))
+  let _trs ← ShaderM.declareInputBuffer "tileRows" (.array (.scalar .u32) (M / 32))
   let _pos ← ShaderM.declareInputBuffer "pos" (.array (.scalar .u32) M)
   let _slot ← ShaderM.declareInputBuffer "slot" (.array (.scalar .u32) M)
   let _dst ← ShaderM.declareOutputBuffer "dst" (.array (.scalar .f32) (nUsed * nTok * N))
@@ -819,6 +843,12 @@ def q8MatmulGroupedRegIndexedScatterKernel (M N K nExpert nUsed nTok : Nat) : Sh
   let isActive := Exp.lt teRaw (Exp.litU32 nExpert)
   let e := Exp.select isActive teRaw (Exp.litU32 (nExpert - 1))
   let weightRowOffsetE := Exp.mul e (Exp.litU32 N)
+  -- RAGGED 8-ROW SUB-TILE SKIP (see the q4k indexed kernel): workgroup-uniform guards, barriers
+  -- unconditional; stale rows are dropped by the slot ≥ nUsed scatter check.
+  let trRaw ← ShaderM.readBuffer (ty := .scalar .u32) (n := M / 32) "tileRows" (Exp.vec3Y wid)
+  let frag0 := Exp.and isActive (Exp.lt (Exp.mul sgRow (Exp.litU32 16)) trRaw)
+  let frag1 := Exp.and isActive (Exp.lt (Exp.add (Exp.mul sgRow (Exp.litU32 16)) (Exp.litU32 8)) trRaw)
+  let tr8 := Exp.mul (Exp.div (Exp.add trRaw (Exp.litU32 7)) (Exp.litU32 8)) (Exp.litU32 8)
   let rdByte := fun (bo : Exp (.scalar .u32)) => do
     let w ← ShaderM.readBuffer (ty := .scalar .u32) (n := bU32) "b" (Exp.shiftRight bo (Exp.litU32 2))
     pure (Exp.bitAnd (Exp.shiftRight w (Exp.mul (Exp.bitAnd bo (Exp.litU32 3)) (Exp.litU32 8))) (Exp.litU32 0xFF))
@@ -838,11 +868,12 @@ def q8MatmulGroupedRegIndexedScatterKernel (M N K nExpert nUsed nTok : Nat) : Sh
         let flat := Exp.add tid (Exp.litU32 (s * 128))
         let m := Exp.div flat (Exp.litU32 32)
         let k := Exp.mod flat (Exp.litU32 32)
-        let aIdx := Exp.add (Exp.mul (Exp.add rowBase m) (Exp.litU32 K)) (Exp.add (Exp.mul batchV (Exp.litU32 32)) k)
-        let xf32 ← ShaderM.readBuffer (ty := .scalar .f32) (n := M * K) "a" aIdx
-        let blk := Exp.add (Exp.mul (Exp.div m (Exp.litU32 8)) (Exp.litU32 4)) (Exp.div k (Exp.litU32 8))
-        let within := Exp.add (Exp.mul (Exp.mod m (Exp.litU32 8)) (Exp.litU32 8)) (Exp.mod k (Exp.litU32 8))
-        ShaderM.writeWorkgroup (ty := .scalar .f16) "shared_A" (Exp.add (Exp.mul blk (Exp.litU32 64)) within) (Exp.toF16 xf32)
+        ShaderM.if_ (Exp.lt m tr8) (do
+          let aIdx := Exp.add (Exp.mul (Exp.add rowBase m) (Exp.litU32 K)) (Exp.add (Exp.mul batchV (Exp.litU32 32)) k)
+          let xf32 ← ShaderM.readBuffer (ty := .scalar .f32) (n := M * K) "a" aIdx
+          let blk := Exp.add (Exp.mul (Exp.div m (Exp.litU32 8)) (Exp.litU32 4)) (Exp.div k (Exp.litU32 8))
+          let within := Exp.add (Exp.mul (Exp.mod m (Exp.litU32 8)) (Exp.litU32 8)) (Exp.mod k (Exp.litU32 8))
+          ShaderM.writeWorkgroup (ty := .scalar .f16) "shared_A" (Exp.add (Exp.mul blk (Exp.litU32 64)) within) (Exp.toF16 xf32)) (pure ())
       for s in [0:4] do
         let u := Exp.add tid (Exp.litU32 (s * 128))
         let n := Exp.div u (Exp.litU32 16)
@@ -864,27 +895,34 @@ def q8MatmulGroupedRegIndexedScatterKernel (M N K nExpert nUsed nTok : Nat) : Sh
         ShaderM.writeWorkgroup (ty := .scalar .f16) "shared_B" (Exp.add baseB (Exp.mul kr (Exp.litU32 8))) (Exp.toF16 y0)
         ShaderM.writeWorkgroup (ty := .scalar .f16) "shared_B" (Exp.add baseB (Exp.mul (Exp.add kr (Exp.litU32 1)) (Exp.litU32 8))) (Exp.toF16 y1)) (pure ())
     ShaderM.barrier
-    ShaderM.if_ isActive (do
-      for k8 in [0:4] do
-        for mt in [0:2] do
-          let mtileG := Exp.add (Exp.mul sgRow (Exp.litU32 2)) (Exp.litU32 mt)
-          let blkA := Exp.add (Exp.mul mtileG (Exp.litU32 4)) (Exp.litU32 k8)
-          ShaderM.loadMatrixLeft (st := .f16) (m := 8) (k := 8) "Ax" mt "shared_A" (Exp.mul blkA (Exp.litU32 64)) (Exp.litU32 8)
+    for k8 in [0:4] do
+      ShaderM.if_ frag0 (do
+        let mtileG0 := Exp.mul sgRow (Exp.litU32 2)
+        let blkA0 := Exp.add (Exp.mul mtileG0 (Exp.litU32 4)) (Exp.litU32 k8)
+        ShaderM.loadMatrixLeft (st := .f16) (m := 8) (k := 8) "Ax" 0 "shared_A" (Exp.mul blkA0 (Exp.litU32 64)) (Exp.litU32 8)
         for nt in [0:2] do
           let ntileG := Exp.add (Exp.mul sgCol (Exp.litU32 2)) (Exp.litU32 nt)
           let blkB := Exp.add (Exp.mul (Exp.litU32 (k8 * 4)) (Exp.litU32 1)) ntileG
           ShaderM.loadMatrixRight (st := .f16) (k := 8) (n := 8) "Bx" nt "shared_B" (Exp.mul blkB (Exp.litU32 64)) (Exp.litU32 8)
-        for mt in [0:2] do
-          for nt in [0:2] do
-            ShaderM.matrixMultiplyAccumulateMixed (inSt := .f16) (outSt := .f32) (m := 8) (k := 8) (n := 8) "Cx" (mt * 2 + nt) "Ax" mt "Bx" nt) (pure ())
+        for nt in [0:2] do
+          ShaderM.matrixMultiplyAccumulateMixed (inSt := .f16) (outSt := .f32) (m := 8) (k := 8) (n := 8) "Cx" nt "Ax" 0 "Bx" nt) (pure ())
+      ShaderM.if_ frag1 (do
+        let mtileG1 := Exp.add (Exp.mul sgRow (Exp.litU32 2)) (Exp.litU32 1)
+        let blkA1 := Exp.add (Exp.mul mtileG1 (Exp.litU32 4)) (Exp.litU32 k8)
+        ShaderM.loadMatrixLeft (st := .f16) (m := 8) (k := 8) "Ax" 1 "shared_A" (Exp.mul blkA1 (Exp.litU32 64)) (Exp.litU32 8)
+        for nt in [0:2] do
+          ShaderM.matrixMultiplyAccumulateMixed (inSt := .f16) (outSt := .f32) (m := 8) (k := 8) (n := 8) "Cx" (2 + nt) "Ax" 1 "Bx" nt) (pure ())
     ShaderM.barrier
   -- store the 32×32 result tile to shared_C (guarded), then scatter in-kernel (barrier unconditional)
-  ShaderM.if_ isActive (do
-    for mt in [0:2] do
-      for nt in [0:2] do
-        let rOff := Exp.add mOff (Exp.litU32 (mt * 8))
-        let cOff := Exp.add nOff (Exp.litU32 (nt * 8))
-        ShaderM.storeMatrixResult (st := .f32) (m := 8) (n := 8) "Cx" (mt * 2 + nt) "shared_C" (Exp.add (Exp.mul rOff (Exp.litU32 32)) cOff) (Exp.litU32 32)) (pure ())
+  ShaderM.if_ frag0 (do
+    for nt in [0:2] do
+      let cOff := Exp.add nOff (Exp.litU32 (nt * 8))
+      ShaderM.storeMatrixResult (st := .f32) (m := 8) (n := 8) "Cx" nt "shared_C" (Exp.add (Exp.mul mOff (Exp.litU32 32)) cOff) (Exp.litU32 32)) (pure ())
+  ShaderM.if_ frag1 (do
+    for nt in [0:2] do
+      let rOff := Exp.add mOff (Exp.litU32 8)
+      let cOff := Exp.add nOff (Exp.litU32 (nt * 8))
+      ShaderM.storeMatrixResult (st := .f32) (m := 8) (n := 8) "Cx" (2 + nt) "shared_C" (Exp.add (Exp.mul rOff (Exp.litU32 32)) cOff) (Exp.litU32 32)) (pure ())
   ShaderM.barrier
   ShaderM.if_ isActive (do
     for s in [0:8] do
