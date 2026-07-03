@@ -1408,6 +1408,11 @@ lean_exe «metal-replace-test» where
   supportInterpreter := false
   moreLinkArgs := stdLinkArgs
 
+lean_exe «msl-poc» where
+  root := `Examples.Compute.MslPoc
+  supportInterpreter := false
+  moreLinkArgs := stdLinkArgs
+
 lean_exe «bitnet-validation» where
   root := `Tests.BitNetValidation
   supportInterpreter := false
