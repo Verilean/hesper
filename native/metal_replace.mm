@@ -13,6 +13,7 @@
 #import <Metal/Metal.h>
 #import <MetalPerformanceShaders/MetalPerformanceShaders.h>
 #include <chrono>
+#include <cstring>
 
 // Same extraction as bridge.cpp's EXTRACT_DEVICE_PTR: the device Lean struct holds the wgpu::Device* as its
 // external data at ctor field 0.
@@ -376,6 +377,73 @@ extern "C" lean_obj_res lean_hesper_msl_q4k_bench(
     char out[64];
     snprintf(out, sizeof(out), "%.4f", ms);
     return lean_io_result_mk_ok(lean_mk_string(out));
+}
+
+// HOT-PATH dispatch of the MSL q4k kernel (production path for DG_MSL, ~1.61× vs WGSL/Tint).
+// PSO compiled ONCE (single-slot cache — all 30 layers share dims) on a persistent queue.
+// Encode + commit, NO CPU wait. ORDERING CONTRACT (why this is safe without waits): Dawn's Metal
+// buffers are device-allocated with default options = MTLResourceHazardTrackingModeTracked, so
+// Metal serializes command buffers touching the same buffers in COMMIT order. Caller must
+// flushBatch (commit Dawn's producer encoder) BEFORE this call; Dawn work recorded after runs in
+// a later-committed cb → ordered after ours by the same hazard tracking.
+static id<MTLComputePipelineState> g_q4kPso = nil;
+static id<MTLCommandQueue> g_mslQueue = nil;
+static uint32_t g_q4kKey[5] = {0,0,0,0,0};
+
+extern "C" lean_obj_res lean_hesper_msl_q4k_dispatch(
+    b_lean_obj_arg device_obj,
+    b_lean_obj_arg src_obj, b_lean_obj_arg idx_obj, b_lean_obj_arg b_obj,
+    b_lean_obj_arg c_obj, b_lean_obj_arg te_obj, b_lean_obj_arg tr_obj,
+    uint32_t Mv, uint32_t Nv, uint32_t Kv, uint32_t nExpert, uint32_t srcRows,
+    lean_obj_res /* unit */) {
+    wgpu::Device* device = mr_extract_device(device_obj);
+    if (!device || !device->Get()) return lean_io_result_mk_error(lean_mk_string("msl_q4k_dispatch: invalid device"));
+    id<MTLDevice> mtl = dawn::native::metal::GetMTLDevice(device->Get());
+    wgpu::Buffer* bufs[6] = { mr_extract_buffer(src_obj), mr_extract_buffer(idx_obj),
+                              mr_extract_buffer(b_obj),   mr_extract_buffer(c_obj),
+                              mr_extract_buffer(te_obj),  mr_extract_buffer(tr_obj) };
+    id<MTLBuffer> mb[6];
+    for (int i = 0; i < 6; i++) {
+        if (!bufs[i] || !bufs[i]->Get()) return lean_io_result_mk_error(lean_mk_string("msl_q4k_dispatch: invalid buffer"));
+        mb[i] = reinterpret_cast<dawn::native::metal::Buffer*>(bufs[i]->Get())->GetMTLBuffer();
+        if (!mb[i]) return lean_io_result_mk_error(lean_mk_string("msl_q4k_dispatch: null MTLBuffer"));
+    }
+    uint32_t key[5] = {Mv, Nv, Kv, nExpert, srcRows};
+    if (!g_q4kPso || memcmp(key, g_q4kKey, sizeof(key)) != 0) {
+        std::string msl(kQ4kMslTemplate);
+        auto subst = [&](const char* tok, uint32_t v) {
+            std::string t(tok); std::string r = std::to_string(v);
+            size_t pos;
+            while ((pos = msl.find(t)) != std::string::npos) msl.replace(pos, t.size(), r);
+        };
+        subst("@M@", Mv); subst("@N@", Nv); subst("@K@", Kv);
+        subst("@NEXP@", nExpert); subst("@SRCROWS@", srcRows);
+        NSError* err = nil;
+        MTLCompileOptions* opts = [MTLCompileOptions new];
+        id<MTLLibrary> lib = [mtl newLibraryWithSource:[NSString stringWithUTF8String:msl.c_str()] options:opts error:&err];
+        if (!lib) return lean_io_result_mk_error(lean_mk_string(
+            [[NSString stringWithFormat:@"msl_q4k_dispatch compile failed: %@", err] UTF8String]));
+        id<MTLFunction> fn = [lib newFunctionWithName:@"q4k_grouped_reg_indexed"];
+        id<MTLComputePipelineState> pso = [mtl newComputePipelineStateWithFunction:fn error:&err];
+        if (!pso) return lean_io_result_mk_error(lean_mk_string("msl_q4k_dispatch: pipeline failed"));
+        g_q4kPso = pso;
+        memcpy(g_q4kKey, key, sizeof(key));
+    }
+    if (!g_mslQueue) g_mslQueue = [mtl newCommandQueue];
+    // Hazard tracking orders execution by COMMIT order — but Dawn's submit can lag the wgpu call.
+    // WaitForCommandsToBeScheduled blocks until Dawn's producer command buffers are committed and
+    // scheduled (NOT completed — µs-class), making our commit provably later. Empirically required:
+    // without it the pipeline races (NOBATCH+MSL converges fine; batched+MSL garbaged).
+    dawn::native::metal::WaitForCommandsToBeScheduled(device->Get());
+    id<MTLCommandBuffer> cb = [g_mslQueue commandBuffer];
+    id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+    [enc setComputePipelineState:g_q4kPso];
+    for (int i = 0; i < 6; i++) [enc setBuffer:mb[i] offset:0 atIndex:i];
+    [enc dispatchThreadgroups:MTLSizeMake((Nv + 31) / 32, (Mv + 31) / 32, 1)
+        threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+    [enc endEncoding];
+    [cb commit];   // no wait — hazard tracking orders vs Dawn's committed work
+    return lean_io_result_mk_ok(lean_box(0));
 }
 
 extern "C" lean_obj_res lean_hesper_mtl_device_name(b_lean_obj_arg device_obj, lean_obj_res /* unit */) {

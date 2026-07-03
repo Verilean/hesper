@@ -63,6 +63,14 @@ opaque mpsMatmulBench (device : @& Device) (M N K iters : UInt32) : IO String
 opaque mslQ4kBench (device : @& Device) (src idx b c te tr : @& Buffer)
     (M N K nExpert srcRows iters : UInt32) : IO String
 
+/-- HOT-PATH MSL q4k gate/up dispatch (DG_MSL, ~1.61× vs WGSL/Tint). PSO cached after the first
+    call; encode+commit with NO CPU wait. ORDERING CONTRACT: caller must flushBatch (commit the
+    Dawn producer encoder) immediately BEFORE; Dawn buffers are hazard-tracked so Metal orders the
+    command buffers by commit order on the shared buffers. macOS only. -/
+@[extern "lean_hesper_msl_q4k_dispatch"]
+opaque mslQ4kDispatch (device : @& Device) (src idx b c te tr : @& Buffer)
+    (M N K nExpert srcRows : UInt32) : IO Unit
+
 /-- Check if the device was created with the Chromium experimental
     subgroup matrix feature. `subgroup_matrix_left/right/result` types
     and `subgroupMatrixLoad/Store/MultiplyAccumulate` are available iff
