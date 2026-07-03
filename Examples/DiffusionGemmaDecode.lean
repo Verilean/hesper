@@ -1276,8 +1276,9 @@ def main (args : List String) : IO Unit := do
   -- stop rule, adapted to the top-K H scale: llama.cpp stops at meanH<0.005 (its full-vocab H → ~0
   -- when every position is ultra-confident); our top-8+tail H floors well above that, so the binding
   -- condition here is ARGMAX STABILITY (held ≥ 2) with meanH<0.9 as a sanity ceiling.
-  let ebConfTh := ((((← IO.getEnv "DG_EB_CONF").bind (·.toNat?)).getD (if modeRenoise then 5 else 900)).toFloat) / 1000.0
+  let ebConfTh := ((((← IO.getEnv "DG_EB_CONF").bind (·.toNat?)).getD (if modeRenoise then 20 else 900)).toFloat) / 1000.0   -- renoise: meanH<0.02 (was 0.005); the argmax output settles well before H→0, so 0.005 burned tail steps
   let ebStab := (((← IO.getEnv "DG_EB_STAB").bind (·.toNat?)).getD (if modeRenoise then 1 else 2))   -- stability steps
+  let ebStabTol := ((← IO.getEnv "DG_EB_TOL").bind (·.toNat?)).getD (if modeRenoise then 2 else 0)   -- hamming tolerance for argmax stability (renoise 2: a couple flickering tail positions must not reset stability)
   -- deterministic LCG (llama.cpp uses mt19937(seed); exact stream differs, semantics match)
   let mut ebRng : UInt64 := (((← IO.getEnv "DG_SEED").bind (·.toNat?)).getD 12345).toUInt64
   let mut ebPrevArgmax : Array Nat := Array.replicate C 0
@@ -1988,8 +1989,14 @@ def main (args : List String) : IO Unit := do
             toks := toks.set! (P+pos) ((ebRng >>> 33).toNat % cfg.vocabSize)
         -- SC = softmax(prev logits / prev t): feed the TEMPERED top-K as next step's soft prediction
         scTok := ktokFlat; scProb := qFlat
-        -- adaptive stop: argmax stable ≥ stab steps AND mean entropy < threshold (llama.cpp rule)
-        let stable := !ebFirstStep && argmaxT == ebPrevArgmax
+        -- adaptive stop: argmax stable ≥ stab steps AND mean entropy < threshold (llama.cpp rule).
+        -- The OUTPUT is argmaxT, so once it stops CHANGING (within a hamming tolerance — a few
+        -- flickering high-entropy tail positions must not reset stability and burn steps) further
+        -- steps can't change the answer. DG_EB_TOL = allowed changed positions (default 0 = exact).
+        let mut nChanged := 0
+        if !ebFirstStep then
+          for i in [0:C] do if argmaxT[i]! != ebPrevArgmax[i]! then nChanged := nChanged + 1
+        let stable := !ebFirstStep && nChanged ≤ ebStabTol
         ebHeld := if stable then ebHeld + 1 else 0
         ebPrevArgmax := argmaxT
         ebFirstStep := false
@@ -2004,7 +2011,7 @@ def main (args : List String) : IO Unit := do
         loopTotalMs := loopTotalMs + (t1 - t0)
         effSteps := effSteps + 1
         let stopStr := if finish then " | STOP" else ""
-        IO.println s!"[dg-decode] step {step}: eb acc={nAcc} meanH={meanH} held={ebHeld} t={tCur} | total {t1-t0}ms = emb+fwd {tFwd-t0}ms + lmhead+reduce {tLm-tFwd}ms{stopStr}"
+        IO.println s!"[dg-decode] step {step}: eb acc={nAcc} chg={nChanged} meanH={meanH} held={ebHeld} t={tCur} | total {t1-t0}ms = emb+fwd {tFwd-t0}ms + lmhead+reduce {tLm-tFwd}ms{stopStr}"
         continue
       scTok := ktokFlat; scProb := probFlat   -- feed this step's top-K soft prediction into next step's SC
       let want := if step+1 ≥ decodeSteps then remaining else max 1 ((C + decodeSteps - 1) / decodeSteps)
