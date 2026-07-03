@@ -1440,6 +1440,17 @@ def main (args : List String) : IO Unit := do
   let rAttn ← IO.mkRef (0:Nat); let rDense ← IO.mkRef (0:Nat)
   let rMoe ← IO.mkRef (0:Nat); let rRest ← IO.mkRef (0:Nat); let tPrev ← IO.mkRef (0:Nat)
   let rMoeGrp ← IO.mkRef (0:Nat); let rMoeGU ← IO.mkRef (0:Nat)   -- MoE sub-timers: router+grouping / gate-up
+  -- finer down+rest split: geglu / q80 / down-matmul / scatter(Q5_0 fallback) / wacc+norm
+  let rMoeGeglu ← IO.mkRef (0:Nat); let rMoeQ80 ← IO.mkRef (0:Nat)
+  let rMoeDown ← IO.mkRef (0:Nat); let rMoeSc ← IO.mkRef (0:Nat)
+  if prof then
+    let mut nQ5 := 0
+    for blk in model.inner.blocks do
+      if blk.ffn.down.quantFormat == Hesper.Layers.Linear.QuantFormat.Q5_0 then nQ5 := nQ5 + 1
+    let mut q5idx : List Nat := []
+    for h : i in [0:model.inner.blocks.size] do
+      if (model.inner.blocks[i]'(by exact h.2.1)).ffn.down.quantFormat == Hesper.Layers.Linear.QuantFormat.Q5_0 then q5idx := q5idx ++ [i]
+    IO.println s!"[prof] moe-down quant census: Q5_0={nQ5} / {model.inner.blocks.size} layers at {q5idx}"
   let rBattn ← IO.mkRef (0:Nat); let rAttnO ← IO.mkRef (0:Nat)   -- attention sub-phases: QK^T+softmax+V, and O-proj
   let rQkn ← IO.mkRef (0:Nat)   -- qk-norm + RoPE + v-norm (to split it from the Q/K/V matmuls)
   let pmark := fun (r : IO.Ref Nat) => do
@@ -1456,7 +1467,7 @@ def main (args : List String) : IO Unit := do
   let mut loopTotalMs : Nat := 0
   let mut effSteps : Nat := 0
   for step in [0:decodeSteps] do
-    if prof then rAttn.set 0; rDense.set 0; rMoe.set 0; rRest.set 0; rBattn.set 0; rAttnO.set 0; rQkn.set 0; rMoeGrp.set 0; rMoeGU.set 0
+    if prof then rAttn.set 0; rDense.set 0; rMoe.set 0; rRest.set 0; rBattn.set 0; rAttnO.set 0; rQkn.set 0; rMoeGrp.set 0; rMoeGU.set 0; rMoeGeglu.set 0; rMoeQ80.set 0; rMoeDown.set 0; rMoeSc.set 0
     let remaining := masked.foldl (fun acc b => if b then acc+1 else acc) 0
     if remaining > 0 then
       let t0 ← IO.monoMsNow
@@ -1733,6 +1744,7 @@ def main (args : List String) : IO Unit := do
             else
               disp device (gegluMergedB maxPadded expFF 0 (maxPadded*2*expFF)) (("gu",sGatheredGU)::("eh",sGatheredEh)::List.nil) (maxPadded*expFF) (hash ("gmg",li))
             unless moeNoFlush do Hesper.WGSL.Execute.flushBatch device
+            pmark rMoeGeglu
             if li == 0 && (← IO.getEnv "DG_MOEDOWNDIAG").isSome then
               Hesper.GPUBackend.endBatch device
               let eh ← Hesper.Basic.bytesToFloatArray (← mapBufferRead device sGatheredEh 0 (maxPadded*expFF*4).toUSize)
@@ -1746,6 +1758,7 @@ def main (args : List String) : IO Unit := do
               -- scatters dst[slot,pos,col] IN-KERNEL — no 17.5M-element scatterGUB pass. The q80
               -- round-trip both matches the warp's Q8 rounding AND acts as the geglu→down sync.
               q80 device sGatheredEh maxPadded expFF (hash ("qgehrb",li))
+              pmark rMoeQ80
               if useMslDown then
                 -- DG_MSLDOWN: hand-MSL port (same ordering contract as the gate/up: flushBatch
                 -- commits the producers, the MSL cb commits next, hazard tracking orders them).
@@ -1756,13 +1769,23 @@ def main (args : List String) : IO Unit := do
                 unless moeNoFlush do Hesper.WGSL.Execute.flushBatch device
                 dispRB device (Hesper.Quantization.Q4_K_M.q8MatmulGroupedRegIndexedScatterKernel maxPadded dim expFF nExpert nUsed N)
                   (("a",sGatheredEh)::("b",dnE)::("tileExpert",sTileExpert)::("tileRows",raggedRows)::("pos",sSortedPos)::("slot",sSortedSlot)::("dst",sDownAll)::List.nil) ((dim+31)/32) ((maxPadded+31)/32) (hash ("edrbi",li))
+            else if moeDownRB && useMslDown then
+              -- Q5_0 layer, MSL port (22B/block): same recipe as the Q8_0 MSL down — q80 round-trip
+              -- for rounding parity + sync, flushBatch commits producers, hazard-tracked MSL commit.
+              q80 device sGatheredEh maxPadded expFF (hash ("qgehq5",li))
+              pmark rMoeQ80
+              Hesper.WGSL.Execute.flushBatch device
+              mslQ5DownDispatch device sGatheredEh dnE sTileExpert raggedRows sSortedPos sSortedSlot sDownAll
+                maxPadded.toUInt32 dim.toUInt32 expFF.toUInt32 nExpert.toUInt32 nUsed.toUInt32 N.toUInt32
             else
               q80 device sGatheredEh maxPadded expFF (hash ("qgeh",li))   -- match the per-slot Q8 rounding
+              pmark rMoeQ80
               let downGrpKernel := match blk.ffn.down.quantFormat with
                 | .Q5_0 => Hesper.Layers.Linear.fusedQ5_0BatchExpertF32WarpGroupedKernel { inDim:=expFF, outDim:=dim } nExpert maxPadded
                 | _     => Hesper.Layers.Linear.fusedQ8_0BatchExpertF32WarpGroupedKernel { inDim:=expFF, outDim:=dim } nExpert maxPadded
               unless moeNoFlush do Hesper.WGSL.Execute.flushBatch device
               disp2w device downGrpKernel (("weights",dnE)::("input",sGatheredEh)::("tileExpert",sTileExpert)::("output",sGatheredDown)::List.nil) dim (maxPadded/32) 32 (hash ("edg",li))
+            pmark rMoeDown
             unless moeNoFlush do Hesper.WGSL.Execute.flushBatch device
             -- down scatter is maxPadded*dim = ~17.5M elems → ~68k workgroups > 65535 limit (silently
             -- dropped → sDownAll stayed 0). Use a 2D grid: flat = gid.x + gid.y*(nx*256).
@@ -1772,7 +1795,7 @@ def main (args : List String) : IO Unit := do
             let scNy := (scWG + scNx - 1)/scNx
             -- when fused OR indexed-scatter down ran, sDownAll is already written in-kernel — skip
             -- the staged scatter (it only remains for the Q5_0 warp-grouped fallback path).
-            unless (moeDownFused || (moeDownRB && blk.ffn.down.quantFormat != .Q5_0)) do
+            unless (moeDownFused || (moeDownRB && (blk.ffn.down.quantFormat != .Q5_0 || useMslDown))) do
               disp2 device (scatterGUB maxPadded dim N nUsed (scNx*256)) (("gathered",sGatheredDown)::("pos",sSortedPos)::("slot",sSortedSlot)::("dst",sDownAll)::List.nil) scNx scNy (hash ("sctrd",li))
             -- NOTE: the grouped-down chain (geglu→q80→down→scatter→wacc) is NUMERICALLY correct (DG_MOEDIAG
             -- maxDiff 4e-6) but Dawn drops these no-wait flushes at batch scale → a routing-dependent RACE
@@ -1786,7 +1809,8 @@ def main (args : List String) : IO Unit := do
               Hesper.GPUBackend.beginBatch device
             else
               unless moeNoFlush do Hesper.WGSL.Execute.flushBatch device   -- sync scatter→wacc
-            if li == 0 && (← IO.getEnv "DG_MOEDIAG").isSome then
+            pmark rMoeSc
+            if li == ((← IO.getEnv "DG_DIAGLAYER").bind (·.toNat?)).getD 0 && (← IO.getEnv "DG_MOEDIAG").isSome then
               -- compute the per-slot down reference (into sDownEs) and compare to the grouped sDownAll
               disp device (scatterGUB maxPadded (2*expFF) N nUsed) (("gathered",sGatheredGU)::("pos",sSortedPos)::("slot",sSortedSlot)::("dst",sGateUpAll)::List.nil) (maxPadded*2*expFF) (hash ("mdsc",li))
               for e in [0:nUsed] do
@@ -1850,7 +1874,7 @@ def main (args : List String) : IO Unit := do
             if av > mx then mx := av
           IO.println s!"[lsum s{step} l{li}] sum={s} max={mx}"
       if prof then
-        IO.println s!"[prof step {step}] qkv-mm={← rAttn.get}ms qknorm={← rQkn.get}ms battnB={← rBattn.get}ms attnO={← rAttnO.get}ms dense={← rDense.get}ms | MoE[router+grp={← rMoeGrp.get} gateup={← rMoeGU.get} down+rest={← rMoe.get}] rest={← rRest.get}ms"
+        IO.println s!"[prof step {step}] qkv-mm={← rAttn.get}ms qknorm={← rQkn.get}ms battnB={← rBattn.get}ms attnO={← rAttnO.get}ms dense={← rDense.get}ms | MoE[router+grp={← rMoeGrp.get} gateup={← rMoeGU.get} geglu={← rMoeGeglu.get} q80={← rMoeQ80.get} down={← rMoeDown.get} sc={← rMoeSc.get} wacc+norm={← rMoe.get}] rest={← rRest.get}ms"
       let tFwd ← IO.monoMsNow
       if step == 0 && (← IO.getEnv "DG_LMDIAG").isSome then
         lmHeadDiag device model.inner.finalNorm model.inner.outputWeight cur dim cfg.vocabSize N P

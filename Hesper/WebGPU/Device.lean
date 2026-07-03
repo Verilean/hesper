@@ -79,6 +79,13 @@ opaque mslQ4kDispatch (device : @& Device) (src idx b c te tr : @& Buffer)
 opaque mslQ8DownDispatch (device : @& Device) (a b te tr pos slot dst : @& Buffer)
     (M N K nExpert nUsed nTok : UInt32) : IO Unit
 
+/-- HOT-PATH MSL Q5_0 MoE-down dispatch: the Q5_0 (22B/block) analogue of mslQ8DownDispatch —
+    covers the 16/30 layers whose down_exps are Q5_0 (previously the WGSL warp fallback + staged
+    scatter). Same ordering contract. macOS only. -/
+@[extern "lean_hesper_msl_q5down_dispatch"]
+opaque mslQ5DownDispatch (device : @& Device) (a b te tr pos slot dst : @& Buffer)
+    (M N K nExpert nUsed nTok : UInt32) : IO Unit
+
 /-- Check if the device was created with the Chromium experimental
     subgroup matrix feature. `subgroup_matrix_left/right/result` types
     and `subgroupMatrixLoad/Store/MultiplyAccumulate` are available iff
