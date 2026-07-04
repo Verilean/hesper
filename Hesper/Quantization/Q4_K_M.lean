@@ -331,9 +331,12 @@ def q4kMatmulGroupedRegKernel (M N K nExpert : Nat) : ShaderM Unit := do
   -- through the loop hitting only barriers (~free). Their C rows stay stale — never consumed: the
   -- grouped scatter skips them (clearSortedB pre-sets slot=nUsed for all rows; scatterRank only
   -- overwrites real ones).
-  let isActive := Exp.lt teRaw (Exp.litU32 nExpert)
+  -- Bind loop-invariant guards to WGSL `let`s (computed ONCE) instead of Lean-let substitution, which
+  -- duplicates the expression at every use site (measured: isActive expanded 57× in the Tint MSL).
+  -- EXPERIMENT H1 for the WGSL-vs-hand-MSL codegen gap.
+  let isActive ← ShaderM.let' (.scalar .bool) (Exp.lt teRaw (Exp.litU32 nExpert))
   let e := Exp.select isActive teRaw (Exp.litU32 (nExpert - 1))
-  let weightRowOffsetE := Exp.mul e (Exp.litU32 N)
+  let weightRowOffsetE ← ShaderM.let' (.scalar .u32) (Exp.mul e (Exp.litU32 N))
   let numBlk := K / 256
   -- BLOCK-AT-A-TIME: outer loop over 256-elem Q4_K blocks. The 8 getScaleMin per row are computed ONCE
   -- per block (cooperatively) into shared_dq; the inner jSub loop then just INDEXES shared_dq[2+jSub]
@@ -460,9 +463,12 @@ def q8MatmulGroupedRegKernel (M N K nExpert : Nat) : ShaderM Unit := do
   let mOff := Exp.mul sgRow (Exp.litU32 16)
   let nOff := Exp.mul sgCol (Exp.litU32 16)
   let teRaw ← ShaderM.readBuffer (ty := .scalar .u32) (n := M / 32) "tileExpert" (Exp.vec3Y wid)
-  let isActive := Exp.lt teRaw (Exp.litU32 nExpert)
+  -- Bind loop-invariant guards to WGSL `let`s (computed ONCE) instead of Lean-let substitution, which
+  -- duplicates the expression at every use site (measured: isActive expanded 57× in the Tint MSL).
+  -- EXPERIMENT H1 for the WGSL-vs-hand-MSL codegen gap.
+  let isActive ← ShaderM.let' (.scalar .bool) (Exp.lt teRaw (Exp.litU32 nExpert))
   let e := Exp.select isActive teRaw (Exp.litU32 (nExpert - 1))
-  let weightRowOffsetE := Exp.mul e (Exp.litU32 N)
+  let weightRowOffsetE ← ShaderM.let' (.scalar .u32) (Exp.mul e (Exp.litU32 N))
   let rdByte := fun (bo : Exp (.scalar .u32)) => do
     let w ← ShaderM.readBuffer (ty := .scalar .u32) (n := bU32) "b" (Exp.shiftRight bo (Exp.litU32 2))
     pure (Exp.bitAnd (Exp.shiftRight w (Exp.mul (Exp.bitAnd bo (Exp.litU32 3)) (Exp.litU32 8))) (Exp.litU32 0xFF))
@@ -694,18 +700,21 @@ def q4kMatmulGroupedRegIndexedKernel (M N K nExpert srcRows : Nat) : ShaderM Uni
   let mOff := Exp.mul sgRow (Exp.litU32 16)
   let nOff := Exp.mul sgCol (Exp.litU32 16)
   let teRaw ← ShaderM.readBuffer (ty := .scalar .u32) (n := M / 32) "tileExpert" (Exp.vec3Y wid)
-  let isActive := Exp.lt teRaw (Exp.litU32 nExpert)
+  -- Bind loop-invariant guards to WGSL `let`s (computed ONCE) instead of Lean-let substitution, which
+  -- duplicates the expression at every use site (measured: isActive expanded 57× in the Tint MSL).
+  -- EXPERIMENT H1 for the WGSL-vs-hand-MSL codegen gap.
+  let isActive ← ShaderM.let' (.scalar .bool) (Exp.lt teRaw (Exp.litU32 nExpert))
   let e := Exp.select isActive teRaw (Exp.litU32 (nExpert - 1))
-  let weightRowOffsetE := Exp.mul e (Exp.litU32 N)
+  let weightRowOffsetE ← ShaderM.let' (.scalar .u32) (Exp.mul e (Exp.litU32 N))
   -- RAGGED 8-ROW SUB-TILE SKIP: tileRows[tile] = real rows (1-32). An 8-row WMMA fragment mt of
   -- simdgroup-half sgRow covers rows sgRow*16 + mt*8 .. +7 — fully phantom iff its start ≥ tr.
   -- Guards are WORKGROUP-uniform (trRaw, sgRow uniform per simdgroup) so subgroup-matrix ops stay
   -- uniform; barriers remain unconditional outside all guards. Skipped rows leave stale c/shared —
   -- dropped downstream exactly like the sentinel-tile skip (slot=nUsed / scatter drops them).
   let trRaw ← ShaderM.readBuffer (ty := .scalar .u32) (n := M / 32) "tileRows" (Exp.vec3Y wid)
-  let frag0 := Exp.and isActive (Exp.lt (Exp.mul sgRow (Exp.litU32 16)) trRaw)
-  let frag1 := Exp.and isActive (Exp.lt (Exp.add (Exp.mul sgRow (Exp.litU32 16)) (Exp.litU32 8)) trRaw)
-  let tr8 := Exp.mul (Exp.div (Exp.add trRaw (Exp.litU32 7)) (Exp.litU32 8)) (Exp.litU32 8)
+  let frag0 ← ShaderM.let' (.scalar .bool) (Exp.and isActive (Exp.lt (Exp.mul sgRow (Exp.litU32 16)) trRaw))
+  let frag1 ← ShaderM.let' (.scalar .bool) (Exp.and isActive (Exp.lt (Exp.add (Exp.mul sgRow (Exp.litU32 16)) (Exp.litU32 8)) trRaw))
+  let tr8 ← ShaderM.let' (.scalar .u32) (Exp.mul (Exp.div (Exp.add trRaw (Exp.litU32 7)) (Exp.litU32 8)) (Exp.litU32 8))
   let numBlk := K / 256
   ShaderM.loop (Exp.litU32 0) (Exp.litU32 numBlk) (Exp.litU32 1) fun blockIdx => do
     ShaderM.if_ (Exp.and (Exp.lt tid (Exp.litU32 32)) isActive) (do
@@ -840,15 +849,18 @@ def q8MatmulGroupedRegIndexedScatterKernel (M N K nExpert nUsed nTok : Nat) : Sh
   let mOff := Exp.mul sgRow (Exp.litU32 16)
   let nOff := Exp.mul sgCol (Exp.litU32 16)
   let teRaw ← ShaderM.readBuffer (ty := .scalar .u32) (n := M / 32) "tileExpert" (Exp.vec3Y wid)
-  let isActive := Exp.lt teRaw (Exp.litU32 nExpert)
+  -- Bind loop-invariant guards to WGSL `let`s (computed ONCE) instead of Lean-let substitution, which
+  -- duplicates the expression at every use site (measured: isActive expanded 57× in the Tint MSL).
+  -- EXPERIMENT H1 for the WGSL-vs-hand-MSL codegen gap.
+  let isActive ← ShaderM.let' (.scalar .bool) (Exp.lt teRaw (Exp.litU32 nExpert))
   let e := Exp.select isActive teRaw (Exp.litU32 (nExpert - 1))
-  let weightRowOffsetE := Exp.mul e (Exp.litU32 N)
+  let weightRowOffsetE ← ShaderM.let' (.scalar .u32) (Exp.mul e (Exp.litU32 N))
   -- RAGGED 8-ROW SUB-TILE SKIP (see the q4k indexed kernel): workgroup-uniform guards, barriers
   -- unconditional; stale rows are dropped by the slot ≥ nUsed scatter check.
   let trRaw ← ShaderM.readBuffer (ty := .scalar .u32) (n := M / 32) "tileRows" (Exp.vec3Y wid)
-  let frag0 := Exp.and isActive (Exp.lt (Exp.mul sgRow (Exp.litU32 16)) trRaw)
-  let frag1 := Exp.and isActive (Exp.lt (Exp.add (Exp.mul sgRow (Exp.litU32 16)) (Exp.litU32 8)) trRaw)
-  let tr8 := Exp.mul (Exp.div (Exp.add trRaw (Exp.litU32 7)) (Exp.litU32 8)) (Exp.litU32 8)
+  let frag0 ← ShaderM.let' (.scalar .bool) (Exp.and isActive (Exp.lt (Exp.mul sgRow (Exp.litU32 16)) trRaw))
+  let frag1 ← ShaderM.let' (.scalar .bool) (Exp.and isActive (Exp.lt (Exp.add (Exp.mul sgRow (Exp.litU32 16)) (Exp.litU32 8)) trRaw))
+  let tr8 ← ShaderM.let' (.scalar .u32) (Exp.mul (Exp.div (Exp.add trRaw (Exp.litU32 7)) (Exp.litU32 8)) (Exp.litU32 8))
   let rdByte := fun (bo : Exp (.scalar .u32)) => do
     let w ← ShaderM.readBuffer (ty := .scalar .u32) (n := bU32) "b" (Exp.shiftRight bo (Exp.litU32 2))
     pure (Exp.bitAnd (Exp.shiftRight w (Exp.mul (Exp.bitAnd bo (Exp.litU32 3)) (Exp.litU32 8))) (Exp.litU32 0xFF))
