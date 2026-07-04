@@ -183,7 +183,10 @@ private def downloadDawn (cwd : FilePath) (dawnSrc : FilePath) (dawnVersion : St
   IO.FS.createDirAll dawnSrc.toString
   let tarballUrl := s!"https://dawn.googlesource.com/dawn/+archive/{dawnVersion}.tar.gz"
   let tarballPath := cwd / ".lake/build/dawn.tar.gz"
-  let ret ← runCmd "curl" #["-s", "-L", "-o", tarballPath.toString, tarballUrl]
+  -- `--fail` so an HTTP error (e.g. googlesource rate-limit 429) exits non-zero instead of writing
+  -- the error page into the tarball (which then dies as "gzip: not in gzip format"); `--retry` +
+  -- `--retry-all-errors` retry the transient rate-limits that flake CI.
+  let ret ← runCmd "curl" #["-sS", "-L", "--fail", "--retry", "5", "--retry-all-errors", "--retry-delay", "3", "-o", tarballPath.toString, tarballUrl]
   if ret != 0 then return ret
   let ret ← runCmd "tar" #["-xzf", tarballPath.toString, "-C", dawnSrc.toString]
   if ret != 0 then return ret
@@ -409,10 +412,13 @@ script buildNative do
 
     IO.println s!"Downloading from: {tarballUrl}"
 
-    -- Download tarball using curl (silent mode)
+    -- Download tarball using curl. `--fail` so an HTTP error (e.g. googlesource rate-limit 429)
+    -- exits non-zero instead of writing the error page into the tarball (which then dies as
+    -- "gzip: not in gzip format"); `--retry`+`--retry-all-errors` retry the transient rate-limits
+    -- that flake CI. `-sS` = silent but still show real errors.
     let downloadRet ← IO.Process.spawn {
       cmd := "curl"
-      args := #["-s", "-L", "-o", tarballPath, tarballUrl]
+      args := #["-sS", "-L", "--fail", "--retry", "5", "--retry-all-errors", "--retry-delay", "3", "-o", tarballPath, tarballUrl]
     } >>= (·.wait)
 
     if downloadRet != 0 then
