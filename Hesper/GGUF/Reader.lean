@@ -54,40 +54,70 @@ def loadGGUF (path : String) : IO GGUFFile := do
 def loadGGUFMmap (path : String) : IO GGUFFile := do
   let mmap ← Hesper.CUDA.mmapOpen path
   let fileSize ← Hesper.CUDA.mmapSize mmap
-  -- Parser traverses metadata + tensor infos, which all live in the
-  -- prefix before the aligned tensor data section.  We don't know
-  -- the exact prefix size until we parse, so copy the full file
-  -- prefix into a ByteArray, parse to discover the data section
-  -- offset, then discard the body portion of the prefix — the Lean
-  -- GC will reclaim it on next collection.
-  --
-  -- Optimisation: a single-pass parser that reads only header / meta
-  -- / tensor-info without slurping the body would save ~200 ms of
-  -- ByteArray alloc, but requires rewriting parseGGUF.  For now,
-  -- loadGGUFMmap still allocates the 5 GB ByteArray once — but the
-  -- tensor body is never re-copied during upload, which was the
-  -- bigger win.
-  let fileData ← Hesper.CUDA.mmapSliceToBytesPersistent mmap 0 fileSize
-  match Parser.parseGGUF fileData with
-  | .ok gguf =>
-    -- `dataSectionOffset` is absolute file offset where tensor bodies
-    -- start.  When dataBlob is populated (non-mmap path) it contains
-    -- the body bytes, so offset = fileSize - dataBlob.size.
-    let dataSectionOffset : USize :=
-      if gguf.dataBlob.size > 0 then
-        (fileSize.toNat - gguf.dataBlob.size).toUSize
+  -- Read ONLY the metadata + tensor-info PREFIX (a few MB even for huge models),
+  -- NOT the whole file.  Slurping the full body into a heap ByteArray here — on
+  -- top of the wired 15.7 GB GPU upload — peaked >48 GB RAM → macOS swapped →
+  -- 2× slowdown (disk paging) AND memory-pressure garbage output.  The parser
+  -- only needs the prefix (metadata + tensor infos live before the aligned data
+  -- section); tensor bodies are read on demand from the mmap during upload
+  -- (getTensorDataM, which uses `dataSectionOffset`).
+  let prefixCap : USize := 256 * 1024 * 1024
+  let prefixSize := if fileSize < prefixCap then fileSize else prefixCap
+  let prefixData ← Hesper.CUDA.mmapSliceToBytesPersistent mmap 0 prefixSize
+  let gguf ← match Parser.parseGGUF prefixData with
+    | .ok g => pure g
+    | .error _ =>
+      -- Fallback: metadata+infos exceeded the cap (never for real models) —
+      -- read the full file so parsing still succeeds.
+      if prefixSize < fileSize then
+        let full ← Hesper.CUDA.mmapSliceToBytesPersistent mmap 0 fileSize
+        match Parser.parseGGUF full with
+        | .ok g => pure g
+        | .error msg => throw <| IO.userError s!"Failed to parse GGUF file: {msg}"
       else
-        0
-    -- Drop dataBlob — tensor uploads now go through mmap (uploadTensor
-    -- + getTensorDataM both check `mmap.isSome`).  The 5 GB ByteArray
-    -- becomes garbage and is collected on next GC pass, freeing the
-    -- Lean-heap copy.
-    pure { gguf with
-      mmap := some mmap
-      dataSectionOffset
-      dataBlob := ByteArray.empty
-    }
-  | .error msg => throw <| IO.userError s!"Failed to parse GGUF file: {msg}"
+        throw <| IO.userError "Failed to parse GGUF file (metadata prefix)"
+  -- `gguf.dataSectionOffset` is set by parseGGUF (the aligned body start).  Drop
+  -- dataBlob so the only resident copy is the on-GPU one; bodies stream via mmap.
+  pure { gguf with mmap := some mmap, dataBlob := ByteArray.empty }
+
+/-- Read up to `remaining` bytes from a handle, accumulating across reads
+    until EOF or the cap is hit (a single `Handle.read` may return fewer
+    bytes than requested). -/
+private partial def readPrefixLoop (h : IO.FS.Handle) (remaining : Nat)
+    (acc : ByteArray) : IO ByteArray := do
+  if remaining == 0 then return acc
+  let chunk ← h.read (min remaining (16 * 1024 * 1024)).toUSize
+  if chunk.isEmpty then return acc  -- EOF
+  readPrefixLoop h (remaining - chunk.size) (acc ++ chunk)
+
+/-- Load only the GGUF header (metadata + tensor infos) by reading a
+    bounded prefix of the file — without copying the tensor body.
+    `loadGGUF`/`loadGGUFMmap` both slurp the entire file into a ByteArray,
+    which is unsafe for very large models (a 16 GB file allocates 16 GB).
+
+    Tensor bodies live after the aligned data section, so a prefix that
+    covers metadata + tensor-infos is sufficient: `parseGGUF` sets
+    `dataBlob := ByteArray.empty` when the prefix ends before the data
+    section, and metadata + tensor infos still parse correctly.
+
+    Pure Lean IO (no CUDA/mmap), so it works on every backend.  Use for
+    introspection / validation (config, tensor presence, shapes); tensor
+    body uploads are NOT possible from the returned file.  `maxPrefixBytes`
+    must exceed the metadata+tensor-info size (a few MB even for huge
+    models). -/
+def loadGGUFHeader (path : String)
+    (maxPrefixBytes : Nat := 256 * 1024 * 1024) : IO GGUFFile := do
+  let h ← IO.FS.Handle.mk path .read
+  let prefixBytes ← readPrefixLoop h maxPrefixBytes ByteArray.empty
+  match Parser.parseGGUF prefixBytes with
+  | .ok gguf =>
+    -- Keep the parser's real `dataSectionOffset` (aligned body start) so a
+    -- streaming loader can seek-by-reading to the data section; drop dataBlob
+    -- (the body is streamed on demand, never held in the heap).
+    pure { gguf with dataBlob := ByteArray.empty }
+  | .error msg =>
+    throw <| IO.userError
+      s!"Failed to parse GGUF header (read {prefixBytes.size} bytes; increase maxPrefixBytes?): {msg}"
 
 /-! ## Extended GGUFFile API -/
 

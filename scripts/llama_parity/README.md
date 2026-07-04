@@ -39,3 +39,33 @@ lake exe cuda-conv-transpose-1d-vs-llama
 ```
 
 Both report `max |err| = 0.0` (bit-exact).
+
+---
+
+## DiffusionGemma per-module goldens
+
+Same pattern as Gemma4/BitNet: ggml CPU op = golden, Lean parity test runs
+the Hesper module on the **same** input and compares.  Validates the
+DiffusionGemma CPU reference (`Hesper/Models/DiffusionGemma/Reference.lean`)
+against llama.cpp's ops; the same goldens drive the WGSL/CUDA kernel parity
+later.
+
+Build all dumpers (LC = path to a built llama.cpp):
+
+```bash
+LC=~/git/llama.cpp
+for m in rmsnorm rope geglu softcap matmul softmax attn; do
+  g++ -O2 -std=c++17 scripts/llama_parity/dump_dg_${m}_golden.cpp \
+    -I $LC/ggml/include -I $LC/ggml/src -L $LC/build/bin -Wl,-rpath,$LC/build/bin \
+    -lggml -lggml-base -lggml-cpu -o scripts/llama_parity/dump_dg_${m}_golden
+  mkdir -p /tmp/dg_golden/$m && ./scripts/llama_parity/dump_dg_${m}_golden /tmp/dg_golden/$m
+done
+```
+
+Run parity tests (all report `maxAbsErr ≈ 0`, geglu ~4e-4 from ggml's table-gelu):
+
+```bash
+for m in rmsnorm rope geglu softcap matmul softmax attn; do
+  lake exe diffusiongemma-${m}-parity
+done
+```

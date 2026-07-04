@@ -43,6 +43,69 @@ opaque getDeviceByIndex (inst : @& Instance) (gpuIdx : @& UInt32) : IO Device
 @[extern "lean_hesper_device_has_subgroups"]
 opaque deviceHasSubgroups (device : @& Device) : IO Bool
 
+/-- metal_replacer STEP 1 PoC: the name/props of the MTLDevice behind this WGPUDevice (via Dawn's
+    GetMTLDevice). Proves the Metal interop is live — the foundation for swapping in llama.cpp's Metal
+    kernels. See METAL_REPLACER_INTEGRATION.md. -/
+@[extern "lean_hesper_mtl_device_name"]
+opaque mtlDeviceName (device : @& Device) : IO String
+
+/-- DG_GPUBUSY: read+reset the compute-pass count + host (record/finish) vs GPU (submit+wait)
+    time split accumulated since the last read. Quantifies encoder-per-dispatch host overhead. -/
+@[extern "lean_hesper_gpubusy_read"]
+opaque gpuBusyRead : IO String
+
+/-- DG_GPUBUSY: read+reset the MSL-path split (count / WaitForCommandsToBeScheduled / encode+commit
+    / kernel GPU time). Complements gpuBusyRead (which covers the Dawn WGSL path only). -/
+@[extern "lean_hesper_msl_busy_read"]
+opaque mslBusyRead : IO String
+
+/-- metal_replacer STEP 4: Apple's tuned MPS f16 matmul (C=A·Bᵀ, our reg-matmul shape) as the CEILING —
+    returns "ms/call | GFLOPS | %peak". Diff vs the WGSL reg (harness) at the same shape to quantify the
+    WGSL→Tint→Metal gap. macOS DEBUG/REFERENCE only. See METAL_REPLACER_INTEGRATION.md. -/
+@[extern "lean_hesper_mps_matmul_bench"]
+opaque mpsMatmulBench (device : @& Device) (M N K iters : UInt32) : IO String
+
+/-- metal_replacer MSL PoC: bench the hand-written native-Metal port of
+    q4kMatmulGroupedRegIndexedKernel on the given Dawn buffers (same algorithm as the WGSL kernel).
+    Returns ms/iter from MTLCommandBuffer GPU timestamps. Caller syncs input writes first and
+    writes `c` once (Dawn lazy-clear). macOS DEBUG/REFERENCE only. -/
+@[extern "lean_hesper_msl_q4k_bench"]
+opaque mslQ4kBench (device : @& Device) (src idx b c te tr : @& Buffer)
+    (M N K nExpert srcRows iters : UInt32) : IO String
+
+/-- HOT-PATH MSL q4k gate/up dispatch (DG_MSL, ~1.61× vs WGSL/Tint). PSO cached after the first
+    call; encode+commit with NO CPU wait. ORDERING CONTRACT: caller must flushBatch (commit the
+    Dawn producer encoder) immediately BEFORE; Dawn buffers are hazard-tracked so Metal orders the
+    command buffers by commit order on the shared buffers. macOS only. -/
+@[extern "lean_hesper_msl_q4k_dispatch"]
+opaque mslQ4kDispatch (device : @& Device) (src idx b c te tr : @& Buffer)
+    (M N K nExpert srcRows : UInt32) : IO Unit
+
+/-- HOT-PATH MSL Q8_0 MoE-down dispatch (DG_MSLDOWN): the native port of
+    q8MatmulGroupedRegIndexedScatterKernel (A read direct from the grouped geglu output, ragged
+    sub-tile skip, C scatter-on-store through pos/slot into dst[slot,NTOK,N]). Same ordering
+    contract as mslQ4kDispatch (flushBatch before; hazard-tracked commit order). macOS only. -/
+@[extern "lean_hesper_msl_q8down_dispatch"]
+opaque mslQ8DownDispatch (device : @& Device) (a b te tr pos slot dst : @& Buffer)
+    (M N K nExpert nUsed nTok : UInt32) : IO Unit
+
+/-- HOT-PATH MSL Q5_0 MoE-down dispatch: the Q5_0 (22B/block) analogue of mslQ8DownDispatch —
+    covers the 16/30 layers whose down_exps are Q5_0 (previously the WGSL warp fallback + staged
+    scatter). Same ordering contract. macOS only. -/
+@[extern "lean_hesper_msl_q5down_dispatch"]
+opaque mslQ5DownDispatch (device : @& Device) (a b te tr pos slot dst : @& Buffer)
+    (M N K nExpert nUsed nTok : UInt32) : IO Unit
+
+/-- SINGLE-STREAM (DG_MSLONESTREAM): encode the MSL gate/up (q4k) AND the FUSED MSL down (q8/q5,
+    reads sGatheredGU + inline geglu) into ONE MTLCommandBuffer with two compute encoders + ONE commit,
+    so the gate/up→down MSL chain runs back-to-back with no inter-cb handoff bubble. gate/up writes
+    guC=sGatheredGU which the down reads as its A; down reuses guIdx as pos. isQ5 selects the down
+    kernel. Implies the fused down. macOS only. -/
+@[extern "lean_hesper_msl_gateup_down_onecb"]
+opaque mslGateupDownOnecb (device : @& Device)
+    (guSrc guIdx guB guC te tr dnB dnSlot dnDst : @& Buffer)
+    (maxPadded guN guK nExpert srcRows dnN dnK nUsed nTok isQ5 : UInt32) : IO Unit
+
 /-- Check if the device was created with the Chromium experimental
     subgroup matrix feature. `subgroup_matrix_left/right/result` types
     and `subgroupMatrixLoad/Store/MultiplyAccumulate` are available iff

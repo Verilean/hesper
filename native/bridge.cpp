@@ -48,14 +48,32 @@ static dawn::native::Instance* g_dawn_instance = nullptr;
 static const wgpu::RequestAdapterOptions* togglesAdapterOptions() {
     static WGPUDawnTogglesDescriptor toggles = {};
     toggles.chain.sType = WGPUSType_DawnTogglesDescriptor;
-    static const char* enableList[] = {
-        "allow_unsafe_apis",
-        "use_vulkan_memory_model",
-        "vulkan_enable_f16_on_nvidia",
-        "decompose_uniform_buffers",
-    };
-    toggles.enabledToggles = enableList;
-    toggles.enabledToggleCount = sizeof(enableList) / sizeof(enableList[0]);
+    // Built once. Base toggles are always on; the rest are OPT-IN env gates so the engine's
+    // default behavior (safety, no shader spew) is unchanged.
+    static std::vector<const char*> enableVec = []{
+        std::vector<const char*> v = {
+            "allow_unsafe_apis",
+            "use_vulkan_memory_model",
+            "vulkan_enable_f16_on_nvidia",
+            "decompose_uniform_buffers",
+        };
+        // disable_robustness: Tint clamps every dynamic buffer index for WGSL safety; our decode
+        // kernels are explicitly DSL-guarded so the clamps are redundant ALU (~30% of the WGSL-vs-MSL
+        // codegen gap). Enabling globally makes OOB UB for ANY unguarded kernel → opt-in only.
+        if (getenv("HESPER_DISABLE_ROBUSTNESS")) v.push_back("disable_robustness");
+        // HESPER_DUMP_MSL: emit the Tint-generated MSL (readable, un-renamed) via the logging
+        // callback (see tryCreateDevice), to diff against hand-written MSL and pin the codegen gap.
+        // dump_shaders/disable_symbol_renaming are device-stage (ignored on the adapter toggle).
+        if (getenv("HESPER_DUMP_MSL")) {
+            v.push_back("dump_shaders");
+            // disable_symbol_renaming keeps WGSL names (readable) but can collide with MSL builtins
+            // on large kernels (SIGTRAP) — separate opt-in.
+            if (getenv("HESPER_DUMP_MSL_NORENAME")) v.push_back("disable_symbol_renaming");
+        }
+        return v;
+    }();
+    toggles.enabledToggles = enableVec.data();
+    toggles.enabledToggleCount = enableVec.size();
 
     static wgpu::RequestAdapterOptions options{};
     options.nextInChain = reinterpret_cast<const wgpu::ChainedStruct*>(&toggles.chain);
@@ -643,7 +661,7 @@ static WGPULimits getMaxLimits(wgpu::Adapter& adapter) {
     limits.maxInterStageShaderVariables = atMost(16, adapterLimits.maxInterStageShaderVariables);
     limits.maxColorAttachments = atMost(8, adapterLimits.maxColorAttachments);
     limits.maxColorAttachmentBytesPerSample = atMost(32, adapterLimits.maxColorAttachmentBytesPerSample);
-    limits.maxComputeWorkgroupStorageSize = atMost(16384, adapterLimits.maxComputeWorkgroupStorageSize);
+    limits.maxComputeWorkgroupStorageSize = atMost(32768, adapterLimits.maxComputeWorkgroupStorageSize);
     limits.maxComputeInvocationsPerWorkgroup = atMost(256, adapterLimits.maxComputeInvocationsPerWorkgroup);
     limits.maxComputeWorkgroupSizeX = atMost(256, adapterLimits.maxComputeWorkgroupSizeX);
     limits.maxComputeWorkgroupSizeY = atMost(256, adapterLimits.maxComputeWorkgroupSizeY);
@@ -665,7 +683,19 @@ static wgpu::Device tryCreateDevice(wgpu::Adapter& adapter,
     deviceDesc.requiredFeatureCount = featureCount;
     deviceDesc.requiredFeatures = reinterpret_cast<const wgpu::FeatureName*>(features);
     deviceDesc.requiredLimits = reinterpret_cast<const wgpu::Limits*>(&limits);
-    return adapter.CreateDevice(&deviceDesc);
+    wgpu::Device device = adapter.CreateDevice(&deviceDesc);
+    // HESPER_DUMP_MSL: route Dawn's dump_shaders output (the Tint-generated MSL) to stderr so we can
+    // capture it and diff against the hand-written MSL. Prefixed for easy grep/extraction.
+    if (device && getenv("HESPER_DUMP_MSL")) {
+        // Use the length-explicit StringView form: the const char* convenience overload is NOT
+        // guaranteed null-terminated, which reads OOB (SIGTRAP) on large dumped MSL.
+        device.SetLoggingCallback([](wgpu::LoggingType, wgpu::StringView message) {
+            std::cerr << "===MSLDUMP-BEGIN===\n"
+                      << std::string(message.data, message.length)
+                      << "\n===MSLDUMP-END===" << std::endl;
+        });
+    }
+    return device;
 }
 
 // Feature level for device creation, controlled by HESPER_GPU_FEATURES env var.
@@ -713,14 +743,32 @@ static wgpu::Device createDeviceWithMaxLimits(wgpu::Adapter& adapter) {
     // D3D12), so this is safe to enable unconditionally.
     static WGPUDawnTogglesDescriptor toggles = {};
     toggles.chain.sType = WGPUSType_DawnTogglesDescriptor;
-    static const char* enableList[] = {
-        "allow_unsafe_apis",
-        "use_vulkan_memory_model",
-        "vulkan_enable_f16_on_nvidia",
-        "decompose_uniform_buffers",
-    };
-    toggles.enabledToggles = enableList;
-    toggles.enabledToggleCount = sizeof(enableList) / sizeof(enableList[0]);
+    // Built once. Base toggles are always on; the rest are OPT-IN env gates so the engine's
+    // default behavior (safety, no shader spew) is unchanged.
+    static std::vector<const char*> enableVec = []{
+        std::vector<const char*> v = {
+            "allow_unsafe_apis",
+            "use_vulkan_memory_model",
+            "vulkan_enable_f16_on_nvidia",
+            "decompose_uniform_buffers",
+        };
+        // disable_robustness: Tint clamps every dynamic buffer index for WGSL safety; our decode
+        // kernels are explicitly DSL-guarded so the clamps are redundant ALU (~30% of the WGSL-vs-MSL
+        // codegen gap). Enabling globally makes OOB UB for ANY unguarded kernel → opt-in only.
+        if (getenv("HESPER_DISABLE_ROBUSTNESS")) v.push_back("disable_robustness");
+        // HESPER_DUMP_MSL: emit the Tint-generated MSL (readable, un-renamed) via the logging
+        // callback (see tryCreateDevice), to diff against hand-written MSL and pin the codegen gap.
+        // dump_shaders/disable_symbol_renaming are device-stage (ignored on the adapter toggle).
+        if (getenv("HESPER_DUMP_MSL")) {
+            v.push_back("dump_shaders");
+            // disable_symbol_renaming keeps WGSL names (readable) but can collide with MSL builtins
+            // on large kernels (SIGTRAP) — separate opt-in.
+            if (getenv("HESPER_DUMP_MSL_NORENAME")) v.push_back("disable_symbol_renaming");
+        }
+        return v;
+    }();
+    toggles.enabledToggles = enableVec.data();
+    toggles.enabledToggleCount = enableVec.size();
 
     // Limits: max settings for large model buffers (1 GB storage, 2 GB buffer)
     WGPULimits limits = getMaxLimits(adapter);
@@ -2372,10 +2420,28 @@ lean_obj_res lean_hesper_create_command_encoder(b_lean_obj_arg device_obj, lean_
     return lean_io_result_mk_ok(encoder_struct);
 }
 
+// DG_GPUBUSY instrumentation: split the step's host vs GPU cost. g_pass_count = compute passes
+// recorded; g_record_ns = CPU time recording them; g_finish_ns = CPU in wgpuCommandEncoderFinish
+// (Dawn→Metal translation); g_submitwait_ns = submit + GPU-wait (kernel time + encoder-switch).
+static std::atomic<uint64_t> g_pass_count{0};
+static std::atomic<uint64_t> g_record_ns{0};
+static std::atomic<uint64_t> g_finish_ns{0};
+static std::atomic<uint64_t> g_submitwait_ns{0};
+
+extern "C" lean_obj_res lean_hesper_gpubusy_read(lean_obj_res /* unit */) {
+    char b[256];
+    snprintf(b, sizeof(b), "passes=%llu record=%.2fms finish=%.2fms submit+wait=%.2fms",
+             (unsigned long long)g_pass_count.exchange(0),
+             g_record_ns.exchange(0) / 1e6, g_finish_ns.exchange(0) / 1e6,
+             g_submitwait_ns.exchange(0) / 1e6);
+    return lean_io_result_mk_ok(lean_mk_string(b));
+}
+
 lean_obj_res lean_hesper_record_dispatch(b_lean_obj_arg encoder_obj, b_lean_obj_arg pipeline_obj,
                                           b_lean_obj_arg bind_group_obj,
                                           uint32_t workgroupsX, uint32_t workgroupsY, uint32_t workgroupsZ,
                                           lean_obj_res /* unit */) {
+    auto _t0 = std::chrono::steady_clock::now();
     wgpu::CommandEncoder* encoder = EXTRACT_COMMAND_ENCODER_PTR(encoder_obj);
     wgpu::ComputePipeline* pipeline = EXTRACT_COMPUTE_PIPELINE_PTR(pipeline_obj);
     wgpu::BindGroup* bindGroup = EXTRACT_BIND_GROUP_PTR(bind_group_obj);
@@ -2397,6 +2463,9 @@ lean_obj_res lean_hesper_record_dispatch(b_lean_obj_arg encoder_obj, b_lean_obj_
     wgpuComputePassEncoderEnd(pass);
     wgpuComputePassEncoderRelease(pass);
 
+    g_pass_count.fetch_add(1, std::memory_order_relaxed);
+    g_record_ns.fetch_add(std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now() - _t0).count(), std::memory_order_relaxed);
     return lean_io_result_mk_ok(lean_box(0));
 }
 
@@ -2411,8 +2480,11 @@ lean_obj_res lean_hesper_submit_and_wait(b_lean_obj_arg device_obj, b_lean_obj_a
         return lean_io_result_mk_error(lean_mk_string("CommandEncoder is invalid"));
     }
 
-    // Finish encoder and submit
+    // Finish encoder and submit (DG_GPUBUSY: time Finish=CPU translation vs submit+wait=GPU)
+    auto _tf0 = std::chrono::steady_clock::now();
     WGPUCommandBuffer commandBuffer = wgpuCommandEncoderFinish(encoder->Get(), nullptr);
+    auto _tf1 = std::chrono::steady_clock::now();
+    g_finish_ns.fetch_add(std::chrono::duration_cast<std::chrono::nanoseconds>(_tf1 - _tf0).count(), std::memory_order_relaxed);
     wgpuQueueSubmit(device->GetQueue().Get(), 1, &commandBuffer);
     wgpuCommandBufferRelease(commandBuffer);
 
@@ -2434,10 +2506,32 @@ lean_obj_res lean_hesper_submit_and_wait(b_lean_obj_arg device_obj, b_lean_obj_a
     // Wait synchronously
     wgpu::Instance instance(g_dawn_instance->Get());
     wait(instance, *future);
+    g_submitwait_ns.fetch_add(std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now() - _tf1).count(), std::memory_order_relaxed);
 
     // Clean up FutureData (not returned to Lean, so we own it)
     delete futureData;
 
+    return lean_io_result_mk_ok(lean_box(0));
+}
+
+// Finish + submit the encoder WITHOUT waiting (cheap batch split; queue order + driver
+// cross-command-buffer hazard tracking preserve correctness).
+lean_obj_res lean_hesper_submit_no_wait(b_lean_obj_arg device_obj, b_lean_obj_arg encoder_obj, lean_obj_res /* unit */) {
+    wgpu::Device* device = EXTRACT_DEVICE_PTR(device_obj);
+    wgpu::CommandEncoder* encoder = EXTRACT_COMMAND_ENCODER_PTR(encoder_obj);
+    if (!device || !device->Get()) {
+        return lean_io_result_mk_error(lean_mk_string("Device is invalid"));
+    }
+    if (!encoder || !encoder->Get()) {
+        return lean_io_result_mk_error(lean_mk_string("CommandEncoder is invalid"));
+    }
+    auto _tf0 = std::chrono::steady_clock::now();
+    WGPUCommandBuffer commandBuffer = wgpuCommandEncoderFinish(encoder->Get(), nullptr);
+    wgpuQueueSubmit(device->GetQueue().Get(), 1, &commandBuffer);
+    wgpuCommandBufferRelease(commandBuffer);
+    g_submitwait_ns.fetch_add(std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now() - _tf0).count(), std::memory_order_relaxed);
     return lean_io_result_mk_ok(lean_box(0));
 }
 

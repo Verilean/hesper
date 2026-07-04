@@ -65,8 +65,11 @@ structure Gemma4Block (BufT CacheT : Type) where
   moePostNorm2 : Option (RMSNorm.RMSNorm BufT CacheT)
   -- Optional: RoPE frequency factors (full attention layers only)
   ropeFreqFactors : Option BufT
-  -- Optional: layer output scale
+  -- Optional: layer output scale (DiffusionGemma: canvas/decoder scalar)
   outScale : Option BufT
+  -- Optional: encoder layer output scale (DiffusionGemma global/prompt scalar).
+  -- Unused by Gemma 4; defaults to none so the Gemma 4 loader is unaffected.
+  encOutScale : Option BufT := none
 
 /-- Per-layer embedding weights for a single block -/
 structure Gemma4PerLayerEmbd (BufT CacheT : Type) where

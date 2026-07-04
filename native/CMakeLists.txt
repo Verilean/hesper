@@ -99,6 +99,16 @@ message(STATUS "Dawn build directory: ${DAWN_BUILD_DIR}")
 # with `-lhesper_native` only — Dawn becomes an implementation detail.
 add_library(hesper_native SHARED bridge.cpp glfw_bridge.cpp)
 
+# metal_replace.mm is Objective-C++ (Metal / MPS — the metal_replacer debug/reference path).
+# It only compiles on macOS; on Linux/Windows there is no Objective-C++ backend (cc1objplus)
+# or Metal, so build the real Metal impl on APPLE and symbol-compatible stubs elsewhere (so
+# executables that reference the @[extern] MSL symbols still link — the paths are macOS-only).
+if(APPLE)
+  target_sources(hesper_native PRIVATE metal_replace.mm)
+else()
+  target_sources(hesper_native PRIVATE metal_replace_stub.cpp)
+endif()
+
 # macOS: bridge.cpp references Lean runtime symbols (lean_alloc_object,
 # lean_mk_string, lean_inc_heartbeat, mi_malloc_small, ...) but the
 # Lean runtime lives in the *consumer* (the lean_exe / xeus-lean
@@ -193,6 +203,7 @@ if(APPLE)
   find_library(QUARTZCORE_LIB QuartzCore REQUIRED)
   find_library(IOKIT_LIB IOKit REQUIRED)
   find_library(IOSURFACE_LIB IOSurface REQUIRED)
+  find_library(MPS_LIB MetalPerformanceShaders REQUIRED)   # metal_replacer step 4: MPS matmul ceiling
   target_link_libraries(hesper_native PRIVATE
     "-Wl,-force_load,${DAWN_BUILD_DIR}/src/dawn/libdawn_proc.a"
     ${DAWN_BUILD_DIR}/src/dawn/glfw/libdawn_glfw.a
@@ -206,6 +217,7 @@ if(APPLE)
     ${IOKIT_LIB}
     ${IOSURFACE_LIB}
     ${COCOA_LIB}
+    ${MPS_LIB}
   )
 else()
   target_link_libraries(hesper_native PRIVATE

@@ -183,7 +183,10 @@ private def downloadDawn (cwd : FilePath) (dawnSrc : FilePath) (dawnVersion : St
   IO.FS.createDirAll dawnSrc.toString
   let tarballUrl := s!"https://dawn.googlesource.com/dawn/+archive/{dawnVersion}.tar.gz"
   let tarballPath := cwd / ".lake/build/dawn.tar.gz"
-  let ret ← runCmd "curl" #["-s", "-L", "-o", tarballPath.toString, tarballUrl]
+  -- `--fail` so an HTTP error (e.g. googlesource rate-limit 429) exits non-zero instead of writing
+  -- the error page into the tarball (which then dies as "gzip: not in gzip format"); `--retry` +
+  -- `--retry-all-errors` retry the transient rate-limits that flake CI.
+  let ret ← runCmd "curl" #["-sS", "-L", "--fail", "--retry", "5", "--retry-all-errors", "--retry-delay", "3", "-o", tarballPath.toString, tarballUrl]
   if ret != 0 then return ret
   let ret ← runCmd "tar" #["-xzf", tarballPath.toString, "-C", dawnSrc.toString]
   if ret != 0 then return ret
@@ -409,10 +412,13 @@ script buildNative do
 
     IO.println s!"Downloading from: {tarballUrl}"
 
-    -- Download tarball using curl (silent mode)
+    -- Download tarball using curl. `--fail` so an HTTP error (e.g. googlesource rate-limit 429)
+    -- exits non-zero instead of writing the error page into the tarball (which then dies as
+    -- "gzip: not in gzip format"); `--retry`+`--retry-all-errors` retry the transient rate-limits
+    -- that flake CI. `-sS` = silent but still show real errors.
     let downloadRet ← IO.Process.spawn {
       cmd := "curl"
-      args := #["-s", "-L", "-o", tarballPath, tarballUrl]
+      args := #["-sS", "-L", "--fail", "--retry", "5", "--retry-all-errors", "--retry-delay", "3", "-o", tarballPath, tarballUrl]
     } >>= (·.wait)
 
     if downloadRet != 0 then
@@ -1383,6 +1389,36 @@ lean_exe «subgroup-matrix-f16-probe» where
   supportInterpreter := false
   moreLinkArgs := stdLinkArgs
 
+lean_exe «wmma8x8-test» where
+  root := `Examples.Compute.WMMA8x8Test
+  supportInterpreter := false
+  moreLinkArgs := stdLinkArgs
+
+lean_exe «buffer-coherency-test» where
+  root := `Examples.Compute.BufferCoherencyTest
+  supportInterpreter := false
+  moreLinkArgs := stdLinkArgs
+
+lean_exe «grouped-down-test» where
+  root := `Examples.Compute.GroupedDownTest
+  supportInterpreter := false
+  moreLinkArgs := stdLinkArgs
+
+lean_exe «matmul-bench» where
+  root := `Examples.Compute.MatmulBench
+  supportInterpreter := false
+  moreLinkArgs := stdLinkArgs
+
+lean_exe «metal-replace-test» where
+  root := `Examples.Compute.MetalReplaceTest
+  supportInterpreter := false
+  moreLinkArgs := stdLinkArgs
+
+lean_exe «msl-poc» where
+  root := `Examples.Compute.MslPoc
+  supportInterpreter := false
+  moreLinkArgs := stdLinkArgs
+
 lean_exe «bitnet-validation» where
   root := `Tests.BitNetValidation
   supportInterpreter := false
@@ -1405,6 +1441,61 @@ lean_exe «gemma4-inference» where
 
 lean_exe «gemma4-validation» where
   root := `Examples.Gemma4Validation
+  supportInterpreter := false
+  moreLinkArgs := stdLinkArgs
+
+lean_exe «diffusiongemma-validation» where
+  root := `Examples.DiffusionGemmaValidation
+  supportInterpreter := false
+  moreLinkArgs := stdLinkArgs
+
+lean_exe «diffusiongemma-tiny-test» where
+  root := `Examples.DiffusionGemmaTinyTest
+  supportInterpreter := false
+  moreLinkArgs := stdLinkArgs
+
+lean_exe «diffusiongemma-rmsnorm-parity» where
+  root := `Examples.DSL.DiffusionGemmaRMSNormParity
+  supportInterpreter := false
+  moreLinkArgs := stdLinkArgs
+
+lean_exe «diffusiongemma-rope-parity» where
+  root := `Examples.DSL.DiffusionGemmaRoPEParity
+  supportInterpreter := false
+  moreLinkArgs := stdLinkArgs
+
+lean_exe «diffusiongemma-geglu-parity» where
+  root := `Examples.DSL.DiffusionGemmaGeGLUParity
+  supportInterpreter := false
+  moreLinkArgs := stdLinkArgs
+
+lean_exe «diffusiongemma-softcap-parity» where
+  root := `Examples.DSL.DiffusionGemmaSoftcapParity
+  supportInterpreter := false
+  moreLinkArgs := stdLinkArgs
+
+lean_exe «diffusiongemma-matmul-parity» where
+  root := `Examples.DSL.DiffusionGemmaMatMulParity
+  supportInterpreter := false
+  moreLinkArgs := stdLinkArgs
+
+lean_exe «diffusiongemma-softmax-parity» where
+  root := `Examples.DSL.DiffusionGemmaSoftmaxParity
+  supportInterpreter := false
+  moreLinkArgs := stdLinkArgs
+
+lean_exe «diffusiongemma-attn-parity» where
+  root := `Examples.DSL.DiffusionGemmaAttnParity
+  supportInterpreter := false
+  moreLinkArgs := stdLinkArgs
+
+lean_exe «diffusiongemma-softcap-gpu-parity» where
+  root := `Examples.DSL.DiffusionGemmaSoftcapGPUParity
+  supportInterpreter := false
+  moreLinkArgs := stdLinkArgs
+
+lean_exe «diffusiongemma-gpu-parity» where
+  root := `Examples.DSL.DiffusionGemmaGPUParity
   supportInterpreter := false
   moreLinkArgs := stdLinkArgs
 
@@ -1518,5 +1609,76 @@ lean_exe «wmma-shaderm-test» where
 
 lean_exe «wmma-gpu-parity-test» where
   root := `Tests.CUDA.WmmaGPUParityTest
+  supportInterpreter := false
+  moreLinkArgs := stdLinkArgs
+
+lean_exe «diffusiongemma-load» where
+  root := `Examples.DiffusionGemmaLoad
+  supportInterpreter := false
+  moreLinkArgs := stdLinkArgs
+
+lean_exe «diffusiongemma-forward-probe» where
+  root := `Examples.DiffusionGemmaForwardProbe
+  supportInterpreter := false
+  moreLinkArgs := stdLinkArgs
+
+lean_exe «diffusiongemma-q8mm-parity» where
+  root := `Examples.DSL.DiffusionGemmaQ8MMParity
+  supportInterpreter := false
+  moreLinkArgs := stdLinkArgs
+
+lean_exe «diffusiongemma-gqa-attn-test» where
+  root := `Examples.DSL.DiffusionGemmaGQAAttnTest
+  supportInterpreter := false
+  moreLinkArgs := stdLinkArgs
+
+lean_exe «diffusiongemma-q4kexp-parity» where
+  root := `Examples.DSL.DiffusionGemmaQ4KExpertParity
+  supportInterpreter := false
+  moreLinkArgs := stdLinkArgs
+
+lean_exe «diffusiongemma-q8exp-parity» where
+  root := `Examples.DSL.DiffusionGemmaQ8ExpertParity
+  supportInterpreter := false
+  moreLinkArgs := stdLinkArgs
+
+lean_exe «diffusiongemma-forward» where
+  root := `Examples.DiffusionGemmaForward
+  supportInterpreter := false
+  moreLinkArgs := stdLinkArgs
+
+lean_exe «diffusiongemma-forward-gpu» where
+  root := `Examples.DiffusionGemmaForwardGPU
+  supportInterpreter := false
+  moreLinkArgs := stdLinkArgs
+
+
+lean_exe «diffusiongemma-q4kbatch-parity» where
+  root := `Examples.DSL.DiffusionGemmaQ4KBatchParity
+  moreLinkArgs := stdLinkArgs
+
+lean_exe «diffusiongemma-battn-parity» where
+  root := `Examples.DSL.DiffusionGemmaBatchAttnParity
+  moreLinkArgs := stdLinkArgs
+
+lean_exe «diffusiongemma-q8batch-parity» where
+  root := `Examples.DSL.DiffusionGemmaQ8BatchParity
+  moreLinkArgs := stdLinkArgs
+
+lean_exe «diffusiongemma-qknormrope-parity» where
+  root := `Examples.DSL.DiffusionGemmaQKNormRopeParity
+  moreLinkArgs := stdLinkArgs
+
+lean_exe «diffusiongemma-bidir» where
+  root := `Examples.DiffusionGemmaBidir
+  supportInterpreter := false
+  moreLinkArgs := stdLinkArgs
+
+lean_exe «diffusiongemma-q6kmm-parity» where
+  root := `Examples.DSL.DiffusionGemmaQ6KMMParity
+  moreLinkArgs := stdLinkArgs
+
+lean_exe «diffusiongemma-decode» where
+  root := `Examples.DiffusionGemmaDecode
   supportInterpreter := false
   moreLinkArgs := stdLinkArgs

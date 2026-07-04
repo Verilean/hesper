@@ -5,3 +5,15 @@ bench_conv_transpose_1d
 dump_geglu_quick_golden
 dump_concat_dim0_golden
 dump_permute_4d_golden
+
+# DiffusionGemma dumper binaries
+dump_dg_attn_golden
+dump_dg_geglu_golden
+dump_dg_matmul_golden
+dump_dg_rmsnorm_golden
+dump_dg_rope_golden
+dump_dg_softcap_golden
+dump_dg_softmax_golden
+dump_dg_q8mm_golden
+dump_dg_q4kexp_golden
+dump_dg_q8exp_golden
