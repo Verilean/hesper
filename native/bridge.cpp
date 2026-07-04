@@ -48,23 +48,32 @@ static dawn::native::Instance* g_dawn_instance = nullptr;
 static const wgpu::RequestAdapterOptions* togglesAdapterOptions() {
     static WGPUDawnTogglesDescriptor toggles = {};
     toggles.chain.sType = WGPUSType_DawnTogglesDescriptor;
-    static const char* enableList[] = {
-        "allow_unsafe_apis",
-        "use_vulkan_memory_model",
-        "vulkan_enable_f16_on_nvidia",
-        "decompose_uniform_buffers",
-        // EXPERIMENT (robustness hypothesis for the 1.52× WGSL-vs-hand-MSL codegen gap): Tint clamps
-        // every dynamic buffer index for WGSL safety; our kernels are explicitly DSL-guarded, so the
-        // clamps are redundant ALU in hot dequant loops. Disable → OOB becomes UB, validate golden+gate.
-        "disable_robustness",
-    };
-    toggles.enabledToggles = enableList;
-    // disable_robustness (last entry) is OPT-IN via HESPER_DISABLE_ROBUSTNESS — enabling it globally
-    // would make OOB UB for ANY unguarded kernel in the engine (graphics/other models/tests). The
-    // DiffusionGemma decode kernels are explicitly DSL-guarded (validated 8/8), so it's safe there.
-    size_t nToggles = sizeof(enableList) / sizeof(enableList[0]);
-    if (!getenv("HESPER_DISABLE_ROBUSTNESS")) nToggles -= 1;  // drop the trailing disable_robustness
-    toggles.enabledToggleCount = nToggles;
+    // Built once. Base toggles are always on; the rest are OPT-IN env gates so the engine's
+    // default behavior (safety, no shader spew) is unchanged.
+    static std::vector<const char*> enableVec = []{
+        std::vector<const char*> v = {
+            "allow_unsafe_apis",
+            "use_vulkan_memory_model",
+            "vulkan_enable_f16_on_nvidia",
+            "decompose_uniform_buffers",
+        };
+        // disable_robustness: Tint clamps every dynamic buffer index for WGSL safety; our decode
+        // kernels are explicitly DSL-guarded so the clamps are redundant ALU (~30% of the WGSL-vs-MSL
+        // codegen gap). Enabling globally makes OOB UB for ANY unguarded kernel → opt-in only.
+        if (getenv("HESPER_DISABLE_ROBUSTNESS")) v.push_back("disable_robustness");
+        // HESPER_DUMP_MSL: emit the Tint-generated MSL (readable, un-renamed) via the logging
+        // callback (see tryCreateDevice), to diff against hand-written MSL and pin the codegen gap.
+        // dump_shaders/disable_symbol_renaming are device-stage (ignored on the adapter toggle).
+        if (getenv("HESPER_DUMP_MSL")) {
+            v.push_back("dump_shaders");
+            // disable_symbol_renaming keeps WGSL names (readable) but can collide with MSL builtins
+            // on large kernels (SIGTRAP) — separate opt-in.
+            if (getenv("HESPER_DUMP_MSL_NORENAME")) v.push_back("disable_symbol_renaming");
+        }
+        return v;
+    }();
+    toggles.enabledToggles = enableVec.data();
+    toggles.enabledToggleCount = enableVec.size();
 
     static wgpu::RequestAdapterOptions options{};
     options.nextInChain = reinterpret_cast<const wgpu::ChainedStruct*>(&toggles.chain);
@@ -674,7 +683,19 @@ static wgpu::Device tryCreateDevice(wgpu::Adapter& adapter,
     deviceDesc.requiredFeatureCount = featureCount;
     deviceDesc.requiredFeatures = reinterpret_cast<const wgpu::FeatureName*>(features);
     deviceDesc.requiredLimits = reinterpret_cast<const wgpu::Limits*>(&limits);
-    return adapter.CreateDevice(&deviceDesc);
+    wgpu::Device device = adapter.CreateDevice(&deviceDesc);
+    // HESPER_DUMP_MSL: route Dawn's dump_shaders output (the Tint-generated MSL) to stderr so we can
+    // capture it and diff against the hand-written MSL. Prefixed for easy grep/extraction.
+    if (device && getenv("HESPER_DUMP_MSL")) {
+        // Use the length-explicit StringView form: the const char* convenience overload is NOT
+        // guaranteed null-terminated, which reads OOB (SIGTRAP) on large dumped MSL.
+        device.SetLoggingCallback([](wgpu::LoggingType, wgpu::StringView message) {
+            std::cerr << "===MSLDUMP-BEGIN===\n"
+                      << std::string(message.data, message.length)
+                      << "\n===MSLDUMP-END===" << std::endl;
+        });
+    }
+    return device;
 }
 
 // Feature level for device creation, controlled by HESPER_GPU_FEATURES env var.
@@ -722,23 +743,32 @@ static wgpu::Device createDeviceWithMaxLimits(wgpu::Adapter& adapter) {
     // D3D12), so this is safe to enable unconditionally.
     static WGPUDawnTogglesDescriptor toggles = {};
     toggles.chain.sType = WGPUSType_DawnTogglesDescriptor;
-    static const char* enableList[] = {
-        "allow_unsafe_apis",
-        "use_vulkan_memory_model",
-        "vulkan_enable_f16_on_nvidia",
-        "decompose_uniform_buffers",
-        // EXPERIMENT (robustness hypothesis for the 1.52× WGSL-vs-hand-MSL codegen gap): Tint clamps
-        // every dynamic buffer index for WGSL safety; our kernels are explicitly DSL-guarded, so the
-        // clamps are redundant ALU in hot dequant loops. Disable → OOB becomes UB, validate golden+gate.
-        "disable_robustness",
-    };
-    toggles.enabledToggles = enableList;
-    // disable_robustness (last entry) is OPT-IN via HESPER_DISABLE_ROBUSTNESS — enabling it globally
-    // would make OOB UB for ANY unguarded kernel in the engine (graphics/other models/tests). The
-    // DiffusionGemma decode kernels are explicitly DSL-guarded (validated 8/8), so it's safe there.
-    size_t nToggles = sizeof(enableList) / sizeof(enableList[0]);
-    if (!getenv("HESPER_DISABLE_ROBUSTNESS")) nToggles -= 1;  // drop the trailing disable_robustness
-    toggles.enabledToggleCount = nToggles;
+    // Built once. Base toggles are always on; the rest are OPT-IN env gates so the engine's
+    // default behavior (safety, no shader spew) is unchanged.
+    static std::vector<const char*> enableVec = []{
+        std::vector<const char*> v = {
+            "allow_unsafe_apis",
+            "use_vulkan_memory_model",
+            "vulkan_enable_f16_on_nvidia",
+            "decompose_uniform_buffers",
+        };
+        // disable_robustness: Tint clamps every dynamic buffer index for WGSL safety; our decode
+        // kernels are explicitly DSL-guarded so the clamps are redundant ALU (~30% of the WGSL-vs-MSL
+        // codegen gap). Enabling globally makes OOB UB for ANY unguarded kernel → opt-in only.
+        if (getenv("HESPER_DISABLE_ROBUSTNESS")) v.push_back("disable_robustness");
+        // HESPER_DUMP_MSL: emit the Tint-generated MSL (readable, un-renamed) via the logging
+        // callback (see tryCreateDevice), to diff against hand-written MSL and pin the codegen gap.
+        // dump_shaders/disable_symbol_renaming are device-stage (ignored on the adapter toggle).
+        if (getenv("HESPER_DUMP_MSL")) {
+            v.push_back("dump_shaders");
+            // disable_symbol_renaming keeps WGSL names (readable) but can collide with MSL builtins
+            // on large kernels (SIGTRAP) — separate opt-in.
+            if (getenv("HESPER_DUMP_MSL_NORENAME")) v.push_back("disable_symbol_renaming");
+        }
+        return v;
+    }();
+    toggles.enabledToggles = enableVec.data();
+    toggles.enabledToggleCount = enableVec.size();
 
     // Limits: max settings for large model buffers (1 GB storage, 2 GB buffer)
     WGPULimits limits = getMaxLimits(adapter);
