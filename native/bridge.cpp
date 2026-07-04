@@ -2372,10 +2372,28 @@ lean_obj_res lean_hesper_create_command_encoder(b_lean_obj_arg device_obj, lean_
     return lean_io_result_mk_ok(encoder_struct);
 }
 
+// DG_GPUBUSY instrumentation: split the step's host vs GPU cost. g_pass_count = compute passes
+// recorded; g_record_ns = CPU time recording them; g_finish_ns = CPU in wgpuCommandEncoderFinish
+// (Dawn→Metal translation); g_submitwait_ns = submit + GPU-wait (kernel time + encoder-switch).
+static std::atomic<uint64_t> g_pass_count{0};
+static std::atomic<uint64_t> g_record_ns{0};
+static std::atomic<uint64_t> g_finish_ns{0};
+static std::atomic<uint64_t> g_submitwait_ns{0};
+
+extern "C" lean_obj_res lean_hesper_gpubusy_read(lean_obj_res /* unit */) {
+    char b[256];
+    snprintf(b, sizeof(b), "passes=%llu record=%.2fms finish=%.2fms submit+wait=%.2fms",
+             (unsigned long long)g_pass_count.exchange(0),
+             g_record_ns.exchange(0) / 1e6, g_finish_ns.exchange(0) / 1e6,
+             g_submitwait_ns.exchange(0) / 1e6);
+    return lean_io_result_mk_ok(lean_mk_string(b));
+}
+
 lean_obj_res lean_hesper_record_dispatch(b_lean_obj_arg encoder_obj, b_lean_obj_arg pipeline_obj,
                                           b_lean_obj_arg bind_group_obj,
                                           uint32_t workgroupsX, uint32_t workgroupsY, uint32_t workgroupsZ,
                                           lean_obj_res /* unit */) {
+    auto _t0 = std::chrono::steady_clock::now();
     wgpu::CommandEncoder* encoder = EXTRACT_COMMAND_ENCODER_PTR(encoder_obj);
     wgpu::ComputePipeline* pipeline = EXTRACT_COMPUTE_PIPELINE_PTR(pipeline_obj);
     wgpu::BindGroup* bindGroup = EXTRACT_BIND_GROUP_PTR(bind_group_obj);
@@ -2397,6 +2415,9 @@ lean_obj_res lean_hesper_record_dispatch(b_lean_obj_arg encoder_obj, b_lean_obj_
     wgpuComputePassEncoderEnd(pass);
     wgpuComputePassEncoderRelease(pass);
 
+    g_pass_count.fetch_add(1, std::memory_order_relaxed);
+    g_record_ns.fetch_add(std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now() - _t0).count(), std::memory_order_relaxed);
     return lean_io_result_mk_ok(lean_box(0));
 }
 
@@ -2411,8 +2432,11 @@ lean_obj_res lean_hesper_submit_and_wait(b_lean_obj_arg device_obj, b_lean_obj_a
         return lean_io_result_mk_error(lean_mk_string("CommandEncoder is invalid"));
     }
 
-    // Finish encoder and submit
+    // Finish encoder and submit (DG_GPUBUSY: time Finish=CPU translation vs submit+wait=GPU)
+    auto _tf0 = std::chrono::steady_clock::now();
     WGPUCommandBuffer commandBuffer = wgpuCommandEncoderFinish(encoder->Get(), nullptr);
+    auto _tf1 = std::chrono::steady_clock::now();
+    g_finish_ns.fetch_add(std::chrono::duration_cast<std::chrono::nanoseconds>(_tf1 - _tf0).count(), std::memory_order_relaxed);
     wgpuQueueSubmit(device->GetQueue().Get(), 1, &commandBuffer);
     wgpuCommandBufferRelease(commandBuffer);
 
@@ -2434,6 +2458,8 @@ lean_obj_res lean_hesper_submit_and_wait(b_lean_obj_arg device_obj, b_lean_obj_a
     // Wait synchronously
     wgpu::Instance instance(g_dawn_instance->Get());
     wait(instance, *future);
+    g_submitwait_ns.fetch_add(std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now() - _tf1).count(), std::memory_order_relaxed);
 
     // Clean up FutureData (not returned to Lean, so we own it)
     delete futureData;
@@ -2452,9 +2478,12 @@ lean_obj_res lean_hesper_submit_no_wait(b_lean_obj_arg device_obj, b_lean_obj_ar
     if (!encoder || !encoder->Get()) {
         return lean_io_result_mk_error(lean_mk_string("CommandEncoder is invalid"));
     }
+    auto _tf0 = std::chrono::steady_clock::now();
     WGPUCommandBuffer commandBuffer = wgpuCommandEncoderFinish(encoder->Get(), nullptr);
     wgpuQueueSubmit(device->GetQueue().Get(), 1, &commandBuffer);
     wgpuCommandBufferRelease(commandBuffer);
+    g_submitwait_ns.fetch_add(std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now() - _tf0).count(), std::memory_order_relaxed);
     return lean_io_result_mk_ok(lean_box(0));
 }
 
