@@ -16,29 +16,41 @@ most of it (→1.15×) with a one-line-per-guard WGSL change. The gap is closeab
 
 ## What Metal RECOVERS (do not waste time "fixing" these in WGSL)
 
-Metal's compiler reliably does these; changing the WGSL to pre-do them measures NULL:
+Metal's compiler reliably does these; changing the WGSL to pre-do them measures NULL. **Metal's optimizer
+is strong on *local* transforms — it recovers most emitted-code verbosity.** Two verified null results:
 
 - **Strength reduction** — `a / 2^k` → `>>`, `a % 2^k` → `&`. Tint emits guarded integer div/mod (231 div
   + 151 mod in the q4k kernel!) but Metal inlines, const-props the literal divisor, folds the div-by-zero
   `select`, and strength-reduces. Emitting `>>`/`&` from the DSL measured **0 change**. (Verified 2026-07.)
-- **Constant folding**, basic **dead-code elimination**, **function inlining**.
+- **SROA of constant-indexed local arrays** — `array<subgroup_matrix_result, 4>` accessed `Cx[0..3]` with
+  the create-temp + write-back pattern (H2). Converting to 4 named scalar fragments *eliminated the
+  `tint_array` from the MSL* but measured **0 change** (6.08→6.10 ms) — Metal SROAs the opaque-type array
+  into registers and copy-props the temp+write-back away. So array-vs-named-register accumulators do NOT
+  matter on Metal.
+- **Constant folding**, basic **dead-code elimination**, **function inlining**, **copy propagation**.
 
-## What Metal does NOT recover (THE levers — fix these in WGSL)
+## What Metal does NOT recover (THE lever — fix this in WGSL)
 
-- **Common-subexpression duplication from Lean-`let`.** In the ShaderM DSL, `let x := expr` is a *Lean*
-  binding = **substitution**: every use of `x` re-emits the whole `expr` tree into the WGSL. A loop-
-  invariant guard reused across fragments/blocks expanded **57×** in the q4k MSL, and Metal did NOT CSE
-  the repeated (read-only) buffer-load + compare. **Fix:** bind reused/loop-invariant subexpressions with
-  `ShaderM.let'` (emits a WGSL `let x = expr;`, computed once). q4k: 7.22→6.08 ms, 1.37×→**1.15×**,
-  bit-identical. This is *systemic* — every kernel that reuses a Lean-`let` value has it.
-- **Arrays of opaque types not register-promoted.** `declareMatrixResultArray "Cx" … 4` emits
-  `var Cx: array<subgroup_matrix_result<…>, 4>` accessed by constant index. Metal may fail to SROA an
-  array of the opaque `simdgroup_matrix` type into registers → the 8×8 fragments live in thread memory,
-  and each MAC does a create-temp + write-back (`v = 0; MAC(v, …, Cx[i]); Cx[i] = v`). Hand-MSL uses 4
-  *named scalar* registers `Cx0..Cx3` with in-place MAC. **Fix:** declare scalar matrices, not an array.
-- **Robustness bounds-clamps.** Tint clamps every dynamic buffer index for WGSL safety (~30% of the raw
-  gap). Removable via the `HESPER_DISABLE_ROBUSTNESS` env gate (OFF by default — enabling globally makes
-  OOB *undefined behavior* for any unguarded kernel; DG decode kernels are DSL-guarded so it's safe there).
+The ONE local transform Metal reliably fails at is **CSE of a subexpression duplicated across a large
+function body** — everything else it recovers (above). So the single high-value WGSL fix is:
+
+- **Common-subexpression duplication from Lean-`let` (THE lever).** In the ShaderM DSL, `let x := expr` is
+  a *Lean* binding = **substitution**: every use of `x` re-emits the whole `expr` tree into the WGSL. A
+  loop-invariant guard reused across fragments/blocks expanded **57×** in the q4k MSL, and Metal did NOT
+  CSE the repeated (read-only) buffer-load + compare. **Fix:** bind reused / loop-invariant subexpressions
+  with `ShaderM.let'` (emits a WGSL `let x = expr;`, computed once). q4k: 7.22→6.08 ms, 1.37×→**1.15×**,
+  bit-identical. This is *systemic* — every kernel that reuses a Lean-`let` value has it. This one class
+  accounts for essentially all of the recoverable codegen gap on Metal (the div/mod and accumulator-array
+  "pathologies" are visible in the MSL but cost nothing — Metal recovers them).
+- **Robustness bounds-clamps** (separate axis, ~30% of the *raw* gap). Removable via the
+  `HESPER_DISABLE_ROBUSTNESS` env gate (OFF by default — enabling globally makes OOB *undefined behavior*
+  for any unguarded kernel; DG decode kernels are DSL-guarded so it's safe there).
+
+**⇒ The playbook is narrow and cheap: hunt duplicated subexpressions (esp. loop-invariant guards and
+buffer reads reused via Lean-`let`) and bind them with `let'`.** Don't bother rewriting div/mod, unrolling,
+or accumulator storage — Metal already handles those. The residual after `let'` (q4k ~1.15×) is near the
+floor of WGSL-through-Tint and is diminishing returns; spend the effort applying `let'` across MORE kernels
+(attention / dense / down all use the same Lean-`let` idiom) rather than chasing one kernel to 1.0×.
 
 ---
 
@@ -88,7 +100,9 @@ that lands, apply `let'` to loop-invariant / multiply-used values by hand.
 | Change | kernel | WGSL ms | ratio (robustness off) | golden |
 |---|---|---|---|---|
 | baseline | q4k gate/up reg | 7.22 | 1.37× | — |
-| H1: guard `let'` (57×→1×) | q4k gate/up reg | 6.08 | **1.15×** | bit-identical |
-| H2: scalar accumulators | q4k gate/up reg | *(measuring)* | | |
+| H1: guard `let'` (57×→1×) | q4k gate/up reg | **6.08** | **1.15×** | bit-identical ✅ landed |
+| H2: scalar accumulators | q4k gate/up reg | 6.10 | 1.156× | NULL (Metal SROAs the array) — reverted |
+| strength-reduction (÷/%→>>/&) | q4k gate/up reg | 7.24 | 1.37× | NULL (Metal recovers) — reverted |
 
-Hand-MSL target: 5.28 ms = 1.0×.
+Hand-MSL target: 5.28 ms = 1.0×. H1 captured essentially all the recoverable gap; residual 1.15× is near
+the WGSL-through-Tint floor.
