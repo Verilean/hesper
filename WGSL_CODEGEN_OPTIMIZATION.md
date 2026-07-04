@@ -48,9 +48,26 @@ function body** — everything else it recovers (above). So the single high-valu
 
 **⇒ The playbook is narrow and cheap: hunt duplicated subexpressions (esp. loop-invariant guards and
 buffer reads reused via Lean-`let`) and bind them with `let'`.** Don't bother rewriting div/mod, unrolling,
-or accumulator storage — Metal already handles those. The residual after `let'` (q4k ~1.15×) is near the
-floor of WGSL-through-Tint and is diminishing returns; spend the effort applying `let'` across MORE kernels
-(attention / dense / down all use the same Lean-`let` idiom) rather than chasing one kernel to 1.0×.
+or accumulator storage — Metal already handles those.
+
+### Where the pathology actually lives (scope the effort — measured 2026-07-04)
+The duplicated-guard pathology is NOT everywhere. It appears in the **grouped-MoE kernels** whose sentinel /
+ragged-skip guard (`tileExpert[tile] < nExpert`, `frag0/frag1`) is reused across every fragment/block
+(q4k: 57×; the generic grouped reg matmul: 209×). It does **NOT** appear in the **non-grouped** matmuls
+(attention QKV/O-proj, dense gate/up/down, lm_head) — they take a compile-time weight offset, no guard.
+Two consequences:
+- The deployed DiffusionGemma decode runs the grouped-MoE kernels as **hand-MSL** (`mslQ4kDispatch` etc.),
+  so H1 on the WGSL q4k kernel helps only the `DG_NOMSL` portable fallback, not the default path.
+- Applying `let'` to the grouped reg matmul measured **0 ms** at the deployed MoE shape (M=6208) — the
+  guard is amortized under a compute-bound matmul already sitting *below* its roofline floor. It helps only
+  when the guard is a real fraction of a small kernel's time.
+- **So there is no broad decode-wide `let'` win to harvest.** The remaining WGSL headroom in the deployed
+  decode is **tile efficiency at small M** (ROOFLINE: QKV-KV full 4.9×, dense gate/up 3.2×, O-proj 1.9×
+  above floor at M=262) — a *tile-granularity* problem (see `PERF_AUTOTUNE_LOOP.md`), NOT a codegen-CSE one.
+
+**Bottom line: `let'`/CSE is the right tool for grouped kernels with reused guards; verify the pathology
+exists (dump + count) AND that the kernel isn't already at floor before spending effort.** A general
+auto-CSE codegen pass would be correct but buys ~0 on the deployed path (no duplication there to remove).
 
 ---
 
