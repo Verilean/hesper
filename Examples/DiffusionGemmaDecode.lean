@@ -1195,7 +1195,11 @@ def main (args : List String) : IO Unit := do
   -- DG_FUSEDOWN: the MSL down kernel reads the raw grouped gate/up (sGatheredGU) and computes geglu
   -- inline, dropping the Dawn gegluMergedB + q80 dispatches so MSL gate/up and MSL down run
   -- back-to-back on Dawn's queue (tests the ~220ms cross-queue handoff-bubble hypothesis).
-  let fuseDown := useMslDown && (← IO.getEnv "DG_FUSEDOWN").isSome
+  -- DG_MSLONESTREAM: encode MSL gate/up + fused MSL down into ONE MTLCommandBuffer (one commit) via
+  -- mslGateupDownOnecb — tests whether same-cb execution removes the inter-cb handoff bubble. Implies
+  -- the fused down (down reads sGatheredGU). Requires useMsl + useMslDown.
+  let oneStream := useMsl && useMslDown && (← IO.getEnv "DG_MSLONESTREAM").isSome
+  let fuseDown := (useMslDown && (← IO.getEnv "DG_FUSEDOWN").isSome) || oneStream
   -- DG_MOENOFLUSH: drop the MoE chain's per-layer flushBatch splits. Those were added to fight a
   -- "Dawn drops barriers at scale" race — but that race may have been the kill-9 GPU wedge / swap
   -- corruption all along (post-reboot experiment). If correct without them: faster AND simpler.
@@ -1677,7 +1681,9 @@ def main (args : List String) : IO Unit := do
           unless skGrp do disp device (scatterRankB totalTok nExpert nUsed maxPadded) (("idxs",sIdxs)::("off",sExpertOffset)::("sp",sSortedPos)::("ss",sSortedSlot)::List.nil) totalTok (hash ("srkk",li))
           pmark rMoeGrp   -- router + counting-sort grouping (clear/count/offsets/scatterRank)
           if moeRB then
-            if useMsl then
+            if oneStream then
+              pure ()   -- DG_MSLONESTREAM: gate/up is encoded into the combined one-cb dispatch at the down site
+            else if useMsl then
               -- DG_MSL: the hand-MSL port of the indexed gate/up (1.61× vs WGSL/Tint, commit 8332c90).
               -- flushBatch commits the Dawn producers (grouping chain + sMoeN); the MSL cb commits
               -- next; Dawn's consumers commit at the following flush — hazard-tracked buffers give
@@ -1759,6 +1765,14 @@ def main (args : List String) : IO Unit := do
               IO.println s!"[moedowndiag] max|geglu A (down input)| = {mx}  (f16 max = 65504 → overflow if larger)"
               Hesper.GPUBackend.beginBatch device
             if moeDownFused then pure ()   -- the fused kernel already did geglu+down+scatter → sDownAll
+            else if oneStream then
+              -- DG_MSLONESTREAM: gate/up + fused down in ONE MTLCommandBuffer (one commit). flushBatch
+              -- commits the Dawn producers; the combined MSL cb commits next; Dawn consumers follow.
+              Hesper.WGSL.Execute.flushBatch device
+              mslGateupDownOnecb device sMoeN sSortedPos guE sGatheredGU sTileExpert raggedRows dnE sSortedSlot sDownAll
+                maxPadded.toUInt32 (2*expFF).toUInt32 dim.toUInt32 nExpert.toUInt32 N.toUInt32
+                dim.toUInt32 expFF.toUInt32 nUsed.toUInt32 N.toUInt32 (if blk.ffn.down.quantFormat == .Q5_0 then 1 else 0)
+              pmark rMoeQ80
             else if moeDownRB && blk.ffn.down.quantFormat != .Q5_0 then
               -- INDEXED-SCATTER reg-matmul down (matrix units, in-kernel Q8_0 dequant): the C store
               -- scatters dst[slot,pos,col] IN-KERNEL — no 17.5M-element scatterGUB pass. The q80

@@ -96,6 +96,16 @@ opaque mslQ8DownDispatch (device : @& Device) (a b te tr pos slot dst : @& Buffe
 opaque mslQ5DownDispatch (device : @& Device) (a b te tr pos slot dst : @& Buffer)
     (M N K nExpert nUsed nTok : UInt32) : IO Unit
 
+/-- SINGLE-STREAM (DG_MSLONESTREAM): encode the MSL gate/up (q4k) AND the FUSED MSL down (q8/q5,
+    reads sGatheredGU + inline geglu) into ONE MTLCommandBuffer with two compute encoders + ONE commit,
+    so the gate/up→down MSL chain runs back-to-back with no inter-cb handoff bubble. gate/up writes
+    guC=sGatheredGU which the down reads as its A; down reuses guIdx as pos. isQ5 selects the down
+    kernel. Implies the fused down. macOS only. -/
+@[extern "lean_hesper_msl_gateup_down_onecb"]
+opaque mslGateupDownOnecb (device : @& Device)
+    (guSrc guIdx guB guC te tr dnB dnSlot dnDst : @& Buffer)
+    (maxPadded guN guK nExpert srcRows dnN dnK nUsed nTok isQ5 : UInt32) : IO Unit
+
 /-- Check if the device was created with the Chromium experimental
     subgroup matrix feature. `subgroup_matrix_left/right/result` types
     and `subgroupMatrixLoad/Store/MultiplyAccumulate` are available iff

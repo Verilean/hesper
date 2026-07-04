@@ -989,6 +989,108 @@ extern "C" lean_obj_res lean_hesper_msl_q5down_dispatch(
     return lean_io_result_mk_ok(lean_box(0));
 }
 
+// SINGLE-STREAM: encode the MSL gate/up AND the fused MSL down into ONE command buffer (two compute
+// encoders, ONE commit) — testing whether same-cb execution removes the ~220ms/step inter-cb handoff
+// bubbles. Two compute encoders in one cb are implicitly ordered + memory-coherent on Metal, so the
+// gate/up→sGatheredGU→down chain is correct with no explicit barrier. Requires the FUSED down (reads
+// sGatheredGU + inline geglu) so there is no Dawn work between the two MSL kernels. isQ5 selects the
+// down kernel. Buffers: gate/up {src,idx,b(guE),c(sGatheredGU),te,tr}; down reuses c as its A and idx
+// as its pos, plus {b(dnE),slot,dst}. Shares the g_q4k/q8d/q5d PSO caches with the separate dispatches.
+extern "C" lean_obj_res lean_hesper_msl_gateup_down_onecb(
+    b_lean_obj_arg device_obj,
+    b_lean_obj_arg guSrc_obj, b_lean_obj_arg guIdx_obj, b_lean_obj_arg guB_obj, b_lean_obj_arg guC_obj,
+    b_lean_obj_arg te_obj, b_lean_obj_arg tr_obj,
+    b_lean_obj_arg dnB_obj, b_lean_obj_arg dnSlot_obj, b_lean_obj_arg dnDst_obj,
+    uint32_t maxPadded, uint32_t guN, uint32_t guK, uint32_t nExpert, uint32_t srcRows,
+    uint32_t dnN, uint32_t dnK, uint32_t nUsed, uint32_t nTok, uint32_t isQ5,
+    lean_obj_res /* unit */) {
+    wgpu::Device* device = mr_extract_device(device_obj);
+    if (!device || !device->Get()) return lean_io_result_mk_error(lean_mk_string("msl_onecb: invalid device"));
+    id<MTLDevice> mtl = dawn::native::metal::GetMTLDevice(device->Get());
+    b_lean_obj_arg objs[9] = {guSrc_obj, guIdx_obj, guB_obj, guC_obj, te_obj, tr_obj, dnB_obj, dnSlot_obj, dnDst_obj};
+    id<MTLBuffer> Mb[9];
+    for (int i = 0; i < 9; i++) {
+        wgpu::Buffer* wb = mr_extract_buffer(objs[i]);
+        if (!wb || !wb->Get()) return lean_io_result_mk_error(lean_mk_string("msl_onecb: invalid buffer"));
+        Mb[i] = reinterpret_cast<dawn::native::metal::Buffer*>(wb->Get())->GetMTLBuffer();
+        if (!Mb[i]) return lean_io_result_mk_error(lean_mk_string("msl_onecb: null MTLBuffer"));
+    }
+    id<MTLBuffer> guSrc=Mb[0], guIdx=Mb[1], guB=Mb[2], guC=Mb[3], te=Mb[4], tr=Mb[5], dnB=Mb[6], dnSlot=Mb[7], dnDst=Mb[8];
+    auto substOf = [](std::string& msl, const char* t, uint32_t v){
+        std::string tk(t), r = std::to_string(v); size_t p;
+        while ((p = msl.find(tk)) != std::string::npos) msl.replace(p, tk.size(), r);
+    };
+    // gate/up PSO (shares g_q4kPso cache)
+    uint32_t gkey[5] = {maxPadded, guN, guK, nExpert, srcRows};
+    if (!g_q4kPso || memcmp(gkey, g_q4kKey, sizeof(gkey)) != 0) {
+        std::string msl(kQ4kMslTemplate);
+        substOf(msl,"@M@",maxPadded); substOf(msl,"@N@",guN); substOf(msl,"@K@",guK);
+        substOf(msl,"@NEXP@",nExpert); substOf(msl,"@SRCROWS@",srcRows);
+        NSError* err=nil; MTLCompileOptions* opts=[MTLCompileOptions new];
+        id<MTLLibrary> lib=[mtl newLibraryWithSource:[NSString stringWithUTF8String:msl.c_str()] options:opts error:&err];
+        if(!lib) return lean_io_result_mk_error(lean_mk_string([[NSString stringWithFormat:@"msl_onecb q4k compile: %@",err] UTF8String]));
+        id<MTLFunction> fn=[lib newFunctionWithName:@"q4k_grouped_reg_indexed"];
+        id<MTLComputePipelineState> pso=[mtl newComputePipelineStateWithFunction:fn error:&err];
+        if(!pso) return lean_io_result_mk_error(lean_mk_string("msl_onecb: q4k pipeline failed"));
+        g_q4kPso=pso; memcpy(g_q4kKey,gkey,sizeof(gkey));
+    }
+    // down PSO (fused=1), q8 or q5 (shares g_q8dPso/g_q5dPso caches)
+    uint32_t dkey[7] = {maxPadded, dnN, dnK, nExpert, nUsed, nTok, 1u};
+    id<MTLComputePipelineState> downPso = nil;
+    if (isQ5) {
+        if (!g_q5dPso || memcmp(dkey, g_q5dKey, sizeof(dkey)) != 0) {
+            std::string msl(kQ5DownMslTemplate);
+            substOf(msl,"@M@",maxPadded); substOf(msl,"@N@",dnN); substOf(msl,"@K@",dnK);
+            substOf(msl,"@NEXP@",nExpert); substOf(msl,"@NUSED@",nUsed); substOf(msl,"@NTOK@",nTok); substOf(msl,"@FUSED@",1u);
+            NSError* err=nil; MTLCompileOptions* opts=[MTLCompileOptions new];
+            id<MTLLibrary> lib=[mtl newLibraryWithSource:[NSString stringWithUTF8String:msl.c_str()] options:opts error:&err];
+            if(!lib) return lean_io_result_mk_error(lean_mk_string([[NSString stringWithFormat:@"msl_onecb q5 compile: %@",err] UTF8String]));
+            id<MTLFunction> fn=[lib newFunctionWithName:@"q5_down_indexed_scatter"];
+            id<MTLComputePipelineState> pso=[mtl newComputePipelineStateWithFunction:fn error:&err];
+            if(!pso) return lean_io_result_mk_error(lean_mk_string("msl_onecb: q5 pipeline failed"));
+            g_q5dPso=pso; memcpy(g_q5dKey,dkey,sizeof(dkey));
+        }
+        downPso = g_q5dPso;
+    } else {
+        if (!g_q8dPso || memcmp(dkey, g_q8dKey, sizeof(dkey)) != 0) {
+            std::string msl(kQ8DownMslTemplate);
+            substOf(msl,"@M@",maxPadded); substOf(msl,"@N@",dnN); substOf(msl,"@K@",dnK);
+            substOf(msl,"@NEXP@",nExpert); substOf(msl,"@NUSED@",nUsed); substOf(msl,"@NTOK@",nTok); substOf(msl,"@FUSED@",1u);
+            NSError* err=nil; MTLCompileOptions* opts=[MTLCompileOptions new];
+            id<MTLLibrary> lib=[mtl newLibraryWithSource:[NSString stringWithUTF8String:msl.c_str()] options:opts error:&err];
+            if(!lib) return lean_io_result_mk_error(lean_mk_string([[NSString stringWithFormat:@"msl_onecb q8 compile: %@",err] UTF8String]));
+            id<MTLFunction> fn=[lib newFunctionWithName:@"q8_down_indexed_scatter"];
+            id<MTLComputePipelineState> pso=[mtl newComputePipelineStateWithFunction:fn error:&err];
+            if(!pso) return lean_io_result_mk_error(lean_mk_string("msl_onecb: q8 pipeline failed"));
+            g_q8dPso=pso; memcpy(g_q8dKey,dkey,sizeof(dkey));
+        }
+        downPso = g_q8dPso;
+    }
+    // ONE command buffer, TWO encoders, ONE commit
+    auto _tw0 = std::chrono::steady_clock::now();
+    static const bool sepQueue = getenv("DG_MSLSEPQUEUE") != nullptr;
+    id<MTLCommandQueue> mslQ = sepQueue ? nil : mr_dawn_queue(device);
+    if (!mslQ) { if (!g_mslQueue) g_mslQueue = [mtl newCommandQueue]; dawn::native::metal::WaitForCommandsToBeScheduled(device->Get()); mslQ = g_mslQueue; }
+    auto _tw1 = std::chrono::steady_clock::now();
+    id<MTLCommandBuffer> cb = [mslQ commandBuffer];
+    id<MTLComputeCommandEncoder> e1 = [cb computeCommandEncoder];
+    [e1 setComputePipelineState:g_q4kPso];
+    { id<MTLBuffer> gb[6] = {guSrc, guIdx, guB, guC, te, tr}; for (int i=0;i<6;i++) [e1 setBuffer:gb[i] offset:0 atIndex:i]; }
+    [e1 dispatchThreadgroups:MTLSizeMake((guN+31)/32, (maxPadded+31)/32, 1) threadsPerThreadgroup:MTLSizeMake(128,1,1)];
+    [e1 endEncoding];
+    id<MTLComputeCommandEncoder> e2 = [cb computeCommandEncoder];
+    [e2 setComputePipelineState:downPso];
+    { id<MTLBuffer> db[7] = {guC, dnB, te, tr, guIdx, dnSlot, dnDst}; for (int i=0;i<7;i++) [e2 setBuffer:db[i] offset:0 atIndex:i]; }
+    [e2 dispatchThreadgroups:MTLSizeMake((dnN+31)/32, (maxPadded+31)/32, 1) threadsPerThreadgroup:MTLSizeMake(128,1,1)];
+    [e2 endEncoding];
+    mslAccountGpu(cb);
+    [cb commit];
+    g_msl_count.fetch_add(1, std::memory_order_relaxed);
+    g_msl_wait_ns.fetch_add(std::chrono::duration_cast<std::chrono::nanoseconds>(_tw1 - _tw0).count(), std::memory_order_relaxed);
+    g_msl_enc_ns.fetch_add(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - _tw1).count(), std::memory_order_relaxed);
+    return lean_io_result_mk_ok(lean_box(0));
+}
+
 extern "C" lean_obj_res lean_hesper_mtl_device_name(b_lean_obj_arg device_obj, lean_obj_res /* unit */) {
     wgpu::Device* device = mr_extract_device(device_obj);
     if (!device || !device->Get()) {
