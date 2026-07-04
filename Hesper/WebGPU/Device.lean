@@ -49,6 +49,16 @@ opaque deviceHasSubgroups (device : @& Device) : IO Bool
 @[extern "lean_hesper_mtl_device_name"]
 opaque mtlDeviceName (device : @& Device) : IO String
 
+/-- DG_GPUBUSY: read+reset the compute-pass count + host (record/finish) vs GPU (submit+wait)
+    time split accumulated since the last read. Quantifies encoder-per-dispatch host overhead. -/
+@[extern "lean_hesper_gpubusy_read"]
+opaque gpuBusyRead : IO String
+
+/-- DG_GPUBUSY: read+reset the MSL-path split (count / WaitForCommandsToBeScheduled / encode+commit
+    / kernel GPU time). Complements gpuBusyRead (which covers the Dawn WGSL path only). -/
+@[extern "lean_hesper_msl_busy_read"]
+opaque mslBusyRead : IO String
+
 /-- metal_replacer STEP 4: Apple's tuned MPS f16 matmul (C=A·Bᵀ, our reg-matmul shape) as the CEILING —
     returns "ms/call | GFLOPS | %peak". Diff vs the WGSL reg (harness) at the same shape to quantify the
     WGSL→Tint→Metal gap. macOS DEBUG/REFERENCE only. See METAL_REPLACER_INTEGRATION.md. -/

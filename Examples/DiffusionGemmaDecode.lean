@@ -2012,6 +2012,7 @@ def main (args : List String) : IO Unit := do
         effSteps := effSteps + 1
         let stopStr := if finish then " | STOP" else ""
         IO.println s!"[dg-decode] step {step}: eb acc={nAcc} chg={nChanged} meanH={meanH} held={ebHeld} t={tCur} | total {t1-t0}ms = emb+fwd {tFwd-t0}ms + lmhead+reduce {tLm-tFwd}ms{stopStr}"
+        if (← IO.getEnv "DG_GPUBUSY").isSome then IO.println s!"  [gpubusy] {← Hesper.WebGPU.gpuBusyRead} || {← Hesper.WebGPU.mslBusyRead}"
         continue
       scTok := ktokFlat; scProb := probFlat   -- feed this step's top-K soft prediction into next step's SC
       let want := if step+1 ≥ decodeSteps then remaining else max 1 ((C + decodeSteps - 1) / decodeSteps)

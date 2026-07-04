@@ -14,6 +14,30 @@
 #import <MetalPerformanceShaders/MetalPerformanceShaders.h>
 #include <chrono>
 #include <cstring>
+#include <atomic>
+
+// DG_GPUBUSY: MSL-path accounting. wait = time in WaitForCommandsToBeScheduled (Dawn→MSL handoff);
+// enc = command-buffer build+encode+commit (CPU); gpu = kernel GPU time (GPUEnd-GPUStart, via a
+// completed handler). count = MSL dispatches. Read+reset by lean_hesper_msl_busy_read.
+static std::atomic<uint64_t> g_msl_count{0};
+static std::atomic<uint64_t> g_msl_wait_ns{0};
+static std::atomic<uint64_t> g_msl_enc_ns{0};
+static std::atomic<uint64_t> g_msl_gpu_ns{0};
+
+static inline void mslAccountGpu(id<MTLCommandBuffer> cb) {
+    [cb addCompletedHandler:^(id<MTLCommandBuffer> c) {
+        g_msl_gpu_ns.fetch_add((uint64_t)((c.GPUEndTime - c.GPUStartTime) * 1e9), std::memory_order_relaxed);
+    }];
+}
+
+extern "C" lean_obj_res lean_hesper_msl_busy_read(lean_obj_res /* unit */) {
+    char b[256];
+    snprintf(b, sizeof(b), "msl_count=%llu wait=%.2fms enc=%.2fms gpu=%.2fms",
+             (unsigned long long)g_msl_count.exchange(0),
+             g_msl_wait_ns.exchange(0) / 1e6, g_msl_enc_ns.exchange(0) / 1e6,
+             g_msl_gpu_ns.exchange(0) / 1e6);
+    return lean_io_result_mk_ok(lean_mk_string(b));
+}
 
 // Same extraction as bridge.cpp's EXTRACT_DEVICE_PTR: the device Lean struct holds the wgpu::Device* as its
 // external data at ctor field 0.
@@ -447,7 +471,9 @@ extern "C" lean_obj_res lean_hesper_msl_q4k_dispatch(
     // WaitForCommandsToBeScheduled blocks until Dawn's producer command buffers are committed and
     // scheduled (NOT completed — µs-class), making our commit provably later. Empirically required:
     // without it the pipeline races (NOBATCH+MSL converges fine; batched+MSL garbaged).
+    auto _tw0 = std::chrono::steady_clock::now();
     dawn::native::metal::WaitForCommandsToBeScheduled(device->Get());
+    auto _tw1 = std::chrono::steady_clock::now();
     id<MTLCommandBuffer> cb = [g_mslQueue commandBuffer];
     id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
     [enc setComputePipelineState:g_q4kPso];
@@ -455,7 +481,11 @@ extern "C" lean_obj_res lean_hesper_msl_q4k_dispatch(
     [enc dispatchThreadgroups:MTLSizeMake((Nv + 31) / 32, (Mv + 31) / 32, 1)
         threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
     [enc endEncoding];
+    mslAccountGpu(cb);
     [cb commit];   // no wait — hazard tracking orders vs Dawn's committed work
+    g_msl_count.fetch_add(1, std::memory_order_relaxed);
+    g_msl_wait_ns.fetch_add(std::chrono::duration_cast<std::chrono::nanoseconds>(_tw1 - _tw0).count(), std::memory_order_relaxed);
+    g_msl_enc_ns.fetch_add(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - _tw1).count(), std::memory_order_relaxed);
     return lean_io_result_mk_ok(lean_box(0));
 }
 
@@ -644,7 +674,9 @@ extern "C" lean_obj_res lean_hesper_msl_q8down_dispatch(
         memcpy(g_q8dKey, key, sizeof(key));
     }
     if (!g_mslQueue) g_mslQueue = [mtl newCommandQueue];
+    auto _tw0 = std::chrono::steady_clock::now();
     dawn::native::metal::WaitForCommandsToBeScheduled(device->Get());
+    auto _tw1 = std::chrono::steady_clock::now();
     id<MTLCommandBuffer> cb = [g_mslQueue commandBuffer];
     id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
     [enc setComputePipelineState:g_q8dPso];
@@ -652,7 +684,11 @@ extern "C" lean_obj_res lean_hesper_msl_q8down_dispatch(
     [enc dispatchThreadgroups:MTLSizeMake((Nv + 31) / 32, (Mv + 31) / 32, 1)
         threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
     [enc endEncoding];
+    mslAccountGpu(cb);
     [cb commit];   // no wait — hazard tracking orders vs Dawn's committed work
+    g_msl_count.fetch_add(1, std::memory_order_relaxed);
+    g_msl_wait_ns.fetch_add(std::chrono::duration_cast<std::chrono::nanoseconds>(_tw1 - _tw0).count(), std::memory_order_relaxed);
+    g_msl_enc_ns.fetch_add(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - _tw1).count(), std::memory_order_relaxed);
     return lean_io_result_mk_ok(lean_box(0));
 }
 
@@ -848,7 +884,9 @@ extern "C" lean_obj_res lean_hesper_msl_q5down_dispatch(
         memcpy(g_q5dKey, key, sizeof(key));
     }
     if (!g_mslQueue) g_mslQueue = [mtl newCommandQueue];
+    auto _tw0 = std::chrono::steady_clock::now();
     dawn::native::metal::WaitForCommandsToBeScheduled(device->Get());
+    auto _tw1 = std::chrono::steady_clock::now();
     id<MTLCommandBuffer> cb = [g_mslQueue commandBuffer];
     id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
     [enc setComputePipelineState:g_q5dPso];
@@ -856,7 +894,11 @@ extern "C" lean_obj_res lean_hesper_msl_q5down_dispatch(
     [enc dispatchThreadgroups:MTLSizeMake((Nv + 31) / 32, (Mv + 31) / 32, 1)
         threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
     [enc endEncoding];
+    mslAccountGpu(cb);
     [cb commit];   // no wait — hazard tracking orders vs Dawn's committed work
+    g_msl_count.fetch_add(1, std::memory_order_relaxed);
+    g_msl_wait_ns.fetch_add(std::chrono::duration_cast<std::chrono::nanoseconds>(_tw1 - _tw0).count(), std::memory_order_relaxed);
+    g_msl_enc_ns.fetch_add(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - _tw1).count(), std::memory_order_relaxed);
     return lean_io_result_mk_ok(lean_box(0));
 }
 
