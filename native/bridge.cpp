@@ -53,9 +53,18 @@ static const wgpu::RequestAdapterOptions* togglesAdapterOptions() {
         "use_vulkan_memory_model",
         "vulkan_enable_f16_on_nvidia",
         "decompose_uniform_buffers",
+        // EXPERIMENT (robustness hypothesis for the 1.52× WGSL-vs-hand-MSL codegen gap): Tint clamps
+        // every dynamic buffer index for WGSL safety; our kernels are explicitly DSL-guarded, so the
+        // clamps are redundant ALU in hot dequant loops. Disable → OOB becomes UB, validate golden+gate.
+        "disable_robustness",
     };
     toggles.enabledToggles = enableList;
-    toggles.enabledToggleCount = sizeof(enableList) / sizeof(enableList[0]);
+    // disable_robustness (last entry) is OPT-IN via HESPER_DISABLE_ROBUSTNESS — enabling it globally
+    // would make OOB UB for ANY unguarded kernel in the engine (graphics/other models/tests). The
+    // DiffusionGemma decode kernels are explicitly DSL-guarded (validated 8/8), so it's safe there.
+    size_t nToggles = sizeof(enableList) / sizeof(enableList[0]);
+    if (!getenv("HESPER_DISABLE_ROBUSTNESS")) nToggles -= 1;  // drop the trailing disable_robustness
+    toggles.enabledToggleCount = nToggles;
 
     static wgpu::RequestAdapterOptions options{};
     options.nextInChain = reinterpret_cast<const wgpu::ChainedStruct*>(&toggles.chain);
@@ -718,9 +727,18 @@ static wgpu::Device createDeviceWithMaxLimits(wgpu::Adapter& adapter) {
         "use_vulkan_memory_model",
         "vulkan_enable_f16_on_nvidia",
         "decompose_uniform_buffers",
+        // EXPERIMENT (robustness hypothesis for the 1.52× WGSL-vs-hand-MSL codegen gap): Tint clamps
+        // every dynamic buffer index for WGSL safety; our kernels are explicitly DSL-guarded, so the
+        // clamps are redundant ALU in hot dequant loops. Disable → OOB becomes UB, validate golden+gate.
+        "disable_robustness",
     };
     toggles.enabledToggles = enableList;
-    toggles.enabledToggleCount = sizeof(enableList) / sizeof(enableList[0]);
+    // disable_robustness (last entry) is OPT-IN via HESPER_DISABLE_ROBUSTNESS — enabling it globally
+    // would make OOB UB for ANY unguarded kernel in the engine (graphics/other models/tests). The
+    // DiffusionGemma decode kernels are explicitly DSL-guarded (validated 8/8), so it's safe there.
+    size_t nToggles = sizeof(enableList) / sizeof(enableList[0]);
+    if (!getenv("HESPER_DISABLE_ROBUSTNESS")) nToggles -= 1;  // drop the trailing disable_robustness
+    toggles.enabledToggleCount = nToggles;
 
     // Limits: max settings for large model buffers (1 GB storage, 2 GB buffer)
     WGPULimits limits = getMaxLimits(adapter);
