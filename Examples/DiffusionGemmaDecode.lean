@@ -1192,6 +1192,10 @@ def main (args : List String) : IO Unit := do
   -- DG_MSLDOWN: MSL port of the Q8_0 MoE down (same recipe as the gate/up). Separate opt-out so
   -- the two can be A/B'd independently; both share the portable-WGSL fallback semantics.
   let useMslDown := (← IO.getEnv "DG_NOMSLDOWN").isNone
+  -- DG_FUSEDOWN: the MSL down kernel reads the raw grouped gate/up (sGatheredGU) and computes geglu
+  -- inline, dropping the Dawn gegluMergedB + q80 dispatches so MSL gate/up and MSL down run
+  -- back-to-back on Dawn's queue (tests the ~220ms cross-queue handoff-bubble hypothesis).
+  let fuseDown := useMslDown && (← IO.getEnv "DG_FUSEDOWN").isSome
   -- DG_MOENOFLUSH: drop the MoE chain's per-layer flushBatch splits. Those were added to fight a
   -- "Dawn drops barriers at scale" race — but that race may have been the kill-9 GPU wedge / swap
   -- corruption all along (post-reboot experiment). If correct without them: faster AND simpler.
@@ -1742,6 +1746,7 @@ def main (args : List String) : IO Unit := do
             if moeDownFused then
               dispRB device (Hesper.Quantization.Q4_K_M.q8FusedGegluDownScatterKernel maxPadded dim expFF nExpert nUsed N)
                 (("gu",sGatheredGU)::("b",dnE)::("tileExpert",sTileExpert)::("pos",sSortedPos)::("slot",sSortedSlot)::("dst",sDownAll)::List.nil) ((dim+31)/32) ((maxPadded+31)/32) (hash ("fdg",li))
+            else if fuseDown then pure ()   -- geglu is computed inline inside the fused MSL down kernel
             else
               disp device (gegluMergedB maxPadded expFF 0 (maxPadded*2*expFF)) (("gu",sGatheredGU)::("eh",sGatheredEh)::List.nil) (maxPadded*expFF) (hash ("gmg",li))
             unless moeNoFlush do Hesper.WGSL.Execute.flushBatch device
@@ -1758,13 +1763,14 @@ def main (args : List String) : IO Unit := do
               -- INDEXED-SCATTER reg-matmul down (matrix units, in-kernel Q8_0 dequant): the C store
               -- scatters dst[slot,pos,col] IN-KERNEL — no 17.5M-element scatterGUB pass. The q80
               -- round-trip both matches the warp's Q8 rounding AND acts as the geglu→down sync.
-              q80 device sGatheredEh maxPadded expFF (hash ("qgehrb",li))
+              unless fuseDown do q80 device sGatheredEh maxPadded expFF (hash ("qgehrb",li))
               pmark rMoeQ80
               if useMslDown then
                 -- DG_MSLDOWN: hand-MSL port (same ordering contract as the gate/up: flushBatch
                 -- commits the producers, the MSL cb commits next, hazard tracking orders them).
+                -- DG_FUSEDOWN: pass the raw grouped gate/up (sGatheredGU); the kernel geglu's inline.
                 Hesper.WGSL.Execute.flushBatch device
-                mslQ8DownDispatch device sGatheredEh dnE sTileExpert raggedRows sSortedPos sSortedSlot sDownAll
+                mslQ8DownDispatch device (if fuseDown then sGatheredGU else sGatheredEh) dnE sTileExpert raggedRows sSortedPos sSortedSlot sDownAll
                   maxPadded.toUInt32 dim.toUInt32 expFF.toUInt32 nExpert.toUInt32 nUsed.toUInt32 N.toUInt32
               else do
                 unless moeNoFlush do Hesper.WGSL.Execute.flushBatch device
@@ -1773,10 +1779,10 @@ def main (args : List String) : IO Unit := do
             else if moeDownRB && useMslDown then
               -- Q5_0 layer, MSL port (22B/block): same recipe as the Q8_0 MSL down — q80 round-trip
               -- for rounding parity + sync, flushBatch commits producers, hazard-tracked MSL commit.
-              q80 device sGatheredEh maxPadded expFF (hash ("qgehq5",li))
+              unless fuseDown do q80 device sGatheredEh maxPadded expFF (hash ("qgehq5",li))
               pmark rMoeQ80
               Hesper.WGSL.Execute.flushBatch device
-              mslQ5DownDispatch device sGatheredEh dnE sTileExpert raggedRows sSortedPos sSortedSlot sDownAll
+              mslQ5DownDispatch device (if fuseDown then sGatheredGU else sGatheredEh) dnE sTileExpert raggedRows sSortedPos sSortedSlot sDownAll
                 maxPadded.toUInt32 dim.toUInt32 expFF.toUInt32 nExpert.toUInt32 nUsed.toUInt32 N.toUInt32
             else
               q80 device sGatheredEh maxPadded expFF (hash ("qgeh",li))   -- match the per-slot Q8 rounding

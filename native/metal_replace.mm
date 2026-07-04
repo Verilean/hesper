@@ -555,9 +555,19 @@ constant uint NUSED = @NUSED@u;
 constant uint NTOK = @NTOK@u;
 constant uint RSB = (K/32u)*34u;   // row stride in BYTES (34B per 32-K Q8_0 block, NOT u32-aligned)
 constant uint NUMBLK = K/32u;
+constant uint FUSED = @FUSED@u;   // 1 = buffer(0) is the raw grouped gate/up [M,2K]; geglu inline
 
 inline uint rd_byte(device const uint* b, uint bo) {
   return (b[bo >> 2u] >> ((bo & 3u)*8u)) & 0xFFu;
+}
+
+// tanh-GELU geglu (matches gegluMergedB / q8FusedGegluDownScatterKernel): gate*0.5*(1+tanh(...))*up
+inline float geglu_row(device const float* gu, uint row, uint kG) {
+  float gate = gu[row*(2u*K) + kG];
+  float up   = gu[row*(2u*K) + K + kG];
+  float g3 = gate*gate*gate;
+  float inner = clamp(0.7978845608f*(gate + 0.044715f*g3), -10.0f, 10.0f);
+  return 0.5f*gate*(1.0f + tanh(inner)) * up;
 }
 
 kernel void q8_down_indexed_scatter(
@@ -609,7 +619,8 @@ kernel void q8_down_indexed_scatter(
         uint flat = tid + s*128u;
         uint m = flat/32u, k = flat % 32u;
         if (m < tr8) {
-          float x = a[(rowBase + m)*K + blockIdx*32u + k];
+          uint kG = blockIdx*32u + k;
+          float x = FUSED ? geglu_row(a, rowBase + m, kG) : a[(rowBase + m)*K + kG];
           uint blk = (m/8u)*4u + k/8u;
           uint within = (m % 8u)*8u + (k % 8u);
           shared_A[blk*64u + within] = half(x);
@@ -679,7 +690,7 @@ kernel void q8_down_indexed_scatter(
 )MSL";
 
 static id<MTLComputePipelineState> g_q8dPso = nil;
-static uint32_t g_q8dKey[6] = {0,0,0,0,0,0};
+static uint32_t g_q8dKey[7] = {0,0,0,0,0,0,0};
 
 extern "C" lean_obj_res lean_hesper_msl_q8down_dispatch(
     b_lean_obj_arg device_obj,
@@ -700,7 +711,8 @@ extern "C" lean_obj_res lean_hesper_msl_q8down_dispatch(
         mb[i] = reinterpret_cast<dawn::native::metal::Buffer*>(bufs[i]->Get())->GetMTLBuffer();
         if (!mb[i]) return lean_io_result_mk_error(lean_mk_string("msl_q8down: null MTLBuffer"));
     }
-    uint32_t key[6] = {Mv, Nv, Kv, nExpert, nUsed, nTok};
+    uint32_t fused = getenv("DG_FUSEDOWN") != nullptr ? 1u : 0u;
+    uint32_t key[7] = {Mv, Nv, Kv, nExpert, nUsed, nTok, fused};
     if (!g_q8dPso || memcmp(key, g_q8dKey, sizeof(key)) != 0) {
         std::string msl(kQ8DownMslTemplate);
         auto subst = [&](const char* tok, uint32_t v) {
@@ -710,6 +722,7 @@ extern "C" lean_obj_res lean_hesper_msl_q8down_dispatch(
         };
         subst("@M@", Mv); subst("@N@", Nv); subst("@K@", Kv);
         subst("@NEXP@", nExpert); subst("@NUSED@", nUsed); subst("@NTOK@", nTok);
+        subst("@FUSED@", fused);
         NSError* err = nil;
         MTLCompileOptions* opts = [MTLCompileOptions new];
         id<MTLLibrary> lib = [mtl newLibraryWithSource:[NSString stringWithUTF8String:msl.c_str()] options:opts error:&err];
@@ -764,9 +777,18 @@ constant uint NUSED = @NUSED@u;
 constant uint NTOK = @NTOK@u;
 constant uint RSB = (K/32u)*22u;   // row stride in BYTES (22B per 32-K Q5_0 block)
 constant uint NUMBLK = K/32u;
+constant uint FUSED = @FUSED@u;   // 1 = buffer(0) is the raw grouped gate/up [M,2K]; geglu inline
 
 inline uint rd_byte(device const uint* b, uint bo) {
   return (b[bo >> 2u] >> ((bo & 3u)*8u)) & 0xFFu;
+}
+
+inline float geglu_row(device const float* gu, uint row, uint kG) {
+  float gate = gu[row*(2u*K) + kG];
+  float up   = gu[row*(2u*K) + K + kG];
+  float g3 = gate*gate*gate;
+  float inner = clamp(0.7978845608f*(gate + 0.044715f*g3), -10.0f, 10.0f);
+  return 0.5f*gate*(1.0f + tanh(inner)) * up;
 }
 
 kernel void q5_down_indexed_scatter(
@@ -821,7 +843,8 @@ kernel void q5_down_indexed_scatter(
         uint flat = tid + s*128u;
         uint m = flat/32u, k = flat % 32u;
         if (m < tr8) {
-          float x = a[(rowBase + m)*K + blockIdx*32u + k];
+          uint kG = blockIdx*32u + k;
+          float x = FUSED ? geglu_row(a, rowBase + m, kG) : a[(rowBase + m)*K + kG];
           uint blk = (m/8u)*4u + k/8u;
           uint within = (m % 8u)*8u + (k % 8u);
           shared_A[blk*64u + within] = half(x);
@@ -896,7 +919,7 @@ kernel void q5_down_indexed_scatter(
 )MSL";
 
 static id<MTLComputePipelineState> g_q5dPso = nil;
-static uint32_t g_q5dKey[6] = {0,0,0,0,0,0};
+static uint32_t g_q5dKey[7] = {0,0,0,0,0,0,0};
 
 extern "C" lean_obj_res lean_hesper_msl_q5down_dispatch(
     b_lean_obj_arg device_obj,
@@ -917,7 +940,8 @@ extern "C" lean_obj_res lean_hesper_msl_q5down_dispatch(
         mb[i] = reinterpret_cast<dawn::native::metal::Buffer*>(bufs[i]->Get())->GetMTLBuffer();
         if (!mb[i]) return lean_io_result_mk_error(lean_mk_string("msl_q5down: null MTLBuffer"));
     }
-    uint32_t key[6] = {Mv, Nv, Kv, nExpert, nUsed, nTok};
+    uint32_t fused = getenv("DG_FUSEDOWN") != nullptr ? 1u : 0u;
+    uint32_t key[7] = {Mv, Nv, Kv, nExpert, nUsed, nTok, fused};
     if (!g_q5dPso || memcmp(key, g_q5dKey, sizeof(key)) != 0) {
         std::string msl(kQ5DownMslTemplate);
         auto subst = [&](const char* tok, uint32_t v) {
@@ -927,6 +951,7 @@ extern "C" lean_obj_res lean_hesper_msl_q5down_dispatch(
         };
         subst("@M@", Mv); subst("@N@", Nv); subst("@K@", Kv);
         subst("@NEXP@", nExpert); subst("@NUSED@", nUsed); subst("@NTOK@", nTok);
+        subst("@FUSED@", fused);
         NSError* err = nil;
         MTLCompileOptions* opts = [MTLCompileOptions new];
         id<MTLLibrary> lib = [mtl newLibraryWithSource:[NSString stringWithUTF8String:msl.c_str()] options:opts error:&err];
