@@ -60,6 +60,48 @@ class Buffer {
 };
 }  // namespace dawn::native::metal
 
+// MINIMAL decls to reach Dawn's OWN MTLCommandQueue (same reinterpret trick). Committing the MSL
+// command buffers to Dawn's queue instead of a separate one makes commit-order == execution-order
+// on a single Metal queue → correct producer→MSL→consumer ordering WITHOUT the per-dispatch
+// WaitForCommandsToBeScheduled CPU block (~7ms × 60/step = 430ms/step, the whole gap to llama.cpp).
+// Symbols verified in libwebgpu_dawn.a:
+//   dawn::native::metal::Queue::GetPendingCommandContext(dawn::native::ExecutionQueueBase::SubmitMode)
+//   dawn::native::metal::CommandRecordingContext::GetCommands()
+// Passive submitMode is peek-only (no SetNeedsSubmit); GetCommands returns the current pending
+// MTLCommandBuffer, whose -commandQueue IS Dawn's mCommandQueue.
+namespace dawn::native {
+class ExecutionQueueBase {
+ public:
+    enum class SubmitMode { Normal, Passive };
+};
+namespace metal {
+class CommandRecordingContext {
+ public:
+    id<MTLCommandBuffer> GetCommands();
+};
+class Queue {
+ public:
+    CommandRecordingContext* GetPendingCommandContext(dawn::native::ExecutionQueueBase::SubmitMode);
+};
+}  // namespace metal
+}  // namespace dawn::native
+
+// Dawn's own MTLCommandQueue (cached). WGPUQueue C-handle == QueueBase* == metal::Queue* (single
+// inheritance, QueueBase-first). Returns nil if Dawn hasn't prepared a command buffer yet.
+static id<MTLCommandQueue> g_dawnQueue = nil;
+static id<MTLCommandQueue> mr_dawn_queue(wgpu::Device* device) {
+    if (g_dawnQueue) return g_dawnQueue;
+    WGPUQueue qh = device->GetQueue().Get();
+    if (!qh) return nil;
+    auto* dq = reinterpret_cast<dawn::native::metal::Queue*>(qh);
+    auto* ctx = dq->GetPendingCommandContext(dawn::native::ExecutionQueueBase::SubmitMode::Passive);
+    if (!ctx) return nil;
+    id<MTLCommandBuffer> cb = ctx->GetCommands();
+    if (!cb) return nil;
+    g_dawnQueue = [cb commandQueue];
+    return g_dawnQueue;
+}
+
 // STEP 2: bridge our Dawn buffer to its underlying MTLBuffer. Prove it by reporting the MTLBuffer's length
 // (must match our allocation) + its contents (readable on unified memory).
 extern "C" lean_obj_res lean_hesper_mtl_buffer_probe(b_lean_obj_arg buffer_obj, lean_obj_res /* unit */) {
@@ -466,15 +508,21 @@ extern "C" lean_obj_res lean_hesper_msl_q4k_dispatch(
         g_q4kPso = pso;
         memcpy(g_q4kKey, key, sizeof(key));
     }
-    if (!g_mslQueue) g_mslQueue = [mtl newCommandQueue];
-    // Hazard tracking orders execution by COMMIT order — but Dawn's submit can lag the wgpu call.
-    // WaitForCommandsToBeScheduled blocks until Dawn's producer command buffers are committed and
-    // scheduled (NOT completed — µs-class), making our commit provably later. Empirically required:
-    // without it the pipeline races (NOBATCH+MSL converges fine; batched+MSL garbaged).
+    // Commit to Dawn's OWN queue → commit-order == execution-order on one Metal queue → correct
+    // producer→MSL→consumer ordering (the decode flushBatch-commits Dawn producers before this call
+    // and consumers after) with NO WaitForCommandsToBeScheduled CPU block. Falls back to a separate
+    // queue + the scheduling wait only if Dawn's queue isn't reachable yet (first dispatch). Set
+    // DG_MSLSEPQUEUE to force the old separate-queue+wait path.
     auto _tw0 = std::chrono::steady_clock::now();
-    dawn::native::metal::WaitForCommandsToBeScheduled(device->Get());
+    static const bool sepQueue = getenv("DG_MSLSEPQUEUE") != nullptr;
+    id<MTLCommandQueue> mslQ = sepQueue ? nil : mr_dawn_queue(device);
+    if (!mslQ) {
+        if (!g_mslQueue) g_mslQueue = [mtl newCommandQueue];
+        dawn::native::metal::WaitForCommandsToBeScheduled(device->Get());
+        mslQ = g_mslQueue;
+    }
     auto _tw1 = std::chrono::steady_clock::now();
-    id<MTLCommandBuffer> cb = [g_mslQueue commandBuffer];
+    id<MTLCommandBuffer> cb = [mslQ commandBuffer];
     id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
     [enc setComputePipelineState:g_q4kPso];
     for (int i = 0; i < 6; i++) [enc setBuffer:mb[i] offset:0 atIndex:i];
@@ -673,11 +721,18 @@ extern "C" lean_obj_res lean_hesper_msl_q8down_dispatch(
         g_q8dPso = pso;
         memcpy(g_q8dKey, key, sizeof(key));
     }
-    if (!g_mslQueue) g_mslQueue = [mtl newCommandQueue];
+    // Commit to Dawn's own queue (commit-order == execution-order, no scheduling wait); fall back to
+    // a separate queue + WaitForCommandsToBeScheduled if Dawn's queue isn't reachable. See mr_dawn_queue.
     auto _tw0 = std::chrono::steady_clock::now();
-    dawn::native::metal::WaitForCommandsToBeScheduled(device->Get());
+    static const bool sepQueue = getenv("DG_MSLSEPQUEUE") != nullptr;
+    id<MTLCommandQueue> mslQ = sepQueue ? nil : mr_dawn_queue(device);
+    if (!mslQ) {
+        if (!g_mslQueue) g_mslQueue = [mtl newCommandQueue];
+        dawn::native::metal::WaitForCommandsToBeScheduled(device->Get());
+        mslQ = g_mslQueue;
+    }
     auto _tw1 = std::chrono::steady_clock::now();
-    id<MTLCommandBuffer> cb = [g_mslQueue commandBuffer];
+    id<MTLCommandBuffer> cb = [mslQ commandBuffer];
     id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
     [enc setComputePipelineState:g_q8dPso];
     for (int i = 0; i < 7; i++) [enc setBuffer:mb[i] offset:0 atIndex:i];
@@ -883,11 +938,18 @@ extern "C" lean_obj_res lean_hesper_msl_q5down_dispatch(
         g_q5dPso = pso;
         memcpy(g_q5dKey, key, sizeof(key));
     }
-    if (!g_mslQueue) g_mslQueue = [mtl newCommandQueue];
+    // Commit to Dawn's own queue (commit-order == execution-order, no scheduling wait); fall back to
+    // a separate queue + WaitForCommandsToBeScheduled if Dawn's queue isn't reachable. See mr_dawn_queue.
     auto _tw0 = std::chrono::steady_clock::now();
-    dawn::native::metal::WaitForCommandsToBeScheduled(device->Get());
+    static const bool sepQueue = getenv("DG_MSLSEPQUEUE") != nullptr;
+    id<MTLCommandQueue> mslQ = sepQueue ? nil : mr_dawn_queue(device);
+    if (!mslQ) {
+        if (!g_mslQueue) g_mslQueue = [mtl newCommandQueue];
+        dawn::native::metal::WaitForCommandsToBeScheduled(device->Get());
+        mslQ = g_mslQueue;
+    }
     auto _tw1 = std::chrono::steady_clock::now();
-    id<MTLCommandBuffer> cb = [g_mslQueue commandBuffer];
+    id<MTLCommandBuffer> cb = [mslQ commandBuffer];
     id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
     [enc setComputePipelineState:g_q5dPso];
     for (int i = 0; i < 7; i++) [enc setBuffer:mb[i] offset:0 atIndex:i];
