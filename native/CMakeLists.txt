@@ -97,7 +97,17 @@ message(STATUS "Dawn build directory: ${DAWN_BUILD_DIR}")
 # their symbols (`dawnProcSetProcs`, `wgpuInstance*`, the entire Dawn
 # native runtime) are present in libhesper_native.so.  Consumers link
 # with `-lhesper_native` only — Dawn becomes an implementation detail.
-add_library(hesper_native SHARED bridge.cpp glfw_bridge.cpp metal_replace.mm)
+add_library(hesper_native SHARED bridge.cpp glfw_bridge.cpp)
+
+# metal_replace.mm is Objective-C++ (Metal / MPS — the metal_replacer debug/reference path).
+# It only compiles on macOS; on Linux/Windows there is no Objective-C++ backend (cc1objplus)
+# or Metal, so build the real Metal impl on APPLE and symbol-compatible stubs elsewhere (so
+# executables that reference the @[extern] MSL symbols still link — the paths are macOS-only).
+if(APPLE)
+  target_sources(hesper_native PRIVATE metal_replace.mm)
+else()
+  target_sources(hesper_native PRIVATE metal_replace_stub.cpp)
+endif()
 
 # macOS: bridge.cpp references Lean runtime symbols (lean_alloc_object,
 # lean_mk_string, lean_inc_heartbeat, mi_malloc_small, ...) but the
