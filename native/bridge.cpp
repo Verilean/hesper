@@ -31,6 +31,7 @@
 #include <string>
 #include <atomic>
 #include <memory>
+#include <mutex>
 #include <future>
 
 // Note: g_device removed - all functions now take device as parameter
@@ -672,6 +673,23 @@ static WGPULimits getMaxLimits(wgpu::Adapter& adapter) {
 }
 
 // Try to create a device with given feature set
+// HESPER_DUMP_MSL: retain the most recent Tint-MSL dump in-process so the autotune sweep can feed
+// it straight to the occupancy probe (lean_hesper_msl_occupancy_probe) — no stderr scraping.
+static std::mutex g_last_msl_mutex;
+static std::string g_last_dumped_msl;
+// Read once at device creation. Lives in a global (NOT a lambda capture): the logging callback must
+// be a CAPTURELESS lambda — a capturing one goes through the functor-userdata path whose lifetime
+// does not cover repeated logging invocations (observed: use-after-free → randomly ignored `quiet`
+// + nondeterministic SIGTRAP/SIGABRT during pipeline compiles).
+static bool g_msl_dump_quiet = false;
+
+// Read the most recent Tint-MSL dump captured by the HESPER_DUMP_MSL logging callback.
+// Empty string if nothing was dumped yet (or HESPER_DUMP_MSL is not set).
+extern "C" lean_obj_res lean_hesper_last_dumped_msl(lean_obj_res /* unit */) {
+    std::lock_guard<std::mutex> lock(g_last_msl_mutex);
+    return lean_io_result_mk_ok(lean_mk_string(g_last_dumped_msl.c_str()));
+}
+
 static wgpu::Device tryCreateDevice(wgpu::Adapter& adapter,
                                      const WGPUFeatureName* features, size_t featureCount,
                                      const WGPULimits& limits,
@@ -685,14 +703,23 @@ static wgpu::Device tryCreateDevice(wgpu::Adapter& adapter,
     deviceDesc.requiredLimits = reinterpret_cast<const wgpu::Limits*>(&limits);
     wgpu::Device device = adapter.CreateDevice(&deviceDesc);
     // HESPER_DUMP_MSL: route Dawn's dump_shaders output (the Tint-generated MSL) to stderr so we can
-    // capture it and diff against the hand-written MSL. Prefixed for easy grep/extraction.
+    // capture it and diff against the hand-written MSL, AND retain the latest dump in-process for the
+    // occupancy probe. HESPER_DUMP_MSL_QUIET=1 keeps the capture but suppresses stderr (sweep mode).
     if (device && getenv("HESPER_DUMP_MSL")) {
-        // Use the length-explicit StringView form: the const char* convenience overload is NOT
-        // guaranteed null-terminated, which reads OOB (SIGTRAP) on large dumped MSL.
+        g_msl_dump_quiet = getenv("HESPER_DUMP_MSL_QUIET") != nullptr;
+        // CAPTURELESS lambda (function-pointer path) — see g_msl_dump_quiet comment. Use the
+        // length-explicit StringView form: the const char* convenience overload is NOT guaranteed
+        // null-terminated, which reads OOB (SIGTRAP) on large dumped MSL.
         device.SetLoggingCallback([](wgpu::LoggingType, wgpu::StringView message) {
-            std::cerr << "===MSLDUMP-BEGIN===\n"
-                      << std::string(message.data, message.length)
-                      << "\n===MSLDUMP-END===" << std::endl;
+            {
+                std::lock_guard<std::mutex> lock(g_last_msl_mutex);
+                g_last_dumped_msl.assign(message.data, message.length);
+            }
+            if (!g_msl_dump_quiet) {
+                std::cerr << "===MSLDUMP-BEGIN===\n"
+                          << std::string(message.data, message.length)
+                          << "\n===MSLDUMP-END===" << std::endl;
+            }
         });
     }
     return device;
