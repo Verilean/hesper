@@ -139,3 +139,4 @@
 | 2026-07-05 | **mulMvQ4K family: 汎用性証明クリア（2 家族目、1 コマンド 12 秒）だが e2e NEUTRAL** | 全 shape 勝者 R1W1（4-warp は Apple で負け）。真因 = 684 dispatch × ~14µs 逐次レイテンシ床（HESPER_GPUBUSY 実測 GPU 9.5ms）— カーネル内部でなく dispatch 数が拘束。M7 の残りは fusion / dispatch 削減 |
 | 2026-07-05 | device-fed decode（HESPER_DEVICE_FED）は WebGPU で採用せず | 66.7 vs 68.0 t/s（利得なし）+ EOS 挙動差。CUDA graphs 前提の設計 |
 | 2026-07-05 | **M3 精読の結論: fusion 主線を撤回、並列 dispatch が本丸** | llama.cpp は Concurrent encoder + hazard-only barrier で我々より多い op 数を 6.4ms で流す。Dawn は Serial ハードコード。fusion 単独は ~100 t/s 天井。詳細 docs/llama-metal-dispatch-analysis.md |
+| 2026-07-05 | **CONCPROBE で B 案をデリスク: Serial 13.5µs/dispatch（decode 実測 14µs と一致=モデル妥当）→ Concurrent 6.9µs（2×、同一バッファ最悪契約で）** | 同じ Tint-MSL カーネルを native encoder で 300 発、dispatchType だけ変えて GPU 時間直測。GPU 9.5→~4.7ms 以下が射程 = decode ~104+ t/s。CONCPROBE=1 matmul-bench で再現 |
