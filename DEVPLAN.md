@@ -28,6 +28,9 @@
 - Metal が回収する最適化（strength reduction、SROA、copy-prop）を WGSL 側で先回りしても null。回収しないのは大域の重複部分式 CSE（→ `ShaderM.let'`）。詳細 `WGSL_CODEGEN_OPTIMIZATION.md`。
 - kernel は Lean 実行時に WGSL を生成する関数 → **パラメータ sweep に Lean 再ビルド不要**（1 プロセスで variant 生成→compile→実測）。
 - pipeline cache は WGSL ソース hash キー → 100 variants 問題なし。workgroupSize は kernel 定義に焼かれる（dispatch パラメータではない）。
+- **TAT 実測済み（M0, 2026-07-05, TATPROBE=1）**: **0.118 s/variant**（gen+compile ~80ms + bench100 ~40ms、deployed reg kernel @ QKV-KV 実 shape）→ **100 variants ≈ 12 秒、1000 ≈ 2 分**。律速は sweep でなく Lean 再ビルド（構造変更 ~1-3 分）と decode 統合（~8 分 + eval）。
+- **sweep 基盤は runtime-K-loop 生成器必須**: Lean レベルで K を全展開する生成器（`matMulTransposeF16WMMA8x8RegKernel`）は K=2816 で 1 variant のコンパイルが 5 分超（Tint/Metal 爆発）→ sweep 不能。M2/M4 は deployed 型（`ShaderM.loop`）で作る。
+- M2 golden の設計注意: 実 shape の CPU 参照 matmul は遅すぎる → golden は小 shape（64×32×64 級）で variant ごとに実施し、実 shape は timing のみ。
 
 ---
 
@@ -57,15 +60,17 @@
 
 ## §3. 現在の状態
 
-- **進行中**: M0（この文書の確定 + TAT 実測）— 新 Fable セッションで開始すること
+- **完了**: M0（TAT 実測: **0.118 s/variant、100 variants ≈ 12 秒** — 見積り 2-3s/variant より 20× 良、合否基準クリア）→ **★レビュー待ち**
+- **進行中**: —（M0 レビュー後、M1: occupancy probe FFI へ）
 - **直近の実測**（2026-07-05, M4 Max, feat/diffusiongemma）:
+  - TAT probe: 0.118 s/variant（TATPROBE=1、MatmulBench.lean）。full-unroll 生成器は sweep 不能（>5min/variant）
   - DiffusionGemma 26B-A4B: llama.cpp 比 54-96%（平均 ~73%）、per-step ~800ms vs 363ms
   - roofline 上位: QKV-KV 4.9× above floor、dense g/up 3.2×（未チューニング = M2 の初弾対象）
   - WGSL-vs-hand-MSL kernel 床: 1.15×（H1 let' 後）
 - **次の一手（TODO）**:
-  1. [ ] M0: TAT 表の実測（sweep 骨格ができた時点で variant/秒を測る → §1 に確定値を記入）★
+  1. [x] M0: TAT 表の実測 → §1 に確定値記入済み → **★レビュー**
   2. [ ] M1: probe FFI
-  3. [ ] M2: SWEEP=1 Tier 1 → QKV-KV/dense のランク表 ★
+  3. [ ] M2: SWEEP=1 Tier 1 → QKV-KV/dense のランク表 ★（golden は小 shape で。variant kernel は runtime-K-loop 型を新設 or M4 前倒し）
   4. [ ] M3: llama.cpp 精読表 ★（M2 と並行）
   5. [ ] M6: E4B 例の現状確認 → E2B bring-up ★
   6. [ ] M7: E2B ≤30分 autotune で ≥200tps ★★
@@ -79,3 +84,4 @@
 | 2026-07-05 | tile 幅の単独模倣を棄却 | WIDE64 実測で逆効果。リファレンスは構造ごと写す（原則 7） |
 | 2026-07-05 | JAX 移行を棄却 | jax-metal 未成熟 / Pallas に Metal 無し / block-quant 一級サポート無し |
 | 2026-07-05 | E2B をフロー証明のターゲットに採用 | 帯域律速で Tint 税が消える土俵 + 公開比較（webml 250tps / llama.cpp）+ E4B 資産で 1-2 日圏 |
+| 2026-07-05 | **M0 合格**: sweep TAT = 0.118s/variant 実測（設計成立） | TATPROBE=1。当初 8x8Reg で probe → K 全展開で compile 爆発 → deployed 型（runtime K loop）に切替えて成功。**sweep 基盤 = runtime-K-loop 必須**を §1 に昇格 |
