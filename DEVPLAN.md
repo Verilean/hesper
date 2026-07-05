@@ -79,7 +79,7 @@
   3. [ ] M2: runtime-K-loop パラメータ化 kernel（M4 前倒し）+ SWEEP=1 + 小 shape golden + tune log → QKV-KV/dense ランク表 ★
   3b. [ ] **TAT 対策（ユーザー指摘 2026-07-05）: decode 統合 build が ~8-10 分と長すぎる** — DiffusionGemmaDecode.lean が 2000 行超の単一ファイルで 1 行の変更が全再 elaborate を誘発。対策候補: (a) decode を複数モジュールに分割（forward/schedule/main）、(b) 滅多に使わない Examples/exe を default deps から外す・別ディレクトリに move、(c) 統合面を薄く保つ（lookup 駆動にしたのはその一歩）。M5 完了後に着手
   4. [ ] M3: llama.cpp 精読表 ★（M2 と並行）
-  5. [~] M6: E2B bring-up — **プラミング完了（validation error 0、e2e 実行 7.8 t/s @ graphs-off）、正しさ = 数値バグ残（多言語 token salad、prefill logits から既に誤り）**。llama.cpp 参照確立: E2B 生成 **156.5 t/s**（M7 の現実的な的; 私の 200-250 BW 見積りは楽観だった）。
+  5. [x] **M6 完了: E2B greedy decode が llama.cpp と一致** — "The capital of France is" → **"Paris." + EOT** ✓ / "The largest planet…" → **"Jupiter." + EOT** ✓ / 64-token 詩も coherent。**現状 8.05 t/s**（graphs-off・correctness-first 経路）vs llama.cpp **156.5 t/s** = M7 の出発点 19.4×。★レビュー待ち。llama.cpp 参照確立: E2B 生成 **156.5 t/s**（M7 の現実的な的; 私の 200-250 BW 見積りは楽観だった）。
      踏んだ修正（1 日で 21 回の実行反復、全て engine 一般益）: GGUF u32 配列 metadata（E 系）/ MatFormer per-layer dims（tensor shape 優先, E2B L0 ffn=6144≠12288）/ PLE 1.6GB 表 → row-staging 64-slot（binding 上限+robustness clamp+batch 順序ハザード 3 連対応）/ binding 4 倍数 round / CreateBindGroup error scope（作成時理由の可視化）/ 書込 aliasing×3 を in-place kernel 化（qkvNorm・qNorm・normThenAdd — CUDA 合法/WebGPU 違法）/ ce 名 sanitize（Float 埋込→WGSL 不正識別子）/ **maxComputeWorkgroupSize 1024 要求**（wg-512/1024 kernel 解禁 = autotune の sg4x4 も解禁）/ Q4_K embd lookup kernel 新設（dequantQ4KElementAt 抽出）/ Q4_K lm-head chunked f16 前 dequant（f32 中間 1.6GB 回避）/ BlockCoop 2D grid（vocab 262144 > 65535）/ dp4a enable（WebGPU、subgroups 時）。
      **数値 parity bisect（進行中、大きく前進）**: llama-eval-callback を参照に層別比較を確立。
      - **✅ 消去済み**: Q4_K embedding lookup（CPU golden 16/16 一致）/ inp_scaled（llama と厳密一致）/ Q6_K down matmul（正しかった）/ normThenAdd kernel（CPU golden 一致）
@@ -87,7 +87,14 @@
      - **層別スキャン: layer 0 完全一致（attn 0.02 / ffn 0.006）→ 乖離は layer 0 末尾の PLE 適用チェーン**（llama: proj@inp_scaled → SCALE → per-256 RMS_NORM×projNormW → +selected → SCALE(1/√2) → gelu(inp_gate@pe_in)×inp_per_layer → proj → norm×post_norm → +pe_in → ×layer_output_scale）。our per_layer_embd_out ≠ llama → **PLE 式のどこかの SCALE 定数 or 順序が違う**
      - 学び: llama の tensor 名は add 前後でズレる（ffn_post_norm=add 前、pe_in=add 後）— 比較時は OP チェーンで確認
      - 訂正: 「batched prefill の staging 順序ハザード」理論は誤り（prefill は非バッチ、各 dispatch 即時実行）。slot 化は無害だが不要だった
-     - **次**: PLE チェーンの SCALE 定数を llama.cpp ソース（gemma4-iswa.cpp）と突合し、plInputAll の golden dump を足して単体照合
+     - **最終ラウンド（2026-07-05、4 バグで decode 完全一致）**: PLE 定数は全部正しかった — 犯人は**テンソル型の思い込み**×3 + **prepared-cache の buffer 捕捉**×1:
+       1. **`per_layer_token_embd` は E2B では Q5_K（type 13）**（E4B は Q6_K）— Q6_K として dequant していた。CPU golden（llama node_1 GET_ROWS と bit 一致）で確定 → `Hesper/Quantization/Q5_K.lean` 新設（176B/block は 4-aligned なので u32-indexed、scale unpack は Q4_K と同一で `getScaleMin` 再利用）+ loader 型検出 + 両 call site 分岐
+       2. **`per_layer_model_proj` は BF16（type 30）** — 生 bytes を f16 として matmul に食わせていた（指数幅違い→ゴミ）。GPU BF16→F16 repack kernel（算術変換、bitcast 不要）を load 時に 1 回。GGUF Loader.GGMLType に BF16 追加
+       3. **`blk.*.inp_gate/proj` は E2B では F32**（E4B は Q4_K）— loadLinear が F32 を Q4_K として解釈（ple_gate が ±10⁴）。`Linear.QuantFormat.F16` 新設: load 時 GPU pack f32→f16、forward/forwardBatchDP4A に F16 早期分岐（executeMatMulTransposeF16）
+       4. **decode 常時 196228 の真因 = finalNorm の prepared-cache が prefill の buffer binding (buf2→buf1) を捕捉**、decode の ping-pong は **35 層（奇数）で buf1→buf2 に反転** → replay が古い scratch を読む。E4B は 42 層（偶数）で偶然一致し潜伏。`state.finalNormDecodePrepared`（decode 専用 ref）で分離。**教訓: prepared/cached dispatch は buffer binding を捕捉する — 呼び出し毎に buffer が変わる call site で shared ref を使ってはならない（層数の偶奇でしか発火しない罠）**
+     - 検証: decode hidden vs 7-token prefill hidden relL2 0.014（L34）= KV-cache/全層 decode 経路も parity。層別スキャン l_out-0/34 とも llama と一致
+     - 診断手法の資産化: `scripts/llama_parity/scan_layers.py`（llama-eval-callback text vs golden .bin 層別比較）、decode 側 `single_p{pos}_finalNorm/logits` dump 追加、dumpBuf を WebGPU batch 下で安全化（isBatching probe + 再 open）
+     - CPU lm-head 切り分け（hidden 正しい/GPU logits 誤り→犯人は norm→lmHead チェーン）が決定打だった — bisect は「GPU dump → CPU で続きを計算」が最速
   6. [ ] M7: E2B ≤30分 autotune で ≥200tps ★★
 
 **M1 で確定した実装制約**（原則に準ずる）:
@@ -113,3 +120,6 @@
 | 2026-07-05 | **勝ち幅を 2.7×/1.7× → 1.45×/1.25× に訂正**（refine 300×3 実測）。probe-prune + refine 段を新設 | 単発 sweep 行に ~3× 過渡外れ値（0.267/0.767 同一設定）→ sweep=安く順位付け、refine=確実に決定、の 2 段が必須。ユーザーの再現性指摘が的中 |
 | 2026-07-05 | **incumbent ガード新設**（deployed 設定が refine に常時参戦、勝てなければ winner 無し） | 8-shape 連続 sweep の後半が熱で腐り、deployed より遅い設定が「勝者」になり decode で +39ms regression（ABA で捕捉）。ガード+cool refine 後は Q-full/attnO-SWA で incumbent が正しく防衛 |
 | 2026-07-05 | **M5 = e2e NEUTRAL、DG_TUNED は opt-in 維持** | 勝った 6 shape の合計節約 ~13ms/step はノイズ ±30ms 未満（tune 対象は step の ~10%）。原則 4 のゲートが機能。フロー自体は検証完了 — 効かせるには step 時間を支配する対象（E2B matvec / battnB）に向ける |
+| 2026-07-05 | **M6 合格: E2B greedy = llama.cpp 一致（"Paris."✓ "Jupiter."✓）、8.05 t/s** | 最終 4 バグ = E2B 固有テンソル型（PLE 表 Q5_K / proj BF16 / inp_gate·proj F32）×3 + finalNorm prepared-cache の buffer 捕捉（35 層奇数で ping-pong 反転、E4B 42 層は偶然潜伏）。詳細 §3-5 |
+| 2026-07-05 | 量子化型は tensor 毎に GGUF から読む（思い込み禁止）を原則運用に | E2B は同名 tensor が E4B と別型（Q6_K→Q5_K, Q4_K→F32, F16→BF16）。3/4 バグがこのクラス。loadLinear/loader は型検出 + 明示 throw（未対応型）に |
+| 2026-07-05 | prepared/cached dispatch の shared ref は「buffer が呼び出し毎に不変」の site 限定 | finalNorm bug の教訓。ping-pong buffer を渡す site は専用 ref か throwaway。層数の偶奇でしか発火しない罠として決定ログに固定 |

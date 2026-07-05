@@ -16,6 +16,7 @@ import Hesper.Layers.RoPE
 import Hesper.Layers.Embedding
 import Hesper.Layers.Softmax
 import Hesper.Quantization.Q4_K_M
+import Hesper.Quantization.Q5_K
 import Hesper.Layers.MoE
 import Hesper.Layers.PerLayerEmbedding
 import Hesper.GGUF.Parser
@@ -180,6 +181,13 @@ structure InferenceState (BufT CacheT : Type) where
   -- to wait for the per-iter argmax value.
   argmaxHistoryBuf : BufT
   historySlotBuf   : BufT
+  /-- Decode-dedicated prepared ref for the finalNorm before lm-head.
+      MUST be separate from `model.finalNorm.prepared`: the prefill populates
+      that shared ref with ITS buffer bindings (buf2→buf1), and a decode
+      replay would silently read/write the wrong buffers whenever the layer
+      count is odd (decode ping-pong ends at buf1→buf2 — E2B has 35 layers;
+      E4B's 42 masked the bug by parity). -/
+  finalNormDecodePrepared : IO.Ref (Option CacheT)
   -- Scratch buffer for Q8_1 quantized lmHead input (hiddenSize/32 * 9 u32),
   -- lazily allocated on first dp4a-enabled lmHead call.
   lmHeadQ8Buf : IO.Ref (Option BufT)
@@ -343,6 +351,7 @@ def createInferenceState [GPUBackend β] (ctx : β) (cfg : Config) : IO (Inferen
     -- Slot starts at 0 and is incremented by historyAppendKernel each decode.
     argmaxHistoryBuf := ← GPUBackend.allocBuffer ctx (65536 * 4 : USize)
     historySlotBuf   := ← GPUBackend.allocBuffer ctx (4 : USize)
+    finalNormDecodePrepared := ← GPUBackend.newCacheRef (β := β)
     lmHeadQ8Buf := ← IO.mkRef none
     lmHeadQuantizePrepared := ← GPUBackend.newCacheRef (β := β)
     lmHeadDP4APrepared := ← GPUBackend.newCacheRef (β := β)
@@ -399,11 +408,13 @@ def dumpBuf [GPUBackend β] (ctx : β) (buf : GPUBackend.Buf β) (bytes : USize)
     -- Probe CUDA batch state: if currently batching, queue sync returns
     -- some; we flush + reopen only in that case.  Safe regardless of backend
     -- because endBatch on `none` is a no-op.
-    let wasBatching ← Hesper.Backend.isCudaBatching
-    GPUBackend.endBatch ctx
+    let wasCudaBatching ← Hesper.Backend.isCudaBatching
+    let wasWebGPUBatching ← Hesper.WGSL.Execute.isBatching
+    -- WebGPU throws on endBatch outside a batch; CUDA no-ops. Tolerate both.
+    try GPUBackend.endBatch ctx catch _ => pure ()
     let data ← GPUBackend.readBuffer ctx buf bytes
     IO.FS.writeBinFile s!"{dir}/{suffix}.bin" data
-    if wasBatching then
+    if wasCudaBatching || wasWebGPUBatching then
       GPUBackend.beginBatch ctx
 
 /-- Write a small scalar (≤8 bytes) to a device buffer via a pinned-host
@@ -1551,11 +1562,19 @@ def forwardPrefillBatch [GPUBackend β] (ctx : β)
               (tb.extract (tokenId*rb) ((tokenId+1)*rb))
           pure embdTableGPU
       let scaleFactor : Float := Float.sqrt embdPL.toFloat
-      ce "q6kDequantScale_pf_r64"
-        (Hesper.Quantization.Q6_K.q6kTableRowDequantScaleKernel totalPL scaleFactor
-          cfg.vocabSize (declRows := 64))
-        [("table", tableForKernel), ("params", state.plRawRowBuf), ("output", state.plModelProj)]
-        (.dispatch1D totalPL)
+      -- E2B ships per_layer_token_embd as Q5_K; E4B as Q6_K (block layouts differ).
+      if model.perLayerEmbdIsQ5K then
+        ce "q5kDequantScale_pf_r64"
+          (Hesper.Quantization.Q5_K.q5kTableRowDequantScaleKernel totalPL scaleFactor
+            cfg.vocabSize (declRows := 64))
+          [("table", tableForKernel), ("params", state.plRawRowBuf), ("output", state.plModelProj)]
+          (.dispatch1D totalPL)
+      else
+        ce "q6kDequantScale_pf_r64"
+          (Hesper.Quantization.Q6_K.q6kTableRowDequantScaleKernel totalPL scaleFactor
+            cfg.vocabSize (declRows := 64))
+          [("table", tableForKernel), ("params", state.plRawRowBuf), ("output", state.plModelProj)]
+          (.dispatch1D totalPL)
       writeColIdxU32 colIdxBuf i
       ce s!"colExtrScaledEmb_sl{seqLen}"
         (columnExtractKernel dim seqLen)
@@ -2505,11 +2524,19 @@ def forwardSingleToken [GPUBackend β] (ctx : β)
               GPUBackend.writeBuffer ctx embdTableGPU (tb.extract (tokenId*rb) ((tokenId+1)*rb))
             pure embdTableGPU
         let scaleFactor : Float := Float.sqrt embdPL.toFloat
-        ce "q6kDequantScale"
-          (Hesper.Quantization.Q6_K.q6kTableRowDequantScaleKernel totalPL scaleFactor
-            model.config.vocabSize)
-          [("table", tableForKernel), ("params", state.plRawRowBuf), ("output", state.plModelProj)]
-          (.dispatch1D totalPL)
+        -- E2B ships per_layer_token_embd as Q5_K; E4B as Q6_K (block layouts differ).
+        if model.perLayerEmbdIsQ5K then
+          ce "q5kDequantScale"
+            (Hesper.Quantization.Q5_K.q5kTableRowDequantScaleKernel totalPL scaleFactor
+              model.config.vocabSize)
+            [("table", tableForKernel), ("params", state.plRawRowBuf), ("output", state.plModelProj)]
+            (.dispatch1D totalPL)
+        else
+          ce "q6kDequantScale"
+            (Hesper.Quantization.Q6_K.q6kTableRowDequantScaleKernel totalPL scaleFactor
+              model.config.vocabSize)
+            [("table", tableForKernel), ("params", state.plRawRowBuf), ("output", state.plModelProj)]
+            (.dispatch1D totalPL)
 
       -- 2) per_layer_model_proj @ buf2 → plTokenSelected
       let projConfig : Hesper.WGSL.MatMul.Config := {
@@ -2597,7 +2624,11 @@ def forwardSingleToken [GPUBackend β] (ctx : β)
     -- and ignores the wgSize argument) and call the hand-written kernel
     -- with workgroupSize=1024 directly.  Memo: project_rmsnorm_parity.md.
     Hesper.WGSL.Execute.withSection "finalNorm" do
+      -- refOverride: do NOT share model.finalNorm.prepared with the prefill —
+      -- its cached dispatch captures the PREFILL buffers (buf2→buf1) while the
+      -- decode ping-pong ends at buf1→buf2 for odd layer counts (E2B: 35).
       RMSNorm.forward ctx model.finalNorm currentBuf nextBuf (workgroupSize := 1024)
+        (refOverride := some state.finalNormDecodePrepared)
 
   -- Step 4: LM head matmul (1 × hiddenSize @ hiddenSize × vocabSize)
   Hesper.WGSL.Execute.withSection "lmHead" do
@@ -2815,6 +2846,10 @@ def forwardSingleToken [GPUBackend β] (ctx : β)
         (PerLayerEmbedding.scaleKernel model.config.vocabSize 1.0)
         [("input", state.logitsBuf2), ("output", state.logitsBuf)]
         (.dispatch1D model.config.vocabSize)
+
+  -- Parity diagnostic: post-softcap decode logits + the finalNorm output feeding lm-head.
+  dumpBuf ctx nextBuf (model.config.hiddenSize * 4).toUSize s!"single_p{pos}_finalNorm"
+  dumpBuf ctx state.logitsBuf (model.config.vocabSize * 4).toUSize s!"single_p{pos}_logits"
 
   if ownBatch then GPUBackend.endBatch ctx
 

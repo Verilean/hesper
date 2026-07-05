@@ -1,6 +1,7 @@
 import Hesper.Backend
 import Hesper.WGSL.Monad
 import Hesper.WGSL.Exp
+import Hesper.WGSL.MatMul
 import Hesper.Quantization.Q4_K_M
 import Hesper.Quantization.Q6_K
 import Hesper.Logging
@@ -5443,6 +5444,7 @@ inductive QuantFormat where
   | Q6_K   -- Q6_K: 210 bytes per 256 elements
   | Q8_0   -- Q8_0: 34 bytes per 32 elements (f16 scale + 32×int8)
   | Q5_0   -- Q5_0: 22 bytes per 32 elements (f16 scale + 4B qh + 16B qs)
+  | F16    -- unquantized, packed f16 [N, K/2] u32 (e.g. E2B PLE inp_gate/proj shipped as F32)
   deriving Repr, BEq, Inhabited
 
 /-- Quantized linear layer (supports Q4_K and Q6_K) -/
@@ -5696,6 +5698,12 @@ def forwardBatchDP4A [GPUBackend β] (ctx : β)
     (layer : LinearLayer (GPUBackend.Buf β) (GPUBackend.CachedDispatch β))
     (inputBuf outputBuf : GPUBackend.Buf β)
     (seqLen : Nat) : IO Unit := do
+  -- F16 (unquantized) weights: plain f16 matmul, no dp4a quantize step.
+  if layer.quantFormat == .F16 then
+    Hesper.WGSL.MatMul.executeMatMulTransposeF16 ctx inputBuf layer.weightBuf outputBuf
+      { M := seqLen, N := layer.config.outDim, K := layer.config.inDim }
+    return
+
   if seqLen <= 1 then
     forwardDP4A ctx layer inputBuf outputBuf
     return
@@ -6830,6 +6838,12 @@ def fusedQ4KMBatchExpertKernelInt (config : Config) (nExpert N nUsed slot : Nat)
 
 def LinearLayer.forward [GPUBackend β] (ctx : β) (layer : LinearLayer (GPUBackend.Buf β) (GPUBackend.CachedDispatch β))
     (inputBuf outputBuf : GPUBackend.Buf β) : IO Unit := do
+  -- F16 (unquantized) weights: plain f16 matmul (M=1).
+  if layer.quantFormat == .F16 then
+    Hesper.WGSL.MatMul.executeMatMulTransposeF16 ctx inputBuf layer.weightBuf outputBuf
+      { M := 1, N := layer.config.outDim, K := layer.config.inDim }
+    return
+
   let profiling ← profilingRef.get
   let startNs ← if profiling then IO.monoNanosNow else pure 0
 
@@ -6971,6 +6985,11 @@ def LinearLayer.forward [GPUBackend β] (ctx : β) (layer : LinearLayer (GPUBack
       (256,
        fusedQ5_0BatchKernel layer.config 1,
        hash ("q5_0-lin", layer.config.inDim, layer.config.outDim))
+    | .F16, _ =>
+      -- unreachable: .F16 takes the executeMatMulTransposeF16 early-return above
+      (256,
+       fusedQ4KMLinearKernel layer.config,
+       hash ("f16-lin-unreachable", layer.config.inDim, layer.config.outDim))
   let execConfig : Hesper.ExecConfig := {
     numWorkgroups := (layer.config.outDim, 1, 1)
     workgroupSize := { x := wgSize, y := 1, z := 1 }
