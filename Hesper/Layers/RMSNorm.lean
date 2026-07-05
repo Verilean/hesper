@@ -135,8 +135,10 @@ def rmsNormKernel (config : Config) (workgroupSize : Nat := 256) : ShaderM Unit 
   let normalized := Exp.div inputVal rms
   let result := Exp.mul normalized scaleVal
 
-  let finalResult := Exp.select inBounds result (Exp.litF32 0.0)
-  ShaderM.writeBuffer (ty := .scalar .f32) "output" idx finalResult
+  -- bounds-guarded write (a clamped OOB write races the last element's owner)
+  ShaderM.if_ inBounds (do
+    ShaderM.writeBuffer (ty := .scalar .f32) "output" idx result
+  ) (pure ())
 
 /-- Block-wide sum reduction using warp-shuffle then a single cross-warp
     pass through shared memory.  Returns a value that holds the total
@@ -610,8 +612,10 @@ def rmsApplyKernel (config : Config) (numRows : Nat) : ShaderM Unit := do
   let result := Exp.mul normalized scaleVal
 
   -- Write output
-  let finalResult := Exp.select inBounds result (Exp.litF32 0.0)
-  ShaderM.writeBuffer (ty := .scalar .f32) "output" idx finalResult
+  -- bounds-guarded write (a clamped OOB write races the last element's owner)
+  ShaderM.if_ inBounds (do
+    ShaderM.writeBuffer (ty := .scalar .f32) "output" idx result
+  ) (pure ())
 
 /-! ## Fused RMSNorm + Q8_1 quantize
 

@@ -754,6 +754,7 @@ def forwardBlock [GPUBackend β] (ctx : β)
         [("input", state.kBuf2), ("output", state.kBuf), ("params", state.paramsBuf)]
         (.dispatch1D (numKVHeads * headDim / 2))
 
+  dumpBuf ctx state.kBuf (numKVHeads * headDim * 4).toUSize s!"single_p{pos}_kroped_L{li}"
   -- Step 5: Write K/V to cache and compute flash attention
   -- KV-shared layers reuse an earlier layer's cache (see Config.kvCacheLayer).
   let kvLi := cfg.kvCacheLayer li
@@ -793,6 +794,7 @@ def forwardBlock [GPUBackend β] (ctx : β)
              ("params", state.paramsBuf)]
             (.dispatch1D (numKVHeads * (headDim / 2)))
 
+    dumpBuf ctx kvCache.kBufF16 (8 * (headDim/2) * 4).toUSize s!"single_p{pos}_kcacheHead0_L{li}"
     -- Flash attention: Q @ K_cache^T → softmax → @ V_cache → output
     -- Gemma 4 uses hparams.f_attention_scale = 1.0 (NOT the usual 1/sqrt(headDim)),
     -- because the Q-norm RMSNorm already normalizes each head, so the dot product
