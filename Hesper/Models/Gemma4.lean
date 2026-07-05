@@ -2381,6 +2381,37 @@ def forwardPrefillBatch [GPUBackend β] (ctx : β)
         { numWorkgroups := (gridX, gridY, 1), workgroupSize := { x := wgSize, y := 1, z := 1 }
           extensions := if useSubgroups then ["subgroups"] else []
           : Hesper.ExecConfig }
+  | .Q4_K =>
+    -- Q4_K dp4a lm-head (E2B): fused finalNorm+Q8_1 quantize, then the 4-warp
+    -- dp4a matvec over the raw Q4_K table with a 2D grid. Same shape as the
+    -- decode-side branch in forwardSingleToken.
+    let nQ8Blocks := cfg.hiddenSize / 32
+    let q8Buf ← match ← state.lmHeadQ8Buf.get with
+      | some b => pure b
+      | none =>
+        let b ← GPUBackend.allocBuffer ctx (nQ8Blocks * 9 * 4).toUSize
+        state.lmHeadQ8Buf.set (some b)
+        pure b
+    GPUBackend.executeWithConfigCached ctx
+      (Hesper.Layers.RMSNorm.fusedRMSNormQ8_1Kernel model.finalNorm.config)
+      [("input", state.buf2), ("scale", model.finalNorm.scale), ("output", q8Buf)]
+      { numWorkgroups := (1, 1, 1), workgroupSize := { x := 256, y := 1, z := 1 }
+        extensions := ["subgroups"] : Hesper.ExecConfig }
+      (hash ("fused-rmsnorm-q8_1-lmhead", cfg.hiddenSize))
+      state.lmHeadQuantizePrepared
+    let gridX4k : Nat := 4096
+    let gridY4k : Nat := (cfg.vocabSize + gridX4k - 1) / gridX4k
+    GPUBackend.executeWithConfigCached ctx
+      (Hesper.Layers.Linear.fusedQ4KMLinearDP4A4WarpKernel
+        { inDim := cfg.hiddenSize, outDim := cfg.vocabSize } (gridXWidth := gridX4k))
+      [("weights", model.outputWeight), ("input_q8", q8Buf), ("output", state.logitsBuf)]
+      { numWorkgroups := (gridX4k, gridY4k, 1), workgroupSize := { x := 128, y := 1, z := 1 }
+        extensions := ["subgroups"]
+        funcName := s!"q4k_dp4a_4warp_lmhead_{cfg.hiddenSize}_{cfg.vocabSize}"
+        : Hesper.ExecConfig }
+      (hash ("q4k-dp4a-lmhead-4warp", cfg.hiddenSize, cfg.vocabSize))
+      state.lmHeadDP4APrepared
+    dumpGolden "prefill_logits_raw" state.logitsBuf cfg.vocabSize
   | _ =>
     -- Non-Q6_K fallback: F32 matmul transpose.  Needs standalone RMSNorm.
     RMSNorm.forward ctx model.finalNorm state.buf2 state.buf1 (workgroupSize := 1024)
@@ -2819,6 +2850,40 @@ def forwardSingleToken [GPUBackend β] (ctx : β)
             workgroupSize := { x := wgSize, y := 1, z := 1 }
             extensions := if useSubgroups then ["subgroups"] else []
             : Hesper.ExecConfig }
+    | .Q4_K =>
+      -- Q4_K dp4a lm-head (Gemma 4 E2B: token_embd is Q4_K). Reads the 226 MB
+      -- Q4_K table directly instead of the 786 MB pre-dequantised f16
+      -- (HESPER_LMHEAD_F16=1 keeps the f16 path for A/B). finalNorm already
+      -- emitted into nextBuf (useFusedNormLmHead=false here); quantize it to
+      -- Q8_1 and run the 4-warp dp4a matvec with a 2D grid (vocab > 65535).
+      let hidden := model.config.hiddenSize
+      let vocab := model.config.vocabSize
+      let nQ8Blocks := hidden / 32
+      let q8Buf ← match ← state.lmHeadQ8Buf.get with
+        | some b => pure b
+        | none =>
+          let b ← GPUBackend.allocBuffer ctx (nQ8Blocks * 9 * 4).toUSize
+          state.lmHeadQ8Buf.set (some b)
+          pure b
+      GPUBackend.executeWithConfigCached ctx
+        (Hesper.Layers.Linear.quantizeQ8_1Kernel hidden)
+        [("input", nextBuf), ("output", q8Buf)]
+        { numWorkgroups := (nQ8Blocks, 1, 1), workgroupSize := { x := 32, y := 1, z := 1 }
+          extensions := ["subgroups"] : Hesper.ExecConfig }
+        (hash ("q8_1-quantize-lmhead-q4k", hidden))
+        state.lmHeadQuantizePrepared
+      let gridX4k : Nat := 4096
+      let gridY4k : Nat := (vocab + gridX4k - 1) / gridX4k
+      GPUBackend.executeWithConfigCached ctx
+        (Hesper.Layers.Linear.fusedQ4KMLinearDP4A4WarpKernel
+          { inDim := hidden, outDim := vocab } (gridXWidth := gridX4k))
+        [("weights", model.outputWeight), ("input_q8", q8Buf), ("output", state.logitsBuf)]
+        { numWorkgroups := (gridX4k, gridY4k, 1), workgroupSize := { x := 128, y := 1, z := 1 }
+          extensions := ["subgroups"]
+          funcName := s!"q4k_dp4a_4warp_lmhead_{hidden}_{vocab}"
+          : Hesper.ExecConfig }
+        (hash ("q4k-dp4a-lmhead-4warp", hidden, vocab))
+        state.lmHeadDP4APrepared
     | _ =>
       let lmHeadConfig : Hesper.WGSL.MatMul.Config := {
         M := 1, N := model.config.vocabSize, K := model.config.hiddenSize

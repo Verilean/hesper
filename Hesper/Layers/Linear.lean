@@ -2787,10 +2787,13 @@ def fusedQ4KMLinearDP4A2RowKernel (config : Config) : ShaderM Unit := do
     threads 0..31 (warp 0) handle blocks {0,1,8,9}, warps 1–3 handle
     blocks {2..7} — every block is covered exactly once, no duplicated
     work, no `*0.5` correction. -/
-def fusedQ4KMLinearDP4A4WarpKernel (config : Config) : ShaderM Unit := do
+def fusedQ4KMLinearDP4A4WarpKernel (config : Config) (gridXWidth : Nat := 0) : ShaderM Unit := do
   let wid ← ShaderM.workgroupId
   let lid ← ShaderM.localId
-  let outIdx := Exp.vec3X wid
+  -- 2D grid when outDim exceeds the 65535 per-dimension workgroup limit
+  -- (lm-head vocab 262144): row = wid.x + wid.y * gridXWidth.
+  let outIdx := if gridXWidth == 0 then Exp.vec3X wid
+                else Exp.add (Exp.vec3X wid) (Exp.mul (Exp.vec3Y wid) (Exp.litU32 gridXWidth))
   let tid := Exp.vec3X lid            -- 0..127
   let warpId := Exp.shiftRight tid (Exp.litU32 5)  -- 0..3
   let laneId := Exp.bitAnd tid (Exp.litU32 31)     -- 0..31
