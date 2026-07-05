@@ -634,7 +634,7 @@ def Gemma4Model.fromGGUFDataWithGguf [GPUBackend β] (ctx : β)
         { numWorkgroups := (totalBlocks, 1, 1), workgroupSize := { x := 64, y := 1, z := 1 }
           extensions := [] }
       pure (some f16Buf)
-    else if isQ4K then do
+    else if isQ4K && (← IO.getEnv "HESPER_LMHEAD_F16") == some "1" then do
       -- Q4_K-tied lm_head (Gemma 4 E2B quantises token_embd as Q4_K, unlike E4B's Q6_K).
       -- Same fast-f16 path, but the f32 intermediate for the FULL table (vocab×dim×4 ≈ 1.6 GB)
       -- exceeds maxStorageBufferBindingSize — so dequant+pack in CHUNKS through a chunk-sized
