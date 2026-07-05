@@ -1027,6 +1027,40 @@ def matVecSweep (device : Device) : IO Unit := do
       Hesper.WGSL.Autotune.refineTopK device mulMvQ4KFamily shape
         (incumbent := some [("R", 1), ("W", 4)])
 
+/-- CONCPROBE=1 (M3 de-risk): does MTLDispatchTypeConcurrent recover Dawn's
+    ~14µs/dispatch Serial cost? Compile the tuned R1W1 matvec ONCE through Dawn
+    (captures its Tint-MSL via HESPER_DUMP_MSL), then run 300 back-to-back
+    dispatches of that MSL natively — Serial vs Concurrent, same kernel, same
+    buffers. The delta is exactly the win options A/B would buy. -/
+def concurrentDispatchProbe : IO Unit := do
+  let inst ← Hesper.init
+  let device ← getDevice inst
+  let K := 1536; let N := 2560  -- the QKV shape (worst %BW in the MATVEC roofline)
+  let bpr := K / 256
+  let w   ← mkBuf device (N * bpr * 36)
+  let q8  ← mkBuf device ((K/32) * 9)
+  let out ← mkBuf device N
+  -- Compile through Dawn once to capture the Tint-MSL (needs HESPER_DUMP_MSL=1).
+  let kern := Hesper.Layers.Linear.q4kMatVecDP4AGenKernel { inDim := K, outDim := N } 1 1
+  let cfg : Hesper.ExecConfig := { numWorkgroups := (N, 1, 1), workgroupSize := {x:=32},
+                                   extensions := ["subgroups"], diagnostics := [] }
+  let r ← IO.mkRef none
+  Hesper.GPUBackend.executeWithConfigCached device kern
+    (("weights",w)::("input_q8",q8)::("output",out)::List.nil) cfg 0 r
+  let msl ← Hesper.WebGPU.lastDumpedMsl
+  if msl.isEmpty then
+    IO.println "[concprobe] no MSL captured — run with HESPER_DUMP_MSL=1 HESPER_DUMP_MSL_QUIET=1"
+    return
+  let nD : UInt32 := 300
+  IO.println s!"\n=== ★ CONCPROBE: {nD} dispatches of tuned R1W1 matvec (N={N} K={K}), one native encoder ==="
+  for (label, conc) in [("Serial     (Dawn today)", (0 : UInt8)), ("Concurrent (llama.cpp) ", (1 : UInt8))] do
+    -- 3 reps, report each (first includes warmup)
+    let mut times : List String := []
+    for _ in [0:3] do
+      let ms ← Hesper.WebGPU.mslConcurrentProbe device msl w q8 out nD N.toUInt32 1 32 conc
+      times := times ++ [ms]
+    IO.println s!"  {label}: GPU ms for {nD} dispatches = {times}  (per-dispatch = ms/300)"
+
 /-- Bench one Q4_K dp4a matvec (M=1 decode) shape in isolation: the deployed
     `fusedQ4KMLinearDP4A4WarpKernel`. Returns ms/call. `gridX2D > 0` switches
     to the 2D lm-head grid. -/
@@ -1077,6 +1111,8 @@ end Examples.Compute.MatmulBench
 def main : IO Unit := do
   if (← IO.getEnv "ROOFLINE").isSome then
     Examples.Compute.MatmulBench.forwardRoofline
+  else if (← IO.getEnv "CONCPROBE").isSome then
+    Examples.Compute.MatmulBench.concurrentDispatchProbe
   else if (← IO.getEnv "MATVEC_SWEEP").isSome then do
     let inst ← Hesper.init
     let device ← Hesper.WebGPU.getDevice inst
