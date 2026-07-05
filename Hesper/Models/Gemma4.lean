@@ -236,19 +236,19 @@ structure InferenceState (BufT CacheT : Type) where
 
 /-- Dynamic cache ref store. Lazily creates IO.Ref per unique cacheKey. -/
 structure KernelCacheRefs (CacheT : Type) where
-  store : IO.Ref (Array (UInt64 × IO.Ref (Option CacheT)))
+  store : IO.Ref (Std.HashMap UInt64 (IO.Ref (Option CacheT)))
 
 def KernelCacheRefs.getRef (kcr : KernelCacheRefs CacheT) (key : UInt64) : IO (IO.Ref (Option CacheT)) := do
-  let arr ← kcr.store.get
-  match arr.find? (fun (k, _) => k == key) with
-  | some (_, r) => pure r
+  let m ← kcr.store.get
+  match m.get? key with
+  | some r => pure r
   | none =>
     let r ← IO.mkRef none
-    kcr.store.modify (·.push (key, r))
+    kcr.store.modify (·.insert key r)
     pure r
 
 def createKernelCacheRefs [GPUBackend β] : IO (KernelCacheRefs (GPUBackend.CachedDispatch β)) := do
-  pure { store := ← IO.mkRef #[] }
+  pure { store := ← IO.mkRef {} }
 
 /-- Create inference state with pre-allocated buffers -/
 def createInferenceState [GPUBackend β] (ctx : β) (cfg : Config) : IO (InferenceState (GPUBackend.Buf β) (GPUBackend.CachedDispatch β)) := do
