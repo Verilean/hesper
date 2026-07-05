@@ -174,25 +174,35 @@ def sweep (device : Device) (fam : Family) (shape : Shape)
         bufs := bufs ++ [(nm, b)]
       let r ← IO.mkRef none
       Hesper.GPUBackend.executeWithConfigCached device kern bufs cfg 0 r
+      -- HESPER_NATIVE_BENCH=1: time on a native SERIAL Metal encoder via the variant's
+      -- dumped Tint-MSL (captured by the warmup compile just above). Dawn's per-dispatch
+      -- overhead (~35 µs, measured) drowns small kernels — the native path measures the
+      -- kernel itself. Contract: benchBuffers must list buffers in BINDING ORDER.
+      let nativeBench := (← IO.getEnv "HESPER_NATIVE_BENCH").isSome
+      let nativeMsl ← if nativeBench then Hesper.WebGPU.lastDumpedMsl else pure ""
+      let benchMs : Nat → IO Float := fun n => do
+        if nativeBench && !nativeMsl.isEmpty then
+          let (gx, gy, gz) := cfg.numWorkgroups
+          let s ← Hesper.WebGPU.mslBenchSerial device nativeMsl
+            (bufs.map (·.2)).toArray n.toUInt32 gx.toUInt32 gy.toUInt32 gz.toUInt32
+            cfg.workgroupSize.x.toUInt32
+          pure ((parseMs s).getD 1e18 / n.toFloat)
+        else
+          let t0 ← IO.monoMsNow
+          Hesper.GPUBackend.beginBatch device
+          for _ in [0:n] do Hesper.GPUBackend.executeWithConfigCached device kern bufs cfg 0 r
+          Hesper.GPUBackend.endBatch device
+          let t1 ← IO.monoMsNow
+          pure ((t1-t0).toFloat / n.toFloat)
       let occ ← probeOccupancy device
       -- stage 1: short probe; prune the obviously-slow tail
-      let tp0 ← IO.monoMsNow
-      Hesper.GPUBackend.beginBatch device
-      for _ in [0:probeIters] do Hesper.GPUBackend.executeWithConfigCached device kern bufs cfg 0 r
-      Hesper.GPUBackend.endBatch device
-      let tp1 ← IO.monoMsNow
-      let msProbe := (tp1-tp0).toFloat / probeIters.toFloat
+      let msProbe ← benchMs probeIters
       if msProbe > pruneFactor * bestSoFar then
         pruned := pruned + 1
         h.putStrLn s!"{fam.name},{shape.key},{p.key},{msProbe},,{occ},{cfg.workgroupSize.x},PRUNED"
       else
         -- stage 2: full measurement (contenders only)
-        let t0 ← IO.monoMsNow
-        Hesper.GPUBackend.beginBatch device
-        for _ in [0:iters] do Hesper.GPUBackend.executeWithConfigCached device kern bufs cfg 0 r
-        Hesper.GPUBackend.endBatch device
-        let t1 ← IO.monoMsNow
-        let ms := (t1-t0).toFloat / iters.toFloat
+        let ms ← benchMs iters
         let gflops := flops / (ms/1000.0) / 1.0e9
         if ms < bestSoFar then bestSoFar := ms
         h.putStrLn s!"{fam.name},{shape.key},{p.key},{ms},{gflops},{occ},{cfg.workgroupSize.x},PASS"
@@ -259,16 +269,32 @@ def refineTopK (device : Device) (fam : Family) (shape : Shape)
       let b ← createBuffer device { size := (words*4).toUSize, usage := [.storage, .copyDst, .copySrc], mappedAtCreation := false }
       bufs := bufs ++ [(nm, b)]
     let r ← IO.mkRef none
+    -- Same native-GPU timing option as the sweep (see there for the rationale).
+    -- The variant's pipeline is usually already in the Lean pipeline cache from the
+    -- sweep phase of the SAME process → the warmup would not recompile → lastDumpedMsl
+    -- would be STALE (a different variant's MSL). Reset the cache first: recompiles
+    -- are ~4 ms (Metal disk shader cache) and the dump is then guaranteed fresh.
+    let nativeBench := (← IO.getEnv "HESPER_NATIVE_BENCH").isSome
+    if nativeBench then Hesper.WGSL.Execute.resetPipelineCache
     Hesper.GPUBackend.executeWithConfigCached device kern bufs cfg 0 r
+    let nativeMsl ← if nativeBench then Hesper.WebGPU.lastDumpedMsl else pure ""
     let mut mn : Float := 1e18
     let mut ts : List Float := []
     for _ in [0:reps] do
-      let t0 ← IO.monoMsNow
-      Hesper.GPUBackend.beginBatch device
-      for _ in [0:iters] do Hesper.GPUBackend.executeWithConfigCached device kern bufs cfg 0 r
-      Hesper.GPUBackend.endBatch device
-      let t1 ← IO.monoMsNow
-      let ms := (t1-t0).toFloat / iters.toFloat
+      let ms ← do
+        if nativeBench && !nativeMsl.isEmpty then
+          let (gx, gy, gz) := cfg.numWorkgroups
+          let s ← Hesper.WebGPU.mslBenchSerial device nativeMsl
+            (bufs.map (·.2)).toArray iters.toUInt32 gx.toUInt32 gy.toUInt32 gz.toUInt32
+            cfg.workgroupSize.x.toUInt32
+          pure ((parseMs s).getD 1e18 / iters.toFloat)
+        else
+          let t0 ← IO.monoMsNow
+          Hesper.GPUBackend.beginBatch device
+          for _ in [0:iters] do Hesper.GPUBackend.executeWithConfigCached device kern bufs cfg 0 r
+          Hesper.GPUBackend.endBatch device
+          let t1 ← IO.monoMsNow
+          pure ((t1-t0).toFloat / iters.toFloat)
       ts := ts ++ [ms]
       if ms < mn then mn := ms
     IO.println s!"  {v}: reps={ts.map (fun t => (t*1000).round/1000)} min={((mn*1000).round)/1000}ms"

@@ -27,6 +27,7 @@ lean_obj_res lean_hesper_mtl_buffer_probe(b_lean_obj_arg, lean_obj_res) { return
 
 lean_obj_res lean_hesper_msl_occupancy_probe(b_lean_obj_arg, b_lean_obj_arg, lean_obj_res) { return msl_stub(); }
 lean_obj_res lean_hesper_msl_concurrent_probe(b_lean_obj_arg, b_lean_obj_arg, b_lean_obj_arg, b_lean_obj_arg, b_lean_obj_arg, uint32_t, uint32_t, uint32_t, uint32_t, uint8_t, lean_obj_res) { return msl_stub(); }
+lean_obj_res lean_hesper_msl_bench_serial(b_lean_obj_arg, b_lean_obj_arg, b_lean_obj_arg, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, lean_obj_res) { return msl_stub(); }
 
 lean_obj_res lean_hesper_metal_dispatch_mul2(
     b_lean_obj_arg, b_lean_obj_arg, b_lean_obj_arg, uint32_t, lean_obj_res) { return msl_stub(); }

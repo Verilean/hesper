@@ -67,6 +67,13 @@ opaque lastDumpedMsl : IO String
 @[extern "lean_hesper_msl_occupancy_probe"]
 opaque mslOccupancyProbe (device : @& Device) (msl : @& String) : IO String
 
+/-- Native serialized GPU timing of a dumped Tint-MSL kernel: `nDispatches` back-to-back in
+    one SERIAL Metal encoder, GPU ms from GPUStart/EndTime. Buffers in BINDING ORDER.
+    The honest per-kernel bench (Dawn adds ~35 µs/dispatch that drowns small matvecs). -/
+@[extern "lean_hesper_msl_bench_serial"]
+opaque mslBenchSerial (device : @& Device) (msl : @& String) (bufs : @& Array Buffer)
+    (nDispatches gridX gridY gridZ wgX : UInt32) : IO String
+
 /-- M3 de-risk probe: run `nDispatches` of a dumped Tint-MSL kernel back-to-back in ONE
     native Metal encoder with Serial or Concurrent dispatch type (no barriers — timing
     only, racing writes tolerated). Returns GPU wall ms as a string. -/
