@@ -429,7 +429,177 @@ def tatProbe (device : Device) : IO Unit := do
   let perVar := totalS / nVariants.toFloat
   IO.println s!"[TATPROBE] total {totalS}s / {nVariants} variants = {perVar}s/variant → 100 variants ≈ {perVar*100.0/60.0} min"
 
+/-- One autotune variant of the generalized reg-WMMA kernel. -/
+structure SweepVariant where
+  tmsg : Nat
+  tnsg : Nat
+  sgRows : Nat
+  sgCols : Nat
+  bk : Nat
+  deriving Repr
+
+def SweepVariant.mTile (v : SweepVariant) : Nat := v.sgRows * 8 * v.tmsg
+def SweepVariant.nTile (v : SweepVariant) : Nat := v.sgCols * 8 * v.tnsg
+def SweepVariant.wgSize (v : SweepVariant) : Nat := v.sgRows * v.sgCols * 32
+def SweepVariant.sharedBytes (v : SweepVariant) : Nat := (v.mTile * v.bk + v.bk * v.nTile) * 2
+def SweepVariant.name (v : SweepVariant) : String :=
+  s!"TM{v.tmsg}xTN{v.tnsg}_sg{v.sgRows}x{v.sgCols}_BK{v.bk}"
+
+/-- Static feasibility (DEVPLAN A-2: reject before generation). `nShape` = the target N. -/
+def SweepVariant.feasible (v : SweepVariant) (kShape nShape : Nat) : Bool :=
+  v.bk % 8 == 0 &&
+  -- device limit: maxComputeWorkgroupSizeX defaults to 256 (wg=512 fails pipeline VALIDATION →
+  -- null pipeline → the execute path SIGSEGVs; engine robustness issue noted in DEVPLAN)
+  v.wgSize ≤ 256 &&
+  v.sharedBytes ≤ 32768 &&
+  (v.mTile * v.bk) % v.wgSize == 0 &&
+  (v.nTile * (v.bk / 2)) % v.wgSize == 0 &&
+  (v.bk / 2) ≥ 1 &&
+  kShape % v.bk == 0 &&
+  nShape % v.nTile == 0
+
+/-- Golden gate at a variant-scaled SMALL shape (real-shape CPU reference is too slow — DEVPLAN).
+    Returns none on pass, some errorString on fail. -/
+def checkVariantGolden (device : Device) (v : SweepVariant) : IO (Option String) := do
+  let M := v.mTile * 2; let N := v.nTile * 2; let K := v.bk * 2
+  let wf := fun (n k : Nat) => (((n + k) % 7 : Nat).toFloat) - 3.0
+  let af := fun (m k : Nat) => (((m * 2 + k) % 5 : Nat).toFloat) - 2.0
+  let mut wA : Array Float := #[]
+  for n in [0:N] do for k in [0:K] do wA := wA.push (wf n k)
+  let mut aA : Array Float := #[]
+  for m in [0:M] do for k in [0:K] do aA := aA.push (af m k)
+  let wf32 ← mkBuf device (N*K); let bf16 ← mkBuf device (N*(K/2))
+  let aBuf ← mkBuf device (M*K); let cBuf ← mkBuf device (M*N)
+  writeBuffer device wf32 0 (← Hesper.Basic.floatArrayToBytes wA)
+  writeBuffer device aBuf 0 (← Hesper.Basic.floatArrayToBytes aA)
+  let rp ← IO.mkRef none
+  Hesper.GPUBackend.executeWithConfigCached device (packF32ToF16 (N*(K/2)))
+    (("fin",wf32)::("fout",bf16)::List.nil) { numWorkgroups := ((N*(K/2)+255)/256,1,1), workgroupSize := {x:=256} } 1 rp
+  let cfg : Hesper.ExecConfig := {
+    numWorkgroups := (N / v.nTile, M / v.mTile, 1), workgroupSize := {x := v.wgSize},
+    extensions := ["f16","chromium_experimental_subgroup_matrix"],
+    diagnostics := [("off","chromium.subgroup_matrix_uniformity")] }
+  let rr ← IO.mkRef none
+  Hesper.GPUBackend.executeWithConfigCached device
+    (Hesper.WGSL.MatMul.matMulTransposeF16WMMARegKernelGen { M := M, N := N, K := K } v.tmsg v.tnsg v.sgRows v.sgCols v.bk)
+    (("a",aBuf)::("b",bf16)::("c",cBuf)::List.nil) cfg 1 rr
+  let gpu ← Hesper.Basic.bytesToFloatArray (← mapBufferRead device cBuf 0 (M*N*4).toUSize)
+  let mut md := 0.0
+  for m in [0:M] do for n in [0:N] do
+    let mut g := 0.0
+    for k in [0:K] do g := g + (af m k) * (wf n k)
+    let d := (gpu.getD (m*N+n) 0.0 - g).abs
+    if d > md then md := d
+  if md > 0.5 then return some s!"maxDiff={md} @ M={M} N={N} K={K}"
+  return none
+
+/-- DEVPLAN M2 — SWEEP=1: Tier-1 autotune sweep of the generalized reg-WMMA kernel at the
+    worst-roofline decode shapes. Per variant (mandatory, 原則 2): golden(small shape) → timing
+    (100-iter batched) → occupancy probe → CSV append. Prints a ranked table vs the deployed
+    baseline (TMsg=4 TNsg=2 sg2x2 BK32 = the current 64×32 kernel's configuration). -/
+def sweepTier1 (device : Device) : IO Unit := do
+  let shapes : List (String × Nat × Nat × Nat) :=
+    [("QKV-KV", 262, 1024, 2816), ("dense-gu", 262, 2112, 2816)]
+  -- Tier-1 grid (+BK axis since the generator takes it anyway)
+  let mut grid : Array SweepVariant := #[]
+  for sgR in [1, 2, 4] do
+    for sgC in [1, 2, 4] do
+      for tm in [1, 2, 4, 8] do
+        for tn in [1, 2, 4] do
+          for bk in [16, 32, 64] do
+            grid := grid.push { tmsg := tm, tnsg := tn, sgRows := sgR, sgCols := sgC, bk := bk }
+  let dumpOn := (← IO.getEnv "HESPER_DUMP_MSL").isSome
+  -- Resource lifetimes accumulate per variant (golden buffers + pipelines have no free API) and a
+  -- full 300-variant pass SIGSEGVs near the end. So the sweep is RESUMABLE: variants already in the
+  -- CSV are skipped, SWEEP_LIMIT caps variants per process, and the driver just re-runs the binary
+  -- until the CSV is complete. Rankings come from the CSV.
+  let limit := ((← IO.getEnv "SWEEP_LIMIT").bind (·.toNat?)).getD 120
+  let csvPath := "tune/tune_log.csv"
+  IO.FS.createDirAll "tune"
+  let csvExists ← System.FilePath.pathExists csvPath
+  let doneKeys ← (do
+    if csvExists then
+      let content ← IO.FS.readFile csvPath
+      pure <| content.splitOn "\n" |>.filterMap (fun line =>
+        match line.splitOn "," with
+        | _kernel :: shape :: _m :: _n :: _k :: variant :: _rest => some s!"{shape}/{variant}"
+        | _ => none)
+    else pure [])
+  let h ← IO.FS.Handle.mk csvPath (if csvExists then .append else .write)
+  if !csvExists then
+    h.putStrLn "kernel,shape,M,N,K,variant,ms,gflops,occMaxThreads,sharedBytes,wgSize,golden"
+  let mut budget := limit
+  let stdout ← IO.getStdout
+  for (sname, M, N, K) in shapes do
+    let feasibleAll := grid.filter (·.feasible K N)
+    let feasibles := feasibleAll.filter (fun v => !(doneKeys.contains s!"{sname}/{v.name}"))
+    IO.println s!"=== SWEEP {sname} [M={M} N={N} K={K}]: {feasibles.size} remaining of {feasibleAll.size} feasible ({grid.size} grid) ==="
+    stdout.flush
+    -- pad M so the largest Mtile's grid roundup stays in-bounds (WMMA tail contract)
+    let maxMTile := feasibles.foldl (fun a v => max a v.mTile) 64
+    let mPad := ((M + maxMTile - 1) / maxMTile) * maxMTile
+    let aBuf ← mkBuf device (mPad*K); let bBuf ← mkBuf device (N*(K/2)); let cBuf ← mkBuf device (mPad*N)
+    let bufs : List (String × Buffer) := [("a",aBuf),("b",bBuf),("c",cBuf)]
+    let flops := 2.0 * M.toFloat * N.toFloat * K.toFloat
+    let mut results : Array (SweepVariant × Float × String) := #[]
+    let t0 ← IO.monoMsNow
+    for v in feasibles do
+      if budget == 0 then break
+      budget := budget - 1
+      -- 1) golden gate (small shape)
+      match ← checkVariantGolden device v with
+      | some err =>
+        IO.println s!"  {v.name}: ❌ GOLDEN FAIL {err}"
+        stdout.flush
+        h.putStrLn s!"regGen,{sname},{M},{N},{K},{v.name},,,,,{v.wgSize},FAIL"
+      | none =>
+        -- 2) timing at the real shape (M padded per contract)
+        let mGrid := (M + v.mTile - 1) / v.mTile
+        let kern := Hesper.WGSL.MatMul.matMulTransposeF16WMMARegKernelGen
+          { M := mPad, N := N, K := K } v.tmsg v.tnsg v.sgRows v.sgCols v.bk
+        let cfg : Hesper.ExecConfig := {
+          numWorkgroups := (N / v.nTile, mGrid, 1), workgroupSize := {x := v.wgSize},
+          extensions := ["f16","chromium_experimental_subgroup_matrix"],
+          diagnostics := [("off","chromium.subgroup_matrix_uniformity")] }
+        let r ← IO.mkRef none
+        Hesper.GPUBackend.executeWithConfigCached device kern bufs cfg 1 r
+        -- 3) occupancy probe (mandatory column) — right after this variant's pipeline compile
+        let occ ← (do
+          if dumpOn then
+            let msl ← Hesper.WebGPU.lastDumpedMsl
+            Hesper.WebGPU.mslOccupancyProbe device msl
+          else pure "occ=n/a") <|> pure "occ=err"
+        let iters := 30   -- ranking precision is enough; the winner gets a precise re-bench
+        let tb0 ← IO.monoMsNow
+        Hesper.GPUBackend.beginBatch device
+        for _ in [0:iters] do Hesper.GPUBackend.executeWithConfigCached device kern bufs cfg 1 r
+        Hesper.GPUBackend.endBatch device
+        let tb1 ← IO.monoMsNow
+        let ms := (tb1-tb0).toFloat / iters.toFloat
+        let gflops := flops / (ms/1000.0) / 1.0e9
+        results := results.push (v, ms, occ)
+        if results.size % 20 == 0 then
+          IO.println s!"  ... {results.size}/{feasibles.size} timed"
+          stdout.flush
+        h.putStrLn s!"regGen,{sname},{M},{N},{K},{v.name},{ms},{gflops},{occ},{v.sharedBytes},{v.wgSize},PASS"
+    let t1 ← IO.monoMsNow
+    h.flush
+    -- ranked table (top 10 + the deployed-baseline point)
+    let sorted := results.qsort (fun a b => a.2.1 < b.2.1)
+    IO.println s!"--- {sname}: {results.size} timed in {(t1-t0).toFloat/1000.0}s — TOP 10 ---"
+    for (v, ms, occ) in sorted.toList.take 10 do
+      let gflops := flops / (ms/1000.0) / 1.0e9
+      IO.println s!"  {v.name}: {ms}ms | {gflops} GFLOPS | {occ} | shared={v.sharedBytes}B wg={v.wgSize}"
+    match results.find? (fun (v, _, _) => v.tmsg == 4 && v.tnsg == 2 && v.sgRows == 2 && v.sgCols == 2 && v.bk == 32) with
+    | some (v, ms, occ) => IO.println s!"  [deployed-baseline] {v.name}: {ms}ms | {occ}"
+    | none => IO.println "  [deployed-baseline] TM4xTN2_sg2x2_BK32: not in feasible set (?)"
+    stdout.flush
+
 def main : IO Unit := do
+  if (← IO.getEnv "SWEEP").isSome then
+    let inst ← Hesper.init; let device ← getDevice inst
+    Examples.Compute.MatmulBench.sweepTier1 device
+    return
   if (← IO.getEnv "TATPROBE").isSome then
     let inst ← Hesper.init; let device ← getDevice inst
     Examples.Compute.MatmulBench.tatProbe device
