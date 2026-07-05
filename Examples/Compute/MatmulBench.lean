@@ -539,14 +539,28 @@ def regGenFamily : Hesper.WGSL.Autotune.Family where
     (`Autotune.best`) — consumers never hand-copy numbers. -/
 def sweepTier1' (device : Device) : IO Unit := do
   let limit := ((← IO.getEnv "SWEEP_LIMIT").bind (·.toNat?)).getD 120
-  for shape in [({ M := 262, N := 1024, K := 2816 } : Hesper.WGSL.Autotune.Shape),
-                ({ M := 262, N := 2112, K := 2816 } : Hesper.WGSL.Autotune.Shape)] do
+  -- The decode's REAL WMMARegKernel shapes (M = nP = 320: canvas 256 + prompt ≤64, padded to 64).
+  -- QKV full/SWA (od = qDim/kvDim per layer parity), attnO ×2, dense gate/up + down.
+  for shape in [({ M := 320, N := 1024, K := 2816 } : Hesper.WGSL.Autotune.Shape),  -- KV (full)
+                ({ M := 320, N := 2048, K := 2816 } : Hesper.WGSL.Autotune.Shape),  -- KV (SWA)
+                ({ M := 320, N := 4096, K := 2816 } : Hesper.WGSL.Autotune.Shape),  -- Q (SWA)
+                ({ M := 320, N := 8192, K := 2816 } : Hesper.WGSL.Autotune.Shape),  -- Q (full)
+                ({ M := 320, N := 2816, K := 4096 } : Hesper.WGSL.Autotune.Shape),  -- attnO (SWA)
+                ({ M := 320, N := 2816, K := 8192 } : Hesper.WGSL.Autotune.Shape),  -- attnO (full)
+                ({ M := 320, N := 2112, K := 2816 } : Hesper.WGSL.Autotune.Shape),  -- dense gate/up
+                ({ M := 320, N := 2816, K := 2112 } : Hesper.WGSL.Autotune.Shape)] do -- dense down
     let remaining ← Hesper.WGSL.Autotune.sweep device regGenFamily shape (limit := limit)
     IO.println s!"[sweep] {shape.key}: {remaining} variants remaining (re-run to continue)"
     -- sweep complete for this shape → REFINE: top-10 re-measured 300 iters × 3 reps, winner by
-    -- min-of-reps (single sweep rows carry up to ~3× transient outliers — measured)
+    -- min-of-reps (single sweep rows carry up to ~3× transient outliers — measured). The DEPLOYED
+    -- config competes as incumbent (a thermally-skewed sweep can never deploy a regression), and
+    -- SWEEP_COOL_MS inserts a cool-down before each shape's refine (long multi-shape runs heat the
+    -- box and corrupt absolute times — measured: a hot refine crowned a config SLOWER than deployed).
     if remaining == 0 then
+      let coolMs := ((← IO.getEnv "SWEEP_COOL_MS").bind (·.toNat?)).getD 0
+      if coolMs > 0 then IO.sleep coolMs.toUInt32
       Hesper.WGSL.Autotune.refineTopK device regGenFamily shape
+        (incumbent := some [("TM", 4), ("TN", 2), ("sgR", 2), ("sgC", 2), ("BK", 32)])
 
 /-- (superseded by sweepTier1' + Autotune engine; kept for the ranked-table print path) -/
 def sweepTier1 (device : Device) : IO Unit := do
