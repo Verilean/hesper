@@ -2472,6 +2472,40 @@ extern "C" lean_obj_res lean_hesper_gpubusy_read(lean_obj_res /* unit */) {
     return lean_io_result_mk_ok(lean_mk_string(b));
 }
 
+// ── Single-pass batching ─────────────────────────────────────────────────
+// One compute pass per batch instead of one per dispatch. Pass open/close
+// costs ~5-15 µs each; at ~600 dispatches/token that was 3-9 ms of pure
+// pass-switch overhead per decode step. WebGPU defines per-dispatch usage
+// scopes WITHIN a pass, so writes from dispatch N are visible to dispatch
+// N+1 without ending the pass — data dependencies are preserved.
+// HESPER_SINGLE_PASS=1 opts in. DEFAULT OFF: single-pass mode changes decode
+// numerics (bit-level divergence first appearing in layer-1 attention;
+// deterministic per mode, prefill unaffected) — an intra-pass hazard is being
+// missed somewhere (Dawn-on-Metal barrier or a scheduling-sensitive kernel).
+// Measured win was only ~+3% (49.6→51.3 t/s), so it stays off until the
+// hazard is found. Reproducer: poem prompt, 24 tokens, md5 of token list
+// differs between HESPER_SINGLE_PASS=0/1; bisect via /tmp/sp{0,1} dumps.
+static WGPUComputePassEncoder g_open_pass = nullptr;
+static WGPUCommandEncoder g_open_pass_owner = nullptr;
+
+static bool single_pass_enabled() {
+    static const bool enabled = [] {
+        const char* v = getenv("HESPER_SINGLE_PASS");
+        return v && strcmp(v, "1") == 0;
+    }();
+    return enabled;
+}
+
+// End + release the open pass if it belongs to `enc` (call before Finish).
+static void close_open_pass_for(WGPUCommandEncoder enc) {
+    if (g_open_pass && g_open_pass_owner == enc) {
+        wgpuComputePassEncoderEnd(g_open_pass);
+        wgpuComputePassEncoderRelease(g_open_pass);
+        g_open_pass = nullptr;
+        g_open_pass_owner = nullptr;
+    }
+}
+
 lean_obj_res lean_hesper_record_dispatch(b_lean_obj_arg encoder_obj, b_lean_obj_arg pipeline_obj,
                                           b_lean_obj_arg bind_group_obj,
                                           uint32_t workgroupsX, uint32_t workgroupsY, uint32_t workgroupsZ,
@@ -2491,14 +2525,32 @@ lean_obj_res lean_hesper_record_dispatch(b_lean_obj_arg encoder_obj, b_lean_obj_
         return lean_io_result_mk_error(lean_mk_string("BindGroup is invalid"));
     }
 
-    WGPUComputePassEncoder pass = wgpuCommandEncoderBeginComputePass(encoder->Get(), nullptr);
-    wgpuComputePassEncoderSetPipeline(pass, pipeline->Get());
-    wgpuComputePassEncoderSetBindGroup(pass, 0, bindGroup->Get(), 0, nullptr);
-    wgpuComputePassEncoderDispatchWorkgroups(pass, workgroupsX, workgroupsY, workgroupsZ);
-    wgpuComputePassEncoderEnd(pass);
-    wgpuComputePassEncoderRelease(pass);
+    if (single_pass_enabled()) {
+        WGPUComputePassEncoder pass;
+        if (g_open_pass && g_open_pass_owner == encoder->Get()) {
+            pass = g_open_pass;
+        } else {
+            // A pass left open on a DIFFERENT encoder means that encoder was
+            // abandoned without submit — close ours out to avoid leaking.
+            if (g_open_pass) close_open_pass_for(g_open_pass_owner);
+            pass = wgpuCommandEncoderBeginComputePass(encoder->Get(), nullptr);
+            g_open_pass = pass;
+            g_open_pass_owner = encoder->Get();
+            g_pass_count.fetch_add(1, std::memory_order_relaxed);
+        }
+        wgpuComputePassEncoderSetPipeline(pass, pipeline->Get());
+        wgpuComputePassEncoderSetBindGroup(pass, 0, bindGroup->Get(), 0, nullptr);
+        wgpuComputePassEncoderDispatchWorkgroups(pass, workgroupsX, workgroupsY, workgroupsZ);
+    } else {
+        WGPUComputePassEncoder pass = wgpuCommandEncoderBeginComputePass(encoder->Get(), nullptr);
+        wgpuComputePassEncoderSetPipeline(pass, pipeline->Get());
+        wgpuComputePassEncoderSetBindGroup(pass, 0, bindGroup->Get(), 0, nullptr);
+        wgpuComputePassEncoderDispatchWorkgroups(pass, workgroupsX, workgroupsY, workgroupsZ);
+        wgpuComputePassEncoderEnd(pass);
+        wgpuComputePassEncoderRelease(pass);
+        g_pass_count.fetch_add(1, std::memory_order_relaxed);
+    }
 
-    g_pass_count.fetch_add(1, std::memory_order_relaxed);
     g_record_ns.fetch_add(std::chrono::duration_cast<std::chrono::nanoseconds>(
         std::chrono::steady_clock::now() - _t0).count(), std::memory_order_relaxed);
     return lean_io_result_mk_ok(lean_box(0));
@@ -2516,6 +2568,7 @@ lean_obj_res lean_hesper_submit_and_wait(b_lean_obj_arg device_obj, b_lean_obj_a
     }
 
     // Finish encoder and submit (DG_GPUBUSY: time Finish=CPU translation vs submit+wait=GPU)
+    close_open_pass_for(encoder->Get());
     auto _tf0 = std::chrono::steady_clock::now();
     WGPUCommandBuffer commandBuffer = wgpuCommandEncoderFinish(encoder->Get(), nullptr);
     auto _tf1 = std::chrono::steady_clock::now();
@@ -2561,6 +2614,7 @@ lean_obj_res lean_hesper_submit_no_wait(b_lean_obj_arg device_obj, b_lean_obj_ar
     if (!encoder || !encoder->Get()) {
         return lean_io_result_mk_error(lean_mk_string("CommandEncoder is invalid"));
     }
+    close_open_pass_for(encoder->Get());
     auto _tf0 = std::chrono::steady_clock::now();
     WGPUCommandBuffer commandBuffer = wgpuCommandEncoderFinish(encoder->Get(), nullptr);
     wgpuQueueSubmit(device->GetQueue().Get(), 1, &commandBuffer);
