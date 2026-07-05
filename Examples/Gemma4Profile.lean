@@ -23,14 +23,17 @@ Usage:
 open Hesper.WebGPU
 open Hesper.Models.Gemma4
 
-def main : IO Unit := do
+def main (args : List String) : IO Unit := do
   IO.println "═══════════════════════════════════════════════"
   IO.println "  Gemma 4 Per-Token Profile"
   IO.println "═══════════════════════════════════════════════"
 
-  let modelPath := "data/gemma-4-e4b-it-Q4_K_M.gguf"
+  let modelPath := args.headD "data/gemma-4-e4b-it-Q4_K_M.gguf"
   let inst ← Hesper.init
   let device ← getDevice inst
+  -- Same dp4a gating as Gemma4Inference (fused-QKV path requires it on WebGPU+subgroups).
+  if ← Hesper.WebGPU.deviceHasSubgroups device then
+    Hesper.Layers.Linear.dp4aEnabled.set true
   IO.println s!"[Load] {modelPath}"
   let model ← Gemma4Model.fromGGUF device modelPath
   let state ← createInferenceState device model.config

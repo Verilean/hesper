@@ -13,6 +13,12 @@ open Hesper.WebGPU
 open Hesper.WGSL.Execute
 open Hesper.WGSL (WorkgroupSize)
 
+/-- Cached once: HESPER_KEYED_PIPELINES=0 disables authoritative cache keys. -/
+private def keyedPipelinesEnabled : IO Bool := do
+  match ← IO.getEnv "HESPER_KEYED_PIPELINES" with
+  | some "0" => pure false
+  | _ => pure true
+
 @[reducible] instance : GPUBackend Device where
   Buf := Buffer
   CachedDispatch := PreparedDispatch
@@ -22,15 +28,25 @@ open Hesper.WGSL (WorkgroupSize)
       { funcName := config.funcName, workgroupSize := config.workgroupSize,
         numWorkgroups := config.numWorkgroups,
         extensions := config.extensions, diagnostics := config.diagnostics }
-  executeWithConfigCached device computation namedBuffers (config : Hesper.ExecConfig) _cacheKey cacheRef :=
-    -- cacheKey is ignored for pipeline cache — WGSL hash is always used
-    -- (external cacheKey can collide with other modules' keys).
-    -- cacheRef is still passed for PreparedDispatch fast-path.
-    executeShaderNamed device computation namedBuffers
-      { funcName := config.funcName, workgroupSize := config.workgroupSize,
-        numWorkgroups := config.numWorkgroups,
-        extensions := config.extensions, diagnostics := config.diagnostics }
-      none (some cacheRef)
+  executeWithConfigCached device computation namedBuffers (config : Hesper.ExecConfig) cacheKey cacheRef :=
+    -- The caller's cacheKey is AUTHORITATIVE (mirrors the CUDA backend, which
+    -- skips codegen entirely on a key hit): the first call compiles the WGSL
+    -- and registers the pipeline under the key; later calls skip WGSL
+    -- regeneration (compileToWGSL per dispatch was ~100-200 µs — the dominant
+    -- decode host cost at ~600 dispatches/token). Buffers are still re-bound
+    -- per call via the (key, buffers) bind-group cache, so ping-pong buffer
+    -- call sites stay correct. Contract (same as CUDA): a cacheKey must
+    -- uniquely identify the generated WGSL — bake-varying params into the key.
+    -- cacheKey=0 means "no key" (hash the generated WGSL as before).
+    do
+      -- HESPER_KEYED_PIPELINES=0: fall back to hashing the regenerated WGSL
+      -- per call (slow but collision-proof) — A/B tool for key-collision hunts.
+      let keyed ← keyedPipelinesEnabled
+      executeShaderNamed device computation namedBuffers
+        { funcName := config.funcName, workgroupSize := config.workgroupSize,
+          numWorkgroups := config.numWorkgroups,
+          extensions := config.extensions, diagnostics := config.diagnostics }
+        (if cacheKey == 0 || !keyed then none else some cacheKey) (some cacheRef)
   replayCached device cached dims :=
     replayPreparedDispatch device cached dims.1 dims.2.1 dims.2.2
   allocBuffer device size :=
