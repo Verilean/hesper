@@ -1152,6 +1152,68 @@ extern "C" lean_obj_res lean_hesper_msl_concurrent_probe(
     }
 }
 
+// ===========================================================================================
+// Native GPU timing for the autotune engine (HESPER_NATIVE_BENCH=1): benching tiny matvecs
+// through Dawn measures Dawn's ~35 µs/dispatch overhead, not the kernel (native serial
+// 13.5 µs vs 47 µs through Dawn for the SAME kernel — measured). This runs `nDispatches`
+// of the variant's dumped Tint-MSL back-to-back in one SERIAL native encoder and returns
+// the honest serialized GPU ms. Buffers come as a Lean Array in BINDING ORDER.
+// ===========================================================================================
+extern "C" lean_obj_res lean_hesper_msl_bench_serial(
+    b_lean_obj_arg device_obj, b_lean_obj_arg msl_obj, b_lean_obj_arg bufs_array,
+    uint32_t nDispatches, uint32_t gridX, uint32_t gridY, uint32_t gridZ, uint32_t wgX,
+    lean_obj_res /* unit */) {
+    @autoreleasepool {
+        wgpu::Device* device = mr_extract_device(device_obj);
+        if (!device || !device->Get()) return lean_io_result_mk_error(lean_mk_string("bench_serial: invalid device"));
+        id<MTLDevice> mtl = dawn::native::metal::GetMTLDevice(device->Get());
+        const char* mslSrc = lean_string_cstr(msl_obj);
+        if (!mslSrc || mslSrc[0] == '\0')
+            return lean_io_result_mk_error(lean_mk_string("bench_serial: empty MSL (set HESPER_DUMP_MSL=1)"));
+        size_t nBufs = lean_array_size(bufs_array);
+        std::vector<id<MTLBuffer>> mb(nBufs);
+        for (size_t i = 0; i < nBufs; i++) {
+            wgpu::Buffer* b = mr_extract_buffer(lean_array_get_core(bufs_array, i));
+            if (!b || !b->Get()) return lean_io_result_mk_error(lean_mk_string("bench_serial: invalid buffer"));
+            mb[i] = reinterpret_cast<dawn::native::metal::Buffer*>(b->Get())->GetMTLBuffer();
+        }
+        // PSO cache keyed by MSL hash — refine re-benches the same variants.
+        static std::unordered_map<size_t, id<MTLComputePipelineState>> psoCache;
+        size_t key = std::hash<std::string>{}(std::string(mslSrc));
+        id<MTLComputePipelineState> pso = nil;
+        auto it = psoCache.find(key);
+        if (it != psoCache.end()) pso = it->second;
+        else {
+            NSError* err = nil;
+            MTLCompileOptions* opts = [MTLCompileOptions new];
+            id<MTLLibrary> lib = [mtl newLibraryWithSource:[NSString stringWithUTF8String:mslSrc] options:opts error:&err];
+            if (!lib) return lean_io_result_mk_error(lean_mk_string(
+                [[NSString stringWithFormat:@"bench_serial compile failed: %@", err] UTF8String]));
+            id<MTLFunction> fn = [lib newFunctionWithName:@"dawn_entry_point"];
+            if (!fn) return lean_io_result_mk_error(lean_mk_string("bench_serial: no dawn_entry_point"));
+            pso = [mtl newComputePipelineStateWithFunction:fn error:&err];
+            if (!pso) return lean_io_result_mk_error(lean_mk_string("bench_serial: PSO failed"));
+            psoCache[key] = pso;
+        }
+        if (!g_mslQueue) g_mslQueue = [mtl newCommandQueue];
+        id<MTLCommandBuffer> cb = [g_mslQueue commandBuffer];
+        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];   // serial (default)
+        [enc setComputePipelineState:pso];
+        for (size_t i = 0; i < nBufs; i++) [enc setBuffer:mb[i] offset:0 atIndex:i];
+        for (uint32_t d = 0; d < nDispatches; d++) {
+            [enc dispatchThreadgroups:MTLSizeMake(gridX, gridY, gridZ)
+                threadsPerThreadgroup:MTLSizeMake(wgX, 1, 1)];
+        }
+        [enc endEncoding];
+        [cb commit];
+        [cb waitUntilCompleted];
+        double gpuMs = ([cb GPUEndTime] - [cb GPUStartTime]) * 1000.0;
+        char buf[64];
+        snprintf(buf, sizeof(buf), "%.4f", gpuMs);
+        return lean_io_result_mk_ok(lean_mk_string(buf));
+    }
+}
+
 extern "C" lean_obj_res lean_hesper_msl_occupancy_probe(
     b_lean_obj_arg device_obj, b_lean_obj_arg msl_obj, lean_obj_res /* unit */) {
     @autoreleasepool {

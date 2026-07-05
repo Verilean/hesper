@@ -6,6 +6,7 @@ import Hesper.WebGPU.BufferOps
 import Hesper.Basic
 import Hesper.WGSL.MatMul
 import Hesper.WGSL.Autotune
+import Hesper.WGSL.MulMvQ4K
 import Hesper.Quantization.Q4_K_M
 import Hesper.Layers.Linear
 
@@ -983,6 +984,76 @@ def checkMulMvGolden (device : Device) (r w : Nat) : IO (Option String) := do
 /-- Grid X width for the 2D dispatch when N/R exceeds the 65535 per-dim cap. -/
 def mulMvGridX (nWGs : Nat) : Nat := if nWGs > 65535 then 4096 else 0
 
+/-- Golden for the llama-port f32 kernel: reference = GPU Q4_K dequant → f32 matmul
+    (both production-validated), tight rel tolerance (same f32 precision class). -/
+def checkMulMvF32Golden (device : Device) (nr0 nsg : Nat) : IO (Option String) := do
+  let K := 1536
+  let N := max (nr0 * nsg * 8) 64
+  let wBuf ← mkQ4KTestWeights device N K
+  -- f32 input (same synthetic vector the Q8 golden uses, un-quantized)
+  let mut xA : Array Float := #[]
+  for k in [0:K] do xA := xA.push ((((k*7+3) % 13 : Nat).toFloat) - 6.0)
+  let xf ← mkBuf device K
+  writeBuffer device xf 0 (← Hesper.Basic.floatArrayToBytes xA)
+  -- reference: GPU Q4_K dequant (production-validated) → CPU dot per row.
+  -- (executeMatMulTranspose was tried first and turned out to DROP the last output
+  --  element — a latent bug in that legacy f32 path, now avoided here.)
+  let wf ← mkBuf device (N*K)
+  let r0 ← IO.mkRef none
+  Hesper.GPUBackend.executeWithConfigCached device
+    (Hesper.Quantization.Q4_K_M.dequantQ4KMKernel (N*K) 0 0)
+    (("data",wBuf)::("output",wf)::List.nil)
+    { numWorkgroups := ((N*K+255)/256, 1, 1), workgroupSize := {x:=256} } 0 r0
+  -- variant
+  let outVar ← mkBuf device N
+  let rv ← IO.mkRef none
+  Hesper.GPUBackend.executeWithConfigCached device
+    (Hesper.WGSL.MulMvQ4K.mulMvQ4KF32Kernel K N nr0 nsg)
+    (("weights",wBuf)::("input",xf)::("output",outVar)::List.nil)
+    { numWorkgroups := (N/(nr0*nsg), 1, 1), workgroupSize := {x:=32*nsg}, extensions := ["subgroups"] } 0 rv
+  let wfA ← Hesper.Basic.bytesToFloatArray (← mapBufferRead device wf 0 (N*K*4).toUSize)
+  let gVar ← Hesper.Basic.bytesToFloatArray (← mapBufferRead device outVar 0 (N*4).toUSize)
+  let mut worst := 0.0
+  let mut worstI := 0
+  let mut worstRef := 0.0
+  for i in [0:N] do
+    let mut cpu := 0.0
+    for k in [0:K] do
+      cpu := cpu + (wfA.getD (i*K + k) 0.0) * (xA.getD k 0.0)
+    let b := gVar.getD i 0.0
+    let d := (cpu-b).abs / (max cpu.abs (max b.abs 1e-3))
+    if d > worst then worst := d; worstI := i; worstRef := cpu
+  if worst > 1e-3 then
+    return some s!"relDiff={worst} @i={worstI} (cpuRef={worstRef} var={gVar.getD worstI 0.0}) N={N} K={K}"
+  return none
+
+/-- The llama.cpp-port f32 matvec as a family. Center point NR0=2,NSG=2 = llama's
+    shipping config (原則 7); the sweep explores around it. NO quantize dispatch. -/
+def mulMvQ4Kf32Family : Hesper.WGSL.Autotune.Family where
+  name := "mulMvQ4Kf32"
+  space := Id.run do
+    let mut s : List Hesper.WGSL.Autotune.Params := []
+    for nr0 in [1, 2, 4] do
+      for nsg in [1, 2, 4, 8] do
+        s := s ++ [[("NR0", nr0), ("NSG", nsg)]]
+    return s
+  feasible := fun p shape =>
+    let nr0 := p.get! "NR0"; let nsg := p.get! "NSG"
+    32*nsg ≤ 256 && shape.N % (nsg*nr0) == 0 && shape.K % 256 == 0
+  gen := fun p shape =>
+    let nr0 := p.get! "NR0"; let nsg := p.get! "NSG"
+    Hesper.WGSL.MulMvQ4K.mulMvQ4KF32Kernel shape.K shape.N nr0 nsg
+      (gridXWidth := mulMvGridX (shape.N / (nsg*nr0)))
+  cfg := fun p shape =>
+    let nr0 := p.get! "NR0"; let nsg := p.get! "NSG"
+    let nWGs := shape.N / (nsg*nr0)
+    let gx := mulMvGridX nWGs
+    let grid := if gx == 0 then (nWGs, 1, 1) else (gx, (nWGs + gx - 1) / gx, 1)
+    { numWorkgroups := grid, workgroupSize := {x := 32*nsg}, extensions := ["subgroups"] }
+  benchBuffers := fun shape =>
+    [("weights", shape.N * (shape.K/256) * 36), ("input", shape.K), ("output", shape.N)]
+  golden := fun p device => checkMulMvF32Golden device (p.get! "NR0") (p.get! "NSG")
+
 def mulMvQ4KFamily : Hesper.WGSL.Autotune.Family where
   name := "mulMvQ4K"
   space := Id.run do
@@ -1026,6 +1097,14 @@ def matVecSweep (device : Device) : IO Unit := do
       -- incumbent = the deployed 4-warp layout (R=1, W=4)
       Hesper.WGSL.Autotune.refineTopK device mulMvQ4KFamily shape
         (incumbent := some [("R", 1), ("W", 4)])
+    -- The llama-port f32 family at the same shape (no quantize dispatch at all).
+    -- incumbent := none — no member of THIS family is deployed yet, so the refine
+    -- winner must always be written (the incumbent guard compares against the
+    -- DEPLOYED config; the family center is not deployed).
+    let remaining2 ← Hesper.WGSL.Autotune.sweep device mulMvQ4Kf32Family shape (limit := limit)
+    IO.println s!"[matvec-sweep f32] {shape.key}: {remaining2} remaining"
+    if remaining2 == 0 then
+      Hesper.WGSL.Autotune.refineTopK device mulMvQ4Kf32Family shape (incumbent := none)
 
 /-- CONCPROBE=1 (M3 de-risk): does MTLDispatchTypeConcurrent recover Dawn's
     ~14µs/dispatch Serial cost? Compile the tuned R1W1 matvec ONCE through Dawn
