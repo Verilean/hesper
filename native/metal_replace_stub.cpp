@@ -72,4 +72,16 @@ lean_obj_res lean_hesper_msl_gateup_down_onecb(
     uint32_t, uint32_t, uint32_t, uint32_t, uint32_t,
     lean_obj_res) { return msl_stub(); }
 
+lean_obj_res lean_hesper_replay_reset(lean_obj_res) { return msl_stub(); }
+
+lean_obj_res lean_hesper_replay_barrier(lean_obj_res) { return msl_stub(); }
+
+lean_obj_res lean_hesper_replay_record(
+    b_lean_obj_arg, b_lean_obj_arg, b_lean_obj_arg, b_lean_obj_arg,
+    uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t,
+    lean_obj_res) { return msl_stub(); }
+
+lean_obj_res lean_hesper_replay_run(
+    uint32_t, uint32_t, lean_obj_res) { return msl_stub(); }
+
 }  // extern "C"

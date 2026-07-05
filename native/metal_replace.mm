@@ -1259,6 +1259,149 @@ extern "C" lean_obj_res lean_hesper_msl_occupancy_probe(
     }
 }
 
+// ===========================================================================================
+// Experiment 2 Phase A: NATIVE REPLAY of a captured decode-token dispatch sequence.
+// Falsification test of the post-mortem's C2 ("the gap is the dispatch layer, not kernels"):
+// the Lean side captures every dispatch of ONE decode token (Tint-CLI MSL + buffers in MSL
+// binding order + grid/wg dims + threadgroup bytes), then we replay the whole token in ONE
+// native command buffer, timing Serial vs MTLDispatchTypeConcurrent (no-barrier upper bound,
+// and per-layer-barrier realistic bound via barrier markers). Timing-only: the replay runs on
+// the live Dawn buffers AFTER decode finishes, so values are garbage but layout is identical —
+// all our kernels are fixed-trip-count, so timing is value-independent.
+// ===========================================================================================
+struct HesperReplayOp {
+    id<MTLComputePipelineState> pso;   // nil => barrier marker
+    std::vector<id<MTLBuffer>> bufs;
+    uint32_t gx, gy, gz, tx, ty, tz;
+    uint32_t tgBytes;
+};
+// Heap-allocated: never destroyed, so no static-destruction-order issues with ARC members.
+static std::vector<HesperReplayOp>* g_replayOps = nullptr;
+static std::unordered_map<size_t, id<MTLComputePipelineState>>* g_replayPsoCache = nullptr;
+// Stashed at record time so replay_run needs no device handle (callable from
+// backend-generic Lean code).
+static id<MTLDevice> g_replayMtlDevice = nil;
+
+static inline std::vector<HesperReplayOp>& hesper_replay_ops() {
+    if (!g_replayOps) g_replayOps = new std::vector<HesperReplayOp>();
+    return *g_replayOps;
+}
+
+extern "C" lean_obj_res lean_hesper_replay_reset(lean_obj_res /* unit */) {
+    hesper_replay_ops().clear();
+    return lean_io_result_mk_ok(lean_box(0));
+}
+
+extern "C" lean_obj_res lean_hesper_replay_barrier(lean_obj_res /* unit */) {
+    HesperReplayOp op{};
+    op.pso = nil;
+    hesper_replay_ops().push_back(std::move(op));
+    return lean_io_result_mk_ok(lean_box(0));
+}
+
+// Record one dispatch. `bufs_array` must already be in MSL [[buffer(i)]] order (the Lean side
+// parses the Tint-CLI entry-point signature). `entry` = the MSL kernel function name.
+extern "C" lean_obj_res lean_hesper_replay_record(
+    b_lean_obj_arg device_obj, b_lean_obj_arg msl_obj, b_lean_obj_arg entry_obj,
+    b_lean_obj_arg bufs_array,
+    uint32_t gx, uint32_t gy, uint32_t gz,
+    uint32_t tx, uint32_t ty, uint32_t tz,
+    uint32_t tgBytes, lean_obj_res /* unit */) {
+    @autoreleasepool {
+        wgpu::Device* device = mr_extract_device(device_obj);
+        if (!device || !device->Get()) return lean_io_result_mk_error(lean_mk_io_user_error(lean_mk_string("replay_record: invalid device")));
+        id<MTLDevice> mtl = dawn::native::metal::GetMTLDevice(device->Get());
+        g_replayMtlDevice = mtl;
+        const char* mslSrc = lean_string_cstr(msl_obj);
+        const char* entry = lean_string_cstr(entry_obj);
+        if (!mslSrc || mslSrc[0] == '\0') return lean_io_result_mk_error(lean_mk_io_user_error(lean_mk_string("replay_record: empty MSL")));
+
+        if (!g_replayPsoCache) g_replayPsoCache = new std::unordered_map<size_t, id<MTLComputePipelineState>>();
+        size_t key = std::hash<std::string>{}(std::string(mslSrc));
+        id<MTLComputePipelineState> pso = nil;
+        auto it = g_replayPsoCache->find(key);
+        if (it != g_replayPsoCache->end()) pso = it->second;
+        else {
+            NSError* err = nil;
+            MTLCompileOptions* opts = [MTLCompileOptions new];
+            id<MTLLibrary> lib = [mtl newLibraryWithSource:[NSString stringWithUTF8String:mslSrc] options:opts error:&err];
+            if (!lib) return lean_io_result_mk_error(lean_mk_io_user_error(lean_mk_string(
+                [[NSString stringWithFormat:@"replay_record compile failed (%s): %@", entry, err] UTF8String])));
+            id<MTLFunction> fn = [lib newFunctionWithName:[NSString stringWithUTF8String:entry]];
+            if (!fn) return lean_io_result_mk_error(lean_mk_io_user_error(lean_mk_string(
+                [[NSString stringWithFormat:@"replay_record: entry '%s' not found", entry] UTF8String])));
+            pso = [mtl newComputePipelineStateWithFunction:fn error:&err];
+            if (!pso) return lean_io_result_mk_error(lean_mk_io_user_error(lean_mk_string(
+                [[NSString stringWithFormat:@"replay_record: PSO failed (%s): %@", entry, err] UTF8String])));
+            (*g_replayPsoCache)[key] = pso;
+        }
+
+        HesperReplayOp op{};
+        op.pso = pso;
+        size_t nBufs = lean_array_size(bufs_array);
+        op.bufs.resize(nBufs);
+        for (size_t i = 0; i < nBufs; i++) {
+            wgpu::Buffer* b = mr_extract_buffer(lean_array_get_core(bufs_array, i));
+            if (!b || !b->Get()) return lean_io_result_mk_error(lean_mk_io_user_error(lean_mk_string("replay_record: invalid buffer")));
+            op.bufs[i] = reinterpret_cast<dawn::native::metal::Buffer*>(b->Get())->GetMTLBuffer();
+        }
+        op.gx = gx; op.gy = gy; op.gz = gz;
+        op.tx = tx; op.ty = ty; op.tz = tz;
+        op.tgBytes = tgBytes;
+        hesper_replay_ops().push_back(std::move(op));
+        return lean_io_result_mk_ok(lean_box(0));
+    }
+}
+
+// Replay the recorded sequence. mode: 0 = Serial, 1 = Concurrent (no barriers — timing upper
+// bound), 2 = Concurrent + memoryBarrier at recorded layer markers. Runs `iters` command
+// buffers back-to-back; returns "count=<ops> min=<ms> avg=<ms>" (GPU wall per iteration).
+extern "C" lean_obj_res lean_hesper_replay_run(
+    uint32_t mode, uint32_t iters, lean_obj_res /* unit */) {
+    @autoreleasepool {
+        id<MTLDevice> mtl = g_replayMtlDevice;
+        if (!mtl) return lean_io_result_mk_error(lean_mk_io_user_error(lean_mk_string("replay_run: nothing recorded (no device)")));
+        auto& ops = hesper_replay_ops();
+        size_t nOps = 0;
+        for (auto& op : ops) if (op.pso) nOps++;
+        if (nOps == 0) return lean_io_result_mk_error(lean_mk_io_user_error(lean_mk_string("replay_run: nothing recorded")));
+        if (!g_mslQueue) g_mslQueue = [mtl newCommandQueue];
+        if (iters == 0) iters = 1;
+        double best = 1e30, sum = 0.0;
+        for (uint32_t r = 0; r < iters; r++) {
+            id<MTLCommandBuffer> cb = [g_mslQueue commandBuffer];
+            MTLComputePassDescriptor* desc = [MTLComputePassDescriptor computePassDescriptor];
+            desc.dispatchType = (mode == 0) ? MTLDispatchTypeSerial : MTLDispatchTypeConcurrent;
+            id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoderWithDescriptor:desc];
+            for (auto& op : ops) {
+                if (!op.pso) {
+                    if (mode == 2) [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+                    continue;
+                }
+                [enc setComputePipelineState:op.pso];
+                for (size_t i = 0; i < op.bufs.size(); i++) [enc setBuffer:op.bufs[i] offset:0 atIndex:i];
+                if (op.tgBytes > 0)
+                    [enc setThreadgroupMemoryLength:((op.tgBytes + 15u) & ~15u) atIndex:0];
+                [enc dispatchThreadgroups:MTLSizeMake(op.gx, op.gy, op.gz)
+                    threadsPerThreadgroup:MTLSizeMake(op.tx, op.ty, op.tz)];
+            }
+            [enc endEncoding];
+            [cb commit];
+            [cb waitUntilCompleted];
+            if ([cb status] == MTLCommandBufferStatusError) {
+                return lean_io_result_mk_error(lean_mk_io_user_error(lean_mk_string(
+                    [[NSString stringWithFormat:@"replay_run: command buffer error: %@", [cb error]] UTF8String])));
+            }
+            double ms = ([cb GPUEndTime] - [cb GPUStartTime]) * 1000.0;
+            best = std::min(best, ms);
+            sum += ms;
+        }
+        char buf[128];
+        snprintf(buf, sizeof(buf), "count=%zu min=%.4f avg=%.4f", nOps, best, sum / iters);
+        return lean_io_result_mk_ok(lean_mk_string(buf));
+    }
+}
+
 extern "C" lean_obj_res lean_hesper_mtl_device_name(b_lean_obj_arg device_obj, lean_obj_res /* unit */) {
     wgpu::Device* device = mr_extract_device(device_obj);
     if (!device || !device->Get()) {

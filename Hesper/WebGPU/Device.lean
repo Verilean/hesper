@@ -87,6 +87,32 @@ opaque mslConcurrentProbe (device : @& Device) (msl : @& String)
 @[extern "lean_hesper_msl_busy_read"]
 opaque mslBusyRead : IO String
 
+/-- Exp 2 Phase A (native replay): clear the recorded dispatch sequence. -/
+@[extern "lean_hesper_replay_reset"]
+opaque replayReset : IO Unit
+
+/-- Exp 2 Phase A: push a barrier marker (layer boundary) into the replay sequence.
+    Only honored by `replayRun mode=2` (concurrent + barriers). -/
+@[extern "lean_hesper_replay_barrier"]
+opaque replayBarrier : IO Unit
+
+/-- Exp 2 Phase A: record one dispatch for native replay. `bufs` must be in MSL
+    `[[buffer(i)]]` order (parse the Tint-CLI entry signature); `entry` = the MSL kernel
+    function name; `tgBytes` = threadgroup memory upper bound (0 if none; set via
+    setThreadgroupMemoryLength at index 0). PSO compiled once per unique MSL. -/
+@[extern "lean_hesper_replay_record"]
+opaque replayRecord (device : @& Device) (msl : @& String) (entry : @& String)
+    (bufs : @& Array Buffer) (gx gy gz tx ty tz tgBytes : UInt32) : IO Unit
+
+/-- Exp 2 Phase A: replay the recorded token in ONE native command buffer.
+    mode: 0 = Serial (sanity vs Dawn GPU time), 1 = Concurrent no-barrier (upper bound),
+    2 = Concurrent + barriers at recorded markers (realistic). Returns
+    "count=<ops> min=<ms> avg=<ms>". TIMING ONLY — buffer contents end up garbage.
+    Device comes from the record-time stash, so this is callable from
+    backend-generic code. -/
+@[extern "lean_hesper_replay_run"]
+opaque replayRun (mode iters : UInt32) : IO String
+
 /-- metal_replacer STEP 4: Apple's tuned MPS f16 matmul (C=A·Bᵀ, our reg-matmul shape) as the CEILING —
     returns "ms/call | GFLOPS | %peak". Diff vs the WGSL reg (harness) at the same shape to quantify the
     WGSL→Tint→Metal gap. macOS DEBUG/REFERENCE only. See METAL_REPLACER_INTEGRATION.md. -/
