@@ -95,7 +95,12 @@
      - 検証: decode hidden vs 7-token prefill hidden relL2 0.014（L34）= KV-cache/全層 decode 経路も parity。層別スキャン l_out-0/34 とも llama と一致
      - 診断手法の資産化: `scripts/llama_parity/scan_layers.py`（llama-eval-callback text vs golden .bin 層別比較）、decode 側 `single_p{pos}_finalNorm/logits` dump 追加、dumpBuf を WebGPU batch 下で安全化（isBatching probe + 再 open）
      - CPU lm-head 切り分け（hidden 正しい/GPU logits 誤り→犯人は norm→lmHead チェーン）が決定打だった — bisect は「GPU dump → CPU で続きを計算」が最速
-  6. [ ] M7: E2B ≤30分 autotune で ≥200tps ★★
+  6. [~] **M7 進行中（2026-07-05）: 8.05 → 68.0 t/s（8.4×）— まだ kernel チューニング前、全部オーバーヘッド除去**。llama.cpp 156.5 の 43%。
+     - **ラダー**: 8.05 → **39.9**（WebGPU executeWithConfigCached が cacheKey を捨て毎 dispatch WGSL 全再生成 ~180µs×600 → CUDA 同様 key を権威化、collision 検証 = KEYED=0 と全 1151 golden ビット一致）→ **64.1**（pipeline/bindgroup/kcr の 3 cache が Array 線形スキャン ~450k probe/token → Std.HashMap）→ **68.0**（Q4_K dp4a lm-head 新設: f16 800MB read → Q4_K 226MB、HESPER_LMHEAD_F16 不要化 + VRAM -786MB）
+     - **既知問題（棄却済み lever）**: bridge の single-compute-pass 化（HESPER_SINGLE_PASS=1 opt-in、default OFF）— decode L1-attention から bit-divergence（mode 毎に決定的、prefill は不変）= intra-pass hazard がどこかで漏れる。利得 +0.6ms のみと判明（pass 切替は想定より安い）→ hunt は保留。再現: poem 24tok の md5 が SINGLE_PASS=0/1 で異なる
+     - **現状内訳** (~14.7ms/token): GPU ~8ms（帯域 floor 見積 ~4ms、FFN matvec 838MB/token が支配）+ host record ~2-3ms + argmax readback 0.6ms + prePLE 0.8ms
+     - **次**: mul_mv Family を Autotune に実装（FFN gate/up/down K=1536 N=6144/12288 dp4a matvec）= フレームワーク汎用性証明の本命 + GPU 2.2× ギャップの主対象。その後 argmax/readback、prePLE
+     - 単体診断ツール: gemma4-profile が argv でモデル指定可に（E2B 対応）
 
 **M1 で確定した実装制約**（原則に準ずる）:
 - **Dawn の SetLoggingCallback は CAPTURELESS lambda 限定**: capture 付き functor は寿命が繰返し発火をカバーせず use-after-free（確率的に quiet 無視 + SIGTRAP/SIGABRT を実測）。状態は global で渡す。
@@ -123,3 +128,7 @@
 | 2026-07-05 | **M6 合格: E2B greedy = llama.cpp 一致（"Paris."✓ "Jupiter."✓）、8.05 t/s** | 最終 4 バグ = E2B 固有テンソル型（PLE 表 Q5_K / proj BF16 / inp_gate·proj F32）×3 + finalNorm prepared-cache の buffer 捕捉（35 層奇数で ping-pong 反転、E4B 42 層は偶然潜伏）。詳細 §3-5 |
 | 2026-07-05 | 量子化型は tensor 毎に GGUF から読む（思い込み禁止）を原則運用に | E2B は同名 tensor が E4B と別型（Q6_K→Q5_K, Q4_K→F32, F16→BF16）。3/4 バグがこのクラス。loadLinear/loader は型検出 + 明示 throw（未対応型）に |
 | 2026-07-05 | prepared/cached dispatch の shared ref は「buffer が呼び出し毎に不変」の site 限定 | finalNorm bug の教訓。ping-pong buffer を渡す site は専用 ref か throwaway。層数の偶奇でしか発火しない罠として決定ログに固定 |
+| 2026-07-05 | **WebGPU cacheKey を権威化（CUDA と同契約）** — 8.05→39.9 t/s | 毎 dispatch の WGSL 再生成 ~180µs×600 が decode の 88% だった。collision 検証: HESPER_KEYED_PIPELINES=0 と全 1151 golden ビット一致。契約 = key は生成 WGSL を一意に識別（baked param は key に含める） |
+| 2026-07-05 | 3 つの dispatch cache を HashMap 化 — 39.9→64.1 t/s | pipeline/bindgroup/kcr が Array 線形スキャン（~450k probe/token）。ホスト記録 5.3→1.1ms |
+| 2026-07-05 | single-compute-pass 化は default OFF で保留 | decode L1-attention から bit-divergence（intra-pass hazard 漏れ、mode 毎決定的・prefill 不変）。利得 +0.6ms のみ。reproducer 記録済（poem 24tok md5） |
+| 2026-07-05 | Q4_K dp4a lm-head を default に — 64.1→68.0 t/s、HESPER_LMHEAD_F16 廃止（opt-in 化） | f16 事前 dequant 800MB read → Q4_K 226MB 直読。VRAM -786MB。prefill/decode 両方 |
