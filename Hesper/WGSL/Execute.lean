@@ -6,6 +6,7 @@ import Hesper.WebGPU.Device
 import Hesper.WebGPU.Buffer
 import Hesper.WebGPU.Shader
 import Hesper.WebGPU.Pipeline
+import Hesper.WGSL.NativeReplay
 import Hesper.Logging
 
 namespace Hesper.WGSL.Execute
@@ -698,6 +699,15 @@ def executeShaderNamed
   -- Save PreparedDispatch for future instant replay (first token only)
   if let some ref := preparedRef then
     ref.set (some { pipeline, bindGroup })
+
+  -- Exp 2 Phase A: while capturing, mirror this dispatch into the native replay
+  -- sequence (regenerates WGSL unconditionally — capture is a one-token mode, the
+  -- ~100 µs × 567 extra cost is irrelevant and the normal dispatch below still runs).
+  if ← NativeReplay.isCapturing then
+    let wgsl := compileToWGSL computation config.funcName config.workgroupSize config.extensions config.diagnostics
+    let tgBytes := NativeReplay.sharedBytes (ShaderM.exec computation).sharedVars
+    NativeReplay.recordDispatch device wgsl config.funcName namedBuffers tgBytes
+      config.numWorkgroups config.workgroupSize.x config.workgroupSize.y config.workgroupSize.z
 
   -- Check if we're in batch mode
   let (wx, wy, wz) := config.numWorkgroups

@@ -2693,6 +2693,9 @@ def forwardSingleToken [GPUBackend β] (ctx : β)
     forwardBlock ctx block model.config currentBuf nextBuf state pos
       (kcr := kcr) (perLayerEmbd := plEmbd) (perLayerInput := plInputBuf)
       (skipPosWrite := skipPosWrite)
+    -- Exp 2 Phase A: layer-boundary barrier marker for native replay mode 2
+    -- (no-op unless a capture is active).
+    Hesper.WGSL.NativeReplay.layerBarrier
     let oldCb := currentBuf
     currentBuf := nextBuf
     nextBuf := oldCb
@@ -3600,7 +3603,21 @@ def generate [GPUBackend β] (ctx : β) (model : Gemma4Model (GPUBackend.Buf β)
             let dfThisIter := deviceFedActive && decodeForwardsDone >= 1
             let dfTokenSkip := dfThisIter
             let dfPosSkip   := dfThisIter
+            -- Exp 2 Phase A: HESPER_NATIVE_REPLAY=<n> captures decode forward #n's
+            -- dispatch sequence (n≥1 so pipelines are warm; default 1) into the
+            -- native replay list; the timing runs happen after the generate loop
+            -- finishes (timing-only — replay clobbers buffer contents).
+            -- Needs HESPER_TINT_BIN.
+            let nativeReplayTok := (← IO.getEnv "HESPER_NATIVE_REPLAY").bind (·.toNat?)
+            let captureNow := nativeReplayTok == some decodeForwardsDone
+            if captureNow then
+              IO.println "[replay] capturing this token's dispatches (tint CLI per unique kernel)…"
+              Hesper.WGSL.NativeReplay.startCapture
             forwardSingleToken ctx model nextToken newPos state (kcr := some kcr) (skipTokenWrite := dfTokenSkip) (skipPosWrite := dfPosSkip)
+            if captureNow then
+              let (n, misses) ← Hesper.WGSL.NativeReplay.stopCapture
+              IO.println s!"[replay] captured {n} dispatches; misses={misses.length}"
+              for m in misses.take 20 do IO.println s!"[replay]   MISS {m}"
             if deviceFedActive then
               -- Increment pos / cacheLen / posF32 device-side so the *next*
               -- iteration's forward sees the correct values without any host
@@ -3677,6 +3694,16 @@ def generate [GPUBackend β] (ctx : β) (model : Gemma4Model (GPUBackend.Buf β)
     Hesper.printAllocHistogram
     Hesper.printModuleLoadStats
     Hesper.printExecuteImplStats
+
+  -- Exp 2 Phase A: replay the captured token natively (Serial sanity vs
+  -- MTLDispatchTypeConcurrent). Runs AFTER decode so the buffer clobbering
+  -- is harmless; results are GPU-wall per token.
+  if (← IO.getEnv "HESPER_NATIVE_REPLAY").isSome then
+    IO.println "[replay] native replay of the captured token (20 iters each):"
+    try
+      IO.println (← Hesper.WGSL.NativeReplay.runAll 20)
+    catch e =>
+      IO.println s!"[replay] FAILED: {e}"
 
   return tokens
 
