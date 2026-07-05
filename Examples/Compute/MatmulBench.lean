@@ -379,7 +379,55 @@ def benchNonMatmul : IO Unit := do
   IO.println "  ⇒ llama.cpp's equivalent ≈ 0 (fused element-wise, INDEXED mul_mat_id = no gather/scatter, flash-attn)."
   IO.println "  ~HALF the 2.5× gap. The indexed-MoE redesign (MOE_INDEXED_DESIGN.md) removes the grouping/scatter."
 
+/-- DEVPLAN M0 — TAT probe: measure the true per-variant cost of an IN-PROCESS sweep
+    (WGSL gen + pipeline compile + 100-iter batched bench), over the already-parameterized
+    `matMulTransposeF16WMMA8x8RegKernel (TM TN)`. The autotune design holds only if this is
+    within ~2× of the ~2-3 s/variant estimate (100 variants ≈ 5-15 min). No golden here —
+    pure timing probe; the M2 sweep runner adds the golden gate. -/
+def tatProbe (device : Device) : IO Unit := do
+  -- FINDING (first attempt, kept as a constraint): matMulTransposeF16WMMA8x8RegKernel unrolls the
+  -- K loop at the LEAN level — at K=2816 that's 352 fully-unrolled tiles and Tint/Metal compile
+  -- spins for minutes on the FIRST variant. Sweep substrates MUST use runtime-K-loop generators
+  -- (the deployed matMulTransposeF16WMMARegKernel style). So this probe uses the deployed kernel,
+  -- forcing a NEW pipeline per variant via the baked weightRowOffset literal (identical structure,
+  -- different WGSL string → cache miss → full gen+compile per variant = the real sweep cost).
+  let M := 262; let N := 1024; let K := 2816   -- real QKV-KV shape
+  let aBuf ← mkBuf device (M*K)
+  let bBuf ← mkBuf device (N*(K/2))
+  let cBuf ← mkBuf device (M*N)
+  let bufs : List (String × Buffer) := [("a",aBuf),("b",bBuf),("c",cBuf)]
+  let nVariants := 10
+  IO.println s!"[TATPROBE] {nVariants} pipeline-distinct variants (deployed reg kernel, runtime K loop) @ M={M} N={N} K={K}"
+  let tAll0 ← IO.monoMsNow
+  for i in [0:nVariants] do
+    let t0 ← IO.monoMsNow
+    -- weightRowOffset := i bakes a distinct literal → distinct WGSL → new pipeline compile.
+    -- Timing-only probe (garbage weights); offset stays tiny vs N so accesses stay in-bounds.
+    let kern := Hesper.WGSL.MatMul.matMulTransposeF16WMMARegKernel { M := M, N := N, K := K } i N
+    let cfg : Hesper.ExecConfig := {
+      numWorkgroups := ((N+31)/32, (M+63)/64, 1), workgroupSize := {x:=128},
+      extensions := ["f16","chromium_experimental_subgroup_matrix"],
+      diagnostics := [("off","chromium.subgroup_matrix_uniformity")] }
+    let r ← IO.mkRef none
+    -- gen + pipeline compile + first dispatch (the cold cost of a NEW variant)
+    Hesper.GPUBackend.executeWithConfigCached device kern bufs cfg 1 r
+    let t1 ← IO.monoMsNow
+    let iters := 100
+    Hesper.GPUBackend.beginBatch device
+    for _ in [0:iters] do Hesper.GPUBackend.executeWithConfigCached device kern bufs cfg 1 r
+    Hesper.GPUBackend.endBatch device
+    let t2 ← IO.monoMsNow
+    IO.println s!"  variant {i}: gen+compile+warm {t1-t0}ms | bench(100) {t2-t1}ms ({(t2-t1).toFloat/100.0}ms/iter) | variant total {t2-t0}ms"
+  let tAll1 ← IO.monoMsNow
+  let totalS := (tAll1-tAll0).toFloat/1000.0
+  let perVar := totalS / nVariants.toFloat
+  IO.println s!"[TATPROBE] total {totalS}s / {nVariants} variants = {perVar}s/variant → 100 variants ≈ {perVar*100.0/60.0} min"
+
 def main : IO Unit := do
+  if (← IO.getEnv "TATPROBE").isSome then
+    let inst ← Hesper.init; let device ← getDevice inst
+    Examples.Compute.MatmulBench.tatProbe device
+    return
   if (← IO.getEnv "NONMM").isSome then
     Examples.Compute.MatmulBench.benchNonMatmul
     return
