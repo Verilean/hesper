@@ -60,20 +60,25 @@
 
 ## §3. 現在の状態
 
-- **完了**: M0（TAT 実測: **0.118 s/variant、100 variants ≈ 12 秒** — 見積り 2-3s/variant より 20× 良、合否基準クリア）→ **★レビュー待ち**
-- **進行中**: —（M0 レビュー後、M1: occupancy probe FFI へ）
+- **完了**: M0（★ユーザー承認済み: TAT 0.118 s/variant、100 ≈ 12 秒）、M1（occupancy probe + dump 捕獲、3/3 クリーン: QUIET 動作・occ 列出力・EXIT=0。CI 緑は push 後確認）
+- **進行中**: M2（SWEEP=1 Tier-1。★承認済みの設計変更: runtime-K-loop パラメータ化 kernel = M4 前倒しとセット）
 - **直近の実測**（2026-07-05, M4 Max, feat/diffusiongemma）:
-  - TAT probe: 0.118 s/variant（TATPROBE=1、MatmulBench.lean）。full-unroll 生成器は sweep 不能（>5min/variant）
+  - TAT probe: 0.118 s/variant（cold Metal cache）。**再 sweep は Metal ディスク shader cache で compile 80ms→4ms** → 0.046 s/variant
+  - occupancy probe 動作: deployed reg kernel = maxThreads=1024（spill 無し）, execWidth=32
   - DiffusionGemma 26B-A4B: llama.cpp 比 54-96%（平均 ~73%）、per-step ~800ms vs 363ms
-  - roofline 上位: QKV-KV 4.9× above floor、dense g/up 3.2×（未チューニング = M2 の初弾対象）
-  - WGSL-vs-hand-MSL kernel 床: 1.15×（H1 let' 後）
+  - roofline 上位: QKV-KV 4.9× above floor、dense g/up 3.2×（M2 の初弾対象）
 - **次の一手（TODO）**:
-  1. [x] M0: TAT 表の実測 → §1 に確定値記入済み → **★レビュー**
-  2. [ ] M1: probe FFI
-  3. [ ] M2: SWEEP=1 Tier 1 → QKV-KV/dense のランク表 ★（golden は小 shape で。variant kernel は runtime-K-loop 型を新設 or M4 前倒し）
+  1. [x] M0: TAT 実測 → ★承認済み
+  2. [x] M1: probe FFI（CI 確認のみ残）
+  3. [ ] M2: runtime-K-loop パラメータ化 kernel（M4 前倒し）+ SWEEP=1 + 小 shape golden + tune log → QKV-KV/dense ランク表 ★
   4. [ ] M3: llama.cpp 精読表 ★（M2 と並行）
   5. [ ] M6: E4B 例の現状確認 → E2B bring-up ★
   6. [ ] M7: E2B ≤30分 autotune で ≥200tps ★★
+
+**M1 で確定した実装制約**（原則に準ずる）:
+- **Dawn の SetLoggingCallback は CAPTURELESS lambda 限定**: capture 付き functor は寿命が繰返し発火をカバーせず use-after-free（確率的に quiet 無視 + SIGTRAP/SIGABRT を実測）。状態は global で渡す。
+- **Tint MSL の staticThreadgroupMemoryLength は常に 0**（threadgroup メモリは dispatch 時動的割当）→ shared サイズ列は Lean 側で計算して出す。
+- Metal ディスク shader cache: 同一ソースの再 compile は ~4ms → 再 sweep はほぼ無料。
 
 ## §4. 決定ログ
 
@@ -85,3 +90,5 @@
 | 2026-07-05 | JAX 移行を棄却 | jax-metal 未成熟 / Pallas に Metal 無し / block-quant 一級サポート無し |
 | 2026-07-05 | E2B をフロー証明のターゲットに採用 | 帯域律速で Tint 税が消える土俵 + 公開比較（webml 250tps / llama.cpp）+ E4B 資産で 1-2 日圏 |
 | 2026-07-05 | **M0 合格**: sweep TAT = 0.118s/variant 実測（設計成立） | TATPROBE=1。当初 8x8Reg で probe → K 全展開で compile 爆発 → deployed 型（runtime K loop）に切替えて成功。**sweep 基盤 = runtime-K-loop 必須**を §1 に昇格 |
+| 2026-07-05 | M0 ★承認（ユーザー）+ M2 設計変更承認: M4（runtime-K-loop パラメータ化 kernel）を M2 に前倒し | full-unroll 制約により 8x8Reg が sweep 基盤に使えないため |
+| 2026-07-05 | **M1 合格**: occupancy probe 動作（maxThreads/execWidth）。callback は captureless 限定 | capture 付き lambda で use-after-free（quiet 確率無視 + SIGTRAP）を実測 → global 状態 + captureless で 3/3 クリーン |

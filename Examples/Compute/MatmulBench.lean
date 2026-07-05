@@ -417,7 +417,13 @@ def tatProbe (device : Device) : IO Unit := do
     for _ in [0:iters] do Hesper.GPUBackend.executeWithConfigCached device kern bufs cfg 1 r
     Hesper.GPUBackend.endBatch device
     let t2 ← IO.monoMsNow
-    IO.println s!"  variant {i}: gen+compile+warm {t1-t0}ms | bench(100) {t2-t1}ms ({(t2-t1).toFloat/100.0}ms/iter) | variant total {t2-t0}ms"
+    -- MANDATORY resource column (DEVPLAN 原則 2): occupancy via the M1 probe. Needs
+    -- HESPER_DUMP_MSL=1 (+_QUIET=1) so the variant's Tint-MSL was captured at pipeline compile.
+    let occ ← (do
+      let msl ← Hesper.WebGPU.lastDumpedMsl
+      if msl.isEmpty then pure "occ=n/a (set HESPER_DUMP_MSL=1)"
+      else Hesper.WebGPU.mslOccupancyProbe device msl) <|> pure "occ=probe-failed"
+    IO.println s!"  variant {i}: gen+compile+warm {t1-t0}ms | bench(100) {t2-t1}ms ({(t2-t1).toFloat/100.0}ms/iter) | {occ} | variant total {t2-t0}ms"
   let tAll1 ← IO.monoMsNow
   let totalS := (tAll1-tAll0).toFloat/1000.0
   let perVar := totalS / nVariants.toFloat

@@ -54,6 +54,19 @@ opaque mtlDeviceName (device : @& Device) : IO String
 @[extern "lean_hesper_gpubusy_read"]
 opaque gpuBusyRead : IO String
 
+/-- DEVPLAN M1: the most recent Tint-MSL dump captured in-process by the HESPER_DUMP_MSL logging
+    callback (empty if nothing dumped yet / env not set). Feed to `mslOccupancyProbe`. Set
+    HESPER_DUMP_MSL_QUIET=1 to capture without the stderr spew (sweep mode). -/
+@[extern "lean_hesper_last_dumped_msl"]
+opaque lastDumpedMsl : IO String
+
+/-- DEVPLAN M1: compile a Tint-dumped MSL source with the real Metal compiler and report the
+    pipeline's resource stats: "maxThreads=N execWidth=M tgMem=K". maxThreads is the
+    register-pressure inverse signal (drops on spill); this is the MANDATORY resource column of
+    the autotune sweep. macOS only (IO error elsewhere). -/
+@[extern "lean_hesper_msl_occupancy_probe"]
+opaque mslOccupancyProbe (device : @& Device) (msl : @& String) : IO String
+
 /-- DG_GPUBUSY: read+reset the MSL-path split (count / WaitForCommandsToBeScheduled / encode+commit
     / kernel GPU time). Complements gpuBusyRead (which covers the Dawn WGSL path only). -/
 @[extern "lean_hesper_msl_busy_read"]

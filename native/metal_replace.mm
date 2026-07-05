@@ -1091,6 +1091,57 @@ extern "C" lean_obj_res lean_hesper_msl_gateup_down_onecb(
     return lean_io_result_mk_ok(lean_box(0));
 }
 
+// DEVPLAN M1 — occupancy probe: compile a Tint-dumped MSL source with the REAL Metal compiler and
+// report the pipeline's resource stats. Same source + same compiler as the Dawn path, so the numbers
+// match what the deployed pipeline gets: maxTotalThreadsPerThreadgroup is the register-pressure
+// inverse signal (drops when the kernel spills), threadExecutionWidth confirms simd width (32 on
+// Apple), staticThreadgroupMemoryLength is the shared-memory footprint. This is the MANDATORY
+// resource column of the autotune sweep (never report speed without it).
+extern "C" lean_obj_res lean_hesper_msl_occupancy_probe(
+    b_lean_obj_arg device_obj, b_lean_obj_arg msl_obj, lean_obj_res /* unit */) {
+    @autoreleasepool {
+        wgpu::Device* device = mr_extract_device(device_obj);
+        if (!device || !device->Get()) {
+            return lean_io_result_mk_error(lean_mk_string("occupancy_probe: device is invalid"));
+        }
+        id<MTLDevice> mtl = dawn::native::metal::GetMTLDevice(device->Get());
+        if (!mtl) {
+            return lean_io_result_mk_error(lean_mk_string("occupancy_probe: null MTLDevice"));
+        }
+        const char* mslSrc = lean_string_cstr(msl_obj);
+        if (!mslSrc || mslSrc[0] == '\0') {
+            return lean_io_result_mk_error(lean_mk_string(
+                "occupancy_probe: empty MSL source (is HESPER_DUMP_MSL=1 set and a pipeline compiled?)"));
+        }
+        NSError* err = nil;
+        MTLCompileOptions* opts = [MTLCompileOptions new];
+        id<MTLLibrary> lib = [mtl newLibraryWithSource:[NSString stringWithUTF8String:mslSrc]
+                                               options:opts error:&err];
+        if (!lib) {
+            NSString* msg = [NSString stringWithFormat:@"occupancy_probe: newLibraryWithSource failed: %@",
+                             err ? err.localizedDescription : @"(no error info)"];
+            return lean_io_result_mk_error(lean_mk_string([msg UTF8String]));
+        }
+        id<MTLFunction> fn = [lib newFunctionWithName:@"dawn_entry_point"];
+        if (!fn) {
+            return lean_io_result_mk_error(lean_mk_string(
+                "occupancy_probe: entry point 'dawn_entry_point' not found in dumped MSL"));
+        }
+        id<MTLComputePipelineState> pso = [mtl newComputePipelineStateWithFunction:fn error:&err];
+        if (!pso) {
+            NSString* msg = [NSString stringWithFormat:@"occupancy_probe: PSO creation failed: %@",
+                             err ? err.localizedDescription : @"(no error info)"];
+            return lean_io_result_mk_error(lean_mk_string([msg UTF8String]));
+        }
+        char buf[128];
+        snprintf(buf, sizeof(buf), "maxThreads=%lu execWidth=%lu tgMem=%lu",
+                 (unsigned long)pso.maxTotalThreadsPerThreadgroup,
+                 (unsigned long)pso.threadExecutionWidth,
+                 (unsigned long)pso.staticThreadgroupMemoryLength);
+        return lean_io_result_mk_ok(lean_mk_string(buf));
+    }
+}
+
 extern "C" lean_obj_res lean_hesper_mtl_device_name(b_lean_obj_arg device_obj, lean_obj_res /* unit */) {
     wgpu::Device* device = mr_extract_device(device_obj);
     if (!device || !device->Get()) {
