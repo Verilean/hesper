@@ -645,7 +645,10 @@ static WGPULimits getMaxLimits(wgpu::Adapter& adapter) {
         atMost(4, adapterLimits.maxDynamicStorageBuffersPerPipelineLayout);
     limits.maxSampledTexturesPerShaderStage = atMost(16, adapterLimits.maxSampledTexturesPerShaderStage);
     limits.maxSamplersPerShaderStage = atMost(16, adapterLimits.maxSamplersPerShaderStage);
-    limits.maxStorageBuffersPerShaderStage = atMost(8, adapterLimits.maxStorageBuffersPerShaderStage);
+    // 16: the fused qkvNormRope kernel binds 9 storage buffers (q_io + scales + k/v
+    // in/out + params + freq_factors); the WebGPU default of 8 rejects its layout.
+    // Apple Metal supports 31 buffer arguments.
+    limits.maxStorageBuffersPerShaderStage = atMost(16, adapterLimits.maxStorageBuffersPerShaderStage);
     limits.maxStorageTexturesPerShaderStage = atMost(4, adapterLimits.maxStorageTexturesPerShaderStage);
     limits.maxUniformBuffersPerShaderStage = atMost(12, adapterLimits.maxUniformBuffersPerShaderStage);
     limits.maxUniformBufferBindingSize = atMost(65536, adapterLimits.maxUniformBufferBindingSize);

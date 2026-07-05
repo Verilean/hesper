@@ -776,6 +776,121 @@ def fusedPerHeadQKVNormKernel
       )
   )
 
+/-- `fusedPerHeadQKVNormKernel` + RoPE-Q folded in (webml `DecodeQkNormRope` shape):
+    the q lane (wg_id.y == 0) normalises into SHARED memory, barriers, then applies the
+    freq-factors NeoX rotation and writes the FINAL roped q — the standalone ropeQ
+    dispatch disappears. k/v lanes unchanged (k is roped inside the fused KV-write).
+
+    Grid: (numHeads, 3, 1) when the layer owns KV; (numHeads, 1, 1) for KV-shared
+    layers (q-only). `ropeBase` is BAKED → must be in the cache key.
+    Extra bindings vs the base kernel: `params` (pos at [0]), `freq_factors`. -/
+def fusedPerHeadQKVNormRopeKernel
+    (numHeads numKVHeads headDim : Nat) (eps ropeBase : Float) : ShaderM Unit := do
+  let wid ← ShaderM.workgroupId
+  let lid ← ShaderM.localId
+  let headIdx := Exp.vec3X wid
+  let yIdx := Exp.vec3Y wid
+  let tid := Exp.vec3X lid
+  let qTotal := numHeads * headDim
+  let kvTotal := numKVHeads * headDim
+  let dimPairs := headDim / 2
+  -- q is IN-PLACE (read_write "q_io"): per-head regions are WG-disjoint and every
+  -- read happens before the WG's writes (norm → shared_q → barrier → rope write).
+  -- Separate in/out bindings would be writable-storage aliasing on WebGPU.
+  let _qIo    ← ShaderM.declareOutputBuffer "q_io"    (.array (.scalar .f32) qTotal)
+  let _qScale ← ShaderM.declareInputBuffer  "q_scale" (.array (.scalar .f32) headDim)
+  let _kIn    ← ShaderM.declareInputBuffer  "k_in"    (.array (.scalar .f32) kvTotal)
+  let _kScale ← ShaderM.declareInputBuffer  "k_scale" (.array (.scalar .f32) headDim)
+  let _kOut   ← ShaderM.declareOutputBuffer "k_out"   (.array (.scalar .f32) kvTotal)
+  let _vIn    ← ShaderM.declareInputBuffer  "v_in"    (.array (.scalar .f32) kvTotal)
+  let _vOut   ← ShaderM.declareOutputBuffer "v_out"   (.array (.scalar .f32) kvTotal)
+  let _params ← ShaderM.declareInputBuffer  "params"  (.array (.scalar .u32) 2)
+  let _ff     ← ShaderM.declareInputBuffer  "freq_factors" (.array (.scalar .f32) dimPairs)
+  let wgSize := if headDim < 256 then headDim else 256
+  ShaderM.sharedNamed "shared_sum" (.array (.scalar .f32) wgSize)
+  ShaderM.sharedNamed "shared_q" (.array (.scalar .f32) headDim)
+  let invalidKV : Exp (.scalar .bool) :=
+    Exp.and (Exp.ne yIdx (Exp.litU32 0))
+            (Exp.ge headIdx (Exp.litU32 numKVHeads))
+  ShaderM.if_ invalidKV (pure ()) (do
+    let headBase := Exp.mul headIdx (Exp.litU32 headDim)
+    ShaderM.varNamed "local_sum" (.scalar .f32) (Exp.litF32 0.0)
+    let localSum : Exp (.scalar .f32) := Exp.var "local_sum"
+    ShaderM.loop tid (Exp.litU32 headDim) (Exp.litU32 wgSize) fun i => do
+      let elemIdx := Exp.add headBase i
+      ShaderM.if_ (Exp.eq yIdx (Exp.litU32 0)) (do
+        let v ← ShaderM.readBuffer (ty := .scalar .f32) (n := qTotal) "q_io" elemIdx
+        ShaderM.assign "local_sum" (Exp.add localSum (Exp.mul v v))
+      ) (do
+        ShaderM.if_ (Exp.eq yIdx (Exp.litU32 1)) (do
+          let v ← ShaderM.readBuffer (ty := .scalar .f32) (n := kvTotal) "k_in" elemIdx
+          ShaderM.assign "local_sum" (Exp.add localSum (Exp.mul v v))
+        ) (do
+          let v ← ShaderM.readBuffer (ty := .scalar .f32) (n := kvTotal) "v_in" elemIdx
+          ShaderM.assign "local_sum" (Exp.add localSum (Exp.mul v v)))
+      )
+    ShaderM.writeWorkgroup (ty := .scalar .f32) "shared_sum" tid localSum
+    ShaderM.barrier
+    let mut stride := wgSize / 2
+    while stride > 0 do
+      ShaderM.if_ (Exp.lt tid (Exp.litU32 stride)) (do
+        let a ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := wgSize) "shared_sum" tid
+        let b ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := wgSize) "shared_sum"
+                  (Exp.add tid (Exp.litU32 stride))
+        ShaderM.writeWorkgroup (ty := .scalar .f32) "shared_sum" tid (Exp.add a b)
+      ) (pure ())
+      ShaderM.barrier
+      stride := stride / 2
+    let sumSq ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := wgSize) "shared_sum" (Exp.litU32 0)
+    let rms := Exp.inverseSqrt
+                 (Exp.add (Exp.div sumSq (Exp.litF32 headDim.toFloat))
+                          (Exp.litF32 eps))
+    let rmsName ← ShaderM.var (.scalar .f32) rms
+    let rmsRef : Exp (.scalar .f32) := Exp.var rmsName
+    -- ── Phase 2 ──
+    -- q lane: normed values → shared_q, barrier, then NeoX rope pairs → q_out.
+    -- k/v lanes: as in the base kernel. The rope barrier must be WG-uniform, so
+    -- phase 2 is split by lane OUTSIDE the element loop.
+    ShaderM.if_ (Exp.eq yIdx (Exp.litU32 0)) (do
+      ShaderM.loop tid (Exp.litU32 headDim) (Exp.litU32 wgSize) fun i => do
+        let elemIdx := Exp.add headBase i
+        let v ← ShaderM.readBuffer (ty := .scalar .f32) (n := qTotal) "q_io" elemIdx
+        let w ← ShaderM.readBuffer (ty := .scalar .f32) (n := headDim) "q_scale" i
+        ShaderM.writeWorkgroup (ty := .scalar .f32) "shared_q" i (Exp.mul (Exp.mul v rmsRef) w)
+    ) (do
+      ShaderM.loop tid (Exp.litU32 headDim) (Exp.litU32 wgSize) fun i => do
+        let elemIdx := Exp.add headBase i
+        ShaderM.if_ (Exp.eq yIdx (Exp.litU32 1)) (do
+          let v ← ShaderM.readBuffer (ty := .scalar .f32) (n := kvTotal) "k_in" elemIdx
+          let w ← ShaderM.readBuffer (ty := .scalar .f32) (n := headDim) "k_scale" i
+          ShaderM.writeBuffer (ty := .scalar .f32) "k_out" elemIdx (Exp.mul (Exp.mul v rmsRef) w)
+        ) (do
+          let v ← ShaderM.readBuffer (ty := .scalar .f32) (n := kvTotal) "v_in" elemIdx
+          ShaderM.writeBuffer (ty := .scalar .f32) "v_out" elemIdx (Exp.mul v rmsRef)))
+    ShaderM.barrier
+    ShaderM.if_ (Exp.eq yIdx (Exp.litU32 0)) (do
+      -- RoPE math copied verbatim from ropeWithFreqFactorsKernel (numeric identity).
+      let pos ← ShaderM.readBuffer (ty := .scalar .u32) (n := 2) "params" (Exp.litU32 0)
+      let posF32 := Exp.toF32 pos
+      ShaderM.loop tid (Exp.litU32 dimPairs) (Exp.litU32 wgSize) fun p => do
+        let freqFactor ← ShaderM.readBuffer (ty := .scalar .f32) (n := dimPairs) "freq_factors" p
+        let exponent := Exp.div (Exp.mul (Exp.litF32 2.0) (Exp.toF32 p)) (Exp.litF32 headDim.toFloat)
+        let freqInv := Exp.pow (Exp.litF32 ropeBase) (Exp.neg exponent)
+        let theta := Exp.div (Exp.mul posF32 freqInv) freqFactor
+        let cosTheta := Exp.cos theta
+        let sinTheta := Exp.sin theta
+        let x0 ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := headDim) "shared_q" p
+        let x1 ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := headDim) "shared_q"
+                   (Exp.add p (Exp.litU32 dimPairs))
+        let idx0 := Exp.add headBase p
+        let idx1 := Exp.add headBase (Exp.add p (Exp.litU32 dimPairs))
+        ShaderM.writeBuffer (ty := .scalar .f32) "q_io" idx0
+          (Exp.sub (Exp.mul x0 cosTheta) (Exp.mul x1 sinTheta))
+        ShaderM.writeBuffer (ty := .scalar .f32) "q_io" idx1
+          (Exp.add (Exp.mul x0 sinTheta) (Exp.mul x1 cosTheta))
+    ) (pure ())
+  )
+
 /-- Batched fused per-head Q/K/V RMSNorm.  Same algorithm as
     `fusedPerHeadQKVNormKernel` but processes `seqLen` query tokens in a
     single dispatch.
