@@ -56,6 +56,22 @@
 - **Phase C**: 量子化 layout の indexed type 化 + bounds 証明 → disable_robustness default ON（検証が性能を買う）。README "verified"→"typed" 降格。Hespera 別リポ分離
 - **Phase D**: 判断点 — novel 機能（実行時学習等）を llama.cpp に移植 vs Hesper 続行を実測で再判定
 
+## §5. Phase D 判定（2026-07-06、ユーザー裁定 — LLM 推論プロダクトとしての Hesper は撤収）
+
+**検証された事実に基づく結論**:
+1. **TTT/推論時学習の研究**は PyTorch（量子化 sim を eval に含める）で行い、配備先はサーバー = vLLM（PyTorch 原生 + multi-LoRA 機構がセッション毎 fast-weight と好相性）、ローカル/Mac = llama.cpp フォーク（固定レシピなら backward は転置量子化 matvec + 外積 + optimizer の 4-6 カーネルで足りる）。**TTT を理由に Hesper を選ぶ必然は無い**。
+2. **WebGPU/ブラウザ配布のニッチ**: webml-community（手書き 1 モデル専用、QAT int4、250tps）と MLC/web-llm が既に占有。我々の実測でも同じ Dawn/WGSL 上で到達可能性は証明された（=技術的差別化ではない）が、後発として取る理由が無い。
+3. **verified 推論**: 近期の LLM 市場に実利ほぼ無し（買い手が証明を要求しない）。実利があったのは「検証が性能を買う」(robustness-off ~10%) と「バグクラスの構築時排除」— 後者は今セッションの clamp-write race ×11 が皮肉にも最良の実証（型で殺せた事故に数日払った）だが、これは**開発コスト削減の話であってプロダクトの堀ではない**。
+4. **抽象化の総括**（§4 の一連の議論）: 抽象化が代金を払える条件 = ①レイヤーの所有/理解 ②下までの可視性 ③escape hatch。Hesper は③を今セッションで整備し②を部分達成、①は Tint/Dawn が他人のコードで恒常的な摩擦（Tint MSL プリンタバグ、Dawn Serial dispatch）。jax-metal は①②③全滅の対照例。llama.cpp/webml は「層が無い」ことでこの問題自体を持たない。
+
+**判定: LLM 推論エンジンとしての Hesper のプロダクトベット（verified WebGPU inference）は、自ら集めた証拠により棄却。** 撤収し、以下を回収資産とする:
+- **autotune フレームワーク**（Family 契約 + native 計時 + incumbent guard + winners lookup、2 family で汎用性実証、1 コマンド 12 秒）— 汎用 GPU チューニング基盤として独立価値
+- **診断キット**: HESPER_DUMP_MSL / native serial 計時 / 決定性プローブ（NOBATCH + 多プロセス md5）/ 層別 golden-parity 手法 — GPU correctness 調査の再利用可能な方法論
+- **upstream 価値のある発見**: Tint MSL プリンタバグ（valid WGSL → 引数脱落 MSL、最小再現化して報告する価値）、Dawn の MTLDispatchTypeSerial 制約（crbug.com/425987598 に実測データを添えられる）、WGSL clamp-write race パターン（select-to-zero は write を守らない）
+- **DEVPLAN 方式そのもの**（原則ゲート・負の結果の記録・★関門）— 次のプロジェクトの運用体系として
+
+**学習としての評価**: 仮説は棄却されたが、棄却は clean な実測で行われた（8.05→90 t/s の過程が「カーネルでも言語でもなく構造の問題」を峻別した）。ただし同じ結論にもっと安く到達できたはず（webml 精読を M3 で最初にやっていれば数週間短縮）— 原則 7 違反 3 回の代金。
+
 ---
 
 ## §3. 現在の状態
