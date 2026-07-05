@@ -60,8 +60,8 @@
 
 ## §3. 現在の状態
 
-- **完了**: M0（★ユーザー承認済み: TAT 0.118 s/variant、100 ≈ 12 秒）、M1（occupancy probe + dump 捕獲、3/3 クリーン: QUIET 動作・occ 列出力・EXIT=0。CI 緑は push 後確認）
-- **進行中**: M2（SWEEP=1 Tier-1。★承認済みの設計変更: runtime-K-loop パラメータ化 kernel = M4 前倒しとセット）
+- **完了**: M0（★承認済み）、M1（probe、3/3 クリーン）、**M2+M4 前倒し（★レビュー待ち）**: `matMulTransposeF16WMMARegKernelGen(TMsg,TNsg,sgRows,sgCols,BK)` + SWEEP=1 resumable ランナー。**524 variants 完走、golden 失敗 0**。**QKV-KV: 勝者 TM2xTN1_sg1x4_BK16 = 0.267ms vs deployed 設定 0.733ms（同条件、2.7×）/ standalone deployed 実測 0.40-0.51ms 比でも ~1.5-1.9×。floor 距離 5.2×→2.7×。dense-gu: TM2xTN2_sg2x1_BK16 = 0.500ms vs 0.833（1.7×）、floor 3.2×→2.5×。** 勝ちパターン: **BK16 + 小中 tile + wg64-128**（全行 maxThreads=1024 = spill 無し → 小 shape では occupancy/padding 削減が支配、深い tile は不利）
+- **進行中**: M2 ★レビュー → 承認後 M5（decode 統合: QKV-KV/dense の dispatch を勝者設定に flag 切替 → dg_eval 8/8 → per-step 実測）
 - **直近の実測**（2026-07-05, M4 Max, feat/diffusiongemma）:
   - TAT probe: 0.118 s/variant（cold Metal cache）。**再 sweep は Metal ディスク shader cache で compile 80ms→4ms** → 0.046 s/variant
   - occupancy probe 動作: deployed reg kernel = maxThreads=1024（spill 無し）, execWidth=32
@@ -92,3 +92,5 @@
 | 2026-07-05 | **M0 合格**: sweep TAT = 0.118s/variant 実測（設計成立） | TATPROBE=1。当初 8x8Reg で probe → K 全展開で compile 爆発 → deployed 型（runtime K loop）に切替えて成功。**sweep 基盤 = runtime-K-loop 必須**を §1 に昇格 |
 | 2026-07-05 | M0 ★承認（ユーザー）+ M2 設計変更承認: M4（runtime-K-loop パラメータ化 kernel）を M2 に前倒し | full-unroll 制約により 8x8Reg が sweep 基盤に使えないため |
 | 2026-07-05 | **M1 合格**: occupancy probe 動作（maxThreads/execWidth）。callback は captureless 限定 | capture 付き lambda で use-after-free（quiet 確率無視 + SIGTRAP）を実測 → global 状態 + captureless で 3/3 クリーン |
+| 2026-07-05 | sweep は resumable（CSV skip + SWEEP_LIMIT）に | 300 variant 一気は SIGSEGV。真因 = **wg=512 が maxComputeWorkgroupSizeX=256 を超え pipeline が null → execute 経路が null 参照で SIGSEGV**（engine 堅牢性の課題、别途）。feasibility に wg≤256 を追加して解消 |
+| 2026-07-05 | **M2 合格（524 variants、golden 0 fail）**: QKV-KV 0.733→0.267ms、dense 0.833→0.500ms（同条件）。勝ち = BK16+小 tile+wg64-128 | 「4.9×/3.2× above floor は未チューニングが原因」仮説が実証された。深 tile(BK32/TM4)は M=262 では padding 浪費+occupancy 損 |
