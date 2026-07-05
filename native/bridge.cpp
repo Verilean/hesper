@@ -662,11 +662,14 @@ static WGPULimits getMaxLimits(wgpu::Adapter& adapter) {
     limits.maxInterStageShaderVariables = atMost(16, adapterLimits.maxInterStageShaderVariables);
     limits.maxColorAttachments = atMost(8, adapterLimits.maxColorAttachments);
     limits.maxColorAttachmentBytesPerSample = atMost(32, adapterLimits.maxColorAttachmentBytesPerSample);
-    limits.maxComputeWorkgroupStorageSize = atMost(32768, adapterLimits.maxComputeWorkgroupStorageSize);
-    limits.maxComputeInvocationsPerWorkgroup = atMost(256, adapterLimits.maxComputeInvocationsPerWorkgroup);
-    limits.maxComputeWorkgroupSizeX = atMost(256, adapterLimits.maxComputeWorkgroupSizeX);
-    limits.maxComputeWorkgroupSizeY = atMost(256, adapterLimits.maxComputeWorkgroupSizeY);
-    limits.maxComputeWorkgroupSizeZ = atMost(64, adapterLimits.maxComputeWorkgroupSizeZ);
+    // Request the adapter's full compute-workgroup capability (Apple M-series: 1024) — the
+    // WebGPU defaults (256/64) reject legitimate kernels: gemma4 sumAllTokens uses wg 1024, and
+    // the autotune sweep's sgRows×sgCols=16 variants need wg 512.
+    limits.maxComputeWorkgroupStorageSize = atMost(65536, adapterLimits.maxComputeWorkgroupStorageSize);
+    limits.maxComputeInvocationsPerWorkgroup = atMost(1024, adapterLimits.maxComputeInvocationsPerWorkgroup);
+    limits.maxComputeWorkgroupSizeX = atMost(1024, adapterLimits.maxComputeWorkgroupSizeX);
+    limits.maxComputeWorkgroupSizeY = atMost(1024, adapterLimits.maxComputeWorkgroupSizeY);
+    limits.maxComputeWorkgroupSizeZ = atMost(1024, adapterLimits.maxComputeWorkgroupSizeZ);
     limits.maxComputeWorkgroupsPerDimension =
         atMost(65535, adapterLimits.maxComputeWorkgroupsPerDimension);
     return limits;
@@ -1711,7 +1714,12 @@ lean_obj_res lean_hesper_create_bind_group(b_lean_obj_arg device_obj, b_lean_obj
     if (g_verbose) fprintf(stderr, "[C++] Creating BindGroup...\n");
     fflush(stderr);
 
-    wgpu::BindGroup bindGroup = device->CreateBindGroup(&bgDesc);
+    // Error scope so CREATION-time validation failures print their reason here (otherwise the
+    // error object surfaces later as an opaque "[Invalid BindGroup] is invalid" at SetBindGroup).
+    wgpu::BindGroup bindGroup;
+    runWithErrorScope(device->Get(), g_dawn_instance, "CreateBindGroup", [&]() {
+        bindGroup = device->CreateBindGroup(&bgDesc);
+    });
 
     if (g_verbose) fprintf(stderr, "[C++] BindGroup created: wrapper=%p, WGPUBindGroup=%p\n", (void*)&bindGroup, (void*)bindGroup.Get());
     fflush(stderr);

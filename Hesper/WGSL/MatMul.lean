@@ -243,10 +243,14 @@ def matMulTransposeF16Kernel (config : Config) : ShaderM Unit := do
     `matMulTransposeF16Kernel`). Row `n` starts at u32 index
     `n * (K/2)`.
 -/
-def matMulTransposeF16BlockCoopKernel (config : Config) : ShaderM Unit := do
+def matMulTransposeF16BlockCoopKernel (config : Config) (gridXWidth : Nat := 0) : ShaderM Unit := do
   let wid ← ShaderM.workgroupId
   let lid ← ShaderM.localId
-  let outIdx := Exp.vec3X wid
+  -- gridXWidth > 0: 2D grid (outIdx = x + y·gridXWidth) — one workgroup per output row would
+  -- exceed the 65535 per-dimension limit at lm-head N (vocab 262144).
+  let outIdx := if gridXWidth > 0
+    then Exp.add (Exp.vec3X wid) (Exp.mul (Exp.vec3Y wid) (Exp.litU32 gridXWidth))
+    else Exp.vec3X wid
   let tid := Exp.vec3X lid
 
   let packedK := config.K / 2        -- u32s per row of B
@@ -320,14 +324,17 @@ def executeMatMulTransposeF16BlockCoop [GPUBackend β] (ctx : β)
     ("b", bF16Buf),
     ("c", cBuf)
   ]
+  -- 2D grid when N exceeds the 65535 per-dimension workgroup limit (lm-head vocab 262144)
+  let gx := min config.N 32768
+  let gy := (config.N + gx - 1) / gx
   let execConfig : Hesper.ExecConfig := {
-    numWorkgroups := (config.N, 1, 1)
+    numWorkgroups := (gx, gy, 1)
     workgroupSize := { x := 32, y := 1, z := 1 }
     extensions := ["subgroups"]
   }
   let cacheKey : UInt64 := hash ("mmf16-blockcoop", config.M, config.N, config.K)
   GPUBackend.executeWithConfigCached ctx
-    (matMulTransposeF16BlockCoopKernel config)
+    (matMulTransposeF16BlockCoopKernel config (if gy > 1 then gx else 0))
     namedBuffers execConfig cacheKey (← IO.mkRef none)
 
 /-! ## Optimized F16 Transposed MatMul with Shared Memory -/

@@ -79,7 +79,9 @@
   3. [ ] M2: runtime-K-loop パラメータ化 kernel（M4 前倒し）+ SWEEP=1 + 小 shape golden + tune log → QKV-KV/dense ランク表 ★
   3b. [ ] **TAT 対策（ユーザー指摘 2026-07-05）: decode 統合 build が ~8-10 分と長すぎる** — DiffusionGemmaDecode.lean が 2000 行超の単一ファイルで 1 行の変更が全再 elaborate を誘発。対策候補: (a) decode を複数モジュールに分割（forward/schedule/main）、(b) 滅多に使わない Examples/exe を default deps から外す・別ディレクトリに move、(c) 統合面を薄く保つ（lookup 駆動にしたのはその一歩）。M5 完了後に着手
   4. [ ] M3: llama.cpp 精読表 ★（M2 と並行）
-  5. [ ] M6: E4B 例の現状確認 → E2B bring-up ★
+  5. [~] M6: E2B bring-up — **プラミング完了（validation error 0、e2e 実行 7.8 t/s @ graphs-off）、正しさ = 数値バグ残（多言語 token salad、prefill logits から既に誤り）**。llama.cpp 参照確立: E2B 生成 **156.5 t/s**（M7 の現実的な的; 私の 200-250 BW 見積りは楽観だった）。
+     踏んだ修正（1 日で 21 回の実行反復、全て engine 一般益）: GGUF u32 配列 metadata（E 系）/ MatFormer per-layer dims（tensor shape 優先, E2B L0 ffn=6144≠12288）/ PLE 1.6GB 表 → row-staging 64-slot（binding 上限+robustness clamp+batch 順序ハザード 3 連対応）/ binding 4 倍数 round / CreateBindGroup error scope（作成時理由の可視化）/ 書込 aliasing×3 を in-place kernel 化（qkvNorm・qNorm・normThenAdd — CUDA 合法/WebGPU 違法）/ ce 名 sanitize（Float 埋込→WGSL 不正識別子）/ **maxComputeWorkgroupSize 1024 要求**（wg-512/1024 kernel 解禁 = autotune の sg4x4 も解禁）/ Q4_K embd lookup kernel 新設（dequantQ4KElementAt 抽出）/ Q4_K lm-head chunked f16 前 dequant（f32 中間 1.6GB 回避）/ BlockCoop 2D grid（vocab 262144 > 65535）/ dp4a enable（WebGPU、subgroups 時）。
+     **次 = 数値 parity bisect**: 既存 Gemma4Layer0-5 dump harness で llama.cpp と層別比較（第一容疑: 新設 Q4_K 経路 2 つ・PLE 値・E2B 固有 config 解釈）
   6. [ ] M7: E2B ≤30分 autotune で ≥200tps ★★
 
 **M1 で確定した実装制約**（原則に準ずる）:

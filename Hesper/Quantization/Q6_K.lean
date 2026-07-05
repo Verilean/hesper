@@ -963,17 +963,17 @@ def q6kSingleRowDequantScaleKernel (dim : Nat) (scale : Float) : ShaderM Unit :=
     with the full table buffer size — proven to JIT correctly.
     `vocabSize` determines the declared table buffer size. -/
 def q6kTableRowDequantScaleKernel (dim : Nat) (scale : Float)
-    (vocabSize : Nat) : ShaderM Unit := do
+    (vocabSize : Nat) (declRows : Nat := 2) : ShaderM Unit := do
   let gid ← ShaderM.globalId
   let idx := Exp.vec3X gid
 
   let blocksPerRow := dim / 256
   let rowU32Size := (blocksPerRow * blockSizeBytes + 3) / 4
-  -- Declare a small buffer (2 rows) — CUDA ignores declared sizes for
-  -- global memory.  The actual GPU buffer is vocabSize rows; the
-  -- runtime tokenId selects the correct row offset.  Keeping the declared
-  -- size small prevents PTX array-size explosion in the ShaderM printer.
-  let declaredU32 := rowU32Size * 2
+  -- Declare a small buffer (`declRows` rows) — CUDA ignores declared sizes for global memory,
+  -- but WebGPU robustness CLAMPS reads to the declared size, so the declaration must cover every
+  -- slot the runtime tokenId can address (row-staged multi-slot scratch: declRows = slot count).
+  -- Keeping it small prevents PTX array-size explosion in the ShaderM printer.
+  let declaredU32 := rowU32Size * declRows
 
   let _table ← ShaderM.declareReadOnlyBuffer "table" (.array (.scalar .u32) declaredU32)
   let _params ← ShaderM.declareReadOnlyBuffer "params" (.array (.scalar .u32) 1)

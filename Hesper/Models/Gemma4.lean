@@ -319,7 +319,11 @@ def createInferenceState [GPUBackend β] (ctx : β) (cfg : Config) : IO (Inferen
       let totalPL := cfg.embdPerLayer * cfg.numHiddenLayers
       let blocksPerRow := (totalPL + 255) / 256
       let rowBytes := blocksPerRow * 210
-      GPUBackend.allocBuffer ctx (max rowBytes 4).toUSize
+      -- Round up to a multiple of 4: WebGPU storage-buffer binding sizes must be 4-aligned.
+      -- An ODD Q6_K block count makes rowBytes % 4 == 2 (E2B: 35 blocks × 210 = 7350) —
+      -- CreateBindGroup then fails validation ("Binding size isn't a multiple of 4").
+      let rowBytes4 := ((max rowBytes 4) + 3) / 4 * 4
+      GPUBackend.allocBuffer ctx rowBytes4.toUSize
     argmaxBuf := ← GPUBackend.allocBuffer ctx (4 : USize)
     argmaxCacheRef := ← GPUBackend.newCacheRef (β := β)
     -- HESPER_DEVICE_ARGMAX=1: skip the per-token cuMemcpyDtoH(4 byte) by
@@ -483,7 +487,9 @@ def forwardBlock [GPUBackend β] (ctx : β)
       let ref ← k.getRef key
       -- Tag config.funcName with the call-site name so cacheRef-miss traces
       -- show the human-readable `ce "..."` name instead of a hex cacheKey.
-      let configNamed : Hesper.ExecConfig := { config with funcName := name }
+      -- Sanitize: several call sites embed Float params in the name (e.g. base10000.000000);
+      -- '.' is invalid in a WGSL identifier → shader-module parse error on WebGPU.
+      let configNamed : Hesper.ExecConfig := { config with funcName := (name.replace "." "p").replace "-" "m" }
       GPUBackend.executeWithConfigCached ctx shader namedBufs configNamed key ref
     | none => GPUBackend.execute ctx shader namedBufs config
 
@@ -1238,7 +1244,9 @@ def forwardPrefillBatch [GPUBackend β] (ctx : β)
       let key := hash ("gemma4_prefill_ce", name, config.numWorkgroups,
                         config.workgroupSize.x, config.workgroupSize.y, config.workgroupSize.z)
       let ref ← k.getRef key
-      let configNamed : Hesper.ExecConfig := { config with funcName := name }
+      -- Sanitize: several call sites embed Float params in the name (e.g. base10000.000000);
+      -- '.' is invalid in a WGSL identifier → shader-module parse error on WebGPU.
+      let configNamed : Hesper.ExecConfig := { config with funcName := (name.replace "." "p").replace "-" "m" }
       GPUBackend.executeWithConfigCached ctx shader namedBufs configNamed key ref
     | none => GPUBackend.execute ctx shader namedBufs config
 
@@ -1428,6 +1436,13 @@ def forwardPrefillBatch [GPUBackend β] (ctx : β)
         (Hesper.Quantization.Q6_K.q6kEmbeddingLookupKernel model.config.vocabSize dim)
         [("token_ids", state.tokenBuf), ("embedding_table", model.embedding.embeddingTable), ("output", state.buf1)]
         (.dispatch1D dim)
+    | .Q4_K =>
+      -- Gemma 4 E2B quantises token_embd as Q4_K (E4B uses Q6_K) — the F32 fallback would
+      -- misdeclare the table (binding validation error → zero hiddens → token-0 output).
+      ce "q4kEmbLookup"
+        (Hesper.Quantization.Q4_K_M.q4kEmbeddingLookupKernel model.config.vocabSize dim)
+        [("token_ids", state.tokenBuf), ("embedding_table", model.embedding.embeddingTable), ("output", state.buf1)]
+        (.dispatch1D dim)
     | _ =>
       Embedding.forward ctx model.embedding state.tokenBuf state.buf1 1 1
     -- Copy state.buf1 → batchBuf1 column i  (same i, no re-write needed —
@@ -1508,9 +1523,15 @@ def forwardPrefillBatch [GPUBackend β] (ctx : β)
       -- (synthesised as a `Buf` at offset = tokenId × rowBytes), which
       -- means kernelTokenId is always 0 and no cuMemcpy fires.
       -- Legacy path: real `tokenId` indexes the full VRAM table.
-      let kernelTokenId : Nat := match model.perLayerEmbdMmap with
-        | some _ => 0
-        | none   => tokenId
+      -- Row-staged slot for this position: the batched prefill records ALL dispatches then
+      -- submits once, so per-token stagings into one slot would all complete BEFORE any
+      -- dispatch runs (last-write-wins for every position). Slot i%64 + kernel tokenId=i%64
+      -- makes each position read its own row.
+      let stageSlot : Nat := i % 64
+      let kernelTokenId : Nat := match model.perLayerEmbdMmap, model.perLayerEmbdTableBytes with
+        | some _, _ => 0
+        | none, some _ => stageSlot
+        | none, none => tokenId
       writeScalarViaStaging ctx state.plRawRowBuf 0 state.stagingPLRowPtr 0
         (Hesper.WebGPU.BufferOps.uint32ToBytes kernelTokenId.toUInt32)
       let tableForKernel ← match model.perLayerEmbdMmap with
@@ -1519,11 +1540,19 @@ def forwardPrefillBatch [GPUBackend β] (ctx : β)
           match ← GPUBackend.bufFromRawDevicePtr ctx rowDevPtr rowBytesU with
           | some b => pure b
           | none   => pure embdTableGPU  -- backend without UVA: fallback
-        | none => pure embdTableGPU
+        | none =>
+          -- ROW-STAGING (WebGPU): stage this token's Q6_K row into ITS slot of the 64-row
+          -- scratch (stride = u32-rounded rowBytes, matching the kernel's rowU32Size).
+          if let some tb := model.perLayerEmbdTableBytes then
+            let rb := model.perLayerEmbdRowBytes
+            let stride := ((rb + 3) / 4) * 4
+            GPUBackend.writeBufferOffset ctx embdTableGPU (stageSlot * stride).toUSize
+              (tb.extract (tokenId*rb) ((tokenId+1)*rb))
+          pure embdTableGPU
       let scaleFactor : Float := Float.sqrt embdPL.toFloat
-      ce "q6kDequantScale_pf"
+      ce "q6kDequantScale_pf_r64"
         (Hesper.Quantization.Q6_K.q6kTableRowDequantScaleKernel totalPL scaleFactor
-          cfg.vocabSize)
+          cfg.vocabSize (declRows := 64))
         [("table", tableForKernel), ("params", state.plRawRowBuf), ("output", state.plModelProj)]
         (.dispatch1D totalPL)
       writeColIdxU32 colIdxBuf i
@@ -1733,9 +1762,11 @@ def forwardPrefillBatch [GPUBackend β] (ctx : β)
         -- Batched fused QKV norm: grid (numHeads*seqLen, 3, 1).
         ce (if isFull then "qkvNormFullBatch" else "qkvNormSWABatch")
           (fusedPerHeadQKVNormBatchKernel numHeads numKVHeads headDim seqLen cfg.rmsNormEps)
-          [("q_in", batchQBuf), ("q_scale", block.attention.qNormWeight), ("q_out", batchQBuf),
-           ("k_in", batchKBuf), ("k_scale", block.attention.kNormWeight), ("k_out", batchKBuf),
-           ("v_in", batchVBuf),                                            ("v_out", batchVBuf)]
+          -- single read_write binding per tensor (in-place): duplicate in/out entries on the
+          -- same buffer are writable-storage aliasing = WebGPU validation error
+          [("q_scale", block.attention.qNormWeight), ("q_io", batchQBuf),
+           ("k_scale", block.attention.kNormWeight), ("k_io", batchKBuf),
+           ("v_io", batchVBuf)]
           { numWorkgroups := (numHeads * seqLen, 3, 1),
             workgroupSize := { x := wgSize, y := 1, z := 1 } : Hesper.ExecConfig }
         let stageActive := stageDumpLayer.any (· = li)
@@ -1790,10 +1821,10 @@ def forwardPrefillBatch [GPUBackend β] (ctx : β)
         let kvCache := state.kvCaches[kvLi]
         writeParamsU32At 0 startPos
         -- Q-only norm, grid (numHeads, seqLen, 1).
-        ce s!"qNormBatch_{headDim}"
-          (perHeadRMSNormBatchKernel numHeads headDim seqLen cfg.rmsNormEps)
-          [("input", batchQBuf), ("weight", block.attention.qNormWeight),
-           ("output", batchQBuf)]
+        -- in-place variant: input==output on the same buffer is writable-storage aliasing on WebGPU
+        ce s!"qNormBatchIP_{headDim}"
+          (perHeadRMSNormBatchInPlaceKernel numHeads headDim seqLen cfg.rmsNormEps)
+          [("weight", block.attention.qNormWeight), ("q_io", batchQBuf)]
           { numWorkgroups := (numHeads, seqLen, 1),
             workgroupSize := { x := wgSize, y := 1, z := 1 } : Hesper.ExecConfig }
         let stageActive := stageDumpLayer.any (· = li)
@@ -2145,8 +2176,9 @@ def forwardPrefillBatch [GPUBackend β] (ctx : β)
         let plePostRef ← match kcr with
           | some k => k.getRef plePostKey
           | none => IO.mkRef none
-        RMSNorm.forwardNormThenAddBatch ctx ple.postNorm
-          plProjBatchBuf nextBuf nextBuf seqLen plePostRef
+        -- in-place: passing nextBuf as both residual and output is writable-storage aliasing on WebGPU
+        RMSNorm.forwardNormThenAddBatchInPlace ctx ple.postNorm
+          plProjBatchBuf nextBuf seqLen plePostRef
       | none => pure ()
     | none => pure ()
 
@@ -2394,7 +2426,9 @@ def forwardSingleToken [GPUBackend β] (ctx : β)
     | some k =>
       let key := hash ("gemma4_ce", name, config.numWorkgroups, config.workgroupSize.x, config.workgroupSize.y, config.workgroupSize.z)
       let ref ← k.getRef key
-      let configNamed : Hesper.ExecConfig := { config with funcName := name }
+      -- Sanitize: several call sites embed Float params in the name (e.g. base10000.000000);
+      -- '.' is invalid in a WGSL identifier → shader-module parse error on WebGPU.
+      let configNamed : Hesper.ExecConfig := { config with funcName := (name.replace "." "p").replace "-" "m" }
       GPUBackend.executeWithConfigCached ctx shader namedBufs configNamed key ref
     | none => GPUBackend.execute ctx shader namedBufs config
   let tokenBytes := Hesper.WebGPU.BufferOps.uint32ToBytes tokenId.toUInt32
@@ -2408,8 +2442,14 @@ def forwardSingleToken [GPUBackend β] (ctx : β)
         (Hesper.Quantization.Q6_K.q6kEmbeddingLookupKernel model.config.vocabSize model.config.hiddenSize)
         [("token_ids", state.tokenBuf), ("embedding_table", model.embedding.embeddingTable), ("output", state.buf1)]
         (.dispatch1D model.config.hiddenSize)
+    | .Q4_K =>
+      -- Gemma 4 E2B: Q4_K token_embd (see the prefill site)
+      ce "q4kEmbLookup"
+        (Hesper.Quantization.Q4_K_M.q4kEmbeddingLookupKernel model.config.vocabSize model.config.hiddenSize)
+        [("token_ids", state.tokenBuf), ("embedding_table", model.embedding.embeddingTable), ("output", state.buf1)]
+        (.dispatch1D model.config.hiddenSize)
     | _ =>
-      -- F32 / F16 / Q4_K: use existing Embedding.forward (assumes F32 interpretation)
+      -- F32 / F16: use existing Embedding.forward (F32 interpretation)
       Embedding.forward ctx model.embedding state.tokenBuf state.buf1 1 1
 
   -- Scale embeddings by sqrt(hiddenSize)
@@ -2443,9 +2483,10 @@ def forwardSingleToken [GPUBackend β] (ctx : β)
         -- pointer at `devPtr + tokenId × rowBytes`, so it dereferences
         -- the host page through the unified VA mapping with no explicit
         -- cuMemcpy. Legacy path: real tokenId indexes the full VRAM table.
-        let kernelTokenId : Nat := match model.perLayerEmbdMmap with
-          | some _ => 0
-          | none   => tokenId
+        let kernelTokenId : Nat := match model.perLayerEmbdMmap, model.perLayerEmbdTableBytes with
+          | some _, _ => 0
+          | none, some _ => 0   -- row-staged: the scratch holds exactly this token's row
+          | none, none => tokenId
         let tokenIdBytes := Hesper.WebGPU.BufferOps.uint32ToBytes kernelTokenId.toUInt32
         if !skipTokenWrite then
           writeScalarViaStaging ctx state.plRawRowBuf 0 state.stagingPLRowPtr 0 tokenIdBytes
@@ -2455,7 +2496,13 @@ def forwardSingleToken [GPUBackend β] (ctx : β)
             match ← GPUBackend.bufFromRawDevicePtr ctx rowDevPtr rowBytesU with
             | some b => pure b
             | none   => pure embdTableGPU
-          | none => pure embdTableGPU
+          | none =>
+            -- ROW-STAGING (WebGPU): stage this token's Q6_K row into the one-row scratch
+            -- (see the prefill site for the rationale).
+            if let some tb := model.perLayerEmbdTableBytes then
+              let rb := model.perLayerEmbdRowBytes
+              GPUBackend.writeBuffer ctx embdTableGPU (tb.extract (tokenId*rb) ((tokenId+1)*rb))
+            pure embdTableGPU
         let scaleFactor : Float := Float.sqrt embdPL.toFloat
         ce "q6kDequantScale"
           (Hesper.Quantization.Q6_K.q6kTableRowDequantScaleKernel totalPL scaleFactor
