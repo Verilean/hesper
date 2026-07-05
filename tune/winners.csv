@@ -1,0 +1,3 @@
+family,shape,params,ms
+regGen,262x1024x2816,BK=16;TM=2;TN=2;sgC=4;sgR=1,0.283333
+regGen,262x2112x2816,BK=16;TM=4;TN=1;sgC=4;sgR=1,0.463333

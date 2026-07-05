@@ -60,8 +60,13 @@
 
 ## §3. 現在の状態
 
-- **完了**: M0（★承認済み）、M1（probe、3/3 クリーン）、**M2+M4 前倒し（★レビュー待ち）**: `matMulTransposeF16WMMARegKernelGen(TMsg,TNsg,sgRows,sgCols,BK)` + SWEEP=1 resumable ランナー。**524 variants 完走、golden 失敗 0**。**QKV-KV: 勝者 TM2xTN1_sg1x4_BK16 = 0.267ms vs deployed 設定 0.733ms（同条件、2.7×）/ standalone deployed 実測 0.40-0.51ms 比でも ~1.5-1.9×。floor 距離 5.2×→2.7×。dense-gu: TM2xTN2_sg2x1_BK16 = 0.500ms vs 0.833（1.7×）、floor 3.2×→2.5×。** 勝ちパターン: **BK16 + 小中 tile + wg64-128**（全行 maxThreads=1024 = spill 無し → 小 shape では occupancy/padding 削減が支配、深い tile は不利）
-- **進行中**: M2 ★レビュー → 承認後 M5（decode 統合: QKV-KV/dense の dispatch を勝者設定に flag 切替 → dg_eval 8/8 → per-step 実測）
+- **完了**: M0（★承認済み）、M1（probe、3/3 クリーン）、**M2+M4 前倒し（★レビュー待ち、汎用化+再現性検証済み）**:
+  - **汎用 autotune core = `Hesper/WGSL/Autotune.lean`（library）**: Family 契約（space/feasible/gen/cfg/golden 宣言 ~50 行）に対し、engine が sweep/golden/probe-prune/occupancy/tune log/resume/**refine(top-10 × 300 iters × 3 反復)**/winners.csv/**実行時 `best` lookup** を共有提供。matmul は最初の instantiation（`regGenFamily`）。E2B mul_mv family が「matmul 専用でない」の証明担当（M6/M7）
+  - **再現性（ユーザー指摘で検証）**: 独立 2 回の全 sweep → dense 勝者は完全一致、QKV-KV は同着プレート。ただし**単発 sweep 行には最大 ~3× の過渡外れ値**（同一設定が 0.267/0.767ms）→ **refine 段を新設**（top-10 を 300×3 で再計測、min-of-reps で確定。反復内ばらつき ±2%）
+  - **正直な勝ち幅（300×3 同一ハーネス・cool、当初の 2.7×/1.7× は外れ値 baseline による誇張と判明・訂正)**: QKV-KV 0.283ms vs deployed 0.417ms = **1.45×**、dense-gu 0.463 vs 0.580 = **1.25×**。floor 距離 QKV-KV 2.9×、dense 2.3×
+  - **汎用 kernel の忠実性確認**: Gen(deployed 設定) 0.413/0.577 ≈ 実 deployed kernel 0.417/0.580（1% 以内）= M4 合否「64×32 を再発見」クリア
+  - 勝ちパターン: **BK16 + 小中 tile + sgC 多め（wg128）**、全行 spill 無し
+- **進行中**: M2 ★レビュー → 承認後 M5（decode 統合は `Autotune.best` lookup 経由 — 数字の手書き無し → dg_eval 8/8 → per-step 実測）
 - **直近の実測**（2026-07-05, M4 Max, feat/diffusiongemma）:
   - TAT probe: 0.118 s/variant（cold Metal cache）。**再 sweep は Metal ディスク shader cache で compile 80ms→4ms** → 0.046 s/variant
   - occupancy probe 動作: deployed reg kernel = maxThreads=1024（spill 無し）, execWidth=32
@@ -94,3 +99,5 @@
 | 2026-07-05 | **M1 合格**: occupancy probe 動作（maxThreads/execWidth）。callback は captureless 限定 | capture 付き lambda で use-after-free（quiet 確率無視 + SIGTRAP）を実測 → global 状態 + captureless で 3/3 クリーン |
 | 2026-07-05 | sweep は resumable（CSV skip + SWEEP_LIMIT）に | 300 variant 一気は SIGSEGV。真因 = **wg=512 が maxComputeWorkgroupSizeX=256 を超え pipeline が null → execute 経路が null 参照で SIGSEGV**（engine 堅牢性の課題、别途）。feasibility に wg≤256 を追加して解消 |
 | 2026-07-05 | **M2 合格（524 variants、golden 0 fail）**: QKV-KV 0.733→0.267ms、dense 0.833→0.500ms（同条件）。勝ち = BK16+小 tile+wg64-128 | 「4.9×/3.2× above floor は未チューニングが原因」仮説が実証された。深 tile(BK32/TM4)は M=262 では padding 浪費+occupancy 損 |
+| 2026-07-05 | 手動 tune ループ→**汎用 Autotune library に抽出**（Family 契約 + 共有 engine + 実行時 lookup）。ユーザー指摘（matmul 専用/手動 tune/パラメータ非外出し）が正しかった | Triton の @autotune と同じ境界: kernel 作者は宣言のみ、探索/記録/消費は機構 |
+| 2026-07-05 | **勝ち幅を 2.7×/1.7× → 1.45×/1.25× に訂正**（refine 300×3 実測）。probe-prune + refine 段を新設 | 単発 sweep 行に ~3× 過渡外れ値（0.267/0.767 同一設定）→ sweep=安く順位付け、refine=確実に決定、の 2 段が必須。ユーザーの再現性指摘が的中 |
