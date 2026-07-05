@@ -1079,6 +1079,33 @@ def mulMvQ4KFamily : Hesper.WGSL.Autotune.Family where
     [("weights", shape.N * (shape.K/256) * 36), ("input_q8", (shape.K/32)*9), ("output", shape.N)]
   golden := fun p device => checkMulMvGolden device (p.get! "R") (p.get! "W")
 
+/-- MULMV_DET=1: determinism probe for the deployed f32 winner kernels — run the
+    kernel repeatedly on FIXED inputs and bit-compare consecutive outputs.
+    A single mismatch = a real race (subgroup/uniformity/OOB class). -/
+def mulMvDeterminismProbe : IO Unit := do
+  let inst ← Hesper.init
+  let device ← getDevice inst
+  for (k, n, nr0, nsg) in [(2048, 1536, 2, 1), (6144, 1536, 2, 2), (1536, 2560, 4, 4)] do
+    let wBuf ← mkQ4KTestWeights device n k
+    let mut xA : Array Float := #[]
+    for i in [0:k] do xA := xA.push ((((i*13+5) % 17 : Nat).toFloat) - 8.0)
+    let xf ← mkBuf device k
+    writeBuffer device xf 0 (← Hesper.Basic.floatArrayToBytes xA)
+    let out ← mkBuf device n
+    let r ← IO.mkRef none
+    let run : IO ByteArray := do
+      Hesper.GPUBackend.executeWithConfigCached device
+        (Hesper.WGSL.MulMvQ4K.mulMvQ4KF32Kernel k n nr0 nsg)
+        (("weights",wBuf)::("input",xf)::("output",out)::List.nil)
+        { numWorkgroups := (n/(nr0*nsg), 1, 1), workgroupSize := {x:=32*nsg}, extensions := ["subgroups"] } 0 r
+      mapBufferRead device out 0 (n*4).toUSize
+    let ref ← run
+    let mut bad := 0
+    for _ in [0:50] do
+      let cur ← run
+      if cur != ref then bad := bad + 1
+    IO.println s!"[mulmv-det] K={k} N={n} NR0={nr0} NSG={nsg}: {bad}/50 runs differ from first"
+
 /-- MATVEC_SWEEP=1: sweep + refine the mul_mv family at the E2B decode shapes —
     the M7 "one command" flow. Winners land in tune/winners.csv. -/
 def matVecSweep (device : Device) : IO Unit := do
@@ -1192,6 +1219,8 @@ def main : IO Unit := do
     Examples.Compute.MatmulBench.forwardRoofline
   else if (← IO.getEnv "CONCPROBE").isSome then
     Examples.Compute.MatmulBench.concurrentDispatchProbe
+  else if (← IO.getEnv "MULMV_DET").isSome then
+    Examples.Compute.MatmulBench.mulMvDeterminismProbe
   else if (← IO.getEnv "MATVEC_SWEEP").isSome then do
     let inst ← Hesper.init
     let device ← Hesper.WebGPU.getDevice inst

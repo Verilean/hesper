@@ -401,8 +401,19 @@ def createInferenceState [GPUBackend β] (ctx : β) (cfg : Config) : IO (Inferen
     Caller passes the byte count; suffix identifies the checkpoint.
     Flushes any pending CUDA batch queue first so the buffer reflects all
     queued launches.  If there was an active batch, reopens it afterwards. -/
+initialize dumpDirCache : IO.Ref (Option (Option String)) ← IO.mkRef none
+
 def dumpBuf [GPUBackend β] (ctx : β) (buf : GPUBackend.Buf β) (bytes : USize) (suffix : String) : IO Unit := do
-  match ← IO.getEnv "HESPER_DUMP_DIR" with
+  -- env cached once: dumpBuf sits on the decode hot path (~15 sites × 35 layers);
+  -- a per-call getEnv would cost ~0.5 ms/token when dumping is OFF.
+  let dirOpt ← do
+    match ← dumpDirCache.get with
+    | some v => pure v
+    | none =>
+      let v ← IO.getEnv "HESPER_DUMP_DIR"
+      dumpDirCache.set (some v)
+      pure v
+  match dirOpt with
   | none => pure ()
   | some dir =>
     -- Probe CUDA batch state: if currently batching, queue sync returns
@@ -714,6 +725,9 @@ def forwardBlock [GPUBackend β] (ctx : β)
     let posF32Bytes ← Hesper.Basic.floatToBytes pos.toFloat
     writeScalarViaStaging ctx state.posF32Buf 0 state.stagingPosF32Ptr 0 posF32Bytes
 
+  dumpBuf ctx state.kBuf (numKVHeads * headDim * 4).toUSize s!"single_p{pos}_kproj_L{li}"
+  dumpBuf ctx state.kBuf2 (numKVHeads * headDim * 4).toUSize s!"single_p{pos}_knormed_L{li}"
+  dumpBuf ctx state.vBuf2 (numKVHeads * headDim * 4).toUSize s!"single_p{pos}_vnormed_L{li}"
   Hesper.WGSL.Execute.withSection "rope" do
     -- RoPE on Q: qBuf2 → qBuf
     match block.ropeFreqFactors with
@@ -804,12 +818,16 @@ def forwardBlock [GPUBackend β] (ctx : β)
         state.qBuf kvCache.kBufF16 kvCache.vBufF16 state.paramsBuf
         state.flashPartialOutV11 state.flashPartialMetaV11 state.attnOutBuf
         numHeads numKVHeads cfg.maxSeqLen headDim scale
-        (kcrLookup := kcrLk)
+        (kcrLookup := kcrLk) (cacheLen := cacheLen)
+      dumpBuf ctx state.qBuf (numHeads * headDim * 4).toUSize s!"single_p{pos}_qpost_L{li}"
+      dumpBuf ctx state.flashPartialMetaV11 (numHeads * 8 * 2 * 4).toUSize s!"single_p{pos}_pmeta_L{li}"
+      dumpBuf ctx state.flashPartialOutV11 (numHeads * 8 * headDim * 4).toUSize s!"single_p{pos}_pout_L{li}"
 
     -- Output projection: attnOut [numHeads * headDim] → normedBuf [hiddenSize]
     -- Circuit-DSL: single matmulQ4K op via runCached (build once, replay).
     -- Equivalent to direct LinearLayer.forward; sets up the IR for later
     -- fusion with the post-attn norm chain.
+    dumpBuf ctx state.attnOutBuf (numHeads * headDim * 4).toUSize s!"single_p{pos}_oprojIn_L{li}"
     Hesper.WGSL.Execute.withSection "oProj" do
       -- HESPER_BYPASS_OPROJ=1 short-circuits the Circuit DSL path for this
       -- section. Used as the H4c A/B test (doc 57 §3b.7): result was
@@ -844,6 +862,7 @@ def forwardBlock [GPUBackend β] (ctx : β)
     let ref ← match kcr with
       | some k => k.getRef key
       | none => IO.mkRef none
+    dumpBuf ctx state.normedBuf (cfg.hiddenSize * 4).toUSize s!"single_p{pos}_oprojOut_L{li}"
     RMSNorm.forwardNormThenAdd ctx block.postAttnNorm
       state.normedBuf inputBuf state.attnResidualBuf ref (workgroupSize := 1024)
   dumpBuf ctx state.attnResidualBuf (cfg.hiddenSize * 4).toUSize s!"single_p{pos}_postAttn_L{li}"
@@ -2605,7 +2624,10 @@ def forwardSingleToken [GPUBackend β] (ctx : β)
   -- skip our own begin/endBatch so each dispatch auto-syncs.
   let profiling ← Hesper.Layers.Linear.profilingRef.get
   let alreadyBatching ← Hesper.WGSL.Execute.isBatching
-  let ownBatch := !profiling && !alreadyBatching
+  -- HESPER_DECODE_NOBATCH=1: each dispatch submits+waits (race-diagnostic mode —
+  -- if the intermittent bit-wobble disappears here, it's a batching/sync hazard).
+  let noBatch := (← IO.getEnv "HESPER_DECODE_NOBATCH") == some "1"
+  let ownBatch := !profiling && !alreadyBatching && !noBatch
   if ownBatch then GPUBackend.beginBatch ctx
 
   let mut currentBuf := state.buf2

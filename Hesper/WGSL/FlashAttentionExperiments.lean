@@ -549,8 +549,15 @@ def executeFlashAttentionV11 [GPUBackend β] (ctx : β)
     (numHeads numKVHeads maxSeqLen headDim : Nat) (scale : Float)
     (kcrLookup :
        Option (UInt64 → IO (IO.Ref (Option (GPUBackend.CachedDispatch β)))) := none)
-    : IO Unit := do
-  let numSplits : Nat := 8
+    (cacheLen : Nat := 8) : IO Unit := do
+  -- numSplits must not exceed cacheLen: the partial kernel's split range
+  -- [i·L/8, (i+1)·L/8) is EMPTY when L < 8, and an empty split skips the whole
+  -- K loop — the epilogue then aggregates UNINITIALIZED threadgroup memory into
+  -- partial_out/partial_meta (nondeterministic bit-wobble; usually near-benign
+  -- because the leftover threadgroup contents are a previous dispatch's data —
+  -- found via a 5-process md5 determinism probe at pos=6/cacheLen=7).
+  -- For L ≥ 8 every split has ≥1 K position (⌊(i+1)L/8⌋−⌊iL/8⌋ ≥ ⌊L/8⌋ ≥ 1).
+  let numSplits : Nat := min 8 (max cacheLen 1)
   let workgroupSize : Nat := 128
 
   -- Partial kernel: gridDim = (numHeads, numSplits, 1)
