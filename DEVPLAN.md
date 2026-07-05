@@ -1,10 +1,11 @@
 # DEVPLAN — Hesper measured-JIT rebuild: premises, hypotheses, evidence, verdict
 
 **Status: the product bet is RETIRED (Phase D verdict, 2026-07-06). This document is now
-the post-mortem of record.** The full Japanese working log this replaces is in git history
-(`git log --follow DEVPLAN.md`). Development followed the cycle: read this file → work a
-milestone under the principles → update state + decision log → commit code and DEVPLAN
-together; ★ items required user review.
+the post-mortem of record.** The verbatim Japanese working log (per-milestone state +
+dated decision log, the diary this document distills) is preserved in **`DEVLOG.md`**;
+§6 below reconstructs the causal chain from it. Development followed the cycle: read this
+file → work a milestone under the principles → update state + decision log → commit code
+and DEVPLAN together; ★ items required user review.
 
 ---
 
@@ -167,7 +168,68 @@ outer products, optimizer step). Nothing about TTT requires Hesper.
 
 ---
 
-## §6. Process lessons (the cost accounting)
+## §6. Chronology — the causal chain to the verdict
+
+How each conclusion was actually reached, in order. Each step names its trigger and what
+it caused next; dated primary entries are in `DEVLOG.md` §4. All on 2026-07-05/06.
+
+1. **M0 — TAT probe.** Measured 0.118 s/variant → the autotune design is viable.
+   Side-discovery: the full-unroll kernel generator explodes Tint/Metal compile at
+   K=2816 → the sweep substrate must use runtime K-loops (promoted to a premise).
+2. **M2+M4 — first sweeps.** 524 variants, golden 0 fail; claimed 2.7×/1.7× wins.
+   **User challenged reproducibility** → re-measurement found ~3× transient outliers in
+   single sweep rows → the refine stage (top-10 × 300 iters × 3 reps) was created and the
+   wins corrected to **1.45×/1.25×**. A thermally-rotten winner then caused a +39 ms
+   decode regression → the **incumbent guard** was created. (Two framework features exist
+   *because* of two caught mistakes.)
+3. **M5 — first integration: e2e NEUTRAL.** The tuned WGSL matmuls were only ~10 % of the
+   diffusion step; a 20 % win there sinks below ±30 ms noise. Principle 4's gate fired as
+   designed → redirect to a target where matvec dominates the step: **E2B (M6/M7)**.
+4. **M6 — E2B bring-up to correctness, 8.05 t/s.** Four bugs, three of them
+   "assumed the tensor type instead of reading it" (PLE table Q5_K, proj BF16,
+   inp_gate/proj F32) → new operating rule: read every tensor's type from GGUF, throw on
+   unhandled. Fourth: prepared-dispatch captured prefill buffers, exposed only by E2B's
+   odd layer count.
+5. **M7 — overhead removals, 8.05 → 68.0 t/s.** cacheKey authority (WGSL was re-generated
+   per dispatch just to hash it) → 39.9; HashMap caches (linear scans, ~450 k
+   probes/token) → 64.1; Q4_K dp4a lm-head (800 → 226 MB/token) → 68.0. No kernel was
+   made faster yet — this was all engine tax.
+6. **mulMv family sweep → e2e NEUTRAL again → the real constraint found.** All-shape
+   winner R1W1 didn't move decode. `HESPER_GPUBUSY` (built for this) measured **684
+   dispatches × ~14 µs serialized = 9.5 ms GPU floor** — the constraint is the dispatch
+   layer, not kernel interiors. **This falsified premise P3.**
+7. **Violation #1 → course correction.** I proposed fusion ("fewer dispatches") *before*
+   the M3 reference reading. **User: "did you analyze llama.cpp's kernels?"** M3 reading
+   then showed llama.cpp runs *more* ops (1033) faster via `MTLDispatchTypeConcurrent` +
+   hazard-only barriers, while Dawn hardcodes Serial → fusion demoted, native-dispatch
+   plan B proposed; CONCPROBE derisked it (13.5 → 6.9 µs/dispatch).
+8. **Violation #2 → kernel-first ordering.** **User: "the kernels are bad and autotune
+   isn't done — why native dispatch?"** Native-encoder timing (Dawn overhead removed)
+   showed the tuned R1W1 at only **43 % BW** — the "kernels are same-class" claim had been
+   structural, not measured. Order fixed: kernels first.
+9. **The principle-7-compliant port.** llama.cpp `kernel_mul_mv_q4_K_f32` ported
+   *structure-whole* into the DSL → **90–97 % BW**, beating the dp4a family 1.4–1.7×
+   (`dot4I8Packed` is emulated on Apple). Deployed: +8 %, 74.8 t/s. Honest decomposition:
+   kernels now ~2 ms; the ~6.5 ms dispatch tax dominates → back to the dispatch layer,
+   but now with clean hands.
+10. **Violation #3 → fusion reinstated, plan B parked.** **User: "webml is WebGPU — why
+    250 t/s?"** (webml was required reading in the original plan's A-0.) Reading it:
+    ~390 dispatches/token via epilogue fusion, *inside the same Dawn serial dispatch* →
+    H5 confirmed, native transport unnecessary, fusion is the road.
+11. **Fusion batches + the race hunt.** PLE-gate fusion (−35) landed; qkNormRope fusion
+    hit the **Tint MSL printer bug** (valid WGSL → broken MSL, parked). Its gating
+    required bit-determinism, which was broken — hunting that exposed two *pre-existing*
+    bugs: the empty split-K aggregating uninitialized threadgroup memory, and **11
+    clamp-write races**. 1-dispatch attention → 567 dispatches, GPU 7.7 ms.
+12. **Metric correction.** The "~75 t/s" figures were 48-token averages diluted by
+    first-token pipeline compiles; steady state = **89.6–96 t/s**.
+13. **The closing decomposition → verdict.** User asked whether webml's edge is the QAT
+    model. Effective-BW table (§3): 122/197/279 GB/s; llama.cpp on QAT-q4_0 ≈ 177 t/s →
+    H6 rejected; the gap is dispatch structure + runtime leanness. With P3 falsified, P4's
+    market premise examined, and the ceiling shown to belong to hand-written incumbents,
+    **user verdict: retire the product bet** → this post-mortem.
+
+## §7. Process lessons (the cost accounting)
 
 The core hypothesis was falsified *cleanly*: the 8.05 → 90 t/s ladder isolated "not the
 kernels, not the language — the dispatch structure" one variable at a time. But the same
