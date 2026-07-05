@@ -1097,6 +1097,61 @@ extern "C" lean_obj_res lean_hesper_msl_gateup_down_onecb(
 // inverse signal (drops when the kernel spills), threadExecutionWidth confirms simd width (32 on
 // Apple), staticThreadgroupMemoryLength is the shared-memory footprint. This is the MANDATORY
 // resource column of the autotune sweep (never report speed without it).
+// ===========================================================================================
+// M3 de-risk probe: does MTLDispatchTypeConcurrent recover the ~14 µs/dispatch serialization
+// that Dawn's hardcoded Serial encoder costs us? Compiles a DUMPED Tint-MSL kernel (same code
+// Dawn runs), records `nDispatches` back-to-back in ONE encoder with the requested dispatch
+// type and NO barriers (racing writes are fine — timing only), returns GPU wall ms.
+// ===========================================================================================
+extern "C" lean_obj_res lean_hesper_msl_concurrent_probe(
+    b_lean_obj_arg device_obj, b_lean_obj_arg msl_obj,
+    b_lean_obj_arg b0_obj, b_lean_obj_arg b1_obj, b_lean_obj_arg b2_obj,
+    uint32_t nDispatches, uint32_t gridX, uint32_t gridY, uint32_t wgX,
+    uint8_t concurrent,
+    lean_obj_res /* unit */) {
+    @autoreleasepool {
+        wgpu::Device* device = mr_extract_device(device_obj);
+        if (!device || !device->Get()) return lean_io_result_mk_error(lean_mk_string("conc_probe: invalid device"));
+        id<MTLDevice> mtl = dawn::native::metal::GetMTLDevice(device->Get());
+        const char* mslSrc = lean_string_cstr(msl_obj);
+        if (!mslSrc || mslSrc[0] == '\0')
+            return lean_io_result_mk_error(lean_mk_string("conc_probe: empty MSL (set HESPER_DUMP_MSL=1)"));
+        wgpu::Buffer* bufs[3] = { mr_extract_buffer(b0_obj), mr_extract_buffer(b1_obj), mr_extract_buffer(b2_obj) };
+        id<MTLBuffer> mb[3];
+        for (int i = 0; i < 3; i++) {
+            if (!bufs[i] || !bufs[i]->Get()) return lean_io_result_mk_error(lean_mk_string("conc_probe: invalid buffer"));
+            mb[i] = reinterpret_cast<dawn::native::metal::Buffer*>(bufs[i]->Get())->GetMTLBuffer();
+        }
+        NSError* err = nil;
+        MTLCompileOptions* opts = [MTLCompileOptions new];
+        id<MTLLibrary> lib = [mtl newLibraryWithSource:[NSString stringWithUTF8String:mslSrc] options:opts error:&err];
+        if (!lib) return lean_io_result_mk_error(lean_mk_string(
+            [[NSString stringWithFormat:@"conc_probe compile failed: %@", err] UTF8String]));
+        id<MTLFunction> fn = [lib newFunctionWithName:@"dawn_entry_point"];
+        if (!fn) return lean_io_result_mk_error(lean_mk_string("conc_probe: no dawn_entry_point"));
+        id<MTLComputePipelineState> pso = [mtl newComputePipelineStateWithFunction:fn error:&err];
+        if (!pso) return lean_io_result_mk_error(lean_mk_string("conc_probe: PSO failed"));
+        if (!g_mslQueue) g_mslQueue = [mtl newCommandQueue];
+        id<MTLCommandBuffer> cb = [g_mslQueue commandBuffer];
+        MTLComputePassDescriptor* desc = [MTLComputePassDescriptor computePassDescriptor];
+        desc.dispatchType = concurrent ? MTLDispatchTypeConcurrent : MTLDispatchTypeSerial;
+        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoderWithDescriptor:desc];
+        [enc setComputePipelineState:pso];
+        for (int i = 0; i < 3; i++) [enc setBuffer:mb[i] offset:0 atIndex:i];
+        for (uint32_t d = 0; d < nDispatches; d++) {
+            [enc dispatchThreadgroups:MTLSizeMake(gridX, gridY, 1)
+                threadsPerThreadgroup:MTLSizeMake(wgX, 1, 1)];
+        }
+        [enc endEncoding];
+        [cb commit];
+        [cb waitUntilCompleted];
+        double gpuMs = ([cb GPUEndTime] - [cb GPUStartTime]) * 1000.0;
+        char buf[64];
+        snprintf(buf, sizeof(buf), "%.4f", gpuMs);
+        return lean_io_result_mk_ok(lean_mk_string(buf));
+    }
+}
+
 extern "C" lean_obj_res lean_hesper_msl_occupancy_probe(
     b_lean_obj_arg device_obj, b_lean_obj_arg msl_obj, lean_obj_res /* unit */) {
     @autoreleasepool {

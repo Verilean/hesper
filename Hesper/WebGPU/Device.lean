@@ -67,6 +67,14 @@ opaque lastDumpedMsl : IO String
 @[extern "lean_hesper_msl_occupancy_probe"]
 opaque mslOccupancyProbe (device : @& Device) (msl : @& String) : IO String
 
+/-- M3 de-risk probe: run `nDispatches` of a dumped Tint-MSL kernel back-to-back in ONE
+    native Metal encoder with Serial or Concurrent dispatch type (no barriers — timing
+    only, racing writes tolerated). Returns GPU wall ms as a string. -/
+@[extern "lean_hesper_msl_concurrent_probe"]
+opaque mslConcurrentProbe (device : @& Device) (msl : @& String)
+    (b0 b1 b2 : @& Buffer) (nDispatches gridX gridY wgX : UInt32)
+    (concurrent : UInt8) : IO String
+
 /-- DG_GPUBUSY: read+reset the MSL-path split (count / WaitForCommandsToBeScheduled / encode+commit
     / kernel GPU time). Complements gpuBusyRead (which covers the Dawn WGSL path only). -/
 @[extern "lean_hesper_msl_busy_read"]
