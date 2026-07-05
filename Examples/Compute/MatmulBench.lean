@@ -5,6 +5,7 @@ import Hesper.WebGPU.Buffer
 import Hesper.WebGPU.BufferOps
 import Hesper.Basic
 import Hesper.WGSL.MatMul
+import Hesper.WGSL.Autotune
 import Hesper.Quantization.Q4_K_M
 import Hesper.Layers.Linear
 
@@ -493,10 +494,61 @@ def checkVariantGolden (device : Device) (v : SweepVariant) : IO (Option String)
   if md > 0.5 then return some s!"maxDiff={md} @ M={M} N={N} K={K}"
   return none
 
-/-- DEVPLAN M2 — SWEEP=1: Tier-1 autotune sweep of the generalized reg-WMMA kernel at the
-    worst-roofline decode shapes. Per variant (mandatory, 原則 2): golden(small shape) → timing
-    (100-iter batched) → occupancy probe → CSV append. Prints a ranked table vs the deployed
-    baseline (TMsg=4 TNsg=2 sg2x2 BK32 = the current 64×32 kernel's configuration). -/
+/-- The reg-WMMA matmul as an Autotune FAMILY (DEVPLAN M2): ~50 lines of declaration — the sweep
+    engine, tune log, resume, winners cache, and runtime lookup all come from
+    `Hesper.WGSL.Autotune` and are SHARED with every other family (mul_mv for E2B next). -/
+def regGenFamily : Hesper.WGSL.Autotune.Family where
+  name := "regGen"
+  space := Id.run do
+    let mut s : List Hesper.WGSL.Autotune.Params := []
+    for sgR in [1, 2, 4] do
+      for sgC in [1, 2, 4] do
+        for tm in [1, 2, 4, 8] do
+          for tn in [1, 2, 4] do
+            for bk in [16, 32, 64] do
+              s := s ++ [[("TM", tm), ("TN", tn), ("sgR", sgR), ("sgC", sgC), ("BK", bk)]]
+    return s
+  feasible := fun p shape =>
+    let v : SweepVariant := { tmsg := p.get! "TM", tnsg := p.get! "TN",
+                              sgRows := p.get! "sgR", sgCols := p.get! "sgC", bk := p.get! "BK" }
+    v.feasible shape.K shape.N
+  gen := fun p shape =>
+    Hesper.WGSL.MatMul.matMulTransposeF16WMMARegKernelGen
+      { M := shape.M, N := shape.N, K := shape.K }
+      (p.get! "TM") (p.get! "TN") (p.get! "sgR") (p.get! "sgC") (p.get! "BK")
+  cfg := fun p shape =>
+    let v : SweepVariant := { tmsg := p.get! "TM", tnsg := p.get! "TN",
+                              sgRows := p.get! "sgR", sgCols := p.get! "sgC", bk := p.get! "BK" }
+    { numWorkgroups := (shape.N / v.nTile, (shape.M + v.mTile - 1) / v.mTile, 1),
+      workgroupSize := {x := v.wgSize},
+      extensions := ["f16","chromium_experimental_subgroup_matrix"],
+      diagnostics := [("off","chromium.subgroup_matrix_uniformity")] }
+  benchBuffers := fun shape =>
+    [("a", shape.M * shape.K), ("b", shape.N * (shape.K / 2)), ("c", shape.M * shape.N)]
+  golden := fun p device =>
+    let v : SweepVariant := { tmsg := p.get! "TM", tnsg := p.get! "TN",
+                              sgRows := p.get! "sgR", sgCols := p.get! "sgC", bk := p.get! "BK" }
+    checkVariantGolden device v
+  padShape := fun p shape =>
+    let v : SweepVariant := { tmsg := p.get! "TM", tnsg := p.get! "TN",
+                              sgRows := p.get! "sgR", sgCols := p.get! "sgC", bk := p.get! "BK" }
+    { shape with M := ((shape.M + v.mTile - 1) / v.mTile) * v.mTile }
+
+/-- DEVPLAN M2 — SWEEP=1: drive the GENERIC engine (Autotune.sweep) over the reg-WMMA family at
+    the worst-roofline decode shapes. Winners land in tune/winners.csv for runtime lookup
+    (`Autotune.best`) — consumers never hand-copy numbers. -/
+def sweepTier1' (device : Device) : IO Unit := do
+  let limit := ((← IO.getEnv "SWEEP_LIMIT").bind (·.toNat?)).getD 120
+  for shape in [({ M := 262, N := 1024, K := 2816 } : Hesper.WGSL.Autotune.Shape),
+                ({ M := 262, N := 2112, K := 2816 } : Hesper.WGSL.Autotune.Shape)] do
+    let remaining ← Hesper.WGSL.Autotune.sweep device regGenFamily shape (limit := limit)
+    IO.println s!"[sweep] {shape.key}: {remaining} variants remaining (re-run to continue)"
+    -- sweep complete for this shape → REFINE: top-10 re-measured 300 iters × 3 reps, winner by
+    -- min-of-reps (single sweep rows carry up to ~3× transient outliers — measured)
+    if remaining == 0 then
+      Hesper.WGSL.Autotune.refineTopK device regGenFamily shape
+
+/-- (superseded by sweepTier1' + Autotune engine; kept for the ranked-table print path) -/
 def sweepTier1 (device : Device) : IO Unit := do
   let shapes : List (String × Nat × Nat × Nat) :=
     [("QKV-KV", 262, 1024, 2816), ("dense-gu", 262, 2112, 2816)]
@@ -595,10 +647,77 @@ def sweepTier1 (device : Device) : IO Unit := do
     | none => IO.println "  [deployed-baseline] TM4xTN2_sg2x2_BK32: not in feasible set (?)"
     stdout.flush
 
+/-- DEVPLAN M2 validity check — REBENCH=1: precise (300-iter × 3-repeat) re-measurement of the
+    sweep winners AGAINST the actual deployed kernel in the SAME harness. Answers: (a) is the win
+    reproducible (run-to-run variance)? (b) is the in-sweep "deployed config 0.733ms" honest vs the
+    standalone deployed kernel (harness-validity: the sweep's mPad/buffers must not inflate the
+    baseline)? -/
+def rebenchWinners (device : Device) : IO Unit := do
+  let stdout ← IO.getStdout
+  let shapes : List (String × Nat × Nat × Nat × SweepVariant × SweepVariant) :=
+    [("QKV-KV", 262, 1024, 2816,
+      { tmsg := 2, tnsg := 1, sgRows := 1, sgCols := 4, bk := 16 },   -- winner
+      { tmsg := 1, tnsg := 2, sgRows := 2, sgCols := 1, bk := 16 }),  -- runner-up
+     ("dense-gu", 262, 2112, 2816,
+      { tmsg := 2, tnsg := 2, sgRows := 2, sgCols := 1, bk := 16 },
+      { tmsg := 4, tnsg := 2, sgRows := 1, sgCols := 2, bk := 16 })]
+  let deployedCfg : SweepVariant := { tmsg := 4, tnsg := 2, sgRows := 2, sgCols := 2, bk := 32 }
+  for (sname, M, N, K, win, second) in shapes do
+    let mPad := ((M + 255) / 256) * 256
+    let aBuf ← mkBuf device (mPad*K); let bBuf ← mkBuf device (N*(K/2)); let cBuf ← mkBuf device (mPad*N)
+    let bufs : List (String × Buffer) := [("a",aBuf),("b",bBuf),("c",cBuf)]
+    IO.println s!"=== REBENCH {sname} [M={M} N={N} K={K}] 300 iters × 3 repeats ==="
+    let benchGen := fun (v : SweepVariant) => do
+      let kern := Hesper.WGSL.MatMul.matMulTransposeF16WMMARegKernelGen
+        { M := mPad, N := N, K := K } v.tmsg v.tnsg v.sgRows v.sgCols v.bk
+      let cfg : Hesper.ExecConfig := {
+        numWorkgroups := (N / v.nTile, (M + v.mTile - 1) / v.mTile, 1), workgroupSize := {x := v.wgSize},
+        extensions := ["f16","chromium_experimental_subgroup_matrix"],
+        diagnostics := [("off","chromium.subgroup_matrix_uniformity")] }
+      let r ← IO.mkRef none
+      Hesper.GPUBackend.executeWithConfigCached device kern bufs cfg 1 r
+      let mut times : Array Float := #[]
+      for _ in [0:3] do
+        let t0 ← IO.monoMsNow
+        Hesper.GPUBackend.beginBatch device
+        for _ in [0:300] do Hesper.GPUBackend.executeWithConfigCached device kern bufs cfg 1 r
+        Hesper.GPUBackend.endBatch device
+        let t1 ← IO.monoMsNow
+        times := times.push ((t1-t0).toFloat / 300.0)
+      pure times
+    let benchDeployed := do
+      let kern := Hesper.WGSL.MatMul.matMulTransposeF16WMMARegKernel { M := mPad, N := N, K := K } 0 N
+      let cfg : Hesper.ExecConfig := {
+        numWorkgroups := ((N+31)/32, (M+63)/64, 1), workgroupSize := {x:=128},
+        extensions := ["f16","chromium_experimental_subgroup_matrix"],
+        diagnostics := [("off","chromium.subgroup_matrix_uniformity")] }
+      let r ← IO.mkRef none
+      Hesper.GPUBackend.executeWithConfigCached device kern bufs cfg 1 r
+      let mut times : Array Float := #[]
+      for _ in [0:3] do
+        let t0 ← IO.monoMsNow
+        Hesper.GPUBackend.beginBatch device
+        for _ in [0:300] do Hesper.GPUBackend.executeWithConfigCached device kern bufs cfg 1 r
+        Hesper.GPUBackend.endBatch device
+        let t1 ← IO.monoMsNow
+        times := times.push ((t1-t0).toFloat / 300.0)
+      pure times
+    let showRow := fun (nm : String) (ts : Array Float) =>
+      IO.println s!"  {nm}: {ts.toList.map (fun t => (t*1000).round / 1000)} ms  (min {(ts.foldl min 1e9 * 1000).round/1000})"
+    showRow s!"winner    {win.name}" (← benchGen win)
+    showRow s!"runner-up {second.name}" (← benchGen second)
+    showRow s!"deployedCfg {deployedCfg.name} (Gen)" (← benchGen deployedCfg)
+    showRow "DEPLOYED kernel (actual, 64×32 wg128)" (← benchDeployed)
+    stdout.flush
+
 def main : IO Unit := do
+  if (← IO.getEnv "REBENCH").isSome then
+    let inst ← Hesper.init; let device ← getDevice inst
+    Examples.Compute.MatmulBench.rebenchWinners device
+    return
   if (← IO.getEnv "SWEEP").isSome then
     let inst ← Hesper.init; let device ← getDevice inst
-    Examples.Compute.MatmulBench.sweepTier1 device
+    Examples.Compute.MatmulBench.sweepTier1' device
     return
   if (← IO.getEnv "TATPROBE").isSome then
     let inst ← Hesper.init; let device ← getDevice inst
