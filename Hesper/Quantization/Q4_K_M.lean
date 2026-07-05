@@ -156,7 +156,8 @@ def getScaleMin (j : Nat)
 
     @param numElements Total number of elements to dequantize
 -/
-def dequantQ4KMKernel (numElements : Nat) (gridXWidth : Nat := 0) : ShaderM Unit := do
+def dequantQ4KMKernel (numElements : Nat) (gridXWidth : Nat := 0)
+    (elemOffset : Nat := 0) : ShaderM Unit := do
   let gid ← ShaderM.globalId
   -- 1D when gridXWidth=0; else 2D (idx = x + y*gridXWidth) so numElements/256 > the 65535
   -- per-dimension workgroup limit can be covered by a single 2D dispatch.
@@ -167,8 +168,13 @@ def dequantQ4KMKernel (numElements : Nat) (gridXWidth : Nat := 0) : ShaderM Unit
   -- Bounds check
   let inBounds := Exp.lt idx (Exp.litU32 numElements)
 
-  -- Number of blocks
-  let numBlocks := (numElements + blockSize - 1) / blockSize
+  -- elemOffset (baked): CHUNKED dequant of a big table — the source element is idx+elemOffset in
+  -- the full Q4_K buffer while the f32 output stays chunk-local (idx). Lets a 1.6 GB-f32 table be
+  -- dequanted through a chunk-sized scratch (full-size f32 exceeds maxStorageBufferBindingSize).
+  let gIdx := if elemOffset > 0 then Exp.add idx (Exp.litU32 elemOffset) else idx
+
+  -- Number of blocks (cover the offset region too — declared ≤ the actual bound buffer)
+  let numBlocks := (numElements + elemOffset + blockSize - 1) / blockSize
   -- Data buffer: raw bytes as u32 array
   let numU32 := (numBlocks * blockSizeBytes + 3) / 4
 
@@ -177,8 +183,8 @@ def dequantQ4KMKernel (numElements : Nat) (gridXWidth : Nat := 0) : ShaderM Unit
 
   ShaderM.if_ inBounds (do
     -- Which super-block and element within it
-    let blockIdx := Exp.div idx (Exp.litU32 blockSize)
-    let localIdx := Exp.mod idx (Exp.litU32 blockSize)
+    let blockIdx := Exp.div gIdx (Exp.litU32 blockSize)
+    let localIdx := Exp.mod gIdx (Exp.litU32 blockSize)
 
     -- Block byte offset in data buffer
     -- blockBase (in u32 units) = blockIdx * 144 / 4 = blockIdx * 36
@@ -270,6 +276,75 @@ structure DequantConfig where
   numElements : Nat
   workgroupSize : Nat := 256
   deriving Repr
+
+/-- Dequantize ONE Q4_K element at a runtime global element index from a table bound as
+    `bufName` (u32-packed Q4_K blocks, declared size `numU32`). The element math of
+    `dequantQ4KMKernel` factored for reuse (embedding lookups etc.). -/
+def dequantQ4KElementAt (bufName : String) (numU32 : Nat)
+    (gIdx : Exp (.scalar .u32)) : ShaderM (Exp (.scalar .f32)) := do
+  let blockIdx := Exp.div gIdx (Exp.litU32 blockSize)
+  let localIdx := Exp.mod gIdx (Exp.litU32 blockSize)
+  let blockBaseU32 := Exp.mul blockIdx (Exp.litU32 36)
+  let dmU32 ← ShaderM.readBuffer (ty := .scalar .u32) (n := numU32) bufName blockBaseU32
+  let d := fp16ToF32 (Exp.bitAnd dmU32 (Exp.litU32 0xFFFF))
+  let dmin := fp16ToF32 (Exp.shiftRight dmU32 (Exp.litU32 16))
+  let scalesU32_0 ← ShaderM.readBuffer (ty := .scalar .u32) (n := numU32) bufName (Exp.add blockBaseU32 (Exp.litU32 1))
+  let scalesU32_1 ← ShaderM.readBuffer (ty := .scalar .u32) (n := numU32) bufName (Exp.add blockBaseU32 (Exp.litU32 2))
+  let scalesU32_2 ← ShaderM.readBuffer (ty := .scalar .u32) (n := numU32) bufName (Exp.add blockBaseU32 (Exp.litU32 3))
+  let chunkIdx := Exp.div localIdx (Exp.litU32 64)
+  let posInChunk := Exp.mod localIdx (Exp.litU32 64)
+  let isHighNibble := Exp.ge posInChunk (Exp.litU32 32)
+  let posInSubBlock := Exp.mod posInChunk (Exp.litU32 32)
+  let subBlockIdx := Exp.add (Exp.mul chunkIdx (Exp.litU32 2)) (Exp.select isHighNibble (Exp.litU32 1) (Exp.litU32 0))
+  let (sc0, m0) := getScaleMin 0 scalesU32_0 scalesU32_1 scalesU32_2
+  let (sc1, m1) := getScaleMin 1 scalesU32_0 scalesU32_1 scalesU32_2
+  let (sc2, m2) := getScaleMin 2 scalesU32_0 scalesU32_1 scalesU32_2
+  let (sc3, m3) := getScaleMin 3 scalesU32_0 scalesU32_1 scalesU32_2
+  let (sc4, m4) := getScaleMin 4 scalesU32_0 scalesU32_1 scalesU32_2
+  let (sc5, m5) := getScaleMin 5 scalesU32_0 scalesU32_1 scalesU32_2
+  let (sc6, m6) := getScaleMin 6 scalesU32_0 scalesU32_1 scalesU32_2
+  let (sc7, m7) := getScaleMin 7 scalesU32_0 scalesU32_1 scalesU32_2
+  let scVal := Exp.select (Exp.eq subBlockIdx (Exp.litU32 0)) sc0
+    (Exp.select (Exp.eq subBlockIdx (Exp.litU32 1)) sc1
+    (Exp.select (Exp.eq subBlockIdx (Exp.litU32 2)) sc2
+    (Exp.select (Exp.eq subBlockIdx (Exp.litU32 3)) sc3
+    (Exp.select (Exp.eq subBlockIdx (Exp.litU32 4)) sc4
+    (Exp.select (Exp.eq subBlockIdx (Exp.litU32 5)) sc5
+    (Exp.select (Exp.eq subBlockIdx (Exp.litU32 6)) sc6 sc7))))))
+  let mVal := Exp.select (Exp.eq subBlockIdx (Exp.litU32 0)) m0
+    (Exp.select (Exp.eq subBlockIdx (Exp.litU32 1)) m1
+    (Exp.select (Exp.eq subBlockIdx (Exp.litU32 2)) m2
+    (Exp.select (Exp.eq subBlockIdx (Exp.litU32 3)) m3
+    (Exp.select (Exp.eq subBlockIdx (Exp.litU32 4)) m4
+    (Exp.select (Exp.eq subBlockIdx (Exp.litU32 5)) m5
+    (Exp.select (Exp.eq subBlockIdx (Exp.litU32 6)) m6 m7))))))
+  let qsByteIdx := Exp.add (Exp.mul chunkIdx (Exp.litU32 32)) posInSubBlock
+  let qsU32Idx := Exp.div qsByteIdx (Exp.litU32 4)
+  let qsByteOffset := Exp.mul (Exp.mod qsByteIdx (Exp.litU32 4)) (Exp.litU32 8)
+  let qsU32 ← ShaderM.readBuffer (ty := .scalar .u32) (n := numU32) bufName (Exp.add blockBaseU32 (Exp.add (Exp.litU32 4) qsU32Idx))
+  let qsByte := Exp.bitAnd (Exp.shiftRight qsU32 qsByteOffset) (Exp.litU32 0xFF)
+  let qVal := Exp.select isHighNibble
+    (Exp.shiftRight qsByte (Exp.litU32 4))
+    (Exp.bitAnd qsByte (Exp.litU32 0xF))
+  pure (Exp.sub (Exp.mul d (Exp.mul scVal (Exp.toF32 qVal))) (Exp.mul dmin mVal))
+
+/-- Q4_K embedding lookup (single token): output[i] = dequant(table[token_ids[0]], i).
+    Mirrors `Q6_K.q6kEmbeddingLookupKernel` — the Q4_K table binds whole (Gemma 4 E2B
+    token_embd Q4_K ≈ 226 MB, well under the storage-binding limit). Grid: dispatch1D dim. -/
+def q4kEmbeddingLookupKernel (vocabSize dim : Nat) : ShaderM Unit := do
+  let gid ← ShaderM.globalId
+  let idx := Exp.vec3X gid
+  let blocksPerRow := dim / 256
+  let totalU32 := (vocabSize * blocksPerRow * blockSizeBytes + 3) / 4
+  let _tokenIds ← ShaderM.declareReadOnlyBuffer "token_ids" (.array (.scalar .u32) 1)
+  let _table ← ShaderM.declareReadOnlyBuffer "embedding_table" (.array (.scalar .u32) totalU32)
+  let _output ← ShaderM.declareOutputBuffer "output" (.array (.scalar .f32) dim)
+  ShaderM.if_ (Exp.lt idx (Exp.litU32 dim)) (do
+    let tokenId ← ShaderM.readBuffer (ty := .scalar .u32) (n := 1) "token_ids" (Exp.litU32 0)
+    let gIdx := Exp.add (Exp.mul tokenId (Exp.litU32 dim)) idx
+    let val ← dequantQ4KElementAt "embedding_table" totalU32 gIdx
+    ShaderM.writeBuffer (ty := .scalar .f32) "output" idx val
+  ) (pure ())
 
 /-- Execute Q4_K_M dequantization on GPU
 

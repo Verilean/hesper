@@ -561,6 +561,62 @@ def perHeadRMSNormBatchKernel (numHeads headDim seqLen : Nat) (eps : Float) : Sh
 
 /-! ## Bare RMSNorm Kernels (no learned weights) -/
 
+/-- IN-PLACE variant of perHeadRMSNormBatchKernel (single read_write q_io binding): binding the
+    same buffer as separate input/output entries is writable-storage aliasing — a WebGPU
+    validation error. Per-element read→scale→write same-thread same-index, so in-place is safe. -/
+def perHeadRMSNormBatchInPlaceKernel (numHeads headDim seqLen : Nat) (eps : Float) : ShaderM Unit := do
+  let wid ← ShaderM.workgroupId
+  let lid ← ShaderM.localId
+  let headIdx := Exp.vec3X wid
+  let tokIdx  := Exp.vec3Y wid
+  let tid := Exp.vec3X lid
+
+  let qDim := numHeads * headDim
+  let totalElements := qDim * seqLen
+
+  let _weight ← ShaderM.declareInputBuffer "weight" (.array (.scalar .f32) headDim)
+  let _output ← ShaderM.declareOutputBuffer "q_io" (.array (.scalar .f32) totalElements)
+
+  let wgSize := if headDim < 256 then headDim else 256
+  ShaderM.sharedNamed "shared_sum" (.array (.scalar .f32) wgSize)
+
+  -- Offset into the batch buffer for this (token, head): col-major
+  -- column stride = qDim; within the column, head starts at head*headDim.
+  let colBase := Exp.mul tokIdx (Exp.litU32 qDim)
+  let headBase := Exp.add colBase (Exp.mul headIdx (Exp.litU32 headDim))
+
+  ShaderM.varNamed "local_sum" (.scalar .f32) (Exp.litF32 0.0)
+  let localSum : Exp (.scalar .f32) := Exp.var "local_sum"
+
+  ShaderM.loop tid (Exp.litU32 headDim) (Exp.litU32 wgSize) fun i => do
+    let val ← ShaderM.readBuffer (ty := .scalar .f32) (n := totalElements) "q_io" (Exp.add headBase i)
+    ShaderM.assign "local_sum" (Exp.add localSum (Exp.mul val val))
+
+  ShaderM.writeWorkgroup (ty := .scalar .f32) "shared_sum" tid localSum
+  ShaderM.barrier
+
+  let mut stride := wgSize / 2
+  while stride > 0 do
+    ShaderM.if_ (Exp.lt tid (Exp.litU32 stride)) (do
+      let a ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := wgSize) "shared_sum" tid
+      let b ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := wgSize) "shared_sum" (Exp.add tid (Exp.litU32 stride))
+      ShaderM.writeWorkgroup (ty := .scalar .f32) "shared_sum" tid (Exp.add a b)
+    ) (pure ())
+    ShaderM.barrier
+    stride := stride / 2
+
+  let sumSq ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := wgSize) "shared_sum" (Exp.litU32 0)
+  let rms := Exp.inverseSqrt (Exp.add (Exp.div sumSq (Exp.litF32 headDim.toFloat)) (Exp.litF32 eps))
+
+  ShaderM.loop tid (Exp.litU32 headDim) (Exp.litU32 wgSize) fun i => do
+    let val ← ShaderM.readBuffer (ty := .scalar .f32) (n := totalElements) "q_io" (Exp.add headBase i)
+    let w ← ShaderM.readBuffer (ty := .scalar .f32) (n := headDim) "weight" i
+    let normed := Exp.mul (Exp.mul val rms) w
+    ShaderM.writeBuffer (ty := .scalar .f32) "q_io" (Exp.add headBase i) normed
+
+/-! ## Bare RMSNorm Kernels (no learned weights) -/
+
+
 /-- Per-head bare RMSNorm: normalize each head independently (no learned weights).
     Used for V-norm in Gemma 4: each KV head's `headDim` elements are normalized
     by their own RMS. Total input size is `numHeads * headDim`.
@@ -745,14 +801,11 @@ def fusedPerHeadQKVNormBatchKernel
   let tid     := Exp.vec3X lid
   let qTotal  := numHeads * headDim
   let kvTotal := numKVHeads * headDim
-  let _qIn    ← ShaderM.declareInputBuffer  "q_in"    (.array (.scalar .f32) (qTotal * seqLen))
   let _qScale ← ShaderM.declareInputBuffer  "q_scale" (.array (.scalar .f32) headDim)
-  let _qOut   ← ShaderM.declareOutputBuffer "q_out"   (.array (.scalar .f32) (qTotal * seqLen))
-  let _kIn    ← ShaderM.declareInputBuffer  "k_in"    (.array (.scalar .f32) (kvTotal * seqLen))
+  let _qOut   ← ShaderM.declareOutputBuffer "q_io"   (.array (.scalar .f32) (qTotal * seqLen))
   let _kScale ← ShaderM.declareInputBuffer  "k_scale" (.array (.scalar .f32) headDim)
-  let _kOut   ← ShaderM.declareOutputBuffer "k_out"   (.array (.scalar .f32) (kvTotal * seqLen))
-  let _vIn    ← ShaderM.declareInputBuffer  "v_in"    (.array (.scalar .f32) (kvTotal * seqLen))
-  let _vOut   ← ShaderM.declareOutputBuffer "v_out"   (.array (.scalar .f32) (kvTotal * seqLen))
+  let _kOut   ← ShaderM.declareOutputBuffer "k_io"   (.array (.scalar .f32) (kvTotal * seqLen))
+  let _vOut   ← ShaderM.declareOutputBuffer "v_io"   (.array (.scalar .f32) (kvTotal * seqLen))
   let wgSize := if headDim < 256 then headDim else 256
   ShaderM.sharedNamed "shared_sum" (.array (.scalar .f32) wgSize)
   let invalidKV : Exp (.scalar .bool) :=
@@ -767,16 +820,16 @@ def fusedPerHeadQKVNormBatchKernel
     let localSum : Exp (.scalar .f32) := Exp.var "local_sum"
     ShaderM.loop tid (Exp.litU32 headDim) (Exp.litU32 wgSize) fun i => do
       ShaderM.if_ (Exp.eq yIdx (Exp.litU32 0)) (do
-        let v ← ShaderM.readBuffer (ty := .scalar .f32) (n := qTotal * seqLen) "q_in"
+        let v ← ShaderM.readBuffer (ty := .scalar .f32) (n := qTotal * seqLen) "q_io"
                   (Exp.add qColBase i)
         ShaderM.assign "local_sum" (Exp.add localSum (Exp.mul v v))
       ) (do
         ShaderM.if_ (Exp.eq yIdx (Exp.litU32 1)) (do
-          let v ← ShaderM.readBuffer (ty := .scalar .f32) (n := kvTotal * seqLen) "k_in"
+          let v ← ShaderM.readBuffer (ty := .scalar .f32) (n := kvTotal * seqLen) "k_io"
                     (Exp.add kvColBase i)
           ShaderM.assign "local_sum" (Exp.add localSum (Exp.mul v v))
         ) (do
-          let v ← ShaderM.readBuffer (ty := .scalar .f32) (n := kvTotal * seqLen) "v_in"
+          let v ← ShaderM.readBuffer (ty := .scalar .f32) (n := kvTotal * seqLen) "v_io"
                     (Exp.add kvColBase i)
           ShaderM.assign "local_sum" (Exp.add localSum (Exp.mul v v)))
       )
@@ -800,22 +853,22 @@ def fusedPerHeadQKVNormBatchKernel
     let rmsRef : Exp (.scalar .f32) := Exp.var rmsName
     ShaderM.loop tid (Exp.litU32 headDim) (Exp.litU32 wgSize) fun i => do
       ShaderM.if_ (Exp.eq yIdx (Exp.litU32 0)) (do
-        let v ← ShaderM.readBuffer (ty := .scalar .f32) (n := qTotal * seqLen) "q_in"
+        let v ← ShaderM.readBuffer (ty := .scalar .f32) (n := qTotal * seqLen) "q_io"
                   (Exp.add qColBase i)
         let w ← ShaderM.readBuffer (ty := .scalar .f32) (n := headDim) "q_scale" i
-        ShaderM.writeBuffer (ty := .scalar .f32) "q_out" (Exp.add qColBase i)
+        ShaderM.writeBuffer (ty := .scalar .f32) "q_io" (Exp.add qColBase i)
           (Exp.mul (Exp.mul v rmsRef) w)
       ) (do
         ShaderM.if_ (Exp.eq yIdx (Exp.litU32 1)) (do
-          let v ← ShaderM.readBuffer (ty := .scalar .f32) (n := kvTotal * seqLen) "k_in"
+          let v ← ShaderM.readBuffer (ty := .scalar .f32) (n := kvTotal * seqLen) "k_io"
                     (Exp.add kvColBase i)
           let w ← ShaderM.readBuffer (ty := .scalar .f32) (n := headDim) "k_scale" i
-          ShaderM.writeBuffer (ty := .scalar .f32) "k_out" (Exp.add kvColBase i)
+          ShaderM.writeBuffer (ty := .scalar .f32) "k_io" (Exp.add kvColBase i)
             (Exp.mul (Exp.mul v rmsRef) w)
         ) (do
-          let v ← ShaderM.readBuffer (ty := .scalar .f32) (n := kvTotal * seqLen) "v_in"
+          let v ← ShaderM.readBuffer (ty := .scalar .f32) (n := kvTotal * seqLen) "v_io"
                     (Exp.add kvColBase i)
-          ShaderM.writeBuffer (ty := .scalar .f32) "v_out" (Exp.add kvColBase i)
+          ShaderM.writeBuffer (ty := .scalar .f32) "v_io" (Exp.add kvColBase i)
             (Exp.mul v rmsRef)))
   )
 

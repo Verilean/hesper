@@ -109,6 +109,12 @@ structure Gemma4Model (BufT CacheT : Type) where
       llama.cpp's getrows kernel reading the CPU_Mapped buffer. -/
   perLayerEmbdMmap : Option (Hesper.CUDA.MMappedFile × USize × USize × USize) := none
   perLayerEmbdTableGPU : Option BufT
+  /-- Row-staging path (WebGPU / no-mmap): the full Q6_K per-layer table kept on CPU. When set,
+      `perLayerEmbdTableGPU` is a ONE-ROW scratch buffer and the active token's row is
+      writeBuffer'd into it before each dequant dispatch (kernel tokenId = 0). Binding the full
+      1.5-2.2 GiB table is invalid on WebGPU (maxStorageBufferBindingSize) AND wrong (the kernel
+      declares a 2-row table, so robustness clamps any real tokenId). -/
+  perLayerEmbdTableBytes : Option ByteArray := none
   perLayerEmbdRowBytes : Nat
   perLayerModelProj : Option BufT
   perLayerProjNorm : Option (RMSNorm.RMSNorm BufT CacheT)
