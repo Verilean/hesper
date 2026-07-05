@@ -66,7 +66,8 @@
   - **正直な勝ち幅（300×3 同一ハーネス・cool、当初の 2.7×/1.7× は外れ値 baseline による誇張と判明・訂正)**: QKV-KV 0.283ms vs deployed 0.417ms = **1.45×**、dense-gu 0.463 vs 0.580 = **1.25×**。floor 距離 QKV-KV 2.9×、dense 2.3×
   - **汎用 kernel の忠実性確認**: Gen(deployed 設定) 0.413/0.577 ≈ 実 deployed kernel 0.417/0.580（1% 以内）= M4 合否「64×32 を再発見」クリア
   - 勝ちパターン: **BK16 + 小中 tile + sgC 多め（wg128）**、全行 spill 無し
-- **進行中**: M2 ★レビュー → 承認後 M5（decode 統合は `Autotune.best` lookup 経由 — 数字の手書き無し → dg_eval 8/8 → per-step 実測）
+- **M5 判定（★レビュー待ち、正直な結論 = e2e NEUTRAL）**: 実 decode 8 shape (M=nP=320) を sweep+refine → `DG_TUNED=1`（`Autotune.best` lookup 駆動、数字手書き無し、winners.csv 差し替えで decode 再ビルド不要）。**初回は熱で腐った勝者が +39ms の regression → incumbent ガード（deployed 設定が refine に常時参戦、勝てなければ winner 無し=構造的に regression 不可）+ cool refine で修正 → ABAB: TUNED 642/611 vs default 639/607 = ノイズ内**。事後算: 勝った 6 shape の節約 ~13ms/step vs ノイズ ±30ms — **tune 対象の WGSL matmul 群は step の ~10% しか占めず、そこの 20% は雑音に沈む**。DG_TUNED は opt-in のまま（shipped path 不変）。**autotune フロー自体は e2e 検証完了**（sweep→refine→lookup→統合→ゲートが全部機能し、regression を 2 回捕捉）。残り時間の主 = MoE(MSL 凍結)・battnB attention（WGSL、次の family 候補）・elementwise
+- **進行中**: M5 ★レビュー → 次は M3（llama.cpp 精読表）or M6（E2B bring-up — matvec が step 時間の全てを占める土俵で、フロー証明の本命）
 - **直近の実測**（2026-07-05, M4 Max, feat/diffusiongemma）:
   - TAT probe: 0.118 s/variant（cold Metal cache）。**再 sweep は Metal ディスク shader cache で compile 80ms→4ms** → 0.046 s/variant
   - occupancy probe 動作: deployed reg kernel = maxThreads=1024（spill 無し）, execWidth=32
@@ -76,6 +77,7 @@
   1. [x] M0: TAT 実測 → ★承認済み
   2. [x] M1: probe FFI（CI 確認のみ残）
   3. [ ] M2: runtime-K-loop パラメータ化 kernel（M4 前倒し）+ SWEEP=1 + 小 shape golden + tune log → QKV-KV/dense ランク表 ★
+  3b. [ ] **TAT 対策（ユーザー指摘 2026-07-05）: decode 統合 build が ~8-10 分と長すぎる** — DiffusionGemmaDecode.lean が 2000 行超の単一ファイルで 1 行の変更が全再 elaborate を誘発。対策候補: (a) decode を複数モジュールに分割（forward/schedule/main）、(b) 滅多に使わない Examples/exe を default deps から外す・別ディレクトリに move、(c) 統合面を薄く保つ（lookup 駆動にしたのはその一歩）。M5 完了後に着手
   4. [ ] M3: llama.cpp 精読表 ★（M2 と並行）
   5. [ ] M6: E4B 例の現状確認 → E2B bring-up ★
   6. [ ] M7: E2B ≤30分 autotune で ≥200tps ★★
@@ -101,3 +103,5 @@
 | 2026-07-05 | **M2 合格（524 variants、golden 0 fail）**: QKV-KV 0.733→0.267ms、dense 0.833→0.500ms（同条件）。勝ち = BK16+小 tile+wg64-128 | 「4.9×/3.2× above floor は未チューニングが原因」仮説が実証された。深 tile(BK32/TM4)は M=262 では padding 浪費+occupancy 損 |
 | 2026-07-05 | 手動 tune ループ→**汎用 Autotune library に抽出**（Family 契約 + 共有 engine + 実行時 lookup）。ユーザー指摘（matmul 専用/手動 tune/パラメータ非外出し）が正しかった | Triton の @autotune と同じ境界: kernel 作者は宣言のみ、探索/記録/消費は機構 |
 | 2026-07-05 | **勝ち幅を 2.7×/1.7× → 1.45×/1.25× に訂正**（refine 300×3 実測）。probe-prune + refine 段を新設 | 単発 sweep 行に ~3× 過渡外れ値（0.267/0.767 同一設定）→ sweep=安く順位付け、refine=確実に決定、の 2 段が必須。ユーザーの再現性指摘が的中 |
+| 2026-07-05 | **incumbent ガード新設**（deployed 設定が refine に常時参戦、勝てなければ winner 無し） | 8-shape 連続 sweep の後半が熱で腐り、deployed より遅い設定が「勝者」になり decode で +39ms regression（ABA で捕捉）。ガード+cool refine 後は Q-full/attnO-SWA で incumbent が正しく防衛 |
+| 2026-07-05 | **M5 = e2e NEUTRAL、DG_TUNED は opt-in 維持** | 勝った 6 shape の合計節約 ~13ms/step はノイズ ±30ms 未満（tune 対象は step の ~10%）。原則 4 のゲートが機能。フロー自体は検証完了 — 効かせるには step 時間を支配する対象（E2B matvec / battnB）に向ける |

@@ -227,7 +227,8 @@ where
     Re-measure the TOP-`k` distinct configs with `iters`×`reps` and crown the winner by
     min-of-reps — the sweep RANKS cheaply, the refine stage DECIDES reliably. -/
 def refineTopK (device : Device) (fam : Family) (shape : Shape)
-    (k : Nat := 10) (iters : Nat := 300) (reps : Nat := 3) : IO Unit := do
+    (k : Nat := 10) (iters : Nat := 300) (reps : Nat := 3)
+    (incumbent : Option Params := none) : IO Unit := do
   let stdout ← IO.getStdout
   let content ← IO.FS.readFile logPath
   let mut rows : Array (Float × String) := #[]
@@ -237,7 +238,13 @@ def refineTopK (device : Device) (fam : Family) (shape : Shape)
       if f == fam.name && s == shape.key && line.endsWith "PASS" then
         if let some ms := parseMs msS then rows := rows.push (ms, v)
     | _ => pure ()
-  let top := (((rows.qsort (fun a b => a.1 < b.1)).toList.map (·.2)).eraseDups).take k
+  -- INCUMBENT GUARD: the currently-deployed config always competes in the refine. If nothing
+  -- beats it, NO winner row is written (lookup falls back to the deployed kernel) — a corrupted
+  -- sweep (e.g. thermally skewed rankings) can therefore never deploy a regression.
+  let incKey := incumbent.map Params.key
+  let mut top := (((rows.qsort (fun a b => a.1 < b.1)).toList.map (·.2)).eraseDups).take k
+  if let some ik := incKey then
+    if !(top.contains ik) then top := top ++ [ik]
   IO.println s!"[refine] {fam.name}@{shape.key}: top {top.length} configs × {reps} reps @ {iters} iters"
   stdout.flush
   let mut best : Float := 1e18
@@ -268,8 +275,18 @@ def refineTopK (device : Device) (fam : Family) (shape : Shape)
     stdout.flush
     if mn < best then best := mn; bestP := v
   if bestP != "" then
-    writeWinnerRow fam.name shape bestP best
-    IO.println s!"[refine] WINNER {fam.name}@{shape.key} = {bestP} ({best}ms, min of {reps}×{iters})"
+    if incKey == some bestP then
+      -- incumbent stands: remove any provisional winner so lookup falls back to the deployed path
+      writeWinnerRow fam.name shape "" 0
+      let c ← IO.FS.readFile winnersPath
+      let keep := c.splitOn "\n" |>.filter (fun l => !l.startsWith s!"{fam.name},{shape.key}," && l != "")
+      let h ← IO.FS.Handle.mk winnersPath .write
+      for l in keep do h.putStrLn l
+      h.flush
+      IO.println s!"[refine] INCUMBENT STANDS {fam.name}@{shape.key} ({best}ms) — no winner written"
+    else
+      writeWinnerRow fam.name shape bestP best
+      IO.println s!"[refine] WINNER {fam.name}@{shape.key} = {bestP} ({best}ms, min of {reps}×{iters})"
 
 /-- RUNTIME winner lookup: consumers drive their generator with these params. Falls back to
     `default` when the shape was never tuned (and logs that fact — silent fallbacks hide
@@ -285,5 +302,21 @@ def best (family : String) (shape : Shape) (default : Params) : IO Params := do
       | _ => pure ()
   IO.eprintln s!"[autotune] NO WINNER for {family}@{shape.key} — using default (run the sweep!)"
   pure default
+
+/-- Load all winners ONCE (hot loops must not do per-dispatch file IO). -/
+def readWinners : IO (List (String × String × Params)) := do
+  if ← winnersPath.pathExists then
+    let content ← IO.FS.readFile winnersPath
+    pure <| content.splitOn "\n" |>.filterMap fun line =>
+      match line.splitOn "," with
+      | f :: s :: v :: _ =>
+        if f == "family" then none else some (f, s, Params.parse v)
+      | _ => none
+  else pure []
+
+/-- In-memory winner lookup against a `readWinners` snapshot. -/
+def lookupWinner (ws : List (String × String × Params)) (family : String) (shape : Shape) :
+    Option Params :=
+  ws.find? (fun (f, s, _) => f == family && s == shape.key) |>.map (·.2.2)
 
 end Hesper.WGSL.Autotune
