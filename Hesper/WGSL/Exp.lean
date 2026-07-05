@@ -721,7 +721,10 @@ partial def Exp.toWGSL {t : WGSLType} : Exp t → String
   | atan2 y x => s!"atan2({toWGSL y}, {toWGSL x})"
   | sinh e => s!"sinh({toWGSL e})"
   | cosh e => s!"cosh({toWGSL e})"
-  | tanh e => s!"tanh({toWGSL e})"
+  -- tanh: clamp the argument. Dawn compiles MSL with `math_mode(relaxed)`, where Metal's
+  -- fast::tanh is exp-based and returns NaN for |x| ≳ 44 (hit by Gemma E2B's GELU: inner=58 →
+  -- NaN → downstream garbage). tanh(±20) = ±1 within f32 ulp, so the clamp is semantics-free.
+  | tanh e => s!"tanh(clamp({toWGSL e}, -20.0, 20.0))"
   | asinh e => s!"asinh({toWGSL e})"
   | acosh e => s!"acosh({toWGSL e})"
   | atanh e => s!"atanh({toWGSL e})"

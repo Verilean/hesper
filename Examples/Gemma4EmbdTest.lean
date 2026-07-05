@@ -5,6 +5,7 @@ import Hesper.WebGPU.Buffer
 import Hesper.WebGPU.BufferOps
 import Hesper.WGSL.Execute
 import Hesper.Quantization.Q6_K
+import Hesper.Quantization.Q4_K_M
 
 /-!
 # Gemma 4 Embedding Lookup Test
@@ -69,14 +70,22 @@ def main (args : List String) : IO Unit := do
     mappedAtCreation := false
   }
 
-  -- Run Q6_K embedding lookup
-  IO.println s!"[EmbdTest] Running Q6_K embedding lookup for token {tokenId}..."
+  -- Run embedding lookup — branch on the tensor's actual quant format
   let namedBufs : List (String × Buffer) :=
     [("token_ids", tokenBuf), ("embedding_table", embBuf), ("output", outBuf)]
-  Hesper.WGSL.Execute.executeShaderNamed device
-    (Hesper.Quantization.Q6_K.q6kEmbeddingLookupKernel vocabSize dim)
-    namedBufs
-    (Hesper.WGSL.Execute.ExecutionConfig.dispatch1D dim)
+  match embTensor.ggmlType with
+  | .Q4_K =>
+    IO.println s!"[EmbdTest] Running Q4_K embedding lookup for token {tokenId}..."
+    Hesper.WGSL.Execute.executeShaderNamed device
+      (Hesper.Quantization.Q4_K_M.q4kEmbeddingLookupKernel vocabSize dim)
+      namedBufs
+      (Hesper.WGSL.Execute.ExecutionConfig.dispatch1D dim)
+  | _ =>
+    IO.println s!"[EmbdTest] Running Q6_K embedding lookup for token {tokenId}..."
+    Hesper.WGSL.Execute.executeShaderNamed device
+      (Hesper.Quantization.Q6_K.q6kEmbeddingLookupKernel vocabSize dim)
+      namedBufs
+      (Hesper.WGSL.Execute.ExecutionConfig.dispatch1D dim)
 
   -- Download result
   let result ← Hesper.WebGPU.BufferOps.downloadFloatArray device outBuf dim

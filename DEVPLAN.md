@@ -81,7 +81,13 @@
   4. [ ] M3: llama.cpp 精読表 ★（M2 と並行）
   5. [~] M6: E2B bring-up — **プラミング完了（validation error 0、e2e 実行 7.8 t/s @ graphs-off）、正しさ = 数値バグ残（多言語 token salad、prefill logits から既に誤り）**。llama.cpp 参照確立: E2B 生成 **156.5 t/s**（M7 の現実的な的; 私の 200-250 BW 見積りは楽観だった）。
      踏んだ修正（1 日で 21 回の実行反復、全て engine 一般益）: GGUF u32 配列 metadata（E 系）/ MatFormer per-layer dims（tensor shape 優先, E2B L0 ffn=6144≠12288）/ PLE 1.6GB 表 → row-staging 64-slot（binding 上限+robustness clamp+batch 順序ハザード 3 連対応）/ binding 4 倍数 round / CreateBindGroup error scope（作成時理由の可視化）/ 書込 aliasing×3 を in-place kernel 化（qkvNorm・qNorm・normThenAdd — CUDA 合法/WebGPU 違法）/ ce 名 sanitize（Float 埋込→WGSL 不正識別子）/ **maxComputeWorkgroupSize 1024 要求**（wg-512/1024 kernel 解禁 = autotune の sg4x4 も解禁）/ Q4_K embd lookup kernel 新設（dequantQ4KElementAt 抽出）/ Q4_K lm-head chunked f16 前 dequant（f32 中間 1.6GB 回避）/ BlockCoop 2D grid（vocab 262144 > 65535）/ dp4a enable（WebGPU、subgroups 時）。
-     **次 = 数値 parity bisect**: 既存 Gemma4Layer0-5 dump harness で llama.cpp と層別比較（第一容疑: 新設 Q4_K 経路 2 つ・PLE 値・E2B 固有 config 解釈）
+     **数値 parity bisect（進行中、大きく前進）**: llama-eval-callback を参照に層別比較を確立。
+     - **✅ 消去済み**: Q4_K embedding lookup（CPU golden 16/16 一致）/ inp_scaled（llama と厳密一致）/ Q6_K down matmul（正しかった）/ normThenAdd kernel（CPU golden 一致）
+     - **✅ 大修正: Metal relaxed-math の fast::tanh は |x|≳44 で NaN** — E2B の GELU inner=58 で発火（E4B は振幅不足で潜伏）。DSL codegen で `tanh(clamp(x,±20))` に（engine-wide、意味論不変）。修正後 **ffn_out-0 が llama と parity**（-6.2511 vs -6.2759）
+     - **層別スキャン: layer 0 完全一致（attn 0.02 / ffn 0.006）→ 乖離は layer 0 末尾の PLE 適用チェーン**（llama: proj@inp_scaled → SCALE → per-256 RMS_NORM×projNormW → +selected → SCALE(1/√2) → gelu(inp_gate@pe_in)×inp_per_layer → proj → norm×post_norm → +pe_in → ×layer_output_scale）。our per_layer_embd_out ≠ llama → **PLE 式のどこかの SCALE 定数 or 順序が違う**
+     - 学び: llama の tensor 名は add 前後でズレる（ffn_post_norm=add 前、pe_in=add 後）— 比較時は OP チェーンで確認
+     - 訂正: 「batched prefill の staging 順序ハザード」理論は誤り（prefill は非バッチ、各 dispatch 即時実行）。slot 化は無害だが不要だった
+     - **次**: PLE チェーンの SCALE 定数を llama.cpp ソース（gemma4-iswa.cpp）と突合し、plInputAll の golden dump を足して単体照合
   6. [ ] M7: E2B ≤30分 autotune で ≥200tps ★★
 
 **M1 で確定した実装制約**（原則に準ずる）:
