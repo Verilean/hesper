@@ -88,7 +88,7 @@ def checkCorrect (device : Device) : IO Unit := do
   writeBuffer device aBuf 0 (← Hesper.Basic.floatArrayToBytes aA)
   let rp ← IO.mkRef none
   Hesper.GPUBackend.executeWithConfigCached device (packF32ToF16 (N*(K/2)))
-    (("fin",wf32)::("fout",bf16)::List.nil) { numWorkgroups := ((N*(K/2)+255)/256,1,1), workgroupSize := {x:=256} } 1 rp
+    (("fin",wf32)::("fout",bf16)::List.nil) { numWorkgroups := ((N*(K/2)+255)/256,1,1), workgroupSize := {x:=256} } 0 rp
   let cfg : Hesper.ExecConfig := {
     numWorkgroups := ((N+31)/32, (M+63)/64, 1), workgroupSize := {x:=128},
     extensions := ["f16","chromium_experimental_subgroup_matrix"],
@@ -126,7 +126,7 @@ def checkGroupedCorrect (device : Device) : IO Unit := do
   writeBuffer device teBuf 0 teB
   let rp ← IO.mkRef none
   Hesper.GPUBackend.executeWithConfigCached device (packF32ToF16 (nE*N*(K/2)))
-    (("fin",wf32)::("fout",bf16)::List.nil) { numWorkgroups := ((nE*N*(K/2)+255)/256,1,1), workgroupSize := {x:=256} } 1 rp
+    (("fin",wf32)::("fout",bf16)::List.nil) { numWorkgroups := ((nE*N*(K/2)+255)/256,1,1), workgroupSize := {x:=256} } 0 rp
   let cfg : Hesper.ExecConfig := {
     numWorkgroups := ((N+31)/32, (M+63)/64, 1), workgroupSize := {x:=128},
     extensions := ["f16","chromium_experimental_subgroup_matrix"],
@@ -210,7 +210,7 @@ def checkFusedQ4KCorrect (device : Device) : IO Unit := do
   let wbuf ← mkBuf device (bRows*K)
   let rd ← IO.mkRef none
   Hesper.GPUBackend.executeWithConfigCached device (Hesper.Quantization.Q4_K_M.dequantQ4KMKernel (bRows*K))
-    (("data",qbuf)::("output",wbuf)::List.nil) { numWorkgroups := ((bRows*K+255)/256,1,1), workgroupSize := {x:=256} } 1 rd
+    (("data",qbuf)::("output",wbuf)::List.nil) { numWorkgroups := ((bRows*K+255)/256,1,1), workgroupSize := {x:=256} } 0 rd
   let wF32 ← Hesper.Basic.bytesToFloatArray (← mapBufferRead device wbuf 0 (bRows*K*4).toUSize)
   let af := fun (m k : Nat) => (((m*2+k) % 5 : Nat).toFloat) - 2.0
   let mut aA : Array Float := #[]
@@ -475,7 +475,7 @@ def checkVariantGolden (device : Device) (v : SweepVariant) : IO (Option String)
   writeBuffer device aBuf 0 (← Hesper.Basic.floatArrayToBytes aA)
   let rp ← IO.mkRef none
   Hesper.GPUBackend.executeWithConfigCached device (packF32ToF16 (N*(K/2)))
-    (("fin",wf32)::("fout",bf16)::List.nil) { numWorkgroups := ((N*(K/2)+255)/256,1,1), workgroupSize := {x:=256} } 1 rp
+    (("fin",wf32)::("fout",bf16)::List.nil) { numWorkgroups := ((N*(K/2)+255)/256,1,1), workgroupSize := {x:=256} } 0 rp
   let cfg : Hesper.ExecConfig := {
     numWorkgroups := (N / v.nTile, M / v.mTile, 1), workgroupSize := {x := v.wgSize},
     extensions := ["f16","chromium_experimental_subgroup_matrix"],
@@ -913,10 +913,175 @@ def forwardRoofline : IO Unit := do
   IO.println "READ: both MoE quantized kernels are dequant-bound (MMQ5 g/up at 46% of llama.cpp, warp down at 32% — the"
   IO.println "      warp is FURTHEST, so dp4a-tiling the down to the MMQ5's level is validated); medium-M attn/dense ~64ms."
 
+/-! ## mul_mv family (E2B M=1 decode) — DEVPLAN M7
+
+The Q4_K dp4a matvec as a SECOND Autotune Family — proving the framework is not
+matmul-only. Substrate: `Linear.q4kMatVecDP4AGenKernel (R=rowsPerWG, W=warpsPerRow)`;
+R1W4 = the deployed kernel layout. -/
+
+/-- Deterministic synthetic Q4_K weights: LCG u32 stream with each block's
+    (d,dmin) f16 header pinned to (1.0, 0.5) so all values stay finite. -/
+def mkQ4KTestWeights (device : Device) (N K : Nat) : IO Buffer := do
+  let nW := N * (K/256) * 36
+  let mut bytes := ByteArray.empty
+  let mut seed : UInt32 := 12345
+  for i in [0:nW] do
+    seed := seed * 1664525 + 1013904223
+    let v : UInt32 := if i % 36 == 0 then 0x38003C00 else seed
+    bytes := bytes.push v.toUInt8
+    bytes := bytes.push (v >>> 8).toUInt8
+    bytes := bytes.push (v >>> 16).toUInt8
+    bytes := bytes.push (v >>> 24).toUInt8
+  let buf ← mkBuf device nW
+  writeBuffer device buf 0 bytes
+  pure buf
+
+/-- Valid Q8_1 input: run the production quantize kernel on a synthetic f32 vector. -/
+def mkQ8TestInput (device : Device) (K : Nat) : IO Buffer := do
+  let mut xA : Array Float := #[]
+  for k in [0:K] do xA := xA.push ((((k*7+3) % 13 : Nat).toFloat) - 6.0)
+  let xf ← mkBuf device K
+  writeBuffer device xf 0 (← Hesper.Basic.floatArrayToBytes xA)
+  let q8 ← mkBuf device ((K/32)*9)
+  let r ← IO.mkRef none
+  Hesper.GPUBackend.executeWithConfigCached device
+    (Hesper.Layers.Linear.quantizeQ8_1Kernel K)
+    (("input",xf)::("output",q8)::List.nil)
+    { numWorkgroups := (K/32, 1, 1), workgroupSize := {x:=32}, extensions := ["subgroups"] } 0 r
+  pure q8
+
+/-- Golden: variant (R,W) vs the DEPLOYED 4-warp kernel (production-validated vs
+    llama.cpp e2e) on identical synthetic buffers. dp4a integer math is exact;
+    only the f32 summation order differs → tight rel tolerance. -/
+def checkMulMvGolden (device : Device) (r w : Nat) : IO (Option String) := do
+  let K := 1536
+  let N := max (r * 8) 64
+  let wBuf ← mkQ4KTestWeights device N K
+  let q8 ← mkQ8TestInput device K
+  let outRef ← mkBuf device N
+  let outVar ← mkBuf device N
+  let rr ← IO.mkRef none
+  Hesper.GPUBackend.executeWithConfigCached device
+    (Hesper.Layers.Linear.fusedQ4KMLinearDP4A4WarpKernel { inDim := K, outDim := N })
+    (("weights",wBuf)::("input_q8",q8)::("output",outRef)::List.nil)
+    { numWorkgroups := (N,1,1), workgroupSize := {x:=128}, extensions := ["subgroups"] } 0 rr
+  let rv ← IO.mkRef none
+  Hesper.GPUBackend.executeWithConfigCached device
+    (Hesper.Layers.Linear.q4kMatVecDP4AGenKernel { inDim := K, outDim := N } r w)
+    (("weights",wBuf)::("input_q8",q8)::("output",outVar)::List.nil)
+    { numWorkgroups := (N/r,1,1), workgroupSize := {x:=32*r*w}, extensions := ["subgroups"] } 0 rv
+  let gRef ← Hesper.Basic.bytesToFloatArray (← mapBufferRead device outRef 0 (N*4).toUSize)
+  let gVar ← Hesper.Basic.bytesToFloatArray (← mapBufferRead device outVar 0 (N*4).toUSize)
+  let mut worst := 0.0
+  for i in [0:N] do
+    let a := gRef.getD i 0.0; let b := gVar.getD i 0.0
+    let d := (a-b).abs / (max a.abs (max b.abs 1e-3))
+    if d > worst then worst := d
+  if worst > 1e-3 then return some s!"relDiff={worst} vs deployed 4-warp @ N={N} K={K}"
+  return none
+
+/-- Grid X width for the 2D dispatch when N/R exceeds the 65535 per-dim cap. -/
+def mulMvGridX (nWGs : Nat) : Nat := if nWGs > 65535 then 4096 else 0
+
+def mulMvQ4KFamily : Hesper.WGSL.Autotune.Family where
+  name := "mulMvQ4K"
+  space := Id.run do
+    let mut s : List Hesper.WGSL.Autotune.Params := []
+    for r in [1, 2, 4, 8, 16] do
+      for w in [1, 2, 4] do
+        s := s ++ [[("R", r), ("W", w)]]
+    return s
+  feasible := fun p shape =>
+    let r := p.get! "R"; let w := p.get! "W"
+    32*r*w ≤ 256 && shape.N % r == 0 && shape.K % 256 == 0
+  gen := fun p shape =>
+    let r := p.get! "R"
+    Hesper.Layers.Linear.q4kMatVecDP4AGenKernel { inDim := shape.K, outDim := shape.N }
+      r (p.get! "W") (gridXWidth := mulMvGridX (shape.N / r))
+  cfg := fun p shape =>
+    let r := p.get! "R"; let w := p.get! "W"
+    let nWGs := shape.N / r
+    let gx := mulMvGridX nWGs
+    let grid := if gx == 0 then (nWGs, 1, 1) else (gx, (nWGs + gx - 1) / gx, 1)
+    { numWorkgroups := grid, workgroupSize := {x := 32*r*w}, extensions := ["subgroups"] }
+  benchBuffers := fun shape =>
+    [("weights", shape.N * (shape.K/256) * 36), ("input_q8", (shape.K/32)*9), ("output", shape.N)]
+  golden := fun p device => checkMulMvGolden device (p.get! "R") (p.get! "W")
+
+/-- MATVEC_SWEEP=1: sweep + refine the mul_mv family at the E2B decode shapes —
+    the M7 "one command" flow. Winners land in tune/winners.csv. -/
+def matVecSweep (device : Device) : IO Unit := do
+  let limit := ((← IO.getEnv "SWEEP_LIMIT").bind (·.toNat?)).getD 120
+  for shape in [({ M := 1, N := 2560,   K := 1536 } : Hesper.WGSL.Autotune.Shape),  -- QKV fused
+                ({ M := 1, N := 1536,   K := 2048 } : Hesper.WGSL.Autotune.Shape),  -- attnO
+                ({ M := 1, N := 12288,  K := 1536 } : Hesper.WGSL.Autotune.Shape),  -- FFN gate+up
+                ({ M := 1, N := 1536,   K := 6144 } : Hesper.WGSL.Autotune.Shape),  -- FFN down (ffn=6144)
+                ({ M := 1, N := 1536,   K := 12288 } : Hesper.WGSL.Autotune.Shape), -- FFN down (ffn=12288)
+                ({ M := 1, N := 262144, K := 1536 } : Hesper.WGSL.Autotune.Shape)] do -- lm-head
+    let remaining ← Hesper.WGSL.Autotune.sweep device mulMvQ4KFamily shape (limit := limit)
+    IO.println s!"[matvec-sweep] {shape.key}: {remaining} remaining"
+    if remaining == 0 then
+      let coolMs := ((← IO.getEnv "SWEEP_COOL_MS").bind (·.toNat?)).getD 0
+      if coolMs > 0 then IO.sleep coolMs.toUInt32
+      -- incumbent = the deployed 4-warp layout (R=1, W=4)
+      Hesper.WGSL.Autotune.refineTopK device mulMvQ4KFamily shape
+        (incumbent := some [("R", 1), ("W", 4)])
+
+/-- Bench one Q4_K dp4a matvec (M=1 decode) shape in isolation: the deployed
+    `fusedQ4KMLinearDP4A4WarpKernel`. Returns ms/call. `gridX2D > 0` switches
+    to the 2D lm-head grid. -/
+def benchQ4KMatVec (device : Device) (K N : Nat) (gridX2D : Nat := 0) : IO Float := do
+  let bpr := K / 256
+  let w   ← mkBuf device (N * bpr * 36)
+  let q8  ← mkBuf device ((K/32) * 9)
+  let out ← mkBuf device N
+  let (grid, gxw) := if gridX2D == 0 then ((N, 1, 1), 0)
+                     else ((gridX2D, (N + gridX2D - 1) / gridX2D, 1), gridX2D)
+  let cfg : Hesper.ExecConfig := { numWorkgroups := grid, workgroupSize := {x:=128},
+                                   extensions := ["subgroups"], diagnostics := [] }
+  let kern := Hesper.Layers.Linear.fusedQ4KMLinearDP4A4WarpKernel { inDim:=K, outDim:=N } (gridXWidth := gxw)
+  benchKernelMs device kern (("weights",w)::("input_q8",q8)::("output",out)::List.nil) cfg 300
+
+/-- E2B decode matvec roofline (MATVEC=1): isolated GPU ms of the deployed dp4a
+    kernels at the decode-hot shapes, vs the Q4_K weight-read bandwidth floor.
+    The per-token aggregate tells which shape class holds the recoverable time. -/
+def e2bMatVecRoofline : IO Unit := do
+  let inst ← Hesper.init
+  let device ← getDevice inst
+  -- (label, K, N, per-token calls, gridX2D)
+  let shapes : List (String × Nat × Nat × Float × Nat) := [
+    ("QKV fused (q+k+v) ", 1536, 2560, 35.0, 0),
+    ("attnO              ", 2048, 1536, 35.0, 0),
+    ("FFN gate+up fused  ", 1536, 12288, 35.0, 0),
+    ("FFN down           ", 6144, 1536, 35.0, 0),
+    ("lm-head            ", 1536, 262144, 1.0, 4096)]
+  -- M4 Max nominal BW; the %floor column is relative — absolute % shifts with the true BW.
+  let bwGBs := 400.0
+  IO.println "\n=== ★ E2B decode matvec roofline (deployed Q4_K dp4a 4-warp, isolated) ==="
+  IO.println "shape               |  ms/call | weight MB | GB/s | %BW(400) | ms/token"
+  let mut totMs := 0.0
+  let mut totFloor := 0.0
+  for (nm, K, N, calls, gx) in shapes do
+    let ms ← benchQ4KMatVec device K N gx
+    let mb := (N.toFloat * K.toFloat * 0.5625) / 1.0e6
+    let gbs := mb / ms  -- MB / ms = GB/s
+    let pct := 100.0 * gbs / bwGBs
+    let perTok := ms * calls
+    totMs := totMs + perTok
+    totFloor := totFloor + (mb * calls) / (bwGBs)  -- ms at BW floor
+    IO.println s!"{nm} |  {ms}  |  {mb}  |  {gbs}  |  {pct}%  |  {perTok}"
+  IO.println s!"\nper-token matvec total ≈ {totMs} ms | BW floor(400GB/s) ≈ {totFloor} ms | recoverable ≈ {totMs - totFloor} ms"
+
 end Examples.Compute.MatmulBench
 
 def main : IO Unit := do
   if (← IO.getEnv "ROOFLINE").isSome then
     Examples.Compute.MatmulBench.forwardRoofline
+  else if (← IO.getEnv "MATVEC_SWEEP").isSome then do
+    let inst ← Hesper.init
+    let device ← Hesper.WebGPU.getDevice inst
+    Examples.Compute.MatmulBench.matVecSweep device
+  else if (← IO.getEnv "MATVEC").isSome then
+    Examples.Compute.MatmulBench.e2bMatVecRoofline
   else
     Examples.Compute.MatmulBench.main

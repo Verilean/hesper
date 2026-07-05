@@ -3519,6 +3519,8 @@ def generate [GPUBackend β] (ctx : β) (model : Gemma4Model (GPUBackend.Buf β)
                 [ ("params", state.paramsBuf), ("posF32", state.posF32Buf) ]
                 { workgroupSize := { x := 1 }, numWorkgroups := (1, 1, 1) }
             decodeForwardsDone := decodeForwardsDone + 1
+            if (← IO.getEnv "HESPER_GPUBUSY").isSome then
+              IO.println s!"[gpubusy] {← Hesper.WebGPU.gpuBusyRead}"
             if (← IO.getEnv "HESPER_DUMP_LOGITS_SINGLE").isSome then
               let bytes ← GPUBackend.readBuffer ctx state.logitsBuf (model.config.vocabSize * 4).toUSize
               IO.FS.writeBinFile s!"/tmp/hesper_single_logits_step{genCount}.bin" bytes
