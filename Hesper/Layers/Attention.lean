@@ -184,8 +184,10 @@ def reshapeToHeadsKernel (batchSize seqLen inputHeads outputHeads headDim : Nat)
       (Exp.add (Exp.mul kvHead (Exp.litU32 headDim)) dimIdx))
 
   let val ← ShaderM.readBuffer (ty := .scalar .f32) (n := totalIn) "inp" inOffset
-  let result := Exp.select inBounds val (Exp.litF32 0.0)
-  ShaderM.writeBuffer (ty := .scalar .f32) "out" idx result
+  -- bounds-guarded write (a clamped OOB write races the last element's owner)
+  ShaderM.if_ inBounds (do
+    ShaderM.writeBuffer (ty := .scalar .f32) "out" idx val
+  ) (pure ())
 
 /-- Reshape [batch, heads, seq, headDim] → [batch, seq, heads, headDim]
 
@@ -215,8 +217,10 @@ def reshapeFromHeadsKernel (batchSize seqLen numHeads headDim : Nat) : ShaderM U
       (Exp.add (Exp.mul seqIdx (Exp.litU32 headDim)) dimIdx))
 
   let val ← ShaderM.readBuffer (ty := .scalar .f32) (n := total) "inp" inOffset
-  let result := Exp.select inBounds val (Exp.litF32 0.0)
-  ShaderM.writeBuffer (ty := .scalar .f32) "out" idx result
+  -- bounds-guarded write (a clamped OOB write races the last element's owner)
+  ShaderM.if_ inBounds (do
+    ShaderM.writeBuffer (ty := .scalar .f32) "out" idx val
+  ) (pure ())
 
 /-- Execute reshape to multi-head layout -/
 def executeReshapeToHeads [GPUBackend β] (ctx : β) (inBuf outBuf : GPUBackend.Buf β)
@@ -1046,8 +1050,10 @@ def cachedScoresKernel (numHeads numKVHeads maxSeqLen headDim : Nat) (scale : Fl
     ShaderM.assign "dot" (Exp.add dot (Exp.mul qVal kVal))
 
   let scaled := Exp.mul dot (Exp.litF32 scale)
-  let result := Exp.select inBounds scaled (Exp.litF32 0.0)
-  ShaderM.writeBuffer (ty := .scalar .f32) "scores" idx result
+  -- bounds-guarded write (a clamped OOB write races the last element's owner)
+  ShaderM.if_ inBounds (do
+    ShaderM.writeBuffer (ty := .scalar .f32) "scores" idx scaled
+  ) (pure ())
 
 /-- Softmax with dynamic row size (cacheLen) from params buffer.
     Input/Output: [numRows * maxSeqLen] (only first cacheLen per row used)
@@ -1094,8 +1100,10 @@ def cachedSoftmaxKernel (numRows maxSeqLen : Nat) : ShaderM Unit := do
 
   -- Normalize
   let result := Exp.div expVal sumExp
-  let finalResult := Exp.select inBounds result (Exp.litF32 0.0)
-  ShaderM.writeBuffer (ty := .scalar .f32) "output" idx finalResult
+  -- bounds-guarded write (a clamped OOB write races the last element's owner)
+  ShaderM.if_ inBounds (do
+    ShaderM.writeBuffer (ty := .scalar .f32) "output" idx result
+  ) (pure ())
 
 /-- Apply attention weights to V_cache with dynamic cacheLen from params buffer.
     attn_weights: [numHeads * maxSeqLen] (only first cacheLen per head used)
@@ -1140,8 +1148,10 @@ def cachedApplyKernel (numHeads numKVHeads maxSeqLen headDim : Nat) : ShaderM Un
     let vVal ← ShaderM.readBuffer (ty := .scalar .f32) (n := numKVHeads * maxSeqLen * headDim) "v_cache" vIdx
     ShaderM.assign "wsum" (Exp.add wsum (Exp.mul attnVal vVal))
 
-  let result := Exp.select inBounds wsum (Exp.litF32 0.0)
-  ShaderM.writeBuffer (ty := .scalar .f32) "output" idx result
+  -- bounds-guarded write (a clamped OOB write races the last element's owner)
+  ShaderM.if_ inBounds (do
+    ShaderM.writeBuffer (ty := .scalar .f32) "output" idx wsum
+  ) (pure ())
 
 /-! ## Forward Pass with KV Cache -/
 

@@ -175,11 +175,11 @@ def ropeKernel (config : Config) (batchSize seqLen numHeads : Nat) (headDimOverr
   let x1_new := Exp.add (Exp.mul x0 sinTheta) (Exp.mul x1 cosTheta)
 
   -- Write output (conditional on bounds)
-  let result0 := Exp.select inBounds x0_new (Exp.litF32 0.0)
-  let result1 := Exp.select inBounds x1_new (Exp.litF32 0.0)
-
-  ShaderM.writeBuffer (ty := .scalar .f32) "output" idx0 result0
-  ShaderM.writeBuffer (ty := .scalar .f32) "output" idx1 result1
+  -- bounds-guarded writes (a clamped OOB write races the last element's owner)
+  ShaderM.if_ inBounds (do
+    ShaderM.writeBuffer (ty := .scalar .f32) "output" idx0 x0_new
+    ShaderM.writeBuffer (ty := .scalar .f32) "output" idx1 x1_new
+  ) (pure ())
 
 /-- RoPE kernel with dynamic posOffset from params buffer.
     Produces identical WGSL regardless of position, enabling pipeline caching.
@@ -234,11 +234,16 @@ def ropeKernelDynamic (config : Config) (batchSize seqLen numHeads : Nat) (headD
   let x0_new := Exp.sub (Exp.mul x0 cosTheta) (Exp.mul x1 sinTheta)
   let x1_new := Exp.add (Exp.mul x0 sinTheta) (Exp.mul x1 cosTheta)
 
-  let result0 := Exp.select inBounds x0_new (Exp.litF32 0.0)
-  let result1 := Exp.select inBounds x1_new (Exp.litF32 0.0)
-
-  ShaderM.writeBuffer (ty := .scalar .f32) "output" idx0 result0
-  ShaderM.writeBuffer (ty := .scalar .f32) "output" idx1 result1
+  -- The write MUST be bounds-guarded, not select-to-zero: an out-of-range
+  -- thread's clamped OOB write (WGSL robustness clamps the INDEX onto the
+  -- last element) RACES the in-range owner of that element — last-writer-wins
+  -- nondeterminism (the DG q6kToF16 clamp-write class; here it fired on
+  -- ropeDynK: 128 pairs in a 256-thread wg → 128 excess threads stomping
+  -- output[255] with 0.0, flipping the K cache's last word per run).
+  ShaderM.if_ inBounds (do
+    ShaderM.writeBuffer (ty := .scalar .f32) "output" idx0 x0_new
+    ShaderM.writeBuffer (ty := .scalar .f32) "output" idx1 x1_new
+  ) (pure ())
 
 /-! ## Optimized: Cached RoPE (Future) -/
 
@@ -306,11 +311,11 @@ def ropeCachedKernel (config : Config) (batchSize seqLen numHeads : Nat) : Shade
   let x1_new := Exp.add (Exp.mul x0 sinTheta) (Exp.mul x1 cosTheta)
 
   -- Write output
-  let result0 := Exp.select inBounds x0_new (Exp.litF32 0.0)
-  let result1 := Exp.select inBounds x1_new (Exp.litF32 0.0)
-
-  ShaderM.writeBuffer (ty := .scalar .f32) "output" idx0 result0
-  ShaderM.writeBuffer (ty := .scalar .f32) "output" idx1 result1
+  -- bounds-guarded writes (a clamped OOB write races the last element's owner)
+  ShaderM.if_ inBounds (do
+    ShaderM.writeBuffer (ty := .scalar .f32) "output" idx0 x0_new
+    ShaderM.writeBuffer (ty := .scalar .f32) "output" idx1 x1_new
+  ) (pure ())
 
 /-! ## High-Level API -/
 
