@@ -280,6 +280,33 @@ private def packF32ToF16ChunkKernel (nOut gridXWidth dstU32Offset : Nat) :
       (Hesper.WGSL.Exp.add i (Hesper.WGSL.Exp.litU32 dstU32Offset))
       (Hesper.WGSL.Exp.pack2x16float (Hesper.WGSL.Exp.vec2 a b))) (pure ())
 
+/-- BF16 → packed-F16 repack. E2B ships `per_layer_model_proj` as BF16 (GGML type 30);
+    the f16 matmul path reads packed f16, and BF16 bits read as F16 are garbage (different
+    exponent width). One thread per u32 = two bf16 values. Arithmetic conversion (no
+    bitcast): value = (-1)^s · (1 + mant/128) · 2^(exp−127); BF16 subnormals (<2^−126)
+    flush to zero — irrelevant for weights. -/
+private def bf16ToF16PackKernel (nOut gridXWidth : Nat) :
+    Hesper.WGSL.Monad.ShaderM Unit :=
+  open Hesper.WGSL Hesper.WGSL.Monad in do
+  let gid ← ShaderM.globalId
+  let i := Exp.add (Exp.vec3X gid) (Exp.mul (Exp.vec3Y gid) (Exp.litU32 gridXWidth))
+  let _in ← ShaderM.declareInputBuffer "bin" (.array (.scalar .u32) nOut)
+  let _out ← ShaderM.declareOutputBuffer "fout" (.array (.scalar .u32) nOut)
+  let cvt (bits : Exp (.scalar .u32)) : Exp (.scalar .f32) :=
+    let sign := Exp.shiftRight bits (Exp.litU32 15)
+    let exp8 := Exp.bitAnd (Exp.shiftRight bits (Exp.litU32 7)) (Exp.litU32 0xFF)
+    let mant := Exp.bitAnd bits (Exp.litU32 0x7F)
+    let signF := Exp.select (Exp.eq sign (Exp.litU32 1)) (Exp.litF32 (-1.0)) (Exp.litF32 1.0)
+    let mag := Exp.mul (Exp.add (Exp.litF32 1.0) (Exp.div (Exp.toF32 mant) (Exp.litF32 128.0)))
+                       (Exp.exp2 (Exp.sub (Exp.toF32 exp8) (Exp.litF32 127.0)))
+    Exp.select (Exp.eq exp8 (Exp.litU32 0)) (Exp.litF32 0.0) (Exp.mul signF mag)
+  ShaderM.if_ (Exp.lt i (Exp.litU32 nOut)) (do
+    let w := Exp.index (Exp.var "bin" : Exp (.array (.scalar .u32) nOut)) i
+    let lo := Exp.bitAnd w (Exp.litU32 0xFFFF)
+    let hi := Exp.shiftRight w (Exp.litU32 16)
+    ShaderM.writeBuffer (ty := .scalar .u32) "fout" i
+      (Exp.pack2x16float (Exp.vec2 (cvt lo) (cvt hi)))) (pure ())
+
 /-! ## Helper: Create GPU Buffer from ByteArray -/
 
 private def uploadBuffer [GPUBackend β] (ctx : β) (data : ByteArray) : IO (GPUBackend.Buf β) := do
@@ -352,8 +379,26 @@ private def loadLinear [GPUBackend β] (ctx : β) (gguf : Hesper.GGUF.GGUFFile)
     | _ => pure (inDim, outDim)
   let quantFormat : Linear.QuantFormat := match tensorInfo.ggmlType with
     | .Q6_K => .Q6_K
+    | .F32 => .F16   -- unquantized (E2B PLE inp_gate/proj): GPU-packed to f16 below
+    | .F16 => .F16
     | _ => .Q4_K
-  let weightBuf ← uploadTensor ctx gguf name
+  let weightBuf ← match tensorInfo.ggmlType with
+    | .F32 => do
+      -- E2B ships PLE inp_gate/proj as F32 — pack to f16 on GPU for the f16 matmul path.
+      IO.println s!"  [loadLinear] {name}: F32 → packed f16 ({inDim}×{outDim})"
+      let raw ← uploadTensor ctx gguf name
+      let ne := inDim * outDim
+      let nOut := ne / 2
+      let f16Buf ← GPUBackend.allocBuffer ctx (2 * ne).toUSize
+      let wg := (nOut + 255) / 256
+      let nx := min wg 65535
+      let ny := (wg + nx - 1) / nx
+      GPUBackend.execute ctx (packF32ToF16ChunkKernel nOut (nx*256) 0)
+        [("fin", raw), ("fout", f16Buf)]
+        { numWorkgroups := (nx, ny, 1), workgroupSize := { x := 256 }, extensions := [] }
+      GPUBackend.freeBuffer ctx raw
+      pure f16Buf
+    | _ => uploadTensor ctx gguf name
   let prepared ← GPUBackend.newCacheRef (β := β)
   let splitKBuf ← IO.mkRef none
   let splitKPartialPrepared ← GPUBackend.newCacheRef (β := β)
@@ -631,11 +676,19 @@ def Gemma4Model.fromGGUFDataWithGguf [GPUBackend β] (ctx : β)
   --       and DMA only the active row (~45 KB) per token. Matches
   --       llama.cpp's CPU_Mapped buffer pattern. Saves 2.2 GB VRAM.
   let (perLayerEmbdMmap, perLayerEmbdTableGPU, perLayerEmbdTableBytes, perLayerEmbdRowBytes,
-       perLayerModelProj, perLayerProjNorm) ←
+       perLayerEmbdIsQ5K, perLayerModelProj, perLayerProjNorm) ←
     if cfg.hasPerLayerEmbeddings then do
       IO.println "[Gemma4] Loading per-layer embeddings..."
       let blocksPerRow := (cfg.embdPerLayer * cfg.numHiddenLayers) / 256
-      let rowBytes := blocksPerRow * 210  -- Q6_K block size
+      -- E4B ships this table as Q6_K (210 B/block); E2B as Q5_K (176 B/block).
+      let isQ5K ← match Hesper.GGUF.Loader.findTensor gguf "per_layer_token_embd.weight" with
+        | .ok info =>
+          match info.ggmlType with
+          | .Q5_K => pure true
+          | .Q6_K => pure false
+          | t => throw (IO.userError s!"per_layer_token_embd: unsupported quant {repr t} (expected Q5_K or Q6_K)")
+        | .error _ => pure false
+      let rowBytes := blocksPerRow * (if isQ5K then 176 else 210)
       let (mmapHandle, tableGpu, tableCpu) ← match Hesper.GGUF.Loader.findTensor gguf "per_layer_token_embd.weight" with
         | .ok info =>
           match gguf.mmap with
@@ -677,7 +730,24 @@ def Gemma4Model.fromGGUFDataWithGguf [GPUBackend β] (ctx : β)
             pure (none, some rowBuf, some bytes)
         | .error _ => pure (none, none, none)
       let proj ← match Hesper.GGUF.Loader.findTensor gguf "per_layer_model_proj.weight" with
-        | .ok _ => pure (some (← uploadTensor ctx gguf "per_layer_model_proj.weight"))
+        | .ok info =>
+          if (match info.ggmlType with | .BF16 => true | _ => false) then do
+            -- E2B ships this projection as BF16 — repack to f16 on GPU for the f16 matmul.
+            IO.println "  per_layer_model_proj: BF16 → f16 repack"
+            let raw ← uploadTensor ctx gguf "per_layer_model_proj.weight"
+            let nElems := cfg.hiddenSize * cfg.embdPerLayer * cfg.numHiddenLayers
+            let nOut := nElems / 2
+            let f16Buf ← GPUBackend.allocBuffer ctx (2 * nElems).toUSize
+            let wg := (nOut + 255) / 256
+            let nx := min wg 65535
+            let ny := (wg + nx - 1) / nx
+            GPUBackend.execute ctx (bf16ToF16PackKernel nOut (nx*256))
+              [("bin", raw), ("fout", f16Buf)]
+              { numWorkgroups := (nx, ny, 1), workgroupSize := { x := 256 }, extensions := [] }
+            GPUBackend.freeBuffer ctx raw
+            pure (some f16Buf)
+          else
+            pure (some (← uploadTensor ctx gguf "per_layer_model_proj.weight"))
         | .error _ => pure none
       let projNorm ← match Hesper.GGUF.Loader.findTensor gguf "per_layer_proj_norm.weight" with
         | .ok _ =>
@@ -685,9 +755,9 @@ def Gemma4Model.fromGGUFDataWithGguf [GPUBackend β] (ctx : β)
           let plNormConfig : RMSNorm.Config := { dim := cfg.embdPerLayer, eps := cfg.rmsNormEps }
           pure (some (← RMSNorm.create ctx plNormConfig d))
         | .error _ => pure none
-      pure (mmapHandle, tableGpu, tableCpu, rowBytes, proj, projNorm)
+      pure (mmapHandle, tableGpu, tableCpu, rowBytes, isQ5K, proj, projNorm)
     else
-      pure (none, none, none, 0, none, none)
+      pure (none, none, none, 0, false, none, none)
 
   -- Per-layer gate/proj/norm per block
   let mut perLayerBlocks : Array (Option (Gemma4PerLayerEmbd (GPUBackend.Buf β) (GPUBackend.CachedDispatch β))) := #[]
@@ -731,6 +801,7 @@ def Gemma4Model.fromGGUFDataWithGguf [GPUBackend β] (ctx : β)
     perLayerEmbdTableGPU
     perLayerEmbdTableBytes
     perLayerEmbdRowBytes
+    perLayerEmbdIsQ5K
     perLayerModelProj
     perLayerProjNorm
     perLayerBlocks
