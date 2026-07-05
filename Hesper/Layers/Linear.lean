@@ -3,6 +3,7 @@ import Hesper.WGSL.Monad
 import Hesper.WGSL.Exp
 import Hesper.WGSL.MatMul
 import Hesper.WGSL.Autotune
+import Hesper.WGSL.MulMvQ4K
 import Hesper.Quantization.Q4_K_M
 import Hesper.Quantization.Q6_K
 import Hesper.Logging
@@ -5667,30 +5668,43 @@ structure LinearLayer (BufT : Type) (CacheT : Type := Unit) where
   dp4aBatchQuantizePrepared : IO.Ref (Option CacheT)
   dp4aBatchMatmulPrepared : IO.Ref (Option CacheT)
 
-/-- HESPER_TUNED=1 enables the autotune-winner matvec path (cached once). -/
+/-- Autotune-winner matvec path — DEFAULT ON (ABAB 4/4 clean separation, +8% e2e,
+    Paris./Jupiter. gates exact, and the f32 path is numerically MORE accurate than
+    q8). HESPER_TUNED=0 restores the heuristic dp4a selection. Cached once. -/
 initialize tunedMatVecEnabledRef : IO.Ref (Option Bool) ← IO.mkRef none
 
 def tunedMatVecEnabled : IO Bool := do
   match ← tunedMatVecEnabledRef.get with
   | some b => pure b
   | none =>
-    let b := (← IO.getEnv "HESPER_TUNED") == some "1"
+    let b := (← IO.getEnv "HESPER_TUNED") != some "0"
     tunedMatVecEnabledRef.set (some b)
     pure b
 
 /-- Winners snapshot for the mulMvQ4K family, loaded once from tune/winners.csv. -/
 initialize mulMvWinnersRef : IO.Ref (Option (List (String × String × Hesper.WGSL.Autotune.Params))) ← IO.mkRef none
 
+private def mulMvWinnersSnapshot : IO (List (String × String × Hesper.WGSL.Autotune.Params)) := do
+  match ← mulMvWinnersRef.get with
+  | some ws => pure ws
+  | none =>
+    let ws ← (Hesper.WGSL.Autotune.readWinners) <|> pure []
+    mulMvWinnersRef.set (some ws)
+    pure ws
+
 /-- Look up the swept (R=rowsPerWG, W=warpsPerRow) for an M=1 Q4_K matvec shape. -/
 def mulMvWinner (inDim outDim : Nat) : IO (Option (Nat × Nat)) := do
-  let ws ← match ← mulMvWinnersRef.get with
-    | some ws => pure ws
-    | none =>
-      let ws ← (Hesper.WGSL.Autotune.readWinners) <|> pure []
-      mulMvWinnersRef.set (some ws)
-      pure ws
+  let ws ← mulMvWinnersSnapshot
   match Hesper.WGSL.Autotune.lookupWinner ws "mulMvQ4K" { M := 1, N := outDim, K := inDim } with
   | some p => pure (some (p.get! "R", p.get! "W"))
+  | none => pure none
+
+/-- Look up the llama-port f32 family winner (NR0, NSG) — 90-97% BW class, and the
+    Q8_1 quantize dispatch disappears entirely (the kernel reads f32 activations). -/
+def mulMvF32Winner (inDim outDim : Nat) : IO (Option (Nat × Nat)) := do
+  let ws ← mulMvWinnersSnapshot
+  match Hesper.WGSL.Autotune.lookupWinner ws "mulMvQ4Kf32" { M := 1, N := outDim, K := inDim } with
+  | some p => pure (some (p.get! "NR0", p.get! "NSG"))
   | none => pure none
 
 /-- Q8_1 quantize input + Q4_K/Q6_K dp4a matmul (2 dispatches).
@@ -5724,6 +5738,28 @@ def forwardDP4A [GPUBackend β] (ctx : β)
           callCountRef.modify (· + 1)
           perShapeAdd layer.config.inDim layer.config.outDim delta
         return
+
+  -- f32 llama-port winner path (HESPER_TUNED=1): 90-97% BW class kernel reading the
+  -- f32 activations DIRECTLY — the Q8_1 quantize dispatch disappears (1 dispatch, and
+  -- numerically MORE accurate than the q8 path). Winner (NR0, NSG) per exact shape
+  -- from tune/winners.csv.
+  if layer.quantFormat == .Q4_K && (← tunedMatVecEnabled) then
+    if let some (nr0, nsg) ← mulMvF32Winner layer.config.inDim layer.config.outDim then
+      GPUBackend.executeWithConfigCached ctx
+        (Hesper.WGSL.MulMvQ4K.mulMvQ4KF32Kernel layer.config.inDim layer.config.outDim nr0 nsg)
+        [("weights", layer.weightBuf), ("input", inputBuf), ("output", outputBuf)]
+        { numWorkgroups := (layer.config.outDim / (nr0*nsg), 1, 1)
+          workgroupSize := { x := 32*nsg, y := 1, z := 1 }
+          extensions := ["subgroups"] }
+        (hash ("q4k-mulmv-f32", layer.config.inDim, layer.config.outDim, nr0, nsg))
+        layer.dp4aMatmulPrepared
+      if profiling then
+        let endNs ← IO.monoNanosNow
+        let delta := (endNs - startNs).toUInt64
+        totalNanosRef.modify (· + delta)
+        callCountRef.modify (· + 1)
+        perShapeAdd layer.config.inDim layer.config.outDim delta
+      return
 
   let nQ8Blocks := layer.config.inDim / 32
   let q8BufBytes : USize := (nQ8Blocks * 9 * 4).toUSize
