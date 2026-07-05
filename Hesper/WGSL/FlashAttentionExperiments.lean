@@ -43,8 +43,12 @@ open Hesper
     Grid: (numHeads, numSplits, 1).  Block: 128 threads.
     minnctapersm := 1 (drives ptxas to 512 reg/thread budget). -/
 def flashAttentionVecParamsKernelV11
-    (numHeads numKVHeads maxSeqLen headDim numSplits : Nat) (scale : Float) :
-    ShaderM Unit := do
+    (numHeads numKVHeads maxSeqLen headDim numSplits : Nat) (scale : Float)
+    (directOutput : Bool := false) : ShaderM Unit := do
+  -- directOutput (webml DecodeAttention shape): numSplits = 1 and the kernel
+  -- writes the FINAL normalized attention output — the combine dispatch
+  -- disappears. Used at decode cacheLen ≤ threshold where split-K parallelism
+  -- doesn't pay for the extra dispatch.
   let workgroupSize : Nat := 128
   let numWarps : Nat := workgroupSize / 32
   let nthreadsKQ : Nat := 16 -- experiment-edit-marker (was 8; C-path)
@@ -73,10 +77,16 @@ def flashAttentionVecParamsKernelV11
                   (.array (.scalar .u32) kvWords)
   let _vCache ← ShaderM.declareInputBuffer "v_cache_f16"
                   (.array (.scalar .u32) kvWords)
-  let _partialOut ← ShaderM.declareOutputBuffer "partial_out"
-                      (.array (.scalar .f32) (numHeads * numSplits * headDim))
-  let _partialMeta ← ShaderM.declareOutputBuffer "partial_meta"
-                       (.array (.scalar .f32) (numHeads * numSplits * 2))
+  if directOutput then
+    let _out ← ShaderM.declareOutputBuffer "output"
+                 (.array (.scalar .f32) (numHeads * headDim))
+    pure ()
+  else
+    let _partialOut ← ShaderM.declareOutputBuffer "partial_out"
+                        (.array (.scalar .f32) (numHeads * numSplits * headDim))
+    let _partialMeta ← ShaderM.declareOutputBuffer "partial_meta"
+                         (.array (.scalar .f32) (numHeads * numSplits * 2))
+    pure ()
   let _params ← ShaderM.declareStorageBuffer "params" (.array (.scalar .u32) 2) .read
 
   -- Smem layout:
@@ -441,24 +451,40 @@ def flashAttentionVecParamsKernelV11
       ShaderM.assign acc1Var (Exp.add (Exp.var acc1Var) (Exp.mul v1 weight))
       ShaderM.assign acc2Var (Exp.add (Exp.var acc2Var) (Exp.mul v2 weight))
       ShaderM.assign acc3Var (Exp.add (Exp.var acc3Var) (Exp.mul v3 weight))
-    let outBase := Exp.add partialBase dBase
-    ShaderM.writeBuffer (ty := .scalar .f32) "partial_out"
-      outBase (Exp.var acc0Var)
-    ShaderM.writeBuffer (ty := .scalar .f32) "partial_out"
-      (Exp.add outBase (Exp.litU32 1)) (Exp.var acc1Var)
-    ShaderM.writeBuffer (ty := .scalar .f32) "partial_out"
-      (Exp.add outBase (Exp.litU32 2)) (Exp.var acc2Var)
-    ShaderM.writeBuffer (ty := .scalar .f32) "partial_out"
-      (Exp.add outBase (Exp.litU32 3)) (Exp.var acc3Var)
+    if directOutput then
+      -- Final output: normalize by the block softmax sum — no combine pass.
+      let outBase := Exp.add (Exp.mul head (Exp.litU32 headDim)) dBase
+      let invSumName ← ShaderM.var (.scalar .f32)
+        (Exp.div (Exp.litF32 1.0) blockSum)
+      let invSum : Exp (.scalar .f32) := Exp.var invSumName
+      ShaderM.writeBuffer (ty := .scalar .f32) "output"
+        outBase (Exp.mul (Exp.var acc0Var) invSum)
+      ShaderM.writeBuffer (ty := .scalar .f32) "output"
+        (Exp.add outBase (Exp.litU32 1)) (Exp.mul (Exp.var acc1Var) invSum)
+      ShaderM.writeBuffer (ty := .scalar .f32) "output"
+        (Exp.add outBase (Exp.litU32 2)) (Exp.mul (Exp.var acc2Var) invSum)
+      ShaderM.writeBuffer (ty := .scalar .f32) "output"
+        (Exp.add outBase (Exp.litU32 3)) (Exp.mul (Exp.var acc3Var) invSum)
+    else
+      let outBase := Exp.add partialBase dBase
+      ShaderM.writeBuffer (ty := .scalar .f32) "partial_out"
+        outBase (Exp.var acc0Var)
+      ShaderM.writeBuffer (ty := .scalar .f32) "partial_out"
+        (Exp.add outBase (Exp.litU32 1)) (Exp.var acc1Var)
+      ShaderM.writeBuffer (ty := .scalar .f32) "partial_out"
+        (Exp.add outBase (Exp.litU32 2)) (Exp.var acc2Var)
+      ShaderM.writeBuffer (ty := .scalar .f32) "partial_out"
+        (Exp.add outBase (Exp.litU32 3)) (Exp.var acc3Var)
 
-  -- Thread 0 writes (blockMax, blockSum) for this split.
-  ShaderM.if_ (Exp.eq tid (Exp.litU32 0)) (do
-    let metaBase := Exp.mul head (Exp.mul (Exp.litU32 numSplits) (Exp.litU32 2))
-    let metaIdx := Exp.add metaBase (Exp.mul splitIdx (Exp.litU32 2))
-    ShaderM.writeBuffer (ty := .scalar .f32) "partial_meta" metaIdx blockMax
-    ShaderM.writeBuffer (ty := .scalar .f32) "partial_meta"
-      (Exp.add metaIdx (Exp.litU32 1)) blockSum
-  ) (pure ())
+  -- Thread 0 writes (blockMax, blockSum) for this split (split-K mode only).
+  if !directOutput then
+    ShaderM.if_ (Exp.eq tid (Exp.litU32 0)) (do
+      let metaBase := Exp.mul head (Exp.mul (Exp.litU32 numSplits) (Exp.litU32 2))
+      let metaIdx := Exp.add metaBase (Exp.mul splitIdx (Exp.litU32 2))
+      ShaderM.writeBuffer (ty := .scalar .f32) "partial_meta" metaIdx blockMax
+      ShaderM.writeBuffer (ty := .scalar .f32) "partial_meta"
+        (Exp.add metaIdx (Exp.litU32 1)) blockSum
+    ) (pure ())
 
 /-- Combine kernel for V5 split-K: reduces `numSplits` partial outputs
     per head into one final output via online softmax over the (max, sum)
@@ -559,6 +585,36 @@ def executeFlashAttentionV11 [GPUBackend β] (ctx : β)
   -- For L ≥ 8 every split has ≥1 K position (⌊(i+1)L/8⌋−⌊iL/8⌋ ≥ ⌊L/8⌋ ≥ 1).
   let numSplits : Nat := min 8 (max cacheLen 1)
   let workgroupSize : Nat := 128
+
+  -- Single-dispatch direct mode (webml DecodeAttention): at decode-scale
+  -- cacheLen the split-K parallelism doesn't pay for the combine dispatch
+  -- (~10 µs serialized) — one kernel writes the normalized output.
+  -- HESPER_FA_DIRECT=0 opts out (A/B).
+  let directOk ← do
+    match ← IO.getEnv "HESPER_FA_DIRECT" with
+    | some "0" => pure false
+    | _ => pure (decide (cacheLen ≤ 1024))
+  if directOk then
+    let shaderD := flashAttentionVecParamsKernelV11
+                     numHeads numKVHeads maxSeqLen headDim 1 scale (directOutput := true)
+    let namedBuffersD :=
+      [ ("q",            qBuf)
+      , ("k_cache_f16",  kCacheF16Buf)
+      , ("v_cache_f16",  vCacheF16Buf)
+      , ("output",       outputBuf)
+      , ("params",       paramsBuf) ]
+    let execConfigD : Hesper.ExecConfig := {
+      workgroupSize := { x := workgroupSize, y := 1, z := 1 }
+      numWorkgroups := (numHeads, 1, 1)
+      extensions := ["subgroups"]
+    }
+    let cacheKeyD : UInt64 :=
+      hash ("flashV11Direct", numHeads, numKVHeads, maxSeqLen, headDim)
+    let refD ← match kcrLookup with
+      | some lk => lk cacheKeyD
+      | none    => IO.mkRef none
+    GPUBackend.executeWithConfigCached ctx shaderD namedBuffersD execConfigD cacheKeyD refD
+    return
 
   -- Partial kernel: gridDim = (numHeads, numSplits, 1)
   let shaderP := flashAttentionVecParamsKernelV11
