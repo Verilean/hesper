@@ -49,13 +49,13 @@ def benchShape (device : Device) (name : String) (M N K : Nat) : IO Float := do
     extensions := ["f16","chromium_experimental_subgroup_matrix"],
     diagnostics := [("off","chromium.subgroup_matrix_uniformity")] }
   let r ← IO.mkRef none
-  Hesper.GPUBackend.executeWithConfigCached device kern bufs cfg 1 r   -- warmup (compile)
+  Hesper.GPUBackend.executeWithConfigCached device kern bufs cfg 0 r   -- warmup (compile)
   let iters := 100
   -- batch the iterations (one submit, no per-call sync) so the time reflects the kernel, not the
   -- submit+wait round-trip — closer to how the matmul runs inside the batched forward.
   let t0 ← IO.monoMsNow
   Hesper.GPUBackend.beginBatch device
-  for _ in [0:iters] do Hesper.GPUBackend.executeWithConfigCached device kern bufs cfg 1 r
+  for _ in [0:iters] do Hesper.GPUBackend.executeWithConfigCached device kern bufs cfg 0 r
   Hesper.GPUBackend.endBatch device
   let t1 ← IO.monoMsNow
   let ms := (t1-t0).toFloat / iters.toFloat
@@ -95,7 +95,7 @@ def checkCorrect (device : Device) : IO Unit := do
     diagnostics := [("off","chromium.subgroup_matrix_uniformity")] }
   let rr ← IO.mkRef none
   Hesper.GPUBackend.executeWithConfigCached device (Hesper.WGSL.MatMul.matMulTransposeF16WMMARegKernel { M := M, N := N, K := K } 0 N)
-    (("a",aBuf)::("b",bf16)::("c",cBuf)::List.nil) cfg 1 rr
+    (("a",aBuf)::("b",bf16)::("c",cBuf)::List.nil) cfg 0 rr
   let gpu ← Hesper.Basic.bytesToFloatArray (← mapBufferRead device cBuf 0 (M*N*4).toUSize)
   let mut md := 0.0; let mut bad := 0
   for m in [0:M] do for n in [0:N] do
@@ -133,7 +133,7 @@ def checkGroupedCorrect (device : Device) : IO Unit := do
     diagnostics := [("off","chromium.subgroup_matrix_uniformity")] }
   let rr ← IO.mkRef none
   Hesper.GPUBackend.executeWithConfigCached device (Hesper.WGSL.MatMul.matMulTransposeF16WMMARegKernel { M := M, N := N, K := K } 0 0 true nE)
-    (("a",aBuf)::("b",bf16)::("c",cBuf)::("tileExpert",teBuf)::List.nil) cfg 1 rr
+    (("a",aBuf)::("b",bf16)::("c",cBuf)::("tileExpert",teBuf)::List.nil) cfg 0 rr
   let gpu ← Hesper.Basic.bytesToFloatArray (← mapBufferRead device cBuf 0 (M*N*4).toUSize)
   let mut md := 0.0; let mut bad := 0
   for m in [0:M] do for n in [0:N] do
@@ -181,11 +181,11 @@ def benchPeak (device : Device) : IO Unit := do
   IO.println "=== MMA PEAK PROBE (pure subgroup-matrix, no memory in loop) — sweep accumulators ==="
   for nAcc in [2, 4, 8, 16, 32] do
     let r ← IO.mkRef none
-    Hesper.GPUBackend.executeWithConfigCached device (mmaPeakProbe iters nAcc) (("a",aBuf)::("c",cBuf)::List.nil) cfg 1 r
+    Hesper.GPUBackend.executeWithConfigCached device (mmaPeakProbe iters nAcc) (("a",aBuf)::("c",cBuf)::List.nil) cfg 0 r
     let reps := 30
     let t0 ← IO.monoMsNow
     Hesper.GPUBackend.beginBatch device
-    for _ in [0:reps] do Hesper.GPUBackend.executeWithConfigCached device (mmaPeakProbe iters nAcc) (("a",aBuf)::("c",cBuf)::List.nil) cfg 1 r
+    for _ in [0:reps] do Hesper.GPUBackend.executeWithConfigCached device (mmaPeakProbe iters nAcc) (("a",aBuf)::("c",cBuf)::List.nil) cfg 0 r
     Hesper.GPUBackend.endBatch device
     let t1 ← IO.monoMsNow
     let ms := (t1-t0).toFloat / reps.toFloat
@@ -227,7 +227,7 @@ def checkFusedQ4KCorrect (device : Device) : IO Unit := do
     diagnostics := [("off","chromium.subgroup_matrix_uniformity")] }
   let rr ← IO.mkRef none
   Hesper.GPUBackend.executeWithConfigCached device (Hesper.Quantization.Q4_K_M.q4kMatmulGroupedRegKernel M N K nE)
-    (("a",aBuf)::("b",qbuf)::("c",cBuf)::("tileExpert",teBuf)::List.nil) cfg 1 rr
+    (("a",aBuf)::("b",qbuf)::("c",cBuf)::("tileExpert",teBuf)::List.nil) cfg 0 rr
   let gpu ← Hesper.Basic.bytesToFloatArray (← mapBufferRead device cBuf 0 (M*N*4).toUSize)
   let mut md := 0.0; let mut maxRel := 0.0; let mut bad := 0
   for m in [0:M] do for n in [0:N] do
@@ -274,7 +274,7 @@ def checkFusedQ8Correct (device : Device) : IO Unit := do
     diagnostics := [("off","chromium.subgroup_matrix_uniformity")] }
   let rr ← IO.mkRef none
   Hesper.GPUBackend.executeWithConfigCached device (Hesper.Quantization.Q4_K_M.q8MatmulGroupedRegKernel M N K nE)
-    (("a",aBuf)::("b",qbuf)::("c",cBuf)::("tileExpert",teBuf)::List.nil) cfg 1 rr
+    (("a",aBuf)::("b",qbuf)::("c",cBuf)::("tileExpert",teBuf)::List.nil) cfg 0 rr
   let gpu ← Hesper.Basic.bytesToFloatArray (← mapBufferRead device cBuf 0 (M*N*4).toUSize)
   let mut md := 0.0; let mut maxRel := 0.0; let mut bad := 0
   for m in [0:M] do for n in [0:N] do
@@ -320,7 +320,7 @@ def checkFusedQ8HighExpert (device : Device) : IO Unit := do
   let cfg : Hesper.ExecConfig := { numWorkgroups := ((N+31)/32, (M+31)/32, 1), workgroupSize := {x:=128}, extensions := ["f16","chromium_experimental_subgroup_matrix"], diagnostics := [("off","chromium.subgroup_matrix_uniformity")] }
   let rr ← IO.mkRef none
   Hesper.GPUBackend.executeWithConfigCached device (Hesper.Quantization.Q4_K_M.q8MatmulGroupedRegKernel M N K nE)
-    (("a",aBuf)::("b",qbuf)::("c",cBuf)::("tileExpert",teBuf)::List.nil) cfg 1 rr
+    (("a",aBuf)::("b",qbuf)::("c",cBuf)::("tileExpert",teBuf)::List.nil) cfg 0 rr
   let gpu ← Hesper.Basic.bytesToFloatArray (← mapBufferRead device cBuf 0 (M*N*4).toUSize)
   let mut md := 0.0; let mut bad := 0; let mut badLo := 0; let mut badHi := 0
   for m in [0:M] do for n in [0:N] do
@@ -362,10 +362,10 @@ def benchNonMatmul : IO Unit := do
     let cfg : Hesper.ExecConfig := { numWorkgroups := (nx,ny,1), workgroupSize := {x:=256}, extensions := [], diagnostics := [] }
     let bufs := (("ina",a)::("inb",b)::("outc",c)::List.nil)
     let r ← IO.mkRef none
-    Hesper.GPUBackend.executeWithConfigCached device (genRW3 nElem (nx*256)) bufs cfg 1 r
+    Hesper.GPUBackend.executeWithConfigCached device (genRW3 nElem (nx*256)) bufs cfg 0 r
     let t0 ← IO.monoMsNow
     Hesper.GPUBackend.beginBatch device
-    for _ in [0:50] do Hesper.GPUBackend.executeWithConfigCached device (genRW3 nElem (nx*256)) bufs cfg 1 r
+    for _ in [0:50] do Hesper.GPUBackend.executeWithConfigCached device (genRW3 nElem (nx*256)) bufs cfg 0 r
     Hesper.GPUBackend.endBatch device
     let t1 ← IO.monoMsNow
     pure ((t1-t0).toFloat / 50.0)
@@ -411,11 +411,11 @@ def tatProbe (device : Device) : IO Unit := do
       diagnostics := [("off","chromium.subgroup_matrix_uniformity")] }
     let r ← IO.mkRef none
     -- gen + pipeline compile + first dispatch (the cold cost of a NEW variant)
-    Hesper.GPUBackend.executeWithConfigCached device kern bufs cfg 1 r
+    Hesper.GPUBackend.executeWithConfigCached device kern bufs cfg 0 r
     let t1 ← IO.monoMsNow
     let iters := 100
     Hesper.GPUBackend.beginBatch device
-    for _ in [0:iters] do Hesper.GPUBackend.executeWithConfigCached device kern bufs cfg 1 r
+    for _ in [0:iters] do Hesper.GPUBackend.executeWithConfigCached device kern bufs cfg 0 r
     Hesper.GPUBackend.endBatch device
     let t2 ← IO.monoMsNow
     -- MANDATORY resource column (DEVPLAN 原則 2): occupancy via the M1 probe. Needs
@@ -483,7 +483,7 @@ def checkVariantGolden (device : Device) (v : SweepVariant) : IO (Option String)
   let rr ← IO.mkRef none
   Hesper.GPUBackend.executeWithConfigCached device
     (Hesper.WGSL.MatMul.matMulTransposeF16WMMARegKernelGen { M := M, N := N, K := K } v.tmsg v.tnsg v.sgRows v.sgCols v.bk)
-    (("a",aBuf)::("b",bf16)::("c",cBuf)::List.nil) cfg 1 rr
+    (("a",aBuf)::("b",bf16)::("c",cBuf)::List.nil) cfg 0 rr
   let gpu ← Hesper.Basic.bytesToFloatArray (← mapBufferRead device cBuf 0 (M*N*4).toUSize)
   let mut md := 0.0
   for m in [0:M] do for n in [0:N] do
@@ -628,7 +628,7 @@ def sweepTier1 (device : Device) : IO Unit := do
           extensions := ["f16","chromium_experimental_subgroup_matrix"],
           diagnostics := [("off","chromium.subgroup_matrix_uniformity")] }
         let r ← IO.mkRef none
-        Hesper.GPUBackend.executeWithConfigCached device kern bufs cfg 1 r
+        Hesper.GPUBackend.executeWithConfigCached device kern bufs cfg 0 r
         -- 3) occupancy probe (mandatory column) — right after this variant's pipeline compile
         let occ ← (do
           if dumpOn then
@@ -638,7 +638,7 @@ def sweepTier1 (device : Device) : IO Unit := do
         let iters := 30   -- ranking precision is enough; the winner gets a precise re-bench
         let tb0 ← IO.monoMsNow
         Hesper.GPUBackend.beginBatch device
-        for _ in [0:iters] do Hesper.GPUBackend.executeWithConfigCached device kern bufs cfg 1 r
+        for _ in [0:iters] do Hesper.GPUBackend.executeWithConfigCached device kern bufs cfg 0 r
         Hesper.GPUBackend.endBatch device
         let tb1 ← IO.monoMsNow
         let ms := (tb1-tb0).toFloat / iters.toFloat
@@ -689,12 +689,12 @@ def rebenchWinners (device : Device) : IO Unit := do
         extensions := ["f16","chromium_experimental_subgroup_matrix"],
         diagnostics := [("off","chromium.subgroup_matrix_uniformity")] }
       let r ← IO.mkRef none
-      Hesper.GPUBackend.executeWithConfigCached device kern bufs cfg 1 r
+      Hesper.GPUBackend.executeWithConfigCached device kern bufs cfg 0 r
       let mut times : Array Float := #[]
       for _ in [0:3] do
         let t0 ← IO.monoMsNow
         Hesper.GPUBackend.beginBatch device
-        for _ in [0:300] do Hesper.GPUBackend.executeWithConfigCached device kern bufs cfg 1 r
+        for _ in [0:300] do Hesper.GPUBackend.executeWithConfigCached device kern bufs cfg 0 r
         Hesper.GPUBackend.endBatch device
         let t1 ← IO.monoMsNow
         times := times.push ((t1-t0).toFloat / 300.0)
@@ -706,12 +706,12 @@ def rebenchWinners (device : Device) : IO Unit := do
         extensions := ["f16","chromium_experimental_subgroup_matrix"],
         diagnostics := [("off","chromium.subgroup_matrix_uniformity")] }
       let r ← IO.mkRef none
-      Hesper.GPUBackend.executeWithConfigCached device kern bufs cfg 1 r
+      Hesper.GPUBackend.executeWithConfigCached device kern bufs cfg 0 r
       let mut times : Array Float := #[]
       for _ in [0:3] do
         let t0 ← IO.monoMsNow
         Hesper.GPUBackend.beginBatch device
-        for _ in [0:300] do Hesper.GPUBackend.executeWithConfigCached device kern bufs cfg 1 r
+        for _ in [0:300] do Hesper.GPUBackend.executeWithConfigCached device kern bufs cfg 0 r
         Hesper.GPUBackend.endBatch device
         let t1 ← IO.monoMsNow
         times := times.push ((t1-t0).toFloat / 300.0)
@@ -797,10 +797,10 @@ def achQuant : Float := 0.27  -- llama.cpp mul_mat_id (the realistic quantized c
 def benchKernelMs (device : Device) (kern : Hesper.WGSL.Monad.ShaderM Unit)
     (bufs : List (String × Buffer)) (cfg : Hesper.ExecConfig) (iters : Nat := 50) : IO Float := do
   let r ← IO.mkRef none
-  Hesper.GPUBackend.executeWithConfigCached device kern bufs cfg 1 r
+  Hesper.GPUBackend.executeWithConfigCached device kern bufs cfg 0 r
   let t0 ← IO.monoMsNow
   Hesper.GPUBackend.beginBatch device
-  for _ in [0:iters] do Hesper.GPUBackend.executeWithConfigCached device kern bufs cfg 1 r
+  for _ in [0:iters] do Hesper.GPUBackend.executeWithConfigCached device kern bufs cfg 0 r
   Hesper.GPUBackend.endBatch device
   let t1 ← IO.monoMsNow
   pure ((t1-t0).toFloat / iters.toFloat)

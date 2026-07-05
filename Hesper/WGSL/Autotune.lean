@@ -173,12 +173,12 @@ def sweep (device : Device) (fam : Family) (shape : Shape)
         let b ← createBuffer device { size := (words*4).toUSize, usage := [.storage, .copyDst, .copySrc], mappedAtCreation := false }
         bufs := bufs ++ [(nm, b)]
       let r ← IO.mkRef none
-      Hesper.GPUBackend.executeWithConfigCached device kern bufs cfg 1 r
+      Hesper.GPUBackend.executeWithConfigCached device kern bufs cfg 0 r
       let occ ← probeOccupancy device
       -- stage 1: short probe; prune the obviously-slow tail
       let tp0 ← IO.monoMsNow
       Hesper.GPUBackend.beginBatch device
-      for _ in [0:probeIters] do Hesper.GPUBackend.executeWithConfigCached device kern bufs cfg 1 r
+      for _ in [0:probeIters] do Hesper.GPUBackend.executeWithConfigCached device kern bufs cfg 0 r
       Hesper.GPUBackend.endBatch device
       let tp1 ← IO.monoMsNow
       let msProbe := (tp1-tp0).toFloat / probeIters.toFloat
@@ -189,7 +189,7 @@ def sweep (device : Device) (fam : Family) (shape : Shape)
         -- stage 2: full measurement (contenders only)
         let t0 ← IO.monoMsNow
         Hesper.GPUBackend.beginBatch device
-        for _ in [0:iters] do Hesper.GPUBackend.executeWithConfigCached device kern bufs cfg 1 r
+        for _ in [0:iters] do Hesper.GPUBackend.executeWithConfigCached device kern bufs cfg 0 r
         Hesper.GPUBackend.endBatch device
         let t1 ← IO.monoMsNow
         let ms := (t1-t0).toFloat / iters.toFloat
@@ -259,13 +259,13 @@ def refineTopK (device : Device) (fam : Family) (shape : Shape)
       let b ← createBuffer device { size := (words*4).toUSize, usage := [.storage, .copyDst, .copySrc], mappedAtCreation := false }
       bufs := bufs ++ [(nm, b)]
     let r ← IO.mkRef none
-    Hesper.GPUBackend.executeWithConfigCached device kern bufs cfg 1 r
+    Hesper.GPUBackend.executeWithConfigCached device kern bufs cfg 0 r
     let mut mn : Float := 1e18
     let mut ts : List Float := []
     for _ in [0:reps] do
       let t0 ← IO.monoMsNow
       Hesper.GPUBackend.beginBatch device
-      for _ in [0:iters] do Hesper.GPUBackend.executeWithConfigCached device kern bufs cfg 1 r
+      for _ in [0:iters] do Hesper.GPUBackend.executeWithConfigCached device kern bufs cfg 0 r
       Hesper.GPUBackend.endBatch device
       let t1 ← IO.monoMsNow
       let ms := (t1-t0).toFloat / iters.toFloat
