@@ -2858,6 +2858,27 @@ def forwardSingleToken [GPUBackend β] (ctx : β)
       -- Q8_1 and run the 4-warp dp4a matvec with a 2D grid (vocab > 65535).
       let hidden := model.config.hiddenSize
       let vocab := model.config.vocabSize
+      -- Tuned f32 llama-port path (HESPER_TUNED=1): reads the normed f32 hidden
+      -- directly — no Q8_1 quantize dispatch, 528 GB/s = 97% BW measured.
+      let f32Win ← do
+        if ← Hesper.Layers.Linear.tunedMatVecEnabled then
+          Hesper.Layers.Linear.mulMvF32Winner hidden vocab
+        else pure none
+      match f32Win with
+      | some (nr0, nsg) =>
+        let nWGs := vocab / (nr0*nsg)
+        let gx := if nWGs > 65535 then 4096 else 0
+        let grid := if gx == 0 then (nWGs, 1, 1) else (gx, (nWGs + gx - 1) / gx, 1)
+        GPUBackend.executeWithConfigCached ctx
+          (Hesper.WGSL.MulMvQ4K.mulMvQ4KF32Kernel hidden vocab nr0 nsg (gridXWidth := gx))
+          [("weights", model.outputWeight), ("input", nextBuf), ("output", state.logitsBuf)]
+          { numWorkgroups := grid, workgroupSize := { x := 32*nsg, y := 1, z := 1 }
+            extensions := ["subgroups"]
+            funcName := s!"q4k_mulmv_f32_lmhead_{hidden}_{vocab}"
+            : Hesper.ExecConfig }
+          (hash ("q4k-mulmv-f32-lmhead", hidden, vocab, nr0, nsg))
+          state.lmHeadDP4APrepared
+      | none =>
       let nQ8Blocks := hidden / 32
       let q8Buf ← match ← state.lmHeadQ8Buf.get with
         | some b => pure b
