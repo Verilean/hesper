@@ -1,167 +1,180 @@
-# DEVPLAN — Hesper 再構築: 実測 JIT (autotune) + システム化開発
+# DEVPLAN — Hesper measured-JIT rebuild: premises, hypotheses, evidence, verdict
 
-**これが開発を駆動する単一の生きたドキュメント。** 全セッションはここから始まりここで終わる:
-
-```
-セッションの循環（毎回）:
-  開始: この DEVPLAN.md を読む → 担当モデルが合うマイルストーン(M)を選ぶ
-  作業: §1 の原則ゲートに従う（sweep → golden → 統合 → eval）
-  終了: §3 の状態と §4 の決定ログを更新 → コード + DEVPLAN.md を同一 commit
-  ★関門: 成果物をユーザーがレビューしてから次の M へ
-```
+**Status: the product bet is RETIRED (Phase D verdict, 2026-07-06). This document is now
+the post-mortem of record.** The full Japanese working log this replaces is in git history
+(`git log --follow DEVPLAN.md`). Development followed the cycle: read this file → work a
+milestone under the principles → update state + decision log → commit code and DEVPLAN
+together; ★ items required user review.
 
 ---
 
-## §1. 開発原則（不変）
+## §0. Operating principles (kept — they are part of the salvage)
 
-1. **予測せず、測る。** 性能はソースの静的性質ではない。仮説は sweep/実測で判定（ヤマカン one-off 実験の禁止）。
-2. **speed + resource を常に両方記録。** ms/GFLOPS/%floor に加えて occupancy(maxThreads)/execWidth/tgMem を必須列に。省略禁止。
-3. **golden bit-exact ゲート。** codegen/パラメータ変更で maxDiff が動いたらそれはバグ。variant は自動失格。
-4. **単体勝ち ≠ 統合勝ち。** 採否は必ず e2e（batched decode 内 per-step、または decode tok/s）で判定。単体 bench だけで採用しない。
-5. **測定衛生**: pgrep（decode/bench の stray）== 0、cool box、`kill -9` 厳禁（Metal が wedge する）。timeout/SIGTERM のみ。
-6. **負の結果も記録。** 棄却した variant/仮説と根拠を §4 決定ログと tune log に残す。同じ実験を二度導出しない。
-7. **リファレンス駆動。** 新 kernel は llama.cpp（refs/llama.cpp-diffusiongemma/）の構造を精読してから。tile 幅だけの模倣は失敗する（WIDE64 の実測教訓）— 構造ごと忠実に。
-8. **fusion は 2 層探索。** 外側 = 分割/fusion（llama.cpp 一致表 + 節約 bytes ランキングでガイド）、内側 = パラメータ sweep。fusion が変われば内側を回し直す。
-
-**確定済みの技術前提**（再調査しない）:
-- Metal では WGSL/Tint と手書き Metal の決定差は小さい（let' 修正後 kernel 1.15×）。MSL hybrid 拡張は棄却済み（batch/bubble で回収不能）。
-- Metal が回収する最適化（strength reduction、SROA、copy-prop）を WGSL 側で先回りしても null。回収しないのは大域の重複部分式 CSE（→ `ShaderM.let'`）。詳細 `WGSL_CODEGEN_OPTIMIZATION.md`。
-- kernel は Lean 実行時に WGSL を生成する関数 → **パラメータ sweep に Lean 再ビルド不要**（1 プロセスで variant 生成→compile→実測）。
-- pipeline cache は WGSL ソース hash キー → 100 variants 問題なし。workgroupSize は kernel 定義に焼かれる（dispatch パラメータではない）。
-- **TAT 実測済み（M0, 2026-07-05, TATPROBE=1）**: **0.118 s/variant**（gen+compile ~80ms + bench100 ~40ms、deployed reg kernel @ QKV-KV 実 shape）→ **100 variants ≈ 12 秒、1000 ≈ 2 分**。律速は sweep でなく Lean 再ビルド（構造変更 ~1-3 分）と decode 統合（~8 分 + eval）。
-- **sweep 基盤は runtime-K-loop 生成器必須**: Lean レベルで K を全展開する生成器（`matMulTransposeF16WMMA8x8RegKernel`）は K=2816 で 1 variant のコンパイルが 5 分超（Tint/Metal 爆発）→ sweep 不能。M2/M4 は deployed 型（`ShaderM.loop`）で作る。
-- M2 golden の設計注意: 実 shape の CPU 参照 matmul は遅すぎる → golden は小 shape（64×32×64 級）で variant ごとに実施し、実 shape は timing のみ。
+1. **Measure, don't predict.** Performance is not a static property of source; hypotheses
+   are settled by sweeps and A/B measurement, never by one-off hunch experiments.
+2. **Record speed AND resources** (ms / GFLOPS / %-of-floor plus occupancy / execWidth /
+   threadgroup memory).
+3. **Golden gates.** A codegen or parameter change that moves maxDiff is a bug; variants
+   auto-disqualify.
+4. **Isolated win ≠ integrated win.** Adoption requires e2e measurement (decode tok/s),
+   never an isolated bench alone.
+5. **Measurement hygiene:** no stray processes (`pgrep` == 0), cool box, never `kill -9` a
+   GPU process (it wedges Metal); timeout/SIGTERM only.
+6. **Record negative results** so no experiment is derived twice.
+7. **Reference-driven:** read llama.cpp/webml structure BEFORE designing kernels.
+   Imitating a single parameter without the structure fails (measured: WIDE64).
+8. **Fusion is a two-level search:** outer loop = op splitting/fusion choice, inner loop =
+   parameter sweep; a fusion change invalidates the inner winners.
 
 ---
 
-## §2. マイルストーン表
+## §1. Premises (as assumed at plan time, 2026-07-05) — and how they fared
 
-**モデル割当**: 設計/FFI/kernel 構造/根本原因究明 = **Fable**（GPU correctness はレース混入リスク高）。sweep 実行・記録・統合・eval の反復 = **安いモデル（Sonnet 級）**。迷ったら格上げし、理由を §4 に記録。
-
-| # | 小ゴール | 成果物 | 合否基準 | モデル | レビュー |
-|---|---|---|---|---|---|
-| M0 | DEVPLAN 確定 + TAT 実測 | この文書 + TAT 表（実測値） | variant/秒・100 variants 壁時計が見積り±2×（見積り: ~2-3s/variant、100 で ≈5-15分） | Fable | **★**（TAT 許容可否） |
-| M1 | occupancy probe + dump 捕獲 | bridge.cpp（g_last_dumped_msl + HESPER_DUMP_MSL_QUIET + FFI）、metal_replace.mm（`lean_hesper_msl_occupancy_probe`: newLibraryWithSource → maxTotalThreadsPerThreadgroup/threadExecutionWidth/staticThreadgroupMemoryLength）、stub、Device.lean externs | macOS で数値が出る + CI（非-Apple）緑 | Fable（FFI。StringView null 終端の前科あり） | —（自動ゲート） |
-| M2 | sweep ランナー Tier 1 | MatmulBench `SWEEP=1`: grid（TM×TN×wg、`matMulTransposeF16WMMA8x8RegKernel` + 現行 64×32 baseline）→ 必須列記録 → tune log CSV 追記 → ランク表。golden 自動判定内蔵 | QKV-KV [262,1024,2816] / dense g/up [262,2112,2816] で全 variant golden 合格 + occupancy 列出力 | 設計: Fable / 実行: 低 | **★**（最初の sweep 表 = フロー機能の証拠） |
-| M3 | リファレンス精読 | llama.cpp 構造選択表（mul_mm: 64×128, sg 2×2, BK, staging, load 幅, double-buffer / mul_mv 閾値 / flash_attn）+ **カーネル分割一致表**（1 layer の dispatch 列: ours vs theirs、どこで fuse しているか） | 表が揃い、Tier 2/3 軸と fusion 候補が導出済み | Fable | **★**（この表で kernel 方針を承認） |
-| M4 | 汎用パラメータ化 kernel | `matMulTransposeF16WMMARegKernelGen(TMsg,TNsg,sgRows,sgCols,BK)` — 現行 64×32 の sg 配置/load 回数/K-loop 定数を式に置換（~40-60 行） | golden bit-exact 全 variant + sweep が現行 64×32 を再発見 or 超え | Fable（レース危険域） | sweep 結果で判定 |
-| M5 | diffusion 統合 | 勝者 variant を env flag で DiffusionGemmaDecode に統合 | dg_eval 8/8 + per-step 改善（cool） | 中 | **★**（per-step 数字） |
-| M6 | E2B bring-up | Gemma 4 E2B decode が正しく動く。資産: E4B generate path（Gemma4.generate + KV cache）、M=1 Q4_K/Q6_K kernels、PLE 実装済（Phase-4 gate）、KV 共有 config、chat template。ギャップ: loader E2B metadata (S) / PLE gate 解除 (S) / chat token 検証 (S) / dense-FFN 経路検証 (M)。見積り 1-2 日。**最初の一歩 = 既存 E4B 例の動作確認 + 現状 tok/s** | greedy が llama.cpp と一致 or 妥当テキスト | Fable（アーキ）/ 低（実行） | **★**（初の正しい decode + 現状 tok/s） |
-| M7 | E2B 最適化 = フロー証明 | 「1 コマンド ≤30 分」autotune で **≥200 tps**（天井 ~200-250: 1.4-1.5GB/token ÷ ~300-350GB/s）+ 採用ピッチ文書（bring-up 日数・TAT ログ・llama.cpp E2B 比・webml 250tps 比） | ≥200 tps（cool）+ 最適化壁時計 ≤30 分 | **低〜中**（安いモデルで達成できること自体が証明） | **★★**（最終成果物 = 採用ピッチ） |
-
-依存: M0-M2 と M3 は並行可。M4 は M2+M3 後。M6 は M2 後いつでも。**Phase A'（M6→M7）を最初のフル適用にする**（採用動機の成果物を先に出す）。
-
-後続フェーズ（M7 後に本表へ展開）:
-- **Phase B**: diffusion 側 e2e 再測定、llama.cpp 64 tok/s 比の更新、残ギャップの roofline 再分解
-- **Phase C**: 量子化 layout の indexed type 化 + bounds 証明 → disable_robustness default ON（検証が性能を買う）。README "verified"→"typed" 降格。Hespera 別リポ分離
-- **Phase D**: 判断点 — novel 機能（実行時学習等）を llama.cpp に移植 vs Hesper 続行を実測で再判定
-
-## §5. Phase D 判定（2026-07-06、ユーザー裁定 — LLM 推論プロダクトとしての Hesper は撤収）
-
-**検証された事実に基づく結論**:
-1. **TTT/推論時学習の研究**は PyTorch（量子化 sim を eval に含める）で行い、配備先はサーバー = vLLM（PyTorch 原生 + multi-LoRA 機構がセッション毎 fast-weight と好相性）、ローカル/Mac = llama.cpp フォーク（固定レシピなら backward は転置量子化 matvec + 外積 + optimizer の 4-6 カーネルで足りる）。**TTT を理由に Hesper を選ぶ必然は無い**。
-2. **WebGPU/ブラウザ配布のニッチ**: webml-community（手書き 1 モデル専用、QAT int4、250tps）と MLC/web-llm が既に占有。我々の実測でも同じ Dawn/WGSL 上で到達可能性は証明された（=技術的差別化ではない）が、後発として取る理由が無い。
-3. **verified 推論**: 近期の LLM 市場に実利ほぼ無し（買い手が証明を要求しない）。実利があったのは「検証が性能を買う」(robustness-off ~10%) と「バグクラスの構築時排除」— 後者は今セッションの clamp-write race ×11 が皮肉にも最良の実証（型で殺せた事故に数日払った）だが、これは**開発コスト削減の話であってプロダクトの堀ではない**。
-4. **抽象化の総括**（§4 の一連の議論）: 抽象化が代金を払える条件 = ①レイヤーの所有/理解 ②下までの可視性 ③escape hatch。Hesper は③を今セッションで整備し②を部分達成、①は Tint/Dawn が他人のコードで恒常的な摩擦（Tint MSL プリンタバグ、Dawn Serial dispatch）。jax-metal は①②③全滅の対照例。llama.cpp/webml は「層が無い」ことでこの問題自体を持たない。
-
-**判定: LLM 推論エンジンとしての Hesper のプロダクトベット（verified WebGPU inference）は、自ら集めた証拠により棄却。** 撤収し、以下を回収資産とする:
-- **autotune フレームワーク**（Family 契約 + native 計時 + incumbent guard + winners lookup、2 family で汎用性実証、1 コマンド 12 秒）— 汎用 GPU チューニング基盤として独立価値
-- **診断キット**: HESPER_DUMP_MSL / native serial 計時 / 決定性プローブ（NOBATCH + 多プロセス md5）/ 層別 golden-parity 手法 — GPU correctness 調査の再利用可能な方法論
-- **upstream 価値のある発見**: Tint MSL プリンタバグ（valid WGSL → 引数脱落 MSL、最小再現化して報告する価値）、Dawn の MTLDispatchTypeSerial 制約（crbug.com/425987598 に実測データを添えられる）、WGSL clamp-write race パターン（select-to-zero は write を守らない）
-- **DEVPLAN 方式そのもの**（原則ゲート・負の結果の記録・★関門）— 次のプロジェクトの運用体系として
-
-**学習としての評価**: 仮説は棄却されたが、棄却は clean な実測で行われた（8.05→90 t/s の過程が「カーネルでも言語でもなく構造の問題」を峻別した）。ただし同じ結論にもっと安く到達できたはず（webml 精読を M3 で最初にやっていれば数週間短縮）— 原則 7 違反 3 回の代金。
-
----
-
-## §3. 現在の状態
-
-- **完了**: M0（★承認済み）、M1（probe、3/3 クリーン）、**M2+M4 前倒し（★レビュー待ち、汎用化+再現性検証済み）**:
-  - **汎用 autotune core = `Hesper/WGSL/Autotune.lean`（library）**: Family 契約（space/feasible/gen/cfg/golden 宣言 ~50 行）に対し、engine が sweep/golden/probe-prune/occupancy/tune log/resume/**refine(top-10 × 300 iters × 3 反復)**/winners.csv/**実行時 `best` lookup** を共有提供。matmul は最初の instantiation（`regGenFamily`）。E2B mul_mv family が「matmul 専用でない」の証明担当（M6/M7）
-  - **再現性（ユーザー指摘で検証）**: 独立 2 回の全 sweep → dense 勝者は完全一致、QKV-KV は同着プレート。ただし**単発 sweep 行には最大 ~3× の過渡外れ値**（同一設定が 0.267/0.767ms）→ **refine 段を新設**（top-10 を 300×3 で再計測、min-of-reps で確定。反復内ばらつき ±2%）
-  - **正直な勝ち幅（300×3 同一ハーネス・cool、当初の 2.7×/1.7× は外れ値 baseline による誇張と判明・訂正)**: QKV-KV 0.283ms vs deployed 0.417ms = **1.45×**、dense-gu 0.463 vs 0.580 = **1.25×**。floor 距離 QKV-KV 2.9×、dense 2.3×
-  - **汎用 kernel の忠実性確認**: Gen(deployed 設定) 0.413/0.577 ≈ 実 deployed kernel 0.417/0.580（1% 以内）= M4 合否「64×32 を再発見」クリア
-  - 勝ちパターン: **BK16 + 小中 tile + sgC 多め（wg128）**、全行 spill 無し
-- **M5 判定（★レビュー待ち、正直な結論 = e2e NEUTRAL）**: 実 decode 8 shape (M=nP=320) を sweep+refine → `DG_TUNED=1`（`Autotune.best` lookup 駆動、数字手書き無し、winners.csv 差し替えで decode 再ビルド不要）。**初回は熱で腐った勝者が +39ms の regression → incumbent ガード（deployed 設定が refine に常時参戦、勝てなければ winner 無し=構造的に regression 不可）+ cool refine で修正 → ABAB: TUNED 642/611 vs default 639/607 = ノイズ内**。事後算: 勝った 6 shape の節約 ~13ms/step vs ノイズ ±30ms — **tune 対象の WGSL matmul 群は step の ~10% しか占めず、そこの 20% は雑音に沈む**。DG_TUNED は opt-in のまま（shipped path 不変）。**autotune フロー自体は e2e 検証完了**（sweep→refine→lookup→統合→ゲートが全部機能し、regression を 2 回捕捉）。残り時間の主 = MoE(MSL 凍結)・battnB attention（WGSL、次の family 候補）・elementwise
-- **進行中**: M5 ★レビュー → 次は M3（llama.cpp 精読表）or M6（E2B bring-up — matvec が step 時間の全てを占める土俵で、フロー証明の本命）
-- **直近の実測**（2026-07-05, M4 Max, feat/diffusiongemma）:
-  - TAT probe: 0.118 s/variant（cold Metal cache）。**再 sweep は Metal ディスク shader cache で compile 80ms→4ms** → 0.046 s/variant
-  - occupancy probe 動作: deployed reg kernel = maxThreads=1024（spill 無し）, execWidth=32
-  - DiffusionGemma 26B-A4B: llama.cpp 比 54-96%（平均 ~73%）、per-step ~800ms vs 363ms
-  - roofline 上位: QKV-KV 4.9× above floor、dense g/up 3.2×（M2 の初弾対象）
-- **次の一手（TODO）**:
-  1. [x] M0: TAT 実測 → ★承認済み
-  2. [x] M1: probe FFI（CI 確認のみ残）
-  3. [ ] M2: runtime-K-loop パラメータ化 kernel（M4 前倒し）+ SWEEP=1 + 小 shape golden + tune log → QKV-KV/dense ランク表 ★
-  3b. [ ] **TAT 対策（ユーザー指摘 2026-07-05）: decode 統合 build が ~8-10 分と長すぎる** — DiffusionGemmaDecode.lean が 2000 行超の単一ファイルで 1 行の変更が全再 elaborate を誘発。対策候補: (a) decode を複数モジュールに分割（forward/schedule/main）、(b) 滅多に使わない Examples/exe を default deps から外す・別ディレクトリに move、(c) 統合面を薄く保つ（lookup 駆動にしたのはその一歩）。M5 完了後に着手
-  4. [x] **M3 完了（E2B/Metal 版、★レビュー待ち）: `docs/llama-metal-dispatch-analysis.md`** — 結論が fusion 計画を反転: llama.cpp は **MTLDispatchTypeConcurrent + hazard-only barrier**（mem-range 追跡）で ~1033 op/token（我々 684 より多い!）を 6.4ms で流す。Dawn は **Serial ハードコード**（crbug.com/425987598）→ 14µs/dispatch 直列床。mul_mv カーネルは同クラス（彼ら 2row×2sg ≈ 我々の R1/R2W1 同着圏）でギャップ主因でない。**道: A=Dawn パッチ / B=native dispatch transport（カーネルは DSL 生成のまま、運搬層のみ metal_replace 経路 + Lean 側 hazard 判定）/ C=fusion のみ（~100 t/s 天井）** — A/B は ★承認要（B は metal_replacer スコープ決定の変更）
-  5. [x] **M6 完了: E2B greedy decode が llama.cpp と一致** — "The capital of France is" → **"Paris." + EOT** ✓ / "The largest planet…" → **"Jupiter." + EOT** ✓ / 64-token 詩も coherent。**現状 8.05 t/s**（graphs-off・correctness-first 経路）vs llama.cpp **156.5 t/s** = M7 の出発点 19.4×。★レビュー待ち。llama.cpp 参照確立: E2B 生成 **156.5 t/s**（M7 の現実的な的; 私の 200-250 BW 見積りは楽観だった）。
-     踏んだ修正（1 日で 21 回の実行反復、全て engine 一般益）: GGUF u32 配列 metadata（E 系）/ MatFormer per-layer dims（tensor shape 優先, E2B L0 ffn=6144≠12288）/ PLE 1.6GB 表 → row-staging 64-slot（binding 上限+robustness clamp+batch 順序ハザード 3 連対応）/ binding 4 倍数 round / CreateBindGroup error scope（作成時理由の可視化）/ 書込 aliasing×3 を in-place kernel 化（qkvNorm・qNorm・normThenAdd — CUDA 合法/WebGPU 違法）/ ce 名 sanitize（Float 埋込→WGSL 不正識別子）/ **maxComputeWorkgroupSize 1024 要求**（wg-512/1024 kernel 解禁 = autotune の sg4x4 も解禁）/ Q4_K embd lookup kernel 新設（dequantQ4KElementAt 抽出）/ Q4_K lm-head chunked f16 前 dequant（f32 中間 1.6GB 回避）/ BlockCoop 2D grid（vocab 262144 > 65535）/ dp4a enable（WebGPU、subgroups 時）。
-     **数値 parity bisect（進行中、大きく前進）**: llama-eval-callback を参照に層別比較を確立。
-     - **✅ 消去済み**: Q4_K embedding lookup（CPU golden 16/16 一致）/ inp_scaled（llama と厳密一致）/ Q6_K down matmul（正しかった）/ normThenAdd kernel（CPU golden 一致）
-     - **✅ 大修正: Metal relaxed-math の fast::tanh は |x|≳44 で NaN** — E2B の GELU inner=58 で発火（E4B は振幅不足で潜伏）。DSL codegen で `tanh(clamp(x,±20))` に（engine-wide、意味論不変）。修正後 **ffn_out-0 が llama と parity**（-6.2511 vs -6.2759）
-     - **層別スキャン: layer 0 完全一致（attn 0.02 / ffn 0.006）→ 乖離は layer 0 末尾の PLE 適用チェーン**（llama: proj@inp_scaled → SCALE → per-256 RMS_NORM×projNormW → +selected → SCALE(1/√2) → gelu(inp_gate@pe_in)×inp_per_layer → proj → norm×post_norm → +pe_in → ×layer_output_scale）。our per_layer_embd_out ≠ llama → **PLE 式のどこかの SCALE 定数 or 順序が違う**
-     - 学び: llama の tensor 名は add 前後でズレる（ffn_post_norm=add 前、pe_in=add 後）— 比較時は OP チェーンで確認
-     - 訂正: 「batched prefill の staging 順序ハザード」理論は誤り（prefill は非バッチ、各 dispatch 即時実行）。slot 化は無害だが不要だった
-     - **最終ラウンド（2026-07-05、4 バグで decode 完全一致）**: PLE 定数は全部正しかった — 犯人は**テンソル型の思い込み**×3 + **prepared-cache の buffer 捕捉**×1:
-       1. **`per_layer_token_embd` は E2B では Q5_K（type 13）**（E4B は Q6_K）— Q6_K として dequant していた。CPU golden（llama node_1 GET_ROWS と bit 一致）で確定 → `Hesper/Quantization/Q5_K.lean` 新設（176B/block は 4-aligned なので u32-indexed、scale unpack は Q4_K と同一で `getScaleMin` 再利用）+ loader 型検出 + 両 call site 分岐
-       2. **`per_layer_model_proj` は BF16（type 30）** — 生 bytes を f16 として matmul に食わせていた（指数幅違い→ゴミ）。GPU BF16→F16 repack kernel（算術変換、bitcast 不要）を load 時に 1 回。GGUF Loader.GGMLType に BF16 追加
-       3. **`blk.*.inp_gate/proj` は E2B では F32**（E4B は Q4_K）— loadLinear が F32 を Q4_K として解釈（ple_gate が ±10⁴）。`Linear.QuantFormat.F16` 新設: load 時 GPU pack f32→f16、forward/forwardBatchDP4A に F16 早期分岐（executeMatMulTransposeF16）
-       4. **decode 常時 196228 の真因 = finalNorm の prepared-cache が prefill の buffer binding (buf2→buf1) を捕捉**、decode の ping-pong は **35 層（奇数）で buf1→buf2 に反転** → replay が古い scratch を読む。E4B は 42 層（偶数）で偶然一致し潜伏。`state.finalNormDecodePrepared`（decode 専用 ref）で分離。**教訓: prepared/cached dispatch は buffer binding を捕捉する — 呼び出し毎に buffer が変わる call site で shared ref を使ってはならない（層数の偶奇でしか発火しない罠）**
-     - 検証: decode hidden vs 7-token prefill hidden relL2 0.014（L34）= KV-cache/全層 decode 経路も parity。層別スキャン l_out-0/34 とも llama と一致
-     - 診断手法の資産化: `scripts/llama_parity/scan_layers.py`（llama-eval-callback text vs golden .bin 層別比較）、decode 側 `single_p{pos}_finalNorm/logits` dump 追加、dumpBuf を WebGPU batch 下で安全化（isBatching probe + 再 open）
-     - CPU lm-head 切り分け（hidden 正しい/GPU logits 誤り→犯人は norm→lmHead チェーン）が決定打だった — bisect は「GPU dump → CPU で続きを計算」が最速
-  6. [~] **M7 進行中（2026-07-05）: 8.05 → 68.0 t/s（8.4×）— まだ kernel チューニング前、全部オーバーヘッド除去**。llama.cpp 156.5 の 43%。
-     - **ラダー**: 8.05 → **39.9**（WebGPU executeWithConfigCached が cacheKey を捨て毎 dispatch WGSL 全再生成 ~180µs×600 → CUDA 同様 key を権威化、collision 検証 = KEYED=0 と全 1151 golden ビット一致）→ **64.1**（pipeline/bindgroup/kcr の 3 cache が Array 線形スキャン ~450k probe/token → Std.HashMap）→ **68.0**（Q4_K dp4a lm-head 新設: f16 800MB read → Q4_K 226MB、HESPER_LMHEAD_F16 不要化 + VRAM -786MB）
-     - **既知問題（棄却済み lever）**: bridge の single-compute-pass 化（HESPER_SINGLE_PASS=1 opt-in、default OFF）— decode L1-attention から bit-divergence（mode 毎に決定的、prefill は不変）= intra-pass hazard がどこかで漏れる。利得 +0.6ms のみと判明（pass 切替は想定より安い）→ hunt は保留。再現: poem 24tok の md5 が SINGLE_PASS=0/1 で異なる
-     - **現状内訳** (~14.7ms/token): GPU ~8ms（帯域 floor 見積 ~4ms、FFN matvec 838MB/token が支配）+ host record ~2-3ms + argmax readback 0.6ms + prePLE 0.8ms
-     - **mul_mv Family 完了（フレームワーク汎用性 = 証明済み）**: `q4kMatVecDP4AGenKernel(R,W)` を substrate に 2 つ目の Family を宣言（~60 行）→ **MATVEC_SWEEP=1 の 1 コマンドで 6 shape sweep+refine が 12 秒**（≤30 分クリア）。全 shape 勝者 = **R1W1**（deployed の 4-warp K 分割は Apple の K=1536-12288 で負け筋: 単体 QKV 0.083→0.047ms、gate+up 0.133→0.073ms）。HESPER_TUNED=1 で winners.csv lookup 駆動統合。
-     - **ただし e2e = NEUTRAL（正直判定、M5 と同じ構図）**: ABAB 66.9/69.3 vs 69.3/67.4。真因を HESPER_GPUBUSY=1（新設 per-token カウンタ）で実測: **684 dispatches/token、GPU submit+wait 9.5ms ≈ 14µs/dispatch = 逐次 dispatch レイテンシが床**。カーネル内部効率は拘束条件でない。
-     - **決定測定: single-pass (passes=1) でも submit+wait 9.5ms 不変** → 14µs/dispatch は pass 切替でなく **Dawn-Metal の dispatch 間 barrier+launch レイテンシ**。llama.cpp Metal は tracked-resource 自動ハザードで独立 dispatch がオーバーラップする（我々は全ペアで直列化）。**⇒ M7 の残りの主戦場 = fusion による dispatch 削減（684→<400 で ~-4ms）**
-     - **✅ カーネル線 完遂（ユーザー裁定の順序どおり）**: llama `kernel_mul_mv_q4_K_f32` を原則 7 で**構造ごと移植**（`Hesper/WGSL/MulMvQ4K.lean`: f32 入力=quantize dispatch 消滅 / NR0 rows/sg の register y 再利用 / 4-block ILP / u16 masked multiply / kmask scale 抽出）→ family `mulMvQ4Kf32`（center = llama の NR0=2,NSG=2）。**測定装置も修正**: Dawn 経由 bench は Dawn 税 ~35µs/dispatch を測っていた → `HESPER_NATIVE_BENCH=1`（mslBenchSerial FFI、native serial encoder の GPUStart/End、refine は variant 毎 pipeline cache reset で MSL stale 防止）。**結果: 全 shape 90-97% BW（lm-head 528GB/s、gate+up 515、down 491; 実効 BW ~546）— 合否 ≥60% 大幅クリア、dp4a family を 1.4-1.7× 圧倒（dot4I8Packed は Apple でエミュレーション）**。deploy: attnO/down/lm-head winners lookup、default ON（ABAB 4/4 分離 +8%）→ **74.8 t/s**。副発見: legacy executeMatMulTranspose が最終出力要素を落とすバグ（golden コメントに記録）
-     - **カーネル完遂後の正直な分解（74.8 t/s = 13.4ms/token）**: kernel 床 ~2ms（90-97% BW）+ **Dawn dispatch 税 ~6.5ms**（637 dispatch、GPU 実測 8.6ms）+ host ~3ms + argmax 0.6ms。fused QKV/gateup の f32 化は Dawn 税下で ROI 逆転（+2 dispatch/層 ≈ +28µs > kernel 利得）のため保留 — **B（concurrent dispatch 層）の下でだけ純利得**。⇒ 支配項は dispatch 層に一本化。B 下の射程 = kernel 2ms + α ≈ **150-200 t/s 圏**（カーネルが無駄をしなくなった分、B の払いは当初見積りより大）
-     - **webml 精読で B は不要と確定（ユーザーの「なぜ webml は 250tps?」が決定打）**: webml は同じ Dawn serial のまま **~390 dispatch/token のエピローグ融合**（OprojNorm/DownNormAdd/GateUpNorm/RmsSrq/NormAddNorm — 全 norm/add/quantize が matmul に相乗り）で 250tps。`docs` 追補 + `refs/webml-gemma4/`（gemma-4-e2b.js 精読、decode 層 op 列抽出済み）。**fusion 線を webml-map で再開**（B は完全パーク）
-     - **決定性の全面回復（fusion 着手時の gate で発覚した既存 race 2 種を根絶）**: (1) flashAttn V11 の**空 split**（cacheLen<8）が未初期化 threadgroup メモリを集約 → numSplits=min(8,cacheLen) 修正 `40b07ba`。(2) **clamp-write race ×11 カーネル**（ropeDynK 他: `select(inBounds,x,0)` を無ガード write — OOB index が最終要素に clamp され正規 owner と race。K cache 最終 word がプロセス毎に反転していた）→ 全 site を if-guard 化 `1e5a145`。**5 プロセス md5 で bit 決定性を確認**。診断キット資産化: HESPER_DECODE_NOBATCH / MULMV_DET / 層内 dump 群
-     - **fusion バッチ 1 `7ebf8ba`**: PLE gate エピローグ融合 default ON（-35 dispatch）。qkNormRope 融合は **Tint MSL プリンタのバグ**（valid WGSL → 壊れた MSL: buffer 引数 v_52 をローカルで shadow + 内部関数に params/freq_factors/threadgroup を渡し忘れ → q 後半 head がゼロ）で default OFF パーク（HESPER_QKNR=1 で再現可）。かつ ROI 誤算（freq factors は FULL 層のみ ~7 dispatch/token; SWA 多数派には factors 無し変種が必要）
-     - **fusion バッチ 2 `17085c1`: decode attention 1-dispatch 化**（directOutput、cacheLen≤1024; split-K は長文用に温存）→ **567 dispatch/token、GPU 7.7ms、~75 t/s**（ABAB で direct 一貫勝ち）。census 訂正: geglu は既に gateup に融合済み（standalone geluMul は MoE 経路のみ）、oproj/down+postNorm も webml と同型（norm は全行 reduction ゆえ consumer 側 1-dispatch が正解でパリティ）、webml の RmsSrq も別 dispatch なので norm+quantize 2-dispatch もパリティ — **残る実差は ropeQ(-35, Tint バグ待ち) / Q6K-V 層の追加 matmul(-17) / argmax readback(-0.5ms) / per-dispatch 単価差（我々 ~12µs vs webml ~9µs 込み込み）+ QAT int4 の read 量差**。fusion 線の現実的天井 ~85 t/s; その先は per-dispatch 単価（bind/encode 経路）と重み形式の話
-     - **計測訂正（重要）**: これまでの「~75 t/s」は 48-token 平均 = 初回 token の pipeline compile（~100ms）で希釈された値。**steady-state decode = per-token ~10.1-10.4ms（sect trace 実測）≈ 90-96 t/s、128-token 実測 89.6 t/s = llama.cpp 156.5 の ~61%**。llama の数字は decode steady-state なので比較はこちらが正。M7 レポートは今後 steady-state（長 seq or median）で
-     - 残 TODO: (a) Tint バグ最小再現 → 回避形状で SWA 向け factors-less qkNormRope（-35）、(b) Q6K-V 層 K/V matmul 統合（-17）、(c) argmax readback 0.55ms（deferred/pipelined read）、(d) host record 残（ce 経路 bind/hash 単価）。合算で ~105-115 t/s 圏 = llama 比 ~70%。その先: per-dispatch 単価（bind/encode）と QAT int4 級の重み形式
-     - 単体診断ツール: gemma4-profile が argv でモデル指定可に（E2B 対応）、HESPER_GPUBUSY=1（passes/record/finish/submit+wait per token）
-     - **key 権威化の余波（修正済み `93706ac`）**: bench/sweep ハーネスが全カーネルに literal cacheKey=1 を渡していた — 権威化後は 2 個目以降のカーネルが最初の pipeline で走る事故。bench 系は 0（WGSL-hash 経路）に統一。**契約の明文化: 異なる WGSL を生む呼び出しに同じ非ゼロ key を渡してはならない**
-
-**M1 で確定した実装制約**（原則に準ずる）:
-- **Dawn の SetLoggingCallback は CAPTURELESS lambda 限定**: capture 付き functor は寿命が繰返し発火をカバーせず use-after-free（確率的に quiet 無視 + SIGTRAP/SIGABRT を実測）。状態は global で渡す。
-- **Tint MSL の staticThreadgroupMemoryLength は常に 0**（threadgroup メモリは dispatch 時動的割当）→ shared サイズ列は Lean 側で計算して出す。
-- Metal ディスク shader cache: 同一ソースの再 compile は ~4ms → 再 sweep はほぼ無料。
-
-## §4. 決定ログ
-
-| 日付 | 決定 | 根拠 |
+| # | Premise | Fate |
 |---|---|---|
-| 2026-07-05 | MSL hybrid 拡張を棄却 | batch/bubble で回収失敗（DG_MSLONESTREAM/FUSEDOWN neutral 実測）。Metal では WGSL との決定差小 |
-| 2026-07-05 | 強度削減/scalar-accumulator 系の WGSL 書き換えを棄却 | Metal が回収（null 実測）。効くのは let' CSE のみ（1.37→1.15×） |
-| 2026-07-05 | tile 幅の単独模倣を棄却 | WIDE64 実測で逆効果。リファレンスは構造ごと写す（原則 7） |
-| 2026-07-05 | JAX 移行を棄却 | jax-metal 未成熟 / Pallas に Metal 無し / block-quant 一級サポート無し |
-| 2026-07-05 | E2B をフロー証明のターゲットに採用 | 帯域律速で Tint 税が消える土俵 + 公開比較（webml 250tps / llama.cpp）+ E4B 資産で 1-2 日圏 |
-| 2026-07-05 | **M0 合格**: sweep TAT = 0.118s/variant 実測（設計成立） | TATPROBE=1。当初 8x8Reg で probe → K 全展開で compile 爆発 → deployed 型（runtime K loop）に切替えて成功。**sweep 基盤 = runtime-K-loop 必須**を §1 に昇格 |
-| 2026-07-05 | M0 ★承認（ユーザー）+ M2 設計変更承認: M4（runtime-K-loop パラメータ化 kernel）を M2 に前倒し | full-unroll 制約により 8x8Reg が sweep 基盤に使えないため |
-| 2026-07-05 | **M1 合格**: occupancy probe 動作（maxThreads/execWidth）。callback は captureless 限定 | capture 付き lambda で use-after-free（quiet 確率無視 + SIGTRAP）を実測 → global 状態 + captureless で 3/3 クリーン |
-| 2026-07-05 | sweep は resumable（CSV skip + SWEEP_LIMIT）に | 300 variant 一気は SIGSEGV。真因 = **wg=512 が maxComputeWorkgroupSizeX=256 を超え pipeline が null → execute 経路が null 参照で SIGSEGV**（engine 堅牢性の課題、别途）。feasibility に wg≤256 を追加して解消 |
-| 2026-07-05 | **M2 合格（524 variants、golden 0 fail）**: QKV-KV 0.733→0.267ms、dense 0.833→0.500ms（同条件）。勝ち = BK16+小 tile+wg64-128 | 「4.9×/3.2× above floor は未チューニングが原因」仮説が実証された。深 tile(BK32/TM4)は M=262 では padding 浪費+occupancy 損 |
-| 2026-07-05 | 手動 tune ループ→**汎用 Autotune library に抽出**（Family 契約 + 共有 engine + 実行時 lookup）。ユーザー指摘（matmul 専用/手動 tune/パラメータ非外出し）が正しかった | Triton の @autotune と同じ境界: kernel 作者は宣言のみ、探索/記録/消費は機構 |
-| 2026-07-05 | **勝ち幅を 2.7×/1.7× → 1.45×/1.25× に訂正**（refine 300×3 実測）。probe-prune + refine 段を新設 | 単発 sweep 行に ~3× 過渡外れ値（0.267/0.767 同一設定）→ sweep=安く順位付け、refine=確実に決定、の 2 段が必須。ユーザーの再現性指摘が的中 |
-| 2026-07-05 | **incumbent ガード新設**（deployed 設定が refine に常時参戦、勝てなければ winner 無し） | 8-shape 連続 sweep の後半が熱で腐り、deployed より遅い設定が「勝者」になり decode で +39ms regression（ABA で捕捉）。ガード+cool refine 後は Q-full/attnO-SWA で incumbent が正しく防衛 |
-| 2026-07-05 | **M5 = e2e NEUTRAL、DG_TUNED は opt-in 維持** | 勝った 6 shape の合計節約 ~13ms/step はノイズ ±30ms 未満（tune 対象は step の ~10%）。原則 4 のゲートが機能。フロー自体は検証完了 — 効かせるには step 時間を支配する対象（E2B matvec / battnB）に向ける |
-| 2026-07-05 | **M6 合格: E2B greedy = llama.cpp 一致（"Paris."✓ "Jupiter."✓）、8.05 t/s** | 最終 4 バグ = E2B 固有テンソル型（PLE 表 Q5_K / proj BF16 / inp_gate·proj F32）×3 + finalNorm prepared-cache の buffer 捕捉（35 層奇数で ping-pong 反転、E4B 42 層は偶然潜伏）。詳細 §3-5 |
-| 2026-07-05 | 量子化型は tensor 毎に GGUF から読む（思い込み禁止）を原則運用に | E2B は同名 tensor が E4B と別型（Q6_K→Q5_K, Q4_K→F32, F16→BF16）。3/4 バグがこのクラス。loadLinear/loader は型検出 + 明示 throw（未対応型）に |
-| 2026-07-05 | prepared/cached dispatch の shared ref は「buffer が呼び出し毎に不変」の site 限定 | finalNorm bug の教訓。ping-pong buffer を渡す site は専用 ref か throwaway。層数の偶奇でしか発火しない罠として決定ログに固定 |
-| 2026-07-05 | **WebGPU cacheKey を権威化（CUDA と同契約）** — 8.05→39.9 t/s | 毎 dispatch の WGSL 再生成 ~180µs×600 が decode の 88% だった。collision 検証: HESPER_KEYED_PIPELINES=0 と全 1151 golden ビット一致。契約 = key は生成 WGSL を一意に識別（baked param は key に含める） |
-| 2026-07-05 | 3 つの dispatch cache を HashMap 化 — 39.9→64.1 t/s | pipeline/bindgroup/kcr が Array 線形スキャン（~450k probe/token）。ホスト記録 5.3→1.1ms |
-| 2026-07-05 | single-compute-pass 化は default OFF で保留 | decode L1-attention から bit-divergence（intra-pass hazard 漏れ、mode 毎決定的・prefill 不変）。利得 +0.6ms のみ。reproducer 記録済（poem 24tok md5） |
-| 2026-07-05 | Q4_K dp4a lm-head を default に — 64.1→68.0 t/s、HESPER_LMHEAD_F16 廃止（opt-in 化） | f16 事前 dequant 800MB read → Q4_K 226MB 直読。VRAM -786MB。prefill/decode 両方 |
-| 2026-07-05 | **mulMvQ4K family: 汎用性証明クリア（2 家族目、1 コマンド 12 秒）だが e2e NEUTRAL** | 全 shape 勝者 R1W1（4-warp は Apple で負け）。真因 = 684 dispatch × ~14µs 逐次レイテンシ床（HESPER_GPUBUSY 実測 GPU 9.5ms）— カーネル内部でなく dispatch 数が拘束。M7 の残りは fusion / dispatch 削減 |
-| 2026-07-05 | device-fed decode（HESPER_DEVICE_FED）は WebGPU で採用せず | 66.7 vs 68.0 t/s（利得なし）+ EOS 挙動差。CUDA graphs 前提の設計 |
-| 2026-07-05 | **M3 精読の結論: fusion 主線を撤回、並列 dispatch が本丸** | llama.cpp は Concurrent encoder + hazard-only barrier で我々より多い op 数を 6.4ms で流す。Dawn は Serial ハードコード。fusion 単独は ~100 t/s 天井。詳細 docs/llama-metal-dispatch-analysis.md |
-| 2026-07-05 | **CONCPROBE で B 案をデリスク: Serial 13.5µs/dispatch（decode 実測 14µs と一致=モデル妥当）→ Concurrent 6.9µs（2×、同一バッファ最悪契約で）** | 同じ Tint-MSL カーネルを native encoder で 300 発、dispatchType だけ変えて GPU 時間直測。GPU 9.5→~4.7ms 以下が射程 = decode ~104+ t/s。CONCPROBE=1 matmul-bench で再現 |
-| 2026-07-05 | **fusion 主線は撤回（プロセス違反の教訓、ユーザー指摘）**: 「684×14µs だから数を減らす」は M3 精読**前**のヤマカン仮説だった。M3 の事実 = llama.cpp は我々より**多い** 1033 op を並列化で流す → fusion は対症療法（Concurrent 化後は小 dispatch がほぼタダになり価値が暴落）。**原則 7（精読が先、発明しない）の再違反 — ★M3 ゲートを飛ばして方針を出さない** | WIDE64 と同型の失敗。ユーザーの「llama.cpp のカーネル分析したよね？」で軌道修正 |
-| 2026-07-05 | **native dispatch (B) も停止・パーク（ユーザー指摘 2 連発目）: カーネル品質ギャップが先** | 「カーネルは同クラス」は構造類似だけの主張で、実測は**否**: tuned R1W1 を native encoder（Dawn オーバーヘッドゼロ）で測ると **170GB/s = 43% BW**。llama.cpp は全 overhead 込み e2e で 219GB/s ⇒ カーネル単体 ~250-300GB/s 級。**カーネル ~2× × 直列化 ~2× の両方が実在し、順序はカーネルが先**（可搬・autotune の本業・悪いカーネルを並列化しても無駄の並列化）。mulMv family は R/W の 2 knob 15 点の初歩版だった — vec-load / blocks-per-thread ILP / smem staging 未掃引、**原則 7 の center-point port（llama の mul_mv 内ループを ShaderM に忠実移植して空間の中心に置く）も未実施**。B は CONCPROBE でデリスク済みのまま保留、カーネルが llama 級（≥60% BW目安）に達してから残ギャップで再判定 |
+| P1 | On Metal, WGSL-via-Tint vs hand-written MSL has no decisive per-kernel gap once codegen quality is handled (`let'` CSE); the "Tint tax" was an excuse for unswept tuning knobs. | **HELD.** The llama.cpp `mul_mv_q4_K` port, written in the DSL, reached 90–97 % of memory bandwidth. |
+| P2 | Kernels are runtime-generated Lean functions, so parameter sweeps need no rebuild → measured-JIT autotuning is cheap. | **HELD.** 0.118 s/variant; a 6-shape family sweeps + refines in ~12 s with one command. |
+| P3 | M=1 decode is bandwidth-bound, so per-kernel BW parity ⇒ e2e parity. | **FALSIFIED.** The binding constraint is the dispatch layer (567 serialized launches through Dawn ≈ 5.7 ms/token), not kernel throughput. Per-kernel parity produced an e2e NEUTRAL. |
+| P4 | The market niche is verified WebGPU inference + browser distribution. | **RETIRED** (§4-C1). The browser lane is occupied (webml, MLC/web-llm); verification has no near-term LLM buyer. |
+| P5 | The realistic target is llama.cpp on the same box (156.5 t/s measured), not a paper BW estimate. | HELD; used as the M7 yardstick throughout. |
+
+---
+
+## §2. Improvement hypotheses and their fates
+
+| # | Hypothesis | Verdict | Evidence |
+|---|---|---|---|
+| H1 | A generic autotune framework (Family contract + shared engine + runtime winner lookup) beats per-kernel hand tuning. | **CONFIRMED** | Two families proven (`regGen` WMMA matmul, `mulMvQ4K(f32)` matvec); caught 2 regressions before shipping (thermal false winner, incumbent guard); honest nulls recorded in winners.csv. |
+| H2 | Kernel quality is the E2B gap → tune to parity and the gap closes. | **HALF-CONFIRMED** | Isolated parity achieved: llama-port kernels at 90–97 % BW; dp4a was 1.4–1.7 × worse because `dot4I8Packed` is emulated on Apple (no dp4a hardware). But e2e moved only ~+8 % — kernels were not the constraint (see P3). |
+| H3 | Fewer dispatches (fusion) closes the remaining gap. | **PARTIALLY CONFIRMED** | Each −35 dispatches ≈ −0.4 ms ≈ +3–4 t/s. PLE-gate fusion and 1-dispatch direct-output attention landed (684 → 567 dispatches, GPU 9.4 → 7.7 ms). Extrapolated ceiling of this line ≈ 105–115 t/s. |
+| H4 | llama.cpp's edge is concurrent dispatch → copy it. | **REJECTED for us** | True for them (`MTLDispatchTypeConcurrent` + hazard-only barriers via ggml_mem_ranges), but Dawn hardcodes `MTLDispatchTypeSerial` (crbug.com/425987598). Measured probe: same kernel 13.5 µs/dispatch serial vs 6.9 µs concurrent. Patching Dawn / native transport parked as unnecessary — see H5. |
+| H5 | webml's 250 t/s proves the ceiling is reachable **within** Dawn serial dispatch. | **CONFIRMED** | Their decode is ~390 dispatches/token with every norm/add/quantize riding matmul epilogues (`OprojNorm`, `DownNormAdd`, `NormAddNorm`, `GateUpNorm`, SRQ produced by the upstream op, 1-dispatch `DecodeAttention`). Same Dawn, same WGSL — structure, not stack. |
+| H6 | The remaining webml gap is mostly their different model (QAT int4 vs our Q4_K_M GGUF). | **REJECTED — the model is the SMALL factor.** Effective read throughput: ours 122 GB/s, llama.cpp 197 GB/s, webml ~279 GB/s, against a 546 GB/s peak — nobody is bandwidth-saturated, so bytes-per-token is not what separates us. QAT int4 reads only ~10–15 % fewer bytes than Q4_K_M; llama.cpp running the same QAT model as q4_0 would gain roughly that (+13 % ≈ 177 t/s), nowhere near 250. QAT's real gift is *quality at low bit-width* (train-time adaptation lets int4 match bf16 quality), not speed. The 250 t/s comes from dispatch count × per-dispatch cost × host-loop leanness. |
+| H7 | The DSL itself blocks webml-style optimization ("the abstraction is the bottleneck"). | **NUANCED** (§4-C3) | Expressiveness: no — every webml/llama.cpp trick proved expressible (the ports exist and hit 90–97 % BW). Velocity and visibility: yes — expression-tree authoring is ~3–5 × slower than raw WGSL, and two foreign layers (Tint, Dawn) hide behavior until you drop a level (we had to build MSL dumping and native timing to see anything). |
+
+---
+
+## §3. Evidence ledger (M4 Max, gemma-4-E2B-it Q4_K_M, greedy decode)
+
+**The optimization ladder** — correctness gates ("Paris.", "Jupiter…") held exactly at
+every step:
+
+| Step | t/s | What changed |
+|---|---|---|
+| M6 bring-up done | 8.05 | Correct decode. 4 E2B-specific bugs: PLE token table is Q5_K (not E4B's Q6_K); per_layer_model_proj is BF16; inp_gate/proj are F32; finalNorm prepared-ref captured prefill-sized buffers (the odd layer count exposed it). |
+| Authoritative pipeline keys | 39.9 | The WebGPU layer re-generated the full WGSL string per dispatch (~180 µs × 684) just to hash it for the cache. Caller-supplied cacheKey, CUDA-contract mirror. |
+| HashMap caches | 64.1 | Pipeline/bindgroup/KCR caches were linear Array scans (~450 k probes/token). |
+| Q4_K dp4a lm-head | 68.0 | f16 pre-dequant read 800 MB/token; direct quantized read is 226 MB (and −786 MB VRAM). |
+| f32 llama-port matvec winners | 74.8 * | `mul_mv_q4_K_f32` port (f32 input, no quantize dispatch) beat the dp4a path 1.4–1.7 ×; quantize dispatches deleted at attnO/ffn-down/lm-head. |
+| PLE-gate fusion + 1-dispatch attention | **89.6–96 steady** | 684 → 567 dispatches; GPU 9.4 → 7.7 ms/token. |
+
+\* 48-token averages were warmup-diluted (first-token pipeline compiles); steady state is
+the honest metric — 111-token run: 89.6 t/s, per-token trace 10.1–10.4 ms.
+
+**Per-token decomposition at end state (~10.3 ms):** GPU 7.7 ms ≈ 2 ms of kernel work at
+90–97 % BW + ~5.7 ms of serialized dispatch latency (567 × ~10 µs); host loop ~2.0 ms;
+argmax readback sync 0.55 ms.
+
+**The three-way comparison that settles H6** (per-token, same box):
+
+| Engine | Bytes read/token | Wall | Effective read BW | t/s |
+|---|---|---|---|---|
+| Hesper (end state) | ~1.26 GB (Q4_K_M) | 10.3 ms | **122 GB/s** | ~90–96 |
+| llama.cpp Metal | ~1.26 GB (Q4_K_M) | 6.4 ms | **197 GB/s** | 156.5 |
+| webml | ~1.12 GB (QAT int4) | ~4.0 ms | **279 GB/s** | ~250 |
+| (peak, M4 Max) | | | 546 GB/s | |
+
+llama.cpp on the QAT model (as q4_0): ~1.12 GB / 197 GB/s ≈ 5.7 ms ≈ **177 t/s** — the
+model swap alone explains ~13 %, not the 250.
+
+**Correctness findings (all fixed; decode is now bit-deterministic across processes,
+verified by 5-run md5):**
+- Flash-attention split-K with cacheLen < numSplits produced an **empty split** whose
+  epilogue aggregated uninitialized threadgroup memory (`40b07ba`).
+- **Clamp-write races in 11 kernels:** the pattern `select(inBounds, x, 0.0)` followed by
+  an unguarded write — the out-of-bounds *index* clamps onto the buffer's last element and
+  races its rightful owner. Smoking gun: ropeDynK (128 pairs in a 256-thread workgroup)
+  flipped the K-cache's last word per process (`1e5a145`). Lesson: select-to-zero guards
+  the value, not the write.
+- **Tint MSL printer bug (open, upstreamable):** a valid-WGSL fused kernel (9 bindings +
+  threadgroup arrays) compiles to MSL whose entry point shadows a buffer parameter
+  (`v_52`) with a local struct const and drops parameters/freq_factors/threadgroup
+  arguments from the inner function call → silent zeros in q heads 4–7 on headDim-512
+  layers. Repro: `HESPER_QKNR=1`. Minimal repro + upstream report pending.
+- Legacy `executeMatMulTranspose` (f32 path) drops the last output element — documented at
+  the golden that caught it; avoid as a reference oracle (use CPU dot).
+
+**Diagnostic kit built (reusable beyond this project):** `HESPER_DUMP_MSL` (per-pipeline
+Tint-MSL capture), `mslBenchSerial` (native-Metal kernel timing — Dawn adds ~35 µs/dispatch
+that drowns small kernels in a Dawn-side bench), `HESPER_GPUBUSY` (per-token dispatch count
++ GPU wall), `HESPER_DECODE_NOBATCH` + cross-process md5 (determinism probe), `MULMV_DET`
+(kernel-isolation determinism), layer-wise golden parity vs llama.cpp eval-callback
+(`scripts/llama_parity/scan_layers.py`).
+
+---
+
+## §4. Conclusions
+
+**C1 — The product bet (verified WebGPU LLM inference) is retired, on our own evidence.**
+Browser distribution is occupied: webml-community ships a hand-written, single-model,
+QAT-int4 engine at 250 t/s, and MLC/web-llm covers the general case. We proved the same
+ceiling is *technically reachable* on the same Dawn/WGSL stack — which is exactly why a
+latecomer has no edge there. Verified inference has no near-term LLM buyer; its
+demonstrated value (robustness-off ≈ 10 %, and killing by construction the bug class we
+paid days for — the 11 clamp-write races) is a development-cost story, not a moat.
+
+**C2 — Where the remaining ~2.5 × to webml actually lives** (settling the "is it the
+model?" question): dispatch count (567 vs ~390 — epilogue fusion everywhere), per-dispatch
+cost (~12 µs vs ~9 µs — runtime leanness above the same Dawn), host loop + argmax sync
+(~2.5 ms vs minimal), and only ~10–15 % from the QAT model format. Nothing is
+language-level: same WGSL, same Dawn, same GPU.
+
+**C3 — The abstraction verdict.** An abstraction layer earns its cost only with all three:
+① ownership/understanding of every layer beneath, ② observability to the bottom,
+③ escape hatches. This project built ③ and partial ②; ① fails permanently at Tint and
+Dawn (foreign codebases — and both bit us: the MSL printer bug, the serial-dispatch
+hardcode). webml and llama.cpp avoid the problem by having no layers they don't see
+through. jax-metal fails ①②③ outright (closed PJRT plugin onto closed MPSGraph, no
+Pallas-on-Metal) — that is our diagnosis of its slowness, same disease worse stage. A DSL
+that is merely a verbose way to write WGSL is strictly worse than WGSL; it pays only via
+bug-class elimination by construction (unrealized here — the 11 races happened *inside*
+the DSL), composition (epilogue combinators — used at 2 sites), and machine sweepability
+(realized — the autotuner).
+
+**C4 — Routing for inference-time learning (TTT) work.** Research belongs in PyTorch, with
+fake-quant evaluation from day one (a bf16-validated learning signal may die on a Q4
+frozen base). Deployment: server → vLLM (it *is* PyTorch under the hood, and per-session
+fast weights map naturally onto its multi-LoRA serving); local/Mac → a llama.cpp fork (a
+fixed TTT recipe needs only ~4–6 hand kernels: transposed-quant matvec for dL/dx, adapter
+outer products, optimizer step). Nothing about TTT requires Hesper.
+
+---
+
+## §5. Salvage — assets that outlive the bet
+
+1. **The autotune framework** (`Hesper/WGSL/Autotune.lean` + `tune/winners.csv`): a Family
+   contract (~50 lines per kernel family) + shared engine (sweep, occupancy probe-prune,
+   golden gate, native timing, top-K refine with incumbent guard, persistent winners,
+   runtime lookup). Generic GPU-tuning value independent of LLMs.
+2. **The GPU-correctness methodology:** the diagnostic kit in §3 plus the hunt patterns —
+   bisect by per-layer/per-stage dumps, CPU-continuation of GPU state, cross-process
+   determinism as a race detector, the grid-roundup / clamp-write audit checklist.
+3. **Upstreamable findings:** the Tint MSL printer bug (minimal repro pending); measured
+   serial-vs-concurrent data for Dawn's dispatch limitation (crbug.com/425987598); the
+   clamp-write race pattern as a lint rule for any WGSL codebase.
+4. **The DEVPLAN method itself** — principles, ★ review gates, negative-result log; the
+   process that made this post-mortem cheap and honest to write.
+
+---
+
+## §6. Process lessons (the cost accounting)
+
+The core hypothesis was falsified *cleanly*: the 8.05 → 90 t/s ladder isolated "not the
+kernels, not the language — the dispatch structure" one variable at a time. But the same
+conclusion was reachable weeks earlier: **principle 7 was violated three times in one
+session** — a fusion plan proposed before reading llama.cpp's kernels; a native-transport
+plan proposed before kernel work was finished; and webml (listed in the original plan's
+A-0 as required reading) actually read only after the user asked "why is webml at
+250 t/s?". Reference reading is cheaper than every experiment it replaces. That, plus
+metric hygiene (steady-state vs warmup-diluted averages), is what the next project
+inherits on day one.
