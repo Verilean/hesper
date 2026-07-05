@@ -49,15 +49,15 @@ def dispFill (device : Device) (kern : Hesper.WGSL.Monad.ShaderM Unit)
   let cfg : Hesper.ExecConfig := { numWorkgroups := (nx, ny, 1), workgroupSize := {x:=256}, extensions := [], diagnostics := [] }
   let r ← IO.mkRef none
   let bufs : List (String × Buffer) := [("out", buf)]
-  Hesper.GPUBackend.executeWithConfigCached device kern bufs cfg 1 r
+  Hesper.GPUBackend.executeWithConfigCached device kern bufs cfg 0 r
 
 def benchKernelMs (device : Device) (kern : Hesper.WGSL.Monad.ShaderM Unit)
     (bufs : List (String × Buffer)) (cfg : Hesper.ExecConfig) (iters : Nat := 50) : IO Float := do
   let r ← IO.mkRef none
-  Hesper.GPUBackend.executeWithConfigCached device kern bufs cfg 1 r
+  Hesper.GPUBackend.executeWithConfigCached device kern bufs cfg 0 r
   let t0 ← IO.monoMsNow
   Hesper.GPUBackend.beginBatch device
-  for _ in [0:iters] do Hesper.GPUBackend.executeWithConfigCached device kern bufs cfg 1 r
+  for _ in [0:iters] do Hesper.GPUBackend.executeWithConfigCached device kern bufs cfg 0 r
   Hesper.GPUBackend.endBatch device
   let t1 ← IO.monoMsNow
   pure ((t1-t0).toFloat / iters.toFloat)
