@@ -99,8 +99,11 @@
      - **ラダー**: 8.05 → **39.9**（WebGPU executeWithConfigCached が cacheKey を捨て毎 dispatch WGSL 全再生成 ~180µs×600 → CUDA 同様 key を権威化、collision 検証 = KEYED=0 と全 1151 golden ビット一致）→ **64.1**（pipeline/bindgroup/kcr の 3 cache が Array 線形スキャン ~450k probe/token → Std.HashMap）→ **68.0**（Q4_K dp4a lm-head 新設: f16 800MB read → Q4_K 226MB、HESPER_LMHEAD_F16 不要化 + VRAM -786MB）
      - **既知問題（棄却済み lever）**: bridge の single-compute-pass 化（HESPER_SINGLE_PASS=1 opt-in、default OFF）— decode L1-attention から bit-divergence（mode 毎に決定的、prefill は不変）= intra-pass hazard がどこかで漏れる。利得 +0.6ms のみと判明（pass 切替は想定より安い）→ hunt は保留。再現: poem 24tok の md5 が SINGLE_PASS=0/1 で異なる
      - **現状内訳** (~14.7ms/token): GPU ~8ms（帯域 floor 見積 ~4ms、FFN matvec 838MB/token が支配）+ host record ~2-3ms + argmax readback 0.6ms + prePLE 0.8ms
-     - **次**: mul_mv Family を Autotune に実装（FFN gate/up/down K=1536 N=6144/12288 dp4a matvec）= フレームワーク汎用性証明の本命 + GPU 2.2× ギャップの主対象。その後 argmax/readback、prePLE
-     - 単体診断ツール: gemma4-profile が argv でモデル指定可に（E2B 対応）
+     - **mul_mv Family 完了（フレームワーク汎用性 = 証明済み）**: `q4kMatVecDP4AGenKernel(R,W)` を substrate に 2 つ目の Family を宣言（~60 行）→ **MATVEC_SWEEP=1 の 1 コマンドで 6 shape sweep+refine が 12 秒**（≤30 分クリア）。全 shape 勝者 = **R1W1**（deployed の 4-warp K 分割は Apple の K=1536-12288 で負け筋: 単体 QKV 0.083→0.047ms、gate+up 0.133→0.073ms）。HESPER_TUNED=1 で winners.csv lookup 駆動統合。
+     - **ただし e2e = NEUTRAL（正直判定、M5 と同じ構図）**: ABAB 66.9/69.3 vs 69.3/67.4。真因を HESPER_GPUBUSY=1（新設 per-token カウンタ）で実測: **684 dispatches/token、GPU submit+wait 9.5ms ≈ 14µs/dispatch = 逐次 dispatch レイテンシが床**。カーネル内部効率は拘束条件でない。
+     - **次（優先順）**: (1) fusion 監査で 684→<400 dispatch（quantize+matvec inline=HESPER_INLINE_QUANT 検証、PLE 5-dispatch チェーン、rope+qkvNorm）、(2) single-pass hazard の bisect（breakPass FFI で層内二分）、(3) fused QKV/gateup kernel の family 化、(4) argmax readback 0.6ms
+     - 単体診断ツール: gemma4-profile が argv でモデル指定可に（E2B 対応）、HESPER_GPUBUSY=1（passes/record/finish/submit+wait per token）
+     - **key 権威化の余波（修正済み `93706ac`）**: bench/sweep ハーネスが全カーネルに literal cacheKey=1 を渡していた — 権威化後は 2 個目以降のカーネルが最初の pipeline で走る事故。bench 系は 0（WGSL-hash 経路）に統一。**契約の明文化: 異なる WGSL を生む呼び出しに同じ非ゼロ key を渡してはならない**
 
 **M1 で確定した実装制約**（原則に準ずる）:
 - **Dawn の SetLoggingCallback は CAPTURELESS lambda 限定**: capture 付き functor は寿命が繰返し発火をカバーせず use-after-free（確率的に quiet 無視 + SIGTRAP/SIGABRT を実測）。状態は global で渡す。
@@ -132,3 +135,5 @@
 | 2026-07-05 | 3 つの dispatch cache を HashMap 化 — 39.9→64.1 t/s | pipeline/bindgroup/kcr が Array 線形スキャン（~450k probe/token）。ホスト記録 5.3→1.1ms |
 | 2026-07-05 | single-compute-pass 化は default OFF で保留 | decode L1-attention から bit-divergence（intra-pass hazard 漏れ、mode 毎決定的・prefill 不変）。利得 +0.6ms のみ。reproducer 記録済（poem 24tok md5） |
 | 2026-07-05 | Q4_K dp4a lm-head を default に — 64.1→68.0 t/s、HESPER_LMHEAD_F16 廃止（opt-in 化） | f16 事前 dequant 800MB read → Q4_K 226MB 直読。VRAM -786MB。prefill/decode 両方 |
+| 2026-07-05 | **mulMvQ4K family: 汎用性証明クリア（2 家族目、1 コマンド 12 秒）だが e2e NEUTRAL** | 全 shape 勝者 R1W1（4-warp は Apple で負け）。真因 = 684 dispatch × ~14µs 逐次レイテンシ床（HESPER_GPUBUSY 実測 GPU 9.5ms）— カーネル内部でなく dispatch 数が拘束。M7 の残りは fusion / dispatch 削減 |
+| 2026-07-05 | device-fed decode（HESPER_DEVICE_FED）は WebGPU で採用せず | 66.7 vs 68.0 t/s（利得なし）+ EOS 挙動差。CUDA graphs 前提の設計 |
