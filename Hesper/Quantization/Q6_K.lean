@@ -963,7 +963,7 @@ def q6kSingleRowDequantScaleKernel (dim : Nat) (scale : Float) : ShaderM Unit :=
     with the full table buffer size — proven to JIT correctly.
     `vocabSize` determines the declared table buffer size. -/
 def q6kTableRowDequantScaleKernel (dim : Nat) (scale : Float)
-    (vocabSize : Nat) (declRows : Nat := 2) : ShaderM Unit := do
+    (vocabSize : Nat) (declRows : Nat := 2) (bakedRow : Option Nat := none) : ShaderM Unit := do
   let gid ← ShaderM.globalId
   let idx := Exp.vec3X gid
 
@@ -979,8 +979,12 @@ def q6kTableRowDequantScaleKernel (dim : Nat) (scale : Float)
   let _params ← ShaderM.declareReadOnlyBuffer "params" (.array (.scalar .u32) 1)
   let _output ← ShaderM.declareOutputBuffer "output" (.array (.scalar .f32) dim)
 
-  -- Read runtime token ID from params[0], use as rowStartU32
-  let tokenId ← ShaderM.readBuffer (ty := .scalar .u32) (n := 1) "params" (Exp.litU32 0)
+  -- Row index: baked literal (per-slot pipelines — batched prefill can't use a params buffer:
+  -- ALL queue writeBuffers complete before ANY recorded dispatch runs, so a shared params slot
+  -- is last-write-wins across positions) or runtime params[0] (decode: one token per submit).
+  let tokenId ← match bakedRow with
+    | some r => pure (Exp.litU32 r)
+    | none => ShaderM.readBuffer (ty := .scalar .u32) (n := 1) "params" (Exp.litU32 0)
 
   ShaderM.if_ (Exp.lt idx (Exp.litU32 dim)) (do
     let val ← dequantQ6KElement dim "table" declaredU32 tokenId idx

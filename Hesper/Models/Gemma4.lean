@@ -1345,7 +1345,8 @@ def forwardPrefillBatch [GPUBackend β] (ctx : β)
     fun name buf nFloats => do
       match goldenDumpDir with
       | some dir =>
-        GPUBackend.endBatch ctx
+        -- tolerant: not all call sites run inside a batch (WebGPU graphs-off path)
+        try GPUBackend.endBatch ctx catch _ => pure ()
         let data ← GPUBackend.readBuffer ctx buf (nFloats * 4).toUSize
         IO.FS.writeBinFile s!"{dir}/{name}.bin" data
       | none => pure ()
@@ -1361,7 +1362,7 @@ def forwardPrefillBatch [GPUBackend β] (ctx : β)
       | some tag =>
         if liActive then
           let dir := (← IO.getEnv "HESPER_ATTN_DUMP_DIR").getD "/tmp"
-          GPUBackend.endBatch ctx
+          try GPUBackend.endBatch ctx catch _ => pure ()
           let data ← GPUBackend.readBuffer ctx buf (nFloats * 4).toUSize
           IO.FS.writeBinFile s!"{dir}/{name}_{tag}.bin" data
       | none => pure ()
