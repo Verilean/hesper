@@ -37,6 +37,13 @@ inductive Mode where
   | capture
   /-- Record ops and SKIP the Dawn dispatch; `commitToken` executes them natively. -/
   | nativeExec
+  /-- FROZEN token replay (CUDA-Graphs analogue): the dispatch sequence recorded by an
+      earlier `nativeExec` token is token-invariant from cacheLen ≥ 8 (identical
+      buffers, grids; positions live in params-buffer CONTENT), so subsequent tokens
+      skip both the Dawn dispatch AND the re-record — the hook returns immediately and
+      `commitToken (reset := false)` re-executes the frozen list. Kills the per-token
+      host record cost. Correctness gate: token sequence must equal the Dawn path. -/
+  | frozen
   deriving BEq, Inhabited
 
 initialize modeRef : IO.Ref Mode ← IO.mkRef .off
@@ -81,6 +88,11 @@ def beginNativeToken : IO Unit := do
   recordedRef.set 0
   missesRef.set []
   modeRef.set .nativeExec
+
+/-- Frozen-mode token: the hook drops every dispatch instantly; the previously
+    recorded list is re-executed by `commitToken`. -/
+def beginFrozenToken : IO Unit := do
+  modeRef.set .frozen
 
 /-- Phase B: execute the recorded token natively (mode 3 = concurrent + hazard barriers
     by default) and drop back to normal Dawn dispatching. Throws if any dispatch was
