@@ -311,3 +311,41 @@ Follow-up (webml quadrant): replay webml's 44 WGSL kernels (already extracted,
 refs/webml-gemma4/wgsl/) with their ~390-dispatch structure through the same harness —
 prediction: serial replay lands ≈ 390 × ~10 µs + kernel work ≈ **~4.5–5.5 ms**,
 matching their ~4 ms/token and proving the op-count lever independently.
+
+### §9 RESULTS (2026-07-06, llama-bench tg64, r=3, same box) — the theory is FALSIFIED
+
+| # | Config | Predicted | Measured | Verdict |
+|---|---|---|---|---|
+| P1 | default | ~156 t/s | **147.6 ± 3.1** (6.78 ms) | ≈ reproduced (tool/box delta vs the older 156.5) |
+| P2 | CONCURRENCY_DISABLE | 90–115 t/s | **145.4 ± 2.8** (6.88 ms) | **FALSIFIED** — concurrency buys ~0.1 ms, not 2–4 ms |
+| P3 | GRAPH_OPTIMIZE_DISABLE | 140–155 | **145.4 ± 3.0** | held, trivially (effect ≈ 0) |
+| P4 | FUSION_DISABLE | 120–145 | **137.6 ± 2.8** (7.27 ms) | held — their op-fusion is worth ~0.5 ms |
+| P4b | both off | — | **141.7 ± 3.0** | ≈ P4 within noise |
+
+**What this kills and what it establishes:**
+
+1. **"llama.cpp's speed = Concurrent + mem_ranges" is DEAD.** Their entire scheduling
+   apparatus (concurrency, reordering, op-fusion) sums to ≲0.6 ms. Fully-serial
+   llama.cpp still does ~142–145 t/s.
+2. Symmetric with our P5 (our serial ≈ our hazard-concurrent): **on this hardware,
+   LLM-decode concurrency is irrelevant in BOTH engines.** Phase A's 3.43 ms
+   no-barrier number was doubly a mirage — it raced dependencies AND measured a
+   schedule no correct engine can use.
+3. Apples-to-apples serial totals: **llama ~6.9 ms vs our native 9.15 ms — and they
+   run ~2× our op count** (~1033 vs 572). The "~10 µs/op universal gap" model of §8
+   is WRONG: their per-op average ≈ 6.5 µs including kernel work; ours ≈ 13 µs.
+   Effective decode read-BW: ours 1.26 GB / 7.5 ms ≈ 168 GB/s vs theirs ≈ 194 GB/s.
+4. ⇒ The remaining deficit is NOT transport (settled §8: ~0.7 ms), NOT scheduling
+   (this table: ~0), NOT op count per se (they have more) — it is **average per-op
+   efficiency**: kernel execution + per-op tail effects (grid/threadgroup shapes,
+   drain), plus our ~1.1 ms host and 0.55 ms argmax.
+5. **Fusion re-priced before round 2** (user gate: "only if proven"): llama's own
+   op-fusion = 0.5 ms over ~1000 ops; our one measured marginal (PLE fusion, −35
+   dispatches) = −0.4 ms ≈ 11 µs/op. A −80-op round 2 projects ≈ −0.9 ms — real but
+   not decisive alone.
+
+**Next diagnostics (before touching fusion):** (a) bisect our 7.5 ms serial GPU by op
+class (grid-size filter in the replay harness) — find where the 13 µs/op average
+lives: the big matvecs (are they really 90–97 % BW *in-token*, streaming cold weights?)
+vs the small-op tail; (b) the webml quadrant: replay their 44 kernels / ~390-dispatch
+token — if it lands ≈ 4 ms serial, fat-kernel efficiency (not count) is what they prove.
