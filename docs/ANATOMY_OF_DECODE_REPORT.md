@@ -282,15 +282,53 @@ op *size* (an ~8 µs dispatch over a 3.9 MB weight cannot hide DRAM latency —
 
 ### 4.4 The remaining per-op budget (per-class profiler)
 
-Replaying each kernel class of our token in isolation (class-sum 6.69 vs whole-token
-6.78 ms — consistent attribution):
+With every systems theory dead (§4.3), what exactly is inside our 6.8 ms of serial
+GPU time? The instrument: the replay harness can re-execute any *subset* of the
+captured token, so we group the 572 dispatches by kernel class (same kernel + same
+grid shape) and time each class alone, back-to-back, serially. Sanity check: the
+per-class times sum to 6.69 ms vs the whole token's 6.78 ms — the attribution is
+consistent (classes barely interact).
 
-| bucket | ops | GPU ms | diagnosis |
+The budget splits into four stories:
+
+**The big matvecs (~146 ops, ~3.7 ms) run at 62 % of peak bandwidth — in a token.**
+Every weight byte of the model flows through these ops (1.26 GB/token), so they set
+most of the floor. Their in-token effective bandwidth is ~340 GB/s against a 546 GB/s
+peak — far below the 90–97 % the isolated bench claimed, for the warm-cache reason
+established in T5. The recoverable slice (toward ~90 %) is ~1.1 ms, and §4.3-T5
+showed parameter tuning cannot reach it; the only identified legal route is
+overlapping the *next* op's weight stream with the current op's compute (§6.1).
+
+**Attention (35 ops, 0.77 ms) launches 8 workgroups on a ~40-core GPU.**
+At decode lengths the attention math is tiny (the cache is short), so each of the 35
+per-layer attention dispatches is essentially a launch: 22 µs apiece with >80 % of
+the machine idle. This is a short-context tax every engine pays — it shrinks in
+relative terms as context grows and the same kernels become bandwidth-bound.
+
+**The single-workgroup tail (141 ops, ~0.70 ms) can't occupy the machine at all.**
+Norms, residual adds, and PLE post-ops each dispatch ONE workgroup over a
+1536-element vector: 2.7–5.4 µs apiece of an almost entirely idle GPU. Individually
+each op is "fine"; collectively they are a tenth of the token. §4.3-T4 showed that
+merely *merging* such ops buys nothing — webml's cure is different in kind: it rides
+these operations on the *tails of the fat matmul kernels that already fill the GPU*
+(epilogue fusion), so the work happens at full occupancy instead of in its own
+under-occupied launch.
+
+**Everything else (~250 small ops, ~1.6 ms)** — rope rotations, KV-cache writes,
+PLE gates — is the same under-occupancy class as the tail.
+
+| bucket | ops | GPU ms | one-line diagnosis |
 |---|---|---|---|
-| big matvecs | ~146 | ~3.7 | 340 GB/s in-token (62 % peak); recoverable only by *overlapping the next op's weight stream* (§6) — not by tuning |
-| attention (grid 8×1×1) | 35 | 0.77 | 8 workgroups on a ~40-core GPU: launch-bound at short context, every engine pays it |
-| 1-workgroup norm/add tail | 141 | ~0.70 | GPU essentially idle per op; webml's cure is riding fat kernels' occupancy (epilogue fusion), not fewer boundaries |
+| big matvecs | ~146 | ~3.7 | 62 % of peak when streaming cold — op-size physics |
+| attention | 35 | 0.77 | launch-bound at short context (8 workgroups) |
+| 1-workgroup norm/add tail | 141 | ~0.70 | GPU idle per op; needs epilogue fusion, not merging |
 | other small ops | ~250 | ~1.6 | same under-occupancy class |
+
+**So the "per-op efficiency" residual has three names**: cold-stream bandwidth at
+small op sizes (~1.1 ms, reachable only by weight-prefetch overlap), under-occupied
+small ops (~2.3 ms total, reachable only by webml-style epilogue fusion into
+occupying kernels), and short-context attention (0.77 ms, largely irreducible at
+this workload). Nothing on this list is a runtime, a scheduler, or a tuning table.
 
 ## 5. The natural experiment: one author, three stacks
 
