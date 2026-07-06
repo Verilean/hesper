@@ -333,6 +333,24 @@ first" and "prove it." A harness for AI authors should force both mechanically
 (mandatory reference summaries before design tasks; pre-registered predictions before
 measurements) — we adopted both as protocol only after paying for each violation.
 
+**The companion failure mode: seduction by "system overhead" illusions.** Four
+times in this record the author-model attributed the gap to a systems mechanism —
+each one plausible, each promising a cheap structural fix, each falsified by a
+measurement it should have demanded first:
+the *Dawn-serialization* theory (predicted ~4 ms recoverable; native replay priced
+the transport at 0.7 ms), the *concurrency/mem_ranges* theory (pre-registered
+90–115 tok/s for serial llama.cpp; its own toggle measured 145 — the entire
+scheduling apparatus is ≲0.6 ms), the *op-count/−10 µs-per-dispatch* theory
+(fusion round 2 deleted 28 dispatches for ±0 ms), and the *warm-bench belief* that
+the kernels were already at 90–97 % of bandwidth (cold-stream benching showed
+13–26 % flattery). The race-mirage number (3.43 ms under no-barrier replay) fed the
+first two illusions for a full day. The pattern is worth naming: **a mechanism story
+with a villain — the runtime, the scheduler, the dispatcher — is more attractive to
+generate than the arithmetic answer ("your kernels do less per byte"), for an LLM
+author and arguably for human engineers too.** Pre-registered predictions plus
+ablation on the real engine were the antidote; both entered the protocol only after
+the illusions had each collected their fee.
+
 The last row is the punchline for autotuning: **the fast loop we automated (parameter
 search) is orthogonal to where the wins live.** Every productive move in this record —
 fat epilogue-fused kernels, operand-format changes, deleting round-trips, the frozen
