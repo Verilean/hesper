@@ -545,17 +545,27 @@ kernel craft — fat, epilogue-fused, low-precision-operand kernels sized to occ
 machine — and by nothing else we could measure. A verified DSL could in principle have
 eliminated the bug classes that consumed most of our debugging time, but nobody is
 buying that in this market, and it does not make tokens faster. And the deepest cost of the layers was
-never the microseconds: it was the iteration frequency — the same author produced a
-1.7×-faster-than-llama.cpp engine in half an hour on a seconds-TAT stack, and could
-not reach parity in days on ours. The transferable outputs are the replay methodology
-(three capture adapters + one comparable harness), the falsification protocol that
-repeatedly outperformed our own expert intuition, and this anatomy itself.
+never the microseconds. It was paid twice in the author's own currency: in
+**iteration cadence** (the same author produced a 1.7×-faster-than-llama.cpp engine
+in half an hour on a seconds-TAT stack, and could not reach parity in days on ours)
+and in **context** (webml's entire engine fits in one file the author can hold whole;
+ours spanned dozens of modules plus two foreign layers the author could not see into
+at all). These are the two design axes the next tool must satisfy together — *small
+enough to know entirely, fast enough to try anything* — and for an AI author they are
+literally the same budget: tokens and turns. The transferable outputs are the replay
+methodology (three capture adapters + one comparable harness), the falsification
+protocol that repeatedly outperformed our own expert intuition, and this anatomy
+itself.
 
 ---
 
 ## Appendix A. Next-architecture playbook: environment per use case
 
-*Every recommendation below is tied to a measurement in this report, not taste.*
+The report's prescriptions (§7) are principles; this appendix is the practical
+version: six situations a team is actually in, and for each, the thinnest environment
+that satisfies the two axes from the conclusion — fits in the author's context, and
+iterates in seconds. *Every recommendation is tied to a measurement in this report,
+not taste.*
 
 One stack correction to the common advice first: **Deno's WebGPU is wgpu/naga (Rust),
 not Dawn/Tint** — a different WGSL→MSL compiler than Chrome. Usually fine (both are
@@ -590,13 +600,20 @@ collector-server lifecycle (§9c cost us several detours). Architecture per repo
    as "fuse these two ops / change the operand format", not "try workgroup sizes" —
    parameters are a cheap inner sweep the harness automates (0.118 s/variant).
 
-### Use case 2 — Copilot-style (human-driven) kernel work
+### Use case 2 — Copilot-style kernel work (human decides, AI assists)
 
-Same harness, plus two things the autonomous loop doesn't need: a persistent watch
-mode (`deno run --watch` re-times on save — keeps the human's loop at editor cadence)
-and the per-class profiler view (§12) so the human picks targets by measured budget,
-not intuition. The incumbent-guard idea (§ autotune) applies to humans too: the
-deployed config always competes before a "win" ships.
+The counterpart to Use case 1: here a human engineer drives — choosing what to
+optimize and judging trade-offs — while the AI drafts kernels and the harness
+measures. The environment is the same as Use case 1, plus two things an autonomous
+loop doesn't need:
+- a **watch mode** (`deno run --watch`: save the kernel file, see correctness +
+  timing a second later), so the human's edit loop stays at editor cadence;
+- the **per-class profiler view** (§4.4) on screen, so targets are picked from the
+  measured budget rather than intuition — this record shows intuition loses (§4.3).
+
+One autonomous-loop idea transfers to humans unchanged: the incumbent guard — the
+currently-deployed kernel always competes in the final timing, so a "win" that only
+beat a strawman can never ship.
 
 ### Use case 3 — new-model bring-up (correctness first)
 
