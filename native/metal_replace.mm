@@ -1490,6 +1490,53 @@ extern "C" lean_obj_res lean_hesper_replay_run(
     }
 }
 
+// Per-op-class profiling (DEVPLAN §12): replay only the ops whose indices are in
+// `idx_array` (u32 indices into the recorded sequence, barriers not counted), serial,
+// `iters` times. The Lean side records op names in order, groups indices by kernel
+// class, and calls this per class → a GPU-time budget of the token by kernel class.
+extern "C" lean_obj_res lean_hesper_replay_run_subset(
+    b_lean_obj_arg idx_array, uint32_t iters, lean_obj_res /* unit */) {
+    @autoreleasepool {
+        id<MTLDevice> mtl = g_replayMtlDevice;
+        if (!mtl) return lean_io_result_mk_error(lean_mk_io_user_error(lean_mk_string("replay_subset: nothing recorded")));
+        auto& all = hesper_replay_ops();
+        // dispatch-index view (skip barrier markers)
+        std::vector<HesperReplayOp*> dispatches;
+        for (auto& op : all) if (op.pso) dispatches.push_back(&op);
+        std::vector<HesperReplayOp*> sel;
+        size_t n = lean_array_size(idx_array);
+        for (size_t i = 0; i < n; i++) {
+            uint32_t k = lean_unbox_uint32(lean_array_get_core(idx_array, i));
+            if (k < dispatches.size()) sel.push_back(dispatches[k]);
+        }
+        if (sel.empty()) return lean_io_result_mk_error(lean_mk_io_user_error(lean_mk_string("replay_subset: empty selection")));
+        if (!g_mslQueue) g_mslQueue = [mtl newCommandQueue];
+        if (iters == 0) iters = 1;
+        double best = 1e30, sum = 0.0;
+        for (uint32_t r = 0; r < iters; r++) {
+            id<MTLCommandBuffer> cb = [g_mslQueue commandBuffer];
+            id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];  // serial
+            for (auto* op : sel) {
+                [enc setComputePipelineState:op->pso];
+                for (size_t i = 0; i < op->bufs.size(); i++) [enc setBuffer:op->bufs[i] offset:0 atIndex:i];
+                if (op->tgBytes > 0)
+                    [enc setThreadgroupMemoryLength:((op->tgBytes + 15u) & ~15u) atIndex:0];
+                [enc dispatchThreadgroups:MTLSizeMake(op->gx, op->gy, op->gz)
+                    threadsPerThreadgroup:MTLSizeMake(op->tx, op->ty, op->tz)];
+            }
+            [enc endEncoding];
+            [cb commit];
+            [cb waitUntilCompleted];
+            double ms = ([cb GPUEndTime] - [cb GPUStartTime]) * 1000.0;
+            best = std::min(best, ms);
+            sum += ms;
+        }
+        char buf[128];
+        snprintf(buf, sizeof(buf), "count=%zu min=%.4f avg=%.4f", sel.size(), best, sum / iters);
+        return lean_io_result_mk_ok(lean_mk_string(buf));
+    }
+}
+
 extern "C" lean_obj_res lean_hesper_mtl_device_name(b_lean_obj_arg device_obj, lean_obj_res /* unit */) {
     wgpu::Device* device = mr_extract_device(device_obj);
     if (!device || !device->Get()) {

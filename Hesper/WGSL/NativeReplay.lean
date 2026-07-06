@@ -49,6 +49,8 @@ inductive Mode where
 initialize modeRef : IO.Ref Mode ← IO.mkRef .off
 initialize recordedRef : IO.Ref Nat ← IO.mkRef 0
 initialize missesRef : IO.Ref (List String) ← IO.mkRef []
+/-- Kernel name per recorded dispatch, in record order (drives per-class profiling). -/
+initialize namesRef : IO.Ref (Array String) ← IO.mkRef #[]
 
 structure CacheEntry where
   msl : String
@@ -76,6 +78,7 @@ def startCapture : IO Unit := do
   replayReset
   recordedRef.set 0
   missesRef.set []
+  namesRef.set #[]
   modeRef.set .capture
 
 def stopCapture : IO (Nat × List String) := do
@@ -87,6 +90,7 @@ def beginNativeToken : IO Unit := do
   replayReset
   recordedRef.set 0
   missesRef.set []
+  namesRef.set #[]
   modeRef.set .nativeExec
 
 /-- Frozen-mode token: the hook drops every dispatch instantly; the previously
@@ -204,15 +208,18 @@ private def emit (device : Device) (key : UInt64) (e : CacheEntry) (dbgName : St
     wgX.toUInt32 wgY.toUInt32 wgZ.toUInt32
     e.tgBytes e.writeMask key
   recordedRef.modify (· + 1)
+  -- Grid dims disambiguate the many non-ce dispatches that share funcName "main"
+  -- (matvecs, attention): same kernel class + shape ⇒ same (name, grid) bucket.
+  namesRef.modify (·.push s!"{dbgName}@{gx}x{gy}x{gz}/{wgX}")
 
 /-- Steady-state record: cache hit on the caller's authoritative key ⇒ record with no
     WGSL/tint work at all. Returns false on miss (caller falls back to `recordSlow`). -/
-def tryRecordFast (device : Device) (key : UInt64)
+def tryRecordFast (device : Device) (key : UInt64) (dbgName : String)
     (namedBuffers : List (String × Buffer))
     (numWorkgroups : Nat × Nat × Nat) (wgX wgY wgZ : Nat) : IO Bool := do
   if key == 0 then return false
   match (← cacheRef.get).get? key with
-  | some e => emit device key e s!"key{key}" namedBuffers numWorkgroups wgX wgY wgZ; return true
+  | some e => emit device key e dbgName namedBuffers numWorkgroups wgX wgY wgZ; return true
   | none => return false
 
 /-- Cold-path record: run tint, parse the entry/bindings, compute the write mask from
@@ -235,6 +242,36 @@ def recordSlow (device : Device) (key : UInt64) (wgsl : String) (dbgName : Strin
     writeMask, perm }
   cacheRef.modify (·.insert key e)
   emit device key e dbgName namedBuffers numWorkgroups wgX wgY wgZ
+
+/-- DEVPLAN §12: per-kernel-class GPU-time budget of the captured token. Groups the
+    recorded dispatches by kernel name and times each class alone (serial, back-to-back)
+    — an approximation (no inter-class cache interactions) whose sum should land near
+    the whole-token serial time. Returns one line per class, largest first. -/
+def profileClasses (iters : UInt32 := 30) : IO String := do
+  let names ← namesRef.get
+  if names.isEmpty then return "profileClasses: no recorded names"
+  let mut groups : Std.HashMap String (Array UInt32) := {}
+  for i in [0:names.size] do
+    let n := names[i]!
+    groups := groups.insert n ((groups.getD n #[]).push i.toUInt32)
+  let parseF := fun (s : String) =>
+    match s.splitOn "." with
+    | [a] => (a.toNat?.getD 0).toFloat
+    | a :: b :: _ =>
+      (a.toNat?.getD 0).toFloat + (b.toNat?.getD 0).toFloat / (10.0 ^ b.length.toFloat)
+    | _ => 0.0
+  let mut rows : Array (Float × String) := #[]
+  for (n, idxs) in groups.toList do
+    let r ← replayRunSubset idxs iters
+    -- parse "count=<n> min=<ms> avg=<ms>"
+    let msVal := match r.splitOn "min=" with
+      | [_, rest] => parseF ((rest.splitOn " ").head!)
+      | _ => 0.0
+    rows := rows.push (msVal, s!"{n}: ops={idxs.size} {r}")
+  let sorted := rows.qsort (fun a b => a.1 > b.1)
+  let total := sorted.foldl (fun acc r => acc + r.1) 0.0
+  let body := String.intercalate "\n" (sorted.toList.map (·.2))
+  return s!"{body}\nclass-sum(min)={total}ms"
 
 /-- Run the captured token natively in all four timing modes and return a report.
     Device-free: the MTLDevice was stashed at record time. TIMING ONLY. -/

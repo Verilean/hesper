@@ -627,7 +627,7 @@ def executeShaderNamed
     return
   if replayMode != .off then
     let key := cacheKey.getD 0
-    let hit ← NativeReplay.tryRecordFast device key namedBuffers
+    let hit ← NativeReplay.tryRecordFast device key config.funcName namedBuffers
       config.numWorkgroups config.workgroupSize.x config.workgroupSize.y config.workgroupSize.z
     unless hit do
       let wgsl := compileToWGSL computation config.funcName config.workgroupSize config.extensions config.diagnostics

@@ -123,6 +123,12 @@ opaque replayRun (mode iters : UInt32) : IO String
 @[extern "lean_hesper_replay_exec"]
 opaque replayExec (mode : UInt32) : IO String
 
+/-- DEVPLAN §12 per-op-class profiling: replay ONLY the given dispatch indices
+    (into the recorded sequence, barriers excluded), serially, `iters` times.
+    Returns "count=<n> min=<ms> avg=<ms>". -/
+@[extern "lean_hesper_replay_run_subset"]
+opaque replayRunSubset (indices : @& Array UInt32) (iters : UInt32) : IO String
+
 /-- metal_replacer STEP 4: Apple's tuned MPS f16 matmul (C=A·Bᵀ, our reg-matmul shape) as the CEILING —
     returns "ms/call | GFLOPS | %peak". Diff vs the WGSL reg (harness) at the same shape to quantify the
     WGSL→Tint→Metal gap. macOS DEBUG/REFERENCE only. See METAL_REPLACER_INTEGRATION.md. -/

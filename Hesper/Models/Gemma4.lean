@@ -3801,6 +3801,14 @@ def generate [GPUBackend β] (ctx : β) (model : Gemma4Model (GPUBackend.Buf β)
       IO.println (← Hesper.WGSL.NativeReplay.runAll 20)
     catch e =>
       IO.println s!"[replay] FAILED: {e}"
+  -- DEVPLAN §12: per-kernel-class GPU budget of the recorded token (needs a recorded
+  -- list, i.e. HESPER_NATIVE_REPLAY=<n> or HESPER_NATIVE_DECODE=<n> in this run).
+  if (← IO.getEnv "HESPER_NATIVE_PROFILE").isSome then
+    IO.println "[profile] per-kernel-class GPU time (serial, min of 30):"
+    try
+      IO.println (← Hesper.WGSL.NativeReplay.profileClasses 30)
+    catch e =>
+      IO.println s!"[profile] FAILED: {e}"
 
   return tokens
 
