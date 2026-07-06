@@ -1,0 +1,70 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="760" height="430" viewBox="0 0 760 430" font-family="Helvetica, Arial, sans-serif">
+  <style>
+    .hdr { font-size: 15px; font-weight: bold; fill: #222; text-anchor: middle; }
+    .box { fill: #eef2fa; stroke: #4472c4; stroke-width: 1.2; }
+    .foreign { fill: #fdeeee; stroke: #c0504d; stroke-width: 1.2; }
+    .metal { fill: #e8e8e8; stroke: #777; stroke-width: 1.2; }
+    .bt { font-size: 12.5px; fill: #222; text-anchor: middle; }
+    .cap { font-size: 11.5px; fill: #555; }
+    .tap { font-size: 11.5px; fill: #b03030; text-anchor: middle; }
+    .arrow { stroke: #b03030; stroke-width: 1.5; fill: none; marker-end: url(#ah); }
+  </style>
+  <defs>
+    <marker id="ah" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto">
+      <path d="M0,0 L8,4 L0,8 z" fill="#b03030"/>
+    </marker>
+  </defs>
+
+  <text class="hdr" x="130" y="26">Hesper</text>
+  <text class="hdr" x="380" y="26">llama.cpp</text>
+  <text class="hdr" x="630" y="26">webml</text>
+
+  <!-- Hesper column: 6 boxes, x 30..230 -->
+  <g>
+    <rect class="box" x="30" y="38"  width="200" height="30"/><text class="bt" x="130" y="58">Lean 4 host loop</text>
+    <rect class="box" x="30" y="72"  width="200" height="30"/><text class="bt" x="130" y="88">ShaderM DSL</text><text class="cap" x="72" y="99">(≅ WGSL, 1:1 — no lift)</text>
+    <rect class="box" x="30" y="106" width="200" height="30"/><text class="bt" x="130" y="126">WGSL text</text>
+    <rect class="foreign" x="30" y="140" width="200" height="30"/><text class="bt" x="130" y="156">Dawn</text><text class="cap" x="60" y="167">validation · serial encode</text>
+    <rect class="foreign" x="30" y="174" width="200" height="30"/><text class="bt" x="130" y="194">Tint → MSL</text>
+    <rect class="metal" x="30" y="208" width="200" height="30"/><text class="bt" x="130" y="228">Metal</text>
+  </g>
+
+  <!-- llama column: 3 boxes bottom-aligned -->
+  <g>
+    <rect class="box" x="280" y="140" width="200" height="30"/><text class="bt" x="380" y="160">C++ host loop</text>
+    <rect class="box" x="280" y="174" width="200" height="30"/><text class="bt" x="380" y="194">hand-written MSL</text>
+    <rect class="metal" x="280" y="208" width="200" height="30"/><text class="bt" x="380" y="228">Metal</text>
+  </g>
+
+  <!-- webml column: 6 boxes -->
+  <g>
+    <rect class="box" x="530" y="38"  width="200" height="30"/><text class="bt" x="630" y="58">JS host loop</text>
+    <rect class="box" x="530" y="72"  width="200" height="30"/><text class="bt" x="630" y="92">hand WGSL (templates)</text>
+    <rect class="box" x="530" y="106" width="200" height="30"/><text class="bt" x="630" y="126">WGSL text</text>
+    <rect class="foreign" x="530" y="140" width="200" height="30"/><text class="bt" x="630" y="156">Chrome / Dawn</text><text class="cap" x="568" y="167">separate GPU process</text>
+    <rect class="foreign" x="530" y="174" width="200" height="30"/><text class="bt" x="630" y="194">Tint → MSL</text>
+    <rect class="metal" x="530" y="208" width="200" height="30"/><text class="bt" x="630" y="228">Metal</text>
+  </g>
+
+  <!-- capture taps -->
+  <text class="tap" x="130" y="262">hook at the dispatch</text>
+  <text class="tap" x="130" y="276">choke point (Lean)</text>
+  <text class="tap" x="380" y="262">patch on the 8 Metal</text>
+  <text class="tap" x="380" y="276">encoder wrappers</text>
+  <text class="tap" x="630" y="262">monkey-patched WebGPU API</text>
+  <text class="tap" x="630" y="276">in headless Chrome + buffer mirror</text>
+
+  <path class="arrow" d="M130,282 L130,318 L340,338"/>
+  <path class="arrow" d="M380,282 L380,330"/>
+  <path class="arrow" d="M630,282 L630,318 L420,338"/>
+
+  <!-- harness -->
+  <rect x="230" y="340" width="300" height="52" fill="#fff7e6" stroke="#c8871a" stroke-width="1.5"/>
+  <text class="bt" x="380" y="362" font-weight="bold">BARE-METAL REPLAY HARNESS</text>
+  <text class="cap" x="252" y="380">one ~100-line loop · serial / concurrent / hazard / subsets</text>
+
+  <!-- legend -->
+  <rect x="30" y="404" width="13" height="13" class="box"/><text class="cap" x="49" y="415">our code / inspectable</text>
+  <rect x="200" y="404" width="13" height="13" class="foreign"/><text class="cap" x="219" y="415">foreign layer (misbehaved during the campaign)</text>
+  <rect x="500" y="404" width="13" height="13" class="metal"/><text class="cap" x="519" y="415">hardware/driver</text>
+</svg>

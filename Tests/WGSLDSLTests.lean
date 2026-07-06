@@ -200,7 +200,9 @@ def testMathFunctions : TestSeq :=
   test "exp(x)" (expExpr.toWGSL == "exp(x)") ++
   test "sin(x)" (sinExpr.toWGSL == "sin(x)") ++
   test "cos(x)" (cosExpr.toWGSL == "cos(x)") ++
-  test "tanh(x)" (tanhExpr.toWGSL == "tanh(x)") ++
+  -- tanh emits a NaN-guard clamp: Dawn compiles MSL with math_mode(relaxed), where
+  -- Metal's fast tanh returns NaN for |x| ≳ 44 (Exp.lean). tanh(±20) = ±1 within f32 ulp.
+  test "tanh(x)" (tanhExpr.toWGSL == "tanh(clamp(x, -20.0, 20.0))") ++
   test "pow(x, y)" (powExpr.toWGSL == "pow(x, y)") ++
   test "select(x > 0, x, 0)" (selectExpr.toWGSL == "select(0.0, x, (x > 0.0))")
 
