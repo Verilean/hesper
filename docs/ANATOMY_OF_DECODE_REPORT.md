@@ -24,9 +24,11 @@ each measure at ≲0.7 ms/token. Kernels plus the op graph set the floor; every 
 runtime is a rounding term.
 
 **And yet the stack lost — which localizes the real cost.** The same author (the
-Fable 5 model) wrote webml's kernels to 250 tok/s in ~30 minutes on a
-seconds-turnaround stack, and could not reach parity in days inside ours (119 tok/s
-vs llama.cpp's 147, DiffusionGemma at ~0.44× per-step). With execution overhead
+Fable 5 model) wrote webml's kernels in ~30 minutes on a seconds-turnaround stack,
+and could not reach parity in days inside ours. Concretely, on Gemma-4-E2B a decoded
+token costs **8.4 ms on our best path vs 6.8 ms (llama.cpp) vs ~4.0 ms (webml)** — a
+256-token reply in ~2.2 s vs ~1.7 s vs ~1.0 s; on DiffusionGemma, one diffusion step
+costs **780–880 ms on ours vs 363 ms on llama.cpp** after a multi-day campaign. With execution overhead
 eliminated as the explanation by measurement, what remains is **iteration time**:
 structural kernel changes — the only kind that mattered — pay a minutes-long compile
 loop, while the thin stack pays seconds. The abstraction tax is turnaround time, not
