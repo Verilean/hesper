@@ -240,3 +240,40 @@ A-0 as required reading) actually read only after the user asked "why is webml a
 250 t/s?". Reference reading is cheaper than every experiment it replaces. That, plus
 metric hygiene (steady-state vs warmup-diluted averages), is what the next project
 inherits on day one.
+
+---
+
+## §8. Post-verdict validation: Experiment 2 (native Metal transport), 2026-07-06
+
+The user's challenge after the verdict: *"if the conclusion is right, removing the
+abstraction layer must produce a near-fastest engine."* Implemented and measured
+(commits `ff2286a`, `7798b56`); the test both **validated the direction and corrected
+C2's magnitude**.
+
+**Phase A (timing replay).** All 572 dispatches of one decode token captured (Tint-CLI
+MSL, Dawn-backed MTLBuffers, 0 misses) and replayed natively, identical kernels:
+serial 6.78 ms (≈ Dawn's 7.7 — sanity), concurrent no-barrier 3.43 ms, per-layer
+barriers 3.92 ms.
+
+**Phase B (real execution) — and the correction.** Automatic hazard analysis
+(llama-style, whole-buffer) inserts **547 barriers over 572 ops**: the decode dataflow
+is a **width-1 dependency chain** — our own fusion (fused QKV, fused gate/up) removed
+the q/k/v & gate/up parallelism llama.cpp still has. So the 3.43 ms was a **race
+mirage**; honest concurrency ≈ serial. `HESPER_NATIVE_DECODE=1` runs every decode
+token natively on Dawn's own MTLQueue (key-indexed PSO + cached binding permutation →
+steady-state record cost is a u64 probe): **token-sequence-identical to the Dawn path**
+over 32 tokens, total 9.15 ms/token vs Dawn 9.8 ms (+7 %).
+
+**Revised decomposition (native serial, steady):** GPU 7.5 ms = ~2 ms kernel work +
+**~5.5 ms of inter-dispatch gaps (~10 µs/op even natively)**. The dispatch layer's
+recoverable waste was ~0.7 ms (Dawn encoder overhead), not ~3.8 ms; the dominant term
+is the **op count itself** — every op removed ≈ −10 µs. C2 stands in direction
+(nothing is language-level; transport + structure), but the actionable lever is
+**fusion** (572 → ~390 ops ≈ −1.8 ms) plus host trim and argmax deferral — the webml
+lesson re-derived from our own hardware counters. llama.cpp's 6.4 ms *total* remains
+the yardstick; the road there is op-count, not concurrency.
+
+Side finds: gemma4-inference dies at startup on WebGPU unless `HESPER_CUDA_GRAPHS=0`
+(graphs default-on hits the CUDA stub); FFI error objects must be
+`lean_mk_io_user_error`-wrapped or the top-level error printer segfaults; Tint renames
+entry points (`main` → `v`) in MSL.
