@@ -616,6 +616,29 @@ def executeShaderNamed
     (cacheKey : Option UInt64 := none)
     (preparedRef : Option (IO.Ref (Option PreparedDispatch)) := none)
     : IO Unit := do
+  -- Exp 2 (native replay): when a capture or native-exec token is active, mirror this
+  -- dispatch into the native replay list. Steady state hits the key-indexed cache (no
+  -- WGSL regeneration); cold kernels take the tint-CLI path once. In nativeExec mode
+  -- the Dawn dispatch below is SKIPPED — commitToken executes the recorded token.
+  let replayMode ← NativeReplay.currentMode
+  if replayMode != .off then
+    let key := cacheKey.getD 0
+    let hit ← NativeReplay.tryRecordFast device key namedBuffers
+      config.numWorkgroups config.workgroupSize.x config.workgroupSize.y config.workgroupSize.z
+    unless hit do
+      let wgsl := compileToWGSL computation config.funcName config.workgroupSize config.extensions config.diagnostics
+      let key := if key != 0 then key else hash wgsl
+      let st := ShaderM.exec computation
+      let writable := st.declaredBuffers.filterMap fun d =>
+        match d.2.2 with
+        | .readWrite => some d.1
+        | .read => none
+      NativeReplay.recordSlow device key wgsl config.funcName namedBuffers writable
+        (NativeReplay.sharedBytes st.sharedVars)
+        config.numWorkgroups config.workgroupSize.x config.workgroupSize.y config.workgroupSize.z
+    if replayMode == .nativeExec then
+      return
+
   -- Check cache: use cacheKey if provided (skips WGSL regeneration), otherwise generate and hash
   let cache ← pipelineCacheRef.get
   let (sourceHash, needsCompile) ← match cacheKey with
@@ -699,15 +722,6 @@ def executeShaderNamed
   -- Save PreparedDispatch for future instant replay (first token only)
   if let some ref := preparedRef then
     ref.set (some { pipeline, bindGroup })
-
-  -- Exp 2 Phase A: while capturing, mirror this dispatch into the native replay
-  -- sequence (regenerates WGSL unconditionally — capture is a one-token mode, the
-  -- ~100 µs × 567 extra cost is irrelevant and the normal dispatch below still runs).
-  if ← NativeReplay.isCapturing then
-    let wgsl := compileToWGSL computation config.funcName config.workgroupSize config.extensions config.diagnostics
-    let tgBytes := NativeReplay.sharedBytes (ShaderM.exec computation).sharedVars
-    NativeReplay.recordDispatch device wgsl config.funcName namedBuffers tgBytes
-      config.numWorkgroups config.workgroupSize.x config.workgroupSize.y config.workgroupSize.z
 
   -- Check if we're in batch mode
   let (wx, wy, wz) := config.numWorkgroups
