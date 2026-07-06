@@ -1,0 +1,205 @@
+diff --git a/ggml/src/ggml-metal/ggml-metal-device.m b/ggml/src/ggml-metal/ggml-metal-device.m
+index a7cbc60..c8aa7af 100644
+--- a/ggml/src/ggml-metal/ggml-metal-device.m
++++ b/ggml/src/ggml-metal/ggml-metal-device.m
+@@ -456,6 +456,100 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_compile_pipeline(ggml_
+ // MTLComputeCommandEncoder wrapper
+ //
+ 
++// ===== HESPER REPLAY EXPERIMENT (LOCAL FORK ONLY — never upstream) =========================
++// Capture the raw encode-command stream of the GGML_METAL_REPLAY=<n>-th encoder and, at its
++// end_encoding, re-encode it 20x into fresh command buffers, timing GPUStart/End:
++//   serial       — plain encoder, barriers skipped (the bare cost of kernels+graph)
++//   as-recorded  — concurrent encoder, barriers replayed (llama's own schedule)
++// GGML_METAL_REPLAY_LOG=1 prints every encoder's index + dispatch count (discovery pass).
++// Timing-only: replays read whatever is in the buffers. See Hesper DEVPLAN §9.
++enum hrp_type { HRP_PIPELINE, HRP_BYTES, HRP_BUFFER, HRP_TGMEM, HRP_DISPATCH, HRP_BARRIER };
++struct hrp_cmd {
++    int type;
++    id  obj;          // retained PSO / MTLBuffer
++    size_t offs;      // buffer offset
++    int idx;
++    void * blob;      // setBytes payload (malloc'd)
++    size_t blob_size; // setBytes length / tg mem size
++    int g0, g1, g2, t0, t1, t2;
++};
++static struct hrp_cmd * hrp_cmds = NULL;
++static int  hrp_n = 0, hrp_cap = 0;
++static int  hrp_target = -2;   // -2 uninit, -1 disabled
++static int  hrp_counter = -1;
++static bool hrp_active = false;
++static bool hrp_log = false;
++static int  hrp_disp_in_encoder = 0;
++static id<MTLCommandQueue> hrp_queue = nil;
++
++static void hrp_init_env(void) {
++    if (hrp_target != -2) return;
++    const char * v = getenv("GGML_METAL_REPLAY");
++    hrp_target = v ? atoi(v) : -1;
++    hrp_log = getenv("GGML_METAL_REPLAY_LOG") != NULL;
++}
++
++static void hrp_push(struct hrp_cmd c) {
++    if (hrp_n == hrp_cap) {
++        hrp_cap = hrp_cap ? hrp_cap * 2 : 8192;
++        hrp_cmds = realloc(hrp_cmds, hrp_cap * sizeof(struct hrp_cmd));
++    }
++    hrp_cmds[hrp_n++] = c;
++}
++
++static double hrp_replay_once(bool concurrent) {
++    id<MTLCommandBuffer> cb = [hrp_queue commandBuffer];
++    id<MTLComputeCommandEncoder> enc;
++    if (concurrent) {
++        enc = [cb computeCommandEncoderWithDispatchType: MTLDispatchTypeConcurrent];
++    } else {
++        enc = [cb computeCommandEncoder];
++    }
++    for (int i = 0; i < hrp_n; i++) {
++        struct hrp_cmd * c = &hrp_cmds[i];
++        switch (c->type) {
++            case HRP_PIPELINE: [enc setComputePipelineState:(id<MTLComputePipelineState>)c->obj]; break;
++            case HRP_BYTES:    [enc setBytes:c->blob length:c->blob_size atIndex:c->idx]; break;
++            case HRP_BUFFER:   [enc setBuffer:(id<MTLBuffer>)c->obj offset:c->offs atIndex:c->idx]; break;
++            case HRP_TGMEM:    [enc setThreadgroupMemoryLength:c->blob_size atIndex:c->idx]; break;
++            case HRP_DISPATCH: [enc dispatchThreadgroups:MTLSizeMake(c->g0, c->g1, c->g2)
++                                    threadsPerThreadgroup:MTLSizeMake(c->t0, c->t1, c->t2)]; break;
++            case HRP_BARRIER:  if (concurrent) [enc memoryBarrierWithScope:MTLBarrierScopeBuffers]; break;
++        }
++    }
++    [enc endEncoding];
++    [cb commit];
++    [cb waitUntilCompleted];
++    return ([cb GPUEndTime] - [cb GPUStartTime]) * 1000.0;
++}
++
++static void hrp_run_replays(void) {
++    int n_disp = 0, n_barrier = 0;
++    for (int i = 0; i < hrp_n; i++) {
++        if (hrp_cmds[i].type == HRP_DISPATCH) n_disp++;
++        if (hrp_cmds[i].type == HRP_BARRIER)  n_barrier++;
++    }
++    for (int mode = 0; mode < 2; mode++) {
++        bool concurrent = (mode == 1);
++        double best = 1e30, sum = 0.0;
++        const int iters = 20;
++        for (int r = 0; r < iters; r++) {
++            double ms = hrp_replay_once(concurrent);
++            if (ms < best) best = ms;
++            sum += ms;
++        }
++        fprintf(stderr, "[hrp] REPLAY encoder=%d ops=%d barriers=%d mode=%s min=%.4f avg=%.4f ms\n",
++                hrp_counter, n_disp, n_barrier, concurrent ? "as-recorded-concurrent" : "serial",
++                best, sum / iters);
++    }
++    for (int i = 0; i < hrp_n; i++) {
++        if (hrp_cmds[i].obj)  [hrp_cmds[i].obj release];
++        if (hrp_cmds[i].blob) free(hrp_cmds[i].blob);
++    }
++    hrp_n = 0;
++}
++// ===== END HESPER REPLAY EXPERIMENT ========================================================
++
+ struct ggml_metal_encoder {
+     id<MTLComputeCommandEncoder> obj;
+ };
+@@ -473,6 +567,18 @@ ggml_metal_encoder_t ggml_metal_encoder_init(ggml_metal_cmd_buf_t cmd_buf_raw, b
+ 
+     [res->obj retain];
+ 
++    hrp_init_env();
++    hrp_counter++;
++    hrp_disp_in_encoder = 0;
++    if (hrp_counter == hrp_target) {
++        hrp_active = true;
++        hrp_n = 0;
++        // PRIVATE queue: llama pre-enqueues its command buffers, so committing the
++        // replay CB on the same queue would wait behind an enqueued-but-uncommitted
++        // CB => deadlock. A separate queue has no such ordering dependence.
++        if (!hrp_queue) hrp_queue = [[[cmd_buf device] newCommandQueue] retain];
++    }
++
+     return res;
+ }
+ 
+@@ -491,30 +597,80 @@ void ggml_metal_encoder_debug_group_pop (ggml_metal_encoder_t encoder) {
+ 
+ void ggml_metal_encoder_set_pipeline(ggml_metal_encoder_t encoder, struct ggml_metal_pipeline_with_params pipeline) {
+     [encoder->obj setComputePipelineState:pipeline.pipeline->obj];
++    if (hrp_active) {
++        struct hrp_cmd c = {0};
++        c.type = HRP_PIPELINE;
++        c.obj = [pipeline.pipeline->obj retain];
++        hrp_push(c);
++    }
+ }
+ 
+ void ggml_metal_encoder_set_bytes(ggml_metal_encoder_t encoder, void * data, size_t size, int idx) {
+     [encoder->obj setBytes:data length:size atIndex:idx];
++    if (hrp_active) {
++        struct hrp_cmd c = {0};
++        c.type = HRP_BYTES;
++        c.blob = malloc(size);
++        memcpy(c.blob, data, size);
++        c.blob_size = size;
++        c.idx = idx;
++        hrp_push(c);
++    }
+ }
+ 
+ void ggml_metal_encoder_set_buffer(ggml_metal_encoder_t encoder, struct ggml_metal_buffer_id buffer, int idx) {
+     [encoder->obj setBuffer:buffer.metal offset:buffer.offs atIndex:idx];
++    if (hrp_active) {
++        struct hrp_cmd c = {0};
++        c.type = HRP_BUFFER;
++        c.obj = [buffer.metal retain];
++        c.offs = buffer.offs;
++        c.idx = idx;
++        hrp_push(c);
++    }
+ }
+ 
+ void ggml_metal_encoder_set_threadgroup_memory_size(ggml_metal_encoder_t encoder, size_t size, int idx) {
+     [encoder->obj setThreadgroupMemoryLength:size atIndex:idx];
++    if (hrp_active) {
++        struct hrp_cmd c = {0};
++        c.type = HRP_TGMEM;
++        c.blob_size = size;
++        c.idx = idx;
++        hrp_push(c);
++    }
+ }
+ 
+ void ggml_metal_encoder_dispatch_threadgroups(ggml_metal_encoder_t encoder, int tg0, int tg1, int tg2, int tptg0, int tptg1, int tptg2) {
+     [encoder->obj dispatchThreadgroups:MTLSizeMake(tg0, tg1, tg2) threadsPerThreadgroup:MTLSizeMake(tptg0, tptg1, tptg2)];
++    hrp_disp_in_encoder++;
++    if (hrp_active) {
++        struct hrp_cmd c = {0};
++        c.type = HRP_DISPATCH;
++        c.g0 = tg0; c.g1 = tg1; c.g2 = tg2;
++        c.t0 = tptg0; c.t1 = tptg1; c.t2 = tptg2;
++        hrp_push(c);
++    }
+ }
+ 
+ void ggml_metal_encoder_memory_barrier(ggml_metal_encoder_t encoder) {
+     [encoder->obj memoryBarrierWithScope:MTLBarrierScopeBuffers];
++    if (hrp_active) {
++        struct hrp_cmd c = {0};
++        c.type = HRP_BARRIER;
++        hrp_push(c);
++    }
+ }
+ 
+ void ggml_metal_encoder_end_encoding(ggml_metal_encoder_t encoder) {
+     [encoder->obj endEncoding];
++    if (hrp_log) {
++        fprintf(stderr, "[hrp] encoder=%d dispatches=%d\n", hrp_counter, hrp_disp_in_encoder);
++    }
++    if (hrp_active) {
++        hrp_active = false;
++        hrp_run_replays();
++    }
+ }
+ 
+ struct ggml_metal_device {
