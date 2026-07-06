@@ -116,47 +116,13 @@ escape hatch) as the strongest form of the layering problem discussed in §5/§5
 
 **Figure 1 — the three stacks, and where each measurement instrument taps in.**
 Note that Hesper's DSL emits WGSL essentially 1:1 (expression tree → text): it adds
-NO abstraction lift over webml's hand WGSL — only layers below it differ in number.
+NO abstraction lift over webml's hand WGSL — only the layers below differ in number.
 
-```
-        Hesper                     llama.cpp                webml
-  ┌──────────────────┐       ┌────────────────┐      ┌────────────────┐
-  │ Lean 4 host loop │◄─┐    │ C++ host loop  │      │ JS host loop   │
-  ├──────────────────┤  │    ├────────────────┤      ├────────────────┤
-  │ ShaderM DSL      │  │    │ hand MSL       │      │ hand WGSL      │
-  │  (≅ WGSL, 1:1)   │  │    │                │      │  (templated)   │
-  ├──────────────────┤  │    │                │      ├────────────────┤
-  │ WGSL text        │  │    │                │      │ WGSL text      │
-  ├──────────────────┤  │    │                │      ├────────────────┤
-  │ Dawn (validation,│  │    │                │      │ Chrome/Dawn    │
-  │  serial encode)  │  │    │                │      │  (GPU process) │
-  ├──────────────────┤  │    ├────────────────┤      ├────────────────┤
-  │ Tint → MSL       │  │    │ (none)         │      │ Tint → MSL     │
-  ├──────────────────┤  │    ├────────────────┤      ├────────────────┤
-  │ Metal            │  │    │ Metal          │      │ Metal          │
-  └──────────────────┘  │    └───────┬────────┘      └───────┬────────┘
-   capture: hook in the └─ frozen     capture: patch on       capture: monkey-patched
-   dispatch choke point    -native    8 encoder wrappers      WebGPU API in headless
-   (executeShaderNamed)    transport  (GGML_METAL_REPLAY)     Chrome + buffer mirror
-                 │                        │                        │
-                 └────────────┬───────────┴────────────────────────┘
-                              ▼
-               ┌──────────────────────────────┐
-               │  BARE-METAL REPLAY HARNESS   │   one ~100-line Metal loop:
-               │  (tools/replay/)             │   serial / concurrent /
-               │  PSO + buffers + grid list   │   hazard-barrier / per-class
-               └──────────────────────────────┘   subsets; GPUStart→End timing
-```
+![Figure 1: the three engine stacks and the capture taps feeding the bare-Metal replay harness](figures/fig1-stacks.svg)
 
-**Figure 2 — where a decode millisecond goes (per token, to scale, serial).**
+**Figure 2 — where a decode millisecond goes (per token, measured, serial).**
 
-```
- webml   ████████████████▊ 3.9 GPU │▍0.2 host                        = ~4.0 ms  (~250 t/s)
- llama   ███████████████████████████▍ 6.31 GPU │██▌0.55 host          = 6.9 ms  (147 t/s)
- Hesper  ████████████████████████████▊ 6.78 GPU │███▏0.7 Dawn │█████▌1.3 walk │██▍0.55 argmax = 9.8 ms
- Hesper* ████████████████████████████████▌ 7.5 GPU │███▊0.9 host        = 8.4 ms  (119 t/s)
-         (* frozen-native transport; GPU is the in-decode figure)
-```
+![Figure 2: per-token time budget — GPU vs host per engine](figures/fig2-token-budget.svg)
 
 ## 3. Methodology
 
@@ -164,12 +130,17 @@ NO abstraction lift over webml's hand WGSL — only layers below it differ in nu
 dispatch sequence — pipelines/MSL, buffers with binding order, grids, threadgroup
 memory — and re-execute it on a ~100-line Metal loop, timing `GPUStartTime→GPUEndTime`
 (20 iters, min & avg). Same loop for all engines ⇒ directly comparable numbers.
-Capture adapters: (a) Hesper: a hook in the single dispatch choke point, MSL obtained by
-running the *pinned* tint CLI on the exact WGSL; (b) llama.cpp: a patch on its eight
-Metal-encoder wrapper functions (local fork only); (c) webml: WebGPU prototype
-monkey-patching in headless Chrome around the unmodified app, including a content
-mirror of ≤64 KiB buffers (uniform values steer loop trip counts — zeros would fake
-timing). Full HOWTO: `tools/replay/README.md`.
+
+Capture adapters:
+- **Hesper** — a hook at the single dispatch choke point; MSL obtained by running the
+  *pinned* tint CLI on the exact WGSL we hand Dawn.
+- **llama.cpp** — a patch on its eight Metal-encoder wrapper functions (local fork
+  only, never upstreamed).
+- **webml** — WebGPU prototype monkey-patching in headless Chrome around the
+  *unmodified* app, including a content mirror of ≤64 KiB buffers (uniform values
+  steer kernel loop trip counts — zero-filled buffers would fake the timing).
+
+Full HOWTO: `tools/replay/README.md`.
 
 **Protocol.** Predictions registered in DEVPLAN before measuring (they were wrong
 twice, which is the point); token-sequence equality as the correctness gate for any
@@ -185,6 +156,15 @@ llama's `ggml_mem_ranges` semantics): a barrier before any op that reads a
 written-since-barrier buffer or writes a read/written one.
 
 ## 4. Results
+
+Four analyses, in the order we ran them, each motivated by the previous one's
+residue: **(4.1)** our own engine's optimization ladder — how much of the original
+15× gap was engine tax rather than kernels; **(4.2)** the cross-engine replay — with
+the tax removed, put all three engines' captured tokens on one harness and read off
+what actually separates them; **(4.3)** targeted falsification of every "systems"
+explanation for the remainder (scheduling ablations, hazard analysis, a fusion
+experiment, a cold-stream re-bench), each with a pre-registered prediction;
+**(4.4)** a per-kernel-class budget that names what is left after all of those fall.
 
 ### 4.1 The Hesper optimization ladder (what the 15× was made of)
 

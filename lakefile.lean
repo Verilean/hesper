@@ -187,9 +187,19 @@ private def downloadDawn (cwd : FilePath) (dawnSrc : FilePath) (dawnVersion : St
   -- the error page into the tarball (which then dies as "gzip: not in gzip format"); `--retry` +
   -- `--retry-all-errors` retry the transient rate-limits that flake CI.
   let ret ← runCmd "curl" #["-sS", "-L", "--fail", "--retry", "5", "--retry-all-errors", "--retry-delay", "3", "-o", tarballPath.toString, tarballUrl]
-  if ret != 0 then return ret
-  let ret ← runCmd "tar" #["-xzf", tarballPath.toString, "-C", dawnSrc.toString]
-  if ret != 0 then return ret
+  if ret == 0 then
+    let ret ← runCmd "tar" #["-xzf", tarballPath.toString, "-C", dawnSrc.toString]
+    if ret != 0 then return ret
+  else
+    -- googlesource's +archive endpoint serves persistent 503s at times (observed in CI
+    -- 2026-07-06). Fall back to the GitHub mirror: same commit, but the tarball nests
+    -- everything under a `dawn-<sha>/` prefix → strip one component on extraction.
+    IO.println "[Hesper] googlesource 503 — falling back to the GitHub mirror..."
+    let ghUrl := s!"https://github.com/google/dawn/archive/{dawnVersion}.tar.gz"
+    let ret ← runCmd "curl" #["-sS", "-L", "--fail", "--retry", "5", "--retry-all-errors", "--retry-delay", "3", "-o", tarballPath.toString, ghUrl]
+    if ret != 0 then return ret
+    let ret ← runCmd "tar" #["-xzf", tarballPath.toString, "-C", dawnSrc.toString, "--strip-components=1"]
+    if ret != 0 then return ret
   IO.println s!"[Hesper] Dawn source extracted to: {dawnSrc}"
   return 0
 
@@ -422,19 +432,34 @@ script buildNative do
     } >>= (·.wait)
 
     if downloadRet != 0 then
-      IO.eprintln "[Hesper] Failed to download Dawn tarball"
-      return downloadRet
-
-    IO.println "Extracting tarball..."
-    -- Extract tarball to dawnSrc
-    let extractRet ← IO.Process.spawn {
-      cmd := "tar"
-      args := #["-xzf", tarballPath, "-C", dawnSrc.toString]
-    } >>= (·.wait)
-
-    if extractRet != 0 then
-      IO.eprintln "[Hesper] Failed to extract Dawn tarball"
-      return extractRet
+      -- googlesource's +archive endpoint serves persistent 503s at times; fall back to
+      -- the GitHub mirror (same commit; tarball nests under `dawn-<sha>/` → strip 1).
+      IO.println "[Hesper] googlesource 503 — falling back to the GitHub mirror..."
+      let ghUrl := s!"https://github.com/google/dawn/archive/{dawnVersion}.tar.gz"
+      let ghRet ← IO.Process.spawn {
+        cmd := "curl"
+        args := #["-sS", "-L", "--fail", "--retry", "5", "--retry-all-errors", "--retry-delay", "3", "-o", tarballPath, ghUrl]
+      } >>= (·.wait)
+      if ghRet != 0 then
+        IO.eprintln "[Hesper] Failed to download Dawn tarball (both mirrors)"
+        return ghRet
+      IO.println "Extracting tarball (GitHub layout)..."
+      let extractRet ← IO.Process.spawn {
+        cmd := "tar"
+        args := #["-xzf", tarballPath, "-C", dawnSrc.toString, "--strip-components=1"]
+      } >>= (·.wait)
+      if extractRet != 0 then
+        IO.eprintln "[Hesper] Failed to extract Dawn tarball"
+        return extractRet
+    else
+      IO.println "Extracting tarball..."
+      let extractRet ← IO.Process.spawn {
+        cmd := "tar"
+        args := #["-xzf", tarballPath, "-C", dawnSrc.toString]
+      } >>= (·.wait)
+      if extractRet != 0 then
+        IO.eprintln "[Hesper] Failed to extract Dawn tarball"
+        return extractRet
 
     IO.println s!"Dawn source extracted to: {dawnSrc}"
   else
