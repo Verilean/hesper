@@ -481,7 +481,6 @@ repeatedly outperformed our own expert intuition, and this anatomy itself.
 ## Appendix A. Next-architecture playbook: environment per use case
 
 *Every recommendation below is tied to a measurement in this report, not taste.*
-tied to a measurement in this record, not taste.*
 
 One stack correction to the common advice first: **Deno's WebGPU is wgpu/naga (Rust),
 not Dawn/Tint** — a different WGSL→MSL compiler than Chrome. Usually fine (both are
