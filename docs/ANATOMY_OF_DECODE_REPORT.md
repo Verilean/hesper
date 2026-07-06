@@ -62,20 +62,24 @@ auditing any claim back to its measurement. Replay tooling and exact commands:
 ## Terminology
 
 First-use context for readers outside GPU/LLM-engine work:
-*batch-size-1 decode* — autoregressive generation of one token at a time for a
-single request, so every weight matrix is applied as a matrix-VECTOR product
-(we occasionally write "M=1", the GEMM M-dimension — project shorthand, not a
-standard term); *op / dispatch* — one GPU kernel launch; *E2B* — the 2-billion-effective-
-parameter Gemma-4 variant; *SWA / FULL* — sliding-window vs global attention layers;
-*PLE* — Gemma's per-layer embeddings; *wg / sg* — GPU workgroup / subgroup (≈ CUDA
-block / warp); *SLC* — the chip's system-level cache; *TAT* — turnaround time of one
-edit-measure iteration; *GGUF Q4_K_M / QAT int4* — 4-bit weight formats (llama.cpp's
-block format vs a quantization-aware-trained format); *SRQ* — int8 dynamic activation
-quantization fused into a producer kernel; *dp4a* — packed int8 dot instruction
-(emulated on Apple GPUs); *epilogue fusion* — folding a following small op (norm/add)
-into a matmul kernel's tail; *WGSL / MSL* — the WebGPU and Metal shading languages;
-*Dawn / Tint* — Chrome's WebGPU runtime and its shader compiler; *frozen replay* —
-re-submitting a captured, token-invariant dispatch list (CUDA-Graphs analogue).
+
+| term | meaning |
+|---|---|
+| **batch-size-1 decode** | autoregressive generation of one token at a time for a single request; every weight matrix is applied as a matrix-**vector** product ("M=1" in project shorthand, after the GEMM M-dimension — not a standard term) |
+| **op / dispatch** | one GPU kernel launch |
+| **E2B** | the 2-billion-effective-parameter Gemma-4 variant |
+| **SWA / FULL** | sliding-window vs global attention layers |
+| **PLE** | Gemma's per-layer embeddings |
+| **wg / sg** | GPU workgroup / subgroup (≈ CUDA block / warp) |
+| **SLC** | the chip's system-level cache |
+| **TAT** | turnaround time of one edit-measure iteration |
+| **GGUF Q4_K_M / QAT int4** | 4-bit weight formats: llama.cpp's block format vs a quantization-aware-trained format |
+| **SRQ** | int8 dynamic activation quantization fused into a producer kernel |
+| **dp4a** | packed int8 dot instruction (emulated, not native, on Apple GPUs) |
+| **epilogue fusion** | folding a following small op (norm/add) into a matmul kernel's tail |
+| **WGSL / MSL** | the WebGPU and Metal shading languages |
+| **Dawn / Tint** | Chrome's WebGPU runtime and its shader compiler |
+| **frozen replay** | re-submitting a captured, token-invariant dispatch list (CUDA-Graphs analogue) |
 
 ## 1. Introduction
 
