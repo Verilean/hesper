@@ -40,7 +40,7 @@ cadence with kernels-as-data; verify the frozen trace afterwards.
 - **Kernels + graph set the floor; the runtime is a ±0.5 ms rounding term.** Host
   loops measured: webml (JS!) ~0.2 ms, llama.cpp ~0.55 ms, Hesper 2.5 ms → 0.9 ms
   after a CUDA-Graphs-style frozen replay.
-- **Concurrency is irrelevant for M=1 decode — in every engine.** Decode dataflows
+- **Concurrency is irrelevant for batch-size-1 decoding — in every engine.** Decode dataflows
   are ~86–96 % true dependencies; llama.cpp's own toggles price its entire scheduling
   apparatus at ≲0.6 ms. Racy no-barrier replays that suggest 2× are a mirage.
 - **webml's 1.7× lead over llama.cpp is kernel craft** (fat epilogue-fused kernels,
@@ -62,8 +62,10 @@ auditing any claim back to its measurement. Replay tooling and exact commands:
 ## Terminology
 
 First-use context for readers outside GPU/LLM-engine work:
-*decode / M=1* — generating one token at a time (batch of one matrix-vector op per
-weight); *op / dispatch* — one GPU kernel launch; *E2B* — the 2-billion-effective-
+*batch-size-1 decode* — autoregressive generation of one token at a time for a
+single request, so every weight matrix is applied as a matrix-VECTOR product
+(we occasionally write "M=1", the GEMM M-dimension — project shorthand, not a
+standard term); *op / dispatch* — one GPU kernel launch; *E2B* — the 2-billion-effective-
 parameter Gemma-4 variant; *SWA / FULL* — sliding-window vs global attention layers;
 *PLE* — Gemma's per-layer embeddings; *wg / sg* — GPU workgroup / subgroup (≈ CUDA
 block / warp); *SLC* — the chip's system-level cache; *TAT* — turnaround time of one
@@ -378,7 +380,7 @@ family: e2e neutral; cold retune: ≤3 %). **Its limit surfaced quickly and is
 structural: parameter search can only recover parameter-shaped losses.** On this
 workload the losses are op-size physics, graph shape, and kernel craft — outside the
 search space. The framework generalizes (it is salvage), but as a *product thesis*
-("autotuning closes the gap to hand-written") it is falsified for M=1 decode.
+("autotuning closes the gap to hand-written") it is falsified for batch-size-1 decode.
 
 **Verification/typed-quantization.** The demand side never materialized. The supply
 side is ironic: this program paid days to exactly the bug classes a typed layer could
@@ -409,7 +411,7 @@ build the diagnostic ladder we used here.
 2. Argmax deferral (0.55 ms) — blocked on a pre-existing device-fed-loop bug.
 3. Engine: propagate Dawn validation errors in batch mode (silent-drop cost a full
    debugging day); Tint printer bug minimal repro → upstream; Dawn pin is 9 months old.
-4. External validity: one box (M4 Max), one model family (E2B), M=1 greedy. Prefill,
+4. External validity: one box (M4 Max), one model family (E2B), batch-size-1 greedy decode. Prefill,
    batch>1, and long-context attention change the anatomy (the attention bucket grows
    from launch-bound to bandwidth-bound).
 
@@ -457,7 +459,7 @@ for the Lean assets that costs the exploration loop nothing.
 
 ## 8. Conclusion
 
-For M=1 LLM decode on Apple Silicon, the engine is nearly irrelevant and the
+For batch-size-1 LLM decoding on Apple Silicon, the engine is nearly irrelevant and the
 scheduler is entirely so: kernels + graph set the floor, dependency chains nullify
 concurrency, and every mature host loop costs ≲0.6 ms. A hand-written engine wins by
 kernel craft — fat, epilogue-fused, low-precision-operand kernels sized to occupy the
@@ -563,4 +565,4 @@ writable-aliasing dispatch, grid-roundup OOB writes.
 - **Don't trust warm isolated benchmarks** (13–26 % flattery) or **racy concurrent
   timings** (the 3.43 ms mirage) — cold-stream + hazard-correct or it didn't happen.
 - **Don't chase scheduling.** Concurrency, reordering, dispatch-count: all measured
-  ≲0.6 ms across three engines for M=1 decode.
+  ≲0.6 ms across three engines for batch-size-1 decode.
