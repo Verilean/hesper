@@ -1490,6 +1490,76 @@ extern "C" lean_obj_res lean_hesper_replay_run(
     }
 }
 
+// COLD-STREAM bench (DEVPLAN §13): like msl_bench_serial, but rotates the buffer at
+// `rotSlot` across `copies` (weight-buffer clones) per dispatch, so successive
+// dispatches read DIFFERENT memory — measuring cold-stream BW instead of the
+// warm-cache number (isolated re-reads of one weight sit in the SLC and flattered
+// the 90–97 % figures; a real decode token streams every weight once, cold).
+extern "C" lean_obj_res lean_hesper_msl_bench_serial_rot(
+    b_lean_obj_arg device_obj, b_lean_obj_arg msl_obj, b_lean_obj_arg bufs_array,
+    uint32_t rotSlot, b_lean_obj_arg copies_array,
+    uint32_t nDispatches, uint32_t gridX, uint32_t gridY, uint32_t gridZ, uint32_t wgX,
+    lean_obj_res /* unit */) {
+    @autoreleasepool {
+        wgpu::Device* device = mr_extract_device(device_obj);
+        if (!device || !device->Get()) return lean_io_result_mk_error(lean_mk_io_user_error(lean_mk_string("bench_rot: invalid device")));
+        id<MTLDevice> mtl = dawn::native::metal::GetMTLDevice(device->Get());
+        const char* mslSrc = lean_string_cstr(msl_obj);
+        if (!mslSrc || mslSrc[0] == '\0')
+            return lean_io_result_mk_error(lean_mk_io_user_error(lean_mk_string("bench_rot: empty MSL (set HESPER_DUMP_MSL=1)")));
+        size_t nBufs = lean_array_size(bufs_array);
+        std::vector<id<MTLBuffer>> mb(nBufs);
+        for (size_t i = 0; i < nBufs; i++) {
+            wgpu::Buffer* b = mr_extract_buffer(lean_array_get_core(bufs_array, i));
+            if (!b || !b->Get()) return lean_io_result_mk_error(lean_mk_io_user_error(lean_mk_string("bench_rot: invalid buffer")));
+            mb[i] = reinterpret_cast<dawn::native::metal::Buffer*>(b->Get())->GetMTLBuffer();
+        }
+        size_t nCopies = lean_array_size(copies_array);
+        std::vector<id<MTLBuffer>> rot(nCopies);
+        for (size_t i = 0; i < nCopies; i++) {
+            wgpu::Buffer* b = mr_extract_buffer(lean_array_get_core(copies_array, i));
+            if (!b || !b->Get()) return lean_io_result_mk_error(lean_mk_io_user_error(lean_mk_string("bench_rot: invalid copy")));
+            rot[i] = reinterpret_cast<dawn::native::metal::Buffer*>(b->Get())->GetMTLBuffer();
+        }
+        if (rot.empty() || rotSlot >= nBufs)
+            return lean_io_result_mk_error(lean_mk_io_user_error(lean_mk_string("bench_rot: bad rotation args")));
+        static std::unordered_map<size_t, id<MTLComputePipelineState>> psoCache;
+        size_t key = std::hash<std::string>{}(std::string(mslSrc));
+        id<MTLComputePipelineState> pso = nil;
+        auto it = psoCache.find(key);
+        if (it != psoCache.end()) pso = it->second;
+        else {
+            NSError* err = nil;
+            MTLCompileOptions* opts = [MTLCompileOptions new];
+            id<MTLLibrary> lib = [mtl newLibraryWithSource:[NSString stringWithUTF8String:mslSrc] options:opts error:&err];
+            if (!lib) return lean_io_result_mk_error(lean_mk_io_user_error(lean_mk_string(
+                [[NSString stringWithFormat:@"bench_rot compile failed: %@", err] UTF8String])));
+            id<MTLFunction> fn = [lib newFunctionWithName:@"dawn_entry_point"];
+            if (!fn) return lean_io_result_mk_error(lean_mk_io_user_error(lean_mk_string("bench_rot: no dawn_entry_point")));
+            pso = [mtl newComputePipelineStateWithFunction:fn error:&err];
+            if (!pso) return lean_io_result_mk_error(lean_mk_io_user_error(lean_mk_string("bench_rot: PSO failed")));
+            psoCache[key] = pso;
+        }
+        if (!g_mslQueue) g_mslQueue = [mtl newCommandQueue];
+        id<MTLCommandBuffer> cb = [g_mslQueue commandBuffer];
+        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];   // serial
+        [enc setComputePipelineState:pso];
+        for (size_t i = 0; i < nBufs; i++) [enc setBuffer:mb[i] offset:0 atIndex:i];
+        for (uint32_t d = 0; d < nDispatches; d++) {
+            [enc setBuffer:rot[d % nCopies] offset:0 atIndex:rotSlot];
+            [enc dispatchThreadgroups:MTLSizeMake(gridX, gridY, gridZ)
+                threadsPerThreadgroup:MTLSizeMake(wgX, 1, 1)];
+        }
+        [enc endEncoding];
+        [cb commit];
+        [cb waitUntilCompleted];
+        double gpuMs = ([cb GPUEndTime] - [cb GPUStartTime]) * 1000.0;
+        char buf[64];
+        snprintf(buf, sizeof(buf), "%.4f", gpuMs);
+        return lean_io_result_mk_ok(lean_mk_string(buf));
+    }
+}
+
 // Per-op-class profiling (DEVPLAN §12): replay only the ops whose indices are in
 // `idx_array` (u32 indices into the recorded sequence, barriers not counted), serial,
 // `iters` times. The Lean side records op names in order, groups indices by kernel
