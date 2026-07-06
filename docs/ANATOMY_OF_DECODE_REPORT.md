@@ -6,23 +6,32 @@
 
 ## Abstract
 
-We optimized Hesper — a Lean 4 → WebGPU (Dawn/Metal) inference engine — from 8 to
-~119 tok/s on Gemma-4-E2B, and still trailed llama.cpp (~147) and the hand-written
-webml engine (~250). To find out why, we captured one decode token from each engine
-and replayed all three on a single bare-Metal harness, alongside pre-registered
-predictions and llama.cpp's own ablation toggles. The result is two anatomies:
+**Background.** Hesper is an LLM inference engine written in Lean 4 that generates
+WGSL compute kernels, built on two motivations: *verified inference* (typed
+quantization layouts and proof-carrying kernels — bug classes like out-of-bounds
+writes and aliasing eliminated by construction) and *browser distribution* via
+WebGPU. The design added layers — Lean DSL → WGSL → Dawn → Tint → Metal — and this
+report is a case study of what those layers actually cost, in a setting where we can
+measure it cleanly.
 
-**Performance:** kernels + the op graph set the floor. Everything else — dispatch
-transport, concurrency, op count, host runtime (JS, C++, or Lean) — measures at
-≲0.7 ms each. webml's 1.7× lead over llama.cpp is kernel craft, not model format or
-runtime.
+**The unusual property of this case: the layers' runtime overhead is nearly zero.**
+The DSL maps 1:1 to WGSL (no abstraction lift, no semantic gap); kernel structures
+port faithfully through it (a llama.cpp kernel port reached 90–97 % of isolated
+bandwidth); and by capturing one decode token from each of three engines — ours,
+llama.cpp, and the hand-written webml — and replaying all three on a single
+bare-Metal harness, we show that transport, scheduling, op count, and host runtime
+each measure at ≲0.7 ms/token. Kernels plus the op graph set the floor; every mature
+runtime is a rounding term.
 
-**Development:** the same author — the Fable 5 model — wrote webml's kernels to
-250 tok/s in ~30 minutes, and could not reach parity in days inside our stack, even
-though our DSL sits at the *same* abstraction level as hand WGSL. **The abstraction
-tax is turnaround time per iteration, not microseconds.** §7 turns this into
-requirements for the next tool: explore at JIT cadence with kernels-as-data, verify
-the frozen trace afterwards.
+**And yet the stack lost — which localizes the real cost.** The same author (the
+Fable 5 model) wrote webml's kernels to 250 tok/s in ~30 minutes on a
+seconds-turnaround stack, and could not reach parity in days inside ours (119 tok/s
+vs llama.cpp's 147, DiffusionGemma at ~0.44× per-step). With execution overhead
+eliminated as the explanation by measurement, what remains is **iteration time**:
+structural kernel changes — the only kind that mattered — pay a minutes-long compile
+loop, while the thin stack pays seconds. The abstraction tax is turnaround time, not
+microseconds. §7 turns this into requirements for the next tool: explore at JIT
+cadence with kernels-as-data; verify the frozen trace afterwards.
 
 ## Key findings at a glance
 
