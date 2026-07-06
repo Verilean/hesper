@@ -24,9 +24,14 @@ a ±0.5 ms rounding term on top.** webml's 1.7× lead over llama.cpp is kernel c
 (the QAT model accounts for only ~10–15 % of bytes). We further show the classic
 isolated kernel benchmark overstates matvec bandwidth by 13–26 % (warm-SLC artifact),
 and that re-autotuning against a cold-stream objective recovers ≤3 %: per-op bandwidth
-is a function of op size, not of tuning parameters. We conclude with an honest account
-of what a typed/verified DSL and an autotune framework did and did not buy, and why
-jax-metal exhibits the same disease in a worse stage.
+is a function of op size, not of tuning parameters. Finally we report a natural
+experiment the record contains almost by accident: **the same author — the Fable 5
+model — built webml's kernels to 250 tok/s in roughly half an hour, and spent
+multi-hour-to-multi-day campaigns inside Hesper's stack without reaching parity**,
+despite Hesper's DSL sitting at the *same abstraction level* as WGSL (no lift, only
+layers). The abstraction tax is best measured not in microseconds but in
+**turnaround time per craft iteration**, which is where autotuning failed to
+compensate and where jax-metal exhibits the same disease in a terminal stage.
 
 ## 1. Introduction
 
@@ -53,7 +58,51 @@ useful than the engine itself.
 | notable kernel tech | llama-port f32 matvecs, fused QKV/gate-up, autotuned | many thin tuned kernels, N_R0×NSG matvecs | few fat kernels: epilogue-fused norms/adds, int8-SRQ activations, subgroup-matrix |
 
 Also referenced: jax-metal (closed PJRT plugin → closed MPSGraph; no kernel authoring
-escape hatch) as the terminal case of the abstraction disease discussed in §7.
+escape hatch) as the terminal case of the abstraction disease discussed in §5/§5b.
+
+**Figure 1 — the three stacks, and where each measurement instrument taps in.**
+Note that Hesper's DSL emits WGSL essentially 1:1 (expression tree → text): it adds
+NO abstraction lift over webml's hand WGSL — only layers below it differ in number.
+
+```
+        Hesper                     llama.cpp                webml
+  ┌──────────────────┐       ┌────────────────┐      ┌────────────────┐
+  │ Lean 4 host loop │◄─┐    │ C++ host loop  │      │ JS host loop   │
+  ├──────────────────┤  │    ├────────────────┤      ├────────────────┤
+  │ ShaderM DSL      │  │    │ hand MSL       │      │ hand WGSL      │
+  │  (≅ WGSL, 1:1)   │  │    │                │      │  (templated)   │
+  ├──────────────────┤  │    │                │      ├────────────────┤
+  │ WGSL text        │  │    │                │      │ WGSL text      │
+  ├──────────────────┤  │    │                │      ├────────────────┤
+  │ Dawn (validation,│  │    │                │      │ Chrome/Dawn    │
+  │  serial encode)  │  │    │                │      │  (GPU process) │
+  ├──────────────────┤  │    ├────────────────┤      ├────────────────┤
+  │ Tint → MSL       │  │    │ (none)         │      │ Tint → MSL     │
+  ├──────────────────┤  │    ├────────────────┤      ├────────────────┤
+  │ Metal            │  │    │ Metal          │      │ Metal          │
+  └──────────────────┘  │    └───────┬────────┘      └───────┬────────┘
+   capture: hook in the └─ frozen     capture: patch on       capture: monkey-patched
+   dispatch choke point    -native    8 encoder wrappers      WebGPU API in headless
+   (executeShaderNamed)    transport  (GGML_METAL_REPLAY)     Chrome + buffer mirror
+                 │                        │                        │
+                 └────────────┬───────────┴────────────────────────┘
+                              ▼
+               ┌──────────────────────────────┐
+               │  BARE-METAL REPLAY HARNESS   │   one ~100-line Metal loop:
+               │  (tools/replay/)             │   serial / concurrent /
+               │  PSO + buffers + grid list   │   hazard-barrier / per-class
+               └──────────────────────────────┘   subsets; GPUStart→End timing
+```
+
+**Figure 2 — where a decode millisecond goes (per token, to scale, serial).**
+
+```
+ webml   ████████████████▊ 3.9 GPU │▍0.2 host                        = ~4.0 ms  (~250 t/s)
+ llama   ███████████████████████████▍ 6.31 GPU │██▌0.55 host          = 6.9 ms  (147 t/s)
+ Hesper  ████████████████████████████▊ 6.78 GPU │███▏0.7 Dawn │█████▌1.3 walk │██▍0.55 argmax = 9.8 ms
+ Hesper* ████████████████████████████████▌ 7.5 GPU │███▊0.9 host        = 8.4 ms  (119 t/s)
+         (* frozen-native transport; GPU is the in-decode figure)
+```
 
 ## 3. Methodology
 
@@ -148,7 +197,47 @@ Replaying each kernel class of our token in isolation (class-sum 6.69 vs whole-t
 | 1-workgroup norm/add tail | 141 | ~0.70 | GPU essentially idle per op; webml's cure is riding fat kernels' occupancy (epilogue fusion), not fewer boundaries |
 | other small ops | ~250 | ~1.6 | same under-occupancy class |
 
-## 5. What the DSL and autotuning actually bought
+## 5. The natural experiment: one author, three stacks
+
+The record contains a control this field rarely gets: **the same author at the same
+skill level worked all three codebases.** webml's page metadata states "Every kernel
+written and optimized by Fable 5"; the Hesper campaigns (both models) were driven by
+the same Fable model; llama.cpp is the community-years baseline neither touched.
+
+| case | stack | author-time to result | outcome vs llama.cpp |
+|---|---|---|---|
+| webml (Gemma-4 E2B) | JS + hand WGSL, edit→browser-reload TAT ≈ seconds | **~30 min** (as reported) | **1.7× faster** (250 vs 147 t/s) |
+| Hesper Gemma-4 E2B | Lean DSL + Dawn/Tint | 1 day bring-up (M6) + multiple sessions of optimization (M7 + this program), **>8 h of pure optimization work** | 0.81× (119 t/s), after building a native transport and a frozen-token replay to get there |
+| Hesper DiffusionGemma 26B-A4B | same stack, Fable applied to an existing codebase | a multi-day, multi-session campaign (races, MoE grouping, schedule, template) | per-step **~0.44×** (777–880 ms vs 363 ms); kernel-level parity avg ~0.73× (0.54–0.96 by op); end-to-end tok/s ~0.23× (15 vs 64.2, step count compounding) |
+
+The explanatory variable cannot be author skill — it is the same model. And it cannot
+be abstraction *level* — Hesper's DSL is isomorphic to WGSL (we demonstrated this by
+porting llama.cpp's `mul_mv_q4_K_f32` structure verbatim into it at 90–97 % isolated
+BW). What differs is **turnaround time per craft iteration**:
+
+| iteration type | webml | Hesper |
+|---|---|---|
+| edit a kernel, see tokens | seconds (browser reload) | structure change = Lean rebuild 1–3 min; decode-integration build ~8–10 min |
+| see what the GPU actually runs | WGSL is what you wrote | build MSL-dump + native-bench + occupancy instruments first (days, once) — Tint and Dawn sit between you and the machine |
+| trust a measurement | direct | discover and subtract Dawn's ~35 µs/dispatch bench tax, its serial hardcode, silent batch validation-swallowing, a Tint printer bug |
+| parameter sweep | manual, but each try is seconds | **0.118 s/variant (autotune)** — the one loop where Hesper is fast |
+
+The last row is the punchline for autotuning: **the fast loop we automated (parameter
+search) is orthogonal to where the wins live.** Every productive move in this record —
+fat epilogue-fused kernels, operand-format changes, deleting round-trips, the frozen
+transport — was a *structural* move that had to go through the slow loop, and the
+slow loop is what the extra layers lengthen. The DSL therefore collected the worst of
+both worlds: no abstraction lift (it *is* WGSL), and a craft loop 1–2 orders of
+magnitude slower than hand-WGSL-in-a-browser. webml's ~30 minutes and Hesper's >8
+hours are the same skill spent at two different iteration frequencies.
+
+The DiffusionGemma case bounds the "just try harder" hypothesis: applying the same
+model to the same stack for days — including finding four real GPU races, a
+mixed-quantization loader bug, and a decode-schedule redesign — still landed at less
+than half of llama.cpp per step. Effort does not amortize a slow loop; it multiplies
+by it.
+
+## 5b. What the DSL and autotuning actually bought
 
 **Autotune framework** (Family contract ~50 lines/kernel family + shared engine:
 sweep, occupancy probe, golden gate, native cold/warm timing, top-K refine with an
@@ -203,7 +292,9 @@ concurrency, and every mature host loop costs ≲0.6 ms. A hand-written engine w
 kernel craft — fat, epilogue-fused, low-precision-operand kernels sized to occupy the
 machine — and by nothing else we could measure. A verified DSL could in principle have
 eliminated the bug classes that consumed most of our debugging time, but nobody is
-buying that in this market, and it does not make tokens faster. The transferable
-outputs are the replay methodology (three capture adapters + one comparable harness),
-the falsification protocol that repeatedly outperformed our own expert intuition, and
-this anatomy itself.
+buying that in this market, and it does not make tokens faster. And the deepest cost of the layers was
+never the microseconds: it was the iteration frequency — the same author produced a
+1.7×-faster-than-llama.cpp engine in half an hour on a seconds-TAT stack, and could
+not reach parity in days on ours. The transferable outputs are the replay methodology
+(three capture adapters + one comparable harness), the falsification protocol that
+repeatedly outperformed our own expert intuition, and this anatomy itself.
