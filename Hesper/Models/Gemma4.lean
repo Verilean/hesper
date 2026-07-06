@@ -696,6 +696,15 @@ def forwardBlock [GPUBackend β] (ctx : β)
   -- (~7/token) — the SWA majority needs a factors-less variant to matter.
   let qknrOn := (← IO.getEnv "HESPER_QKNR") == some "1"
   let qkvRopeFused := block.ropeFreqFactors.isSome && qknrOn
+  -- Fusion round 2 (DEVPLAN §11): FACTORS-LESS fused norm+ropeQ for the
+  -- no-freq-factors (SWA) layers — deletes the standalone ropeDynQ dispatch and the
+  -- qBuf2→qBuf round-trip on 28/35 layers; 8 bindings (no freq_factors) dodges the
+  -- Tint MSL printer bug that parked the 9-binding FULL variant. MEASURED NEUTRAL
+  -- (−28 ops but GPU time unchanged at 7.5 ms — the round-trip is only 0.2 MB/token)
+  -- and its rope rounding profile flips near-tie tokens, so it stays OPT-IN
+  -- (HESPER_QKNR_SWA=1) to keep default outputs reproducible.
+  let qknrSwaOn := (← IO.getEnv "HESPER_QKNR_SWA") == some "1"
+  let qkvRopeFusedSwa := block.ropeFreqFactors.isNone && qknrSwaOn
   Hesper.WGSL.Execute.withSection "qkvNorm" do
     match (if qkvRopeFused then block.ropeFreqFactors else none) with
     | some freqFactors =>
@@ -716,12 +725,38 @@ def forwardBlock [GPUBackend β] (ctx : β)
         ce s!"qNormRope_{if isFull then "F" else "S"}_base{cfg.ropeBase li}"
           (fusedPerHeadQKVNormRopeKernel numHeads numKVHeads headDim cfg.rmsNormEps (cfg.ropeBase li))
           [("q_io", state.qBuf), ("q_scale", block.attention.qNormWeight),
-           ("k_in", state.kBuf), ("k_scale", block.attention.qNormWeight), ("k_out", state.kBuf2),
+           ("k_in", state.kBuf), ("k_scale", block.attention.kNormWeight), ("k_out", state.kBuf2),
            ("v_in", state.vBuf),                                              ("v_out", state.vBuf2),
            ("params", state.paramsBuf), ("freq_factors", freqFactors)]
           { numWorkgroups := (numHeads, 1, 1),
             workgroupSize := { x := wgSize, y := 1, z := 1 } : Hesper.ExecConfig }
     | none =>
+      if qkvRopeFusedSwa then
+        -- Factors-less fused norm+ropeQ (SWA): q normed+roped IN-PLACE in qBuf;
+        -- k/v normed to kBuf2/vBuf2 as in the base kernel.
+        if cfg.hasKV li then
+          ce s!"qkvNormRopeNF_{if isFull then "F" else "S"}_base{cfg.ropeBase li}"
+            (fusedPerHeadQKVNormRopeKernel numHeads numKVHeads headDim cfg.rmsNormEps
+              (cfg.ropeBase li) (useFreqFactors := false))
+            [("q_io", state.qBuf), ("q_scale", block.attention.qNormWeight),
+             ("k_in", state.kBuf), ("k_scale", block.attention.kNormWeight), ("k_out", state.kBuf2),
+             ("v_in", state.vBuf),                                              ("v_out", state.vBuf2),
+             ("params", state.paramsBuf)]
+            { numWorkgroups := (numHeads, 3, 1),
+              workgroupSize := { x := wgSize, y := 1, z := 1 } : Hesper.ExecConfig }
+        else
+          -- KV-shared layer: q lane only; k/v slots get placeholder bindings
+          -- (unreachable at grid y=0; declared kv sizes ≤ the q buffers').
+          ce s!"qNormRopeNF_{if isFull then "F" else "S"}_base{cfg.ropeBase li}"
+            (fusedPerHeadQKVNormRopeKernel numHeads numKVHeads headDim cfg.rmsNormEps
+              (cfg.ropeBase li) (useFreqFactors := false))
+            [("q_io", state.qBuf), ("q_scale", block.attention.qNormWeight),
+             ("k_in", state.kBuf), ("k_scale", block.attention.kNormWeight), ("k_out", state.kBuf2),
+             ("v_in", state.vBuf),                                              ("v_out", state.vBuf2),
+             ("params", state.paramsBuf)]
+            { numWorkgroups := (numHeads, 1, 1),
+              workgroupSize := { x := wgSize, y := 1, z := 1 } : Hesper.ExecConfig }
+      else
       -- Legacy paths (no freq factors): per-head norms, rope as its own dispatch below.
       if cfg.hasKV li then
         ce (if isFull then "qkvNormFull" else "qkvNormSWA")
@@ -768,12 +803,15 @@ def forwardBlock [GPUBackend β] (ctx : β)
         [("input", state.qBuf2), ("output", state.qBuf), ("params", state.paramsBuf), ("freq_factors", freqFactors)]
         (.dispatch1D (numHeads * headDim / 2))
     | none =>
-      let ropeConfig : RoPE.Config := { dim := numHeads * headDim, maxSeqLen := cfg.maxSeqLen, base := cfg.ropeBase li }
-      -- NB: `base` is baked into the shader as a literal — must be in cache key.
-      ce s!"ropeDynQ_{headDim}_base{cfg.ropeBase li}"
-        (RoPE.ropeKernelDynamic ropeConfig 1 1 numHeads headDim)
-        [("input", state.qBuf2), ("output", state.qBuf), ("params", state.paramsBuf)]
-        (.dispatch1D (numHeads * headDim / 2))
+      -- Fusion round 2: on factors-less layers the rotation already happened inside
+      -- the fused qkvNormRopeNF kernel (roped q is in qBuf) — no standalone dispatch.
+      unless qkvRopeFusedSwa do
+        let ropeConfig : RoPE.Config := { dim := numHeads * headDim, maxSeqLen := cfg.maxSeqLen, base := cfg.ropeBase li }
+        -- NB: `base` is baked into the shader as a literal — must be in cache key.
+        ce s!"ropeDynQ_{headDim}_base{cfg.ropeBase li}"
+          (RoPE.ropeKernelDynamic ropeConfig 1 1 numHeads headDim)
+          [("input", state.qBuf2), ("output", state.qBuf), ("params", state.paramsBuf)]
+          (.dispatch1D (numHeads * headDim / 2))
 
     -- ropeK is fused with KV cache write below (when ropeFreqFactors are available
     -- and we have a KV cache).  When freq factors aren't present we fall back to
