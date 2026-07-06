@@ -566,7 +566,7 @@ bindings (`dawn.node`), which gives a CLI loop with *Chrome's exact* compiler st
 |---|---|---|---|
 | **Deno + WebGPU** | JS/TS → wgpu/naga → Metal | seconds, one command | default agent sandbox: `deno run` per iteration, no browser, no locks |
 | **Node + dawn.node** | JS → Dawn/Tint → Metal | seconds | same loop but bit-faithful to Chrome (deploy target = browser) |
-| **Headless Chrome** | the real app → Dawn/Tint | seconds after page setup | fidelity runs + tracing *other people's* engines (the §9c monkey-patch method); NOT the inner loop — profile locks, collectors, lifecycle friction (we hit all of it) |
+| **Headless Chrome** | the real app → Dawn/Tint | seconds after page setup | fidelity runs + tracing *other people's* engines (the §3 browser monkey-patch method); NOT the inner loop — profile locks, collectors, lifecycle friction (we hit all of it) |
 | **Python + wgpu-py** | Python → wgpu-native | seconds | when goldens come from PyTorch anyway: generate reference tensors and bit-compare in one process |
 | **bare-Metal harness** | MSL strings → Metal (0 layers) | seconds (~4 ms recompile, disk cache) | Apple-final targets; already built (`tools/replay/webml/replayer.mm` pattern); tint CLI offline if WGSL is the source language |
 
