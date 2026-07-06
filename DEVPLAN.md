@@ -426,3 +426,35 @@ activations; llama earns its 200 GB/s with many thin, highly-tuned kernels.
 round-trips**, webml-style. Expected first-tranche win −0.5…−1.5 ms of the 2.4 ms
 pool (Q6K-V merge, argmax deferral, factors-less qkNormRope), plus kernel-efficiency
 parity work toward llama's 200 GB/s.
+
+---
+
+## §10. Host-cost kill (a): frozen-token decode — 9.8 → 8.4 ms/token, token-exact
+
+Insight: from cacheLen ≥ 8 the decode dispatch sequence is **token-invariant** —
+identical buffers, grids, kernels; only params-buffer CONTENT changes. So the native
+list recorded once replays verbatim every token (`HESPER_NATIVE_FROZEN=<m>`, the
+CUDA-Graphs analogue), skipping both Dawn and the Lean walk of `forwardSingleToken`.
+
+Two instructive bugs on the way (both found by the token-exactness gate,
+commit `315c8e0`):
+1. **Dawn's queue.writeBuffer is staged, not submitted** — the frozen seeds
+   (pos/cacheLen/posF32/token) sat host-side while the native CB ran. Fix: replay_exec
+   issues an empty `Queue::Submit` first; same-queue FIFO orders the staging copies
+   ahead of the CB. (The walk had masked this via its own batch submits.)
+2. **`gpuArgmax` writes plRawRowBuf = tokenId every iteration** (deviceFed plumbing);
+   the walk silently overwrote it with 0, which the row-staged PLE dequant requires.
+   The frozen path must restore the 0. Divergence was deterministic and started
+   exactly at the first frozen token — the gate localized it in two bisections.
+
+Per-token host work is now: 5 small seed writes + the token's 6160 B PLE row + the
+argmax readback. **Ladder: Dawn 9.8 → nativeExec 9.15 → frozen ~8.4 ms/token
+(~119 t/s), token-sequence-identical.** Remaining (a)-item: argmax readback 0.55 ms
+(deferral machinery exists but HESPER_DEVICE_FED is independently broken — zeros from
+its 9th token even on the plain Dawn path; needs its own fix first).
+
+Answering "is webml's loop path also fast?": yes — their real total (~4.0 ms) minus
+replayed GPU (3.90 ms) leaves ≲0.3 ms of JS host per token; Chrome encodes via IPC to
+the GPU process (overlapped), bind groups are prebuilt, and their loop does almost
+nothing else. Ours was slow because of the per-token Lean walk (~1.3 ms) + record
+path — which frozen mode now eliminates.
