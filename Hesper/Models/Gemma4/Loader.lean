@@ -131,6 +131,22 @@ private def readMetadataU32 (mv : Hesper.GGUF.MetadataValue) : Option Nat :=
     some (b0 ||| (b1 <<< 8) ||| (b2 <<< 16) ||| (b3 <<< 24))
   else none
 
+/-- Helper: read a u32 array from GGUF metadata raw bytes (parser strips the elem-type+length
+    header → 4 bytes per element). E-series (MatFormer) GGUFs store some per-model "scalar" keys
+    as PER-LAYER arrays (e.g. gemma4.feed_forward_length on Gemma 4 E2B). -/
+private def readMetadataU32Array (mv : Hesper.GGUF.MetadataValue) : Option (Array Nat) :=
+  if mv.valueType == .MArray && mv.data.size % 4 == 0 && mv.data.size > 0 then
+    some (Id.run do
+      let mut arr : Array Nat := #[]
+      for i in [0:mv.data.size / 4] do
+        let b0 := mv.data.get! (i*4) |>.toNat
+        let b1 := mv.data.get! (i*4+1) |>.toNat
+        let b2 := mv.data.get! (i*4+2) |>.toNat
+        let b3 := mv.data.get! (i*4+3) |>.toNat
+        arr := arr.push (b0 ||| (b1 <<< 8) ||| (b2 <<< 16) ||| (b3 <<< 24))
+      return arr)
+  else none
+
 /-- Helper: read a bool array from GGUF metadata raw bytes.
     The Hesper parser strips the type+length header, so mv.data is just the raw element bytes.
     For bool arrays, each byte is one bool. -/
@@ -164,7 +180,15 @@ def Config.fromGGUF (gguf : Hesper.GGUF.GGUFFile) : Except String Config := do
     match findMeta key with
     | some mv => match readMetadataU32 mv with
       | some v => .ok v
-      | none => .error s!"Metadata key '{key}' is not uint32"
+      | none =>
+        -- E-series (MatFormer): the key may be a PER-LAYER u32 array. Uniform → that value;
+        -- non-uniform → max (buffer-sizing-safe upper bound; exact per-layer dims come from the
+        -- tensor shapes at load).
+        match readMetadataU32Array mv with
+        | some arr =>
+          if arr.all (· == arr[0]!) then .ok arr[0]!
+          else .ok (arr.foldl max 0)
+        | none => .error s!"Metadata key '{key}' is not uint32 (or u32 array)"
     | none => .error s!"Metadata key '{key}' not found"
 
   let findU32Either (key1 key2 : String) : Except String Nat :=
@@ -233,6 +257,56 @@ def Config.fromGGUF (gguf : Hesper.GGUF.GGUFFile) : Except String Config := do
     numKVSharedLayers := (findU32Either "gemma4.attention.shared_kv_layers" "llama.attention.shared_kv_layers").toOption.getD 0
   }
 
+/-- Pack chunk-local f32 pairs into the FULL packed-f16 buffer at a baked u32 offset:
+    fout[dstU32Offset + i] = pack2x16float(fin[2i], fin[2i+1]). Used by the chunked Q4_K
+    lm_head pre-dequant (full-table f32 exceeds the storage-binding limit). -/
+private def packF32ToF16ChunkKernel (nOut gridXWidth dstU32Offset : Nat) :
+    Hesper.WGSL.Monad.ShaderM Unit := do
+  let gid ← Hesper.WGSL.Monad.ShaderM.globalId
+  let i := Hesper.WGSL.Exp.add (Hesper.WGSL.Exp.vec3X gid)
+    (Hesper.WGSL.Exp.mul (Hesper.WGSL.Exp.vec3Y gid) (Hesper.WGSL.Exp.litU32 gridXWidth))
+  let _in ← Hesper.WGSL.Monad.ShaderM.declareInputBuffer "fin"
+    (.array (.scalar .f32) (nOut * 2))
+  let _out ← Hesper.WGSL.Monad.ShaderM.declareOutputBuffer "fout"
+    (.array (.scalar .u32) (dstU32Offset + nOut))
+  Hesper.WGSL.Monad.ShaderM.if_ (Hesper.WGSL.Exp.lt i (Hesper.WGSL.Exp.litU32 nOut)) (do
+    let a := Hesper.WGSL.Exp.index
+      (Hesper.WGSL.Exp.var "fin" : Hesper.WGSL.Exp (.array (.scalar .f32) (nOut * 2)))
+      (Hesper.WGSL.Exp.mul i (Hesper.WGSL.Exp.litU32 2))
+    let b := Hesper.WGSL.Exp.index
+      (Hesper.WGSL.Exp.var "fin" : Hesper.WGSL.Exp (.array (.scalar .f32) (nOut * 2)))
+      (Hesper.WGSL.Exp.add (Hesper.WGSL.Exp.mul i (Hesper.WGSL.Exp.litU32 2)) (Hesper.WGSL.Exp.litU32 1))
+    Hesper.WGSL.Monad.ShaderM.writeBuffer (ty := .scalar .u32) "fout"
+      (Hesper.WGSL.Exp.add i (Hesper.WGSL.Exp.litU32 dstU32Offset))
+      (Hesper.WGSL.Exp.pack2x16float (Hesper.WGSL.Exp.vec2 a b))) (pure ())
+
+/-- BF16 → packed-F16 repack. E2B ships `per_layer_model_proj` as BF16 (GGML type 30);
+    the f16 matmul path reads packed f16, and BF16 bits read as F16 are garbage (different
+    exponent width). One thread per u32 = two bf16 values. Arithmetic conversion (no
+    bitcast): value = (-1)^s · (1 + mant/128) · 2^(exp−127); BF16 subnormals (<2^−126)
+    flush to zero — irrelevant for weights. -/
+private def bf16ToF16PackKernel (nOut gridXWidth : Nat) :
+    Hesper.WGSL.Monad.ShaderM Unit :=
+  open Hesper.WGSL Hesper.WGSL.Monad in do
+  let gid ← ShaderM.globalId
+  let i := Exp.add (Exp.vec3X gid) (Exp.mul (Exp.vec3Y gid) (Exp.litU32 gridXWidth))
+  let _in ← ShaderM.declareInputBuffer "bin" (.array (.scalar .u32) nOut)
+  let _out ← ShaderM.declareOutputBuffer "fout" (.array (.scalar .u32) nOut)
+  let cvt (bits : Exp (.scalar .u32)) : Exp (.scalar .f32) :=
+    let sign := Exp.shiftRight bits (Exp.litU32 15)
+    let exp8 := Exp.bitAnd (Exp.shiftRight bits (Exp.litU32 7)) (Exp.litU32 0xFF)
+    let mant := Exp.bitAnd bits (Exp.litU32 0x7F)
+    let signF := Exp.select (Exp.eq sign (Exp.litU32 1)) (Exp.litF32 (-1.0)) (Exp.litF32 1.0)
+    let mag := Exp.mul (Exp.add (Exp.litF32 1.0) (Exp.div (Exp.toF32 mant) (Exp.litF32 128.0)))
+                       (Exp.exp2 (Exp.sub (Exp.toF32 exp8) (Exp.litF32 127.0)))
+    Exp.select (Exp.eq exp8 (Exp.litU32 0)) (Exp.litF32 0.0) (Exp.mul signF mag)
+  ShaderM.if_ (Exp.lt i (Exp.litU32 nOut)) (do
+    let w := Exp.index (Exp.var "bin" : Exp (.array (.scalar .u32) nOut)) i
+    let lo := Exp.bitAnd w (Exp.litU32 0xFFFF)
+    let hi := Exp.shiftRight w (Exp.litU32 16)
+    ShaderM.writeBuffer (ty := .scalar .u32) "fout" i
+      (Exp.pack2x16float (Exp.vec2 (cvt lo) (cvt hi)))) (pure ())
+
 /-! ## Helper: Create GPU Buffer from ByteArray -/
 
 private def uploadBuffer [GPUBackend β] (ctx : β) (data : ByteArray) : IO (GPUBackend.Buf β) := do
@@ -293,10 +367,38 @@ private def loadLinear [GPUBackend β] (ctx : β) (gguf : Hesper.GGUF.GGUFFile)
   let tensorInfo ← match Hesper.GGUF.Loader.findTensor gguf name with
     | .ok ti => pure ti
     | .error e => throw $ IO.userError e
+  -- MatFormer (Gemma 4 E-series): per-layer FFN dims VARY (e.g. E2B layer 0 ffn=6144 while the
+  -- config array's max is 12288). The caller's (inDim, outDim) is only an expectation — trust the
+  -- TENSOR's actual GGUF shape ([d0, d1] = [inDim, outDim]) so kernels declare the real sizes
+  -- (a mismatch surfaces as "buffer binding too small" at dispatch on WebGPU).
+  let (inDim, outDim) ← match tensorInfo.shape.toList with
+    | [d0, d1] =>
+      if d0 != inDim || d1 != outDim then
+        IO.println s!"  [loadLinear] {name}: tensor dims {d0}×{d1} override expected {inDim}×{outDim} (MatFormer per-layer)"
+      pure (d0, d1)
+    | _ => pure (inDim, outDim)
   let quantFormat : Linear.QuantFormat := match tensorInfo.ggmlType with
     | .Q6_K => .Q6_K
+    | .F32 => .F16   -- unquantized (E2B PLE inp_gate/proj): GPU-packed to f16 below
+    | .F16 => .F16
     | _ => .Q4_K
-  let weightBuf ← uploadTensor ctx gguf name
+  let weightBuf ← match tensorInfo.ggmlType with
+    | .F32 => do
+      -- E2B ships PLE inp_gate/proj as F32 — pack to f16 on GPU for the f16 matmul path.
+      IO.println s!"  [loadLinear] {name}: F32 → packed f16 ({inDim}×{outDim})"
+      let raw ← uploadTensor ctx gguf name
+      let ne := inDim * outDim
+      let nOut := ne / 2
+      let f16Buf ← GPUBackend.allocBuffer ctx (2 * ne).toUSize
+      let wg := (nOut + 255) / 256
+      let nx := min wg 65535
+      let ny := (wg + nx - 1) / nx
+      GPUBackend.execute ctx (packF32ToF16ChunkKernel nOut (nx*256) 0)
+        [("fin", raw), ("fout", f16Buf)]
+        { numWorkgroups := (nx, ny, 1), workgroupSize := { x := 256 }, extensions := [] }
+      GPUBackend.freeBuffer ctx raw
+      pure f16Buf
+    | _ => uploadTensor ctx gguf name
   let prepared ← GPUBackend.newCacheRef (β := β)
   let splitKBuf ← IO.mkRef none
   let splitKPartialPrepared ← GPUBackend.newCacheRef (β := β)
@@ -519,6 +621,7 @@ def Gemma4Model.fromGGUFDataWithGguf [GPUBackend β] (ctx : β)
   -- path (matches llama.cpp's CUDA backend, which keeps output.weight in f16
   -- when the source is Q6_K).
   let isQ6K := match outputWeightFormat with | .Q6_K => true | _ => false
+  let isQ4K := match outputWeightFormat with | .Q4_K => true | _ => false
   let outputWeightF16 ← if isQ6K then do
       IO.println s!"  Pre-dequantising Q6_K lm_head → packed f16 ({(cfg.vocabSize * cfg.hiddenSize * 2) / (1024*1024)} MiB)"
       let totalU32 := cfg.vocabSize * (cfg.hiddenSize / 2)
@@ -531,6 +634,37 @@ def Gemma4Model.fromGGUFDataWithGguf [GPUBackend β] (ctx : β)
         { numWorkgroups := (totalBlocks, 1, 1), workgroupSize := { x := 64, y := 1, z := 1 }
           extensions := [] }
       pure (some f16Buf)
+    else if isQ4K && (← IO.getEnv "HESPER_LMHEAD_F16") == some "1" then do
+      -- Q4_K-tied lm_head (Gemma 4 E2B quantises token_embd as Q4_K, unlike E4B's Q6_K).
+      -- Same fast-f16 path, but the f32 intermediate for the FULL table (vocab×dim×4 ≈ 1.6 GB)
+      -- exceeds maxStorageBufferBindingSize — so dequant+pack in CHUNKS through a chunk-sized
+      -- f32 scratch (dequantQ4KMKernel's baked elemOffset), packing into the final f16 buffer.
+      IO.println s!"  Pre-dequantising Q4_K lm_head → packed f16 ({(cfg.vocabSize * cfg.hiddenSize * 2) / (1024*1024)} MiB, chunked)"
+      let ne := cfg.vocabSize * cfg.hiddenSize
+      let f16Buf ← GPUBackend.allocBuffer ctx (2 * ne).toUSize
+      let chunkRows := 32768
+      let chunkElems := chunkRows * cfg.hiddenSize
+      let scratch ← GPUBackend.allocBuffer ctx (4 * chunkElems).toUSize
+      let nChunks := (cfg.vocabSize + chunkRows - 1) / chunkRows
+      for c in [0:nChunks] do
+        let off := c * chunkElems
+        let thisElems := min chunkElems (ne - off)
+        let wg := (thisElems + 255) / 256
+        let nx := min wg 65535
+        let ny := (wg + nx - 1) / nx
+        GPUBackend.execute ctx
+          (Hesper.Quantization.Q4_K_M.dequantQ4KMKernel thisElems (nx*256) off)
+          [("data", outputWeight), ("output", scratch)]
+          { numWorkgroups := (nx, ny, 1), workgroupSize := { x := 256 }, extensions := [] }
+        let packN := thisElems / 2
+        let pwg := (packN + 255) / 256
+        let pnx := min pwg 65535
+        let pny := (pwg + pnx - 1) / pnx
+        GPUBackend.execute ctx
+          (packF32ToF16ChunkKernel packN (pnx*256) (off / 2))
+          [("fin", scratch), ("fout", f16Buf)]
+          { numWorkgroups := (pnx, pny, 1), workgroupSize := { x := 256 }, extensions := [] }
+      pure (some f16Buf)
     else
       pure none
 
@@ -541,13 +675,21 @@ def Gemma4Model.fromGGUFDataWithGguf [GPUBackend β] (ctx : β)
   --   (b) HESPER_USE_MMAP=1 + this path: keep the table in CPU mmap
   --       and DMA only the active row (~45 KB) per token. Matches
   --       llama.cpp's CPU_Mapped buffer pattern. Saves 2.2 GB VRAM.
-  let (perLayerEmbdMmap, perLayerEmbdTableGPU, perLayerEmbdRowBytes,
-       perLayerModelProj, perLayerProjNorm) ←
+  let (perLayerEmbdMmap, perLayerEmbdTableGPU, perLayerEmbdTableBytes, perLayerEmbdRowBytes,
+       perLayerEmbdIsQ5K, perLayerModelProj, perLayerProjNorm) ←
     if cfg.hasPerLayerEmbeddings then do
       IO.println "[Gemma4] Loading per-layer embeddings..."
       let blocksPerRow := (cfg.embdPerLayer * cfg.numHiddenLayers) / 256
-      let rowBytes := blocksPerRow * 210  -- Q6_K block size
-      let (mmapHandle, tableGpu) ← match Hesper.GGUF.Loader.findTensor gguf "per_layer_token_embd.weight" with
+      -- E4B ships this table as Q6_K (210 B/block); E2B as Q5_K (176 B/block).
+      let isQ5K ← match Hesper.GGUF.Loader.findTensor gguf "per_layer_token_embd.weight" with
+        | .ok info =>
+          match info.ggmlType with
+          | .Q5_K => pure true
+          | .Q6_K => pure false
+          | t => throw (IO.userError s!"per_layer_token_embd: unsupported quant {repr t} (expected Q5_K or Q6_K)")
+        | .error _ => pure false
+      let rowBytes := blocksPerRow * (if isQ5K then 176 else 210)
+      let (mmapHandle, tableGpu, tableCpu) ← match Hesper.GGUF.Loader.findTensor gguf "per_layer_token_embd.weight" with
         | .ok info =>
           match gguf.mmap with
           | some mh =>
@@ -567,14 +709,45 @@ def Gemma4Model.fromGGUFDataWithGguf [GPUBackend β] (ctx : β)
             IO.println s!"  per_layer_token_embd: {info.size} bytes → mmap UVA (cuMemHostRegister + cuMemHostGetDevicePointer)"
             let devPtr ← Hesper.CUDA.mmapRegisterRegion mh absOff tableBytes
             let placeholderBuf ← GPUBackend.allocBuffer ctx rowBytes.toUSize
-            pure (some (mh, dataSecOff, tensorOff, devPtr), some placeholderBuf)
+            pure (some (mh, dataSecOff, tensorOff, devPtr), some placeholderBuf, none)
           | none =>
-            -- Legacy path: upload the whole table to VRAM.
-            IO.println s!"  per_layer_token_embd: {info.size} bytes → GPU ({info.size / 1024 / 1024} MB)"
-            pure (none, some (← uploadTensor ctx gguf "per_layer_token_embd.weight"))
-        | .error _ => pure (none, none)
+            -- ROW-STAGING path (WebGPU / no-mmap): binding the full 1.5-2.2 GiB table is invalid
+            -- (maxStorageBufferBindingSize) AND wrong (the dequant kernel declares a 2-row table —
+            -- robustness clamps any real tokenId on WebGPU). Keep the table on CPU; the forward
+            -- writeBuffers ONE row (~rowBytes ≈ 7 KB) into this scratch per token (negligible H2D)
+            -- and passes kernel tokenId = 0. Also saves the full table's VRAM.
+            IO.println s!"  per_layer_token_embd: {info.size} bytes → CPU (row-staged, {rowBytes} B/token)"
+            -- 64 SLOTS, u32-rounded stride ((rowBytes+3)/4×4 — the kernel's rowU32Size): the
+            -- BATCHED prefill records all dispatches then submits ONCE, so per-token stagings
+            -- into a single slot would all land before any dispatch runs (last-write-wins for
+            -- every position). Position i stages into slot i%64 and the kernel gets tokenId=i%64.
+            -- The dequant kernel must DECLARE 64 rows (declRows — WebGPU robustness clamps to
+            -- the declared size).
+            let rowBuf ← GPUBackend.allocBuffer ctx (64 * (((rowBytes + 3) / 4) * 4)).toUSize
+            let bytes ← match Hesper.GGUF.Loader.getTensorData gguf "per_layer_token_embd.weight" with
+              | .ok (_, data) => pure data
+              | .error e => throw (IO.userError e)
+            pure (none, some rowBuf, some bytes)
+        | .error _ => pure (none, none, none)
       let proj ← match Hesper.GGUF.Loader.findTensor gguf "per_layer_model_proj.weight" with
-        | .ok _ => pure (some (← uploadTensor ctx gguf "per_layer_model_proj.weight"))
+        | .ok info =>
+          if (match info.ggmlType with | .BF16 => true | _ => false) then do
+            -- E2B ships this projection as BF16 — repack to f16 on GPU for the f16 matmul.
+            IO.println "  per_layer_model_proj: BF16 → f16 repack"
+            let raw ← uploadTensor ctx gguf "per_layer_model_proj.weight"
+            let nElems := cfg.hiddenSize * cfg.embdPerLayer * cfg.numHiddenLayers
+            let nOut := nElems / 2
+            let f16Buf ← GPUBackend.allocBuffer ctx (2 * nElems).toUSize
+            let wg := (nOut + 255) / 256
+            let nx := min wg 65535
+            let ny := (wg + nx - 1) / nx
+            GPUBackend.execute ctx (bf16ToF16PackKernel nOut (nx*256))
+              [("bin", raw), ("fout", f16Buf)]
+              { numWorkgroups := (nx, ny, 1), workgroupSize := { x := 256 }, extensions := [] }
+            GPUBackend.freeBuffer ctx raw
+            pure (some f16Buf)
+          else
+            pure (some (← uploadTensor ctx gguf "per_layer_model_proj.weight"))
         | .error _ => pure none
       let projNorm ← match Hesper.GGUF.Loader.findTensor gguf "per_layer_proj_norm.weight" with
         | .ok _ =>
@@ -582,9 +755,9 @@ def Gemma4Model.fromGGUFDataWithGguf [GPUBackend β] (ctx : β)
           let plNormConfig : RMSNorm.Config := { dim := cfg.embdPerLayer, eps := cfg.rmsNormEps }
           pure (some (← RMSNorm.create ctx plNormConfig d))
         | .error _ => pure none
-      pure (mmapHandle, tableGpu, rowBytes, proj, projNorm)
+      pure (mmapHandle, tableGpu, tableCpu, rowBytes, isQ5K, proj, projNorm)
     else
-      pure (none, none, 0, none, none)
+      pure (none, none, none, 0, false, none, none)
 
   -- Per-layer gate/proj/norm per block
   let mut perLayerBlocks : Array (Option (Gemma4PerLayerEmbd (GPUBackend.Buf β) (GPUBackend.CachedDispatch β))) := #[]
@@ -626,7 +799,9 @@ def Gemma4Model.fromGGUFDataWithGguf [GPUBackend β] (ctx : β)
     outputWeightF16
     perLayerEmbdMmap
     perLayerEmbdTableGPU
+    perLayerEmbdTableBytes
     perLayerEmbdRowBytes
+    perLayerEmbdIsQ5K
     perLayerModelProj
     perLayerProjNorm
     perLayerBlocks

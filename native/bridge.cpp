@@ -31,6 +31,7 @@
 #include <string>
 #include <atomic>
 #include <memory>
+#include <mutex>
 #include <future>
 
 // Note: g_device removed - all functions now take device as parameter
@@ -644,7 +645,10 @@ static WGPULimits getMaxLimits(wgpu::Adapter& adapter) {
         atMost(4, adapterLimits.maxDynamicStorageBuffersPerPipelineLayout);
     limits.maxSampledTexturesPerShaderStage = atMost(16, adapterLimits.maxSampledTexturesPerShaderStage);
     limits.maxSamplersPerShaderStage = atMost(16, adapterLimits.maxSamplersPerShaderStage);
-    limits.maxStorageBuffersPerShaderStage = atMost(8, adapterLimits.maxStorageBuffersPerShaderStage);
+    // 16: the fused qkvNormRope kernel binds 9 storage buffers (q_io + scales + k/v
+    // in/out + params + freq_factors); the WebGPU default of 8 rejects its layout.
+    // Apple Metal supports 31 buffer arguments.
+    limits.maxStorageBuffersPerShaderStage = atMost(16, adapterLimits.maxStorageBuffersPerShaderStage);
     limits.maxStorageTexturesPerShaderStage = atMost(4, adapterLimits.maxStorageTexturesPerShaderStage);
     limits.maxUniformBuffersPerShaderStage = atMost(12, adapterLimits.maxUniformBuffersPerShaderStage);
     limits.maxUniformBufferBindingSize = atMost(65536, adapterLimits.maxUniformBufferBindingSize);
@@ -661,17 +665,37 @@ static WGPULimits getMaxLimits(wgpu::Adapter& adapter) {
     limits.maxInterStageShaderVariables = atMost(16, adapterLimits.maxInterStageShaderVariables);
     limits.maxColorAttachments = atMost(8, adapterLimits.maxColorAttachments);
     limits.maxColorAttachmentBytesPerSample = atMost(32, adapterLimits.maxColorAttachmentBytesPerSample);
-    limits.maxComputeWorkgroupStorageSize = atMost(32768, adapterLimits.maxComputeWorkgroupStorageSize);
-    limits.maxComputeInvocationsPerWorkgroup = atMost(256, adapterLimits.maxComputeInvocationsPerWorkgroup);
-    limits.maxComputeWorkgroupSizeX = atMost(256, adapterLimits.maxComputeWorkgroupSizeX);
-    limits.maxComputeWorkgroupSizeY = atMost(256, adapterLimits.maxComputeWorkgroupSizeY);
-    limits.maxComputeWorkgroupSizeZ = atMost(64, adapterLimits.maxComputeWorkgroupSizeZ);
+    // Request the adapter's full compute-workgroup capability (Apple M-series: 1024) — the
+    // WebGPU defaults (256/64) reject legitimate kernels: gemma4 sumAllTokens uses wg 1024, and
+    // the autotune sweep's sgRows×sgCols=16 variants need wg 512.
+    limits.maxComputeWorkgroupStorageSize = atMost(65536, adapterLimits.maxComputeWorkgroupStorageSize);
+    limits.maxComputeInvocationsPerWorkgroup = atMost(1024, adapterLimits.maxComputeInvocationsPerWorkgroup);
+    limits.maxComputeWorkgroupSizeX = atMost(1024, adapterLimits.maxComputeWorkgroupSizeX);
+    limits.maxComputeWorkgroupSizeY = atMost(1024, adapterLimits.maxComputeWorkgroupSizeY);
+    limits.maxComputeWorkgroupSizeZ = atMost(1024, adapterLimits.maxComputeWorkgroupSizeZ);
     limits.maxComputeWorkgroupsPerDimension =
         atMost(65535, adapterLimits.maxComputeWorkgroupsPerDimension);
     return limits;
 }
 
 // Try to create a device with given feature set
+// HESPER_DUMP_MSL: retain the most recent Tint-MSL dump in-process so the autotune sweep can feed
+// it straight to the occupancy probe (lean_hesper_msl_occupancy_probe) — no stderr scraping.
+static std::mutex g_last_msl_mutex;
+static std::string g_last_dumped_msl;
+// Read once at device creation. Lives in a global (NOT a lambda capture): the logging callback must
+// be a CAPTURELESS lambda — a capturing one goes through the functor-userdata path whose lifetime
+// does not cover repeated logging invocations (observed: use-after-free → randomly ignored `quiet`
+// + nondeterministic SIGTRAP/SIGABRT during pipeline compiles).
+static bool g_msl_dump_quiet = false;
+
+// Read the most recent Tint-MSL dump captured by the HESPER_DUMP_MSL logging callback.
+// Empty string if nothing was dumped yet (or HESPER_DUMP_MSL is not set).
+extern "C" lean_obj_res lean_hesper_last_dumped_msl(lean_obj_res /* unit */) {
+    std::lock_guard<std::mutex> lock(g_last_msl_mutex);
+    return lean_io_result_mk_ok(lean_mk_string(g_last_dumped_msl.c_str()));
+}
+
 static wgpu::Device tryCreateDevice(wgpu::Adapter& adapter,
                                      const WGPUFeatureName* features, size_t featureCount,
                                      const WGPULimits& limits,
@@ -685,14 +709,23 @@ static wgpu::Device tryCreateDevice(wgpu::Adapter& adapter,
     deviceDesc.requiredLimits = reinterpret_cast<const wgpu::Limits*>(&limits);
     wgpu::Device device = adapter.CreateDevice(&deviceDesc);
     // HESPER_DUMP_MSL: route Dawn's dump_shaders output (the Tint-generated MSL) to stderr so we can
-    // capture it and diff against the hand-written MSL. Prefixed for easy grep/extraction.
+    // capture it and diff against the hand-written MSL, AND retain the latest dump in-process for the
+    // occupancy probe. HESPER_DUMP_MSL_QUIET=1 keeps the capture but suppresses stderr (sweep mode).
     if (device && getenv("HESPER_DUMP_MSL")) {
-        // Use the length-explicit StringView form: the const char* convenience overload is NOT
-        // guaranteed null-terminated, which reads OOB (SIGTRAP) on large dumped MSL.
+        g_msl_dump_quiet = getenv("HESPER_DUMP_MSL_QUIET") != nullptr;
+        // CAPTURELESS lambda (function-pointer path) — see g_msl_dump_quiet comment. Use the
+        // length-explicit StringView form: the const char* convenience overload is NOT guaranteed
+        // null-terminated, which reads OOB (SIGTRAP) on large dumped MSL.
         device.SetLoggingCallback([](wgpu::LoggingType, wgpu::StringView message) {
-            std::cerr << "===MSLDUMP-BEGIN===\n"
-                      << std::string(message.data, message.length)
-                      << "\n===MSLDUMP-END===" << std::endl;
+            {
+                std::lock_guard<std::mutex> lock(g_last_msl_mutex);
+                g_last_dumped_msl.assign(message.data, message.length);
+            }
+            if (!g_msl_dump_quiet) {
+                std::cerr << "===MSLDUMP-BEGIN===\n"
+                          << std::string(message.data, message.length)
+                          << "\n===MSLDUMP-END===" << std::endl;
+            }
         });
     }
     return device;
@@ -1684,7 +1717,12 @@ lean_obj_res lean_hesper_create_bind_group(b_lean_obj_arg device_obj, b_lean_obj
     if (g_verbose) fprintf(stderr, "[C++] Creating BindGroup...\n");
     fflush(stderr);
 
-    wgpu::BindGroup bindGroup = device->CreateBindGroup(&bgDesc);
+    // Error scope so CREATION-time validation failures print their reason here (otherwise the
+    // error object surfaces later as an opaque "[Invalid BindGroup] is invalid" at SetBindGroup).
+    wgpu::BindGroup bindGroup;
+    runWithErrorScope(device->Get(), g_dawn_instance, "CreateBindGroup", [&]() {
+        bindGroup = device->CreateBindGroup(&bgDesc);
+    });
 
     if (g_verbose) fprintf(stderr, "[C++] BindGroup created: wrapper=%p, WGPUBindGroup=%p\n", (void*)&bindGroup, (void*)bindGroup.Get());
     fflush(stderr);
@@ -2437,6 +2475,40 @@ extern "C" lean_obj_res lean_hesper_gpubusy_read(lean_obj_res /* unit */) {
     return lean_io_result_mk_ok(lean_mk_string(b));
 }
 
+// ── Single-pass batching ─────────────────────────────────────────────────
+// One compute pass per batch instead of one per dispatch. Pass open/close
+// costs ~5-15 µs each; at ~600 dispatches/token that was 3-9 ms of pure
+// pass-switch overhead per decode step. WebGPU defines per-dispatch usage
+// scopes WITHIN a pass, so writes from dispatch N are visible to dispatch
+// N+1 without ending the pass — data dependencies are preserved.
+// HESPER_SINGLE_PASS=1 opts in. DEFAULT OFF: single-pass mode changes decode
+// numerics (bit-level divergence first appearing in layer-1 attention;
+// deterministic per mode, prefill unaffected) — an intra-pass hazard is being
+// missed somewhere (Dawn-on-Metal barrier or a scheduling-sensitive kernel).
+// Measured win was only ~+3% (49.6→51.3 t/s), so it stays off until the
+// hazard is found. Reproducer: poem prompt, 24 tokens, md5 of token list
+// differs between HESPER_SINGLE_PASS=0/1; bisect via /tmp/sp{0,1} dumps.
+static WGPUComputePassEncoder g_open_pass = nullptr;
+static WGPUCommandEncoder g_open_pass_owner = nullptr;
+
+static bool single_pass_enabled() {
+    static const bool enabled = [] {
+        const char* v = getenv("HESPER_SINGLE_PASS");
+        return v && strcmp(v, "1") == 0;
+    }();
+    return enabled;
+}
+
+// End + release the open pass if it belongs to `enc` (call before Finish).
+static void close_open_pass_for(WGPUCommandEncoder enc) {
+    if (g_open_pass && g_open_pass_owner == enc) {
+        wgpuComputePassEncoderEnd(g_open_pass);
+        wgpuComputePassEncoderRelease(g_open_pass);
+        g_open_pass = nullptr;
+        g_open_pass_owner = nullptr;
+    }
+}
+
 lean_obj_res lean_hesper_record_dispatch(b_lean_obj_arg encoder_obj, b_lean_obj_arg pipeline_obj,
                                           b_lean_obj_arg bind_group_obj,
                                           uint32_t workgroupsX, uint32_t workgroupsY, uint32_t workgroupsZ,
@@ -2456,14 +2528,32 @@ lean_obj_res lean_hesper_record_dispatch(b_lean_obj_arg encoder_obj, b_lean_obj_
         return lean_io_result_mk_error(lean_mk_string("BindGroup is invalid"));
     }
 
-    WGPUComputePassEncoder pass = wgpuCommandEncoderBeginComputePass(encoder->Get(), nullptr);
-    wgpuComputePassEncoderSetPipeline(pass, pipeline->Get());
-    wgpuComputePassEncoderSetBindGroup(pass, 0, bindGroup->Get(), 0, nullptr);
-    wgpuComputePassEncoderDispatchWorkgroups(pass, workgroupsX, workgroupsY, workgroupsZ);
-    wgpuComputePassEncoderEnd(pass);
-    wgpuComputePassEncoderRelease(pass);
+    if (single_pass_enabled()) {
+        WGPUComputePassEncoder pass;
+        if (g_open_pass && g_open_pass_owner == encoder->Get()) {
+            pass = g_open_pass;
+        } else {
+            // A pass left open on a DIFFERENT encoder means that encoder was
+            // abandoned without submit — close ours out to avoid leaking.
+            if (g_open_pass) close_open_pass_for(g_open_pass_owner);
+            pass = wgpuCommandEncoderBeginComputePass(encoder->Get(), nullptr);
+            g_open_pass = pass;
+            g_open_pass_owner = encoder->Get();
+            g_pass_count.fetch_add(1, std::memory_order_relaxed);
+        }
+        wgpuComputePassEncoderSetPipeline(pass, pipeline->Get());
+        wgpuComputePassEncoderSetBindGroup(pass, 0, bindGroup->Get(), 0, nullptr);
+        wgpuComputePassEncoderDispatchWorkgroups(pass, workgroupsX, workgroupsY, workgroupsZ);
+    } else {
+        WGPUComputePassEncoder pass = wgpuCommandEncoderBeginComputePass(encoder->Get(), nullptr);
+        wgpuComputePassEncoderSetPipeline(pass, pipeline->Get());
+        wgpuComputePassEncoderSetBindGroup(pass, 0, bindGroup->Get(), 0, nullptr);
+        wgpuComputePassEncoderDispatchWorkgroups(pass, workgroupsX, workgroupsY, workgroupsZ);
+        wgpuComputePassEncoderEnd(pass);
+        wgpuComputePassEncoderRelease(pass);
+        g_pass_count.fetch_add(1, std::memory_order_relaxed);
+    }
 
-    g_pass_count.fetch_add(1, std::memory_order_relaxed);
     g_record_ns.fetch_add(std::chrono::duration_cast<std::chrono::nanoseconds>(
         std::chrono::steady_clock::now() - _t0).count(), std::memory_order_relaxed);
     return lean_io_result_mk_ok(lean_box(0));
@@ -2481,6 +2571,7 @@ lean_obj_res lean_hesper_submit_and_wait(b_lean_obj_arg device_obj, b_lean_obj_a
     }
 
     // Finish encoder and submit (DG_GPUBUSY: time Finish=CPU translation vs submit+wait=GPU)
+    close_open_pass_for(encoder->Get());
     auto _tf0 = std::chrono::steady_clock::now();
     WGPUCommandBuffer commandBuffer = wgpuCommandEncoderFinish(encoder->Get(), nullptr);
     auto _tf1 = std::chrono::steady_clock::now();
@@ -2526,6 +2617,7 @@ lean_obj_res lean_hesper_submit_no_wait(b_lean_obj_arg device_obj, b_lean_obj_ar
     if (!encoder || !encoder->Get()) {
         return lean_io_result_mk_error(lean_mk_string("CommandEncoder is invalid"));
     }
+    close_open_pass_for(encoder->Get());
     auto _tf0 = std::chrono::steady_clock::now();
     WGPUCommandBuffer commandBuffer = wgpuCommandEncoderFinish(encoder->Get(), nullptr);
     wgpuQueueSubmit(device->GetQueue().Get(), 1, &commandBuffer);

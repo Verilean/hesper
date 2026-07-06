@@ -15,6 +15,7 @@
 #include <chrono>
 #include <cstring>
 #include <atomic>
+#include <unordered_set>
 
 // DG_GPUBUSY: MSL-path accounting. wait = time in WaitForCommandsToBeScheduled (Dawn→MSL handoff);
 // enc = command-buffer build+encode+commit (CPU); gpu = kernel GPU time (GPUEnd-GPUStart, via a
@@ -1089,6 +1090,521 @@ extern "C" lean_obj_res lean_hesper_msl_gateup_down_onecb(
     g_msl_wait_ns.fetch_add(std::chrono::duration_cast<std::chrono::nanoseconds>(_tw1 - _tw0).count(), std::memory_order_relaxed);
     g_msl_enc_ns.fetch_add(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - _tw1).count(), std::memory_order_relaxed);
     return lean_io_result_mk_ok(lean_box(0));
+}
+
+// DEVPLAN M1 — occupancy probe: compile a Tint-dumped MSL source with the REAL Metal compiler and
+// report the pipeline's resource stats. Same source + same compiler as the Dawn path, so the numbers
+// match what the deployed pipeline gets: maxTotalThreadsPerThreadgroup is the register-pressure
+// inverse signal (drops when the kernel spills), threadExecutionWidth confirms simd width (32 on
+// Apple), staticThreadgroupMemoryLength is the shared-memory footprint. This is the MANDATORY
+// resource column of the autotune sweep (never report speed without it).
+// ===========================================================================================
+// M3 de-risk probe: does MTLDispatchTypeConcurrent recover the ~14 µs/dispatch serialization
+// that Dawn's hardcoded Serial encoder costs us? Compiles a DUMPED Tint-MSL kernel (same code
+// Dawn runs), records `nDispatches` back-to-back in ONE encoder with the requested dispatch
+// type and NO barriers (racing writes are fine — timing only), returns GPU wall ms.
+// ===========================================================================================
+extern "C" lean_obj_res lean_hesper_msl_concurrent_probe(
+    b_lean_obj_arg device_obj, b_lean_obj_arg msl_obj,
+    b_lean_obj_arg b0_obj, b_lean_obj_arg b1_obj, b_lean_obj_arg b2_obj,
+    uint32_t nDispatches, uint32_t gridX, uint32_t gridY, uint32_t wgX,
+    uint8_t concurrent,
+    lean_obj_res /* unit */) {
+    @autoreleasepool {
+        wgpu::Device* device = mr_extract_device(device_obj);
+        if (!device || !device->Get()) return lean_io_result_mk_error(lean_mk_string("conc_probe: invalid device"));
+        id<MTLDevice> mtl = dawn::native::metal::GetMTLDevice(device->Get());
+        const char* mslSrc = lean_string_cstr(msl_obj);
+        if (!mslSrc || mslSrc[0] == '\0')
+            return lean_io_result_mk_error(lean_mk_string("conc_probe: empty MSL (set HESPER_DUMP_MSL=1)"));
+        wgpu::Buffer* bufs[3] = { mr_extract_buffer(b0_obj), mr_extract_buffer(b1_obj), mr_extract_buffer(b2_obj) };
+        id<MTLBuffer> mb[3];
+        for (int i = 0; i < 3; i++) {
+            if (!bufs[i] || !bufs[i]->Get()) return lean_io_result_mk_error(lean_mk_string("conc_probe: invalid buffer"));
+            mb[i] = reinterpret_cast<dawn::native::metal::Buffer*>(bufs[i]->Get())->GetMTLBuffer();
+        }
+        NSError* err = nil;
+        MTLCompileOptions* opts = [MTLCompileOptions new];
+        id<MTLLibrary> lib = [mtl newLibraryWithSource:[NSString stringWithUTF8String:mslSrc] options:opts error:&err];
+        if (!lib) return lean_io_result_mk_error(lean_mk_string(
+            [[NSString stringWithFormat:@"conc_probe compile failed: %@", err] UTF8String]));
+        id<MTLFunction> fn = [lib newFunctionWithName:@"dawn_entry_point"];
+        if (!fn) return lean_io_result_mk_error(lean_mk_string("conc_probe: no dawn_entry_point"));
+        id<MTLComputePipelineState> pso = [mtl newComputePipelineStateWithFunction:fn error:&err];
+        if (!pso) return lean_io_result_mk_error(lean_mk_string("conc_probe: PSO failed"));
+        if (!g_mslQueue) g_mslQueue = [mtl newCommandQueue];
+        id<MTLCommandBuffer> cb = [g_mslQueue commandBuffer];
+        MTLComputePassDescriptor* desc = [MTLComputePassDescriptor computePassDescriptor];
+        desc.dispatchType = concurrent ? MTLDispatchTypeConcurrent : MTLDispatchTypeSerial;
+        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoderWithDescriptor:desc];
+        [enc setComputePipelineState:pso];
+        for (int i = 0; i < 3; i++) [enc setBuffer:mb[i] offset:0 atIndex:i];
+        for (uint32_t d = 0; d < nDispatches; d++) {
+            [enc dispatchThreadgroups:MTLSizeMake(gridX, gridY, 1)
+                threadsPerThreadgroup:MTLSizeMake(wgX, 1, 1)];
+        }
+        [enc endEncoding];
+        [cb commit];
+        [cb waitUntilCompleted];
+        double gpuMs = ([cb GPUEndTime] - [cb GPUStartTime]) * 1000.0;
+        char buf[64];
+        snprintf(buf, sizeof(buf), "%.4f", gpuMs);
+        return lean_io_result_mk_ok(lean_mk_string(buf));
+    }
+}
+
+// ===========================================================================================
+// Native GPU timing for the autotune engine (HESPER_NATIVE_BENCH=1): benching tiny matvecs
+// through Dawn measures Dawn's ~35 µs/dispatch overhead, not the kernel (native serial
+// 13.5 µs vs 47 µs through Dawn for the SAME kernel — measured). This runs `nDispatches`
+// of the variant's dumped Tint-MSL back-to-back in one SERIAL native encoder and returns
+// the honest serialized GPU ms. Buffers come as a Lean Array in BINDING ORDER.
+// ===========================================================================================
+extern "C" lean_obj_res lean_hesper_msl_bench_serial(
+    b_lean_obj_arg device_obj, b_lean_obj_arg msl_obj, b_lean_obj_arg bufs_array,
+    uint32_t nDispatches, uint32_t gridX, uint32_t gridY, uint32_t gridZ, uint32_t wgX,
+    lean_obj_res /* unit */) {
+    @autoreleasepool {
+        wgpu::Device* device = mr_extract_device(device_obj);
+        if (!device || !device->Get()) return lean_io_result_mk_error(lean_mk_string("bench_serial: invalid device"));
+        id<MTLDevice> mtl = dawn::native::metal::GetMTLDevice(device->Get());
+        const char* mslSrc = lean_string_cstr(msl_obj);
+        if (!mslSrc || mslSrc[0] == '\0')
+            return lean_io_result_mk_error(lean_mk_string("bench_serial: empty MSL (set HESPER_DUMP_MSL=1)"));
+        size_t nBufs = lean_array_size(bufs_array);
+        std::vector<id<MTLBuffer>> mb(nBufs);
+        for (size_t i = 0; i < nBufs; i++) {
+            wgpu::Buffer* b = mr_extract_buffer(lean_array_get_core(bufs_array, i));
+            if (!b || !b->Get()) return lean_io_result_mk_error(lean_mk_string("bench_serial: invalid buffer"));
+            mb[i] = reinterpret_cast<dawn::native::metal::Buffer*>(b->Get())->GetMTLBuffer();
+        }
+        // PSO cache keyed by MSL hash — refine re-benches the same variants.
+        static std::unordered_map<size_t, id<MTLComputePipelineState>> psoCache;
+        size_t key = std::hash<std::string>{}(std::string(mslSrc));
+        id<MTLComputePipelineState> pso = nil;
+        auto it = psoCache.find(key);
+        if (it != psoCache.end()) pso = it->second;
+        else {
+            NSError* err = nil;
+            MTLCompileOptions* opts = [MTLCompileOptions new];
+            id<MTLLibrary> lib = [mtl newLibraryWithSource:[NSString stringWithUTF8String:mslSrc] options:opts error:&err];
+            if (!lib) return lean_io_result_mk_error(lean_mk_string(
+                [[NSString stringWithFormat:@"bench_serial compile failed: %@", err] UTF8String]));
+            id<MTLFunction> fn = [lib newFunctionWithName:@"dawn_entry_point"];
+            if (!fn) return lean_io_result_mk_error(lean_mk_string("bench_serial: no dawn_entry_point"));
+            pso = [mtl newComputePipelineStateWithFunction:fn error:&err];
+            if (!pso) return lean_io_result_mk_error(lean_mk_string("bench_serial: PSO failed"));
+            psoCache[key] = pso;
+        }
+        if (!g_mslQueue) g_mslQueue = [mtl newCommandQueue];
+        id<MTLCommandBuffer> cb = [g_mslQueue commandBuffer];
+        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];   // serial (default)
+        [enc setComputePipelineState:pso];
+        for (size_t i = 0; i < nBufs; i++) [enc setBuffer:mb[i] offset:0 atIndex:i];
+        for (uint32_t d = 0; d < nDispatches; d++) {
+            [enc dispatchThreadgroups:MTLSizeMake(gridX, gridY, gridZ)
+                threadsPerThreadgroup:MTLSizeMake(wgX, 1, 1)];
+        }
+        [enc endEncoding];
+        [cb commit];
+        [cb waitUntilCompleted];
+        double gpuMs = ([cb GPUEndTime] - [cb GPUStartTime]) * 1000.0;
+        char buf[64];
+        snprintf(buf, sizeof(buf), "%.4f", gpuMs);
+        return lean_io_result_mk_ok(lean_mk_string(buf));
+    }
+}
+
+extern "C" lean_obj_res lean_hesper_msl_occupancy_probe(
+    b_lean_obj_arg device_obj, b_lean_obj_arg msl_obj, lean_obj_res /* unit */) {
+    @autoreleasepool {
+        wgpu::Device* device = mr_extract_device(device_obj);
+        if (!device || !device->Get()) {
+            return lean_io_result_mk_error(lean_mk_string("occupancy_probe: device is invalid"));
+        }
+        id<MTLDevice> mtl = dawn::native::metal::GetMTLDevice(device->Get());
+        if (!mtl) {
+            return lean_io_result_mk_error(lean_mk_string("occupancy_probe: null MTLDevice"));
+        }
+        const char* mslSrc = lean_string_cstr(msl_obj);
+        if (!mslSrc || mslSrc[0] == '\0') {
+            return lean_io_result_mk_error(lean_mk_string(
+                "occupancy_probe: empty MSL source (is HESPER_DUMP_MSL=1 set and a pipeline compiled?)"));
+        }
+        NSError* err = nil;
+        MTLCompileOptions* opts = [MTLCompileOptions new];
+        id<MTLLibrary> lib = [mtl newLibraryWithSource:[NSString stringWithUTF8String:mslSrc]
+                                               options:opts error:&err];
+        if (!lib) {
+            NSString* msg = [NSString stringWithFormat:@"occupancy_probe: newLibraryWithSource failed: %@",
+                             err ? err.localizedDescription : @"(no error info)"];
+            return lean_io_result_mk_error(lean_mk_string([msg UTF8String]));
+        }
+        id<MTLFunction> fn = [lib newFunctionWithName:@"dawn_entry_point"];
+        if (!fn) {
+            return lean_io_result_mk_error(lean_mk_string(
+                "occupancy_probe: entry point 'dawn_entry_point' not found in dumped MSL"));
+        }
+        id<MTLComputePipelineState> pso = [mtl newComputePipelineStateWithFunction:fn error:&err];
+        if (!pso) {
+            NSString* msg = [NSString stringWithFormat:@"occupancy_probe: PSO creation failed: %@",
+                             err ? err.localizedDescription : @"(no error info)"];
+            return lean_io_result_mk_error(lean_mk_string([msg UTF8String]));
+        }
+        char buf[128];
+        snprintf(buf, sizeof(buf), "maxThreads=%lu execWidth=%lu tgMem=%lu",
+                 (unsigned long)pso.maxTotalThreadsPerThreadgroup,
+                 (unsigned long)pso.threadExecutionWidth,
+                 (unsigned long)pso.staticThreadgroupMemoryLength);
+        return lean_io_result_mk_ok(lean_mk_string(buf));
+    }
+}
+
+// ===========================================================================================
+// Experiment 2 Phase A: NATIVE REPLAY of a captured decode-token dispatch sequence.
+// Falsification test of the post-mortem's C2 ("the gap is the dispatch layer, not kernels"):
+// the Lean side captures every dispatch of ONE decode token (Tint-CLI MSL + buffers in MSL
+// binding order + grid/wg dims + threadgroup bytes), then we replay the whole token in ONE
+// native command buffer, timing Serial vs MTLDispatchTypeConcurrent (no-barrier upper bound,
+// and per-layer-barrier realistic bound via barrier markers). Timing-only: the replay runs on
+// the live Dawn buffers AFTER decode finishes, so values are garbage but layout is identical —
+// all our kernels are fixed-trip-count, so timing is value-independent.
+// ===========================================================================================
+struct HesperReplayOp {
+    id<MTLComputePipelineState> pso;   // nil => barrier marker
+    std::vector<id<MTLBuffer>> bufs;
+    uint32_t gx, gy, gz, tx, ty, tz;
+    uint32_t tgBytes;
+    uint32_t writeMask;  // bit i set => bufs[i] is written (WGSL read_write binding)
+};
+// Heap-allocated: never destroyed, so no static-destruction-order issues with ARC members.
+static std::vector<HesperReplayOp>* g_replayOps = nullptr;
+static std::unordered_map<size_t, id<MTLComputePipelineState>>* g_replayPsoCache = nullptr;
+// Stashed at record time so replay_run needs no device handle (callable from
+// backend-generic Lean code).
+static id<MTLDevice> g_replayMtlDevice = nil;
+static wgpu::Device* g_replayDawnDevice = nullptr;  // for mr_dawn_queue in replay_exec
+
+static inline std::vector<HesperReplayOp>& hesper_replay_ops() {
+    if (!g_replayOps) g_replayOps = new std::vector<HesperReplayOp>();
+    return *g_replayOps;
+}
+
+extern "C" lean_obj_res lean_hesper_replay_reset(lean_obj_res /* unit */) {
+    hesper_replay_ops().clear();
+    return lean_io_result_mk_ok(lean_box(0));
+}
+
+extern "C" lean_obj_res lean_hesper_replay_barrier(lean_obj_res /* unit */) {
+    HesperReplayOp op{};
+    op.pso = nil;
+    hesper_replay_ops().push_back(std::move(op));
+    return lean_io_result_mk_ok(lean_box(0));
+}
+
+// Record one dispatch. `bufs_array` must already be in MSL [[buffer(i)]] order (the Lean side
+// parses the Tint-CLI entry-point signature). `entry` = the MSL kernel function name.
+// `key` = the Lean-side authoritative cache key: the PSO cache is keyed on it directly so the
+// steady-state record cost is a u64 map probe — NOT a copy+hash of the ~10 KB MSL string
+// (572 records/token made that megabytes of hashing per token).
+extern "C" lean_obj_res lean_hesper_replay_record(
+    b_lean_obj_arg device_obj, b_lean_obj_arg msl_obj, b_lean_obj_arg entry_obj,
+    b_lean_obj_arg bufs_array,
+    uint32_t gx, uint32_t gy, uint32_t gz,
+    uint32_t tx, uint32_t ty, uint32_t tz,
+    uint32_t tgBytes, uint32_t writeMask, uint64_t key, lean_obj_res /* unit */) {
+    @autoreleasepool {
+        wgpu::Device* device = mr_extract_device(device_obj);
+        if (!device || !device->Get()) return lean_io_result_mk_error(lean_mk_io_user_error(lean_mk_string("replay_record: invalid device")));
+        id<MTLDevice> mtl = dawn::native::metal::GetMTLDevice(device->Get());
+        g_replayMtlDevice = mtl;
+        g_replayDawnDevice = device;
+
+        if (!g_replayPsoCache) g_replayPsoCache = new std::unordered_map<size_t, id<MTLComputePipelineState>>();
+        id<MTLComputePipelineState> pso = nil;
+        auto it = g_replayPsoCache->find(key);
+        if (it != g_replayPsoCache->end()) pso = it->second;
+        else {
+            const char* mslSrc = lean_string_cstr(msl_obj);
+            const char* entry = lean_string_cstr(entry_obj);
+            if (!mslSrc || mslSrc[0] == '\0') return lean_io_result_mk_error(lean_mk_io_user_error(lean_mk_string("replay_record: empty MSL")));
+            NSError* err = nil;
+            MTLCompileOptions* opts = [MTLCompileOptions new];
+            id<MTLLibrary> lib = [mtl newLibraryWithSource:[NSString stringWithUTF8String:mslSrc] options:opts error:&err];
+            if (!lib) return lean_io_result_mk_error(lean_mk_io_user_error(lean_mk_string(
+                [[NSString stringWithFormat:@"replay_record compile failed (%s): %@", entry, err] UTF8String])));
+            id<MTLFunction> fn = [lib newFunctionWithName:[NSString stringWithUTF8String:entry]];
+            if (!fn) return lean_io_result_mk_error(lean_mk_io_user_error(lean_mk_string(
+                [[NSString stringWithFormat:@"replay_record: entry '%s' not found", entry] UTF8String])));
+            pso = [mtl newComputePipelineStateWithFunction:fn error:&err];
+            if (!pso) return lean_io_result_mk_error(lean_mk_io_user_error(lean_mk_string(
+                [[NSString stringWithFormat:@"replay_record: PSO failed (%s): %@", entry, err] UTF8String])));
+            (*g_replayPsoCache)[key] = pso;
+        }
+
+        HesperReplayOp op{};
+        op.pso = pso;
+        size_t nBufs = lean_array_size(bufs_array);
+        op.bufs.resize(nBufs);
+        for (size_t i = 0; i < nBufs; i++) {
+            wgpu::Buffer* b = mr_extract_buffer(lean_array_get_core(bufs_array, i));
+            if (!b || !b->Get()) return lean_io_result_mk_error(lean_mk_io_user_error(lean_mk_string("replay_record: invalid buffer")));
+            op.bufs[i] = reinterpret_cast<dawn::native::metal::Buffer*>(b->Get())->GetMTLBuffer();
+        }
+        op.gx = gx; op.gy = gy; op.gz = gz;
+        op.tx = tx; op.ty = ty; op.tz = tz;
+        op.tgBytes = tgBytes;
+        op.writeMask = writeMask;
+        hesper_replay_ops().push_back(std::move(op));
+        return lean_io_result_mk_ok(lean_box(0));
+    }
+}
+
+// Encode the recorded sequence into ONE compute encoder. mode: 0 = Serial,
+// 1 = Concurrent no barriers, 2 = Concurrent + barriers at recorded layer markers,
+// 3 = Concurrent + AUTOMATIC hazard barriers (llama.cpp ggml_mem_ranges-style,
+//     whole-buffer granularity: barrier before an op that reads a buffer written
+//     since the last barrier, or writes a buffer read/written since the last barrier).
+// Returns the number of barriers inserted.
+static size_t hesper_replay_encode(id<MTLComputeCommandEncoder> enc, uint32_t mode,
+                                   std::vector<HesperReplayOp>& ops) {
+    size_t barriers = 0;
+    std::unordered_set<void*> readSet, writeSet;
+    for (auto& op : ops) {
+        if (!op.pso) {
+            if (mode == 2) { [enc memoryBarrierWithScope:MTLBarrierScopeBuffers]; barriers++; }
+            continue;
+        }
+        if (mode == 3) {
+            bool hazard = false;
+            for (size_t i = 0; i < op.bufs.size() && !hazard; i++) {
+                void* p = (__bridge void*)op.bufs[i];
+                bool writes = (i < 32) && ((op.writeMask >> i) & 1u);
+                if (writeSet.count(p)) hazard = true;                       // RAW / WAW
+                else if (writes && readSet.count(p)) hazard = true;         // WAR
+            }
+            if (hazard) {
+                [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+                barriers++;
+                readSet.clear();
+                writeSet.clear();
+            }
+            for (size_t i = 0; i < op.bufs.size(); i++) {
+                void* p = (__bridge void*)op.bufs[i];
+                if ((i < 32) && ((op.writeMask >> i) & 1u)) writeSet.insert(p);
+                else readSet.insert(p);
+            }
+        }
+        [enc setComputePipelineState:op.pso];
+        for (size_t i = 0; i < op.bufs.size(); i++) [enc setBuffer:op.bufs[i] offset:0 atIndex:i];
+        if (op.tgBytes > 0)
+            [enc setThreadgroupMemoryLength:((op.tgBytes + 15u) & ~15u) atIndex:0];
+        [enc dispatchThreadgroups:MTLSizeMake(op.gx, op.gy, op.gz)
+            threadsPerThreadgroup:MTLSizeMake(op.tx, op.ty, op.tz)];
+    }
+    return barriers;
+}
+
+// Execute the recorded token ONCE as the REAL computation (Exp 2 Phase B): the command
+// buffer goes to DAWN'S OWN MTLCommandQueue when reachable (commit order == execution
+// order with Dawn's staging writes / readbacks on a single queue), falling back to our
+// private queue. Waits for completion. Returns "ms=<gpu ms> barriers=<n> queue=<dawn|own>".
+extern "C" lean_obj_res lean_hesper_replay_exec(
+    uint32_t mode, lean_obj_res /* unit */) {
+    @autoreleasepool {
+        id<MTLDevice> mtl = g_replayMtlDevice;
+        if (!mtl) return lean_io_result_mk_error(lean_mk_io_user_error(lean_mk_string("replay_exec: nothing recorded")));
+        auto& ops = hesper_replay_ops();
+        size_t nOps = 0;
+        for (auto& op : ops) if (op.pso) nOps++;
+        if (nOps == 0) return lean_io_result_mk_error(lean_mk_io_user_error(lean_mk_string("replay_exec: nothing recorded")));
+        // Flush Dawn's PENDING work first (an empty Submit pushes staged
+        // queue.WriteBuffer copies into a command buffer on Dawn's MTLQueue).
+        // Without this, host writes issued since the last Dawn submit (e.g. the
+        // frozen-token pos/token seeds) would still be host-side when our CB runs —
+        // kernels would read stale params. Same-queue FIFO then orders them first.
+        if (g_replayDawnDevice && g_replayDawnDevice->Get()) {
+            g_replayDawnDevice->GetQueue().Submit(0, nullptr);
+        }
+        id<MTLCommandQueue> q = g_replayDawnDevice ? mr_dawn_queue(g_replayDawnDevice) : nil;
+        bool onDawnQueue = (q != nil);
+        if (!q) {
+            if (!g_mslQueue) g_mslQueue = [mtl newCommandQueue];
+            q = g_mslQueue;
+        }
+        id<MTLCommandBuffer> cb = [q commandBuffer];
+        MTLComputePassDescriptor* desc = [MTLComputePassDescriptor computePassDescriptor];
+        desc.dispatchType = (mode == 0) ? MTLDispatchTypeSerial : MTLDispatchTypeConcurrent;
+        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoderWithDescriptor:desc];
+        size_t barriers = hesper_replay_encode(enc, mode, ops);
+        [enc endEncoding];
+        [cb commit];
+        [cb waitUntilCompleted];
+        if ([cb status] == MTLCommandBufferStatusError) {
+            return lean_io_result_mk_error(lean_mk_io_user_error(lean_mk_string(
+                [[NSString stringWithFormat:@"replay_exec: command buffer error: %@", [cb error]] UTF8String])));
+        }
+        double ms = ([cb GPUEndTime] - [cb GPUStartTime]) * 1000.0;
+        char buf[128];
+        snprintf(buf, sizeof(buf), "ms=%.4f barriers=%zu queue=%s", ms, barriers, onDawnQueue ? "dawn" : "own");
+        return lean_io_result_mk_ok(lean_mk_string(buf));
+    }
+}
+
+// Replay the recorded sequence. mode: 0 = Serial, 1 = Concurrent (no barriers — timing upper
+// bound), 2 = Concurrent + memoryBarrier at recorded layer markers. Runs `iters` command
+// buffers back-to-back; returns "count=<ops> min=<ms> avg=<ms>" (GPU wall per iteration).
+extern "C" lean_obj_res lean_hesper_replay_run(
+    uint32_t mode, uint32_t iters, lean_obj_res /* unit */) {
+    @autoreleasepool {
+        id<MTLDevice> mtl = g_replayMtlDevice;
+        if (!mtl) return lean_io_result_mk_error(lean_mk_io_user_error(lean_mk_string("replay_run: nothing recorded (no device)")));
+        auto& ops = hesper_replay_ops();
+        size_t nOps = 0;
+        for (auto& op : ops) if (op.pso) nOps++;
+        if (nOps == 0) return lean_io_result_mk_error(lean_mk_io_user_error(lean_mk_string("replay_run: nothing recorded")));
+        if (!g_mslQueue) g_mslQueue = [mtl newCommandQueue];
+        if (iters == 0) iters = 1;
+        double best = 1e30, sum = 0.0;
+        size_t barriers = 0;
+        for (uint32_t r = 0; r < iters; r++) {
+            id<MTLCommandBuffer> cb = [g_mslQueue commandBuffer];
+            MTLComputePassDescriptor* desc = [MTLComputePassDescriptor computePassDescriptor];
+            desc.dispatchType = (mode == 0) ? MTLDispatchTypeSerial : MTLDispatchTypeConcurrent;
+            id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoderWithDescriptor:desc];
+            barriers = hesper_replay_encode(enc, mode, ops);
+            [enc endEncoding];
+            [cb commit];
+            [cb waitUntilCompleted];
+            if ([cb status] == MTLCommandBufferStatusError) {
+                return lean_io_result_mk_error(lean_mk_io_user_error(lean_mk_string(
+                    [[NSString stringWithFormat:@"replay_run: command buffer error: %@", [cb error]] UTF8String])));
+            }
+            double ms = ([cb GPUEndTime] - [cb GPUStartTime]) * 1000.0;
+            best = std::min(best, ms);
+            sum += ms;
+        }
+        char buf[160];
+        snprintf(buf, sizeof(buf), "count=%zu barriers=%zu min=%.4f avg=%.4f", nOps, barriers, best, sum / iters);
+        return lean_io_result_mk_ok(lean_mk_string(buf));
+    }
+}
+
+// COLD-STREAM bench (DEVPLAN §13): like msl_bench_serial, but rotates the buffer at
+// `rotSlot` across `copies` (weight-buffer clones) per dispatch, so successive
+// dispatches read DIFFERENT memory — measuring cold-stream BW instead of the
+// warm-cache number (isolated re-reads of one weight sit in the SLC and flattered
+// the 90–97 % figures; a real decode token streams every weight once, cold).
+extern "C" lean_obj_res lean_hesper_msl_bench_serial_rot(
+    b_lean_obj_arg device_obj, b_lean_obj_arg msl_obj, b_lean_obj_arg bufs_array,
+    uint32_t rotSlot, b_lean_obj_arg copies_array,
+    uint32_t nDispatches, uint32_t gridX, uint32_t gridY, uint32_t gridZ, uint32_t wgX,
+    lean_obj_res /* unit */) {
+    @autoreleasepool {
+        wgpu::Device* device = mr_extract_device(device_obj);
+        if (!device || !device->Get()) return lean_io_result_mk_error(lean_mk_io_user_error(lean_mk_string("bench_rot: invalid device")));
+        id<MTLDevice> mtl = dawn::native::metal::GetMTLDevice(device->Get());
+        const char* mslSrc = lean_string_cstr(msl_obj);
+        if (!mslSrc || mslSrc[0] == '\0')
+            return lean_io_result_mk_error(lean_mk_io_user_error(lean_mk_string("bench_rot: empty MSL (set HESPER_DUMP_MSL=1)")));
+        size_t nBufs = lean_array_size(bufs_array);
+        std::vector<id<MTLBuffer>> mb(nBufs);
+        for (size_t i = 0; i < nBufs; i++) {
+            wgpu::Buffer* b = mr_extract_buffer(lean_array_get_core(bufs_array, i));
+            if (!b || !b->Get()) return lean_io_result_mk_error(lean_mk_io_user_error(lean_mk_string("bench_rot: invalid buffer")));
+            mb[i] = reinterpret_cast<dawn::native::metal::Buffer*>(b->Get())->GetMTLBuffer();
+        }
+        size_t nCopies = lean_array_size(copies_array);
+        std::vector<id<MTLBuffer>> rot(nCopies);
+        for (size_t i = 0; i < nCopies; i++) {
+            wgpu::Buffer* b = mr_extract_buffer(lean_array_get_core(copies_array, i));
+            if (!b || !b->Get()) return lean_io_result_mk_error(lean_mk_io_user_error(lean_mk_string("bench_rot: invalid copy")));
+            rot[i] = reinterpret_cast<dawn::native::metal::Buffer*>(b->Get())->GetMTLBuffer();
+        }
+        if (rot.empty() || rotSlot >= nBufs)
+            return lean_io_result_mk_error(lean_mk_io_user_error(lean_mk_string("bench_rot: bad rotation args")));
+        static std::unordered_map<size_t, id<MTLComputePipelineState>> psoCache;
+        size_t key = std::hash<std::string>{}(std::string(mslSrc));
+        id<MTLComputePipelineState> pso = nil;
+        auto it = psoCache.find(key);
+        if (it != psoCache.end()) pso = it->second;
+        else {
+            NSError* err = nil;
+            MTLCompileOptions* opts = [MTLCompileOptions new];
+            id<MTLLibrary> lib = [mtl newLibraryWithSource:[NSString stringWithUTF8String:mslSrc] options:opts error:&err];
+            if (!lib) return lean_io_result_mk_error(lean_mk_io_user_error(lean_mk_string(
+                [[NSString stringWithFormat:@"bench_rot compile failed: %@", err] UTF8String])));
+            id<MTLFunction> fn = [lib newFunctionWithName:@"dawn_entry_point"];
+            if (!fn) return lean_io_result_mk_error(lean_mk_io_user_error(lean_mk_string("bench_rot: no dawn_entry_point")));
+            pso = [mtl newComputePipelineStateWithFunction:fn error:&err];
+            if (!pso) return lean_io_result_mk_error(lean_mk_io_user_error(lean_mk_string("bench_rot: PSO failed")));
+            psoCache[key] = pso;
+        }
+        if (!g_mslQueue) g_mslQueue = [mtl newCommandQueue];
+        id<MTLCommandBuffer> cb = [g_mslQueue commandBuffer];
+        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];   // serial
+        [enc setComputePipelineState:pso];
+        for (size_t i = 0; i < nBufs; i++) [enc setBuffer:mb[i] offset:0 atIndex:i];
+        for (uint32_t d = 0; d < nDispatches; d++) {
+            [enc setBuffer:rot[d % nCopies] offset:0 atIndex:rotSlot];
+            [enc dispatchThreadgroups:MTLSizeMake(gridX, gridY, gridZ)
+                threadsPerThreadgroup:MTLSizeMake(wgX, 1, 1)];
+        }
+        [enc endEncoding];
+        [cb commit];
+        [cb waitUntilCompleted];
+        double gpuMs = ([cb GPUEndTime] - [cb GPUStartTime]) * 1000.0;
+        char buf[64];
+        snprintf(buf, sizeof(buf), "%.4f", gpuMs);
+        return lean_io_result_mk_ok(lean_mk_string(buf));
+    }
+}
+
+// Per-op-class profiling (DEVPLAN §12): replay only the ops whose indices are in
+// `idx_array` (u32 indices into the recorded sequence, barriers not counted), serial,
+// `iters` times. The Lean side records op names in order, groups indices by kernel
+// class, and calls this per class → a GPU-time budget of the token by kernel class.
+extern "C" lean_obj_res lean_hesper_replay_run_subset(
+    b_lean_obj_arg idx_array, uint32_t iters, lean_obj_res /* unit */) {
+    @autoreleasepool {
+        id<MTLDevice> mtl = g_replayMtlDevice;
+        if (!mtl) return lean_io_result_mk_error(lean_mk_io_user_error(lean_mk_string("replay_subset: nothing recorded")));
+        auto& all = hesper_replay_ops();
+        // dispatch-index view (skip barrier markers)
+        std::vector<HesperReplayOp*> dispatches;
+        for (auto& op : all) if (op.pso) dispatches.push_back(&op);
+        std::vector<HesperReplayOp*> sel;
+        size_t n = lean_array_size(idx_array);
+        for (size_t i = 0; i < n; i++) {
+            uint32_t k = lean_unbox_uint32(lean_array_get_core(idx_array, i));
+            if (k < dispatches.size()) sel.push_back(dispatches[k]);
+        }
+        if (sel.empty()) return lean_io_result_mk_error(lean_mk_io_user_error(lean_mk_string("replay_subset: empty selection")));
+        if (!g_mslQueue) g_mslQueue = [mtl newCommandQueue];
+        if (iters == 0) iters = 1;
+        double best = 1e30, sum = 0.0;
+        for (uint32_t r = 0; r < iters; r++) {
+            id<MTLCommandBuffer> cb = [g_mslQueue commandBuffer];
+            id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];  // serial
+            for (auto* op : sel) {
+                [enc setComputePipelineState:op->pso];
+                for (size_t i = 0; i < op->bufs.size(); i++) [enc setBuffer:op->bufs[i] offset:0 atIndex:i];
+                if (op->tgBytes > 0)
+                    [enc setThreadgroupMemoryLength:((op->tgBytes + 15u) & ~15u) atIndex:0];
+                [enc dispatchThreadgroups:MTLSizeMake(op->gx, op->gy, op->gz)
+                    threadsPerThreadgroup:MTLSizeMake(op->tx, op->ty, op->tz)];
+            }
+            [enc endEncoding];
+            [cb commit];
+            [cb waitUntilCompleted];
+            double ms = ([cb GPUEndTime] - [cb GPUStartTime]) * 1000.0;
+            best = std::min(best, ms);
+            sum += ms;
+        }
+        char buf[128];
+        snprintf(buf, sizeof(buf), "count=%zu min=%.4f avg=%.4f", sel.size(), best, sum / iters);
+        return lean_io_result_mk_ok(lean_mk_string(buf));
+    }
 }
 
 extern "C" lean_obj_res lean_hesper_mtl_device_name(b_lean_obj_arg device_obj, lean_obj_res /* unit */) {

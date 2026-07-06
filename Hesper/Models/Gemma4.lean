@@ -16,6 +16,7 @@ import Hesper.Layers.RoPE
 import Hesper.Layers.Embedding
 import Hesper.Layers.Softmax
 import Hesper.Quantization.Q4_K_M
+import Hesper.Quantization.Q5_K
 import Hesper.Layers.MoE
 import Hesper.Layers.PerLayerEmbedding
 import Hesper.GGUF.Parser
@@ -180,6 +181,13 @@ structure InferenceState (BufT CacheT : Type) where
   -- to wait for the per-iter argmax value.
   argmaxHistoryBuf : BufT
   historySlotBuf   : BufT
+  /-- Decode-dedicated prepared ref for the finalNorm before lm-head.
+      MUST be separate from `model.finalNorm.prepared`: the prefill populates
+      that shared ref with ITS buffer bindings (buf2→buf1), and a decode
+      replay would silently read/write the wrong buffers whenever the layer
+      count is odd (decode ping-pong ends at buf1→buf2 — E2B has 35 layers;
+      E4B's 42 masked the bug by parity). -/
+  finalNormDecodePrepared : IO.Ref (Option CacheT)
   -- Scratch buffer for Q8_1 quantized lmHead input (hiddenSize/32 * 9 u32),
   -- lazily allocated on first dp4a-enabled lmHead call.
   lmHeadQ8Buf : IO.Ref (Option BufT)
@@ -228,19 +236,19 @@ structure InferenceState (BufT CacheT : Type) where
 
 /-- Dynamic cache ref store. Lazily creates IO.Ref per unique cacheKey. -/
 structure KernelCacheRefs (CacheT : Type) where
-  store : IO.Ref (Array (UInt64 × IO.Ref (Option CacheT)))
+  store : IO.Ref (Std.HashMap UInt64 (IO.Ref (Option CacheT)))
 
 def KernelCacheRefs.getRef (kcr : KernelCacheRefs CacheT) (key : UInt64) : IO (IO.Ref (Option CacheT)) := do
-  let arr ← kcr.store.get
-  match arr.find? (fun (k, _) => k == key) with
-  | some (_, r) => pure r
+  let m ← kcr.store.get
+  match m.get? key with
+  | some r => pure r
   | none =>
     let r ← IO.mkRef none
-    kcr.store.modify (·.push (key, r))
+    kcr.store.modify (·.insert key r)
     pure r
 
 def createKernelCacheRefs [GPUBackend β] : IO (KernelCacheRefs (GPUBackend.CachedDispatch β)) := do
-  pure { store := ← IO.mkRef #[] }
+  pure { store := ← IO.mkRef {} }
 
 /-- Create inference state with pre-allocated buffers -/
 def createInferenceState [GPUBackend β] (ctx : β) (cfg : Config) : IO (InferenceState (GPUBackend.Buf β) (GPUBackend.CachedDispatch β)) := do
@@ -319,7 +327,11 @@ def createInferenceState [GPUBackend β] (ctx : β) (cfg : Config) : IO (Inferen
       let totalPL := cfg.embdPerLayer * cfg.numHiddenLayers
       let blocksPerRow := (totalPL + 255) / 256
       let rowBytes := blocksPerRow * 210
-      GPUBackend.allocBuffer ctx (max rowBytes 4).toUSize
+      -- Round up to a multiple of 4: WebGPU storage-buffer binding sizes must be 4-aligned.
+      -- An ODD Q6_K block count makes rowBytes % 4 == 2 (E2B: 35 blocks × 210 = 7350) —
+      -- CreateBindGroup then fails validation ("Binding size isn't a multiple of 4").
+      let rowBytes4 := ((max rowBytes 4) + 3) / 4 * 4
+      GPUBackend.allocBuffer ctx rowBytes4.toUSize
     argmaxBuf := ← GPUBackend.allocBuffer ctx (4 : USize)
     argmaxCacheRef := ← GPUBackend.newCacheRef (β := β)
     -- HESPER_DEVICE_ARGMAX=1: skip the per-token cuMemcpyDtoH(4 byte) by
@@ -339,6 +351,7 @@ def createInferenceState [GPUBackend β] (ctx : β) (cfg : Config) : IO (Inferen
     -- Slot starts at 0 and is incremented by historyAppendKernel each decode.
     argmaxHistoryBuf := ← GPUBackend.allocBuffer ctx (65536 * 4 : USize)
     historySlotBuf   := ← GPUBackend.allocBuffer ctx (4 : USize)
+    finalNormDecodePrepared := ← GPUBackend.newCacheRef (β := β)
     lmHeadQ8Buf := ← IO.mkRef none
     lmHeadQuantizePrepared := ← GPUBackend.newCacheRef (β := β)
     lmHeadDP4APrepared := ← GPUBackend.newCacheRef (β := β)
@@ -388,18 +401,31 @@ def createInferenceState [GPUBackend β] (ctx : β) (cfg : Config) : IO (Inferen
     Caller passes the byte count; suffix identifies the checkpoint.
     Flushes any pending CUDA batch queue first so the buffer reflects all
     queued launches.  If there was an active batch, reopens it afterwards. -/
+initialize dumpDirCache : IO.Ref (Option (Option String)) ← IO.mkRef none
+
 def dumpBuf [GPUBackend β] (ctx : β) (buf : GPUBackend.Buf β) (bytes : USize) (suffix : String) : IO Unit := do
-  match ← IO.getEnv "HESPER_DUMP_DIR" with
+  -- env cached once: dumpBuf sits on the decode hot path (~15 sites × 35 layers);
+  -- a per-call getEnv would cost ~0.5 ms/token when dumping is OFF.
+  let dirOpt ← do
+    match ← dumpDirCache.get with
+    | some v => pure v
+    | none =>
+      let v ← IO.getEnv "HESPER_DUMP_DIR"
+      dumpDirCache.set (some v)
+      pure v
+  match dirOpt with
   | none => pure ()
   | some dir =>
     -- Probe CUDA batch state: if currently batching, queue sync returns
     -- some; we flush + reopen only in that case.  Safe regardless of backend
     -- because endBatch on `none` is a no-op.
-    let wasBatching ← Hesper.Backend.isCudaBatching
-    GPUBackend.endBatch ctx
+    let wasCudaBatching ← Hesper.Backend.isCudaBatching
+    let wasWebGPUBatching ← Hesper.WGSL.Execute.isBatching
+    -- WebGPU throws on endBatch outside a batch; CUDA no-ops. Tolerate both.
+    try GPUBackend.endBatch ctx catch _ => pure ()
     let data ← GPUBackend.readBuffer ctx buf bytes
     IO.FS.writeBinFile s!"{dir}/{suffix}.bin" data
-    if wasBatching then
+    if wasCudaBatching || wasWebGPUBatching then
       GPUBackend.beginBatch ctx
 
 /-- Write a small scalar (≤8 bytes) to a device buffer via a pinned-host
@@ -483,7 +509,9 @@ def forwardBlock [GPUBackend β] (ctx : β)
       let ref ← k.getRef key
       -- Tag config.funcName with the call-site name so cacheRef-miss traces
       -- show the human-readable `ce "..."` name instead of a hex cacheKey.
-      let configNamed : Hesper.ExecConfig := { config with funcName := name }
+      -- Sanitize: several call sites embed Float params in the name (e.g. base10000.000000);
+      -- '.' is invalid in a WGSL identifier → shader-module parse error on WebGPU.
+      let configNamed : Hesper.ExecConfig := { config with funcName := (name.replace "." "p").replace "-" "m" }
       GPUBackend.executeWithConfigCached ctx shader namedBufs configNamed key ref
     | none => GPUBackend.execute ctx shader namedBufs config
 
@@ -656,28 +684,93 @@ def forwardBlock [GPUBackend β] (ctx : β)
     workgroupSize := { x := wgSize, y := 1, z := 1 }
   } : Hesper.ExecConfig)
   let isFull := cfg.isFullAttention li
+  dumpBuf ctx state.qBuf (numHeads * headDim * 4).toUSize s!"single_p{pos}_qpre_L{li}"
+  -- webml `DecodeQkNormRope` fusion: when freq factors exist (Gemma 4 default),
+  -- RoPE-Q is folded into the per-head norm kernel — the standalone ropeQ dispatch
+  -- disappears and the roped q lands DIRECTLY in state.qBuf (attention's input).
+  -- DEFAULT OFF: the fused kernel's WGSL is valid but TINT'S MSL PRINTER emits a
+  -- broken entry point for it (parameter `v_52` shadowed by a local, and the inner
+  -- function call drops params/freq_factors/threadgroup args) → q heads 4-7 come
+  -- out zero on headDim-512 layers. Opt in with HESPER_QKNR=1 to reproduce.
+  -- Also its ROI was misjudged: freq-factor layers are only the FULL layers
+  -- (~7/token) — the SWA majority needs a factors-less variant to matter.
+  let qknrOn := (← IO.getEnv "HESPER_QKNR") == some "1"
+  let qkvRopeFused := block.ropeFreqFactors.isSome && qknrOn
+  -- Fusion round 2 (DEVPLAN §11): FACTORS-LESS fused norm+ropeQ for the
+  -- no-freq-factors (SWA) layers — deletes the standalone ropeDynQ dispatch and the
+  -- qBuf2→qBuf round-trip on 28/35 layers; 8 bindings (no freq_factors) dodges the
+  -- Tint MSL printer bug that parked the 9-binding FULL variant. MEASURED NEUTRAL
+  -- (−28 ops but GPU time unchanged at 7.5 ms — the round-trip is only 0.2 MB/token)
+  -- and its rope rounding profile flips near-tie tokens, so it stays OPT-IN
+  -- (HESPER_QKNR_SWA=1) to keep default outputs reproducible.
+  let qknrSwaOn := (← IO.getEnv "HESPER_QKNR_SWA") == some "1"
+  let qkvRopeFusedSwa := block.ropeFreqFactors.isNone && qknrSwaOn
   Hesper.WGSL.Execute.withSection "qkvNorm" do
-    -- When this layer has its own KV, fuse the three per-head norms
-    -- (qNorm, kNorm, vNorm) into a single dispatch.  Grid is
-    -- `(numHeads, 3, 1)`; `wg_id.y` picks Q/K/V; WGs with
-    -- `wg_id.y > 0 && wg_id.x >= numKVHeads` early-return.  Saves 2
-    -- dispatches per layer per token.
-    --
-    -- When the layer shares KV with an earlier block, only qNorm runs
-    -- — keep the existing single-dispatch path for that case.
-    if cfg.hasKV li then
-      ce (if isFull then "qkvNormFull" else "qkvNormSWA")
-        (fusedPerHeadQKVNormKernel numHeads numKVHeads headDim cfg.rmsNormEps)
-        [("q_in", state.qBuf), ("q_scale", block.attention.qNormWeight), ("q_out", state.qBuf2),
-         ("k_in", state.kBuf), ("k_scale", block.attention.kNormWeight), ("k_out", state.kBuf2),
-         ("v_in", state.vBuf),                                              ("v_out", state.vBuf2)]
-        { numWorkgroups := (numHeads, 3, 1),
-          workgroupSize := { x := wgSize, y := 1, z := 1 } : Hesper.ExecConfig }
-    else
-      ce (if isFull then "qNormFull" else "qNormSWA")
-        (perHeadRMSNormKernel numHeads headDim cfg.rmsNormEps)
-        [("input", state.qBuf), ("weight", block.attention.qNormWeight), ("output", state.qBuf2)]
-        (mkNormConfig numHeads)
+    match (if qkvRopeFused then block.ropeFreqFactors else none) with
+    | some freqFactors =>
+      -- ropeBase is BAKED into the kernel → it must be in the ce name/key.
+      if cfg.hasKV li then
+        ce s!"qkvNormRope_{if isFull then "F" else "S"}_base{cfg.ropeBase li}"
+          (fusedPerHeadQKVNormRopeKernel numHeads numKVHeads headDim cfg.rmsNormEps (cfg.ropeBase li))
+          [("q_io", state.qBuf), ("q_scale", block.attention.qNormWeight),
+           ("k_in", state.kBuf), ("k_scale", block.attention.kNormWeight), ("k_out", state.kBuf2),
+           ("v_in", state.vBuf),                                              ("v_out", state.vBuf2),
+           ("params", state.paramsBuf), ("freq_factors", freqFactors)]
+          { numWorkgroups := (numHeads, 3, 1),
+            workgroupSize := { x := wgSize, y := 1, z := 1 } : Hesper.ExecConfig }
+      else
+        -- KV-shared layer: q lane only (grid y=1); k/v slots get placeholder
+        -- bindings (never read — the k/v branches are unreachable at y=0, and
+        -- the declared kv sizes are ≤ the q buffers').
+        ce s!"qNormRope_{if isFull then "F" else "S"}_base{cfg.ropeBase li}"
+          (fusedPerHeadQKVNormRopeKernel numHeads numKVHeads headDim cfg.rmsNormEps (cfg.ropeBase li))
+          [("q_io", state.qBuf), ("q_scale", block.attention.qNormWeight),
+           ("k_in", state.kBuf), ("k_scale", block.attention.kNormWeight), ("k_out", state.kBuf2),
+           ("v_in", state.vBuf),                                              ("v_out", state.vBuf2),
+           ("params", state.paramsBuf), ("freq_factors", freqFactors)]
+          { numWorkgroups := (numHeads, 1, 1),
+            workgroupSize := { x := wgSize, y := 1, z := 1 } : Hesper.ExecConfig }
+    | none =>
+      if qkvRopeFusedSwa then
+        -- Factors-less fused norm+ropeQ (SWA): q normed+roped IN-PLACE in qBuf;
+        -- k/v normed to kBuf2/vBuf2 as in the base kernel.
+        if cfg.hasKV li then
+          ce s!"qkvNormRopeNF_{if isFull then "F" else "S"}_base{cfg.ropeBase li}"
+            (fusedPerHeadQKVNormRopeKernel numHeads numKVHeads headDim cfg.rmsNormEps
+              (cfg.ropeBase li) (useFreqFactors := false))
+            [("q_io", state.qBuf), ("q_scale", block.attention.qNormWeight),
+             ("k_in", state.kBuf), ("k_scale", block.attention.kNormWeight), ("k_out", state.kBuf2),
+             ("v_in", state.vBuf),                                              ("v_out", state.vBuf2),
+             ("params", state.paramsBuf)]
+            { numWorkgroups := (numHeads, 3, 1),
+              workgroupSize := { x := wgSize, y := 1, z := 1 } : Hesper.ExecConfig }
+        else
+          -- KV-shared layer: q lane only; k/v slots get placeholder bindings
+          -- (unreachable at grid y=0; declared kv sizes ≤ the q buffers').
+          ce s!"qNormRopeNF_{if isFull then "F" else "S"}_base{cfg.ropeBase li}"
+            (fusedPerHeadQKVNormRopeKernel numHeads numKVHeads headDim cfg.rmsNormEps
+              (cfg.ropeBase li) (useFreqFactors := false))
+            [("q_io", state.qBuf), ("q_scale", block.attention.qNormWeight),
+             ("k_in", state.kBuf), ("k_scale", block.attention.kNormWeight), ("k_out", state.kBuf2),
+             ("v_in", state.vBuf),                                              ("v_out", state.vBuf2),
+             ("params", state.paramsBuf)]
+            { numWorkgroups := (numHeads, 1, 1),
+              workgroupSize := { x := wgSize, y := 1, z := 1 } : Hesper.ExecConfig }
+      else
+      -- Legacy paths (no freq factors): per-head norms, rope as its own dispatch below.
+      if cfg.hasKV li then
+        ce (if isFull then "qkvNormFull" else "qkvNormSWA")
+          (fusedPerHeadQKVNormKernel numHeads numKVHeads headDim cfg.rmsNormEps)
+          [("q_in", state.qBuf), ("q_scale", block.attention.qNormWeight), ("q_out", state.qBuf2),
+           ("k_in", state.kBuf), ("k_scale", block.attention.kNormWeight), ("k_out", state.kBuf2),
+           ("v_in", state.vBuf),                                              ("v_out", state.vBuf2)]
+          { numWorkgroups := (numHeads, 3, 1),
+            workgroupSize := { x := wgSize, y := 1, z := 1 } : Hesper.ExecConfig }
+      else
+        ce (if isFull then "qNormFull" else "qNormSWA")
+          (perHeadRMSNormKernel numHeads headDim cfg.rmsNormEps)
+          [("input", state.qBuf), ("weight", block.attention.qNormWeight), ("output", state.qBuf2)]
+          (mkNormConfig numHeads)
 
   -- Step 4: RoPE on Q and K
   -- Upload position to params buffer (u32 for hand-coded kernels).
@@ -697,25 +790,34 @@ def forwardBlock [GPUBackend β] (ctx : β)
     let posF32Bytes ← Hesper.Basic.floatToBytes pos.toFloat
     writeScalarViaStaging ctx state.posF32Buf 0 state.stagingPosF32Ptr 0 posF32Bytes
 
+  dumpBuf ctx state.kBuf (numKVHeads * headDim * 4).toUSize s!"single_p{pos}_kproj_L{li}"
+  dumpBuf ctx state.kBuf2 (numKVHeads * headDim * 4).toUSize s!"single_p{pos}_knormed_L{li}"
+  dumpBuf ctx state.vBuf2 (numKVHeads * headDim * 4).toUSize s!"single_p{pos}_vnormed_L{li}"
   Hesper.WGSL.Execute.withSection "rope" do
-    -- RoPE on Q: qBuf2 → qBuf
-    match block.ropeFreqFactors with
+    -- RoPE on Q: qBuf2 → qBuf.  When freq factors exist, the rotation was already
+    -- applied inside the fused qkvNormRope kernel above — no standalone dispatch.
+    match (if qkvRopeFused then none else block.ropeFreqFactors) with
     | some freqFactors =>
       ce s!"ropeFreqQ_{headDim}_base{cfg.ropeBase li}"
         (ropeWithFreqFactorsKernel headDim numHeads (cfg.ropeBase li))
         [("input", state.qBuf2), ("output", state.qBuf), ("params", state.paramsBuf), ("freq_factors", freqFactors)]
         (.dispatch1D (numHeads * headDim / 2))
     | none =>
-      let ropeConfig : RoPE.Config := { dim := numHeads * headDim, maxSeqLen := cfg.maxSeqLen, base := cfg.ropeBase li }
-      -- NB: `base` is baked into the shader as a literal — must be in cache key.
-      ce s!"ropeDynQ_{headDim}_base{cfg.ropeBase li}"
-        (RoPE.ropeKernelDynamic ropeConfig 1 1 numHeads headDim)
-        [("input", state.qBuf2), ("output", state.qBuf), ("params", state.paramsBuf)]
-        (.dispatch1D (numHeads * headDim / 2))
+      -- Fusion round 2: on factors-less layers the rotation already happened inside
+      -- the fused qkvNormRopeNF kernel (roped q is in qBuf) — no standalone dispatch.
+      unless qkvRopeFusedSwa do
+        let ropeConfig : RoPE.Config := { dim := numHeads * headDim, maxSeqLen := cfg.maxSeqLen, base := cfg.ropeBase li }
+        -- NB: `base` is baked into the shader as a literal — must be in cache key.
+        ce s!"ropeDynQ_{headDim}_base{cfg.ropeBase li}"
+          (RoPE.ropeKernelDynamic ropeConfig 1 1 numHeads headDim)
+          [("input", state.qBuf2), ("output", state.qBuf), ("params", state.paramsBuf)]
+          (.dispatch1D (numHeads * headDim / 2))
 
     -- ropeK is fused with KV cache write below (when ropeFreqFactors are available
     -- and we have a KV cache).  When freq factors aren't present we fall back to
     -- the legacy two-kernel path.
+  dumpBuf ctx state.qBuf (numHeads * headDim * 4).toUSize s!"single_p{pos}_qroped_L{li}"
+  Hesper.WGSL.Execute.withSection "ropeTail" do
     if cfg.hasKV li && block.ropeFreqFactors.isNone then
       let ropeConfig : RoPE.Config := { dim := numKVHeads * headDim, maxSeqLen := cfg.maxSeqLen, base := cfg.ropeBase li }
       ce s!"ropeDynK_{headDim}_{numKVHeads}_base{cfg.ropeBase li}"
@@ -723,6 +825,7 @@ def forwardBlock [GPUBackend β] (ctx : β)
         [("input", state.kBuf2), ("output", state.kBuf), ("params", state.paramsBuf)]
         (.dispatch1D (numKVHeads * headDim / 2))
 
+  dumpBuf ctx state.kBuf (numKVHeads * headDim * 4).toUSize s!"single_p{pos}_kroped_L{li}"
   -- Step 5: Write K/V to cache and compute flash attention
   -- KV-shared layers reuse an earlier layer's cache (see Config.kvCacheLayer).
   let kvLi := cfg.kvCacheLayer li
@@ -762,6 +865,7 @@ def forwardBlock [GPUBackend β] (ctx : β)
              ("params", state.paramsBuf)]
             (.dispatch1D (numKVHeads * (headDim / 2)))
 
+    dumpBuf ctx kvCache.kBufF16 (8 * (headDim/2) * 4).toUSize s!"single_p{pos}_kcacheHead0_L{li}"
     -- Flash attention: Q @ K_cache^T → softmax → @ V_cache → output
     -- Gemma 4 uses hparams.f_attention_scale = 1.0 (NOT the usual 1/sqrt(headDim)),
     -- because the Q-norm RMSNorm already normalizes each head, so the dot product
@@ -787,12 +891,16 @@ def forwardBlock [GPUBackend β] (ctx : β)
         state.qBuf kvCache.kBufF16 kvCache.vBufF16 state.paramsBuf
         state.flashPartialOutV11 state.flashPartialMetaV11 state.attnOutBuf
         numHeads numKVHeads cfg.maxSeqLen headDim scale
-        (kcrLookup := kcrLk)
+        (kcrLookup := kcrLk) (cacheLen := cacheLen)
+      dumpBuf ctx state.qBuf (numHeads * headDim * 4).toUSize s!"single_p{pos}_qpost_L{li}"
+      dumpBuf ctx state.flashPartialMetaV11 (numHeads * 8 * 2 * 4).toUSize s!"single_p{pos}_pmeta_L{li}"
+      dumpBuf ctx state.flashPartialOutV11 (numHeads * 8 * headDim * 4).toUSize s!"single_p{pos}_pout_L{li}"
 
     -- Output projection: attnOut [numHeads * headDim] → normedBuf [hiddenSize]
     -- Circuit-DSL: single matmulQ4K op via runCached (build once, replay).
     -- Equivalent to direct LinearLayer.forward; sets up the IR for later
     -- fusion with the post-attn norm chain.
+    dumpBuf ctx state.attnOutBuf (numHeads * headDim * 4).toUSize s!"single_p{pos}_oprojIn_L{li}"
     Hesper.WGSL.Execute.withSection "oProj" do
       -- HESPER_BYPASS_OPROJ=1 short-circuits the Circuit DSL path for this
       -- section. Used as the H4c A/B test (doc 57 §3b.7): result was
@@ -827,6 +935,7 @@ def forwardBlock [GPUBackend β] (ctx : β)
     let ref ← match kcr with
       | some k => k.getRef key
       | none => IO.mkRef none
+    dumpBuf ctx state.normedBuf (cfg.hiddenSize * 4).toUSize s!"single_p{pos}_oprojOut_L{li}"
     RMSNorm.forwardNormThenAdd ctx block.postAttnNorm
       state.normedBuf inputBuf state.attnResidualBuf ref (workgroupSize := 1024)
   dumpBuf ctx state.attnResidualBuf (cfg.hiddenSize * 4).toUSize s!"single_p{pos}_postAttn_L{li}"
@@ -1083,6 +1192,19 @@ def forwardBlock [GPUBackend β] (ctx : β)
             -- Tensor ids: 0 = outputBuf external, 1 = plInputAll external,
             -- 2 = matmul-epi output (caller-facing).
             [(0, outputBuf), (1, plInputAll), (2, state.moeRouterOutBuf)]
+      else if plEmbd.inpGate.quantFormat == .F16 && plEmbd.inpGate.config.inDim % 64 == 0 then do
+        -- E2B (F16-packed inp_gate): fused matvec + GELU × slice epilogue —
+        -- ONE dispatch replaces (F16 matvec) + (geluGateMulSlice). webml's
+        -- DecodePleGate shape. plOffset is BAKED → must be in the key.
+        Hesper.WGSL.Execute.withSection "ple.inpGateGeluF16" do
+          ce s!"pleGateF16Fused_{plOffset}"
+            (PerLayerEmbedding.pleGateF16FusedKernel
+              plEmbd.inpGate.config.inDim plEmbd.inpGate.config.outDim plTotalSize plOffset)
+            [("a", outputBuf), ("b", plEmbd.inpGate.weightBuf),
+             ("per_layer_input", plInputAll), ("c", state.moeRouterOutBuf)]
+            { numWorkgroups := (plEmbd.inpGate.config.outDim, 1, 1)
+              workgroupSize := { x := 32, y := 1, z := 1 }
+              extensions := ["subgroups"] : Hesper.ExecConfig }
       else do
         Hesper.WGSL.Execute.withSection "ple.inpGate" do
           Linear.LinearLayer.forward ctx plEmbd.inpGate outputBuf state.plGateBuf
@@ -1238,7 +1360,9 @@ def forwardPrefillBatch [GPUBackend β] (ctx : β)
       let key := hash ("gemma4_prefill_ce", name, config.numWorkgroups,
                         config.workgroupSize.x, config.workgroupSize.y, config.workgroupSize.z)
       let ref ← k.getRef key
-      let configNamed : Hesper.ExecConfig := { config with funcName := name }
+      -- Sanitize: several call sites embed Float params in the name (e.g. base10000.000000);
+      -- '.' is invalid in a WGSL identifier → shader-module parse error on WebGPU.
+      let configNamed : Hesper.ExecConfig := { config with funcName := (name.replace "." "p").replace "-" "m" }
       GPUBackend.executeWithConfigCached ctx shader namedBufs configNamed key ref
     | none => GPUBackend.execute ctx shader namedBufs config
 
@@ -1337,7 +1461,8 @@ def forwardPrefillBatch [GPUBackend β] (ctx : β)
     fun name buf nFloats => do
       match goldenDumpDir with
       | some dir =>
-        GPUBackend.endBatch ctx
+        -- tolerant: not all call sites run inside a batch (WebGPU graphs-off path)
+        try GPUBackend.endBatch ctx catch _ => pure ()
         let data ← GPUBackend.readBuffer ctx buf (nFloats * 4).toUSize
         IO.FS.writeBinFile s!"{dir}/{name}.bin" data
       | none => pure ()
@@ -1353,7 +1478,7 @@ def forwardPrefillBatch [GPUBackend β] (ctx : β)
       | some tag =>
         if liActive then
           let dir := (← IO.getEnv "HESPER_ATTN_DUMP_DIR").getD "/tmp"
-          GPUBackend.endBatch ctx
+          try GPUBackend.endBatch ctx catch _ => pure ()
           let data ← GPUBackend.readBuffer ctx buf (nFloats * 4).toUSize
           IO.FS.writeBinFile s!"{dir}/{name}_{tag}.bin" data
       | none => pure ()
@@ -1426,6 +1551,13 @@ def forwardPrefillBatch [GPUBackend β] (ctx : β)
     | .Q6_K =>
       ce "q6kEmbLookup"
         (Hesper.Quantization.Q6_K.q6kEmbeddingLookupKernel model.config.vocabSize dim)
+        [("token_ids", state.tokenBuf), ("embedding_table", model.embedding.embeddingTable), ("output", state.buf1)]
+        (.dispatch1D dim)
+    | .Q4_K =>
+      -- Gemma 4 E2B quantises token_embd as Q4_K (E4B uses Q6_K) — the F32 fallback would
+      -- misdeclare the table (binding validation error → zero hiddens → token-0 output).
+      ce "q4kEmbLookup"
+        (Hesper.Quantization.Q4_K_M.q4kEmbeddingLookupKernel model.config.vocabSize dim)
         [("token_ids", state.tokenBuf), ("embedding_table", model.embedding.embeddingTable), ("output", state.buf1)]
         (.dispatch1D dim)
     | _ =>
@@ -1508,9 +1640,15 @@ def forwardPrefillBatch [GPUBackend β] (ctx : β)
       -- (synthesised as a `Buf` at offset = tokenId × rowBytes), which
       -- means kernelTokenId is always 0 and no cuMemcpy fires.
       -- Legacy path: real `tokenId` indexes the full VRAM table.
-      let kernelTokenId : Nat := match model.perLayerEmbdMmap with
-        | some _ => 0
-        | none   => tokenId
+      -- Row-staged slot for this position: the batched prefill records ALL dispatches then
+      -- submits once, so per-token stagings into one slot would all complete BEFORE any
+      -- dispatch runs (last-write-wins for every position). Slot i%64 + kernel tokenId=i%64
+      -- makes each position read its own row.
+      let stageSlot : Nat := i % 64
+      let kernelTokenId : Nat := match model.perLayerEmbdMmap, model.perLayerEmbdTableBytes with
+        | some _, _ => 0
+        | none, some _ => stageSlot
+        | none, none => tokenId
       writeScalarViaStaging ctx state.plRawRowBuf 0 state.stagingPLRowPtr 0
         (Hesper.WebGPU.BufferOps.uint32ToBytes kernelTokenId.toUInt32)
       let tableForKernel ← match model.perLayerEmbdMmap with
@@ -1519,13 +1657,29 @@ def forwardPrefillBatch [GPUBackend β] (ctx : β)
           match ← GPUBackend.bufFromRawDevicePtr ctx rowDevPtr rowBytesU with
           | some b => pure b
           | none   => pure embdTableGPU  -- backend without UVA: fallback
-        | none => pure embdTableGPU
+        | none =>
+          -- ROW-STAGING (WebGPU): stage this token's Q6_K row into ITS slot of the 64-row
+          -- scratch (stride = u32-rounded rowBytes, matching the kernel's rowU32Size).
+          if let some tb := model.perLayerEmbdTableBytes then
+            let rb := model.perLayerEmbdRowBytes
+            let stride := ((rb + 3) / 4) * 4
+            GPUBackend.writeBufferOffset ctx embdTableGPU (stageSlot * stride).toUSize
+              (tb.extract (tokenId*rb) ((tokenId+1)*rb))
+          pure embdTableGPU
       let scaleFactor : Float := Float.sqrt embdPL.toFloat
-      ce "q6kDequantScale_pf"
-        (Hesper.Quantization.Q6_K.q6kTableRowDequantScaleKernel totalPL scaleFactor
-          cfg.vocabSize)
-        [("table", tableForKernel), ("params", state.plRawRowBuf), ("output", state.plModelProj)]
-        (.dispatch1D totalPL)
+      -- E2B ships per_layer_token_embd as Q5_K; E4B as Q6_K (block layouts differ).
+      if model.perLayerEmbdIsQ5K then
+        ce "q5kDequantScale_pf_r64"
+          (Hesper.Quantization.Q5_K.q5kTableRowDequantScaleKernel totalPL scaleFactor
+            cfg.vocabSize (declRows := 64))
+          [("table", tableForKernel), ("params", state.plRawRowBuf), ("output", state.plModelProj)]
+          (.dispatch1D totalPL)
+      else
+        ce "q6kDequantScale_pf_r64"
+          (Hesper.Quantization.Q6_K.q6kTableRowDequantScaleKernel totalPL scaleFactor
+            cfg.vocabSize (declRows := 64))
+          [("table", tableForKernel), ("params", state.plRawRowBuf), ("output", state.plModelProj)]
+          (.dispatch1D totalPL)
       writeColIdxU32 colIdxBuf i
       ce s!"colExtrScaledEmb_sl{seqLen}"
         (columnExtractKernel dim seqLen)
@@ -1733,9 +1887,11 @@ def forwardPrefillBatch [GPUBackend β] (ctx : β)
         -- Batched fused QKV norm: grid (numHeads*seqLen, 3, 1).
         ce (if isFull then "qkvNormFullBatch" else "qkvNormSWABatch")
           (fusedPerHeadQKVNormBatchKernel numHeads numKVHeads headDim seqLen cfg.rmsNormEps)
-          [("q_in", batchQBuf), ("q_scale", block.attention.qNormWeight), ("q_out", batchQBuf),
-           ("k_in", batchKBuf), ("k_scale", block.attention.kNormWeight), ("k_out", batchKBuf),
-           ("v_in", batchVBuf),                                            ("v_out", batchVBuf)]
+          -- single read_write binding per tensor (in-place): duplicate in/out entries on the
+          -- same buffer are writable-storage aliasing = WebGPU validation error
+          [("q_scale", block.attention.qNormWeight), ("q_io", batchQBuf),
+           ("k_scale", block.attention.kNormWeight), ("k_io", batchKBuf),
+           ("v_io", batchVBuf)]
           { numWorkgroups := (numHeads * seqLen, 3, 1),
             workgroupSize := { x := wgSize, y := 1, z := 1 } : Hesper.ExecConfig }
         let stageActive := stageDumpLayer.any (· = li)
@@ -1790,10 +1946,10 @@ def forwardPrefillBatch [GPUBackend β] (ctx : β)
         let kvCache := state.kvCaches[kvLi]
         writeParamsU32At 0 startPos
         -- Q-only norm, grid (numHeads, seqLen, 1).
-        ce s!"qNormBatch_{headDim}"
-          (perHeadRMSNormBatchKernel numHeads headDim seqLen cfg.rmsNormEps)
-          [("input", batchQBuf), ("weight", block.attention.qNormWeight),
-           ("output", batchQBuf)]
+        -- in-place variant: input==output on the same buffer is writable-storage aliasing on WebGPU
+        ce s!"qNormBatchIP_{headDim}"
+          (perHeadRMSNormBatchInPlaceKernel numHeads headDim seqLen cfg.rmsNormEps)
+          [("weight", block.attention.qNormWeight), ("q_io", batchQBuf)]
           { numWorkgroups := (numHeads, seqLen, 1),
             workgroupSize := { x := wgSize, y := 1, z := 1 } : Hesper.ExecConfig }
         let stageActive := stageDumpLayer.any (· = li)
@@ -2145,8 +2301,9 @@ def forwardPrefillBatch [GPUBackend β] (ctx : β)
         let plePostRef ← match kcr with
           | some k => k.getRef plePostKey
           | none => IO.mkRef none
-        RMSNorm.forwardNormThenAddBatch ctx ple.postNorm
-          plProjBatchBuf nextBuf nextBuf seqLen plePostRef
+        -- in-place: passing nextBuf as both residual and output is writable-storage aliasing on WebGPU
+        RMSNorm.forwardNormThenAddBatchInPlace ctx ple.postNorm
+          plProjBatchBuf nextBuf seqLen plePostRef
       | none => pure ()
     | none => pure ()
 
@@ -2329,6 +2486,37 @@ def forwardPrefillBatch [GPUBackend β] (ctx : β)
         { numWorkgroups := (gridX, gridY, 1), workgroupSize := { x := wgSize, y := 1, z := 1 }
           extensions := if useSubgroups then ["subgroups"] else []
           : Hesper.ExecConfig }
+  | .Q4_K =>
+    -- Q4_K dp4a lm-head (E2B): fused finalNorm+Q8_1 quantize, then the 4-warp
+    -- dp4a matvec over the raw Q4_K table with a 2D grid. Same shape as the
+    -- decode-side branch in forwardSingleToken.
+    let nQ8Blocks := cfg.hiddenSize / 32
+    let q8Buf ← match ← state.lmHeadQ8Buf.get with
+      | some b => pure b
+      | none =>
+        let b ← GPUBackend.allocBuffer ctx (nQ8Blocks * 9 * 4).toUSize
+        state.lmHeadQ8Buf.set (some b)
+        pure b
+    GPUBackend.executeWithConfigCached ctx
+      (Hesper.Layers.RMSNorm.fusedRMSNormQ8_1Kernel model.finalNorm.config)
+      [("input", state.buf2), ("scale", model.finalNorm.scale), ("output", q8Buf)]
+      { numWorkgroups := (1, 1, 1), workgroupSize := { x := 256, y := 1, z := 1 }
+        extensions := ["subgroups"] : Hesper.ExecConfig }
+      (hash ("fused-rmsnorm-q8_1-lmhead", cfg.hiddenSize))
+      state.lmHeadQuantizePrepared
+    let gridX4k : Nat := 4096
+    let gridY4k : Nat := (cfg.vocabSize + gridX4k - 1) / gridX4k
+    GPUBackend.executeWithConfigCached ctx
+      (Hesper.Layers.Linear.fusedQ4KMLinearDP4A4WarpKernel
+        { inDim := cfg.hiddenSize, outDim := cfg.vocabSize } (gridXWidth := gridX4k))
+      [("weights", model.outputWeight), ("input_q8", q8Buf), ("output", state.logitsBuf)]
+      { numWorkgroups := (gridX4k, gridY4k, 1), workgroupSize := { x := 128, y := 1, z := 1 }
+        extensions := ["subgroups"]
+        funcName := s!"q4k_dp4a_4warp_lmhead_{cfg.hiddenSize}_{cfg.vocabSize}"
+        : Hesper.ExecConfig }
+      (hash ("q4k-dp4a-lmhead-4warp", cfg.hiddenSize, cfg.vocabSize))
+      state.lmHeadDP4APrepared
+    dumpGolden "prefill_logits_raw" state.logitsBuf cfg.vocabSize
   | _ =>
     -- Non-Q6_K fallback: F32 matmul transpose.  Needs standalone RMSNorm.
     RMSNorm.forward ctx model.finalNorm state.buf2 state.buf1 (workgroupSize := 1024)
@@ -2394,7 +2582,9 @@ def forwardSingleToken [GPUBackend β] (ctx : β)
     | some k =>
       let key := hash ("gemma4_ce", name, config.numWorkgroups, config.workgroupSize.x, config.workgroupSize.y, config.workgroupSize.z)
       let ref ← k.getRef key
-      let configNamed : Hesper.ExecConfig := { config with funcName := name }
+      -- Sanitize: several call sites embed Float params in the name (e.g. base10000.000000);
+      -- '.' is invalid in a WGSL identifier → shader-module parse error on WebGPU.
+      let configNamed : Hesper.ExecConfig := { config with funcName := (name.replace "." "p").replace "-" "m" }
       GPUBackend.executeWithConfigCached ctx shader namedBufs configNamed key ref
     | none => GPUBackend.execute ctx shader namedBufs config
   let tokenBytes := Hesper.WebGPU.BufferOps.uint32ToBytes tokenId.toUInt32
@@ -2408,8 +2598,14 @@ def forwardSingleToken [GPUBackend β] (ctx : β)
         (Hesper.Quantization.Q6_K.q6kEmbeddingLookupKernel model.config.vocabSize model.config.hiddenSize)
         [("token_ids", state.tokenBuf), ("embedding_table", model.embedding.embeddingTable), ("output", state.buf1)]
         (.dispatch1D model.config.hiddenSize)
+    | .Q4_K =>
+      -- Gemma 4 E2B: Q4_K token_embd (see the prefill site)
+      ce "q4kEmbLookup"
+        (Hesper.Quantization.Q4_K_M.q4kEmbeddingLookupKernel model.config.vocabSize model.config.hiddenSize)
+        [("token_ids", state.tokenBuf), ("embedding_table", model.embedding.embeddingTable), ("output", state.buf1)]
+        (.dispatch1D model.config.hiddenSize)
     | _ =>
-      -- F32 / F16 / Q4_K: use existing Embedding.forward (assumes F32 interpretation)
+      -- F32 / F16: use existing Embedding.forward (F32 interpretation)
       Embedding.forward ctx model.embedding state.tokenBuf state.buf1 1 1
 
   -- Scale embeddings by sqrt(hiddenSize)
@@ -2443,9 +2639,10 @@ def forwardSingleToken [GPUBackend β] (ctx : β)
         -- pointer at `devPtr + tokenId × rowBytes`, so it dereferences
         -- the host page through the unified VA mapping with no explicit
         -- cuMemcpy. Legacy path: real tokenId indexes the full VRAM table.
-        let kernelTokenId : Nat := match model.perLayerEmbdMmap with
-          | some _ => 0
-          | none   => tokenId
+        let kernelTokenId : Nat := match model.perLayerEmbdMmap, model.perLayerEmbdTableBytes with
+          | some _, _ => 0
+          | none, some _ => 0   -- row-staged: the scratch holds exactly this token's row
+          | none, none => tokenId
         let tokenIdBytes := Hesper.WebGPU.BufferOps.uint32ToBytes kernelTokenId.toUInt32
         if !skipTokenWrite then
           writeScalarViaStaging ctx state.plRawRowBuf 0 state.stagingPLRowPtr 0 tokenIdBytes
@@ -2455,13 +2652,27 @@ def forwardSingleToken [GPUBackend β] (ctx : β)
             match ← GPUBackend.bufFromRawDevicePtr ctx rowDevPtr rowBytesU with
             | some b => pure b
             | none   => pure embdTableGPU
-          | none => pure embdTableGPU
+          | none =>
+            -- ROW-STAGING (WebGPU): stage this token's Q6_K row into the one-row scratch
+            -- (see the prefill site for the rationale).
+            if let some tb := model.perLayerEmbdTableBytes then
+              let rb := model.perLayerEmbdRowBytes
+              GPUBackend.writeBuffer ctx embdTableGPU (tb.extract (tokenId*rb) ((tokenId+1)*rb))
+            pure embdTableGPU
         let scaleFactor : Float := Float.sqrt embdPL.toFloat
-        ce "q6kDequantScale"
-          (Hesper.Quantization.Q6_K.q6kTableRowDequantScaleKernel totalPL scaleFactor
-            model.config.vocabSize)
-          [("table", tableForKernel), ("params", state.plRawRowBuf), ("output", state.plModelProj)]
-          (.dispatch1D totalPL)
+        -- E2B ships per_layer_token_embd as Q5_K; E4B as Q6_K (block layouts differ).
+        if model.perLayerEmbdIsQ5K then
+          ce "q5kDequantScale"
+            (Hesper.Quantization.Q5_K.q5kTableRowDequantScaleKernel totalPL scaleFactor
+              model.config.vocabSize)
+            [("table", tableForKernel), ("params", state.plRawRowBuf), ("output", state.plModelProj)]
+            (.dispatch1D totalPL)
+        else
+          ce "q6kDequantScale"
+            (Hesper.Quantization.Q6_K.q6kTableRowDequantScaleKernel totalPL scaleFactor
+              model.config.vocabSize)
+            [("table", tableForKernel), ("params", state.plRawRowBuf), ("output", state.plModelProj)]
+            (.dispatch1D totalPL)
 
       -- 2) per_layer_model_proj @ buf2 → plTokenSelected
       let projConfig : Hesper.WGSL.MatMul.Config := {
@@ -2499,7 +2710,10 @@ def forwardSingleToken [GPUBackend β] (ctx : β)
   -- skip our own begin/endBatch so each dispatch auto-syncs.
   let profiling ← Hesper.Layers.Linear.profilingRef.get
   let alreadyBatching ← Hesper.WGSL.Execute.isBatching
-  let ownBatch := !profiling && !alreadyBatching
+  -- HESPER_DECODE_NOBATCH=1: each dispatch submits+waits (race-diagnostic mode —
+  -- if the intermittent bit-wobble disappears here, it's a batching/sync hazard).
+  let noBatch := (← IO.getEnv "HESPER_DECODE_NOBATCH") == some "1"
+  let ownBatch := !profiling && !alreadyBatching && !noBatch
   if ownBatch then GPUBackend.beginBatch ctx
 
   let mut currentBuf := state.buf2
@@ -2517,6 +2731,9 @@ def forwardSingleToken [GPUBackend β] (ctx : β)
     forwardBlock ctx block model.config currentBuf nextBuf state pos
       (kcr := kcr) (perLayerEmbd := plEmbd) (perLayerInput := plInputBuf)
       (skipPosWrite := skipPosWrite)
+    -- Exp 2 Phase A: layer-boundary barrier marker for native replay mode 2
+    -- (no-op unless a capture is active).
+    Hesper.WGSL.NativeReplay.layerBarrier
     let oldCb := currentBuf
     currentBuf := nextBuf
     nextBuf := oldCb
@@ -2549,7 +2766,11 @@ def forwardSingleToken [GPUBackend β] (ctx : β)
     -- and ignores the wgSize argument) and call the hand-written kernel
     -- with workgroupSize=1024 directly.  Memo: project_rmsnorm_parity.md.
     Hesper.WGSL.Execute.withSection "finalNorm" do
+      -- refOverride: do NOT share model.finalNorm.prepared with the prefill —
+      -- its cached dispatch captures the PREFILL buffers (buf2→buf1) while the
+      -- decode ping-pong ends at buf1→buf2 for odd layer counts (E2B: 35).
       RMSNorm.forward ctx model.finalNorm currentBuf nextBuf (workgroupSize := 1024)
+        (refOverride := some state.finalNormDecodePrepared)
 
   -- Step 4: LM head matmul (1 × hiddenSize @ hiddenSize × vocabSize)
   Hesper.WGSL.Execute.withSection "lmHead" do
@@ -2740,6 +2961,61 @@ def forwardSingleToken [GPUBackend β] (ctx : β)
             workgroupSize := { x := wgSize, y := 1, z := 1 }
             extensions := if useSubgroups then ["subgroups"] else []
             : Hesper.ExecConfig }
+    | .Q4_K =>
+      -- Q4_K dp4a lm-head (Gemma 4 E2B: token_embd is Q4_K). Reads the 226 MB
+      -- Q4_K table directly instead of the 786 MB pre-dequantised f16
+      -- (HESPER_LMHEAD_F16=1 keeps the f16 path for A/B). finalNorm already
+      -- emitted into nextBuf (useFusedNormLmHead=false here); quantize it to
+      -- Q8_1 and run the 4-warp dp4a matvec with a 2D grid (vocab > 65535).
+      let hidden := model.config.hiddenSize
+      let vocab := model.config.vocabSize
+      -- Tuned f32 llama-port path (HESPER_TUNED=1): reads the normed f32 hidden
+      -- directly — no Q8_1 quantize dispatch, 528 GB/s = 97% BW measured.
+      let f32Win ← do
+        if ← Hesper.Layers.Linear.tunedMatVecEnabled then
+          Hesper.Layers.Linear.mulMvF32Winner hidden vocab
+        else pure none
+      match f32Win with
+      | some (nr0, nsg) =>
+        let nWGs := vocab / (nr0*nsg)
+        let gx := if nWGs > 65535 then 4096 else 0
+        let grid := if gx == 0 then (nWGs, 1, 1) else (gx, (nWGs + gx - 1) / gx, 1)
+        GPUBackend.executeWithConfigCached ctx
+          (Hesper.WGSL.MulMvQ4K.mulMvQ4KF32Kernel hidden vocab nr0 nsg (gridXWidth := gx))
+          [("weights", model.outputWeight), ("input", nextBuf), ("output", state.logitsBuf)]
+          { numWorkgroups := grid, workgroupSize := { x := 32*nsg, y := 1, z := 1 }
+            extensions := ["subgroups"]
+            funcName := s!"q4k_mulmv_f32_lmhead_{hidden}_{vocab}"
+            : Hesper.ExecConfig }
+          (hash ("q4k-mulmv-f32-lmhead", hidden, vocab, nr0, nsg))
+          state.lmHeadDP4APrepared
+      | none =>
+      let nQ8Blocks := hidden / 32
+      let q8Buf ← match ← state.lmHeadQ8Buf.get with
+        | some b => pure b
+        | none =>
+          let b ← GPUBackend.allocBuffer ctx (nQ8Blocks * 9 * 4).toUSize
+          state.lmHeadQ8Buf.set (some b)
+          pure b
+      GPUBackend.executeWithConfigCached ctx
+        (Hesper.Layers.Linear.quantizeQ8_1Kernel hidden)
+        [("input", nextBuf), ("output", q8Buf)]
+        { numWorkgroups := (nQ8Blocks, 1, 1), workgroupSize := { x := 32, y := 1, z := 1 }
+          extensions := ["subgroups"] : Hesper.ExecConfig }
+        (hash ("q8_1-quantize-lmhead-q4k", hidden))
+        state.lmHeadQuantizePrepared
+      let gridX4k : Nat := 4096
+      let gridY4k : Nat := (vocab + gridX4k - 1) / gridX4k
+      GPUBackend.executeWithConfigCached ctx
+        (Hesper.Layers.Linear.fusedQ4KMLinearDP4A4WarpKernel
+          { inDim := hidden, outDim := vocab } (gridXWidth := gridX4k))
+        [("weights", model.outputWeight), ("input_q8", q8Buf), ("output", state.logitsBuf)]
+        { numWorkgroups := (gridX4k, gridY4k, 1), workgroupSize := { x := 128, y := 1, z := 1 }
+          extensions := ["subgroups"]
+          funcName := s!"q4k_dp4a_4warp_lmhead_{hidden}_{vocab}"
+          : Hesper.ExecConfig }
+        (hash ("q4k-dp4a-lmhead-4warp", hidden, vocab))
+        state.lmHeadDP4APrepared
     | _ =>
       let lmHeadConfig : Hesper.WGSL.MatMul.Config := {
         M := 1, N := model.config.vocabSize, K := model.config.hiddenSize
@@ -2767,6 +3043,10 @@ def forwardSingleToken [GPUBackend β] (ctx : β)
         (PerLayerEmbedding.scaleKernel model.config.vocabSize 1.0)
         [("input", state.logitsBuf2), ("output", state.logitsBuf)]
         (.dispatch1D model.config.vocabSize)
+
+  -- Parity diagnostic: post-softcap decode logits + the finalNorm output feeding lm-head.
+  dumpBuf ctx nextBuf (model.config.hiddenSize * 4).toUSize s!"single_p{pos}_finalNorm"
+  dumpBuf ctx state.logitsBuf (model.config.vocabSize * 4).toUSize s!"single_p{pos}_logits"
 
   if ownBatch then GPUBackend.endBatch ctx
 
@@ -3361,16 +3641,91 @@ def generate [GPUBackend β] (ctx : β) (model : Gemma4Model (GPUBackend.Buf β)
             let dfThisIter := deviceFedActive && decodeForwardsDone >= 1
             let dfTokenSkip := dfThisIter
             let dfPosSkip   := dfThisIter
-            forwardSingleToken ctx model nextToken newPos state (kcr := some kcr) (skipTokenWrite := dfTokenSkip) (skipPosWrite := dfPosSkip)
-            if deviceFedActive then
+            -- Exp 2 Phase A: HESPER_NATIVE_REPLAY=<n> captures decode forward #n's
+            -- dispatch sequence (n≥1 so pipelines are warm; default 1) into the
+            -- native replay list; the timing runs happen after the generate loop
+            -- finishes (timing-only — replay clobbers buffer contents).
+            -- Needs HESPER_TINT_BIN.
+            let nativeReplayTok := (← IO.getEnv "HESPER_NATIVE_REPLAY").bind (·.toNat?)
+            let captureNow := nativeReplayTok == some decodeForwardsDone
+            -- Exp 2 Phase B: HESPER_NATIVE_DECODE=<n> executes decode forwards #n
+            -- onward NATIVELY: the executeShaderNamed hook records ops and skips the
+            -- Dawn dispatch; commitToken runs the whole token on Dawn's MTLQueue with
+            -- hazard barriers (HESPER_NATIVE_DECODE_MODE overrides; default 3).
+            -- Correctness gate = the generated text.
+            let nativeDecodeTok := (← IO.getEnv "HESPER_NATIVE_DECODE").bind (·.toNat?)
+            let nativeNow : Bool := match nativeDecodeTok with
+              | some n => decide (decodeForwardsDone >= n)
+              | none => false
+            let nativeMode : UInt32 := (((← IO.getEnv "HESPER_NATIVE_DECODE_MODE").bind (·.toNat?)).getD 3).toUInt32
+            -- (a) host-cost kill: HESPER_NATIVE_FROZEN=<m> — from forward #m the
+            -- recorded dispatch list is reused VERBATIM (token-invariant from
+            -- cacheLen ≥ 8; positions travel in params-buffer content), so the hook
+            -- drops every dispatch with zero work. Requires HESPER_NATIVE_DECODE=<n>
+            -- with n < m (token m-1 records the list frozen tokens replay).
+            let frozenTok := (← IO.getEnv "HESPER_NATIVE_FROZEN").bind (·.toNat?)
+            let frozenNow : Bool := nativeNow && (match frozenTok with
+              | some m => decide (decodeForwardsDone >= m)
+              | none => false)
+            if captureNow then
+              IO.println "[replay] capturing this token's dispatches (tint CLI per unique kernel)…"
+              Hesper.WGSL.NativeReplay.startCapture
+            else if frozenNow then
+              Hesper.WGSL.NativeReplay.beginFrozenToken
+            else if nativeNow then
+              Hesper.WGSL.NativeReplay.beginNativeToken
+            -- frozen: the whole forward replays from the frozen list, so the Lean
+            -- walk of forwardSingleToken (~1.3 ms/token) is skipped entirely. The
+            -- only per-token inputs are 5 small device writes (what the skipped
+            -- walk's staging writes did: pos/cacheLen/posF32/token/PLE-row); they
+            -- go through Dawn's queue, which orders BEFORE the frozen commit on the
+            -- same MTLQueue. (HESPER_DEVICE_FED is broken independently — zeros
+            -- from its 9th token even on the plain Dawn path — so the writes stay
+            -- host-side here.)
+            if frozenNow then
+              let posBytes := Hesper.WebGPU.BufferOps.uint32ToBytes newPos.toUInt32
+              let cacheLenBytes := Hesper.WebGPU.BufferOps.uint32ToBytes (newPos + 1).toUInt32
+              let posF32Bytes ← Hesper.Basic.floatToBytes newPos.toFloat
+              let tokBytes := Hesper.WebGPU.BufferOps.uint32ToBytes nextToken.toUInt32
+              GPUBackend.writeBufferOffset ctx state.paramsBuf 0 posBytes
+              GPUBackend.writeBufferOffset ctx state.paramsBuf 4 cacheLenBytes
+              GPUBackend.writeBufferOffset ctx state.posF32Buf 0 posF32Bytes
+              GPUBackend.writeBufferOffset ctx state.tokenBuf 0 tokBytes
+              -- gpuArgmax writes plRawRowBuf = tokenId every iteration (deviceFed
+              -- plumbing); the walk normally overwrites it with 0 (row-staged: the
+              -- dequant kernel must read row 0 of the one-row scratch). Restore 0.
+              GPUBackend.writeBufferOffset ctx state.plRawRowBuf 0
+                (Hesper.WebGPU.BufferOps.uint32ToBytes 0)
+              -- PLE row-staging: the walk uploads THIS token's quantized row into the
+              -- one-row scratch.
+              match model.perLayerEmbdTableGPU, model.perLayerEmbdTableBytes with
+              | some embdTableGPU, some tb =>
+                let rb := model.perLayerEmbdRowBytes
+                GPUBackend.writeBuffer ctx embdTableGPU (tb.extract (nextToken*rb) ((nextToken+1)*rb))
+              | _, _ => pure ()
+            else
+              forwardSingleToken ctx model nextToken newPos state (kcr := some kcr) (skipTokenWrite := dfTokenSkip) (skipPosWrite := dfPosSkip)
+            if captureNow then
+              let (n, misses) ← Hesper.WGSL.NativeReplay.stopCapture
+              IO.println s!"[replay] captured {n} dispatches; misses={misses.length}"
+              for m in misses.take 20 do IO.println s!"[replay]   MISS {m}"
+            if deviceFedActive && !frozenNow then
               -- Increment pos / cacheLen / posF32 device-side so the *next*
               -- iteration's forward sees the correct values without any host
               -- writeScalarViaStaging.  Same kernel the captured decode
-              -- graph uses (line 3081).
+              -- graph uses (line 3081).  Under nativeExec the hook records this
+              -- dispatch into the token list (frozen tokens then replay it), which
+              -- is why the native commit happens AFTER this point.
               GPUBackend.execute ctx advancePosKernel
                 [ ("params", state.paramsBuf), ("posF32", state.posF32Buf) ]
                 { workgroupSize := { x := 1 }, numWorkgroups := (1, 1, 1) }
+            if nativeNow && !captureNow then
+              let report ← Hesper.WGSL.NativeReplay.commitToken nativeMode
+              if nativeDecodeTok == some decodeForwardsDone || decodeSectTrace then
+                IO.println s!"[native] tok={decodeForwardsDone}: {report}"
             decodeForwardsDone := decodeForwardsDone + 1
+            if (← IO.getEnv "HESPER_GPUBUSY").isSome then
+              IO.println s!"[gpubusy] {← Hesper.WebGPU.gpuBusyRead}"
             if (← IO.getEnv "HESPER_DUMP_LOGITS_SINGLE").isSome then
               let bytes ← GPUBackend.readBuffer ctx state.logitsBuf (model.config.vocabSize * 4).toUSize
               IO.FS.writeBinFile s!"/tmp/hesper_single_logits_step{genCount}.bin" bytes
@@ -3436,6 +3791,24 @@ def generate [GPUBackend β] (ctx : β) (model : Gemma4Model (GPUBackend.Buf β)
     Hesper.printAllocHistogram
     Hesper.printModuleLoadStats
     Hesper.printExecuteImplStats
+
+  -- Exp 2 Phase A: replay the captured token natively (Serial sanity vs
+  -- MTLDispatchTypeConcurrent). Runs AFTER decode so the buffer clobbering
+  -- is harmless; results are GPU-wall per token.
+  if (← IO.getEnv "HESPER_NATIVE_REPLAY").isSome then
+    IO.println "[replay] native replay of the captured token (20 iters each):"
+    try
+      IO.println (← Hesper.WGSL.NativeReplay.runAll 20)
+    catch e =>
+      IO.println s!"[replay] FAILED: {e}"
+  -- DEVPLAN §12: per-kernel-class GPU budget of the recorded token (needs a recorded
+  -- list, i.e. HESPER_NATIVE_REPLAY=<n> or HESPER_NATIVE_DECODE=<n> in this run).
+  if (← IO.getEnv "HESPER_NATIVE_PROFILE").isSome then
+    IO.println "[profile] per-kernel-class GPU time (serial, min of 30):"
+    try
+      IO.println (← Hesper.WGSL.NativeReplay.profileClasses 30)
+    catch e =>
+      IO.println s!"[profile] FAILED: {e}"
 
   return tokens
 

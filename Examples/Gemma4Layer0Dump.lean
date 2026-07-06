@@ -38,8 +38,8 @@ open Hesper.WGSL
 /-- Run kernels manually to dump layer 0 intermediate values.
     We replicate the steps of forwardSingleToken + forwardBlock for layer 0 only,
     saving each intermediate value to disk. -/
-def main : IO Unit := do
-  let modelPath := "data/gemma-4-e4b-it-Q4_K_M.gguf"
+def main (args : List String) : IO Unit := do
+  let modelPath := args.getD 0 "data/gemma-4-e4b-it-Q4_K_M.gguf"
   IO.FS.createDirAll "/tmp/hesper_dump"
 
   IO.println "[Init] Creating WebGPU device..."
@@ -263,7 +263,7 @@ def main : IO Unit := do
   -- ====================================================================
   -- Run the per-layer input precompute first to populate state.plInputAll
   -- We need this for the layer 0 slice
-  match model.perLayerEmbdTableCPU, model.perLayerModelProj, model.perLayerProjNorm with
+  match model.perLayerEmbdTableBytes, model.perLayerModelProj, model.perLayerProjNorm with
   | some embdTableCPU, some modelProj, some projNorm =>
     let embdPL := cfg.embdPerLayer
     let nLayers := cfg.numHiddenLayers

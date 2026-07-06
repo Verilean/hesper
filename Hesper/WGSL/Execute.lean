@@ -1,3 +1,4 @@
+import Std.Data.HashMap
 import Hesper.WGSL.Monad
 import Hesper.WGSL.CodeGen
 import Hesper.WebGPU.Types
@@ -5,6 +6,7 @@ import Hesper.WebGPU.Device
 import Hesper.WebGPU.Buffer
 import Hesper.WebGPU.Shader
 import Hesper.WebGPU.Pipeline
+import Hesper.WGSL.NativeReplay
 import Hesper.Logging
 
 namespace Hesper.WGSL.Execute
@@ -143,8 +145,9 @@ structure CachedPipeline where
   declaredNames : List String
   declaredModes : List Monad.BufferAccessMode
 
-/-- Global pipeline cache: maps WGSL source hash to cached pipeline -/
-initialize pipelineCacheRef : IO.Ref (Array (UInt64 × CachedPipeline)) ← IO.mkRef #[]
+/-- Global pipeline cache: maps WGSL source hash to cached pipeline.
+    HashMap — a linear Array scan cost ~ms/token at ~600 dispatches. -/
+initialize pipelineCacheRef : IO.Ref (Std.HashMap UInt64 CachedPipeline) ← IO.mkRef {}
 
 /-- Pipeline cache hit counter -/
 initialize cacheHitsRef : IO.Ref Nat ← IO.mkRef 0
@@ -152,11 +155,9 @@ initialize cacheHitsRef : IO.Ref Nat ← IO.mkRef 0
 /-- Pipeline cache miss counter -/
 initialize cacheMissesRef : IO.Ref Nat ← IO.mkRef 0
 
-/-- Look up a cached pipeline by key from array (linear scan, n ≤ 10 entries) -/
-private def findCachedPipeline (key : UInt64) (cache : Array (UInt64 × CachedPipeline)) : Option CachedPipeline :=
-  match cache.find? (fun entry => entry.1 == key) with
-  | some entry => some entry.2
-  | none => none
+/-- Look up a cached pipeline by key -/
+private def findCachedPipeline (key : UInt64) (cache : Std.HashMap UInt64 CachedPipeline) : Option CachedPipeline :=
+  cache.get? key
 
 /-- Get pipeline cache statistics: (hits, misses) -/
 def getPipelineCacheStats : IO (Nat × Nat) := do
@@ -164,7 +165,7 @@ def getPipelineCacheStats : IO (Nat × Nat) := do
 
 /-- Reset pipeline cache (call when device is destroyed or for benchmarking) -/
 def resetPipelineCache : IO Unit := do
-  pipelineCacheRef.set #[]
+  pipelineCacheRef.set {}
   cacheHitsRef.set 0
   cacheMissesRef.set 0
 
@@ -180,17 +181,15 @@ bind groups are almost always identical across tokens. Caching eliminates
 -/
 
 /-- Global bind group cache: maps (pipeline + buffer IDs) hash to cached BindGroup -/
-initialize bindGroupCacheRef : IO.Ref (Array (UInt64 × BindGroup)) ← IO.mkRef #[]
+initialize bindGroupCacheRef : IO.Ref (Std.HashMap UInt64 BindGroup) ← IO.mkRef {}
 
 /-- Bind group cache hit/miss counters -/
 initialize bgCacheHitsRef : IO.Ref Nat ← IO.mkRef 0
 initialize bgCacheMissesRef : IO.Ref Nat ← IO.mkRef 0
 
 /-- Look up a cached bind group -/
-private def findCachedBindGroup (key : UInt64) (cache : Array (UInt64 × BindGroup)) : Option BindGroup :=
-  match cache.find? (fun entry => entry.1 == key) with
-  | some entry => some entry.2
-  | none => none
+private def findCachedBindGroup (key : UInt64) (cache : Std.HashMap UInt64 BindGroup) : Option BindGroup :=
+  cache.get? key
 
 /-- Compute a bind group cache key from pipeline hash + buffer IDs (single FFI call) -/
 private def computeBindGroupKey (pipelineKey : UInt64) (buffers : List Buffer) : IO UInt64 :=
@@ -516,13 +515,13 @@ def buildKernel (device : Device) (computation : ShaderM Unit)
       bindGroupLayout := bindGroupLayout
     }
     let pipeline ← createComputePipeline device pipelineDesc
-    pipelineCacheRef.modify (·.push (sourceHash, {
+    pipelineCacheRef.modify (·.insert sourceHash {
       shaderModule := shaderModule
       bindGroupLayout := bindGroupLayout
       pipeline := pipeline
       declaredNames := declaredNames
       declaredModes := declaredModes
-    }))
+    })
     pure { pipeline, bindGroupLayout, declaredNames := declaredNames.toArray, sourceHash }
 
 /-- Create a BindGroup by matching named buffers to a CompiledKernel's bindings.
@@ -544,7 +543,7 @@ def bindKernel (device : Device) (kernel : CompiledKernel)
     let bindEntries := sortedBuffers.mapIdx fun i buf =>
       { binding := i.toUInt32, buffer := buf, offset := 0, size := 0 }
     let bg ← createBindGroup device kernel.bindGroupLayout bindEntries.toArray
-    bindGroupCacheRef.modify (·.push (bgKey, bg))
+    bindGroupCacheRef.modify (·.insert bgKey bg)
     pure bg
 
 /-- Create a BindGroup from pre-sorted buffer array (no name matching).
@@ -617,6 +616,33 @@ def executeShaderNamed
     (cacheKey : Option UInt64 := none)
     (preparedRef : Option (IO.Ref (Option PreparedDispatch)) := none)
     : IO Unit := do
+  -- Exp 2 (native replay): when a capture or native-exec token is active, mirror this
+  -- dispatch into the native replay list. Steady state hits the key-indexed cache (no
+  -- WGSL regeneration); cold kernels take the tint-CLI path once. In nativeExec mode
+  -- the Dawn dispatch below is SKIPPED — commitToken executes the recorded token.
+  let replayMode ← NativeReplay.currentMode
+  -- Frozen token replay: the recorded list is reused verbatim — drop the dispatch
+  -- with zero work (no WGSL, no record, no Dawn).
+  if replayMode == .frozen then
+    return
+  if replayMode != .off then
+    let key := cacheKey.getD 0
+    let hit ← NativeReplay.tryRecordFast device key config.funcName namedBuffers
+      config.numWorkgroups config.workgroupSize.x config.workgroupSize.y config.workgroupSize.z
+    unless hit do
+      let wgsl := compileToWGSL computation config.funcName config.workgroupSize config.extensions config.diagnostics
+      let key := if key != 0 then key else hash wgsl
+      let st := ShaderM.exec computation
+      let writable := st.declaredBuffers.filterMap fun d =>
+        match d.2.2 with
+        | .readWrite => some d.1
+        | .read => none
+      NativeReplay.recordSlow device key wgsl config.funcName namedBuffers writable
+        (NativeReplay.sharedBytes st.sharedVars)
+        config.numWorkgroups config.workgroupSize.x config.workgroupSize.y config.workgroupSize.z
+    if replayMode == .nativeExec then
+      return
+
   -- Check cache: use cacheKey if provided (skips WGSL regeneration), otherwise generate and hash
   let cache ← pipelineCacheRef.get
   let (sourceHash, needsCompile) ← match cacheKey with
@@ -662,13 +688,13 @@ def executeShaderNamed
           bindGroupLayout := bindGroupLayout
         }
         let pipeline ← createComputePipeline device pipelineDesc
-        pipelineCacheRef.modify (·.push (sourceHash, {
+        pipelineCacheRef.modify (·.insert sourceHash {
           shaderModule := shaderModule
           bindGroupLayout := bindGroupLayout
           pipeline := pipeline
           declaredNames := declaredNames
           declaredModes := declaredModes
-        }))
+        })
         pure (pipeline, bindGroupLayout, declaredNames)
 
   -- Bind group cache: compute key from namedBuffers BEFORE name matching (skip matching on hit)
@@ -694,7 +720,7 @@ def executeShaderNamed
           offset := 0
           size := 0 }  -- 0 means whole buffer
       let bg ← createBindGroup device bindGroupLayout bindEntries.toArray
-      bindGroupCacheRef.modify (·.push (bgKey, bg))
+      bindGroupCacheRef.modify (·.insert bgKey bg)
       pure bg
 
   -- Save PreparedDispatch for future instant replay (first token only)
@@ -759,13 +785,13 @@ def executeShaderRecorded
         bindGroupLayout := bindGroupLayout
       }
       let pipeline ← createComputePipeline device pipelineDesc
-      pipelineCacheRef.modify (·.push (sourceHash, {
+      pipelineCacheRef.modify (·.insert sourceHash {
         shaderModule := shaderModule
         bindGroupLayout := bindGroupLayout
         pipeline := pipeline
         declaredNames := declaredNames
         declaredModes := declaredModes
-      }))
+      })
       pure (pipeline, bindGroupLayout, declaredNames)
 
   -- Match buffers to bindings by name

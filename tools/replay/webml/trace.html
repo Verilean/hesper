@@ -1,0 +1,178 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>webml trace</title></head><body>
+<script>
+// WebGPU trace hooks — installed BEFORE the app module import below.
+(() => {
+  const state = {
+    tracing: false,
+    shaders: new Map(), shaderSeq: 0,
+    pipelines: new Map(), pipeSeq: 0,
+    bindgroups: new Map(),
+    buffers: new Map(), bufSeq: 0,
+    ops: [],
+  };
+  window.__trace = state;
+
+  const origCSM = GPUDevice.prototype.createShaderModule;
+  GPUDevice.prototype.createShaderModule = function(desc) {
+    const m = origCSM.call(this, desc);
+    state.shaders.set(m, { id: state.shaderSeq++, code: desc.code });
+    return m;
+  };
+  const origCB = GPUDevice.prototype.createBuffer;
+  GPUDevice.prototype.createBuffer = function(desc) {
+    const b = origCB.call(this, desc);
+    state.buffers.set(b, { id: state.bufSeq++, size: desc.size });
+    return b;
+  };
+  const wrapPipeline = (p, desc) => {
+    const sh = state.shaders.get(desc.compute.module);
+    state.pipelines.set(p, {
+      id: state.pipeSeq++,
+      shaderId: sh ? sh.id : -1,
+      entryPoint: desc.compute.entryPoint ?? null,
+      constants: desc.compute.constants ?? null,
+    });
+    return p;
+  };
+  const origCCP = GPUDevice.prototype.createComputePipeline;
+  GPUDevice.prototype.createComputePipeline = function(desc) {
+    return wrapPipeline(origCCP.call(this, desc), desc);
+  };
+  const origCCPA = GPUDevice.prototype.createComputePipelineAsync;
+  GPUDevice.prototype.createComputePipelineAsync = function(desc) {
+    return origCCPA.call(this, desc).then(p => wrapPipeline(p, desc));
+  };
+  const origCBG = GPUDevice.prototype.createBindGroup;
+  GPUDevice.prototype.createBindGroup = function(desc) {
+    const bg = origCBG.call(this, desc);
+    const entries = [];
+    for (const e of desc.entries) {
+      const r = e.resource;
+      if (r && r.buffer) {
+        const info = state.buffers.get(r.buffer);
+        entries.push({ binding: e.binding, buf: info ? info.id : -1,
+          bufSize: info ? info.size : -1, offset: r.offset ?? 0, size: r.size ?? null });
+      }
+    }
+    state.bindgroups.set(bg, entries);
+    return bg;
+  };
+  // Small-buffer CONTENT mirror: uniform/params buffers drive kernel loop trip counts,
+  // so the replayer must upload the real values, not zeros. Mirror every write to
+  // buffers ≤ 64 KiB (writeBuffer + mappedAtCreation ranges).
+  state.mirror = new Map();  // bufId -> Uint8Array
+  const mirrorOf = (info) => {
+    let m = state.mirror.get(info.id);
+    if (!m) { m = new Uint8Array(info.size); state.mirror.set(info.id, m); }
+    return m;
+  };
+  const origWB = GPUQueue.prototype.writeBuffer;
+  GPUQueue.prototype.writeBuffer = function(buffer, bufferOffset, data, dataOffset, size) {
+    const info = state.buffers.get(buffer);
+    if (info && info.size <= 65536) {
+      let bytes = data instanceof ArrayBuffer ? new Uint8Array(data)
+        : new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
+      const elem = data instanceof ArrayBuffer ? 1 : (data.BYTES_PER_ELEMENT ?? 1);
+      const off = (dataOffset ?? 0) * elem;
+      const len = size !== undefined ? size * elem : bytes.length - off;
+      mirrorOf(info).set(bytes.subarray(off, off + len), bufferOffset);
+    }
+    return origWB.call(this, buffer, bufferOffset, data, dataOffset, size);
+  };
+  const origGMR = GPUBuffer.prototype.getMappedRange;
+  GPUBuffer.prototype.getMappedRange = function(offset, size) {
+    const ab = origGMR.call(this, offset, size);
+    const info = state.buffers.get(this);
+    if (info && info.size <= 65536) {
+      (this.__mapped ??= []).push({ offset: offset ?? 0, ab });
+    }
+    return ab;
+  };
+  const origUnmap = GPUBuffer.prototype.unmap;
+  GPUBuffer.prototype.unmap = function() {
+    const info = state.buffers.get(this);
+    if (info && this.__mapped) {
+      for (const { offset, ab } of this.__mapped) {
+        try { mirrorOf(info).set(new Uint8Array(ab), offset); } catch (e) {}
+      }
+      this.__mapped = null;
+    }
+    return origUnmap.call(this);
+  };
+
+  const CPE = GPUComputePassEncoder.prototype;
+  const origSP = CPE.setPipeline;
+  CPE.setPipeline = function(p) { this.__pipe = state.pipelines.get(p); return origSP.call(this, p); };
+  const origSBG = CPE.setBindGroup;
+  CPE.setBindGroup = function(i, bg, ...rest) {
+    (this.__bgs ??= {})[i] = state.bindgroups.get(bg);
+    return origSBG.call(this, i, bg, ...rest);
+  };
+  const origDW = CPE.dispatchWorkgroups;
+  CPE.dispatchWorkgroups = function(x, y = 1, z = 1) {
+    if (state.tracing) {
+      state.ops.push({
+        pipe: this.__pipe ? this.__pipe.id : -1,
+        grid: [x, y, z],
+        bgs: this.__bgs ? Object.entries(this.__bgs).map(([g, es]) => ({ group: +g, entries: es ?? [] })) : [],
+      });
+    }
+    return origDW.call(this, x, y, z);
+  };
+})();
+</script>
+<script type="module">
+import { Gemma4Mobile } from "./gemma-4-e2b.js";
+const log = (m) => fetch('/log', { method: 'POST', body: String(m) }).catch(() => {});
+(async () => {
+  try {
+    if (!navigator.gpu) { log('FATAL: no navigator.gpu'); return; }
+    const a = await navigator.gpu.requestAdapter();
+    if (!a) { log('FATAL: no adapter'); return; }
+    log('adapter ok; loading model…');
+    let lastPct = -10;
+    const model = await Gemma4Mobile.load(null, { onProgress: (p) => {
+      const pct = Math.floor((p?.progress ?? p ?? 0) * 100);
+      if (pct >= lastPct + 10) { lastPct = pct; log('load ' + pct + '%'); }
+    }});
+    log('loaded; warmup…');
+    await model.warmup?.();
+    log('warmup done; generating…');
+    const messages = [{ role: 'user', content: 'Write a short poem about the sea' }];
+    const stream = model.generate(messages, { maxNewTokens: 12 });
+    let n = 0;
+    const t = window.__trace;
+    for await (const _ of stream) {
+      n++;
+      if (n === 6) { t.ops = []; t.tracing = true; }   // trace exactly one steady token
+      else if (n === 7 && t.tracing) { t.tracing = false; log('traced ops=' + t.ops.length); }
+    }
+    t.tracing = false;
+    log('generated ' + n + ' chunks; ops=' + t.ops.length);
+    const usedPipes = new Set(t.ops.map(o => o.pipe));
+    const pipes = [];
+    for (const info of t.pipelines.values()) if (usedPipes.has(info.id)) pipes.push(info);
+    const shaderIds = new Set(pipes.map(p => p.shaderId));
+    const shaders = [];
+    for (const s of t.shaders.values()) if (shaderIds.has(s.id)) shaders.push(s);
+    // small-buffer contents (base64) for buffers the traced ops actually bind
+    const usedBufs = new Set();
+    for (const o of t.ops) for (const g of o.bgs) for (const e of g.entries) usedBufs.add(e.buf);
+    const contents = {};
+    for (const [id, bytes] of t.mirror) {
+      if (!usedBufs.has(id)) continue;
+      let bin = '';
+      for (let i = 0; i < bytes.length; i += 8192)
+        bin += String.fromCharCode.apply(null, bytes.subarray(i, i + 8192));
+      contents[id] = btoa(bin);
+    }
+    const payload = JSON.stringify({ ops: t.ops, pipes, shaders, contents });
+    await fetch('/trace', { method: 'POST', body: payload });
+    log('trace posted bytes=' + payload.length + ' DONE');
+  } catch (e) {
+    log('ERROR: ' + (e && (e.stack || e.message) || e));
+  }
+})();
+</script>
+</body></html>

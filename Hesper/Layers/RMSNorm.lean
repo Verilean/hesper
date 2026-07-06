@@ -135,8 +135,10 @@ def rmsNormKernel (config : Config) (workgroupSize : Nat := 256) : ShaderM Unit 
   let normalized := Exp.div inputVal rms
   let result := Exp.mul normalized scaleVal
 
-  let finalResult := Exp.select inBounds result (Exp.litF32 0.0)
-  ShaderM.writeBuffer (ty := .scalar .f32) "output" idx finalResult
+  -- bounds-guarded write (a clamped OOB write races the last element's owner)
+  ShaderM.if_ inBounds (do
+    ShaderM.writeBuffer (ty := .scalar .f32) "output" idx result
+  ) (pure ())
 
 /-- Block-wide sum reduction using warp-shuffle then a single cross-warp
     pass through shared memory.  Returns a value that holds the total
@@ -417,6 +419,50 @@ def rmsNormThenAddBatchKernel (config : Config) (seqLen : Nat)
     let y := Exp.add (Exp.mul (Exp.div v rms) s) r
     ShaderM.writeBuffer (ty := .scalar .f32) "output" bi y
 
+/-- IN-PLACE variant of `rmsNormThenAddBatchKernel`: `residual_io += RMSNorm(layer_out) * scale`.
+    A single read_write binding — the two-binding form with residual == output is writable-storage
+    aliasing (legal on CUDA, VALIDATION ERROR on WebGPU). Per-element read→add→write by the same
+    thread at the same index (the RMS reduction only reads layer_out), so in-place is race-free. -/
+def rmsNormThenAddBatchInPlaceKernel (config : Config) (seqLen : Nat)
+    (workgroupSize : Nat := 256) : ShaderM Unit := do
+  let wid ← ShaderM.workgroupId
+  let lid ← ShaderM.localId
+  let rowIdx := Exp.vec3X wid
+  let localIdx := Exp.vec3X lid
+  let totalElements := config.dim * seqLen
+  ShaderM.sharedNamed "shared_sum" (.array (.scalar .f32) workgroupSize)
+  let _layerOut ← ShaderM.declareInputBuffer "layer_out" (.array (.scalar .f32) totalElements)
+  let _scale    ← ShaderM.declareInputBuffer "scale" (.array (.scalar .f32) config.dim)
+  let _res      ← ShaderM.declareOutputBuffer "residual_io" (.array (.scalar .f32) totalElements)
+  let rowBase := Exp.mul rowIdx (Exp.litU32 config.dim)
+  ShaderM.varNamed "partial_sum" (.scalar .f32) (Exp.litF32 0.0)
+  let partialSum : Exp (.scalar .f32) := Exp.var "partial_sum"
+  ShaderM.loop localIdx (Exp.litU32 config.dim) (Exp.litU32 workgroupSize) fun i => do
+    let v ← ShaderM.readBuffer (ty := .scalar .f32) (n := totalElements) "layer_out" (Exp.add rowBase i)
+    ShaderM.assign "partial_sum" (Exp.add partialSum (Exp.mul v v))
+  ShaderM.writeWorkgroup (ty := .scalar .f32) "shared_sum" localIdx partialSum
+  ShaderM.barrier
+  let mut stride := workgroupSize / 2
+  while stride > 0 do
+    ShaderM.if_ (Exp.lt localIdx (Exp.litU32 stride)) (do
+      let a ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := workgroupSize) "shared_sum" localIdx
+      let b ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := workgroupSize) "shared_sum" (Exp.add localIdx (Exp.litU32 stride))
+      ShaderM.writeWorkgroup (ty := .scalar .f32) "shared_sum" localIdx (Exp.add a b)
+    ) (pure ())
+    ShaderM.barrier
+    stride := stride / 2
+  let totalSum ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := workgroupSize) "shared_sum" (Exp.litU32 0)
+  let mean := Exp.div totalSum (Exp.litF32 config.dim.toFloat)
+  let rms := Exp.sqrt (Exp.add mean (Exp.litF32 config.eps))
+  ShaderM.loop localIdx (Exp.litU32 config.dim) (Exp.litU32 workgroupSize) fun i => do
+    let bi := Exp.add rowBase i
+    let v ← ShaderM.readBuffer (ty := .scalar .f32) (n := totalElements) "layer_out" bi
+    let s ← ShaderM.readBuffer (ty := .scalar .f32) (n := config.dim) "scale" i
+    let r ← ShaderM.readBuffer (ty := .scalar .f32) (n := totalElements) "residual_io" bi
+    let y := Exp.add (Exp.mul (Exp.div v rms) s) r
+    ShaderM.writeBuffer (ty := .scalar .f32) "residual_io" bi y
+
+
 /-! ## Fused residual-add + RMSNorm -/
 
 /-- Compute `residualOut = a + b` and `output = RMSNorm(residualOut) * scale`
@@ -566,8 +612,10 @@ def rmsApplyKernel (config : Config) (numRows : Nat) : ShaderM Unit := do
   let result := Exp.mul normalized scaleVal
 
   -- Write output
-  let finalResult := Exp.select inBounds result (Exp.litF32 0.0)
-  ShaderM.writeBuffer (ty := .scalar .f32) "output" idx finalResult
+  -- bounds-guarded write (a clamped OOB write races the last element's owner)
+  ShaderM.if_ inBounds (do
+    ShaderM.writeBuffer (ty := .scalar .f32) "output" idx result
+  ) (pure ())
 
 /-! ## Fused RMSNorm + Q8_1 quantize
 
@@ -829,6 +877,20 @@ def forwardNormThenAddBatch [GPUBackend β] (ctx : β)
      ("output", outputBuf)]
     { workgroupSize := { x := workgroupSize }, numWorkgroups := (seqLen, 1, 1) }
     cacheKey preparedRef
+
+/-- In-place driver for `rmsNormThenAddBatchInPlaceKernel` (residual buffer updated in place). -/
+def forwardNormThenAddBatchInPlace [GPUBackend β] (ctx : β)
+    (layer : RMSNorm (GPUBackend.Buf β) (GPUBackend.CachedDispatch β))
+    (layerOutBuf residualIoBuf : GPUBackend.Buf β) (seqLen : Nat)
+    (preparedRef : IO.Ref (Option (GPUBackend.CachedDispatch β)))
+    (workgroupSize : Nat := 256) : IO Unit := do
+  let shader := rmsNormThenAddBatchInPlaceKernel layer.config seqLen workgroupSize
+  let cacheKey : UInt64 := hash ("rms-then-add-batch-inplace", layer.config.dim, seqLen, workgroupSize)
+  GPUBackend.executeWithConfigCached ctx shader
+    [("layer_out", layerOutBuf), ("scale", layer.scale), ("residual_io", residualIoBuf)]
+    { workgroupSize := { x := workgroupSize }, numWorkgroups := (seqLen, 1, 1) }
+    cacheKey preparedRef
+
 
 /-- Fused residual-add + RMSNorm forward.  Computes
     `residualOut = a + b` and `output = RMSNorm(residualOut) * scale` in

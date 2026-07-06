@@ -43,6 +43,12 @@ def main (args : List String) : IO Unit := do
   IO.println "[Init] Creating WebGPU device..."
   let inst ← Hesper.init
   let device ← Hesper.WebGPU.getDevice inst
+  -- dp4a (dot4I8Packed) fast paths are opt-in (Linear.dp4aEnabled defaults to false; only the
+  -- CUDA example set it). WebGPU supports it whenever subgroups are available — without this the
+  -- decode's fused-QKV path selects itself and then throws "dp4a precondition failed".
+  if ← Hesper.WebGPU.deviceHasSubgroups device then
+    Hesper.Layers.Linear.dp4aEnabled.set true
+    IO.println "[Init] dp4a paths enabled (subgroups available)"
 
   -- Step 2: Load model
   IO.println "[Load] Loading Gemma 4 model..."

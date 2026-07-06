@@ -54,10 +54,90 @@ opaque mtlDeviceName (device : @& Device) : IO String
 @[extern "lean_hesper_gpubusy_read"]
 opaque gpuBusyRead : IO String
 
+/-- DEVPLAN M1: the most recent Tint-MSL dump captured in-process by the HESPER_DUMP_MSL logging
+    callback (empty if nothing dumped yet / env not set). Feed to `mslOccupancyProbe`. Set
+    HESPER_DUMP_MSL_QUIET=1 to capture without the stderr spew (sweep mode). -/
+@[extern "lean_hesper_last_dumped_msl"]
+opaque lastDumpedMsl : IO String
+
+/-- DEVPLAN M1: compile a Tint-dumped MSL source with the real Metal compiler and report the
+    pipeline's resource stats: "maxThreads=N execWidth=M tgMem=K". maxThreads is the
+    register-pressure inverse signal (drops on spill); this is the MANDATORY resource column of
+    the autotune sweep. macOS only (IO error elsewhere). -/
+@[extern "lean_hesper_msl_occupancy_probe"]
+opaque mslOccupancyProbe (device : @& Device) (msl : @& String) : IO String
+
+/-- Native serialized GPU timing of a dumped Tint-MSL kernel: `nDispatches` back-to-back in
+    one SERIAL Metal encoder, GPU ms from GPUStart/EndTime. Buffers in BINDING ORDER.
+    The honest per-kernel bench (Dawn adds ~35 µs/dispatch that drowns small matvecs). -/
+@[extern "lean_hesper_msl_bench_serial"]
+opaque mslBenchSerial (device : @& Device) (msl : @& String) (bufs : @& Array Buffer)
+    (nDispatches gridX gridY gridZ wgX : UInt32) : IO String
+
+/-- DEVPLAN §13 cold-stream bench: like `mslBenchSerial`, but the buffer at `rotSlot`
+    rotates across `copies` per dispatch, so successive dispatches read DIFFERENT
+    memory — cold-stream BW instead of the warm-SLC number (an isolated bench
+    re-reading one weight 300× flattered the matvecs to 90–97 %; a real token streams
+    every weight once). Returns GPU ms for the whole run as a string. -/
+@[extern "lean_hesper_msl_bench_serial_rot"]
+opaque mslBenchSerialRot (device : @& Device) (msl : @& String) (bufs : @& Array Buffer)
+    (rotSlot : UInt32) (copies : @& Array Buffer)
+    (nDispatches gridX gridY gridZ wgX : UInt32) : IO String
+
+/-- M3 de-risk probe: run `nDispatches` of a dumped Tint-MSL kernel back-to-back in ONE
+    native Metal encoder with Serial or Concurrent dispatch type (no barriers — timing
+    only, racing writes tolerated). Returns GPU wall ms as a string. -/
+@[extern "lean_hesper_msl_concurrent_probe"]
+opaque mslConcurrentProbe (device : @& Device) (msl : @& String)
+    (b0 b1 b2 : @& Buffer) (nDispatches gridX gridY wgX : UInt32)
+    (concurrent : UInt8) : IO String
+
 /-- DG_GPUBUSY: read+reset the MSL-path split (count / WaitForCommandsToBeScheduled / encode+commit
     / kernel GPU time). Complements gpuBusyRead (which covers the Dawn WGSL path only). -/
 @[extern "lean_hesper_msl_busy_read"]
 opaque mslBusyRead : IO String
+
+/-- Exp 2 Phase A (native replay): clear the recorded dispatch sequence. -/
+@[extern "lean_hesper_replay_reset"]
+opaque replayReset : IO Unit
+
+/-- Exp 2 Phase A: push a barrier marker (layer boundary) into the replay sequence.
+    Only honored by `replayRun mode=2` (concurrent + barriers). -/
+@[extern "lean_hesper_replay_barrier"]
+opaque replayBarrier : IO Unit
+
+/-- Exp 2 Phase A: record one dispatch for native replay. `bufs` must be in MSL
+    `[[buffer(i)]]` order (parse the Tint-CLI entry signature); `entry` = the MSL kernel
+    function name; `tgBytes` = threadgroup memory upper bound (0 if none; set via
+    setThreadgroupMemoryLength at index 0); `writeMask` bit i = bufs[i] is written
+    (read_write binding) — drives mode-3 hazard barriers. PSO compiled once per MSL. -/
+@[extern "lean_hesper_replay_record"]
+opaque replayRecord (device : @& Device) (msl : @& String) (entry : @& String)
+    (bufs : @& Array Buffer) (gx gy gz tx ty tz tgBytes writeMask : UInt32)
+    (key : UInt64) : IO Unit
+
+/-- Exp 2 Phase A: replay the recorded token in ONE native command buffer.
+    mode: 0 = Serial (sanity vs Dawn GPU time), 1 = Concurrent no-barrier (upper bound),
+    2 = Concurrent + barriers at recorded markers (realistic). Returns
+    "count=<ops> min=<ms> avg=<ms>". TIMING ONLY — buffer contents end up garbage.
+    Device comes from the record-time stash, so this is callable from
+    backend-generic code. -/
+@[extern "lean_hesper_replay_run"]
+opaque replayRun (mode iters : UInt32) : IO String
+
+/-- Exp 2 Phase B: execute the recorded token ONCE as the REAL computation.
+    Commits to DAWN'S OWN MTLCommandQueue when reachable (single-queue FIFO ordering
+    with Dawn's staging writes and readbacks), waits for completion. mode as in
+    replayRun; 3 = concurrent + automatic hazard barriers. Returns
+    "ms=<gpu ms> barriers=<n> queue=<dawn|own>". -/
+@[extern "lean_hesper_replay_exec"]
+opaque replayExec (mode : UInt32) : IO String
+
+/-- DEVPLAN §12 per-op-class profiling: replay ONLY the given dispatch indices
+    (into the recorded sequence, barriers excluded), serially, `iters` times.
+    Returns "count=<n> min=<ms> avg=<ms>". -/
+@[extern "lean_hesper_replay_run_subset"]
+opaque replayRunSubset (indices : @& Array UInt32) (iters : UInt32) : IO String
 
 /-- metal_replacer STEP 4: Apple's tuned MPS f16 matmul (C=A·Bᵀ, our reg-matmul shape) as the CEILING —
     returns "ms/call | GFLOPS | %peak". Diff vs the WGSL reg (harness) at the same shape to quantify the

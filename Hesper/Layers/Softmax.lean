@@ -157,8 +157,10 @@ def softmaxKernel (config : Config) : ShaderM Unit := do
   let result := Exp.div expVal sumExp
 
   -- Write output
-  let finalResult := Exp.select inBounds result (Exp.litF32 0.0)
-  ShaderM.writeBuffer (ty := .scalar .f32) "output" idx finalResult
+  -- bounds-guarded write (a clamped OOB write races the last element's owner)
+  ShaderM.if_ inBounds (do
+    ShaderM.writeBuffer (ty := .scalar .f32) "output" idx result
+  ) (pure ())
 
 /-- Softmax with causal masking
 
@@ -228,8 +230,10 @@ def softmaxMaskedKernel (config : Config) : ShaderM Unit := do
   -- Normalize
   let result := Exp.div expVal sumExp
 
-  let finalResult := Exp.select inBounds result (Exp.litF32 0.0)
-  ShaderM.writeBuffer (ty := .scalar .f32) "output" idx finalResult
+  -- bounds-guarded write (a clamped OOB write races the last element's owner)
+  ShaderM.if_ inBounds (do
+    ShaderM.writeBuffer (ty := .scalar .f32) "output" idx result
+  ) (pure ())
 
 /-! ## High-Level API -/
 

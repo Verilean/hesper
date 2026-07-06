@@ -94,6 +94,7 @@ open Hesper.Quantization.TQ2_0
 inductive GGMLType where
   | F32     -- 0: Float32
   | F16     -- 1: Float16
+  | BF16    -- 30: bfloat16
   | Q4_0    -- 2: 4-bit quantization
   | Q4_1    -- 3: 4-bit quantization with offset
   | Q5_0    -- 6: 5-bit quantization
@@ -119,6 +120,7 @@ def GGMLType.fromNat (n : Nat) : GGMLType :=
   match n with
   | 0 => .F32
   | 1 => .F16
+  | 30 => .BF16
   | 2 => .Q4_0
   | 3 => .Q4_1
   | 6 => .Q5_0
@@ -138,6 +140,7 @@ def GGMLType.bytesPerElement (t : GGMLType) : Nat :=
   match t with
   | .F32 => 4
   | .F16 => 2
+  | .BF16 => 2
   | .Q4_0 | .Q4_1 => 0  -- Block-based, varies
   | .Q5_0 | .Q5_1 => 0
   | .Q8_0 | .Q8_1 => 0
@@ -154,6 +157,7 @@ instance : ToString GGMLType where
   toString t := match t with
     | .F32 => "F32"
     | .F16 => "F16"
+    | .BF16 => "BF16"
     | .Q4_0 => "Q4_0"
     | .Q4_1 => "Q4_1"
     | .Q5_0 => "Q5_0"
@@ -198,6 +202,7 @@ def convertGGMLType (t : Hesper.GGUF.GGMLType) : GGMLType :=
   match t with
   | .F32 => .F32
   | .F16 => .F16
+  | .BF16 => .BF16
   | .Q4_0 => .Q4_0
   | .Q4_1 => .Q4_1
   | .Q5_0 => .Q5_0

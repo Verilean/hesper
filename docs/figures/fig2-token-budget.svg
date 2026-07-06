@@ -1,0 +1,59 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="760" height="300" viewBox="0 0 760 300" font-family="Helvetica, Arial, sans-serif">
+  <style>
+    .lbl { font-size: 14px; fill: #222; }
+    .seg { font-size: 12px; fill: #fff; }
+    .tot { font-size: 13px; fill: #222; font-weight: bold; }
+    .cap { font-size: 12px; fill: #555; }
+    .axis { stroke: #bbb; stroke-width: 1; }
+    .tick { font-size: 11px; fill: #888; }
+  </style>
+  <!-- title -->
+  <text x="20" y="24" font-size="15" font-weight="bold" fill="#222">Where a decode millisecond goes (per token, measured, serial)</text>
+
+  <!-- scale: 1 ms = 62 px, origin x=150 -->
+  <!-- gridlines every 2 ms -->
+  <g>
+    <line class="axis" x1="150" y1="40" x2="150" y2="238"/><text class="tick" x="147" y="252">0</text>
+    <line class="axis" x1="274" y1="40" x2="274" y2="238"/><text class="tick" x="266" y="252">2 ms</text>
+    <line class="axis" x1="398" y1="40" x2="398" y2="238"/><text class="tick" x="390" y="252">4 ms</text>
+    <line class="axis" x1="522" y1="40" x2="522" y2="238"/><text class="tick" x="514" y="252">6 ms</text>
+    <line class="axis" x1="646" y1="40" x2="646" y2="238"/><text class="tick" x="638" y="252">8 ms</text>
+  </g>
+
+  <!-- webml: GPU 3.90 (242px), host 0.2 (12px) -->
+  <text class="lbl" x="20" y="70">webml (JS)</text>
+  <rect x="150" y="52" width="242" height="28" fill="#4472c4"/>
+  <text class="seg" x="160" y="71">GPU 3.90</text>
+  <rect x="392" y="52" width="12" height="28" fill="#ed7d31"/>
+  <text class="tot" x="412" y="71">≈ 4.0 ms  (~250 tok/s)</text>
+
+  <!-- llama.cpp: GPU 6.31 (391px), host 0.55 (34px) -->
+  <text class="lbl" x="20" y="118">llama.cpp (C++)</text>
+  <rect x="150" y="100" width="391" height="28" fill="#4472c4"/>
+  <text class="seg" x="160" y="119">GPU 6.31</text>
+  <rect x="541" y="100" width="34" height="28" fill="#ed7d31"/>
+  <text class="tot" x="583" y="119">6.9 ms  (147 tok/s)</text>
+
+  <!-- Hesper Dawn: GPU 7.7 (477px), host 2.1 (130px) -->
+  <text class="lbl" x="20" y="166">Hesper (Dawn)</text>
+  <rect x="150" y="148" width="477" height="28" fill="#4472c4"/>
+  <text class="seg" x="160" y="167">GPU 7.7 (incl. Dawn serial-encoder overhead ~0.9)</text>
+  <rect x="627" y="148" width="130" height="28" fill="#ed7d31"/>
+  <text class="seg" x="633" y="167">host 2.1</text>
+  <text class="tot" x="629" y="196" text-anchor="end">= 9.8 ms</text>
+
+  <!-- Hesper frozen: GPU 7.5 (465px), host 0.9 (56px) -->
+  <text class="lbl" x="20" y="228">Hesper (frozen-</text>
+  <text class="lbl" x="20" y="243">native)</text>
+  <rect x="150" y="210" width="465" height="28" fill="#4472c4"/>
+  <text class="seg" x="160" y="229">GPU 7.5</text>
+  <rect x="615" y="210" width="56" height="28" fill="#2e9e5b"/>
+  <text class="seg" x="619" y="229">0.9</text>
+  <text class="tot" x="679" y="229">8.4 ms  (119 tok/s)</text>
+
+  <!-- legend -->
+  <rect x="150" y="266" width="14" height="14" fill="#4472c4"/><text class="cap" x="170" y="278">GPU (bare-Metal replay / in-decode)</text>
+  <rect x="400" y="266" width="14" height="14" fill="#ed7d31"/><text class="cap" x="420" y="278">host loop + argmax sync</text>
+  <rect x="580" y="266" width="14" height="14" fill="#2e9e5b"/><text class="cap" x="600" y="278">host after frozen replay</text>
+  <text class="cap" x="20" y="296">Hesper (Dawn) host 2.1 = Lean per-token walk 1.3 + record path ~0.25 + argmax sync 0.55. Frozen replay removes the walk (CUDA-Graphs analogue).</text>
+</svg>

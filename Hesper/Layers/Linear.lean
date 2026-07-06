@@ -1,6 +1,9 @@
 import Hesper.Backend
 import Hesper.WGSL.Monad
 import Hesper.WGSL.Exp
+import Hesper.WGSL.MatMul
+import Hesper.WGSL.Autotune
+import Hesper.WGSL.MulMvQ4K
 import Hesper.Quantization.Q4_K_M
 import Hesper.Quantization.Q6_K
 import Hesper.Logging
@@ -2786,10 +2789,13 @@ def fusedQ4KMLinearDP4A2RowKernel (config : Config) : ShaderM Unit := do
     threads 0..31 (warp 0) handle blocks {0,1,8,9}, warps 1–3 handle
     blocks {2..7} — every block is covered exactly once, no duplicated
     work, no `*0.5` correction. -/
-def fusedQ4KMLinearDP4A4WarpKernel (config : Config) : ShaderM Unit := do
+def fusedQ4KMLinearDP4A4WarpKernel (config : Config) (gridXWidth : Nat := 0) : ShaderM Unit := do
   let wid ← ShaderM.workgroupId
   let lid ← ShaderM.localId
-  let outIdx := Exp.vec3X wid
+  -- 2D grid when outDim exceeds the 65535 per-dimension workgroup limit
+  -- (lm-head vocab 262144): row = wid.x + wid.y * gridXWidth.
+  let outIdx := if gridXWidth == 0 then Exp.vec3X wid
+                else Exp.add (Exp.vec3X wid) (Exp.mul (Exp.vec3Y wid) (Exp.litU32 gridXWidth))
   let tid := Exp.vec3X lid            -- 0..127
   let warpId := Exp.shiftRight tid (Exp.litU32 5)  -- 0..3
   let laneId := Exp.bitAnd tid (Exp.litU32 31)     -- 0..31
@@ -3020,6 +3026,195 @@ def fusedQ4KMLinearDP4A4WarpKernel (config : Config) : ShaderM Unit := do
     let total := Exp.add warpTotal (Exp.add p1 (Exp.add p2 p3))
     ShaderM.writeBuffer (ty := .scalar .f32) "output" outIdx total
   ) (pure ())
+
+/-- GENERALIZED Q4_K × Q8_1 dp4a matvec — the autotune substrate for the M=1
+    decode shapes. Parameterizes the deployed kernel family over:
+
+      rowsPerWG  (R): rows of the weight matrix each workgroup computes
+      warpsPerRow(W): warps cooperating on K for each row
+
+    wgSize = 32·R·W. R=1,W=4 reproduces `fusedQ4KMLinearDP4A4WarpKernel`;
+    R=1,W=1 the single-warp kernel; R=2/4,W=1 the 2-row/4-row layouts.
+    New points (R=8·W=1, R=4·W=2, …) become reachable for the sweep.
+
+    Motivation (MATVEC=1 roofline, M4 Max): the deployed R1W4 kernel reads
+    only 6.75 B/thread at K=1536 → latency-bound at 26-100 GB/s on the
+    per-layer shapes while the same kernel at lm-head scale hits 256 GB/s.
+    More rows per WG raises bytes/thread without changing the dp4a math.
+
+    Thread layout per row (llama.cpp mmvq, qi=32, vdr=2):
+      tInRow ∈ [0, 32W): kbxStart = tInRow/16 ∈ [0, 2W), iqs = 2·(tInRow%16)
+      blocks_per_iter = 2W
+    Reduction: subgroupAdd per warp; W>1 adds an smem cross-warp combine
+    (warps of one row are consecutive since threadsPerRow = 32W).
+    `gridXWidth` enables the 2D grid for N/R > 65535. -/
+def q4kMatVecDP4AGenKernel (config : Config) (rowsPerWG warpsPerRow : Nat)
+    (gridXWidth : Nat := 0) : ShaderM Unit := do
+  let wid ← ShaderM.workgroupId
+  let lid ← ShaderM.localId
+  let tid := Exp.vec3X lid
+  let threadsPerRow := 32 * warpsPerRow
+  let wgIdx := if gridXWidth == 0 then Exp.vec3X wid
+               else Exp.add (Exp.vec3X wid) (Exp.mul (Exp.vec3Y wid) (Exp.litU32 gridXWidth))
+  let rowLocalName ← ShaderM.var (.scalar .u32) (Exp.div tid (Exp.litU32 threadsPerRow))
+  let tInRowName   ← ShaderM.var (.scalar .u32) (Exp.mod tid (Exp.litU32 threadsPerRow))
+  let rowLocal : Exp (.scalar .u32) := Exp.var rowLocalName
+  let tInRow   : Exp (.scalar .u32) := Exp.var tInRowName
+  let outIdxName ← ShaderM.var (.scalar .u32)
+    (Exp.add (Exp.mul wgIdx (Exp.litU32 rowsPerWG)) rowLocal)
+  let outIdx : Exp (.scalar .u32) := Exp.var outIdxName
+
+  let blocksPerRow := config.inDim / 256
+  let totalWeightU32 := config.outDim * blocksPerRow * 36
+  let q8BlocksPerRow := config.inDim / 32
+  let q8InputU32Size := q8BlocksPerRow * 9
+
+  let _weights ← ShaderM.declareReadOnlyBuffer "weights" (.array (.scalar .u32) totalWeightU32)
+  let _input ← ShaderM.declareReadOnlyBuffer "input_q8" (.array (.scalar .u32) q8InputU32Size)
+  let _output ← ShaderM.declareOutputBuffer "output" (.array (.scalar .f32) config.outDim)
+
+  if warpsPerRow > 1 then
+    ShaderM.sharedNamed "s_partial" (.array (.scalar .f32) (rowsPerWG * warpsPerRow))
+
+  let inBounds := Exp.lt outIdx (Exp.litU32 config.outDim)
+
+  let kbxStartName ← ShaderM.var (.scalar .u32) (Exp.shiftRight tInRow (Exp.litU32 4))
+  let laneLowName  ← ShaderM.var (.scalar .u32) (Exp.bitAnd tInRow (Exp.litU32 15))
+  let kbxStart : Exp (.scalar .u32) := Exp.var kbxStartName
+  let laneLow  : Exp (.scalar .u32) := Exp.var laneLowName
+  let pairIdxInRowName ← ShaderM.var (.scalar .u32) (Exp.shiftRight laneLow (Exp.litU32 2))
+  let elemOffName      ← ShaderM.var (.scalar .u32) (Exp.bitAnd laneLow (Exp.litU32 3))
+  let pairIdxInRow : Exp (.scalar .u32) := Exp.var pairIdxInRowName
+  let elemOff      : Exp (.scalar .u32) := Exp.var elemOffName
+  let bq8OffName ← ShaderM.var (.scalar .u32) (Exp.shiftLeft pairIdxInRow (Exp.litU32 1))
+  let bq8Off : Exp (.scalar .u32) := Exp.var bq8OffName
+
+  let rowBaseU32Name ← ShaderM.var (.scalar .u32)
+    (Exp.mul outIdx (Exp.litU32 (blocksPerRow * 36)))
+  let rowBaseU32 : Exp (.scalar .u32) := Exp.var rowBaseU32Name
+
+  ShaderM.varNamed "acc" (.scalar .f32) (Exp.litF32 0.0)
+  let acc : Exp (.scalar .f32) := Exp.var "acc"
+
+  let blocksPerIter := 2 * warpsPerRow
+  let maxIter := (blocksPerRow + blocksPerIter - 1) / blocksPerIter
+  ShaderM.loop (Exp.litU32 0) (Exp.litU32 maxIter) (Exp.litU32 1) fun iter => do
+    let blockIdxName ← ShaderM.var (.scalar .u32)
+      (Exp.add kbxStart (Exp.mul iter (Exp.litU32 blocksPerIter)))
+    let blockIdx : Exp (.scalar .u32) := Exp.var blockIdxName
+    let blockInRange := Exp.and (Exp.lt blockIdx (Exp.litU32 blocksPerRow)) inBounds
+    ShaderM.if_ blockInRange (do
+    let blockU32BaseName ← ShaderM.var (.scalar .u32)
+      (Exp.add rowBaseU32 (Exp.mul blockIdx (Exp.litU32 36)))
+    let blockU32Base : Exp (.scalar .u32) := Exp.var blockU32BaseName
+    let (dmU32, sc0, sc1, sc2) ← ShaderM.readBufferU32x4 "weights" blockU32Base
+    let dFName ← ShaderM.var (.scalar .f32) (Exp.vecX (Exp.unpack2x16float dmU32))
+    let dminFName ← ShaderM.var (.scalar .f32) (Exp.vecY (Exp.unpack2x16float dmU32))
+    let dF : Exp (.scalar .f32) := Exp.var dFName
+    let dminF : Exp (.scalar .f32) := Exp.var dminFName
+    let extractScaleMin (is : Exp (.scalar .u32)) : Exp (.scalar .f32) × Exp (.scalar .f32) :=
+      let isLow := Exp.lt is (Exp.litU32 4)
+      let shift4 := Exp.mul is (Exp.litU32 8)
+      let scaleLow := Exp.bitAnd (Exp.shiftRight sc0 shift4) (Exp.litU32 0x3F)
+      let minLow   := Exp.bitAnd (Exp.shiftRight sc1 shift4) (Exp.litU32 0x3F)
+      let isHi := Exp.sub is (Exp.litU32 4)
+      let shiftHi := Exp.mul isHi (Exp.litU32 8)
+      let scaleHiLo := Exp.bitAnd (Exp.shiftRight sc2 shiftHi) (Exp.litU32 0x0F)
+      let scaleHiHi := Exp.shiftLeft
+        (Exp.bitAnd (Exp.shiftRight sc0 (Exp.add shiftHi (Exp.litU32 6))) (Exp.litU32 0x03))
+        (Exp.litU32 4)
+      let scaleHigh := Exp.bitOr scaleHiLo scaleHiHi
+      let minHiLo := Exp.bitAnd (Exp.shiftRight sc2 (Exp.add shiftHi (Exp.litU32 4))) (Exp.litU32 0x0F)
+      let minHiHi := Exp.shiftLeft
+        (Exp.bitAnd (Exp.shiftRight sc1 (Exp.add shiftHi (Exp.litU32 6))) (Exp.litU32 0x03))
+        (Exp.litU32 4)
+      let minHigh := Exp.bitOr minHiLo minHiHi
+      let scaleU := Exp.select isLow scaleLow scaleHigh
+      let minU   := Exp.select isLow minLow   minHigh
+      (Exp.toF32U scaleU, Exp.toF32U minU)
+    let (scA, mA) := extractScaleMin bq8Off
+    let (scB, mB) := extractScaleMin (Exp.add bq8Off (Exp.litU32 1))
+    let q4BaseIdxName ← ShaderM.var (.scalar .u32)
+      (Exp.add blockU32Base
+        (Exp.add (Exp.litU32 4) (Exp.add (Exp.mul bq8Off (Exp.litU32 4)) elemOff)))
+    let q4BaseIdx : Exp (.scalar .u32) := Exp.var q4BaseIdxName
+    let v0 ← ShaderM.readBuffer (ty := .scalar .u32) (n := totalWeightU32) "weights" q4BaseIdx
+    let v1 ← ShaderM.readBuffer (ty := .scalar .u32) (n := totalWeightU32) "weights" (Exp.add q4BaseIdx (Exp.litU32 4))
+    let q8Sub0BaseName ← ShaderM.var (.scalar .u32)
+      (Exp.add (Exp.mul blockIdx (Exp.litU32 (8 * 9))) (Exp.mul bq8Off (Exp.litU32 9)))
+    let q8Sub0Base : Exp (.scalar .u32) := Exp.var q8Sub0BaseName
+    let q8Sub1BaseName ← ShaderM.var (.scalar .u32) (Exp.add q8Sub0Base (Exp.litU32 9))
+    let q8Sub1Base : Exp (.scalar .u32) := Exp.var q8Sub1BaseName
+    let q8Off1Name ← ShaderM.var (.scalar .u32) (Exp.add (Exp.litU32 1) elemOff)
+    let q8Off5Name ← ShaderM.var (.scalar .u32) (Exp.add (Exp.litU32 5) elemOff)
+    let q8Off1 : Exp (.scalar .u32) := Exp.var q8Off1Name
+    let q8Off5 : Exp (.scalar .u32) := Exp.var q8Off5Name
+    let u0 ← ShaderM.readBuffer (ty := .scalar .u32) (n := q8InputU32Size) "input_q8" (Exp.add q8Sub0Base q8Off1)
+    let u1 ← ShaderM.readBuffer (ty := .scalar .u32) (n := q8InputU32Size) "input_q8" (Exp.add q8Sub0Base q8Off5)
+    let u2 ← ShaderM.readBuffer (ty := .scalar .u32) (n := q8InputU32Size) "input_q8" (Exp.add q8Sub1Base q8Off1)
+    let u3 ← ShaderM.readBuffer (ty := .scalar .u32) (n := q8InputU32Size) "input_q8" (Exp.add q8Sub1Base q8Off5)
+    let q8Hdr0 ← ShaderM.readBuffer (ty := .scalar .u32) (n := q8InputU32Size) "input_q8" q8Sub0Base
+    let q8Hdr1 ← ShaderM.readBuffer (ty := .scalar .u32) (n := q8InputU32Size) "input_q8" q8Sub1Base
+    let d8AName ← ShaderM.var (.scalar .f32) (Exp.vecX (Exp.unpack2x16float q8Hdr0))
+    let d8BName ← ShaderM.var (.scalar .f32) (Exp.vecX (Exp.unpack2x16float q8Hdr1))
+    let d8A : Exp (.scalar .f32) := Exp.var d8AName
+    let d8B : Exp (.scalar .f32) := Exp.var d8BName
+    let v0i0 := Exp.bitAnd v0 (Exp.litU32 0x0F0F0F0F)
+    let v1i0 := Exp.bitAnd v1 (Exp.litU32 0x0F0F0F0F)
+    let acc0 := Exp.dot4I8Packed v0i0 u0
+    let dot1_0 := Exp.dot4I8Packed v1i0 u1
+    let dot1_0Combined := Exp.add acc0 dot1_0
+    let sumU_0 := Exp.add (Exp.dot4I8Packed (Exp.litU32 0x01010101) u0)
+                          (Exp.dot4I8Packed (Exp.litU32 0x01010101) u1)
+    let v0i1 := Exp.bitAnd (Exp.shiftRight v0 (Exp.litU32 4)) (Exp.litU32 0x0F0F0F0F)
+    let v1i1 := Exp.bitAnd (Exp.shiftRight v1 (Exp.litU32 4)) (Exp.litU32 0x0F0F0F0F)
+    let acc1 := Exp.dot4I8Packed v0i1 u2
+    let dot1_1 := Exp.dot4I8Packed v1i1 u3
+    let dot1_1Combined := Exp.add acc1 dot1_1
+    let sumU_1 := Exp.add (Exp.dot4I8Packed (Exp.litU32 0x01010101) u2)
+                          (Exp.dot4I8Packed (Exp.litU32 0x01010101) u3)
+    let dot0F := Exp.toF32 dot1_0Combined
+    let dot1F := Exp.toF32 dot1_1Combined
+    let sumU0F := Exp.toF32 sumU_0
+    let sumU1F := Exp.toF32 sumU_1
+    let d8AscA := Exp.mul d8A scA
+    let d8BscB := Exp.mul d8B scB
+    let d8AmA  := Exp.mul d8A mA
+    let d8BmB  := Exp.mul d8B mB
+    let blockSumfD := Exp.fma dot0F d8AscA (Exp.mul dot1F d8BscB)
+    let blockSumfM := Exp.fma sumU0F d8AmA  (Exp.mul sumU1F d8BmB)
+    let accPrime := Exp.fma dF blockSumfD (Exp.fma (Exp.neg dminF) blockSumfM acc)
+    ShaderM.assign "acc" accPrime
+    ) (pure ())
+
+  -- Per-warp partial (all 32 lanes hold distinct products).
+  ShaderM.varNamed "warpTotal" (.scalar .f32) (Exp.subgroupAdd acc)
+  let warpTotal : Exp (.scalar .f32) := Exp.var "warpTotal"
+
+  if warpsPerRow == 1 then
+    -- One warp per row: warpTotal IS the row sum. tInRow==0 ⇔ lane 0.
+    ShaderM.if_ (Exp.and (Exp.eq tInRow (Exp.litU32 0)) inBounds) (do
+      ShaderM.writeBuffer (ty := .scalar .f32) "output" outIdx warpTotal
+    ) (pure ())
+  else do
+    -- Cross-warp combine per row. warpId = tid/32; warps of row r are
+    -- consecutive: r·W .. r·W+W-1.
+    let warpId := Exp.shiftRight tid (Exp.litU32 5)
+    let laneId := Exp.bitAnd tid (Exp.litU32 31)
+    ShaderM.if_ (Exp.eq laneId (Exp.litU32 0)) (do
+      ShaderM.writeWorkgroup (ty := .scalar .f32) "s_partial" warpId warpTotal
+    ) (pure ())
+    ShaderM.barrier
+    ShaderM.if_ (Exp.and (Exp.eq tInRow (Exp.litU32 0)) inBounds) (do
+      ShaderM.varNamed "rowTotal" (.scalar .f32) (Exp.litF32 0.0)
+      let rowTotal : Exp (.scalar .f32) := Exp.var "rowTotal"
+      let base := Exp.mul rowLocal (Exp.litU32 warpsPerRow)
+      ShaderM.loop (Exp.litU32 0) (Exp.litU32 warpsPerRow) (Exp.litU32 1) fun w => do
+        let p ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := rowsPerWG * warpsPerRow)
+          "s_partial" (Exp.add base w)
+        ShaderM.assign "rowTotal" (Exp.add rowTotal p)
+      ShaderM.writeBuffer (ty := .scalar .f32) "output" outIdx (Exp.var "rowTotal")
+    ) (pure ())
 
 /-- Gate+up variant of `fusedQ4KMLinearDP4A4WarpKernel`: 1 row × 4 warps
     cooperative on K, but with TWO weight tensors (gate, up) processed in
@@ -5443,6 +5638,7 @@ inductive QuantFormat where
   | Q6_K   -- Q6_K: 210 bytes per 256 elements
   | Q8_0   -- Q8_0: 34 bytes per 32 elements (f16 scale + 32×int8)
   | Q5_0   -- Q5_0: 22 bytes per 32 elements (f16 scale + 4B qh + 16B qs)
+  | F16    -- unquantized, packed f16 [N, K/2] u32 (e.g. E2B PLE inp_gate/proj shipped as F32)
   deriving Repr, BEq, Inhabited
 
 /-- Quantized linear layer (supports Q4_K and Q6_K) -/
@@ -5471,6 +5667,45 @@ structure LinearLayer (BufT : Type) (CacheT : Type := Unit) where
   -- → ~50 ms of pure JIT overhead per prefill.
   dp4aBatchQuantizePrepared : IO.Ref (Option CacheT)
   dp4aBatchMatmulPrepared : IO.Ref (Option CacheT)
+
+/-- Autotune-winner matvec path — DEFAULT ON (ABAB 4/4 clean separation, +8% e2e,
+    Paris./Jupiter. gates exact, and the f32 path is numerically MORE accurate than
+    q8). HESPER_TUNED=0 restores the heuristic dp4a selection. Cached once. -/
+initialize tunedMatVecEnabledRef : IO.Ref (Option Bool) ← IO.mkRef none
+
+def tunedMatVecEnabled : IO Bool := do
+  match ← tunedMatVecEnabledRef.get with
+  | some b => pure b
+  | none =>
+    let b := (← IO.getEnv "HESPER_TUNED") != some "0"
+    tunedMatVecEnabledRef.set (some b)
+    pure b
+
+/-- Winners snapshot for the mulMvQ4K family, loaded once from tune/winners.csv. -/
+initialize mulMvWinnersRef : IO.Ref (Option (List (String × String × Hesper.WGSL.Autotune.Params))) ← IO.mkRef none
+
+private def mulMvWinnersSnapshot : IO (List (String × String × Hesper.WGSL.Autotune.Params)) := do
+  match ← mulMvWinnersRef.get with
+  | some ws => pure ws
+  | none =>
+    let ws ← (Hesper.WGSL.Autotune.readWinners) <|> pure []
+    mulMvWinnersRef.set (some ws)
+    pure ws
+
+/-- Look up the swept (R=rowsPerWG, W=warpsPerRow) for an M=1 Q4_K matvec shape. -/
+def mulMvWinner (inDim outDim : Nat) : IO (Option (Nat × Nat)) := do
+  let ws ← mulMvWinnersSnapshot
+  match Hesper.WGSL.Autotune.lookupWinner ws "mulMvQ4K" { M := 1, N := outDim, K := inDim } with
+  | some p => pure (some (p.get! "R", p.get! "W"))
+  | none => pure none
+
+/-- Look up the llama-port f32 family winner (NR0, NSG) — 90-97% BW class, and the
+    Q8_1 quantize dispatch disappears entirely (the kernel reads f32 activations). -/
+def mulMvF32Winner (inDim outDim : Nat) : IO (Option (Nat × Nat)) := do
+  let ws ← mulMvWinnersSnapshot
+  match Hesper.WGSL.Autotune.lookupWinner ws "mulMvQ4Kf32" { M := 1, N := outDim, K := inDim } with
+  | some p => pure (some (p.get! "NR0", p.get! "NSG"))
+  | none => pure none
 
 /-- Q8_1 quantize input + Q4_K/Q6_K dp4a matmul (2 dispatches).
     Uses lazily-allocated per-layer Q8_1 scratch buffer and cache refs.
@@ -5503,6 +5738,28 @@ def forwardDP4A [GPUBackend β] (ctx : β)
           callCountRef.modify (· + 1)
           perShapeAdd layer.config.inDim layer.config.outDim delta
         return
+
+  -- f32 llama-port winner path (HESPER_TUNED=1): 90-97% BW class kernel reading the
+  -- f32 activations DIRECTLY — the Q8_1 quantize dispatch disappears (1 dispatch, and
+  -- numerically MORE accurate than the q8 path). Winner (NR0, NSG) per exact shape
+  -- from tune/winners.csv.
+  if layer.quantFormat == .Q4_K && (← tunedMatVecEnabled) then
+    if let some (nr0, nsg) ← mulMvF32Winner layer.config.inDim layer.config.outDim then
+      GPUBackend.executeWithConfigCached ctx
+        (Hesper.WGSL.MulMvQ4K.mulMvQ4KF32Kernel layer.config.inDim layer.config.outDim nr0 nsg)
+        [("weights", layer.weightBuf), ("input", inputBuf), ("output", outputBuf)]
+        { numWorkgroups := (layer.config.outDim / (nr0*nsg), 1, 1)
+          workgroupSize := { x := 32*nsg, y := 1, z := 1 }
+          extensions := ["subgroups"] }
+        (hash ("q4k-mulmv-f32", layer.config.inDim, layer.config.outDim, nr0, nsg))
+        layer.dp4aMatmulPrepared
+      if profiling then
+        let endNs ← IO.monoNanosNow
+        let delta := (endNs - startNs).toUInt64
+        totalNanosRef.modify (· + delta)
+        callCountRef.modify (· + 1)
+        perShapeAdd layer.config.inDim layer.config.outDim delta
+      return
 
   let nQ8Blocks := layer.config.inDim / 32
   let q8BufBytes : USize := (nQ8Blocks * 9 * 4).toUSize
@@ -5557,6 +5814,27 @@ def forwardDP4A [GPUBackend β] (ctx : β)
   --   Q6_K + outDim % 2 == 0 → 2-warp cooperative
   --   Q6_K fallback         → 1-row (single-warp)
   if layer.quantFormat == .Q4_K then
+    -- Autotune winner path (HESPER_TUNED=1): drive the generalized matvec with
+    -- the (R, W) that won the mulMvQ4K sweep for this exact (K, N) shape —
+    -- tune/winners.csv, no hand-copied numbers. Falls through to the
+    -- heuristic selection below when no winner row exists.
+    if (← tunedMatVecEnabled) then
+      if let some (r, w) ← mulMvWinner layer.config.inDim layer.config.outDim then
+        GPUBackend.executeWithConfigCached ctx
+          (q4kMatVecDP4AGenKernel layer.config r w)
+          [("weights", layer.weightBuf), ("input_q8", q8Buf), ("output", outputBuf)]
+          { numWorkgroups := (layer.config.outDim / r, 1, 1)
+            workgroupSize := { x := 32*r*w, y := 1, z := 1 }
+            extensions := ["subgroups"] }
+          (hash ("q4k-dp4a-matvec-gen", layer.config.inDim, layer.config.outDim, r, w))
+          layer.dp4aMatmulPrepared
+        if profiling then
+          let endNs ← IO.monoNanosNow
+          let delta := (endNs - startNs).toUInt64
+          totalNanosRef.modify (· + delta)
+          callCountRef.modify (· + 1)
+          perShapeAdd layer.config.inDim layer.config.outDim delta
+        return
     -- Kernel selection heuristic (llama.cpp parity):
     --   4-warp 1-row: outDim ≤ ~5120 (few WGs otherwise → poor latency hiding)
     --                 AND HESPER_Q4K_4WARP != "0" (opt-out for regression test)
@@ -5696,6 +5974,12 @@ def forwardBatchDP4A [GPUBackend β] (ctx : β)
     (layer : LinearLayer (GPUBackend.Buf β) (GPUBackend.CachedDispatch β))
     (inputBuf outputBuf : GPUBackend.Buf β)
     (seqLen : Nat) : IO Unit := do
+  -- F16 (unquantized) weights: plain f16 matmul, no dp4a quantize step.
+  if layer.quantFormat == .F16 then
+    Hesper.WGSL.MatMul.executeMatMulTransposeF16 ctx inputBuf layer.weightBuf outputBuf
+      { M := seqLen, N := layer.config.outDim, K := layer.config.inDim }
+    return
+
   if seqLen <= 1 then
     forwardDP4A ctx layer inputBuf outputBuf
     return
@@ -6830,6 +7114,12 @@ def fusedQ4KMBatchExpertKernelInt (config : Config) (nExpert N nUsed slot : Nat)
 
 def LinearLayer.forward [GPUBackend β] (ctx : β) (layer : LinearLayer (GPUBackend.Buf β) (GPUBackend.CachedDispatch β))
     (inputBuf outputBuf : GPUBackend.Buf β) : IO Unit := do
+  -- F16 (unquantized) weights: plain f16 matmul (M=1).
+  if layer.quantFormat == .F16 then
+    Hesper.WGSL.MatMul.executeMatMulTransposeF16 ctx inputBuf layer.weightBuf outputBuf
+      { M := 1, N := layer.config.outDim, K := layer.config.inDim }
+    return
+
   let profiling ← profilingRef.get
   let startNs ← if profiling then IO.monoNanosNow else pure 0
 
@@ -6971,6 +7261,11 @@ def LinearLayer.forward [GPUBackend β] (ctx : β) (layer : LinearLayer (GPUBack
       (256,
        fusedQ5_0BatchKernel layer.config 1,
        hash ("q5_0-lin", layer.config.inDim, layer.config.outDim))
+    | .F16, _ =>
+      -- unreachable: .F16 takes the executeMatMulTransposeF16 early-return above
+      (256,
+       fusedQ4KMLinearKernel layer.config,
+       hash ("f16-lin-unreachable", layer.config.inDim, layer.config.outDim))
   let execConfig : Hesper.ExecConfig := {
     numWorkgroups := (layer.config.outDim, 1, 1)
     workgroupSize := { x := wgSize, y := 1, z := 1 }

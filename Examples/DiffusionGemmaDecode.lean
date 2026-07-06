@@ -8,6 +8,7 @@ import Hesper.Layers.RMSNorm
 import Hesper.Quantization.Q6_K
 import Hesper.GGUF.Reader
 import Hesper.Tokenizer.SentencePiece
+import Hesper.WGSL.Autotune
 import Hesper.Basic
 
 /-!
@@ -1007,6 +1008,32 @@ def dispRB (device : Device) (k : Hesper.WGSL.Monad.ShaderM Unit) (bufs : List (
       extensions := ["f16","chromium_experimental_subgroup_matrix"],
       diagnostics := [("off","chromium.subgroup_matrix_uniformity")] } key r
 
+/-- DEVPLAN M5 — autotuned reg-matmul dispatch: look up the swept winner for (M,N,K) in the
+    tune/winners.csv snapshot and drive `matMulTransposeF16WMMARegKernelGen` with it. Returns
+    false (caller falls back to the deployed 64×32 kernel) when the shape is un-tuned or the
+    winner's tile does not divide M/N (WMMA-tail safety: config.M rows are written — a
+    non-dividing mTile would write past the buffer, the known heap-stomp class). -/
+def dispRBTuned (device : Device) (winners : List (String × String × Hesper.WGSL.Autotune.Params))
+    (M N K : Nat) (bufs : List (String × Buffer)) (key : UInt64) : IO Bool := do
+  match Hesper.WGSL.Autotune.lookupWinner winners "regGen" { M := M, N := N, K := K } with
+  | none => pure false
+  | some p =>
+    let tm := p.get! "TM"; let tn := p.get! "TN"
+    let sgR := p.get! "sgR"; let sgC := p.get! "sgC"; let bk := p.get! "BK"
+    let mTile := sgR * 8 * tm; let nTile := sgC * 8 * tn; let wg := sgR * sgC * 32
+    if M % mTile != 0 || N % nTile != 0 || K % bk != 0 then
+      IO.eprintln s!"[autotune] winner tile ({mTile}×{nTile},BK{bk}) does not divide {M}×{N}×{K} — fallback"
+      pure false
+    else
+      let r ← IO.mkRef none
+      Hesper.GPUBackend.executeWithConfigCached device
+        (Hesper.WGSL.MatMul.matMulTransposeF16WMMARegKernelGen { M := M, N := N, K := K } tm tn sgR sgC bk)
+        bufs
+        { numWorkgroups := (N / nTile, M / mTile, 1), workgroupSize := {x := wg},
+          extensions := ["f16","chromium_experimental_subgroup_matrix"],
+          diagnostics := [("off","chromium.subgroup_matrix_uniformity")] } key r
+      pure true
+
 /-- Batched matmul over N rows dispatching by the layer's quant format. -/
 def qK (device : Device) (buf : Buffer) (N K : Nat) (key : UInt64) : IO Unit :=
   disp device (qActQ8K N K) (("data",buf)::List.nil) (N*(K/256)) key
@@ -1188,6 +1215,11 @@ def main (args : List String) : IO Unit := do
   let moeRB := (← IO.getEnv "DG_NOMOERB").isNone   -- DEFAULT ON (validated); DG_NOMOERB=1 opts out
   -- DG_MSL=1: dispatch the hand-MSL gate/up (native Metal, 1.61× vs WGSL/Tint, commit 8332c90)
   -- via the Dawn→Metal interop instead of the WGSL kernel. macOS only; opt-in until judged.
+  -- DEVPLAN M5: DG_TUNED=1 — drive the reg-matmul sites with autotuned winners (tune/winners.csv,
+  -- looked up per (M,N,K) at startup; un-tuned shapes fall back to the deployed kernel).
+  let tuned := (← IO.getEnv "DG_TUNED").isSome
+  let tuneWinners ← if tuned then Hesper.WGSL.Autotune.readWinners else pure []
+  if tuned then IO.println s!"[dg-decode] DG_TUNED: {tuneWinners.length} autotune winners loaded"
   let useMsl := (← IO.getEnv "DG_NOMSL").isNone   -- DEFAULT ON (8/8, -68ms/step adjacent A/B); DG_NOMSL=1 restores the WGSL kernel (non-macOS/portable path)
   -- DG_MSLDOWN: MSL port of the Q8_0 MoE down (same recipe as the gate/up). Separate opt-out so
   -- the two can be A/B'd independently; both share the portable-WGSL fallback semantics.
@@ -1548,9 +1580,13 @@ def main (args : List String) : IO Unit := do
         if qkvRB then
           Hesper.WGSL.Execute.flushBatch device   -- RMSNorm → reg-matmul: batch split
           -- reg-matmul QKV on f32 sN (real dequantized f16 weights). N=outDim, K=dim.
-          let rb := fun (wf16 outB : Buffer) (od : Nat) (key : UInt64) =>
-            dispRB device (Hesper.WGSL.MatMul.matMulTransposeF16WMMARegKernel { M := nP, N := od, K := dim } 0 od)
-              (("a",sN)::("b",wf16)::("c",outB)::List.nil) ((od+31)/32) ((N+63)/64) key
+          let rb := fun (wf16 outB : Buffer) (od : Nat) (key : UInt64) => do
+            let did ← if tuned then
+                dispRBTuned device tuneWinners nP od dim (("a",sN)::("b",wf16)::("c",outB)::List.nil) key
+              else pure false
+            unless did do
+              dispRB device (Hesper.WGSL.MatMul.matMulTransposeF16WMMARegKernel { M := nP, N := od, K := dim } 0 od)
+                (("a",sN)::("b",wf16)::("c",outB)::List.nil) ((od+31)/32) ((N+63)/64) key
           rb (qF16s[li]?.getD sQ) sQ qDim (hash ("rbq",li)); rb (kF16s[li]?.getD sK) sK kvDim (hash ("rbk",li)); rb (vF16s[li]?.getD sV) sV kvDim (hash ("rbv",li))
           Hesper.WGSL.Execute.flushBatch device   -- reg-matmul QKV → qknorm: batch split (Dawn drops the inter-pass barrier for subgroup_matrix at scale)
           if (li == 0 || li == 5) && (← IO.getEnv "DG_QKVDIAG").isSome then
@@ -1584,8 +1620,12 @@ def main (args : List String) : IO Unit := do
         pmark rBattn  -- battnB: QK^T + softmax + weighted-V (matrix-vector per query)
         if qkvRB then
           -- O-proj reg-matmul: A = f32 sCtx [N, qDim], B = wO f16 [dim, qDim/2], C = sAO. K=qDim.
-          dispRB device (Hesper.WGSL.MatMul.matMulTransposeF16WMMARegKernel { M := nP, N := dim, K := qDim } 0 dim)
-            (("a",sCtx)::("b",oF16s[li]?.getD sAO)::("c",sAO)::List.nil) ((dim+31)/32) ((N+63)/64) (hash ("rbo",li))
+          let didO ← if tuned then
+              dispRBTuned device tuneWinners nP dim qDim (("a",sCtx)::("b",oF16s[li]?.getD sAO)::("c",sAO)::List.nil) (hash ("rbo",li))
+            else pure false
+          unless didO do
+            dispRB device (Hesper.WGSL.MatMul.matMulTransposeF16WMMARegKernel { M := nP, N := dim, K := qDim } 0 dim)
+              (("a",sCtx)::("b",oF16s[li]?.getD sAO)::("c",sAO)::List.nil) ((dim+31)/32) ((N+63)/64) (hash ("rbo",li))
           Hesper.WGSL.Execute.flushBatch device
         else
           qK device sCtx N qDim (hash ("qCtx",li))
@@ -1603,10 +1643,18 @@ def main (args : List String) : IO Unit := do
         unless skipDense do
           if qkvRB then
             -- dense gate/up reg-matmul on f32 sN. N=ffn, K=dim.
-            dispRB device (Hesper.WGSL.MatMul.matMulTransposeF16WMMARegKernel { M := nP, N := ffn, K := dim } 0 ffn)
-              (("a",sN)::("b",gateF16s[li]?.getD sG)::("c",sG)::List.nil) ((ffn+31)/32) ((N+63)/64) (hash ("rbg",li))
-            dispRB device (Hesper.WGSL.MatMul.matMulTransposeF16WMMARegKernel { M := nP, N := ffn, K := dim } 0 ffn)
-              (("a",sN)::("b",upF16s[li]?.getD sU)::("c",sU)::List.nil) ((ffn+31)/32) ((N+63)/64) (hash ("rbu",li))
+            let didG ← if tuned then
+                dispRBTuned device tuneWinners nP ffn dim (("a",sN)::("b",gateF16s[li]?.getD sG)::("c",sG)::List.nil) (hash ("rbg",li))
+              else pure false
+            unless didG do
+              dispRB device (Hesper.WGSL.MatMul.matMulTransposeF16WMMARegKernel { M := nP, N := ffn, K := dim } 0 ffn)
+                (("a",sN)::("b",gateF16s[li]?.getD sG)::("c",sG)::List.nil) ((ffn+31)/32) ((N+63)/64) (hash ("rbg",li))
+            let didU ← if tuned then
+                dispRBTuned device tuneWinners nP ffn dim (("a",sN)::("b",upF16s[li]?.getD sU)::("c",sU)::List.nil) (hash ("rbu",li))
+              else pure false
+            unless didU do
+              dispRB device (Hesper.WGSL.MatMul.matMulTransposeF16WMMARegKernel { M := nP, N := ffn, K := dim } 0 ffn)
+                (("a",sN)::("b",upF16s[li]?.getD sU)::("c",sU)::List.nil) ((ffn+31)/32) ((N+63)/64) (hash ("rbu",li))
             Hesper.WGSL.Execute.flushBatch device
           else
             bmm device blk.ffn.gate sN sG N (hash ("g",li))
@@ -1616,8 +1664,12 @@ def main (args : List String) : IO Unit := do
             -- dense down f16 WMMA reg (QKVRB rounding profile): A = f32 geglu sGe [N,ffn], B = down
             -- f16 [dim,ffn/2], C = sD [N,dim] (64-row padded alloc). No q80 needed (A read as f32).
             let some dbuf := downF16s[li]?.getD none | throw (IO.userError "downF16")
-            dispRB device (Hesper.WGSL.MatMul.matMulTransposeF16WMMARegKernel { M := nP, N := dim, K := ffn } 0 dim)
-              (("a",sGe)::("b",dbuf)::("c",sD)::List.nil) ((dim+31)/32) ((N+63)/64) (hash ("rbd",li))
+            let didD ← if tuned then
+                dispRBTuned device tuneWinners nP dim ffn (("a",sGe)::("b",dbuf)::("c",sD)::List.nil) (hash ("rbd",li))
+              else pure false
+            unless didD do
+              dispRB device (Hesper.WGSL.MatMul.matMulTransposeF16WMMARegKernel { M := nP, N := dim, K := ffn } 0 dim)
+                (("a",sGe)::("b",dbuf)::("c",sD)::List.nil) ((dim+31)/32) ((N+63)/64) (hash ("rbd",li))
             Hesper.WGSL.Execute.flushBatch device   -- WMMA → next reader: batch split (Dawn barrier drop)
           else if denseDownRB && blk.ffn.down.quantFormat == .Q8_0 then
             -- TILED reg-matmul dense down (matrix units, in-kernel Q8_0 dequant). A=f32 geglu sGe [N,ffn],

@@ -126,6 +126,53 @@ def geluGateMulSliceKernel (size plTotalSize plOffset : Nat) : ShaderM Unit := d
     ShaderM.writeBuffer (ty := .scalar .f32) "output" idx (Exp.mul gelu plVal)
   ) (pure ())
 
+/-- Fused per-layer GATE (webml `DecodePleGate` shape): F16 block-coop matvec
+    (gate = W_gate @ x) with the GELU × per_layer_input[slice] epilogue folded into
+    the row write — ONE dispatch replaces (F16 matvec) + (`geluGateMulSliceKernel`).
+    E2B ships inp_gate as F32→f16-packed (see loadLinear), so this is the E2B path.
+
+    Grid: (N, 1, 1) workgroups × 32 threads (one subgroup per output row).
+    Requires K % 64 == 0. `plOffset` is baked — MUST be in the cache key. -/
+def pleGateF16FusedKernel (K N plTotalSize plOffset : Nat) : ShaderM Unit := do
+  let wid ← ShaderM.workgroupId
+  let lid ← ShaderM.localId
+  let outIdx := Exp.vec3X wid
+  let tid := Exp.vec3X lid
+  let packedK := K / 2
+  let kTilesPerRow := K / 64
+  let _a ← ShaderM.declareInputBuffer "a" (.array (.scalar .f32) K)
+  let _b ← ShaderM.declareInputBuffer "b" (.array (.scalar .u32) (N * packedK))
+  let _pl ← ShaderM.declareInputBuffer "per_layer_input" (.array (.scalar .f32) plTotalSize)
+  let _c ← ShaderM.declareOutputBuffer "c" (.array (.scalar .f32) N)
+  let inBounds := Exp.lt outIdx (Exp.litU32 N)
+  ShaderM.varNamed "acc" (.scalar .f32) (Exp.litF32 0.0)
+  let acc : Exp (.scalar .f32) := Exp.var "acc"
+  let rowBaseU32 := Exp.mul outIdx (Exp.litU32 packedK)
+  for tile in [0:kTilesPerRow] do
+    let u ← ShaderM.readBuffer (ty := .scalar .u32) (n := N * packedK) "b"
+      (Exp.add rowBaseU32 (Exp.add (Exp.litU32 (tile * 32)) tid))
+    let uN ← ShaderM.var (.scalar .u32) u
+    let unpacked := Exp.unpack2x16float (Exp.var uN)
+    let b0 := Exp.vecX unpacked
+    let b1 := Exp.vecY unpacked
+    let kIdx0 := Exp.add (Exp.litU32 (tile * 64)) (Exp.mul tid (Exp.litU32 2))
+    let a0 ← ShaderM.readBuffer (ty := .scalar .f32) (n := K) "a" kIdx0
+    let a1 ← ShaderM.readBuffer (ty := .scalar .f32) (n := K) "a" (Exp.add kIdx0 (Exp.litU32 1))
+    ShaderM.assign "acc" (Exp.fma a0 b0 acc)
+    ShaderM.assign "acc" (Exp.fma a1 b1 (Exp.var "acc" : Exp (.scalar .f32)))
+  ShaderM.varNamed "totalSum" (.scalar .f32) (Exp.subgroupAdd acc)
+  let g : Exp (.scalar .f32) := Exp.var "totalSum"
+  ShaderM.if_ (Exp.and (Exp.eq tid (Exp.litU32 0)) inBounds) (do
+    -- GELU (same constants as geluGateMulSliceKernel) × per_layer_input slice
+    let sqrt2OverPi := Exp.litF32 0.7978845608028654
+    let x3 := Exp.mul (Exp.mul g g) g
+    let inner := Exp.mul sqrt2OverPi (Exp.add g (Exp.mul (Exp.litF32 0.044715) x3))
+    let gelu := Exp.mul (Exp.mul (Exp.litF32 0.5) g) (Exp.add (Exp.litF32 1.0) (Exp.tanh inner))
+    let plVal ← ShaderM.readBuffer (ty := .scalar .f32) (n := plTotalSize) "per_layer_input"
+      (Exp.add outIdx (Exp.litU32 plOffset))
+    ShaderM.writeBuffer (ty := .scalar .f32) "c" outIdx (Exp.mul gelu plVal)
+  ) (pure ())
+
 /-- Batched version of `geluGateMulSliceKernel`: processes all `seqLen`
     columns in one dispatch.
 
