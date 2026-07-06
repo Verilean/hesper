@@ -1418,6 +1418,14 @@ extern "C" lean_obj_res lean_hesper_replay_exec(
         size_t nOps = 0;
         for (auto& op : ops) if (op.pso) nOps++;
         if (nOps == 0) return lean_io_result_mk_error(lean_mk_io_user_error(lean_mk_string("replay_exec: nothing recorded")));
+        // Flush Dawn's PENDING work first (an empty Submit pushes staged
+        // queue.WriteBuffer copies into a command buffer on Dawn's MTLQueue).
+        // Without this, host writes issued since the last Dawn submit (e.g. the
+        // frozen-token pos/token seeds) would still be host-side when our CB runs —
+        // kernels would read stale params. Same-queue FIFO then orders them first.
+        if (g_replayDawnDevice && g_replayDawnDevice->Get()) {
+            g_replayDawnDevice->GetQueue().Submit(0, nullptr);
+        }
         id<MTLCommandQueue> q = g_replayDawnDevice ? mr_dawn_queue(g_replayDawnDevice) : nil;
         bool onDawnQueue = (q != nil);
         if (!q) {

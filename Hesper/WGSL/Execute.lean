@@ -621,6 +621,10 @@ def executeShaderNamed
   -- WGSL regeneration); cold kernels take the tint-CLI path once. In nativeExec mode
   -- the Dawn dispatch below is SKIPPED — commitToken executes the recorded token.
   let replayMode ← NativeReplay.currentMode
+  -- Frozen token replay: the recorded list is reused verbatim — drop the dispatch
+  -- with zero work (no WGSL, no record, no Dawn).
+  if replayMode == .frozen then
+    return
   if replayMode != .off then
     let key := cacheKey.getD 0
     let hit ← NativeReplay.tryRecordFast device key namedBuffers

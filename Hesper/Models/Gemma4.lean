@@ -3620,28 +3620,71 @@ def generate [GPUBackend β] (ctx : β) (model : Gemma4Model (GPUBackend.Buf β)
               | some n => decide (decodeForwardsDone >= n)
               | none => false
             let nativeMode : UInt32 := (((← IO.getEnv "HESPER_NATIVE_DECODE_MODE").bind (·.toNat?)).getD 3).toUInt32
+            -- (a) host-cost kill: HESPER_NATIVE_FROZEN=<m> — from forward #m the
+            -- recorded dispatch list is reused VERBATIM (token-invariant from
+            -- cacheLen ≥ 8; positions travel in params-buffer content), so the hook
+            -- drops every dispatch with zero work. Requires HESPER_NATIVE_DECODE=<n>
+            -- with n < m (token m-1 records the list frozen tokens replay).
+            let frozenTok := (← IO.getEnv "HESPER_NATIVE_FROZEN").bind (·.toNat?)
+            let frozenNow : Bool := nativeNow && (match frozenTok with
+              | some m => decide (decodeForwardsDone >= m)
+              | none => false)
             if captureNow then
               IO.println "[replay] capturing this token's dispatches (tint CLI per unique kernel)…"
               Hesper.WGSL.NativeReplay.startCapture
+            else if frozenNow then
+              Hesper.WGSL.NativeReplay.beginFrozenToken
             else if nativeNow then
               Hesper.WGSL.NativeReplay.beginNativeToken
-            forwardSingleToken ctx model nextToken newPos state (kcr := some kcr) (skipTokenWrite := dfTokenSkip) (skipPosWrite := dfPosSkip)
+            -- frozen: the whole forward replays from the frozen list, so the Lean
+            -- walk of forwardSingleToken (~1.3 ms/token) is skipped entirely. The
+            -- only per-token inputs are 5 small device writes (what the skipped
+            -- walk's staging writes did: pos/cacheLen/posF32/token/PLE-row); they
+            -- go through Dawn's queue, which orders BEFORE the frozen commit on the
+            -- same MTLQueue. (HESPER_DEVICE_FED is broken independently — zeros
+            -- from its 9th token even on the plain Dawn path — so the writes stay
+            -- host-side here.)
+            if frozenNow then
+              let posBytes := Hesper.WebGPU.BufferOps.uint32ToBytes newPos.toUInt32
+              let cacheLenBytes := Hesper.WebGPU.BufferOps.uint32ToBytes (newPos + 1).toUInt32
+              let posF32Bytes ← Hesper.Basic.floatToBytes newPos.toFloat
+              let tokBytes := Hesper.WebGPU.BufferOps.uint32ToBytes nextToken.toUInt32
+              GPUBackend.writeBufferOffset ctx state.paramsBuf 0 posBytes
+              GPUBackend.writeBufferOffset ctx state.paramsBuf 4 cacheLenBytes
+              GPUBackend.writeBufferOffset ctx state.posF32Buf 0 posF32Bytes
+              GPUBackend.writeBufferOffset ctx state.tokenBuf 0 tokBytes
+              -- gpuArgmax writes plRawRowBuf = tokenId every iteration (deviceFed
+              -- plumbing); the walk normally overwrites it with 0 (row-staged: the
+              -- dequant kernel must read row 0 of the one-row scratch). Restore 0.
+              GPUBackend.writeBufferOffset ctx state.plRawRowBuf 0
+                (Hesper.WebGPU.BufferOps.uint32ToBytes 0)
+              -- PLE row-staging: the walk uploads THIS token's quantized row into the
+              -- one-row scratch.
+              match model.perLayerEmbdTableGPU, model.perLayerEmbdTableBytes with
+              | some embdTableGPU, some tb =>
+                let rb := model.perLayerEmbdRowBytes
+                GPUBackend.writeBuffer ctx embdTableGPU (tb.extract (nextToken*rb) ((nextToken+1)*rb))
+              | _, _ => pure ()
+            else
+              forwardSingleToken ctx model nextToken newPos state (kcr := some kcr) (skipTokenWrite := dfTokenSkip) (skipPosWrite := dfPosSkip)
             if captureNow then
               let (n, misses) ← Hesper.WGSL.NativeReplay.stopCapture
               IO.println s!"[replay] captured {n} dispatches; misses={misses.length}"
               for m in misses.take 20 do IO.println s!"[replay]   MISS {m}"
-            else if nativeNow then
-              let report ← Hesper.WGSL.NativeReplay.commitToken nativeMode
-              if nativeDecodeTok == some decodeForwardsDone || decodeSectTrace then
-                IO.println s!"[native] tok={decodeForwardsDone}: {report}"
-            if deviceFedActive then
+            if deviceFedActive && !frozenNow then
               -- Increment pos / cacheLen / posF32 device-side so the *next*
               -- iteration's forward sees the correct values without any host
               -- writeScalarViaStaging.  Same kernel the captured decode
-              -- graph uses (line 3081).
+              -- graph uses (line 3081).  Under nativeExec the hook records this
+              -- dispatch into the token list (frozen tokens then replay it), which
+              -- is why the native commit happens AFTER this point.
               GPUBackend.execute ctx advancePosKernel
                 [ ("params", state.paramsBuf), ("posF32", state.posF32Buf) ]
                 { workgroupSize := { x := 1 }, numWorkgroups := (1, 1, 1) }
+            if nativeNow && !captureNow then
+              let report ← Hesper.WGSL.NativeReplay.commitToken nativeMode
+              if nativeDecodeTok == some decodeForwardsDone || decodeSectTrace then
+                IO.println s!"[native] tok={decodeForwardsDone}: {report}"
             decodeForwardsDone := decodeForwardsDone + 1
             if (← IO.getEnv "HESPER_GPUBUSY").isSome then
               IO.println s!"[gpubusy] {← Hesper.WebGPU.gpuBusyRead}"
