@@ -6,34 +6,26 @@
 
 ## Abstract
 
-We built Hesper, a verified-inference engine in Lean 4 targeting WebGPU (Dawn/Metal),
-and optimized its Gemma-4-E2B decode from 8.05 to ~119 tok/s. To explain the remaining
-gap to llama.cpp (~147 tok/s) and a hand-written WebGPU engine (webml, ~250 tok/s), we
-developed a **bare-Metal replay harness**: capture one decode token's full dispatch
-sequence from any engine — ours via a Lean hook, llama.cpp via its Metal encoder
-wrappers, webml via monkey-patched WebGPU APIs in headless Chrome — and re-execute it on
-a minimal Metal loop with identical methodology. The replays, together with llama.cpp's
-own ablation toggles and pre-registered predictions, falsified every "systems" theory of
-the gap in turn: dispatch transport (worth ~0.7 ms), concurrent scheduling (~0.1–0.6 ms
-in *every* engine — decode dataflows are ~86–96 % dependency-barriered), op count
-(llama runs 1.5× our ops faster), and small-op fusion (−28 dispatches = ±0 ms).
-What remains is arithmetic: **kernels + graph set the floor; every mature runtime — a
-JS loop in Chrome, C++ ggml, our Lean loop after a CUDA-Graphs-style frozen replay — is
-a ±0.5 ms rounding term on top.** webml's 1.7× lead over llama.cpp is kernel craft
-(fat epilogue-fused kernels, int4+int8-SRQ operands), not runtime or model format
-(the QAT model accounts for only ~10–15 % of bytes). We further show the classic
-isolated kernel benchmark overstates matvec bandwidth by 13–26 % (warm-SLC artifact),
-and that re-autotuning against a cold-stream objective recovers ≤3 %: per-op bandwidth
-is a function of op size, not of tuning parameters. Finally we report a natural
-experiment the record contains almost by accident: **the same author — the Fable 5
-model — built webml's kernels to 250 tok/s in roughly half an hour, and spent
-multi-hour-to-multi-day campaigns inside Hesper's stack without reaching parity**,
-despite Hesper's DSL sitting at the *same abstraction level* as WGSL (no lift, only
-layers). The abstraction tax is best measured not in microseconds but in
-**turnaround time per craft iteration**, which is where autotuning failed to
-compensate — and which jax-metal exhibits in a stronger form still.
+We optimized Hesper — a Lean 4 → WebGPU (Dawn/Metal) inference engine — from 8 to
+~119 tok/s on Gemma-4-E2B, and still trailed llama.cpp (~147) and the hand-written
+webml engine (~250). To find out why, we captured one decode token from each engine
+and replayed all three on a single bare-Metal harness, alongside pre-registered
+predictions and llama.cpp's own ablation toggles. The result is two anatomies:
 
-**Key findings at a glance:**
+**Performance:** kernels + the op graph set the floor. Everything else — dispatch
+transport, concurrency, op count, host runtime (JS, C++, or Lean) — measures at
+≲0.7 ms each. webml's 1.7× lead over llama.cpp is kernel craft, not model format or
+runtime.
+
+**Development:** the same author — the Fable 5 model — wrote webml's kernels to
+250 tok/s in ~30 minutes, and could not reach parity in days inside our stack, even
+though our DSL sits at the *same* abstraction level as hand WGSL. **The abstraction
+tax is turnaround time per iteration, not microseconds.** §7 turns this into
+requirements for the next tool: explore at JIT cadence with kernels-as-data, verify
+the frozen trace afterwards.
+
+## Key findings at a glance
+
 - **Kernels + graph set the floor; the runtime is a ±0.5 ms rounding term.** Host
   loops measured: webml (JS!) ~0.2 ms, llama.cpp ~0.55 ms, Hesper 2.5 ms → 0.9 ms
   after a CUDA-Graphs-style frozen replay.
@@ -44,19 +36,21 @@ compensate — and which jax-metal exhibits in a stronger form still.
   int4 + int8 activations), not model format (~10–15 % of bytes) or runtime.
 - **Isolated kernel benchmarks flatter bandwidth by 13–26 %** (warm-cache artifact);
   the deficit that remains is a function of op *size*, unreachable by parameter tuning.
-- **The abstraction tax is iteration frequency, not microseconds**: the same author
-  (Fable 5) reached 250 tok/s in ~30 min on a seconds-TAT stack and spent days inside
-  ours without parity — with the DSL at the *same* abstraction level as hand WGSL.
+- **Same author, two stacks: ~30 minutes vs days.** The DSL added no abstraction lift
+  over WGSL — only layers, and layers cost iteration frequency, which is where the
+  autotune fast loop (parameters) could not compensate for the slow loop (structure).
 
-**Reading guide.** This file is the paper: results and interpretation. `DEVPLAN.md`
-is the pre-registered plan — premises, hypotheses, and their recorded fates (§8–§13
-are the experiments cited here). `DEVLOG.md` is the frozen raw working diary
-(Japanese) for auditing any claim back to its measurement. Replay tooling and exact
-commands: `tools/replay/README.md`. §7 turns the findings into architecture
-requirements for the next tool (explore-JIT / verify-AOT), and Appendix A gives
-per-use-case environment recommendations.
+## How to read this report
 
-**Terminology** (first-use context for readers outside GPU/LLM-engine work):
+This file is the paper: results and interpretation. `DEVPLAN.md` is the
+pre-registered plan — premises, hypotheses, and their recorded fates (§8–§13 are the
+experiments cited here). `DEVLOG.md` is the frozen raw working diary (Japanese) for
+auditing any claim back to its measurement. Replay tooling and exact commands:
+`tools/replay/README.md`. Appendix A gives per-use-case environment recommendations.
+
+## Terminology
+
+First-use context for readers outside GPU/LLM-engine work:
 *decode / M=1* — generating one token at a time (batch of one matrix-vector op per
 weight); *op / dispatch* — one GPU kernel launch; *E2B* — the 2-billion-effective-
 parameter Gemma-4 variant; *SWA / FULL* — sliding-window vs global attention layers;
