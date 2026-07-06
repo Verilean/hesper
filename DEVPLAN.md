@@ -492,3 +492,46 @@ small class) are now expected NEUTRAL by the same arithmetic — deprioritized.
 (~119 t/s), fusion r2 neutral. Remaining honest levers, in measured-size order:
 per-op kernel efficiency toward llama's ~6.5 µs/op average (our small-op tail),
 argmax deferral (0.55 ms, blocked on the deviceFed fix), then structural ideas.
+
+---
+
+## §12. The per-op efficiency residual, decomposed (per-class GPU profiler)
+
+New instrument (`a99ab47`): `HESPER_NATIVE_PROFILE=1` replays every kernel class of the
+recorded token in isolation (serial, min-of-30) — a complete GPU-time budget by class.
+Class-sum 6.69 ms vs whole-token serial 6.78 ms → the attribution is consistent.
+
+**The 6.8 ms serial GPU budget (572 ops), aggregated:**
+
+| bucket | ops | GPU ms | note |
+|---|---|---|---|
+| big matvecs (QKV/oProj/gate-up/down/lm-head) | ~146 | **~3.7** | effective ~340 GB/s = **62 % of peak** in-token — NOT the 90–97 % of the isolated bench (which re-reads warm weights 300×; a real token streams every weight cold, once) |
+| attention (grid 8×1×1!) | 35 | **0.77** | 22 µs/layer with EIGHT workgroups on a ~40-core GPU — launch-bound and >80 % idle at short context; a short-ctx tax every engine pays |
+| single-workgroup norm/add tail (grid 1×1×1) | 141 | **~0.70** | 2.7–5.4 µs each, one workgroup = GPU essentially idle; postAttn/postFFN norms, PLE post-adds |
+| rope/kv/PLE-gate/misc small ops | ~250 | **~1.6** | same underoccupancy class |
+
+**The residual, named.** After transport (§8), scheduling (§9), op count (§9b/§11) all
+measured ≈ null, "per-op efficiency" resolves into three concrete items:
+1. **In-token matvec streaming at 62 % of peak** (~1.1 ms recoverable toward 90 %):
+   the isolated-bench 90–97 % figure was warm-cache optimistic — the honest target is
+   cold-stream BW. This is the single biggest kernel-side item and is autotune-able
+   (the harness must stream cold weights to measure it, i.e. rotate weight buffers).
+2. **~400 small ops that can't occupy the GPU** (~2.3 ms total): each op is
+   individually "fine" but 1-to-8-workgroup dispatches leave the machine idle.
+   webml's answer is not fewer dispatch *boundaries* (§11: neutral) but making these
+   ride the fat kernels' occupancy (epilogue fusion into ops that already fill the
+   GPU) — worth it ONLY where the small op runs between two big ones.
+3. **Attention at decode length is launch-bound** (0.77 ms): grid = numHeads. A
+   cross-layer or Q-batched attention shape would be needed to occupy; llama.cpp pays
+   the same class of cost here.
+
+**Answer to "would webml's kernels inside llama.cpp beat webml?" — NO, ≈ wash or
+slightly slower.** The bare-harness floor of webml's kernels+graph is 3.90 ms (§9c).
+A runtime adds only its host cost on top: webml's JS loop adds ~0.1–0.3 ms (real
+in-browser ~4.0 ms), llama.cpp's C++ loop adds ~0.6 ms (6.9 total − 6.31 GPU; ggml
+graph build/schedule per token) — so webml-kernels-in-llama ≈ 4.4–4.5 ms ≈ 220 t/s vs
+webml's ~250. llama's concurrency machinery can't help (the webml graph is 316 chained
+fat ops — nothing to overlap, §9). The general law all four experiments converge on:
+**kernels+graph set the floor; every mature runtime (JS-in-Chrome, C++ ggml, our
+Lean+frozen-native at 0.9 ms) is a ±0.5 ms rounding term on top.** Where the runtime
+DOES matter is bring-up and iteration speed, not steady-state tokens.
