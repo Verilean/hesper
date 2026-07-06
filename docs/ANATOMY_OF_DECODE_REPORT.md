@@ -52,7 +52,8 @@ compensate — and which jax-metal exhibits in a stronger form still.
 is the pre-registered plan — premises, hypotheses, and their recorded fates (§8–§13
 are the experiments cited here). `DEVLOG.md` is the frozen raw working diary
 (Japanese) for auditing any claim back to its measurement. Replay tooling and exact
-commands: `tools/replay/README.md`.
+commands: `tools/replay/README.md`. §7 turns the findings into architecture
+requirements for the next tool (explore-JIT / verify-AOT).
 
 **Terminology** (first-use context for readers outside GPU/LLM-engine work):
 *decode / M=1* — generating one token at a time (batch of one matrix-vector op per
@@ -344,7 +345,49 @@ build the diagnostic ladder we used here.
    batch>1, and long-context attention change the anatomy (the attention bucket grows
    from launch-bound to bandwidth-bound).
 
-## 7. Conclusion
+## 7. Prescriptions: what the next tool must look like
+
+The diagnosis (TAT, not microseconds) implies requirements. Stated as a manifesto,
+because each one is backed by a measurement in this record:
+
+**P1 — Structure exploration must run at interpreter/JIT cadence; kernels must be
+data, not code.** Every winning move in this record was structural (§5); every
+structural move paid the compile loop. The fix is architectural, not diligence:
+during the search phase, kernels live as source strings hot-reloaded at runtime
+(WGSL/MSL are JIT-compiled by the driver in milliseconds — our own replayer already
+runs hand-edited MSL with zero rebuild), and the host loop runs in an interpreted or
+JIT environment (Python, JS, or a compiled host in interpreter mode). webml is the
+existence proof: templated-WGSL-as-data + browser reload = a seconds loop, and 250
+tok/s in half an hour. Hesper had this property for *parameters* (0.118 s/variant)
+and lost it exactly where it mattered — structure.
+
+**P2 — A DSL meant for AI-assisted optimization has two new hard requirements.**
+The author of record here is an LLM, which changes the design targets:
+(a) *the engine must fit in the model's context*: webml is one ~550 KB JS file plus
+embedded kernel templates — the whole surface is inspectable at once. Hesper's
+relevant surface spans dozens of Lean modules plus two foreign codebases (Tint, Dawn)
+the model cannot see into at all, so every investigation began by building
+visibility instruments (§3). (b) *the eval loop must match the agent's step cadence*:
+an agent iterating against seconds-latency feedback keeps its hypothesis chain hot;
+against 8-minute builds it re-orients, re-reads, and burns its context on state
+reconstruction. The measured 30-minutes-vs-days gap at equal author skill (§5) is
+mostly this. For the next generation of GPU tooling, "interpreter-driven, one-file,
+seconds-feedback" is not ergonomics — it is what makes an LLM author viable.
+
+**P3 — Split the pipeline: explore JIT, verify AOT.** Verification and typed
+quantization were never the wrong idea — they were in the wrong *loop*. The two-phase
+architecture that salvages them: search for the winning structure in the fast
+environment (P1/P2); once the structure freezes, export it into the typed/verified
+environment, where proofs are amortized over a stable artifact and types kill exactly
+the bug classes this record paid days for (clamp-write races, writable-storage
+aliasing, dtype misassumptions, grid-roundup OOB). Concretely, and cheaper than
+verifying a generator: **verify the trace, not the generator.** The frozen dispatch
+list (§4.1) is a finite, closed artifact — a few hundred (kernel, buffers, ranges,
+grid) tuples per token; bounds, aliasing, and race checks over it are decidable and
+could be produced as a proof-carrying deployment certificate. That is a landing point
+for the Lean assets that costs the exploration loop nothing.
+
+## 8. Conclusion
 
 For M=1 LLM decode on Apple Silicon, the engine is nearly irrelevant and the
 scheduler is entirely so: kernels + graph set the floor, dependency chains nullify
