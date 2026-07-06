@@ -214,14 +214,71 @@ steady-state tokens.
 
 ### 4.3 The falsified systems theories
 
-| theory | test | result |
-|---|---|---|
-| "Dawn's serialized dispatch costs ~4 ms" | native replay, serial: 6.78 vs Dawn 7.7 ms | transport worth **~0.7 ms** |
-| "concurrency + mem_ranges is llama's edge" | llama's own `GGML_METAL_CONCURRENCY_DISABLE` etc. | serial llama = 145.4 vs 147.6 t/s; reorder ≈ 0; their op-fusion ≈ 0.5 ms. **All scheduling ≲0.6 ms** |
-| the 3.43 ms concurrent-no-barrier replay | automatic hazard analysis | **race mirage**: 547/572 of our ops (721/854 of llama's, i.e. *everyone's*) are true dependencies; honest concurrency ≈ serial |
-| "op count is the lever (−10 µs/op)" | fusion round 2: fold ropeQ into the norm kernel | −28 dispatches, **±0 ms** (the deleted round-trip is 0.2 MB against a 1.26 GB token) |
-| "kernels are at 90–97 % BW" (isolated bench) | cold-stream bench (rotate weight clones past the SLC) | warm figures inflated **13–26 %/shape**; true cold BW 304–465 GB/s, matching the in-token 340 GB/s average |
-| "so re-tune for the cold objective" | sweep+refine, cold | winners shift at 3/6 shapes by **≤1–3 %**: per-op BW is a function of **op size** (8 µs over 3.9 MB cannot hide DRAM latency: 304 GB/s; the 226 MB lm-head streams at 465 GB/s) — physics, not parameters |
+Five successive theories attributed the remaining gap to a *systems* mechanism —
+each was plausible, each promised a cheap structural fix, and each was killed by a
+targeted measurement (predictions pre-registered in `DEVPLAN.md` §9 before running).
+This subsection tells each story; the table at the end is the scorecard.
+
+**T1 — "Dawn's serialized dispatch costs ~4 ms/token."**
+*Why plausible:* Dawn hardcodes `MTLDispatchTypeSerial` (crbug.com/425987598), and an
+isolated probe measured 13.5 µs/dispatch serial vs 6.9 µs concurrent; at 567
+dispatches/token that extrapolates to several milliseconds.
+*Test:* build a native transport — replay the identical captured dispatch list on a
+bare Metal encoder, no Dawn at all — and compare serially.
+*Result:* 6.78 ms native vs 7.7 ms through Dawn. The transport was worth **0.7 ms**,
+not 4. The extrapolation failed because most of the per-dispatch "gap" is the kernels
+draining, not Dawn's encoder.
+
+**T2 — the race mirage (why concurrency looked like a 2× win).**
+*Observation:* the same captured token replayed with a concurrent encoder and NO
+barriers ran in 3.43 ms — apparently half the serial time.
+*Test:* add automatic hazard analysis (llama.cpp's `ggml_mem_ranges` semantics —
+a barrier before any op that touches a buffer written since the last barrier).
+*Result:* **547 of our 572 ops need a barrier** (and 721 of llama.cpp's 854 — it is
+everyone's dataflow, not our design): batch-size-1 decode is a dependency *chain*.
+The 3.43 ms was the hardware overlapping through true dependencies — a schedule no
+correct engine can use. Honest concurrency ≈ serial.
+
+**T3 — "llama.cpp's speed comes from Concurrent + mem_ranges."**
+*Why plausible:* they built exactly that machinery, and T1's probe showed a 2×
+per-dispatch difference.
+*Test:* llama.cpp ships its own ablation switches; we pre-registered 90–115 tok/s
+for serial llama.cpp and ran `GGML_METAL_CONCURRENCY_DISABLE`,
+`GGML_METAL_GRAPH_OPTIMIZE_DISABLE`, `GGML_METAL_FUSION_DISABLE` (llama-bench, tg64).
+*Result:* serial llama.cpp = **145.4 tok/s vs 147.6 default** — the prediction missed
+by ~50 %. Reordering ≈ 0; their op-fusion ≈ 0.5 ms. Their entire scheduling apparatus
+sums to ≲0.6 ms. Nobody's speed comes from scheduling.
+
+**T4 — "op count is the lever (each dispatch boundary costs ~10 µs)."**
+*Why plausible:* dividing GPU time by op count gave ~10–13 µs/op, and webml runs far
+fewer ops (316 vs our 572 vs llama's 854).
+*Test:* fusion round 2 — fold the rope rotation into the adjacent norm kernel on 28
+layers, deleting 28 dispatches and one intermediate round-trip.
+*Result:* **−28 dispatches, ±0 ms.** The deleted round-trip moved 0.2 MB against a
+1.26 GB token; per-op "boundary cost" is not a constant you can harvest — llama.cpp
+runs 1.5× our op count *faster*. What matters is bytes moved × kernel efficiency,
+not how many launches carry them.
+
+**T5 — "the kernels are already at 90–97 % of bandwidth" (the warm-bench belief).**
+*Why plausible:* the isolated autotune bench said so.
+*Test:* a cold-stream bench — rotate the weight buffer across enough clones that the
+working set exceeds the system-level cache, so every dispatch reads cold memory,
+like a real token (an isolated bench re-reads ONE weight 300×, which sits in cache).
+*Result:* the warm numbers were flattered by **13–26 % per shape**; true cold
+bandwidth is 304–465 GB/s, bracketing the in-token 340 GB/s average. Re-tuning
+against the cold objective moved winners by **≤1–3 %**: the deficit is a function of
+op *size* (an ~8 µs dispatch over a 3.9 MB weight cannot hide DRAM latency —
+304 GB/s — while the 226 MB lm-head streams at 465 GB/s). Physics, not parameters.
+
+**Scorecard:**
+
+| # | theory | test | verdict |
+|---|---|---|---|
+| T1 | Dawn serialization ≈ 4 ms | native transport replay | worth **0.7 ms** |
+| T2 | concurrency ≈ 2× (3.43 ms) | hazard-barrier replay | **mirage**: 547/572 ops are true dependencies |
+| T3 | llama's edge = scheduling | their own ablation toggles | all of it ≲ **0.6 ms** |
+| T4 | op count, −10 µs/op | fusion round 2 (−28 ops) | **±0 ms**; llama runs more ops, faster |
+| T5 | kernels at 90–97 % BW | cold-stream bench + re-tune | **13–26 % flattery**; re-tune recovers ≤3 % |
 
 ### 4.4 The remaining per-op budget (per-class profiler)
 
