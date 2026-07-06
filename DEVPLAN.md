@@ -385,3 +385,43 @@ Instrumentation kept in the fork (env-gated, off by default):
 `GGML_METAL_REPLAY_LOG=1` (per-encoder dispatch counts), `GGML_METAL_REPLAY=<n>`
 (capture+replay encoder n). Deadlock note: llama pre-enqueues its CBs, so the replay
 must commit on a PRIVATE MTLCommandQueue.
+
+### §9c. The webml quadrant (user-directed): their real token replayed, prediction HELD
+
+Method (new, reusable): mirror the HF space locally, monkey-patch the WebGPU API in a
+driver page (createShaderModule/Pipeline/BindGroup/Buffer, setPipeline/BindGroup,
+dispatchWorkgroups, PLUS a ≤64 KiB buffer-content mirror via writeBuffer/mapped-range
+hooks — uniform values drive loop trip counts, zeros would fake the timing), run the
+real app in headless Chrome (`--headless=new --use-angle=metal`, WebGPU works; model
+2.34 GB QAT int4 cached in the profile), trace exactly one steady decode token, POST
+the trace to a local collector; then tint each pipeline (`--overrides` for constants;
+all 53 compiled — including subgroup-matrix kernels) and replay in a ~150-line
+standalone Metal tool with synthesized buffers + real uniform contents.
+Files: scratchpad webml-app/{trace.html, collector.py, convert.py, replayer.mm}.
+
+**Result (2026-07-06):** webml decode token = **316 ops, 53 pipelines, serial GPU
+3.90 ms min (4.47 avg)** — §9's pre-registered prediction (4.5–5.5 ms ≈ their real
+~4.0 ms/token) HELD at the fast edge. Concurrent-no-barrier 1.85 ms (same race-mirage
+caveat as ever).
+
+**The completed three-engine table (same bare-Metal harness, serial, one decode token):**
+
+| engine | ops | serial GPU | µs/op | bytes/token | effective BW |
+|---|---|---|---|---|---|
+| webml | 316 | **3.90 ms** | 12.3 | ~1.12 GB | **287 GB/s** |
+| llama.cpp | 854 | 6.31 ms | 7.4 | ~1.26 GB | 200 GB/s |
+| Hesper | 572 | 6.78 ms | 11.9 | ~1.26 GB | 186 GB/s |
+
+**Reading:** op count per se predicts nothing (llama: most ops, second-fastest;
+webml: fattest per-op cost, fastest total). What separates the engines is **total
+kernel work = bytes moved × kernel efficiency**. Normalizing webml to our byte count
+(×1.26/1.12) gives ≈ 4.4 ms — so ≈ **2.4 ms of our 6.78 is kernel-shape/fusion
+quality on equal bytes**, the single largest measured lever left. webml earns it with
+epilogue fusion (intermediates never round-trip through memory) and int8-SRQ
+activations; llama earns its 200 GB/s with many thin, highly-tuned kernels.
+
+**Fusion verdict (user gate satisfied):** fusion round 2 is JUSTIFIED — not as
+"fewer dispatch boundaries" (§9 killed that) but as **removing intermediate memory
+round-trips**, webml-style. Expected first-tranche win −0.5…−1.5 ms of the 2.4 ms
+pool (Q6K-V merge, argmax deferral, factors-less qkNormRope), plus kernel-efficiency
+parity work toward llama's 200 GB/s.
