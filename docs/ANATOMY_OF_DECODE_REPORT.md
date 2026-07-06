@@ -31,7 +31,42 @@ multi-hour-to-multi-day campaigns inside Hesper's stack without reaching parity*
 despite Hesper's DSL sitting at the *same abstraction level* as WGSL (no lift, only
 layers). The abstraction tax is best measured not in microseconds but in
 **turnaround time per craft iteration**, which is where autotuning failed to
-compensate and where jax-metal exhibits the same disease in a terminal stage.
+compensate — and which jax-metal exhibits in a stronger form still.
+
+**Key findings at a glance:**
+- **Kernels + graph set the floor; the runtime is a ±0.5 ms rounding term.** Host
+  loops measured: webml (JS!) ~0.2 ms, llama.cpp ~0.55 ms, Hesper 2.5 ms → 0.9 ms
+  after a CUDA-Graphs-style frozen replay.
+- **Concurrency is irrelevant for M=1 decode — in every engine.** Decode dataflows
+  are ~86–96 % true dependencies; llama.cpp's own toggles price its entire scheduling
+  apparatus at ≲0.6 ms. Racy no-barrier replays that suggest 2× are a mirage.
+- **webml's 1.7× lead over llama.cpp is kernel craft** (fat epilogue-fused kernels,
+  int4 + int8 activations), not model format (~10–15 % of bytes) or runtime.
+- **Isolated kernel benchmarks flatter bandwidth by 13–26 %** (warm-cache artifact);
+  the deficit that remains is a function of op *size*, unreachable by parameter tuning.
+- **The abstraction tax is iteration frequency, not microseconds**: the same author
+  (Fable 5) reached 250 tok/s in ~30 min on a seconds-TAT stack and spent days inside
+  ours without parity — with the DSL at the *same* abstraction level as hand WGSL.
+
+**Reading guide.** This file is the paper: results and interpretation. `DEVPLAN.md`
+is the pre-registered plan — premises, hypotheses, and their recorded fates (§8–§13
+are the experiments cited here). `DEVLOG.md` is the frozen raw working diary
+(Japanese) for auditing any claim back to its measurement. Replay tooling and exact
+commands: `tools/replay/README.md`.
+
+**Terminology** (first-use context for readers outside GPU/LLM-engine work):
+*decode / M=1* — generating one token at a time (batch of one matrix-vector op per
+weight); *op / dispatch* — one GPU kernel launch; *E2B* — the 2-billion-effective-
+parameter Gemma-4 variant; *SWA / FULL* — sliding-window vs global attention layers;
+*PLE* — Gemma's per-layer embeddings; *wg / sg* — GPU workgroup / subgroup (≈ CUDA
+block / warp); *SLC* — the chip's system-level cache; *TAT* — turnaround time of one
+edit-measure iteration; *GGUF Q4_K_M / QAT int4* — 4-bit weight formats (llama.cpp's
+block format vs a quantization-aware-trained format); *SRQ* — int8 dynamic activation
+quantization fused into a producer kernel; *dp4a* — packed int8 dot instruction
+(emulated on Apple GPUs); *epilogue fusion* — folding a following small op (norm/add)
+into a matmul kernel's tail; *WGSL / MSL* — the WebGPU and Metal shading languages;
+*Dawn / Tint* — Chrome's WebGPU runtime and its shader compiler; *frozen replay* —
+re-submitting a captured, token-invariant dispatch list (CUDA-Graphs analogue).
 
 ## 1. Introduction
 
@@ -64,7 +99,7 @@ webml source of record: the Hugging Face Space
 in the JS bundle and mirrored in this repo at `refs/webml-gemma4/`).
 
 Also referenced: jax-metal (closed PJRT plugin → closed MPSGraph; no kernel authoring
-escape hatch) as the terminal case of the abstraction disease discussed in §5/§5b.
+escape hatch) as the strongest form of the layering problem discussed in §5/§5b.
 
 **Figure 1 — the three stacks, and where each measurement instrument taps in.**
 Note that Hesper's DSL emits WGSL essentially 1:1 (expression tree → text): it adds
@@ -230,6 +265,23 @@ BW). What differs is **turnaround time per craft iteration**:
 | trust a measurement | direct | discover and subtract Dawn's ~35 µs/dispatch bench tax, its serial hardcode, silent batch validation-swallowing, a Tint printer bug |
 | parameter sweep | manual, but each try is seconds | **0.118 s/variant (autotune)** — the one loop where Hesper is fast |
 
+**Why is the slow loop slow — Lean's nature or this project's shape?** Both,
+separably. *Incidental (fixable)*: the decode paths live in monolithic modules
+(`Gemma4.lean` is 3,815 lines, the DiffusionGemma decoder 2,175) and Lean's
+recompilation granularity is the module — a one-line kernel edit re-elaborates the
+whole file; the lakefile also carries ~240 executables whose dependency closure
+inflates integration builds. Splitting the modules (an engine TODO recorded during the
+campaign) would likely cut the 8–10 min integration loop by most of an order of
+magnitude. *Inherent (structural)*: elaborating the DSL's typed expression trees is
+CPU-expensive by design, minutes-not-seconds is the realistic floor for any compiled
+host language, and — decisively — the browser stack's loop is *zero-compile* because
+WGSL is data, not code. Hesper in fact exploits the same trick where it can: kernels
+are runtime-generated, so *parameter* changes rebuild nothing (0.118 s/variant — the
+autotune loop). Only *structural* kernel changes are Lean code, and those are exactly
+the changes that mattered (§4.3). A kernel-hot-reload mode (kernels as source strings
+reloaded at runtime, as our replayer already does with MSL) would have closed most of
+the gap without abandoning the stack — it was identified only in the post-mortem.
+
 The last row is the punchline for autotuning: **the fast loop we automated (parameter
 search) is orthogonal to where the wins live.** Every productive move in this record —
 fat epilogue-fused kernels, operand-format changes, deleting round-trips, the frozen
@@ -274,10 +326,10 @@ hatches. Hesper built ③ (MSL dump, native bench, the replay harness) and parti
 ① failed permanently at Tint and Dawn — both foreign, and both bit us (a Tint MSL
 printer bug emitting silently-wrong entry points for a 9-binding fused kernel; Dawn's
 serial hardcode; Dawn swallowing validation errors in batches). Authoring in an
-expression-tree DSL was ~3–5× slower than raw WGSL for kernel work. **jax-metal is the
-same disease at a terminal stage**: closed PJRT plugin onto closed MPSGraph, no Pallas
-escape hatch — zero of the three conditions, and no way to even build the diagnostic
-ladder we used here.
+expression-tree DSL was ~3–5× slower than raw WGSL for kernel work. **jax-metal has the
+same structural problem in its strongest form**: a closed PJRT plugin onto closed
+MPSGraph with no Pallas escape hatch — zero of the three conditions, and no way to even
+build the diagnostic ladder we used here.
 
 ## 6. Open problems
 
