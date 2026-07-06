@@ -277,3 +277,37 @@ Side finds: gemma4-inference dies at startup on WebGPU unless `HESPER_CUDA_GRAPH
 (graphs default-on hits the CUDA stub); FFI error objects must be
 `lean_mk_io_user_error`-wrapped or the top-level error printer segfaults; Tint renames
 entry points (`main` → `v`) in MSL.
+
+---
+
+## §9. Controlled cross-engine experiment: PROVE the "concurrency + mem_ranges" claim
+### (predictions registered 2026-07-06 BEFORE measurement — principle 1)
+
+§8 left the llama.cpp side of the story asserted, not proven ("their 6.4 ms comes from
+kernels + Concurrent + range-granularity hazard tracking hiding the ~10 µs/op gaps on a
+width-2–3 graph"). llama.cpp ships its own ablation toggles
+(`GGML_METAL_CONCURRENCY_DISABLE`, `GGML_METAL_FUSION_DISABLE`,
+`GGML_METAL_GRAPH_OPTIMIZE_DISABLE`), so the claim is testable on their engine with
+zero instrumentation. Combined with our Phase B numbers this completes a 2×2:
+graph {ours width-1 fused, theirs wide} × schedule {serial, concurrent+hazard}.
+
+**Predictions (E2B Q4_K_M, M4 Max, greedy decode steady state):**
+
+| # | Config | Prediction | Reasoning |
+|---|---|---|---|
+| P1 | llama default (conc+fusion+reorder) | ~156 t/s (≈6.4 ms) | prior measurement reproduces |
+| P2 | llama + CONCURRENCY_DISABLE | **90–115 t/s (8.5–11 ms)** — the key test | serial exposes ~10 µs/op × their op count; drops BELOW our native-serial 9.15 ms because they run more, finer ops |
+| P3 | llama + GRAPH_OPTIMIZE_DISABLE | 140–155 t/s (small hit) | reordering only widens the overlap window; ranges still hide most gaps |
+| P4 | llama + FUSION_DISABLE | 120–145 t/s | more ops, partially hidden by concurrency |
+| P5 | (ours, measured §8) our graph serial vs hazard-concurrent | 7.5 vs 7.0–7.7 ms — already ≈ equal | width-1 chain: nothing to overlap |
+
+If P2 lands (a large serial penalty on THEIR graph) while P5 stands (no concurrency
+penalty/gain on OURS), the mechanism is proven: **llama.cpp's speed = per-op gaps
+hidden by concurrent overlap on a graph that kept its width; ours kept nothing to
+overlap because we fused the width away.** Then the fusion-lever estimate (−10 µs/op)
+inherits that proof, and fusion round 2 becomes the justified last step.
+
+Follow-up (webml quadrant): replay webml's 44 WGSL kernels (already extracted,
+refs/webml-gemma4/wgsl/) with their ~390-dispatch structure through the same harness —
+prediction: serial replay lands ≈ 390 × ~10 µs + kernel work ≈ **~4.5–5.5 ms**,
+matching their ~4 ms/token and proving the op-count lever independently.
