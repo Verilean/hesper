@@ -32,7 +32,7 @@ costs **780–880 ms on ours vs 363 ms on llama.cpp** after a multi-day campaign
 eliminated as the explanation by measurement, what remains is **iteration time**:
 structural kernel changes — the only kind that mattered — pay a minutes-long compile
 loop, while the thin stack pays seconds. The abstraction tax is turnaround time, not
-microseconds. §7 turns this into requirements for the next tool: explore at JIT
+microseconds. §6 turns this into requirements for the next tool: explore at JIT
 cadence with kernels-as-data; verify the frozen trace afterwards.
 
 ## Key findings at a glance
@@ -297,7 +297,7 @@ most of the floor. Their in-token effective bandwidth is ~340 GB/s against a 546
 peak — far below the 90–97 % the isolated bench claimed, for the warm-cache reason
 established in T5. The recoverable slice (toward ~90 %) is ~1.1 ms, and §4.3-T5
 showed parameter tuning cannot reach it; the only identified legal route is
-overlapping the *next* op's weight stream with the current op's compute (§6.1).
+overlapping the *next* op's weight stream with the current op's compute (Appendix B, item 1).
 
 **Attention (35 ops, 0.77 ms) launches 8 workgroups on a ~40-core GPU.**
 At decode lengths the attention math is tiny (the cache is short), so each of the 35
@@ -481,20 +481,7 @@ same structural problem in its strongest form**: a closed PJRT plugin onto close
 MPSGraph with no Pallas escape hatch — zero of the three conditions, and no way to even
 build the diagnostic ladder we used here.
 
-## 6. Open problems
-
-1. **Weight-prefetch overlap** (the legitimate residue of the race mirage): op N+1's
-   weight bytes are independent of op N's output; a write-free prefetch dispatch is
-   hazard-free and may overlap legally. Prototype cost is low in the replay harness.
-   This is the only identified path to the ~1.1 ms cold-stream deficit.
-2. Argmax deferral (0.55 ms) — blocked on a pre-existing device-fed-loop bug.
-3. Engine: propagate Dawn validation errors in batch mode (silent-drop cost a full
-   debugging day); Tint printer bug minimal repro → upstream; Dawn pin is 9 months old.
-4. External validity: one box (M4 Max), one model family (E2B), batch-size-1 greedy decode. Prefill,
-   batch>1, and long-context attention change the anatomy (the attention bucket grows
-   from launch-bound to bandwidth-bound).
-
-## 7. Prescriptions: what the next tool must look like
+## 6. Prescriptions: what the next tool must look like
 
 The diagnosis (TAT, not microseconds) implies requirements. Stated as a manifesto,
 because each one is backed by a measurement in this record:
@@ -536,7 +523,7 @@ grid) tuples per token; bounds, aliasing, and race checks over it are decidable 
 could be produced as a proof-carrying deployment certificate. That is a landing point
 for the Lean assets that costs the exploration loop nothing.
 
-## 8. Conclusion
+## 7. Conclusion
 
 For batch-size-1 LLM decoding on Apple Silicon, the engine is nearly irrelevant and the
 scheduler is entirely so: kernels + graph set the floor, dependency chains nullify
@@ -561,7 +548,7 @@ itself.
 
 ## Appendix A. Next-architecture playbook: environment per use case
 
-The report's prescriptions (§7) are principles; this appendix is the practical
+The report's prescriptions (§6) are principles; this appendix is the practical
 version: six situations a team is actually in, and for each, the thinnest environment
 that satisfies the two axes from the conclusion — fits in the author's context, and
 iterates in seconds. *Every recommendation is tied to a measurement in this report,
@@ -587,7 +574,7 @@ bindings (`dawn.node`), which gives a CLI loop with *Chrome's exact* compiler st
 
 **Environment: Deno (or the bare-Metal harness for Apple-final).** CLI beats browser
 for the agent loop: single command per iteration, clean stdout, no SingletonLock /
-collector-server lifecycle (§9c cost us several detours). Architecture per report §7:
+collector-server lifecycle (the browser tracing cost us several detours). Architecture per §6:
 
 1. Agent sees ONLY: tensor shapes, the golden, the kernel source string, and last
    timing. No host code in context (P2a).
@@ -643,7 +630,7 @@ isolated) — don't port the stack.
 
 ### Use case 6 — verification (the Lean salvage)
 
-**Verify the trace, not the generator** (§7-P3). After the structure freezes, capture
+**Verify the trace, not the generator** (§6-P3). After the structure freezes, capture
 the token's dispatch list (the frozen-replay artifact: a few hundred (kernel, buffer,
 range, grid) tuples) and prove bounds / no-writable-aliasing / race-freedom over that
 finite object in Lean — a deployment certificate, off the exploration loop. The bug
@@ -661,3 +648,21 @@ writable-aliasing dispatch, grid-roundup OOB writes.
   timings** (the 3.43 ms mirage) — cold-stream + hazard-correct or it didn't happen.
 - **Don't chase scheduling.** Concurrency, reordering, dispatch-count: all measured
   ≲0.6 ms across three engines for batch-size-1 decode.
+
+---
+
+## Appendix B. Open problems (project-specific)
+
+*These are Hesper-repo work items left open at the time of this report — kept for the
+project record rather than the general reader.*
+
+1. **Weight-prefetch overlap** (the legitimate residue of the race mirage): op N+1's
+   weight bytes are independent of op N's output; a write-free prefetch dispatch is
+   hazard-free and may overlap legally. Prototype cost is low in the replay harness.
+   This is the only identified path to the ~1.1 ms cold-stream deficit.
+2. Argmax deferral (0.55 ms) — blocked on a pre-existing device-fed-loop bug.
+3. Engine: propagate Dawn validation errors in batch mode (silent-drop cost a full
+   debugging day); Tint printer bug minimal repro → upstream; Dawn pin is 9 months old.
+4. External validity: one box (M4 Max), one model family (E2B), batch-size-1 greedy decode. Prefill,
+   batch>1, and long-context attention change the anatomy (the attention bucket grows
+   from launch-bound to bandwidth-bound).
