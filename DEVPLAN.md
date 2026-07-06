@@ -535,3 +535,46 @@ fat ops — nothing to overlap, §9). The general law all four experiments conve
 **kernels+graph set the floor; every mature runtime (JS-in-Chrome, C++ ggml, our
 Lean+frozen-native at 0.9 ms) is a ±0.5 ms rounding term on top.** Where the runtime
 DOES matter is bring-up and iteration speed, not steady-state tokens.
+
+---
+
+## §13. The cold-stream matvec recovery attempt (autotune) — the 1.1 ms is PHYSICS, not a knob
+
+New instrument: `HESPER_COLD_BENCH=1` (+`mslBenchSerialRot`) — the native bench now
+rotates the largest (weight) buffer across enough clones that the rotation working set
+exceeds the SLC, so every dispatch reads cold memory, like a real token.
+
+**Warm-optimism quantified (sweep+refine at the 6 E2B shapes):**
+
+| shape | warm GB/s | cold GB/s | cold/warm |
+|---|---|---|---|
+| 2560×1536 (QKV) | 373 | 304 | 1.22 |
+| 1536×2048 (attnO) | 387 | 331 | 1.17 |
+| 12288×1536 | 513 | 407 | 1.26 |
+| 1536×6144 | 493 | 403 | 1.22 |
+| 1536×12288 | 514 | 423 | 1.22 |
+| 262144×1536 (lm-head) | 526 | 465 | 1.13 |
+
+Cold BW 304–465 GB/s brackets the in-token 340 GB/s average — §12's hypothesis is
+quantitatively confirmed; the isolated 90–97 % figures were SLC re-read artifacts.
+
+**Re-tuning under the cold objective recovers ~nothing.** Winners moved at 3/6 shapes
+but all configs are near-tied under cold (≤1–3 %; e.g. lm-head 0.487 vs 0.490 ms
+across NR0/NSG). Cold winners deployed via winners.csv (token gate: sequence identical
+to the reference). **Conclusion: the ~1.1 ms cold-stream deficit is op-size physics,
+not a parameter — an ~8 µs dispatch over a 3.9 MB weight cannot hide DRAM latency
+(304 GB/s), while the 226 MB lm-head streams at 465 GB/s (85 %).** The BW-vs-op-size
+curve, not the tuning table, is the constraint.
+
+**The legitimate recovery design (next experiment, sketched):** op N+1's WEIGHT bytes
+do not depend on op N's output — only its small activation read does. A write-free
+weight-PREFETCH dispatch is hazard-free and may legally overlap op N under any correct
+scheduler, warming the cache for op N+1. This is also the honest kernel of truth inside
+Phase A's raced 3.43 ms number (most of that overlap was weight streaming, which was
+never illegal — only the activation races were). The replay harness can prototype it
+cheaply: interleave prefetch ops touching op N+1's weights, concurrent mode, hazard
+barriers only on real buffers.
+
+Process note: the autotune loop ran end-to-end against a brand-new objective (new
+instrument → sweep → refine with incumbent guard → winners.csv deploy without rebuild
+→ token gate) and correctly returned "no headroom here" — a clean negative (principle 6).

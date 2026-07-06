@@ -87,6 +87,12 @@ lean_obj_res lean_hesper_replay_run(
 lean_obj_res lean_hesper_replay_run_subset(
     b_lean_obj_arg, uint32_t, lean_obj_res) { return msl_stub(); }
 
+lean_obj_res lean_hesper_msl_bench_serial_rot(
+    b_lean_obj_arg, b_lean_obj_arg, b_lean_obj_arg,
+    uint32_t, b_lean_obj_arg,
+    uint32_t, uint32_t, uint32_t, uint32_t, uint32_t,
+    lean_obj_res) { return msl_stub(); }
+
 lean_obj_res lean_hesper_replay_exec(
     uint32_t, lean_obj_res) { return msl_stub(); }
 

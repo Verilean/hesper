@@ -180,12 +180,38 @@ def sweep (device : Device) (fam : Family) (shape : Shape)
       -- kernel itself. Contract: benchBuffers must list buffers in BINDING ORDER.
       let nativeBench := (← IO.getEnv "HESPER_NATIVE_BENCH").isSome
       let nativeMsl ← if nativeBench then Hesper.WebGPU.lastDumpedMsl else pure ""
+      -- DEVPLAN §13 cold-stream: HESPER_COLD_BENCH=1 rotates the LARGEST bench buffer
+      -- (the weight) across enough clones that successive dispatches read cold memory
+      -- (rotation working set ≥ ~96 MB > the SLC). Warm re-reads flattered matvecs to
+      -- 90–97 %; the deploy target is cold-stream BW.
+      let coldBench := (← IO.getEnv "HESPER_COLD_BENCH").isSome
+      let (rotSlot, rotCopies) ← do
+        if coldBench && nativeBench then
+          let sizes := bufSpecs.map (·.2)
+          let maxW := sizes.foldl max 0
+          let slot := (sizes.findIdx? (· == maxW)).getD 0
+          let bytes := maxW * 4
+          let r := min 32 (max 2 ((96*1024*1024 + bytes - 1) / bytes))
+          let wbuf ← match bufs.toArray[slot]? with
+            | some (_, b) => pure b
+            | none => throw (IO.userError "cold-bench: bad slot")
+          let mut copies : Array Buffer := #[wbuf]
+          for _ in [1:r] do
+            let b ← createBuffer device { size := bytes.toUSize, usage := [.storage, .copyDst, .copySrc], mappedAtCreation := false }
+            copies := copies.push b
+          pure (slot, copies)
+        else pure (0, (#[] : Array Buffer))
       let benchMs : Nat → IO Float := fun n => do
         if nativeBench && !nativeMsl.isEmpty then
           let (gx, gy, gz) := cfg.numWorkgroups
-          let s ← Hesper.WebGPU.mslBenchSerial device nativeMsl
-            (bufs.map (·.2)).toArray n.toUInt32 gx.toUInt32 gy.toUInt32 gz.toUInt32
-            cfg.workgroupSize.x.toUInt32
+          let s ← (if rotCopies.size > 1 then
+              Hesper.WebGPU.mslBenchSerialRot device nativeMsl
+                (bufs.map (·.2)).toArray rotSlot.toUInt32 rotCopies
+                n.toUInt32 gx.toUInt32 gy.toUInt32 gz.toUInt32 cfg.workgroupSize.x.toUInt32
+            else
+              Hesper.WebGPU.mslBenchSerial device nativeMsl
+                (bufs.map (·.2)).toArray n.toUInt32 gx.toUInt32 gy.toUInt32 gz.toUInt32
+                cfg.workgroupSize.x.toUInt32)
           pure ((parseMs s).getD 1e18 / n.toFloat)
         else
           let t0 ← IO.monoMsNow
@@ -278,15 +304,39 @@ def refineTopK (device : Device) (fam : Family) (shape : Shape)
     if nativeBench then Hesper.WGSL.Execute.resetPipelineCache
     Hesper.GPUBackend.executeWithConfigCached device kern bufs cfg 0 r
     let nativeMsl ← if nativeBench then Hesper.WebGPU.lastDumpedMsl else pure ""
+    -- Cold-stream rotation (§13): same contract as the sweep site.
+    let coldBench := (← IO.getEnv "HESPER_COLD_BENCH").isSome
+    let bufSpecsR := fam.benchBuffers padded
+    let (rotSlot, rotCopies) ← do
+      if coldBench && nativeBench then
+        let sizes := bufSpecsR.map (·.2)
+        let maxW := sizes.foldl max 0
+        let slot := (sizes.findIdx? (· == maxW)).getD 0
+        let bytes := maxW * 4
+        let rN := min 32 (max 2 ((96*1024*1024 + bytes - 1) / bytes))
+        let wbuf ← match bufs.toArray[slot]? with
+          | some (_, b) => pure b
+          | none => throw (IO.userError "cold-bench: bad slot")
+        let mut copies : Array Buffer := #[wbuf]
+        for _ in [1:rN] do
+          let b ← createBuffer device { size := bytes.toUSize, usage := [.storage, .copyDst, .copySrc], mappedAtCreation := false }
+          copies := copies.push b
+        pure (slot, copies)
+      else pure (0, (#[] : Array Buffer))
     let mut mn : Float := 1e18
     let mut ts : List Float := []
     for _ in [0:reps] do
       let ms ← do
         if nativeBench && !nativeMsl.isEmpty then
           let (gx, gy, gz) := cfg.numWorkgroups
-          let s ← Hesper.WebGPU.mslBenchSerial device nativeMsl
-            (bufs.map (·.2)).toArray iters.toUInt32 gx.toUInt32 gy.toUInt32 gz.toUInt32
-            cfg.workgroupSize.x.toUInt32
+          let s ← (if rotCopies.size > 1 then
+              Hesper.WebGPU.mslBenchSerialRot device nativeMsl
+                (bufs.map (·.2)).toArray rotSlot.toUInt32 rotCopies
+                iters.toUInt32 gx.toUInt32 gy.toUInt32 gz.toUInt32 cfg.workgroupSize.x.toUInt32
+            else
+              Hesper.WebGPU.mslBenchSerial device nativeMsl
+                (bufs.map (·.2)).toArray iters.toUInt32 gx.toUInt32 gy.toUInt32 gz.toUInt32
+                cfg.workgroupSize.x.toUInt32)
           pure ((parseMs s).getD 1e18 / iters.toFloat)
         else
           let t0 ← IO.monoMsNow

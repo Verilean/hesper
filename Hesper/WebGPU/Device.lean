@@ -74,6 +74,16 @@ opaque mslOccupancyProbe (device : @& Device) (msl : @& String) : IO String
 opaque mslBenchSerial (device : @& Device) (msl : @& String) (bufs : @& Array Buffer)
     (nDispatches gridX gridY gridZ wgX : UInt32) : IO String
 
+/-- DEVPLAN §13 cold-stream bench: like `mslBenchSerial`, but the buffer at `rotSlot`
+    rotates across `copies` per dispatch, so successive dispatches read DIFFERENT
+    memory — cold-stream BW instead of the warm-SLC number (an isolated bench
+    re-reading one weight 300× flattered the matvecs to 90–97 %; a real token streams
+    every weight once). Returns GPU ms for the whole run as a string. -/
+@[extern "lean_hesper_msl_bench_serial_rot"]
+opaque mslBenchSerialRot (device : @& Device) (msl : @& String) (bufs : @& Array Buffer)
+    (rotSlot : UInt32) (copies : @& Array Buffer)
+    (nDispatches gridX gridY gridZ wgX : UInt32) : IO String
+
 /-- M3 de-risk probe: run `nDispatches` of a dumped Tint-MSL kernel back-to-back in ONE
     native Metal encoder with Serial or Concurrent dispatch type (no barriers — timing
     only, racing writes tolerated). Returns GPU wall ms as a string. -/
