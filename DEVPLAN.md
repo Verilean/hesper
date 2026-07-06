@@ -349,3 +349,39 @@ class (grid-size filter in the replay harness) — find where the 13 µs/op aver
 lives: the big matvecs (are they really 90–97 % BW *in-token*, streaming cold weights?)
 vs the small-op tail; (b) the webml quadrant: replay their 44 kernels / ~390-dispatch
 token — if it lands ≈ 4 ms serial, fat-kernel efficiency (not count) is what they prove.
+
+### §9b. The cross-replay (user-directed): llama.cpp's kernels in a bare harness
+
+The user cut through: *"just replay llama.cpp's kernels in our harness."* Implemented
+INSIDE the local fork (ggml-metal-device.m: capture the encoder command stream of the
+GGML_METAL_REPLAY=<n>-th encoder, re-encode 20× on a private queue, GPU-time it —
+same methodology as our Phase A; local fork only, never upstream).
+
+llama.cpp E2B decode token = 2 encoders (84 + 770 = 854 dispatches):
+
+| graph+kernels | ops | serial GPU (min) | as-recorded concurrent (min) | barriers |
+|---|---|---|---|---|
+| llama.cpp | 854 | **6.31 ms** (5.82 + 0.48) | **5.92 ms** | 665+56 of 854 |
+| Hesper (§8, same method) | 572 | **6.78 ms** | ~7.0 (mode-3 hazard) | 547 of 572 |
+
+**Findings:**
+1. llama's decode is ALSO ~86 %-barriered under their own mem_ranges — everyone's
+   decode is a dependency chain; their concurrency is worth ~0.4 ms (6 %), matching
+   the §9 ablation. The "wide graph they kept" story is dead too: nobody has
+   meaningful width.
+2. Same-harness kernel+graph comparison: **854 ops in 6.31 ms (7.4 µs/op) vs our
+   572 ops in 6.78 ms (11.9 µs/op)** — their per-op average is ~1.6× better; more,
+   smaller ops that each cost less. The GPU-side deficit of kernels+graph is
+   **~0.5 ms (serial) to ~0.9 ms (their concurrent vs our serial)** — real but far
+   smaller than any previous theory claimed.
+3. Reconciling totals (llama ~6.9 ms/token vs our native ~9.15): GPU kernels+graph
+   ≈ 0.5–1.3 ms (above, plus our steady-vs-min gap), **host machinery ≈ 1.0–1.2 ms**
+   (our per-dispatch record path + argmax readback 0.55 vs their lean C++ loop).
+   After transport (§8), scheduling (§9), and now kernels+graph (§9b) are all
+   measured, the single biggest UNexplored lever on our side is the host loop and
+   argmax, followed by per-op kernel efficiency parity.
+
+Instrumentation kept in the fork (env-gated, off by default):
+`GGML_METAL_REPLAY_LOG=1` (per-encoder dispatch counts), `GGML_METAL_REPLAY=<n>`
+(capture+replay encoder n). Deadlock note: llama pre-enqueues its CBs, so the replay
+must commit on a PRIVATE MTLCommandQueue.
