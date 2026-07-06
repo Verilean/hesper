@@ -3610,14 +3610,30 @@ def generate [GPUBackend β] (ctx : β) (model : Gemma4Model (GPUBackend.Buf β)
             -- Needs HESPER_TINT_BIN.
             let nativeReplayTok := (← IO.getEnv "HESPER_NATIVE_REPLAY").bind (·.toNat?)
             let captureNow := nativeReplayTok == some decodeForwardsDone
+            -- Exp 2 Phase B: HESPER_NATIVE_DECODE=<n> executes decode forwards #n
+            -- onward NATIVELY: the executeShaderNamed hook records ops and skips the
+            -- Dawn dispatch; commitToken runs the whole token on Dawn's MTLQueue with
+            -- hazard barriers (HESPER_NATIVE_DECODE_MODE overrides; default 3).
+            -- Correctness gate = the generated text.
+            let nativeDecodeTok := (← IO.getEnv "HESPER_NATIVE_DECODE").bind (·.toNat?)
+            let nativeNow : Bool := match nativeDecodeTok with
+              | some n => decide (decodeForwardsDone >= n)
+              | none => false
+            let nativeMode : UInt32 := (((← IO.getEnv "HESPER_NATIVE_DECODE_MODE").bind (·.toNat?)).getD 3).toUInt32
             if captureNow then
               IO.println "[replay] capturing this token's dispatches (tint CLI per unique kernel)…"
               Hesper.WGSL.NativeReplay.startCapture
+            else if nativeNow then
+              Hesper.WGSL.NativeReplay.beginNativeToken
             forwardSingleToken ctx model nextToken newPos state (kcr := some kcr) (skipTokenWrite := dfTokenSkip) (skipPosWrite := dfPosSkip)
             if captureNow then
               let (n, misses) ← Hesper.WGSL.NativeReplay.stopCapture
               IO.println s!"[replay] captured {n} dispatches; misses={misses.length}"
               for m in misses.take 20 do IO.println s!"[replay]   MISS {m}"
+            else if nativeNow then
+              let report ← Hesper.WGSL.NativeReplay.commitToken nativeMode
+              if nativeDecodeTok == some decodeForwardsDone || decodeSectTrace then
+                IO.println s!"[native] tok={decodeForwardsDone}: {report}"
             if deviceFedActive then
               -- Increment pos / cacheLen / posF32 device-side so the *next*
               -- iteration's forward sees the correct values without any host

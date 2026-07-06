@@ -99,10 +99,12 @@ opaque replayBarrier : IO Unit
 /-- Exp 2 Phase A: record one dispatch for native replay. `bufs` must be in MSL
     `[[buffer(i)]]` order (parse the Tint-CLI entry signature); `entry` = the MSL kernel
     function name; `tgBytes` = threadgroup memory upper bound (0 if none; set via
-    setThreadgroupMemoryLength at index 0). PSO compiled once per unique MSL. -/
+    setThreadgroupMemoryLength at index 0); `writeMask` bit i = bufs[i] is written
+    (read_write binding) — drives mode-3 hazard barriers. PSO compiled once per MSL. -/
 @[extern "lean_hesper_replay_record"]
 opaque replayRecord (device : @& Device) (msl : @& String) (entry : @& String)
-    (bufs : @& Array Buffer) (gx gy gz tx ty tz tgBytes : UInt32) : IO Unit
+    (bufs : @& Array Buffer) (gx gy gz tx ty tz tgBytes writeMask : UInt32)
+    (key : UInt64) : IO Unit
 
 /-- Exp 2 Phase A: replay the recorded token in ONE native command buffer.
     mode: 0 = Serial (sanity vs Dawn GPU time), 1 = Concurrent no-barrier (upper bound),
@@ -112,6 +114,14 @@ opaque replayRecord (device : @& Device) (msl : @& String) (entry : @& String)
     backend-generic code. -/
 @[extern "lean_hesper_replay_run"]
 opaque replayRun (mode iters : UInt32) : IO String
+
+/-- Exp 2 Phase B: execute the recorded token ONCE as the REAL computation.
+    Commits to DAWN'S OWN MTLCommandQueue when reachable (single-queue FIFO ordering
+    with Dawn's staging writes and readbacks), waits for completion. mode as in
+    replayRun; 3 = concurrent + automatic hazard barriers. Returns
+    "ms=<gpu ms> barriers=<n> queue=<dawn|own>". -/
+@[extern "lean_hesper_replay_exec"]
+opaque replayExec (mode : UInt32) : IO String
 
 /-- metal_replacer STEP 4: Apple's tuned MPS f16 matmul (C=A·Bᵀ, our reg-matmul shape) as the CEILING —
     returns "ms/call | GFLOPS | %peak". Diff vs the WGSL reg (harness) at the same shape to quantify the
