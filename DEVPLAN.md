@@ -397,7 +397,8 @@ real app in headless Chrome (`--headless=new --use-angle=metal`, WebGPU works; m
 the trace to a local collector; then tint each pipeline (`--overrides` for constants;
 all 53 compiled — including subgroup-matrix kernels) and replay in a ~150-line
 standalone Metal tool with synthesized buffers + real uniform contents.
-Files: scratchpad webml-app/{trace.html, collector.py, convert.py, replayer.mm}.
+Tooling + full HOWTO for all three replay methods (Hesper env-gated harness,
+llama.cpp fork patch, browser WebGPU trace): **`tools/replay/README.md`**.
 
 **Result (2026-07-06):** webml decode token = **316 ops, 53 pipelines, serial GPU
 3.90 ms min (4.47 avg)** — §9's pre-registered prediction (4.5–5.5 ms ≈ their real
