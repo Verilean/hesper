@@ -289,6 +289,22 @@ the changes that mattered (§4.3). A kernel-hot-reload mode (kernels as source s
 reloaded at runtime, as our replayer already does with MSL) would have closed most of
 the gap without abandoning the stack — it was identified only in the post-mortem.
 
+**The layers taxed the author's own loop, not just the machine's.** For an LLM
+author the two costs are the same currency — tokens and turns — and they compound:
+(a) *authoring verbosity*: one semantic edit costs ~3–5× the tokens in the
+expression-tree DSL that it costs in raw WGSL (`Exp.add (Exp.mul x y) z` vs
+`x*y + z`), so every hypothesis is several times more expensive to *write*;
+(b) *context surface*: touching one Hesper kernel means holding the kernel module,
+its call site inside a 3,815-line file, and the execute/backend plumbing in context —
+webml's entire engine is one file — and the two layers that actually misbehaved
+(Tint, Dawn) are not in the context at all, so their failures look like the author's
+own bugs until instruments are built; (c) *cadence breaks*: an 8-minute build between
+hypothesis and result forces the agent to re-orient, and after context compaction, to
+re-derive state it already had. We cannot fully separate these three from the build
+time itself — they act on the same wall-clock — but the direction is unambiguous: the
+added layers lowered the *author's* effective throughput as well as the machine's,
+and for an AI author that penalty is paid per token, on every single iteration.
+
 The last row is the punchline for autotuning: **the fast loop we automated (parameter
 search) is orthogonal to where the wins live.** Every productive move in this record —
 fat epilogue-fused kernels, operand-format changes, deleting round-trips, the frozen
@@ -377,7 +393,7 @@ visibility instruments (§3). (b) *the eval loop must match the agent's step cad
 an agent iterating against seconds-latency feedback keeps its hypothesis chain hot;
 against 8-minute builds it re-orients, re-reads, and burns its context on state
 reconstruction. The measured 30-minutes-vs-days gap at equal author skill (§5) is
-mostly this. For the next generation of GPU tooling, "interpreter-driven, one-file,
+mostly this, compounded by the author-side token economics described in §5. For the next generation of GPU tooling, "interpreter-driven, one-file,
 seconds-feedback" is not ergonomics — it is what makes an LLM author viable.
 
 **P3 — Split the pipeline: explore JIT, verify AOT.** Verification and typed
