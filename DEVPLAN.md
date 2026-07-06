@@ -458,3 +458,37 @@ replayed GPU (3.90 ms) leaves ≲0.3 ms of JS host per token; Chrome encodes via
 the GPU process (overlapped), bind groups are prebuilt, and their loop does almost
 nothing else. Ours was slow because of the per-token Lean walk (~1.3 ms) + record
 path — which frozen mode now eliminates.
+
+---
+
+## §11. Fusion round 2, first tranche (c): factors-less qkvNorm+ropeQ — NEUTRAL
+
+Target chosen by census (572 ops: rope 35 + ropeTail ~12 were the largest single-op
+cluster): fold rope-Q into the per-head norm kernel on the 28 factors-less (SWA)
+layers. The 8-binding variant (no freq_factors) dodges the Tint MSL printer bug that
+parked the 9-binding FULL variant. Commit `f02b207`, opt-in `HESPER_QKNR_SWA=1`.
+
+**Result: −28 dispatches, GPU time UNCHANGED (frozen-native 7.51 ms vs ~7.5 ms).**
+§9c's −0.5…−1.5 ms projection for this tranche is FALSIFIED for small fusions: the
+deleted qBuf2 round-trip is 0.2 MB/token against a 1.26 GB token — op count and small
+round-trips are not the lever; only byte-heavy intermediates would pay (and our
+biggest intermediates are already fused). The variant's rope rounding also flips
+near-tie tokens (poem diverges at token 24; "Paris." holds), so default stays OFF for
+output reproducibility. Remaining fusion candidates (Q6K-V merge ≈ 17 ops of the same
+small class) are now expected NEUTRAL by the same arithmetic — deprioritized.
+
+**Two real finds shipped with it:**
+1. **Writable-storage-aliasing latent bug**: the KV-shared placeholder bound
+   qNormWeight to BOTH q_scale and k_scale. The DSL declares every storage buffer
+   `read_write`, so Dawn rejects the dispatch (writable aliasing). The pre-existing
+   freq variant (HESPER_QKNR) had the same bug since it landed. Fixed in both.
+2. **Batched decode SWALLOWS dispatch validation errors** — the invalid dispatch is
+   silently dropped and decode degenerates with no message (this cost the whole hunt:
+   layer-bisect → "on == RAW input, the kernel never ran" → `HESPER_DECODE_NOBATCH=1`
+   finally surfaced the validation text). Engine TODO: propagate Dawn validation
+   errors in batch mode.
+
+**Where this leaves the ladder:** Dawn 9.8 → native 9.15 → frozen 8.4 ms/token
+(~119 t/s), fusion r2 neutral. Remaining honest levers, in measured-size order:
+per-op kernel efficiency toward llama's ~6.5 µs/op average (our small-op tail),
+argmax deferral (0.55 ms, blocked on the deviceFed fix), then structural ideas.
