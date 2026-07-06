@@ -57,6 +57,12 @@ useful than the engine itself.
 | scheduling | Dawn serial (hardcoded, crbug.com/425987598) | MTLDispatchTypeConcurrent + ggml_mem_ranges | Dawn serial |
 | notable kernel tech | llama-port f32 matvecs, fused QKV/gate-up, autotuned | many thin tuned kernels, N_R0×NSG matvecs | few fat kernels: epilogue-fused norms/adds, int8-SRQ activations, subgroup-matrix |
 
+webml source of record: the Hugging Face Space
+[webml-community/gemma-4-webgpu-kernels](https://huggingface.co/spaces/webml-community/gemma-4-webgpu-kernels)
+([file tree](https://huggingface.co/spaces/webml-community/gemma-4-webgpu-kernels/tree/main) —
+`index.html`, `landing.js`, `gemma-4-e2b.js`; the 44 templated WGSL kernels are embedded
+in the JS bundle and mirrored in this repo at `refs/webml-gemma4/`).
+
 Also referenced: jax-metal (closed PJRT plugin → closed MPSGraph; no kernel authoring
 escape hatch) as the terminal case of the abstraction disease discussed in §5/§5b.
 
@@ -201,7 +207,9 @@ Replaying each kernel class of our token in isolation (class-sum 6.69 vs whole-t
 
 The record contains a control this field rarely gets: **the same author at the same
 skill level worked all three codebases.** webml's page metadata states "Every kernel
-written and optimized by Fable 5"; the Hesper campaigns (both models) were driven by
+written and optimized by Fable 5"
+([source](https://huggingface.co/spaces/webml-community/gemma-4-webgpu-kernels/blob/main/index.html));
+the Hesper campaigns (both models) were driven by
 the same Fable model; llama.cpp is the community-years baseline neither touched.
 
 | case | stack | author-time to result | outcome vs llama.cpp |
