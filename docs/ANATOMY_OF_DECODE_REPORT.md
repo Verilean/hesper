@@ -167,7 +167,11 @@ timing). Full HOWTO: `tools/replay/README.md`.
 
 **Protocol.** Predictions registered in DEVPLAN before measuring (they were wrong
 twice, which is the point); token-sequence equality as the correctness gate for any
-change that touches execution; cool box, no stray processes; negative results recorded.
+change that touches execution; cool box, no stray processes; negative results
+recorded. The reference engines were vendored **in-tree for the entire campaign**
+(`refs/llama.cpp-*`, `refs/webml-gemma4/` — source, kernels, and build) as both
+baselines and required reading; see §5 for how that reading discipline actually
+played out.
 
 **Hazard analysis.** To separate legitimate concurrency from what we call the *race
 mirage*, the replay supports automatic hazard barriers (whole-buffer granularity,
@@ -304,6 +308,30 @@ re-derive state it already had. We cannot fully separate these three from the bu
 time itself — they act on the same wall-clock — but the direction is unambiguous: the
 added layers lowered the *author's* effective throughput as well as the machine's,
 and for an AI author that penalty is paid per token, on every single iteration.
+
+**The answers sat next door the whole time — and the model kept not reading them.**
+Both reference engines were vendored inside the repository, grep-able at zero cost,
+and the working protocol even contained an explicit rule ("read the reference before
+designing"). The author-model violated it three times, each violation caught by the
+human, not the model, and each costing a multi-experiment detour that the reading
+would have prevented:
+1. proposed a **fusion plan** before reading llama.cpp's Metal kernels at all
+   (human: *"did you analyze llama.cpp's kernels?"* — the reading then showed their
+   dispatch machinery, inverting the plan);
+2. proposed a **native-dispatch transport** before the kernel work was finished
+   (human: *"the kernels are bad and autotune isn't done — why native dispatch?"* —
+   native timing then showed the tuned kernel at 43 % BW);
+3. **webml — listed as required reading in the original plan — was read only after
+   the human asked "why is webml at 250 tok/s?"**, and its reading immediately
+   re-founded the entire optimization strategy.
+
+The behavioral finding for AI-assisted development: an LLM author's default failure
+mode is to *generate* hypotheses rather than *consult* adjacent evidence, even when
+the evidence is already in its repository. The human's highest-value contributions in
+this record were not code but exactly two speech acts, repeated: "read the reference
+first" and "prove it." A harness for AI authors should force both mechanically
+(mandatory reference summaries before design tasks; pre-registered predictions before
+measurements) — we adopted both as protocol only after paying for each violation.
 
 The last row is the punchline for autotuning: **the fast loop we automated (parameter
 search) is orthogonal to where the wins live.** Every productive move in this record —
