@@ -785,7 +785,11 @@ def fusedPerHeadQKVNormKernel
     layers (q-only). `ropeBase` is BAKED → must be in the cache key.
     Extra bindings vs the base kernel: `params` (pos at [0]), `freq_factors`. -/
 def fusedPerHeadQKVNormRopeKernel
-    (numHeads numKVHeads headDim : Nat) (eps ropeBase : Float) : ShaderM Unit := do
+    (numHeads numKVHeads headDim : Nat) (eps ropeBase : Float)
+    -- Fusion round 2: `useFreqFactors := false` builds the FACTORS-LESS variant for
+    -- the SWA layers (rope base only, no freq_factors binding — 8 bindings, which
+    -- also dodges the Tint MSL printer bug that parked the 9-binding FULL variant).
+    (useFreqFactors : Bool := true) : ShaderM Unit := do
   let wid ← ShaderM.workgroupId
   let lid ← ShaderM.localId
   let headIdx := Exp.vec3X wid
@@ -805,7 +809,9 @@ def fusedPerHeadQKVNormRopeKernel
   let _vIn    ← ShaderM.declareInputBuffer  "v_in"    (.array (.scalar .f32) kvTotal)
   let _vOut   ← ShaderM.declareOutputBuffer "v_out"   (.array (.scalar .f32) kvTotal)
   let _params ← ShaderM.declareInputBuffer  "params"  (.array (.scalar .u32) 2)
-  let _ff     ← ShaderM.declareInputBuffer  "freq_factors" (.array (.scalar .f32) dimPairs)
+  if useFreqFactors then
+    let _ff ← ShaderM.declareInputBuffer "freq_factors" (.array (.scalar .f32) dimPairs)
+    pure ()
   let wgSize := if headDim < 256 then headDim else 256
   ShaderM.sharedNamed "shared_sum" (.array (.scalar .f32) wgSize)
   ShaderM.sharedNamed "shared_q" (.array (.scalar .f32) headDim)
@@ -873,10 +879,14 @@ def fusedPerHeadQKVNormRopeKernel
       let pos ← ShaderM.readBuffer (ty := .scalar .u32) (n := 2) "params" (Exp.litU32 0)
       let posF32 := Exp.toF32 pos
       ShaderM.loop tid (Exp.litU32 dimPairs) (Exp.litU32 wgSize) fun p => do
-        let freqFactor ← ShaderM.readBuffer (ty := .scalar .f32) (n := dimPairs) "freq_factors" p
         let exponent := Exp.div (Exp.mul (Exp.litF32 2.0) (Exp.toF32 p)) (Exp.litF32 headDim.toFloat)
         let freqInv := Exp.pow (Exp.litF32 ropeBase) (Exp.neg exponent)
-        let theta := Exp.div (Exp.mul posF32 freqInv) freqFactor
+        let theta ← if useFreqFactors then do
+            let freqFactor ← ShaderM.readBuffer (ty := .scalar .f32) (n := dimPairs) "freq_factors" p
+            pure (Exp.div (Exp.mul posF32 freqInv) freqFactor)
+          else
+            -- factors-less (SWA): matches ropeKernelDynamic's computeTheta exactly.
+            pure (Exp.mul posF32 freqInv)
         let cosTheta := Exp.cos theta
         let sinTheta := Exp.sin theta
         let x0 ← ShaderM.readWorkgroup (ty := .scalar .f32) (n := headDim) "shared_q" p
