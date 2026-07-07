@@ -570,11 +570,12 @@ reference material but the engine was written from scratch.
 
 Author time, wall clock: **M0→M3 (empty repo → oracle-token-exact bring-up) = 36
 minutes; M4 (15 → 91.6 tok/s, 6×) ≈ 85 minutes; total ≈ 2 hours.** The bring-up
-passed its golden gate on the **first execution**. For calibration: the hesper
-engine this report dissects took months to reach 80% of llama.cpp on its home
-model; this replication reached 89% on a foreign model before lunch. The
-compact-surface + seconds-TAT effect of §5 is not an anecdote about one codebase —
-it reproduced on demand.
+passed its golden gate on the **first execution**. For calibration: on the hesper
+stack the same author needed days of focused sessions (inside a months-old,
+many-module codebase) to reach ~80% of llama.cpp on its home model; this
+replication reached 89% on a foreign model in ~2 hours. The compact-surface +
+seconds-TAT effect of §5 is not an anecdote about one codebase — it reproduced on
+demand.
 
 ### Predictions vs outcomes
 
