@@ -542,7 +542,102 @@ enough to know entirely, fast enough to try anything* — and for an AI author t
 literally the same budget: tokens and turns. The transferable outputs are the replay
 methodology (three capture adapters + one comparable harness), the falsification
 protocol that repeatedly outperformed our own expert intuition, and this anatomy
-itself.
+itself — and §8 shows the whole method reproducing on a foreign model in one
+morning.
+
+---
+
+## 8. Replication: Gemma-4 E4B from scratch, in one morning
+
+To test whether §6's prescriptions generalize beyond the model they were derived on,
+we replicated the webml experiment on a checkpoint the reference engine was never
+built for: **Gemma-4 E4B QAT-mobile** (3.36 GB safetensors; SRQ static activation
+quantization; int4/int8/int2 mixed weights; per-layer-input (PLE) blocks; KV-shared
+layers). Method exactly as prescribed: a new minimal repo whose entire engine surface
+fits in context (~700 lines of JS + 20 small WGSL files), kernels as data
+(hot-reloaded, no build step), a transformers-CPU golden gate wired to one command,
+headless-Chrome harness, predictions pre-registered before measuring, and the
+author-time wall clock logged as part of the experiment. The webml engine was read as
+reference material but the engine was written from scratch.
+
+### Results (M4 Max 48 GB / 546 GB/s peak; single-stream decode)
+
+| engine | ms/token | tok/s | eff. BW (2.20 GB/token) |
+|---|---|---|---|
+| **ours (scratch WGSL, ~11 dispatches/layer)** | **8.05** | **124.2** | 273 GB/s |
+| webml engine, unmodified + E4B repo id | 8.10 | 123.5 | 272 GB/s |
+| llama.cpp (E4B QAT q4_0, llama-bench tg64) | 9.76 | 102.4 | 225 GB/s |
+
+Author time, wall clock: **M0→M3 (empty repo → oracle-token-exact bring-up) = 36
+minutes; M4 (15 → 124.2 tok/s) ≈ one working day.** The bring-up
+passed its golden gate on the **first execution**. For calibration: on the hesper
+stack the same author needed days of focused sessions (inside a months-old,
+many-module codebase) to reach ~80% of llama.cpp on its home model; this
+replication reached 89% on a foreign model in ~2 hours. The compact-surface +
+seconds-TAT effect of §5 is not an anecdote about one codebase — it reproduced on
+demand.
+
+### Predictions vs outcomes
+
+- **P1 (webml swap runs E4B unmodified): held** — 123.5 tok/s. Config-driven
+  kernels generalize; the swap became the oracle and stretch target.
+- **P2 (llama.cpp at 60–85 tok/s): missed low** — 102.4. Recorded, not rationalized.
+- **P3 (beat llama.cpp): reached and exceeded** — 124.2 tok/s = 121% of llama.cpp,
+  and 0.6% past the webml reference engine itself (the stretch target).
+- **P4 (author time ≤ 2–3 days): beaten by an order of magnitude** (~2 h).
+
+### Findings the original experiment did not surface
+
+1. **Token-exactness against a CPU oracle is unattainable for SRQ checkpoints, by
+   mechanism.** Static per-layer activation grids (steps 0.3–0.98) turn any 1-ulp
+   cross-implementation difference into a full quantization step at a grid
+   boundary; drift stays bounded (SRQ re-snaps each layer) but flips near-tie
+   tokens. The golden gate must be amended to: (a) ≥1 prompt token-exact, (b)
+   cross-engine text agreement, (c) layer-fingerprint ratios ≈ 1.000, (d)
+   coherent, semantically-equal text. Two independent GPU engines (ours and webml)
+   converged word-for-word on outputs where both diverged from the CPU oracle.
+2. **A serialized-dispatch cost model explains browser decode wall time**:
+   `fenced dispatch ≈ bytes / streaming-rate + 9–33 µs fixed ramp/drain`, and
+   greedy decode is a fully linear dependency chain. Once kernels stream near
+   peak (ours: 484 GB/s pure-kernel, 89% of theoretical), **dispatch count is the
+   remaining lever** — the quantitative form of §6's fat-kernel prescription.
+   webml's ~316-op graph sits on the same line.
+3. **The token gate alone masks real bugs.** A 10× matvec under-dispatch passed
+   the token-exact prompt; condition (c) plus a bit-exact fused-vs-explicit
+   differential mode caught it and a second lost-edit bug. Golden gates need a
+   numeric per-layer condition, not just output equality.
+4. **The CPU must leave the decode loop entirely.** Feeding the argmax to the next
+   token's embedding on-GPU (tokens read back in chunks through a ring buffer)
+   removed ~1.6 ms/token of `mapAsync` sync — the single largest M4 step — while
+   reproducing greedy outputs bit-identically.
+5. **The codegen-pathology classes of §4 recurred and were caught by the same
+   method**: dual activation streams defeating load CSE (−25% on the grouped
+   matvec), accumulator arrays spilling registers (484 → 273 GB/s), an 8-register
+   fusion variant collapsing to 92 GB/s. Each was measured, rejected, and logged
+   within minutes — the cadence §5 claims is the point.
+
+### How the last 25% was closed — the levers, in order of discovery
+
+Our int4 matvec initially saturated at ~335 GB/s against 484 for f32; five
+shape/staging variants failed to move it. What moved it was **reading the
+reference** (the failure mode §5 names reference-blindness): webml decodes
+nibbles with `unpack4x8unorm`/`unpack4x8snorm` — single native Metal
+instructions — folding the /255·/127 into the output scale and deferring the −8
+zero-point as a producer-computed Σq. Our `unpack4xU8 → convert → subtract`
+chain is a Tint *polyfill*; the port took the int4 matvecs to 400–445 GB/s
+in-graph. Three further levers finished the job: the same native-unpack idea on
+the int2 lm_head (459 GB/s); replacing barrier-tree reductions (≈50–80
+workgroup barriers per one-WG dispatch!) with subgroupAdd two-level reductions;
+and an f16 repack of the f32 per-layer projection (`unpack2x16float`). Each was
+found by measurement, validated by the gate, and several intermediate
+hypotheses (register-blocked fusions, serial rows, shared staging, a −8
+deferral alone) were measured and rejected on the way — the cadence is the
+method. Two cautionary traps from this leg, both harness-level: Dawn's
+`disable_robustness` silently corrupts this engine (every flag flip must re-run
+the correctness gate, not just the benchmark), and Chrome's persistent-profile
+cache can serve stale JS modules after same-second edits (one "impossible" bug
+each). Full logs, pre-registrations, and the decision trail:
+[`Verilean/e4b-webgpu`](https://github.com/Verilean/e4b-webgpu) (`DEVPLAN.md`).
 
 ---
 
