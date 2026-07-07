@@ -637,7 +637,7 @@ method. Two cautionary traps from this leg, both harness-level: Dawn's
 the correctness gate, not just the benchmark), and Chrome's persistent-profile
 cache can serve stale JS modules after same-second edits (one "impossible" bug
 each). Full logs, pre-registrations, and the decision trail:
-`e4b-webgpu/DEVPLAN.md`.
+[`Verilean/e4b-webgpu`](https://github.com/Verilean/e4b-webgpu) (`DEVPLAN.md`).
 
 ---
 
