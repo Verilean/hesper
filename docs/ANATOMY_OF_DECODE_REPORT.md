@@ -566,10 +566,10 @@ reference material but the engine was written from scratch.
 |---|---|---|---|
 | webml engine, unmodified + E4B repo id | 8.10 | **123.5** | 272 GB/s |
 | llama.cpp (E4B QAT q4_0, llama-bench tg64) | 9.76 | **102.4** | 225 GB/s |
-| **ours (scratch WGSL, ~11 dispatches/layer)** | 10.92 | **91.6** | 201 GB/s |
+| **ours (scratch WGSL, ~11 dispatches/layer)** | 10.06 | **99.4** | 219 GB/s |
 
 Author time, wall clock: **M0→M3 (empty repo → oracle-token-exact bring-up) = 36
-minutes; M4 (15 → 91.6 tok/s, 6×) ≈ 85 minutes; total ≈ 2 hours.** The bring-up
+minutes; M4 (15 → 99.4 tok/s) ≈ half a day.** The bring-up
 passed its golden gate on the **first execution**. For calibration: on the hesper
 stack the same author needed days of focused sessions (inside a months-old,
 many-module codebase) to reach ~80% of llama.cpp on its home model; this
@@ -582,7 +582,7 @@ demand.
 - **P1 (webml swap runs E4B unmodified): held** — 123.5 tok/s. Config-driven
   kernels generalize; the swap became the oracle and stretch target.
 - **P2 (llama.cpp at 60–85 tok/s): missed low** — 102.4. Recorded, not rationalized.
-- **P3 (beat llama.cpp): NOT reached** — 91.6 = 89%. The residual is quantified below.
+- **P3 (beat llama.cpp): NOT reached** — 99.4 = 97%. The residual is quantified below.
 - **P4 (author time ≤ 2–3 days): beaten by an order of magnitude** (~2 h).
 
 ### Findings the original experiment did not surface
@@ -615,15 +615,24 @@ demand.
    fusion variant collapsing to 92 GB/s. Each was measured, rejected, and logged
    within minutes — the cadence §5 claims is the point.
 
-### Honest residual
+### Honest residual — and how reference-reading closed most of it
 
-llama.cpp's native-Metal int4 kernels stream at ~400+ GB/s where our WGSL int4
-matvec saturates at ~335 (partially the second activation-load stream; the
-remainder unattributed after five measured shape/staging variants). Closing the
-last 11% needs either fewer than ~11 fenced dispatches per layer or an int4 inner
-loop the WGSL→Metal path does not currently produce. Both are §6 problems, not
-model problems. Full logs, pre-registrations, and the decision trail:
-`e4b-webgpu/DEVPLAN.md`.
+Our int4 matvec initially saturated at ~335 GB/s against 484 for f32; five
+shape/staging variants failed to move it. What moved it was **reading the
+reference** (the failure mode §5 names reference-blindness): webml decodes
+nibbles with `unpack4x8unorm`/`unpack4x8snorm` — single native Metal
+instructions — folding the /255·/127 into the output scale and deferring the −8
+zero-point as a producer-computed Σq. Our `unpack4xU8 → convert → subtract`
+chain is a Tint *polyfill*; swapping it took the fused gate+up matvec to 432
+GB/s in-graph and the engine from 91.6 to 99.4 tok/s in an afternoon. The last
+3% to llama.cpp (and the path toward webml's 123.5) is the same port applied to
+the remaining matvecs plus webml's op schedule (~316 dispatches vs our ~460) —
+§6 problems, not model problems. Two cautionary traps from this leg, both
+harness-level: Dawn's `disable_robustness` silently corrupts this engine (every
+flag flip must re-run the correctness gate, not just the benchmark), and
+Chrome's persistent-profile cache can serve stale JS modules after same-second
+edits (one "impossible" bug each). Full logs, pre-registrations, and the
+decision trail: `e4b-webgpu/DEVPLAN.md`.
 
 ---
 
