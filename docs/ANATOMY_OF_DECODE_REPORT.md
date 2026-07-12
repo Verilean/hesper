@@ -694,6 +694,20 @@ priced autoregression itself: the identical per-token dispatch list runs at
 embedding must wait on the previous argmax — the ~2.6 ms gap is the lm_head
 serialized into the feedback path, not an engine defect.
 
+**Positioning: the only WebGPU implementation of this model.** We surveyed and
+tested every candidate rather than assuming: webml's engine is E2B-only (no
+QAT-mobile checkpoint exists for A4B — verified in M1); WebLLM/MLC has no
+gemma4 support at all (`Unknown model type: gemma4`); onnx-community ships
+only E2B/E4B exports. The one runnable candidate — llama.cpp's own
+experimental ggml-webgpu backend (the gemma4 fork has MUL_MAT_ID and
+flash-attention in WGSL) — was built against our Dawn install and run on the
+same GGUF: it **crashes in Dawn validation** ("writable storage buffer binding
+aliasing" in `glu_geglu_f32_split` — ggml's strided gate/up views of the fused
+FFN tensor legitimately overlap in one buffer, which WebGPU's aliasing rules
+forbid). That is a structural port gap, not a performance gap, and it
+illustrates why the scratch-engine route was necessary: as far as we can
+determine, this engine is the only working WebGPU path for gemma-4-26B-A4B.
+
 **Verdict for the method**: second replication, same cadence, no regression in
 discipline — and its chief scientific value was *correcting* the first one.
 Full logs: the same repo's `DEVPLAN.md`, Campaign 2 sections.
