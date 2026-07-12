@@ -712,6 +712,53 @@ determine, this engine is the only working WebGPU path for gemma-4-26B-A4B.
 discipline — and its chief scientific value was *correcting* the first one.
 Full logs: the same repo's `DEVPLAN.md`, Campaign 2 sections.
 
+### Campaign 3: the Metal port — the post-mortem tested, and A4B decode SOTA in 25 minutes
+
+Campaign 2's post-mortem attributed the decode gap to the WebGPU
+dispatch-boundary tax. Attribution is cheap, so we pre-registered the
+falsifiable version: *the same kernels behind a single serial Metal compute
+encoder recover the ~2.1 ms and pass llama.cpp* (P8: wall ≤ 9.0 ms; P9: beat
+llama.cpp; P10: bring-up ≤ one ~3 h leg). The design keeps the method's TAT
+thesis intact — kernels remain WGSL, developed and gated in the browser under
+Dawn's always-on validation, then crossed mechanically: a WebGPU trace shim
+captures the engine's dispatch plans (decode: 2 × 306 ops; prefill: 396/456)
+plus a 14.6 GB repacked-weight dump; tint converts each pipeline to MSL; a
+~250-line runner compiles the MSL at **runtime** (kernels stay data on both
+targets) and encodes one serial compute encoder per token with GPU-side
+argmax feedback.
+
+Results, same box / same GGUF / same day:
+
+| | decode tg64 | prefill pp512 |
+|---|---|---|
+| browser engine (WebGPU) | 95.0 tok/s | 1010 tok/s |
+| **Metal runner (same WGSL)** | **127.6 fast-math / 119.6 exact** | **1076** |
+| llama.cpp Metal (fork 73d820a) | 114.6 | 1470 |
+
+Token-exact gates pass on Metal for decode AND prefill, in both math modes.
+P8 hit with a flourish: the Metal decode wall (8.36 ms) equals the WebGPU
+*serialized kernel-sum* to the digit — the boundary tax was the entire
+residual, now a measured fact rather than an attribution. P9 hit: **+11% over
+llama.cpp, A4B decode SOTA on this box.** P10 hit absurdly: **M0 to SOTA took
+25 minutes of wall clock**, because every ingredient existed already (the
+trace-shim and tint-replay tooling of §9c, the Dawn-built tint, the goldens,
+the resident harness). The prefill row completes the diagnosis: Metal buys
+prefill only +6.5% — its boundary cost was already amortized (~5 µs/token at
+M=512) — so the remaining prefill gap to llama.cpp is kernel-level, cleanly
+separated from the platform tax that decode was paying.
+
+Two port traps, documented for the next traveler: tint's robustness sizes UBO
+is indexed by the remapped MSL buffer index, not the WGSL binding (fill it
+wrong and writes silently clamp — the model "ignores" its prompt); and blit
+copies are not dispatches, so they vanish from a compute-op trace. Both are
+runner-infrastructure bugs, not kernel bugs: all 96 traced pipelines crossed
+untouched, because they had been gate-proven under Dawn first. That is the
+two-layer division of labor in one sentence — develop where mistakes are
+loud, deploy where dispatches are free — and the product shape that falls
+out: one WGSL kernel asset ships both the only working WebGPU engine for
+this model (95 tok/s, browser-distributable) and a native Metal engine that
+beats llama.cpp on its home turf.
+
 ---
 
 ## Appendix A. Next-architecture playbook: environment per use case
