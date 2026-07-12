@@ -639,6 +639,65 @@ cache can serve stale JS modules after same-second edits (one "impossible" bug
 each). Full logs, pre-registrations, and the decision trail:
 [`Verilean/e4b-webgpu`](https://github.com/Verilean/e4b-webgpu) (`DEVPLAN.md`).
 
+### Campaign 2: gemma-4-26B-A4B (MoE) — the second replication, and what it falsified
+
+One replication can flatter the method, so we ran it again on a deliberately
+harder target: **gemma-4-26B-A4B** — a 128-expert/top-8 MoE, 14.44 GB q4_0
+GGUF parsed and repacked directly in the browser (no QAT-mobile checkpoint
+exists for this model), dense-parallel-MoE layers, k_eq_v full-attention
+layers, a Q6_K tied lm_head. Same discipline: pre-registered predictions,
+token-exact gates against llama.cpp greedy, quiet-window walls, negative
+results logged. Bring-up to a token-exact engine took under a day; the
+campaign ran as ~six focused legs over five calendar days.
+
+**Decode**: naive 45.1 ms/token → **10.52 ms = 95.0 tok/s** (quiet-window,
+gate-exact) vs llama.cpp 112.51 on the same file and box — **84.4%**. The
+kernel-time sum (serialized profile, 8.36 ms) is *below* llama.cpp's wall
+(8.89): the residual is ~310 dispatch boundaries × ~5–7 µs. A purpose-built
+fence probe quantified the boundary laws on Dawn/Metal: same-buffer
+read-modify-write chains cost a pathological ~87 µs/dispatch, ping-pong RAW
+4–5 µs, WAW 2 µs — which motivated an RMW-free rewrite of the layer chain and
+rejected (with data) the webml "last-workgroup merge" fusion that should have
+helped and instead cost +40–50% on our stack.
+
+**The format-assist finding (a correction to Campaign 1's headline).** Byte
+accounting from the GGUF tensor tables shows the E4B "win" was substantially
+the checkpoint format's: on E4B we read 2.09 GB/token (int2 lm_head) vs
+llama.cpp's 2.68 (Q6_K lm_head) — per effective byte llama.cpp was *faster*
+(275 vs 260 GB/s). On A4B both engines read the same file, and the honest
+per-byte race stands at llama.cpp 268 GB/s vs our 225. The replication method
+surfaced this because the second experiment removed the confound the first
+could not see.
+
+**Prefill (M6)**: batched prefill was built in one leg with a bit-identity
+design (same accumulation order per token → generation after batched prefill
+is token-identical to the sequential gate, which held on first run), then
+optimized through pre-registered steps: subgroup-matrix GEMM with JIT q4_0
+dequant in f32 tiles (prediction HIT), MoE expert grouping (prediction
+MISSED — and the miss falsified the byte model: with only ~124 unique experts
+touched per layer, Apple's SLC already dedupes expert re-reads, so the
+per-token "un-amortized bytes" story was wrong; the real walls were matmul
+shape and routing granularity), and finally chunk-shaped MoE GEMMs (8-entry,
+then 32-entry chunks once M is large enough that n_e = M·K/E fills the tiles):
+
+| prefill | ms/token | tok/s | vs llama.cpp (626 / 1470) |
+|---|---|---|---|
+| token-by-token (start) | 8.0 | 125 | 20% / 9% |
+| batched, M=64 | 2.09 | 478 | 76% |
+| batched, M=512 | **0.99** | **1010** | **69%** |
+
+Expert *selection* (router + top-8 + GPU counting-sort grouping) measures
+1–2% of prefill — the MoE cost is the expert matmuls, and it yields to tile
+shape exactly as far as routing granularity allows. A same-day control also
+priced autoregression itself: the identical per-token dispatch list runs at
+125 tok/s when token IDs are known (prefill) but 94 tok/s when each token's
+embedding must wait on the previous argmax — the ~2.6 ms gap is the lm_head
+serialized into the feedback path, not an engine defect.
+
+**Verdict for the method**: second replication, same cadence, no regression in
+discipline — and its chief scientific value was *correcting* the first one.
+Full logs: the same repo's `DEVPLAN.md`, Campaign 2 sections.
+
 ---
 
 ## Appendix A. Next-architecture playbook: environment per use case
