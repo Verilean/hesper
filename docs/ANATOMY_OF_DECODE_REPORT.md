@@ -759,6 +759,68 @@ out: one WGSL kernel asset ships both the only working WebGPU engine for
 this model (95 tok/s, browser-distributable) and a native Metal engine that
 beats llama.cpp on its home turf.
 
+### Campaign 4: zero-training Mamba-ization of E2B — the method, pointed at model surgery
+
+Campaigns 1-3 tested the method on KERNEL work. Campaign 4 asked whether the
+same discipline (pre-registration, layerwise golden diffing, mechanism-hunting,
+honest negative results) survives contact with MODEL-BEHAVIOR research: convert
+Gemma-4 E2B's attention layers to SSM blocks using ONLY closed-form algebra —
+the "Taylor-Calibrate + cycle-consistency" recipe an external theory sketch
+claimed would reach 95% — with a per-layer Jamba fallback. One overnight
+session, 19 pre-registered predictions: **5 hit, 14 missed — and every miss
+carried its diagnosis**, which is the point.
+
+The measured ladder: init-only = broken text (the "95%" claim falsified at
+cos ≈ 0.63); per-layer least-squares corrections = 3 layers convert FREE
+(ppl ratio 1.01); cascade fitting (each correction trained on the inputs the
+hybrid actually produces) recovers the cross-layer compounding term = 6
+layers at ppl 1.43; a multi-scale decay bank revives behavioral agreement
+that no fitting schedule touched; closed-form selective gating (regressing
+per-position attention decay onto the hidden state — what "Taylor-Calibrate"
+should have meant) gives the best algebra-only result; light distillation of
+the inserted parts adds 5-15% and saturates; ALL 13 convertible layers =
+collapse, and end-to-end distillation cannot descend from a collapsed init.
+Structural findings along the way: E2B's KV-sharing caps conversion at 13/35
+layers with 2 untouchable KV-source layers; QAT checkpoints kill gradients at
+every projection (round() in the quantizer — STE wrappers are mandatory);
+parameter count was never the deficit (the inserted block carries 2× the
+original's parameters and comparable state) — the wall is content-dependent
+retrieval sharpness. The campaign's product is a quantitative map that
+EXPLAINS why every published attention→SSM conversion (LoLCATs, MOHAWK,
+Mamba-in-the-Llama) inserts a distillation pass exactly where it does.
+Full record: `Verilean/e2b-jamba` (40 commits, ~7 h wall, most of it
+unattended background compute).
+
+### Campaign 5: KV-cache compression — the map pays off, and the browser engine gets 8k context
+
+Campaign 4's map said the enemy is retrieval precision, which pointed the
+next campaign at the better-conditioned attack: keep exact softmax retrieval
+and compress the CACHE instead (the SnapKV/TOVA/H2O class — which llama.cpp
+does not ship; it has positional context-shift, cache quantization, and iSWA,
+none of which score importance). Claims scoped honestly: ~80% replication,
+~20% new — and the new part is a mechanism finding: **SnapKV's
+observation-window assumption fails on gemma4** (with prefill-window queries
+the needle ranks 2593/4096 at the deep full layer; scored with the FIRST
+GENERATED token's queries it ranks 0-23 at every layer — retrieval-shaped
+attention appears at generation time, not while reading). The fix costs one
+probe token. Python grid on E2B: generation-query scoring retrieves 9/9
+needles at a 12.5% budget where positional eviction (llama.cpp's class)
+keeps 3/9.
+
+Ported to the A4B WebGPU engine as a budget architecture (sliding layers =
+ring caches; full layers = capacity-capped with in-flight attention-mass
+scoring and periodic GPU compaction; an online-softmax attention kernel
+removes the workgroup-memory context cap): **MAXSEQ 640 → 8192 with fixed
+decode memory and cost.** Needle retrieval is IDENTICAL to the full cache at
+2k/4k/8k (at 8k the budget is 7.8% of context and the standard-phrasing
+needle still comes back from every depth), and budget decode is FASTER than
+full-cache decode — 14% at 2k, **43% at 8k** (12.48 vs 21.82 ms/token). Two
+discipline notes for the record: the full-cache CONTROL run is what kept the
+needle score honest (absolute failures were the model's, identically present
+uncompressed), and the same control exposed a real ring-buffer clobber bug
+whose fix improved the uncompressed baseline itself. Full record:
+`Verilean/e4b-webgpu` `DEVPLAN-KV.md`.
+
 ---
 
 ## Appendix A. Next-architecture playbook: environment per use case
