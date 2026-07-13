@@ -21,53 +21,61 @@ rest"? 19 pre-registered predictions; 5 hit, 14 missed with diagnoses.
 
 ### 1.1 The substituted block
 
-Original attention block, per head $h$ (Gemma-4: RoPE, QK-RMSNorm, GQA):
+Original attention block, per head $`h`$ (Gemma-4: RoPE, QK-RMSNorm, GQA):
 
-$$y_t = W_O\,\mathrm{concat}_h\Big(\sum_s A^{(h)}_{ts} v^{(h)}_s\Big),\qquad
-A^{(h)}_{ts} = \mathrm{softmax}_s\big(q^{(h)}_t\!\cdot k^{(h)}_s/\sqrt{d}\big)$$
+```math
+y_t = W_O\,\mathrm{concat}_h\Big(\sum_s A^{(h)}_{ts} v^{(h)}_s\Big),\qquad
+A^{(h)}_{ts} = \mathrm{softmax}_s\big(q^{(h)}_t \cdot k^{(h)}_s/\sqrt{d}\big)
+```
 
-with $q = \mathrm{RoPE}(\mathrm{RMS}_q(W_Q x))$, $k, v$ likewise. The V0
+with $`q = \mathrm{RoPE}(\mathrm{RMS}_q(W_Q x))`$, $`k, v`$ likewise. The V0
 substitute reuses **all four projections** and replaces only the mixing:
 
-$$\hat y_t = W_O\,\mathrm{concat}_h\Big(\tfrac{\sum_s w_{ts}\,v_s}{\sum_s w_{ts}}\Big),
-\qquad w_{ts} = \phi(q_t)\!\cdot\!\phi(k_s)\;\gamma_h^{\,t-s},\qquad
-\phi(u)=\mathrm{elu}(u/\sqrt{d})+1$$
+```math
+\hat y_t = W_O\,\mathrm{concat}_h\Big(\tfrac{\sum_s w_{ts}\,v_s}{\sum_s w_{ts}}\Big),
+\qquad w_{ts} = \phi(q_t) \cdot \phi(k_s)\;\gamma_h^{t-s},\qquad
+\phi(u)=\mathrm{elu}(u/\sqrt{d})+1
+```
 
 which is exactly a diagonal SSM in recurrent form:
 
-$$S_t = \gamma_h S_{t-1} + \phi(k_t)v_t^{\top},\quad
+```math
+S_t = \gamma_h S_{t-1} + \phi(k_t)v_t^{\top},\quad
 z_t = \gamma_h z_{t-1} + \phi(k_t),\quad
-\hat y_t = \frac{\phi(q_t)^{\top}S_t}{\phi(q_t)^{\top}z_t}.$$
+\hat y_t = \frac{\phi(q_t)^{\top}S_t}{\phi(q_t)^{\top}z_t}.
+```
 
 Parameter accounting (measured, layer 5): the block REUSES the original's
 ~7 M (int4) projections and ADDS ~7.2 M fp32 — capacity was never the
-deficit; state size (3 banks × $d_h^2$ ≈ 197 K floats/head) is comparable to
+deficit; state size (3 banks × $`d_h^2`$ ≈ 197 K floats/head) is comparable to
 the attention window memory (262 K floats/kv-head).
 
 ### 1.2 The closed-form toolchain
 
 **Decay init** ("Taylor-Calibrate", done right): from teacher attention maps,
-fit per-head $\gamma_h$ by log-linear regression of mean attention mass vs
+fit per-head $`\gamma_h`$ by log-linear regression of mean attention mass vs
 distance; later, per-position selective gates
-$\gamma_t = \sigma(w_g\!\cdot\!x_t + b)$ initialized by ridge regression of
-$\mathrm{logit}(\gamma^*_t)$ on $x_t$, where $\gamma^*_t = \bar d_t/(1+\bar d_t)$
-and $\bar d_t = \sum_s A_{ts}(t{-}s)$ is the observed mean attended distance.
+$`\gamma_t = \sigma(w_g \cdot x_t + b)`$ initialized by ridge regression of
+$`\mathrm{logit}(\gamma^*_t)`$ on $`x_t`$, where $`\gamma^*_t = \bar d_t/(1+\bar d_t)`$
+and $`\bar d_t = \sum_s A_{ts}(t-s)`$ is the observed mean attended distance.
 
 **Output correction** ("cycle consistency", demystified): ridge regression
 
-$$W^{*} = \arg\min_W \|X_{\text{out}} - Y W\|_F^2 + \lambda\|W\|_F^2
-        = (Y^{\top}Y + \lambda I)^{-1} Y^{\top} X_{\text{out}}$$
+```math
+W^{*} = \arg\min_W \|X_{\mathrm{out}} - Y W\|_F^2 + \lambda\|W\|_F^2
+        = (Y^{\top}Y + \lambda I)^{-1} Y^{\top} X_{\mathrm{out}}
+```
 
-on calibration activations; with a $K$-channel decay bank the source is the
-concatenation $Y\in\mathbb{R}^{n\times Kd}$ (capacity ladder, closed form).
+on calibration activations; with a $`K`$-channel decay bank the source is the
+concatenation $`Y\in\mathbb{R}^{n\times Kd}`$ (capacity ladder, closed form).
 
 **Cascade** (the multi-layer fix): convert layers in ascending single-layer
-ΔKL order; fit $W_i$ on inputs the CURRENT hybrid actually produces, targets
+ΔKL order; fit $`W_i`$ on inputs the CURRENT hybrid actually produces, targets
 stay the teacher's clean outputs — each correction is a translator AND a
 repair operator for accumulated drift.
 
 **Judge**: everything is selected and scored by
-$\Delta\mathrm{KL} = \mathbb{E}_t\,\mathrm{KL}\big(p_{\text{teacher}}(\cdot|x_{\le t})\,\|\,p_{\text{hybrid}}\big)$
+$`\Delta\mathrm{KL} = \mathbb{E}_t\,\mathrm{KL}\big(p_{\mathrm{teacher}}(\cdot|x_{\le t})\,\|\,p_{\mathrm{hybrid}}\big)`$
 on held-out text — local MSE was measured to be nearly uncorrelated with
 downstream damage (the single most reusable methodological result).
 
@@ -76,9 +84,9 @@ downstream damage (the single most reusable methodological result).
 | step | 6-layer hybrid | note |
 |---|---|---|
 | init only | broken text | "95%" falsified: cos ≈ 0.63 |
-| + per-layer $W$ | 3 layers FREE (ppl ×1.01) | 6+ layers degrade |
+| + per-layer $`W`$ | 3 layers FREE (ppl ×1.01) | 6+ layers degrade |
 | + cascade | ppl ×1.43 | compounding recovered (~30%) |
-| + decay bank ($K{=}3$) | agreement revives | capacity moves what fitting cannot |
+| + decay bank ($`K{=}3`$) | agreement revives | capacity moves what fitting cannot |
 | + selective gate (closed form) | ΔKL 1.48 (best algebra) | −9%, not a breakthrough |
 | + light distillation (inserted parts, STE through QAT) | ppl ×1.36 | +5-15%, saturates |
 | ALL 13 convertible layers | collapse (ppl ×34) | additive damage, dominated by layer 0 |
@@ -86,11 +94,11 @@ downstream damage (the single most reusable methodological result).
 
 **Why it had to fail (the owner's diagnosis, confirmed):** the conversion is
 mechanical but the two operators are different function classes. Softmax
-attention performs *content-addressed, winner-take-most retrieval*: $A_{ts}$
+attention performs *content-addressed, winner-take-most retrieval*: $`A_{ts}`$
 can concentrate on one arbitrary position regardless of distance, with
 per-token concentration (measured: layer 0 outputs match in direction,
 cos 0.77, while magnitudes are wildly off — the row-normalized linear kernel
-flattens per-token concentration). The decayed kernel $w_{ts}$ factorizes
+flattens per-token concentration). The decayed kernel $`w_{ts}`$ factorizes
 through a fixed feature inner product times a decay — a *superposition
 memory* that cannot express sharp addressing. Every closed-form lever bought
 5-15% and composed sub-multiplicatively; the residual is exactly where the
@@ -143,11 +151,11 @@ Mamba-ization failed because it crossed function classes. Two targets stay
 INSIDE the function class, which changes the odds fundamentally:
 
 **4.1 Post-training BitNet/1.58-bit-ization of Gemma-4.** Quantizing
-$W \to \alpha\,\mathrm{tern}(W)$ (per-channel scales, weights in
-$\{-1,0,1\}$) is a *perturbation* of the same linear map, not a substitution.
+$`W \to \alpha\,\mathrm{tern}(W)`$ (per-channel scales, weights in
+$`\{-1,0,1\}`$) is a *perturbation* of the same linear map, not a substitution.
 The toolchain maps one-to-one: closed-form optimal scales per channel;
 Hessian-aware rounding on calibration activations (GPTQ's
-$\arg\min_{\hat W}\|X\hat W - XW\|^2$ is exactly our LS machinery — and our
+$`\arg\min_{\hat W}\|X\hat W - XW\|^2`$ is exactly our LS machinery — and our
 cascade IS GPTQ's sequential-quantization scheme, re-derived independently);
 per-layer ΔKL table → mixed-precision hybrid (sensitive layers stay 4-bit,
 the Jamba fallback pattern). Honest prior: pure 1-bit PTQ without any
@@ -156,8 +164,8 @@ mixed precision and a light distillation of scales only is a plausible
 campaign with real deliverables (memory ÷2.5 vs q4_0 → decode speedup on the
 BW-bound engine).
 
-**4.2 Layer compression (prune/merge).** Replace layer $i$ (or a pair) by
-identity + closed-form $W$; judge by ΔKL; cascade the survivors. Same
+**4.2 Layer compression (prune/merge).** Replace layer $`i`$ (or a pair) by
+identity + closed-form $`W`$; judge by ΔKL; cascade the survivors. Same
 harness, function class preserved (deep-layer redundancy is well documented).
 Both proposals inherit the Campaign-4 lesson intact: judge by KL, cascade the
 fits, keep a hybrid escape hatch, and run the full-precision control.
