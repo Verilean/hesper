@@ -40,37 +40,45 @@ namespace WgslCheck
 
 def U32MAX : Nat := 4294967295
 
-/-- u32 interval (values are non-negative; `hi` capped at U32MAX). -/
+/-- u32 interval. `t` marks a bound TAINTED by unbounded memory reads
+(atomicLoad, unknown buffer contents): such an over-approximate hi must
+demote a violation to WARN — the real invariant is data-dependent and
+outside the interval domain. Thread-id/params-derived bounds stay clean. -/
 structure IVal where
   lo : Nat
   hi : Nat
+  t : Bool := false
 deriving Repr, Inhabited, BEq
 
-def IVal.top : IVal := ⟨0, U32MAX⟩
-def IVal.const (n : Nat) : IVal := ⟨n, n⟩
-def IVal.cap (a : IVal) : IVal := ⟨min a.lo U32MAX, min a.hi U32MAX⟩
+def IVal.top : IVal := ⟨0, U32MAX, false⟩
+def IVal.unk : IVal := ⟨0, U32MAX, true⟩
+def IVal.const (n : Nat) : IVal := ⟨n, n, false⟩
+def IVal.cap (a : IVal) : IVal := ⟨min a.lo U32MAX, min a.hi U32MAX, a.t⟩
 
-def IVal.add (a b : IVal) : IVal := IVal.cap ⟨a.lo + b.lo, a.hi + b.hi⟩
-def IVal.mul (a b : IVal) : IVal := IVal.cap ⟨a.lo * b.lo, a.hi * b.hi⟩
+def IVal.add (a b : IVal) : IVal := IVal.cap ⟨a.lo + b.lo, a.hi + b.hi, a.t ∨ b.t⟩
+def IVal.mul (a b : IVal) : IVal := IVal.cap ⟨a.lo * b.lo, a.hi * b.hi, a.t ∨ b.t⟩
 
 /-- u32 subtraction wraps; only precise when no operand pair can wrap. -/
 def IVal.sub (a b : IVal) : IVal :=
-  if b.hi ≤ a.lo then ⟨a.lo - b.hi, a.hi - b.lo⟩ else IVal.top
+  if b.hi ≤ a.lo then ⟨a.lo - b.hi, a.hi - b.lo, a.t ∨ b.t⟩
+  else ⟨0, U32MAX, a.t ∨ b.t⟩
 
 def IVal.div (a b : IVal) : IVal :=
-  if b.lo > 0 then ⟨a.lo / b.hi, a.hi / b.lo⟩ else ⟨0, a.hi⟩
+  if b.lo > 0 then ⟨a.lo / b.hi, a.hi / b.lo, a.t ∨ b.t⟩ else ⟨0, a.hi, a.t⟩
 
 def IVal.mod (a b : IVal) : IVal :=
   if b.lo > 0 then
-    if a.hi < b.lo then a else ⟨0, b.hi - 1⟩
-  else ⟨0, a.hi⟩
+    if a.hi < b.lo then a else ⟨0, b.hi - 1, b.t⟩   -- bound comes from b
+  else ⟨0, a.hi, a.t⟩
 
-def IVal.band (a b : IVal) : IVal := ⟨0, min a.hi b.hi⟩
-def IVal.shl (a : IVal) (c : Nat) : IVal := IVal.cap ⟨a.lo <<< c, a.hi <<< c⟩
-def IVal.shr (a : IVal) (c : Nat) : IVal := ⟨a.lo >>> c, a.hi >>> c⟩
-def IVal.imin (a b : IVal) : IVal := ⟨min a.lo b.lo, min a.hi b.hi⟩
-def IVal.imax (a b : IVal) : IVal := ⟨max a.lo b.lo, max a.hi b.hi⟩
-def IVal.hull (a b : IVal) : IVal := ⟨min a.lo b.lo, max a.hi b.hi⟩
+def IVal.band (a b : IVal) : IVal :=
+  ⟨0, min a.hi b.hi, if a.hi ≤ b.hi then a.t else b.t⟩
+def IVal.shl (a : IVal) (c : Nat) : IVal := IVal.cap ⟨a.lo <<< c, a.hi <<< c, a.t⟩
+def IVal.shr (a : IVal) (c : Nat) : IVal := ⟨a.lo >>> c, a.hi >>> c, a.t⟩
+def IVal.imin (a b : IVal) : IVal :=
+  ⟨min a.lo b.lo, min a.hi b.hi, if a.hi ≤ b.hi then a.t else b.t⟩
+def IVal.imax (a b : IVal) : IVal := ⟨max a.lo b.lo, max a.hi b.hi, a.t ∨ b.t⟩
+def IVal.hull (a b : IVal) : IVal := ⟨min a.lo b.lo, max a.hi b.hi, a.t ∨ b.t⟩
 
 -- ============================== tokens ===============================
 
@@ -274,7 +282,31 @@ structure StorageVar where
   group : Nat
   binding : Nat
   readWrite : Bool
+  elemBytes : Nat := 0   -- bytes per indexed element (0 = unknown)
 deriving Repr, Inhabited
+
+def scalarBytes : String → Nat
+  | "f32" | "u32" | "i32" => 4
+  | "f16" => 2
+  | _ => 0
+
+/-- element size of the declared type starting at `i` (after the `:`).
+Handles `array<T[, N]>`, `vecN<T>`, scalars, `atomic<u32>`. -/
+def typeElemBytes (p : Prs) (i : Nat) : Nat :=
+  let base (j : Nat) : Nat :=
+    match p.tok j with
+    | .ident "atomic" => 4
+    | .ident v =>
+      if v = "vec2" ∨ v = "vec3" ∨ v = "vec4" then
+        let n := if v = "vec2" then 2 else if v = "vec3" then 3 else 4
+        match p.tok (j+2) with
+        | .ident s => n * scalarBytes s
+        | _ => 0
+      else scalarBytes v
+    | _ => 0
+  match p.tok i with
+  | .ident "array" => if p.isSym (i+1) "<" then base (i+2) else 0
+  | _ => base i
 
 structure Entry where
   name : String
@@ -319,8 +351,9 @@ partial def scanKernel (ts : Array PTok) : Kernel := Id.run do
         i := j + 1
       | _ => i := i + 2
     | .ident "var" =>
-      -- var<storage[, access]> name : ...
-      if p.isSym (i+1) "<" ∧ p.tok (i+2) == .ident "storage" then
+      -- var<storage[, access]> name : T   |   var<uniform> name : T
+      if p.isSym (i+1) "<" ∧
+         (p.tok (i+2) == .ident "storage" ∨ p.tok (i+2) == .ident "uniform") then
         let mut j := i + 3
         let mut rw := false
         if p.isSym j "," then
@@ -328,7 +361,8 @@ partial def scanKernel (ts : Array PTok) : Kernel := Id.run do
           j := j + 2
         if p.isSym j ">" then
           if let .ident nm := p.tok (j+1) then
-            storages := ⟨nm, curGroup, curBinding, rw⟩ :: storages
+            let eb := if p.isSym (j+2) ":" then typeElemBytes p (j+3) else 0
+            storages := ⟨nm, curGroup, curBinding, rw, eb⟩ :: storages
         i := j + 2
       else i := i + 1
     | .ident "fn" =>
@@ -377,47 +411,75 @@ structure Ctx where
   wg : Nat × Nat × Nat
   builtins : List (String × String)
 
+def IVal.inter (a b : IVal) : IVal :=
+  ⟨max a.lo b.lo, min a.hi b.hi, if a.hi ≤ b.hi then a.t else b.t⟩
+
+/-- `let` bindings stay symbolic (re-evaluated at USE site, so guard
+refinements between definition and use take effect); `var`/loop bindings are
+eager intervals. -/
+inductive EnvVal where
+  | expr (e : Expr)
+  | ival (v : IVal)
+
 structure WSt where
-  env : List (String × IVal)      -- innermost first
+  env : List (String × EnvVal)    -- innermost first
+  refin : List (String × IVal)    -- guard refinements: var name or "vec.comp"
   sguards : List (Expr × IVal)    -- known: expr < bound
   finds : Array Finding
 
-def envGet (st : WSt) (x : String) : Option IVal :=
-  st.env.lookup x
+def envSetLet (st : WSt) (x : String) (e : Expr) : WSt :=
+  { st with env := (x, .expr e) :: st.env.filter (·.1 ≠ x),
+            refin := st.refin.filter (·.1 ≠ x) }
 
-def envSet (st : WSt) (x : String) (v : IVal) : WSt :=
-  { st with env := (x, v) :: st.env.filter (·.1 ≠ x) }
+def envSetVar (st : WSt) (x : String) (v : IVal) : WSt :=
+  { st with env := (x, .ival v) :: st.env.filter (·.1 ≠ x),
+            refin := st.refin.filter (·.1 ≠ x) }
+
+def refinOf (st : WSt) (key : String) : IVal :=
+  (st.refin.lookup key).getD .top
+
+def refinAdd (st : WSt) (key : String) (v : IVal) : WSt :=
+  { st with refin := (key, (refinOf st key).inter v) :: st.refin.filter (·.1 ≠ key) }
+
+/-- refinement key for guard subjects: plain vars and builtin components. -/
+def refinKey : Expr → Option String
+  | .var v => some v
+  | .member (.var v) m => some (v ++ "." ++ m)
+  | _ => none
 
 def dim (t : Nat × Nat × Nat) (c : Nat) : Nat :=
   match c with | 0 => t.1 | 1 => t.2.1 | _ => t.2.2
 
 def builtinComp (cx : Ctx) (bname : String) (c : Nat) : IVal :=
   match bname with
-  | "global_invocation_id" => ⟨0, dim cx.grid c * dim cx.wg c - 1⟩
-  | "local_invocation_id" => ⟨0, dim cx.wg c - 1⟩
-  | "workgroup_id" => ⟨0, dim cx.grid c - 1⟩
+  | "global_invocation_id" => ⟨0, dim cx.grid c * dim cx.wg c - 1, false⟩
+  | "local_invocation_id" => ⟨0, dim cx.wg c - 1, false⟩
+  | "workgroup_id" => ⟨0, dim cx.grid c - 1, false⟩
   | "num_workgroups" => .const (dim cx.grid c)
-  | _ => .top
+  | _ => .unk
 
 partial def evalE (cx : Ctx) (st : WSt) : Expr → IVal
   | .num n => .const n
-  | .flt => .top
+  | .flt => .unk
   | .var x =>
-    match envGet st x with
-    | some v => v
-    | none =>
-      match cx.builtins.lookup x with
-      | some "local_invocation_index" =>
-        ⟨0, dim cx.wg 0 * dim cx.wg 1 * dim cx.wg 2 - 1⟩
-      | some "subgroup_invocation_id" => ⟨0, 127⟩
-      | some "subgroup_size" => ⟨1, 128⟩
-      | _ => .top
+    let base := match st.env.lookup x with
+      | some (.ival v) => v
+      | some (.expr e) => evalE cx st e
+      | none =>
+        match cx.builtins.lookup x with
+        | some "local_invocation_index" =>
+          ⟨0, dim cx.wg 0 * dim cx.wg 1 * dim cx.wg 2 - 1, false⟩
+        | some "subgroup_invocation_id" => ⟨0, 127, false⟩
+        | some "subgroup_size" => ⟨1, 128, false⟩
+        | _ => .unk
+    base.inter (refinOf st x)
   | .member (.var x) m =>
     let c := if m = "x" then 0 else if m = "y" then 1 else if m = "z" then 2 else 0
-    match cx.builtins.lookup x with
-    | some b => builtinComp cx b c
-    | none => .top
-  | .member _ _ => .top
+    let base := match cx.builtins.lookup x with
+      | some b => builtinComp cx b c
+      | none => .unk
+    base.inter (refinOf st (x ++ "." ++ m))
+  | .member _ _ => .unk
   | .index (.var b) ie =>
     -- a read from a buffer whose contents the manifest supplies (e.g. a
     -- params UBO recorded by the trace) evaluates to a constant
@@ -425,20 +487,20 @@ partial def evalE (cx : Ctx) (st : WSt) : Expr → IVal
     if iv.lo = iv.hi then
       match cx.bufVal b iv.lo with
       | some v => .const v
-      | none => .top
-    else .top
-  | .index _ _ => .top
+      | none => .unk
+    else .unk
+  | .index _ _ => .unk
   | .call f args =>
     let vs := args.map (evalE cx st)
     match f, vs with
     | "min", [a, b] => a.imin b
     | "max", [a, b] => a.imax b
-    | "clamp", [_, a, b] => ⟨a.lo, b.hi⟩
+    | "clamp", [_, a, b] => ⟨a.lo, b.hi, a.t ∨ b.t⟩
     | "select", [a, b, _] => a.hull b
     | "u32", [a] => a
     | "i32", [a] => a
-    | "arrayLength", [_] => .top
-    | _, _ => .top
+    | "arrayLength", [_] => .unk
+    | _, _ => .unk
   | .bin op a b =>
     let va := evalE cx st a
     let vb := evalE cx st b
@@ -449,15 +511,15 @@ partial def evalE (cx : Ctx) (st : WSt) : Expr → IVal
     | "/" => va.div vb
     | "%" => va.mod vb
     | "&" => va.band vb
-    | "|" => IVal.cap ⟨max va.lo vb.lo, va.hi + vb.hi⟩
-    | "^" => IVal.cap ⟨0, va.hi + vb.hi⟩
-    | "<<" => if vb.lo = vb.hi then va.shl vb.lo else .top
-    | ">>" => if vb.lo = vb.hi then va.shr vb.lo else ⟨0, va.hi⟩
-    | _ => .top
+    | "|" => IVal.cap ⟨max va.lo vb.lo, va.hi + vb.hi, va.t ∨ vb.t⟩
+    | "^" => IVal.cap ⟨0, va.hi + vb.hi, va.t ∨ vb.t⟩
+    | "<<" => if vb.lo = vb.hi then va.shl vb.lo else .unk
+    | ">>" => if vb.lo = vb.hi then va.shr vb.lo else ⟨0, va.hi, va.t⟩
+    | _ => .unk
   | .un op a =>
     match op with
     | "&" | "*" => evalE cx st a
-    | _ => .top
+    | _ => .unk
 
 /-- refine `st` with condition `c` known to be `pos`. -/
 partial def applyCond (cx : Ctx) (c : Expr) (pos : Bool) (st : WSt) : WSt :=
@@ -473,22 +535,18 @@ partial def applyCond (cx : Ctx) (c : Expr) (pos : Bool) (st : WSt) : WSt :=
       let s := match g with
         | some sg => { s with sguards := sg :: s.sguards }
         | none => s
-      match x with
-      | .var v =>
-        let cur := (envGet s v).getD .top
-        envSet s v ⟨cur.lo, min cur.hi bound⟩
-      | _ => s
+      match refinKey x with
+      | some k => refinAdd s k ⟨0, bound, false⟩
+      | none => s
     let refineLo (x : Expr) (bound : Nat) (s : WSt) : WSt :=
-      match x with
-      | .var v =>
-        let cur := (envGet s v).getD .top
-        envSet s v ⟨max cur.lo bound, cur.hi⟩
-      | _ => s
+      match refinKey x with
+      | some k => refinAdd s k ⟨bound, U32MAX, false⟩
+      | none => s
     match op, pos with
     | "<", true => refineHi a (vb.hi - 1) (some (a, vb)) st
-    | "<=", true => refineHi a vb.hi (some (a, ⟨vb.lo + 1, vb.hi + 1⟩)) st
+    | "<=", true => refineHi a vb.hi (some (a, ⟨vb.lo + 1, vb.hi + 1, vb.t⟩)) st
     | ">=", false => refineHi a (vb.hi - 1) (some (a, vb)) st   -- !(a>=b) → a<b
-    | ">", false => refineHi a vb.hi (some (a, ⟨vb.lo + 1, vb.hi + 1⟩)) st
+    | ">", false => refineHi a vb.hi (some (a, ⟨vb.lo + 1, vb.hi + 1, vb.t⟩)) st
     | ">=", true => refineLo a vb.lo st
     | ">", true => refineLo a (vb.lo + 1) st
     | "<", false => refineLo a vb.lo st
@@ -496,14 +554,59 @@ partial def applyCond (cx : Ctx) (c : Expr) (pos : Bool) (st : WSt) : WSt :=
     | "==", true =>
       let st := refineHi a vb.hi none st
       let st := refineLo a vb.lo st
-      -- symmetric: refine b by a
-      (match b with
-       | .var v =>
-         let cur := (envGet st v).getD .top
-         envSet st v ⟨max cur.lo va.lo, min cur.hi va.hi⟩
-       | _ => st)
+      match refinKey b with
+      | some k => refinAdd st k va
+      | none => st
     | _, _ => st
   | _, _ => st
+
+/-- decide a condition statically when the intervals are decisive
+(kills template-disabled branches like `if (0u == 1u)`). -/
+partial def condTruth (cx : Ctx) (st : WSt) : Expr → Option Bool
+  | .un "!" a => (condTruth cx st a).map (!·)
+  | .bin "&&" a b =>
+    match condTruth cx st a, condTruth cx st b with
+    | some false, _ | _, some false => some false
+    | some true, some true => some true
+    | _, _ => none
+  | .bin "||" a b =>
+    match condTruth cx st a, condTruth cx st b with
+    | some true, _ | _, some true => some true
+    | some false, some false => some false
+    | _, _ => none
+  | .bin op a b =>
+    let va := evalE cx st a
+    let vb := evalE cx st b
+    match op with
+    | "<" => if va.hi < vb.lo then some true
+             else if va.lo ≥ vb.hi then some false else none
+    | "<=" => if va.hi ≤ vb.lo then some true
+              else if va.lo > vb.hi then some false else none
+    | ">" => if va.lo > vb.hi then some true
+             else if va.hi ≤ vb.lo then some false else none
+    | ">=" => if va.lo ≥ vb.hi then some true
+              else if va.hi < vb.lo then some false else none
+    | "==" => if va.lo = va.hi ∧ vb.lo = vb.hi ∧ va.lo = vb.lo then some true
+              else if va.hi < vb.lo ∨ vb.hi < va.lo then some false else none
+    | "!=" => if va.hi < vb.lo ∨ vb.hi < va.lo then some true
+              else if va.lo = va.hi ∧ vb.lo = vb.hi ∧ va.lo = vb.lo then some false
+              else none
+    | _ => none
+  | _ => none
+
+/-- skip a `{ … }` block starting just after its `{`; returns position after
+the matching `}`. -/
+partial def skipBlock (p : Prs) (i : Nat) : Nat := Id.run do
+  let mut d := 1
+  let mut j := i
+  while j < p.ts.size do
+    match p.tok j with
+    | .sym "{" => d := d + 1; j := j + 1
+    | .sym "}" =>
+      d := d - 1; j := j + 1
+      if d = 0 then return j
+    | _ => j := j + 1
+  return j
 
 def checkStore (cx : Ctx) (st : WSt) (bufName : String) (idx : Expr)
     (line : Nat) : WSt :=
@@ -516,13 +619,16 @@ def checkStore (cx : Ctx) (st : WSt) (bufName : String) (idx : Expr)
     else
       let iv := evalE cx st idx
       if iv.hi < elems then st
-      else if iv.hi < U32MAX then
+      else if ¬iv.t then
+        -- bound derived from thread-id/params arithmetic: trustworthy
         { st with finds := st.finds.push ⟨.fail, line, bufName,
           s!"store index max {iv.hi} ≥ {elems} elems — excess threads \
              clamp-write the last element, racing its owner (guard the store)"⟩ }
       else
+        -- tainted by unbounded memory reads: the real invariant is
+        -- data-dependent and outside the interval domain
         { st with finds := st.finds.push ⟨.warn, line, bufName,
-          s!"store index cannot be bounded by the checker (elems {elems}) — \
+          s!"store index cannot be bounded (elems {elems}; data-dependent) — \
              inspect manually"⟩ }
 
 /-- skip one statement (to `;` at depth 0); returns position after `;`. -/
@@ -571,7 +677,7 @@ partial def walkBlock (cx : Ctx) (st0 : WSt) (i0 : Nat) : WSt × Nat := Id.run d
         if p.isSym j "=" then
           match parseExpr p (j + 1) with
           | some (e, k) =>
-            st := envSet st x (evalE cx st e)
+            st := envSetLet st x e
             i := if p.isSym k ";" then k + 1 else skipStmt p k
           | none => i := skipStmt p (j + 1)
         else i := skipStmt p j
@@ -586,17 +692,42 @@ partial def walkBlock (cx : Ctx) (st0 : WSt) (i0 : Nat) : WSt × Nat := Id.run d
         if p.isSym j "=" then
           match parseExpr p (j + 1) with
           | some (e, k) =>
-            st := envSet st x (evalE cx st e)
+            st := envSetVar st x (evalE cx st e)
             i := if p.isSym k ";" then k + 1 else skipStmt p k
           | none => i := skipStmt p (j + 1)
         else
-          st := envSet st x .top
+          st := envSetVar st x .top
           i := skipStmt p j
       | _ => i := skipStmt p (i + 1)
     | .ident "if" =>
       match parseCondAfterIf cx st i with
       | some (cond, bodyStart) =>
-        if isBailBlock p bodyStart then
+        if condTruth cx st cond == some false then
+          -- template-disabled branch: dead code, skip; walk any else as live
+          let k := skipBlock p bodyStart
+          if p.tok k == .ident "else" ∧ p.isSym (k+1) "{" then
+            let (st', k2) := walkBlock cx st (k + 2)
+            st := { st with finds := st'.finds }
+            i := k2
+          else if p.tok k == .ident "else" then
+            let (st', k2) := walkStmtAt cx st (k + 1)
+            st := { st with finds := st'.finds }
+            i := k2
+          else
+            i := k
+        else if condTruth cx st cond == some true then
+          if isBailBlock p bodyStart then
+            -- unconditional bail: the rest of this block is dead
+            let mut k := skipBlock p bodyStart
+            while ¬(p.isSym k "}") ∧ k < p.ts.size do k := skipStmt p k
+            return (st, k + 1)
+          else
+            let (st', k) := walkBlock cx st bodyStart
+            st := { st with finds := st'.finds }
+            i := if p.tok k == .ident "else" then
+                   (if p.isSym (k+1) "{" then skipBlock p (k+2) else skipStmt p (k+1))
+                 else k
+        else if isBailBlock p bodyStart then
           -- early-exit guard: continue with ¬cond
           st := applyCond cx cond false st
           i := bodyStart + 3
@@ -639,15 +770,17 @@ partial def walkBlock (cx : Ctx) (st0 : WSt) (i0 : Nat) : WSt × Nat := Id.run d
               let vinit := evalE cx st einit
               if p.isSym k2 ";" then
                 if let some (econd, _) := parseExpr p (k2 + 1) then
+                  -- inside the body the condition has just been checked, so
+                  -- the loop variable is bounded by the condition alone
                   match econd with
                   | .bin "<" (.var y) b =>
                     if y = x then
                       let vb := evalE cx st b
-                      loopVar := some (x, ⟨vinit.lo, max vinit.hi (vb.hi - 1)⟩)
+                      loopVar := some (x, ⟨vinit.lo, vb.hi - 1, vb.t⟩)
                   | .bin "<=" (.var y) b =>
                     if y = x then
                       let vb := evalE cx st b
-                      loopVar := some (x, ⟨vinit.lo, max vinit.hi vb.hi⟩)
+                      loopVar := some (x, ⟨vinit.lo, vb.hi, vb.t⟩)
                   | _ => pure ()
       -- find the loop body `{`
       let mut k := i + 1
@@ -661,7 +794,7 @@ partial def walkBlock (cx : Ctx) (st0 : WSt) (i0 : Nat) : WSt × Nat := Id.run d
         | _ => k := k + 1
       if p.isSym k "{" then
         let stB := match loopVar with
-          | some (x, v) => envSet st x v
+          | some (x, v) => envSetVar st x v
           | none => st
         let (st', k2) := walkBlock cx stB (k + 1)
         st := { st with finds := st'.finds }
@@ -699,12 +832,12 @@ partial def walkBlock (cx : Ctx) (st0 : WSt) (i0 : Nat) : WSt × Nat := Id.run d
       else if p.isSym (i+1) "=" then
         match parseExpr p (i + 2) with
         | some (e, k) =>
-          st := envSet st x (evalE cx st e)
+          st := envSetVar st x (evalE cx st e)
           i := if p.isSym k ";" then k + 1 else skipStmt p k
         | none => i := skipStmt p (i + 2)
       else if p.isSym (i+1) "+=" ∨ p.isSym (i+1) "-=" ∨ p.isSym (i+1) "*=" ∨
               p.isSym (i+1) "/=" ∨ p.isSym (i+1) "%=" then
-        st := envSet st x .top
+        st := envSetVar st x .top
         i := skipStmt p (i + 2)
       else
         i := skipStmt p i
@@ -721,11 +854,14 @@ partial def walkStmtAt (cx : Ctx) (st : WSt) (i : Nat) : WSt × Nat :=
       let (st', k) := walkBlock cx stT bodyStart
       let st := { st with finds := st'.finds }
       if p.tok k == .ident "else" then
+        -- the else side sees ¬cond (essential for else-if chains: the final
+        -- else must carry every negated condition of the chain)
+        let stF := applyCond cx cond false st
         if p.isSym (k+1) "{" then
-          let (st'', k2) := walkBlock cx st (k + 2)
+          let (st'', k2) := walkBlock cx stF (k + 2)
           ({ st with finds := st''.finds }, k2)
         else
-          let (st'', k2) := walkStmtAt cx st (k + 1)
+          let (st'', k2) := walkStmtAt cx stF (k + 1)
           ({ st with finds := st''.finds }, k2)
       else (st, k)
     | none => (st, skipStmt p (i + 1))
@@ -748,7 +884,8 @@ structure Binding where
   name : Option String
   group : Option Nat
   bindingNo : Option Nat
-  elems : Nat
+  elems : Option Nat           -- element count, or
+  bytes : Option Nat           -- byte size (elems derived from the declared type)
   values : List (Option Nat)   -- known contents (index → value), [] if unknown
 
 structure Dispatch where
@@ -772,15 +909,17 @@ def parseManifest (j : Json) : Option (List Dispatch) := do
                  (g.getD 1 (Json.num 1) |> jNat).getD 1,
                  (g.getD 2 (Json.num 1) |> jNat).getD 1)
     let bs ← jArr (← jGet d "bindings")
-    let bindings ← bs.toList.mapM fun b => do
-      let elems ← jNat (← jGet b "elems")
+    let bindings := bs.toList.filterMap fun b => do
       let values := match jGet b "values" >>= jArr with
         | some vs => vs.toList.map jNat
         | none => []
+      let elems := jGet b "elems" >>= jNat
+      let bytes := jGet b "bytes" >>= jNat
+      if elems.isNone ∧ bytes.isNone then none else
       return { name := jGet b "name" >>= jStr,
                group := jGet b "group" >>= jNat,
                bindingNo := jGet b "binding" >>= jNat,
-               elems, values : Binding }
+               elems, bytes, values : Binding }
     return { kernel, entry, grid, bindings : Dispatch }
 
 def findBinding (storages : List StorageVar) (bs : List Binding)
@@ -795,8 +934,14 @@ def findBinding (storages : List StorageVar) (bs : List Binding)
   return none
 
 def resolveElems (storages : List StorageVar) (bs : List Binding)
-    (bufName : String) : Option Nat :=
-  (findBinding storages bs bufName).map (·.elems)
+    (bufName : String) : Option Nat := do
+  let b ← findBinding storages bs bufName
+  match b.elems with
+  | some e => some e
+  | none => do
+    let bytes ← b.bytes
+    let sv ← storages.find? (·.name = bufName)
+    if sv.elemBytes > 0 then some (bytes / sv.elemBytes) else none
 
 def resolveVal (storages : List StorageVar) (bs : List Binding)
     (bufName : String) (idx : Nat) : Option Nat := do
@@ -834,7 +979,7 @@ def main (args : List String) : IO UInt32 := do
       elemsOf := resolveElems k.storages d.bindings,
       bufVal := resolveVal k.storages d.bindings,
       grid := d.grid, wg := e.wg, builtins := e.builtins }
-    let st0 : WSt := { env := [], sguards := [], finds := #[] }
+    let st0 : WSt := { env := [], refin := [], sguards := [], finds := #[] }
     let (st, _) := walkBlock cx st0 e.bodyStart
     let (gx, gy, gz) := d.grid
     let (wx, wy, wz) := e.wg
