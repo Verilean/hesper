@@ -7,6 +7,7 @@ import Hesper.WebGPU.Buffer
 import Hesper.WebGPU.Shader
 import Hesper.WebGPU.Pipeline
 import Hesper.WGSL.NativeReplay
+import Hesper.WGSL.JSTrace
 import Hesper.Logging
 
 namespace Hesper.WGSL.Execute
@@ -228,10 +229,15 @@ def forward (device : Device) (layer : BitLinear) ... := do
 ```
 -/
 
-/-- Pre-computed dispatch: pipeline + bind group, ready for instant replay -/
+/-- Pre-computed dispatch: pipeline + bind group, ready for instant replay.
+    The trace* fields carry JS-trace identity through replay (DG_TRACE_JS);
+    zero-cost defaults otherwise. -/
 structure PreparedDispatch where
   pipeline : ComputePipeline
   bindGroup : BindGroup
+  traceKey : UInt64 := 0
+  traceName : String := ""
+  traceBufs : Array (String × UInt64) := #[]
 
 /-! ## Command Buffer Batching
 
@@ -276,6 +282,7 @@ def endBatch (device : Device) : IO Unit := do
   | some encoder => do
     let count ← batchDispatchCountRef.get
     logVerbose s!"[Batch] Submitting {count} recorded dispatches"
+    JSTrace.flush
     submitAndWait device encoder
     batchEncoderRef.set none
     batchDispatchCountRef.set 0
@@ -289,6 +296,7 @@ def flushBatch (device : Device) : IO Unit := do
   match ← batchEncoderRef.get with
   | none => throw <| IO.userError "flushBatch: not in batch mode"
   | some encoder => do
+    JSTrace.flush
     submitNoWait device encoder
     let enc ← createCommandEncoder device
     batchEncoderRef.set (some enc)
@@ -431,6 +439,8 @@ def withSection (name : String) (act : IO α) : IO α := do
     Works in both batch mode (record into shared encoder) and standalone mode. -/
 def replayPreparedDispatch (device : Device) (prepared : PreparedDispatch)
     (wx wy wz : Nat) : IO Unit := do
+  if ← JSTrace.armed then
+    JSTrace.dispatch prepared.traceKey prepared.traceName (wx, wy, wz) prepared.traceBufs
   match ← batchEncoderRef.get with
   | some encoder =>
     recordDispatch encoder prepared.pipeline prepared.bindGroup wx.toUInt32 wy.toUInt32 wz.toUInt32
@@ -560,6 +570,7 @@ def bindKernelDirect (device : Device) (kernel : CompiledKernel)
     Zero string matching. Works in both batch mode and standalone mode. -/
 def dispatchKernel (device : Device) (kernel : CompiledKernel) (bindGroup : BindGroup)
     (numWorkgroups : Nat × Nat × Nat) : IO Unit := do
+  JSTrace.untraced   -- buffer identities are not visible on this path
   let (wx, wy, wz) := numWorkgroups
   match ← batchEncoderRef.get with
   | some encoder =>
@@ -673,6 +684,7 @@ def executeShaderNamed
         cacheMissesRef.modify (· + 1)
         -- Generate WGSL (may already have been done for hash)
         let wgslSource := compileToWGSL computation config.funcName config.workgroupSize config.extensions config.diagnostics
+        JSTrace.kernel sourceHash wgslSource
         let shaderModule ← createShaderModule device wgslSource
         let state := ShaderM.exec computation
         let declaredNames := state.declaredBuffers.map (·.1)
@@ -723,9 +735,22 @@ def executeShaderNamed
       bindGroupCacheRef.modify (·.insert bgKey bg)
       pure bg
 
+  -- JS trace: buffer identities in declared binding order
+  let traceBufs : Array (String × UInt64) ← do
+    if ← JSTrace.enabled then
+      let l ← declaredNames.filterMapM fun name => do
+        match namedBuffers.find? (·.fst == name) with
+        | some (_, buf) => return some (name, ← getBufferId buf)
+        | none => return none
+      pure (l : List _).toArray
+    else pure #[]
+  if ← JSTrace.armed then
+    JSTrace.dispatch sourceHash config.funcName config.numWorkgroups traceBufs
+
   -- Save PreparedDispatch for future instant replay (first token only)
   if let some ref := preparedRef then
-    ref.set (some { pipeline, bindGroup })
+    ref.set (some { pipeline, bindGroup, traceKey := sourceHash,
+                    traceName := config.funcName, traceBufs })
 
   -- Check if we're in batch mode
   let (wx, wy, wz) := config.numWorkgroups

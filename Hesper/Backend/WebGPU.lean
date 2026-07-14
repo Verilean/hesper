@@ -54,6 +54,7 @@ private def keyedPipelinesEnabled : IO Bool := do
   allocBufferUsage device size _usage :=
     createBuffer device { size, usage := [.storage, .copyDst, .copySrc], mappedAtCreation := false }
   freeBuffer _device _buf := pure ()
+  bufferUid _device buf := getBufferId buf
   writeBuffer device buf data :=
     Hesper.WebGPU.writeBuffer device buf 0 data
   writeBufferOffset device buf offset data :=

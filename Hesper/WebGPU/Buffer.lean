@@ -1,6 +1,7 @@
 import Hesper.WebGPU.Types
 import Hesper.Basic
 import Hesper.Logging
+import Hesper.WGSL.JSTrace
 
 namespace Hesper.WebGPU
 
@@ -11,6 +12,10 @@ structure BufferDescriptor where
   mappedAtCreation : Bool   -- Whether to map at creation
   deriving Inhabited
 
+/-- Early alias of `getBufferId` (declared before first use; same FFI symbol). -/
+@[extern "lean_hesper_buffer_id"]
+opaque getBufferIdEarly (buffer : @& Buffer) : IO UInt64
+
 /-- Create a GPU buffer.
     Resources are automatically cleaned up by Lean's GC via External finalizers. -/
 @[extern "lean_hesper_create_buffer"]
@@ -19,7 +24,10 @@ opaque createBufferImpl (device : @& Device) (desc : @& BufferDescriptor) : IO B
 /-- Wrapper with debug output -/
 def createBuffer (device : @& Device) (desc : @& BufferDescriptor) : IO Buffer := do
   Hesper.Logging.logVerbose s!"[Lean] createBuffer: size={desc.size}, usage={desc.usage.length} items, mapped={desc.mappedAtCreation}"
-  createBufferImpl device desc
+  let buf ← createBufferImpl device desc
+  if ← Hesper.WGSL.JSTrace.enabled then
+    Hesper.WGSL.JSTrace.bufCreated (← getBufferIdEarly buf) desc.size.toNat
+  return buf
 
 /-- Write data to a buffer from the CPU.
     @param buffer The target buffer
@@ -27,7 +35,14 @@ def createBuffer (device : @& Device) (desc : @& BufferDescriptor) : IO Buffer :
     @param data Pointer to source data (ByteArray)
 -/
 @[extern "lean_hesper_write_buffer"]
-opaque writeBuffer (device : @& Device) (buffer : @& Buffer) (offset : USize) (data : @& ByteArray) : IO Unit
+opaque writeBufferImpl (device : @& Device) (buffer : @& Buffer) (offset : USize) (data : @& ByteArray) : IO Unit
+
+/-- writeBuffer with an optional JS-trace hook (DG_TRACE_JS): records small
+writes (params, canvases) with contents so a replayer can reproduce them. -/
+def writeBuffer (device : @& Device) (buffer : @& Buffer) (offset : USize) (data : @& ByteArray) : IO Unit := do
+  if ← Hesper.WGSL.JSTrace.armed then
+    Hesper.WGSL.JSTrace.write (← getBufferIdEarly buffer) offset.toNat data
+  writeBufferImpl device buffer offset data
 
 /-- Map a buffer for reading.
     Returns the mapped data as a ByteArray.
@@ -36,7 +51,14 @@ opaque writeBuffer (device : @& Device) (buffer : @& Buffer) (offset : USize) (d
     @param size Size in bytes to map
 -/
 @[extern "lean_hesper_map_buffer_read"]
-opaque mapBufferRead (device : @& Device) (buffer : @& Buffer) (offset : USize) (size : USize) : IO ByteArray
+opaque mapBufferReadImpl (device : @& Device) (buffer : @& Buffer) (offset : USize) (size : USize) : IO ByteArray
+
+/-- mapBufferRead with a JS-trace hook: readbacks are the replayer's sync
+points (logits → CPU commit logic). -/
+def mapBufferRead (device : @& Device) (buffer : @& Buffer) (offset : USize) (size : USize) : IO ByteArray := do
+  if ← Hesper.WGSL.JSTrace.armed then
+    Hesper.WGSL.JSTrace.read (← getBufferIdEarly buffer) offset.toNat size.toNat
+  mapBufferReadImpl device buffer offset size
 
 /-- Unmap a previously mapped buffer -/
 @[extern "lean_hesper_unmap_buffer"]

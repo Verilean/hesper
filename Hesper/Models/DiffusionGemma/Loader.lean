@@ -1,3 +1,4 @@
+import Hesper.WGSL.JSTrace
 import Hesper.Backend
 import Hesper.Backend.WebGPU
 import Hesper.Backend.CUDA
@@ -111,7 +112,10 @@ private def streamTensors [GPUBackend β] (ctx : β) (path : String) (gguf : Hes
       else
         readToEnd h ByteArray.empty
     if data.size ≥ streamThreshold then
-      bufs := bufs.insert ti.name (← uploadBuffer ctx data)
+      let buf ← uploadBuffer ctx data
+      if ← Hesper.WGSL.JSTrace.enabled then
+        Hesper.WGSL.JSTrace.tensor (← GPUBackend.bufferUid ctx buf) ti.name
+      bufs := bufs.insert ti.name buf
     else
       f32s := f32s.insert ti.name data
     cursor := off + data.size

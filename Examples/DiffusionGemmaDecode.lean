@@ -1134,6 +1134,7 @@ def lmHeadDiag (device : Device)
   IO.println s!"[lmdiag] Paris(9079): f32={f32L[9079]!} dp4a={dpL[9079]!} | the(506): f32={f32L[506]!} dp4a={dpL[506]!}"
   IO.println s!"[lmdiag] chunk-0 logit relRMS(dp4a vs f32)={rel}% → big=BUG, small=precision"
 
+set_option maxHeartbeats 1600000 in
 def main (args : List String) : IO Unit := do
   let path := args.head?.getD "diffusiongemma-26B-A4B-it-Q4_K_M.gguf"
   let prompt := (args.drop 1).head?.getD "The capital of France is"
@@ -1508,6 +1509,16 @@ def main (args : List String) : IO Unit := do
   let mut loopTotalMs : Nat := 0
   let mut effSteps : Nat := 0
   for step in [0:decodeSteps] do
+    -- DG_TRACE_JS: record exactly step 0 (all pipelines compile fresh there,
+    -- so every kernel's WGSL is dumped; later steps replay the same plan
+    -- with different params/canvas contents)
+    if step == 0 then
+      Hesper.WGSL.JSTrace.arm
+      Hesper.WGSL.JSTrace.mark "step-begin"
+    if step == 1 then
+      Hesper.WGSL.JSTrace.mark "step-end"
+      Hesper.WGSL.JSTrace.save
+      Hesper.WGSL.JSTrace.disarm
     if prof then rAttn.set 0; rDense.set 0; rMoe.set 0; rRest.set 0; rBattn.set 0; rAttnO.set 0; rQkn.set 0; rMoeGrp.set 0; rMoeGU.set 0; rMoeGeglu.set 0; rMoeQ80.set 0; rMoeDown.set 0; rMoeSc.set 0
     let remaining := masked.foldl (fun acc b => if b then acc+1 else acc) 0
     if remaining > 0 then
@@ -1636,7 +1647,7 @@ def main (args : List String) : IO Unit := do
         -- dense FFN
         if step == 0 && (← IO.getEnv "DG_QFMT").isSome then
           let qfs := fun (q : Hesper.Layers.Linear.QuantFormat) => match q with
-            | .Q4_K => "Q4_K" | .Q8_0 => "Q8_0" | .Q5_0 => "Q5_0" | .Q6_K => "Q6_K"
+            | .Q4_K => "Q4_K" | .Q8_0 => "Q8_0" | .Q5_0 => "Q5_0" | .Q6_K => "Q6_K" | .F16 => "F16"
           IO.println s!"[qfmt L{li}] wQ={qfs blk.attention.wQ.quantFormat} wK={qfs blk.attention.wK.quantFormat} wV={qfs blk.attention.wV.quantFormat} wO={qfs blk.attention.wO.quantFormat} | dense gate={qfs blk.ffn.gate.quantFormat} down={qfs blk.ffn.down.quantFormat}"
         Hesper.Layers.RMSNorm.forward device blk.ffnNorm sPA sN N
         unless qkvRB do qK device sN N dim (hash ("qNf",li))
