@@ -1707,3 +1707,11 @@ lean_exe «diffusiongemma-decode» where
   root := `Examples.DiffusionGemmaDecode
   supportInterpreter := false
   moreLinkArgs := stdLinkArgs
+
+-- ----------------------------------------------------------------------------
+-- wgsl-check: static write-bounds checker for WGSL compute kernels
+-- (pure Lean, no FFI; see tools/WgslCheck/Main.lean and specs/wgslcheck/)
+lean_exe «wgsl-check» where
+  srcDir := "tools"
+  root := `WgslCheck.Main
+  supportInterpreter := false
