@@ -1528,17 +1528,20 @@ def main (args : List String) : IO Unit := do
   let mut loopTotalMs : Nat := 0
   let mut effSteps : Nat := 0
   for step in [0:decodeSteps] do
-    -- DG_TRACE_JS two-phase capture: step 1 collects the referenced-buffer
-    -- set (kernels were all compiled during step 0 and dumped regardless);
-    -- at step-2 START the missing-provenance buffers are dumped — the
-    -- PRE-state of the recorded step — then step 2 itself is recorded as
-    -- the replay stream.
-    if step == 1 then
+    -- DG_TRACE_JS capture: record steps 0-2 as marker-separated streams
+    -- (step 0's dispatch set differs structurally: the SC path only runs
+    -- for step > 0 — a replayer must use the step-0 stream for its step 0
+    -- and the step-2 stream for all later steps). Buffer dump at step-2
+    -- start (weights identical all steps; cross-step SC state is zeroed /
+    -- dynamically written by the replayer).
+    if step == 0 then
       Hesper.WGSL.JSTrace.arm
+      Hesper.WebGPU.jsTraceDumpAllRegistry device
+      Hesper.WGSL.JSTrace.mark "step-0"
+    if step == 1 then
+      Hesper.WGSL.JSTrace.mark "step-1"
     if step == 2 then
-      Hesper.WebGPU.jsTraceDumpMissing device
-      Hesper.WGSL.JSTrace.clearOps
-      Hesper.WGSL.JSTrace.mark "step-begin"
+      Hesper.WGSL.JSTrace.mark "step-2"
     if step == 3 then
       Hesper.WGSL.JSTrace.mark "step-end"
       Hesper.WebGPU.jsTraceDumpPost device

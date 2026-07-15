@@ -160,6 +160,22 @@ def jsTraceDumpWith (device : Device) (suffix : String) : IO Unit := do
 
 def jsTraceDumpMissing (device : Device) : IO Unit := jsTraceDumpWith device ".bin"
 
+/-- dump EVERY registry buffer (no ref-set needed): call at step-0 START so
+the replayer gets the true PRE-step-0 state — pre-step-N dumps left stale
+step-(N-1) content in the unwritten tails of reused scratch buffers, which
+poisoned window-based comparisons (R19). -/
+def jsTraceDumpAllRegistry (device : Device) : IO Unit := do
+  if (← IO.getEnv "DG_TRACE_JS_DUMP").isNone then return
+  let some d ← Hesper.WGSL.JSTrace.outDirGet | return
+  let reg ← jsTraceRegistryRef.get
+  let mut bytes := 0
+  for (uid, (buf, size)) in reg do
+    let data ← mapBufferReadImpl device buf 0 size.toUSize
+    unmapBuffer buf
+    IO.FS.writeBinFile s!"{d}/b{uid}.bin" data
+    bytes := bytes + size
+  IO.println s!"[JSTrace] dumped ALL {reg.size} registry buffers ({bytes / 1000000} MB) as *.bin (pre-step-0)"
+
 /-- post-state dump (after the recorded step): the replayer compares every
 buffer against these to LOCALIZE the first diverging kernel. -/
 def jsTraceDumpPost (device : Device) : IO Unit := jsTraceDumpWith device ".post.bin"

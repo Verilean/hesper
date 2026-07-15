@@ -453,11 +453,14 @@ def jsTraceCksum (device : Device) (uids : Array (String × UInt64))
         | some (_, sz) => sz
         | none => 4096
       | none => 4096
-    let data ← Hesper.WebGPU.mapBufferReadImpl device buf 0 (USize.ofNat (min 4096 size))
+    -- sample the MIDDLE of the buffer (position ~N/2), not the head: head-only
+    -- windows validated only position 0's row and hid position-dependent
+    -- divergence (R19)
+    let off := if size > 8192 then ((size / 2) / 4096) * 4096 else 0
+    let len := min 4096 (size - off)
+    let data ← Hesper.WebGPU.mapBufferReadImpl device buf (USize.ofNat off) (USize.ofNat len)
     Hesper.WebGPU.unmapBuffer buf
     hs := hs.push (JSTrace.fnv32 data)
-    -- 4KB snapshot per checksummed buffer: lets the replayer byte-diff a
-    -- mismatch (LSB rounding vs gross logic difference)
     if let some d ← JSTrace.outDirGet then
       let n ← JSTrace.dispCntRef.get
       IO.FS.writeBinFile s!"{d}/c{n}_{i}.bin" data
