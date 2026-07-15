@@ -82,7 +82,7 @@ def dispatch (sourceHash : UInt64) (name : String) (grid : Nat × Nat × Nat)
     for (_, u) in bufs do refUidsRef.modify (·.insert u true)
   let (x, y, z) := grid
   let bs := ",".intercalate (bufs.toList.map fun (n, u) => s!"[\"{n}\",{u}]")
-  emit s!"\{\"t\":\"d\",\"k\":{sourceHash},\"n\":\"{name}\",\"g\":[{x},{y},{z}],\"b\":[{bs}]}"
+  emit s!"\{\"t\":\"d\",\"k\":\"{sourceHash}\",\"n\":\"{name}\",\"g\":[{x},{y},{z}],\"b\":[{bs}]}"
 
 def write (uid : UInt64) (offset : Nat) (data : ByteArray) : IO Unit := do
   if ¬(← armed) then return
@@ -92,8 +92,13 @@ def write (uid : UInt64) (offset : Nat) (data : ByteArray) : IO Unit := do
   else
     emit s!"\{\"t\":\"w\",\"u\":{uid},\"o\":{offset},\"s\":{data.size}}"
 
-def read (uid : UInt64) (offset size : Nat) : IO Unit := do
-  emit s!"\{\"t\":\"r\",\"u\":{uid},\"o\":{offset},\"s\":{size}}"
+/-- readback event; contents ≤ 2MB are recorded so a replayer can gate on
+bit-equality without porting the CPU logic that consumes them. -/
+def read (uid : UInt64) (offset size : Nat) (data : ByteArray) : IO Unit := do
+  if data.size ≤ 2097152 then
+    emit s!"\{\"t\":\"r\",\"u\":{uid},\"o\":{offset},\"s\":{size},\"hex\":\"{toHex data}\"}"
+  else
+    emit s!"\{\"t\":\"r\",\"u\":{uid},\"o\":{offset},\"s\":{size}}"
 
 def flush : IO Unit := do
   emit "{\"t\":\"f\"}"
@@ -109,16 +114,19 @@ def tensor (uid : UInt64) (name : String) : IO Unit := do
 
 def outDirGet : IO (Option String) := dirRef.get
 
+/-- drop accumulated ops (used between the ref-collection step and the
+recorded replay step). -/
+def clearOps : IO Unit := opsRef.set #[]
+
 /-- uids referenced by traced dispatches that have NEITHER GGUF tensor
 provenance NOR recorded write contents — the derived buffers a replayer
 must load from .bin dumps. -/
 def missingUids : IO (Array UInt64) := do
   let refs ← refUidsRef.get
-  let hexs ← hexUidsRef.get
   let tens := (← tensorsRef.get).map (·.1)
   let mut out := #[]
   for (u, _) in refs do
-    if ¬(tens.contains u) ∧ ¬(hexs.contains u) then out := out.push u
+    if ¬(tens.contains u) then out := out.push u
   return out
 
 def untraced : IO Unit := do

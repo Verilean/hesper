@@ -64,9 +64,10 @@ opaque mapBufferReadImpl (device : @& Device) (buffer : @& Buffer) (offset : USi
 /-- mapBufferRead with a JS-trace hook: readbacks are the replayer's sync
 points (logits → CPU commit logic). -/
 def mapBufferRead (device : @& Device) (buffer : @& Buffer) (offset : USize) (size : USize) : IO ByteArray := do
+  let data ← mapBufferReadImpl device buffer offset size
   if ← Hesper.WGSL.JSTrace.armed then
-    Hesper.WGSL.JSTrace.read (← getBufferIdEarly buffer) offset.toNat size.toNat
-  mapBufferReadImpl device buffer offset size
+    Hesper.WGSL.JSTrace.read (← getBufferIdEarly buffer) offset.toNat size.toNat data
+  return data
 
 /-- Unmap a previously mapped buffer -/
 @[extern "lean_hesper_unmap_buffer"]
@@ -139,7 +140,7 @@ namespace Hesper.WebGPU
 /-- DG_TRACE_JS_DUMP=1: after `JSTrace.save`, dump every referenced buffer
 without provenance (derived weights: predequants, repacks — and activations,
 harmless) as `b<uid>.bin` so the JS replayer can load them directly. -/
-def jsTraceDumpMissing (device : Device) : IO Unit := do
+def jsTraceDumpWith (device : Device) (suffix : String) : IO Unit := do
   if (← IO.getEnv "DG_TRACE_JS_DUMP").isNone then return
   let some d ← Hesper.WGSL.JSTrace.outDirGet | return
   let reg ← jsTraceRegistryRef.get
@@ -151,10 +152,16 @@ def jsTraceDumpMissing (device : Device) : IO Unit := do
     | some (buf, size) =>
       let data ← mapBufferReadImpl device buf 0 size.toUSize
       unmapBuffer buf
-      IO.FS.writeBinFile s!"{d}/b{uid}.bin" data
+      IO.FS.writeBinFile s!"{d}/b{uid}{suffix}" data
       dumped := dumped + 1
       bytes := bytes + size
     | none => pure ()
-  IO.println s!"[JSTrace] dumped {dumped}/{miss.size} derived buffers ({bytes / 1000000} MB)"
+  IO.println s!"[JSTrace] dumped {dumped}/{miss.size} buffers ({bytes / 1000000} MB) as *{suffix}"
+
+def jsTraceDumpMissing (device : Device) : IO Unit := jsTraceDumpWith device ".bin"
+
+/-- post-state dump (after the recorded step): the replayer compares every
+buffer against these to LOCALIZE the first diverging kernel. -/
+def jsTraceDumpPost (device : Device) : IO Unit := jsTraceDumpWith device ".post.bin"
 
 end Hesper.WebGPU

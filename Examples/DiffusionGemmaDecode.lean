@@ -1509,17 +1509,22 @@ def main (args : List String) : IO Unit := do
   let mut loopTotalMs : Nat := 0
   let mut effSteps : Nat := 0
   for step in [0:decodeSteps] do
-    -- DG_TRACE_JS: record exactly step 0 (all pipelines compile fresh there,
-    -- so every kernel's WGSL is dumped; later steps replay the same plan
-    -- with different params/canvas contents)
-    if step == 0 then
-      Hesper.WGSL.JSTrace.arm
-      Hesper.WGSL.JSTrace.mark "step-begin"
+    -- DG_TRACE_JS two-phase capture: step 1 collects the referenced-buffer
+    -- set (kernels were all compiled during step 0 and dumped regardless);
+    -- at step-2 START the missing-provenance buffers are dumped — the
+    -- PRE-state of the recorded step — then step 2 itself is recorded as
+    -- the replay stream.
     if step == 1 then
+      Hesper.WGSL.JSTrace.arm
+    if step == 2 then
+      Hesper.WebGPU.jsTraceDumpMissing device
+      Hesper.WGSL.JSTrace.clearOps
+      Hesper.WGSL.JSTrace.mark "step-begin"
+    if step == 3 then
       Hesper.WGSL.JSTrace.mark "step-end"
+      Hesper.WebGPU.jsTraceDumpPost device
       Hesper.WGSL.JSTrace.save
       Hesper.WGSL.JSTrace.disarm
-      Hesper.WebGPU.jsTraceDumpMissing device
     if prof then rAttn.set 0; rDense.set 0; rMoe.set 0; rRest.set 0; rBattn.set 0; rAttnO.set 0; rQkn.set 0; rMoeGrp.set 0; rMoeGU.set 0; rMoeGeglu.set 0; rMoeQ80.set 0; rMoeDown.set 0; rMoeSc.set 0
     let remaining := masked.foldl (fun acc b => if b then acc+1 else acc) 0
     if remaining > 0 then
