@@ -1048,6 +1048,13 @@ def bmm (device : Device) (layer : Hesper.Layers.Linear.LinearLayer B C) (inB ou
     return
   let cfg := layer.config
   let bufs := ("weights", layer.weightBuf)::("input", inB)::("output", outB)::List.nil
+  -- DG_Q6KWARP=1: warp-per-row Q6_K matmul instead of the block-parallel
+  -- fusedQ6KBatchKernel (11/256 active threads + a ~530KB un-CSE'd WGSL body that
+  -- Chrome's Tint executes at ~4.2s/dispatch — 13 Q6_K layers = 55s/step in the
+  -- JS engine; native Metal absorbs it). Same binds, reads raw f32 input.
+  if layer.quantFormat == .Q6_K && (← IO.getEnv "DG_Q6KWARP").isSome then
+    disp2w device (Hesper.Layers.Linear.fusedQ6KBatchF32WarpKernel cfg.inDim cfg.outDim N) bufs cfg.outDim N 32 key
+    return
   let k := match layer.quantFormat with
     | .Q8_0 => Hesper.Layers.Linear.fusedQ8_0BatchKernel cfg N
     | .Q5_0 => Hesper.Layers.Linear.fusedQ5_0BatchKernel cfg N
