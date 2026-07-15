@@ -112,6 +112,28 @@ def bufCreated (uid : UInt64) (size : Nat) : IO Unit := do
 def tensor (uid : UInt64) (name : String) : IO Unit := do
   if ← enabled then tensorsRef.modify (·.push (uid, name))
 
+initialize cksumRef : IO.Ref Bool ← IO.mkRef false
+initialize dispCntRef : IO.Ref Nat ← IO.mkRef 0
+
+initialize do
+  if (← IO.getEnv "DG_TRACE_JS_CKSUM").isSome then cksumRef.set true
+
+@[inline] def cksumOn : IO Bool := do
+  return (← cksumRef.get) ∧ (← armedRef.get)
+
+/-- FNV-1a 32-bit over the first `n` bytes (mirrored by the JS replayer). -/
+def fnv32 (b : ByteArray) (n : Nat := 4096) : UInt32 := Id.run do
+  let mut h : UInt32 := 0x811c9dc5
+  for i in [0:min n b.size] do
+    h := (h ^^^ (b[i]!).toUInt32) * 16777619
+  return h
+
+def cksum (hs : Array UInt32) : IO Unit := do
+  let n ← dispCntRef.get
+  dispCntRef.modify (· + 1)
+  let l := ",".intercalate (hs.toList.map toString)
+  emit s!"\{\"t\":\"c\",\"n\":{n},\"hs\":[{l}]}"
+
 def outDirGet : IO (Option String) := dirRef.get
 
 /-- drop accumulated ops (used between the ref-collection step and the
@@ -122,12 +144,11 @@ def clearOps : IO Unit := opsRef.set #[]
 provenance NOR recorded write contents — the derived buffers a replayer
 must load from .bin dumps. -/
 def missingUids : IO (Array UInt64) := do
+  -- dump EVERYTHING referenced (incl. GGUF-provenance buffers): the replayer
+  -- prefers .bin dumps and uses GGUF ranges only as fallback — removes the
+  -- range-fetch/repack uncertainty from the parity equation entirely
   let refs ← refUidsRef.get
-  let tens := (← tensorsRef.get).map (·.1)
-  let mut out := #[]
-  for (u, _) in refs do
-    if ¬(tens.contains u) then out := out.push u
-  return out
+  return refs.toList.toArray.map (·.1)
 
 def untraced : IO Unit := do
   if ← armed then untracedRef.modify (· + 1)
