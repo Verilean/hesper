@@ -1519,6 +1519,7 @@ def main (args : List String) : IO Unit := do
       Hesper.WGSL.JSTrace.mark "step-end"
       Hesper.WGSL.JSTrace.save
       Hesper.WGSL.JSTrace.disarm
+      Hesper.WebGPU.jsTraceDumpMissing device
     if prof then rAttn.set 0; rDense.set 0; rMoe.set 0; rRest.set 0; rBattn.set 0; rAttnO.set 0; rQkn.set 0; rMoeGrp.set 0; rMoeGU.set 0; rMoeGeglu.set 0; rMoeQ80.set 0; rMoeDown.set 0; rMoeSc.set 0
     let remaining := masked.foldl (fun acc b => if b then acc+1 else acc) 0
     if remaining > 0 then

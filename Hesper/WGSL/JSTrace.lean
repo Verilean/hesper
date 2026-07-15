@@ -35,6 +35,8 @@ initialize opsRef : IO.Ref (Array String) ← IO.mkRef #[]
 initialize bufSizesRef : IO.Ref (Array (UInt64 × Nat)) ← IO.mkRef #[]
 initialize tensorsRef : IO.Ref (Array (UInt64 × String)) ← IO.mkRef #[]
 initialize untracedRef : IO.Ref Nat ← IO.mkRef 0
+initialize refUidsRef : IO.Ref (Std.HashMap UInt64 Bool) ← IO.mkRef {}
+initialize hexUidsRef : IO.Ref (Std.HashMap UInt64 Bool) ← IO.mkRef {}
 
 /-- one-time env read: DG_TRACE_JS=<outdir> enables tracing. -/
 initialize do
@@ -76,6 +78,8 @@ def kernel (sourceHash : UInt64) (wgsl : String) : IO Unit := do
 
 def dispatch (sourceHash : UInt64) (name : String) (grid : Nat × Nat × Nat)
     (bufs : Array (String × UInt64)) : IO Unit := do
+  if ← armed then
+    for (_, u) in bufs do refUidsRef.modify (·.insert u true)
   let (x, y, z) := grid
   let bs := ",".intercalate (bufs.toList.map fun (n, u) => s!"[\"{n}\",{u}]")
   emit s!"\{\"t\":\"d\",\"k\":{sourceHash},\"n\":\"{name}\",\"g\":[{x},{y},{z}],\"b\":[{bs}]}"
@@ -83,6 +87,7 @@ def dispatch (sourceHash : UInt64) (name : String) (grid : Nat × Nat × Nat)
 def write (uid : UInt64) (offset : Nat) (data : ByteArray) : IO Unit := do
   if ¬(← armed) then return
   if data.size ≤ 65536 then
+    hexUidsRef.modify (·.insert uid true)
     emit s!"\{\"t\":\"w\",\"u\":{uid},\"o\":{offset},\"s\":{data.size},\"hex\":\"{toHex data}\"}"
   else
     emit s!"\{\"t\":\"w\",\"u\":{uid},\"o\":{offset},\"s\":{data.size}}"
@@ -101,6 +106,20 @@ def bufCreated (uid : UInt64) (size : Nat) : IO Unit := do
 
 def tensor (uid : UInt64) (name : String) : IO Unit := do
   if ← enabled then tensorsRef.modify (·.push (uid, name))
+
+def outDirGet : IO (Option String) := dirRef.get
+
+/-- uids referenced by traced dispatches that have NEITHER GGUF tensor
+provenance NOR recorded write contents — the derived buffers a replayer
+must load from .bin dumps. -/
+def missingUids : IO (Array UInt64) := do
+  let refs ← refUidsRef.get
+  let hexs ← hexUidsRef.get
+  let tens := (← tensorsRef.get).map (·.1)
+  let mut out := #[]
+  for (u, _) in refs do
+    if ¬(tens.contains u) ∧ ¬(hexs.contains u) then out := out.push u
+  return out
 
 def untraced : IO Unit := do
   if ← armed then untracedRef.modify (· + 1)

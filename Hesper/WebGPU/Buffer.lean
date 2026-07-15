@@ -16,6 +16,12 @@ structure BufferDescriptor where
 @[extern "lean_hesper_buffer_id"]
 opaque getBufferIdEarly (buffer : @& Buffer) : IO UInt64
 
+/-- JS-trace registry: uid → (buffer, size). Populated only when DG_TRACE_JS
+is set (keeps the buffers alive for the post-save dump — acceptable in a
+trace run). -/
+initialize jsTraceRegistryRef :
+    IO.Ref (Std.HashMap UInt64 (Buffer × Nat)) ← IO.mkRef {}
+
 /-- Create a GPU buffer.
     Resources are automatically cleaned up by Lean's GC via External finalizers. -/
 @[extern "lean_hesper_create_buffer"]
@@ -26,7 +32,9 @@ def createBuffer (device : @& Device) (desc : @& BufferDescriptor) : IO Buffer :
   Hesper.Logging.logVerbose s!"[Lean] createBuffer: size={desc.size}, usage={desc.usage.length} items, mapped={desc.mappedAtCreation}"
   let buf ← createBufferImpl device desc
   if ← Hesper.WGSL.JSTrace.enabled then
-    Hesper.WGSL.JSTrace.bufCreated (← getBufferIdEarly buf) desc.size.toNat
+    let uid ← getBufferIdEarly buf
+    Hesper.WGSL.JSTrace.bufCreated uid desc.size.toNat
+    jsTraceRegistryRef.modify (·.insert uid (buf, desc.size.toNat))
   return buf
 
 /-- Write data to a buffer from the CPU.
@@ -123,5 +131,30 @@ def bytesToFloatArray (bytes : ByteArray) : Array Float :=
     let b3 := bytes.get! (offset + 3)
     let bits : UInt32 := b0.toUInt32 ||| (b1.toUInt32 <<< 8) ||| (b2.toUInt32 <<< 16) ||| (b3.toUInt32 <<< 24)
     Hesper.Basic.float32BitsToFloat64 bits
+
+end Hesper.WebGPU
+
+namespace Hesper.WebGPU
+
+/-- DG_TRACE_JS_DUMP=1: after `JSTrace.save`, dump every referenced buffer
+without provenance (derived weights: predequants, repacks — and activations,
+harmless) as `b<uid>.bin` so the JS replayer can load them directly. -/
+def jsTraceDumpMissing (device : Device) : IO Unit := do
+  if (← IO.getEnv "DG_TRACE_JS_DUMP").isNone then return
+  let some d ← Hesper.WGSL.JSTrace.outDirGet | return
+  let reg ← jsTraceRegistryRef.get
+  let miss ← Hesper.WGSL.JSTrace.missingUids
+  let mut dumped := 0
+  let mut bytes := 0
+  for uid in miss do
+    match reg[uid]? with
+    | some (buf, size) =>
+      let data ← mapBufferReadImpl device buf 0 size.toUSize
+      unmapBuffer buf
+      IO.FS.writeBinFile s!"{d}/b{uid}.bin" data
+      dumped := dumped + 1
+      bytes := bytes + size
+    | none => pure ()
+  IO.println s!"[JSTrace] dumped {dumped}/{miss.size} derived buffers ({bytes / 1000000} MB)"
 
 end Hesper.WebGPU
