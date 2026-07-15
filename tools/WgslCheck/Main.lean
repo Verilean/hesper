@@ -506,7 +506,14 @@ partial def evalE (cx : Ctx) (st : WSt) : Expr → IVal
     let vb := evalE cx st b
     match op with
     | "+" => va.add vb
-    | "-" => va.sub vb
+    | "-" =>
+      -- mod idiom: `x - (x / c) * c` = `x % c` (Tint/codegen emit this form)
+      match b with
+      | .bin "*" (.bin "/" a' c) c' =>
+        if a' == a ∧ c' == c then va.mod (evalE cx st c) else va.sub vb
+      | .bin "*" c' (.bin "/" a' c) =>
+        if a' == a ∧ c' == c then va.mod (evalE cx st c) else va.sub vb
+      | _ => va.sub vb
     | "*" => va.mul vb
     | "/" => va.div vb
     | "%" => va.mod vb
