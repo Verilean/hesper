@@ -1146,6 +1146,25 @@ def main (args : List String) : IO Unit := do
   let cfg := model.inner.config
   -- tokenize the real prompt → P; canvas C from config.
   let tokenizer ← Hesper.Tokenizer.SentencePiece.fromGGUF (← Hesper.GGUF.loadGGUFHeader path)
+  -- DG_DUMP_VOCAB=<file>: id → piece JSON array (JS-side detokenization for
+  -- the trace-replay engine); exits after writing
+  if let some vp ← IO.getEnv "DG_DUMP_VOCAB" then
+    let n := tokenizer.vocab.tokens.size
+    let esc := fun (x : String) => x.foldl (fun acc c =>
+      if c = '"' then acc ++ "\\\""
+      else if c = '\\' then acc ++ "\\\\"
+      else if c.toNat < 32 then
+        let h := (Nat.toDigits 16 c.toNat).asString
+        acc ++ "\\u" ++ "".pushn '0' (4 - h.length) ++ h
+      else acc.push c) ""
+    let mut out := "["
+    for i in [0:n] do
+      let piece := Hesper.Tokenizer.SentencePiece.decodeToken tokenizer.vocab i
+      out := out ++ (if i > 0 then "," else "") ++ "\"" ++ esc piece ++ "\""
+    out := out ++ "]"
+    IO.FS.writeFile vp out
+    IO.println s!"[dg] vocab dumped: {n} pieces → {vp}"
+    return
   -- DG_TEMPLATE=1: llama.cpp-parity input. llama-diffusion-cli applies the GGUF chat template
   -- (rendered, enable_thinking=true):  <bos><|turn>system\n<|think|>\n<turn|>\n<|turn>user\n{P}
   -- <turn|>\n<|turn>model\n   with specials parsed to single ids (<bos>=2 <|think|>=98 <|turn>=105
