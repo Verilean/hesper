@@ -615,6 +615,38 @@ partial def skipBlock (p : Prs) (i : Nat) : Nat := Id.run do
     | _ => j := j + 1
   return j
 
+/-- v1.1: OOB READ detection. Reads clamp (old Tint) or predicate-to-zero
+(newer Tint robustness) — an OOB read is therefore a CROSS-COMPILER VALUE
+DIVERGENCE, silent on both. Walk an expression tree and bounds-check every
+index into a known storage buffer. -/
+partial def checkReads (cx : Ctx) (st : WSt) (line : Nat) : Expr → WSt := fun e =>
+  match e with
+  | .index (.var b) ie =>
+    let st := checkReads cx st line ie
+    match cx.elemsOf b with
+    | none => st
+    | some elems =>
+      let guarded := st.sguards.any fun (g, bnd) => g == ie ∧ bnd.hi ≤ elems
+      if guarded then st
+      else
+        let iv := evalE cx st ie
+        if iv.hi < elems then st
+        else if ¬iv.t then
+          { st with finds := st.finds.push ⟨.fail, line, b,
+            s!"READ index max {iv.hi} ≥ {elems} elems — OOB reads clamp on \
+               old Tint but predicate-to-zero on newer robustness: silent \
+               cross-compiler value divergence"⟩ }
+        else
+          { st with finds := st.finds.push ⟨.warn, line, b,
+            s!"READ index cannot be bounded (elems {elems}; data-dependent) \
+               — potential cross-compiler OOB-read divergence"⟩ }
+  | .index a ie => checkReads cx (checkReads cx st line a) line ie
+  | .bin _ a b => checkReads cx (checkReads cx st line a) line b
+  | .un _ a => checkReads cx st line a
+  | .member a _ => checkReads cx st line a
+  | .call _ args => args.foldl (fun acc x => checkReads cx acc line x) st
+  | _ => st
+
 def checkStore (cx : Ctx) (st : WSt) (bufName : String) (idx : Expr)
     (line : Nat) : WSt :=
   match cx.elemsOf bufName with
@@ -684,6 +716,8 @@ partial def walkBlock (cx : Ctx) (st0 : WSt) (i0 : Nat) : WSt × Nat := Id.run d
         if p.isSym j "=" then
           match parseExpr p (j + 1) with
           | some (e, k) =>
+            let line := if h : j < p.ts.size then p.ts[j].line else 0
+            st := checkReads cx st line e
             st := envSetLet st x e
             i := if p.isSym k ";" then k + 1 else skipStmt p k
           | none => i := skipStmt p (j + 1)
