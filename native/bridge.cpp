@@ -819,11 +819,16 @@ static wgpu::Device createDeviceWithMaxLimits(wgpu::Adapter& adapter) {
     // --- Tier 1: ShaderF16 + Subgroups + ChromiumExperimentalSubgroupMatrix ---
     if (level == FeatureLevel::Auto || level == FeatureLevel::SubgroupMatrix) {
         if (hasSubgroups) {
-            static std::array<WGPUFeatureName, 3> allFeatures = {
+            std::vector<WGPUFeatureName> allFeatures = {
                 WGPUFeatureName_ShaderF16,
                 WGPUFeatureName_Subgroups,
                 WGPUFeatureName_ChromiumExperimentalSubgroupMatrix
             };
+            // HESPER_STRICT_MATH needs the compilation-options feature so the
+            // strictMath chain on shader modules validates
+            if (getenv("HESPER_STRICT_MATH")) {
+                allFeatures.push_back(WGPUFeatureName_ShaderModuleCompilationOptions);
+            }
             wgpu::Device device = tryCreateDevice(adapter, allFeatures.data(), allFeatures.size(), limits, &toggles);
             if (device) {
                 if (g_verbose) std::cout << "[Hesper] Device: subgroups + subgroup_matrix" << std::endl;
@@ -1512,6 +1517,17 @@ lean_obj_res lean_hesper_create_shader_module(b_lean_obj_arg device_obj, b_lean_
     // and changed .code from const char* to wgpu::StringView.
     wgpu::ShaderSourceWGSL wgslDesc{};
     wgslDesc.code = wgpu::StringView(shader_code);
+
+    // HESPER_STRICT_MATH=1: compile MSL with fastMathEnabled OFF (Dawn default
+    // here is fast math: fastMathEnabled = !strictMath). Newer Chrome/Dawn
+    // flipped to strict — this flag reproduces Chrome's numeric semantics
+    // natively for cross-compiler debugging (DG_PORT_LOG R21).
+    static const bool strictMath = getenv("HESPER_STRICT_MATH") != nullptr;
+    wgpu::ShaderModuleCompilationOptions compileOpts{};
+    compileOpts.strictMath = true;
+    if (strictMath) {
+        wgslDesc.nextInChain = &compileOpts;
+    }
 
     wgpu::ShaderModuleDescriptor shaderDesc{};
     shaderDesc.nextInChain = &wgslDesc;
