@@ -1710,7 +1710,13 @@ def main (args : List String) : IO Unit := do
       Hesper.WGSL.JSTrace.mark "step-1"
     if step == 2 then
       Hesper.WGSL.JSTrace.mark "step-2"
-    if step == 3 then
+    -- extended window (delta-prop capture: with DG_DELTAREFRESH=2 the first delta
+    -- streams appear at steps 3/5 — record through step 5 so the engine gets the
+    -- per-bucket dispatch graphs; DG_TRACE_END overrides the end step, default 3)
+    let traceEnd := ((← IO.getEnv "DG_TRACE_END").bind (·.toNat?)).getD 3
+    if step > 2 && step < traceEnd then
+      Hesper.WGSL.JSTrace.mark s!"step-{step}"
+    if step == traceEnd then
       Hesper.WGSL.JSTrace.mark "step-end"
       Hesper.WebGPU.jsTraceDumpPost device
       Hesper.WGSL.JSTrace.save
