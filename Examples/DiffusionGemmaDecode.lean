@@ -308,6 +308,132 @@ def vNormB (N nKV hd : Nat) (eps : Float) : Hesper.WGSL.Monad.ShaderM Unit := do
       let v := Exp.index (Exp.var "vin" : Exp (.array (.scalar .f32) (N*kvDim))) (Exp.add base d)
       ShaderM.assignIndex "vout" (Exp.add base d) (Exp.mul v inv)) (pure ())
 
+/-! ### Delta-prop kernels (DG_DELTA): change-driven row recompute.
+    Only canvas rows whose input token changed are recomputed; they are gathered into
+    contiguous [M,·] buffers, so every dim-baked generator works unchanged with N:=M.
+    `rows` (u32[M]) carries the indirection — ABSOLUTE row indices (canvas positions
+    are rows[i]-P). Bucket padding duplicates rows[0]: scatters then write the same
+    data to the same destination twice (idempotent), so pad lanes are harmless. -/
+
+/-- dst[i,d] = src[rows[i],d] — compact changed rows out of a full [srcRows,dim] buffer. -/
+def rowGatherB (M dim srcRows : Nat) : Hesper.WGSL.Monad.ShaderM Unit := do
+  let gid ← ShaderM.globalId; let t := Exp.vec3X gid
+  let _r ← ShaderM.declareReadOnlyBuffer "rows" (.array (.scalar .u32) M)
+  let _s ← ShaderM.declareReadOnlyBuffer "src" (.array (.scalar .f32) (srcRows*dim))
+  let _d ← ShaderM.declareOutputBuffer "dst" (.array (.scalar .f32) (M*dim))
+  ShaderM.if_ (Exp.lt t (Exp.litU32 (M*dim))) (do
+    let i := Exp.div t (Exp.litU32 dim)
+    let d := Exp.mod t (Exp.litU32 dim)
+    let r := Exp.index (Exp.var "rows" : Exp (.array (.scalar .u32) M)) i
+    let v := Exp.index (Exp.var "src" : Exp (.array (.scalar .f32) (srcRows*dim))) (Exp.add (Exp.mul r (Exp.litU32 dim)) d)
+    ShaderM.writeBuffer (ty := .scalar .f32) "dst" t v) (pure ())
+
+/-- dst[rows[i],d] = src[i,d] — scatter recomputed rows back into a full buffer (K/V caches). -/
+def rowScatterB (M dim dstRows : Nat) : Hesper.WGSL.Monad.ShaderM Unit := do
+  let gid ← ShaderM.globalId; let t := Exp.vec3X gid
+  let _r ← ShaderM.declareReadOnlyBuffer "rows" (.array (.scalar .u32) M)
+  let _s ← ShaderM.declareReadOnlyBuffer "src" (.array (.scalar .f32) (M*dim))
+  let _d ← ShaderM.declareOutputBuffer "dst" (.array (.scalar .f32) (dstRows*dim))
+  ShaderM.if_ (Exp.lt t (Exp.litU32 (M*dim))) (do
+    let i := Exp.div t (Exp.litU32 dim)
+    let d := Exp.mod t (Exp.litU32 dim)
+    let r := Exp.index (Exp.var "rows" : Exp (.array (.scalar .u32) M)) i
+    let v := Exp.index (Exp.var "src" : Exp (.array (.scalar .f32) (M*dim))) t
+    ShaderM.writeBuffer (ty := .scalar .f32) "dst" (Exp.add (Exp.mul r (Exp.litU32 dim)) d) v) (pure ())
+
+/-- qkNormRopeB with the RoPE position read through `rows` (gathered rows keep their
+    original absolute positions). Body identical otherwise. -/
+def qkNormRopeDeltaB (M nHead hd nRotHalf : Nat) (theta eps : Float) : Hesper.WGSL.Monad.ShaderM Unit := do
+  let gid ← ShaderM.globalId
+  let t := Exp.vec3X gid
+  let qDim := nHead*hd; let half := hd/2
+  let coef := -2.0 * Float.log theta / hd.toFloat
+  let _in ← ShaderM.declareReadOnlyBuffer "qin" (.array (.scalar .f32) (M*qDim))
+  let _w ← ShaderM.declareReadOnlyBuffer "wnorm" (.array (.scalar .f32) hd)
+  let _r ← ShaderM.declareReadOnlyBuffer "rows" (.array (.scalar .u32) M)
+  let _out ← ShaderM.declareOutputBuffer "qout" (.array (.scalar .f32) (M*qDim))
+  ShaderM.if_ (Exp.lt t (Exp.litU32 (M*nHead))) (do
+    let p := Exp.index (Exp.var "rows" : Exp (.array (.scalar .u32) M)) (Exp.div t (Exp.litU32 nHead))
+    let base := Exp.mul t (Exp.litU32 hd)
+    let ss ← ShaderM.var (.scalar .f32) (Exp.litF32 0.0)
+    ShaderM.loop (Exp.litU32 0) (Exp.litU32 hd) (Exp.litU32 1) fun d => do
+      let v := Exp.index (Exp.var "qin" : Exp (.array (.scalar .f32) (M*qDim))) (Exp.add base d)
+      ShaderM.assign ss (Exp.add (Exp.var ss) (Exp.mul v v))
+    let inv := Exp.div (Exp.litF32 1.0) (Exp.sqrt (Exp.add (Exp.div (Exp.var ss) (Exp.litF32 hd.toFloat)) (Exp.litF32 eps)))
+    let pf := Exp.toF32 p
+    ShaderM.loop (Exp.litU32 0) (Exp.litU32 half) (Exp.litU32 1) fun j => do
+      let jh := Exp.add j (Exp.litU32 half)
+      let qi : Exp (.array (.scalar .f32) (M*qDim)) := Exp.var "qin"
+      let wn : Exp (.array (.scalar .f32) hd) := Exp.var "wnorm"
+      let a := Exp.mul (Exp.mul (Exp.index qi (Exp.add base j)) inv) (Exp.index wn j)
+      let b := Exp.mul (Exp.mul (Exp.index qi (Exp.add base jh)) inv) (Exp.index wn jh)
+      let freq := Exp.exp (Exp.mul (Exp.litF32 coef) (Exp.toF32 j))
+      let ang0 := Exp.mul pf freq
+      let twoPi := Exp.litF32 6.283185307179586
+      let angRed := Exp.sub ang0 (Exp.mul twoPi (Exp.round (Exp.div ang0 twoPi)))
+      let ang := Exp.select (Exp.lt j (Exp.litU32 nRotHalf)) angRed (Exp.litF32 0.0)
+      ShaderM.assignIndex "qout" (Exp.add base j) (Exp.sub (Exp.mul a (Exp.cos ang)) (Exp.mul b (Exp.sin ang)))
+      ShaderM.assignIndex "qout" (Exp.add base jh) (Exp.add (Exp.mul a (Exp.sin ang)) (Exp.mul b (Exp.cos ang)))) (pure ())
+
+/-- Rectangular attention for delta rows: q/ctx are gathered [M,qDim]; k/v are the FULL
+    [N,kvDim] caches. Gathered rows are canvas rows (≥ P) → the region mask is always
+    "allowed" (canvas attends bidirectionally to everything), so no mask/rows needed. -/
+def battnDeltaB (M N nHead hd nKV : Nat) (scale : Float) (ws : Nat := 256) : Hesper.WGSL.Monad.ShaderM Unit := do
+  let wid ← ShaderM.workgroupId
+  let lid ← ShaderM.localId
+  let h := Exp.vec3X wid; let i := Exp.vec3Y wid; let tid := Exp.vec3X lid
+  let qDim := nHead*hd; let kvDim := nKV*hd; let groupSize := nHead/nKV
+  let _q ← ShaderM.declareReadOnlyBuffer "q" (.array (.scalar .f32) (M*qDim))
+  let _k ← ShaderM.declareReadOnlyBuffer "k" (.array (.scalar .f32) (N*kvDim))
+  let _v ← ShaderM.declareReadOnlyBuffer "v" (.array (.scalar .f32) (N*kvDim))
+  let _o ← ShaderM.declareOutputBuffer "ctx" (.array (.scalar .f32) (M*qDim))
+  ShaderM.sharedNamed "sS" (.array (.scalar .f32) N)
+  let kvhE := Exp.div h (Exp.litU32 groupSize)
+  let qBase := Exp.add (Exp.mul i (Exp.litU32 qDim)) (Exp.mul h (Exp.litU32 hd))
+  let kvB0 := Exp.mul kvhE (Exp.litU32 hd)
+  ShaderM.loop tid (Exp.litU32 N) (Exp.litU32 ws) fun j => do
+    let kBase := Exp.add (Exp.mul j (Exp.litU32 kvDim)) kvB0
+    let sc ← ShaderM.var (.scalar .f32) (Exp.litF32 0.0)
+    ShaderM.loop (Exp.litU32 0) (Exp.litU32 hd) (Exp.litU32 1) fun d => do
+      let qv := Exp.index (Exp.var "q" : Exp (.array (.scalar .f32) (M*qDim))) (Exp.add qBase d)
+      let kv := Exp.index (Exp.var "k" : Exp (.array (.scalar .f32) (N*kvDim))) (Exp.add kBase d)
+      ShaderM.assign sc (Exp.add (Exp.var sc) (Exp.mul qv kv))
+    ShaderM.assignIndex "sS" j (Exp.mul (Exp.var sc : Exp (.scalar .f32)) (Exp.litF32 scale))
+  ShaderM.barrier
+  ShaderM.if_ (Exp.eq tid (Exp.litU32 0)) (do
+    let mx ← ShaderM.var (.scalar .f32) (Exp.litF32 (-1e30))
+    ShaderM.loop (Exp.litU32 0) (Exp.litU32 N) (Exp.litU32 1) fun j => do
+      ShaderM.assign mx (Exp.max (Exp.var mx) (Exp.index (Exp.var "sS" : Exp (.array (.scalar .f32) N)) j))
+    ShaderM.loop (Exp.litU32 0) (Exp.litU32 N) (Exp.litU32 1) fun j => do
+      ShaderM.assignIndex "sS" j (Exp.exp (Exp.sub (Exp.index (Exp.var "sS" : Exp (.array (.scalar .f32) N)) j) (Exp.var mx)))
+    let sm ← ShaderM.var (.scalar .f32) (Exp.litF32 0.0)
+    ShaderM.loop (Exp.litU32 0) (Exp.litU32 N) (Exp.litU32 1) fun j => do
+      ShaderM.assign sm (Exp.add (Exp.var sm) (Exp.index (Exp.var "sS" : Exp (.array (.scalar .f32) N)) j))
+    ShaderM.loop (Exp.litU32 0) (Exp.litU32 N) (Exp.litU32 1) fun j => do
+      ShaderM.assignIndex "sS" j (Exp.div (Exp.index (Exp.var "sS" : Exp (.array (.scalar .f32) N)) j) (Exp.var sm))) (pure ())
+  ShaderM.barrier
+  ShaderM.loop tid (Exp.litU32 hd) (Exp.litU32 ws) fun d => do
+    let acc ← ShaderM.var (.scalar .f32) (Exp.litF32 0.0)
+    ShaderM.loop (Exp.litU32 0) (Exp.litU32 N) (Exp.litU32 1) fun j => do
+      let w := Exp.index (Exp.var "sS" : Exp (.array (.scalar .f32) N)) j
+      let vv := Exp.index (Exp.var "v" : Exp (.array (.scalar .f32) (N*kvDim))) (Exp.add (Exp.add (Exp.mul j (Exp.litU32 kvDim)) kvB0) d)
+      ShaderM.assign acc (Exp.add (Exp.var acc) (Exp.mul w vv))
+    ShaderM.writeBuffer (ty := .scalar .f32) "ctx" (Exp.add qBase d) (Exp.var acc : Exp (.scalar .f32))
+
+/-- copyCanvasLogitsB with row indirection: src holds lm_head logits of the M gathered
+    rows for one vocab chunk; dst rows are the gathered rows' canvas positions. -/
+def copyCanvasLogitsDeltaB (M C P vocab lmChunk chunkOff : Nat) : Hesper.WGSL.Monad.ShaderM Unit := do
+  let gid ← ShaderM.globalId; let t := Exp.vec3X gid
+  let _s ← ShaderM.declareReadOnlyBuffer "src" (.array (.scalar .f32) (M*lmChunk))
+  let _r ← ShaderM.declareReadOnlyBuffer "rows" (.array (.scalar .u32) M)
+  let _d ← ShaderM.declareOutputBuffer "dst" (.array (.scalar .f32) (C*vocab))
+  ShaderM.if_ (Exp.lt t (Exp.litU32 (M*lmChunk))) (do
+    let i := Exp.div t (Exp.litU32 lmChunk)
+    let o := Exp.sub t (Exp.mul i (Exp.litU32 lmChunk))
+    let r := Exp.index (Exp.var "rows" : Exp (.array (.scalar .u32) M)) i
+    let v := Exp.index (Exp.var "src" : Exp (.array (.scalar .f32) (M*lmChunk))) t
+    ShaderM.writeBuffer (ty := .scalar .f32) "dst" (Exp.add (Exp.add (Exp.mul (Exp.sub r (Exp.litU32 P)) (Exp.litU32 vocab)) (Exp.litU32 chunkOff)) o) v) (pure ())
+
 /-- Cross-position attention: wg per (head=wid.x, query=wid.y); scores·scale+region-mask+softmax+weighted-V. -/
 def battnB (N P nHead hd nKV : Nat) (scale : Float) (ws : Nat := 256) : Hesper.WGSL.Monad.ShaderM Unit := do
   let wid ← ShaderM.workgroupId
@@ -1068,21 +1194,29 @@ def bmm (device : Device) (layer : Hesper.Layers.Linear.LinearLayer B C) (inB ou
     Returns (canvasIdx, predToken, confidence)·masked, top-K tokens [C·K], top-K probs [C·K]. -/
 def lmHeadArgmaxFullVocab (device : Device) (outputWeightF16 sN sLogits logitsCanvas outDenom outTok outProb : Buffer)
     (dim vocabSize N C P : Nat) (cap : Float) (masked : Array Bool) (K : Nat := 8)
+    (delta : Option (Nat × Buffer) := none)
     : IO (Array (Nat × Nat × Float) × Array Nat × Array Float) := do
   let lmChunk := 32768
   let nChunks := (vocabSize + lmChunk - 1) / lmChunk
+  -- DG_DELTA: `delta = some (M, rowsAbsBuf)` computes logits for the M gathered rows only
+  -- and scatters them into logitsCanvas via rows[]; unchanged rows keep last step's logits.
+  let mRows := match delta with | some (m, _) => m | none => N
   for c in [0:nChunks] do
     Hesper.GPUBackend.beginBatch device
     -- register-blocked WMMA matmul (f16 weight): logits[N, lmChunk] for this vocab chunk
-    dispRB device (Hesper.WGSL.MatMul.matMulTransposeF16WMMARegKernel { M := ((N+63)/64)*64, N := lmChunk, K := dim } (c*lmChunk) vocabSize)
-      (("a", sN)::("b", outputWeightF16)::("c", sLogits)::List.nil) ((lmChunk+31)/32) ((N+63)/64) (hash ("lmheadrb", c))
+    dispRB device (Hesper.WGSL.MatMul.matMulTransposeF16WMMARegKernel { M := ((mRows+63)/64)*64, N := lmChunk, K := dim } (c*lmChunk) vocabSize)
+      (("a", sN)::("b", outputWeightF16)::("c", sLogits)::List.nil) ((lmChunk+31)/32) ((mRows+63)/64) (hash ("lmheadrb", c, mRows))
     -- batch split after the subgroup-matrix kernel: Dawn-on-Metal drops the inter-pass barrier after
     -- WMMA dispatches at scale (same pattern as the QKV/attnO/dense reg calls). Without it, softcap/
     -- copyCanvas read STALE sLogits → every canvas position argmaxes to the same garbage token
     -- (the <unused6226>×N failure). Hidden states were verified clean — the corruption was here.
     Hesper.WGSL.Execute.flushBatch device
-    disp device (softcapB (N*lmChunk) cap) (("logits", sLogits)::List.nil) (N*lmChunk) (hash ("softcap", c))
-    disp device (copyCanvasLogitsB N C P vocabSize lmChunk (c*lmChunk)) (("src",sLogits)::("dst",logitsCanvas)::List.nil) (C*lmChunk) (hash ("cpcv", c))
+    disp device (softcapB (mRows*lmChunk) cap) (("logits", sLogits)::List.nil) (mRows*lmChunk) (hash ("softcap", c, mRows))
+    match delta with
+    | some (m, rowsB) =>
+      disp device (copyCanvasLogitsDeltaB m C P vocabSize lmChunk (c*lmChunk)) (("src",sLogits)::("rows",rowsB)::("dst",logitsCanvas)::List.nil) (m*lmChunk) (hash ("cpcvd", c, m))
+    | none =>
+      disp device (copyCanvasLogitsB N C P vocabSize lmChunk (c*lmChunk)) (("src",sLogits)::("dst",logitsCanvas)::List.nil) (C*lmChunk) (hash ("cpcv", c))
     Hesper.GPUBackend.endBatch device
   Hesper.GPUBackend.beginBatch device
   disp2 device (reduceTopKB C vocabSize K 256)
@@ -1492,6 +1626,22 @@ def main (args : List String) : IO Unit := do
   let embTT ← mkBuf device (if fullSC then dim*(cfg.vocabSize/2) else 1)
   let sSCC ← mkBuf device (if fullSC then C*dim else 1)
   let scTBuf ← mkBuf device 4
+  -- DG_DELTA: change-driven row recompute (delta-prop). Per-layer K/V caches persist across
+  -- steps: full passes write rope'd K / normed V straight into them; delta passes recompute
+  -- only the canvas rows whose input token changed (gathered contiguous, buckets 64/128/192),
+  -- scatter their fresh K/V into the caches, and attend rectangularly over the full [N] caches.
+  -- Unchanged rows keep stale hiddens/logits (approximation) — DG_DELTAREFRESH (default 4)
+  -- forces a periodic full pass as the drift guardrail. Requires fullSC (renoise default).
+  let deltaOn := (← IO.getEnv "DG_DELTA").isSome
+  let deltaRefresh := ((← IO.getEnv "DG_DELTAREFRESH").bind (·.toNat?)).getD 4
+  let mut sKCs : Array Buffer := #[]
+  let mut sVCs : Array Buffer := #[]
+  for _ in [0:nLayers] do
+    sKCs := sKCs.push (← mkBuf device (if deltaOn then nP*2048 else 1))
+    sVCs := sVCs.push (← mkBuf device (if deltaOn then nP*2048 else 1))
+  let rowsAbsBuf ← mkBuf device (if deltaOn then C else 1)
+  let rowsCanvasBuf ← mkBuf device (if deltaOn then C else 1)
+  let tokDeltaBuf ← mkBuf device (if deltaOn then C else 1)
   if fullSC then
     Hesper.GPUBackend.beginBatch device
     let nT := dim*(cfg.vocabSize/2)
@@ -1538,6 +1688,8 @@ def main (args : List String) : IO Unit := do
     | some e => [e] | none => [])
   let mut loopTotalMs : Nat := 0
   let mut effSteps : Nat := 0
+  let mut deltaPrevToks := toks
+  let mut deltaStepsRun : Nat := 0
   for step in [0:decodeSteps] do
     -- DG_TRACE_JS capture: record steps 0-2 as marker-separated streams
     -- (step 0's dispatch set differs structurally: the SC path only runs
@@ -1562,6 +1714,32 @@ def main (args : List String) : IO Unit := do
     let remaining := masked.foldl (fun acc b => if b then acc+1 else acc) 0
     if remaining > 0 then
       let t0 ← IO.monoMsNow
+      -- DG_DELTA pass decision: the scheduler wrote `toks` itself, so the changed set is
+      -- known exactly before the forward. Delta when: opted in, step>0, not a refresh step,
+      -- and the changed set fits the largest bucket (else full).
+      let mut deltaRowsA : Array Nat := #[]
+      if deltaOn && step > 0 && fullSC && (deltaRefresh == 0 || step % deltaRefresh != 0) then
+        for pos in [0:C] do
+          if toks[P+pos]! != deltaPrevToks[P+pos]! then deltaRowsA := deltaRowsA.push (P+pos)
+      let isDelta := deltaOn && step > 0 && fullSC && (deltaRefresh == 0 || step % deltaRefresh != 0)
+                     && deltaRowsA.size > 0 && deltaRowsA.size ≤ 192
+      let deltaM := if deltaRowsA.size ≤ 64 then 64 else if deltaRowsA.size ≤ 128 then 128 else 192
+      deltaPrevToks := toks
+      let rowsN := if isDelta then deltaM else N   -- rows this forward computes
+      let nPR := ((rowsN + 63) / 64) * 64          -- WMMA row padding for this pass
+      if isDelta then
+        deltaStepsRun := deltaStepsRun + 1
+        let mut rowsAbs : Array Nat := Array.replicate deltaM (deltaRowsA[0]!)
+        for i in [0:deltaRowsA.size] do rowsAbs := rowsAbs.set! i deltaRowsA[i]!
+        let mut rowsCv : Array Nat := Array.replicate deltaM 0
+        let mut tokD : Array Nat := Array.replicate deltaM 0
+        for i in [0:deltaM] do
+          rowsCv := rowsCv.set! i (rowsAbs[i]! - P)
+          tokD := tokD.set! i (toks[rowsAbs[i]!]!)
+        writeBuffer device rowsAbsBuf 0 (u32Bytes rowsAbs)
+        writeBuffer device rowsCanvasBuf 0 (u32Bytes rowsCv)
+        writeBuffer device tokDeltaBuf 0 (u32Bytes tokD)
+        IO.println s!"  [delta] step {step}: {deltaRowsA.size} changed rows → bucket M={deltaM}"
       writeBuffer device tokBuf 0 (u32Bytes toks)
       if step > 0 then
         writeBuffer device scTokBuf 0 (u32Bytes scTok)
@@ -1577,7 +1755,10 @@ def main (args : List String) : IO Unit := do
           let tSC := if modeRenoise then ebPrevT else scTempEnv
           writeBuffer device scTBuf 0 (← Hesper.Basic.floatArrayToBytes #[tSC])
       Hesper.GPUBackend.beginBatch device
-      disp device (Hesper.Quantization.Q6_K.q6kEmbedGatherKernel N cfg.vocabSize dim embScale) (("token_ids",tokBuf)::("embedding_table",embTable)::("output",a)::List.nil) (N*dim) (hash "emb")
+      if isDelta then
+        disp device (Hesper.Quantization.Q6_K.q6kEmbedGatherKernel rowsN cfg.vocabSize dim embScale) (("token_ids",tokDeltaBuf)::("embedding_table",embTable)::("output",a)::List.nil) (rowsN*dim) (hash ("embd",rowsN))
+      else
+        disp device (Hesper.Quantization.Q6_K.q6kEmbedGatherKernel N cfg.vocabSize dim embScale) (("token_ids",tokBuf)::("embedding_table",embTable)::("output",a)::List.nil) (N*dim) (hash "emb")
       -- self-conditioning: soft-embed the previous step's top-K prediction → SC-MLP → add to canvas (step>0)
       if step > 0 then
         match model.scPreNorm, model.scGate, model.scUp, model.scDown with
@@ -1592,7 +1773,10 @@ def main (args : List String) : IO Unit := do
             dispRB device (Hesper.WGSL.MatMul.matMulTransposeF16WMMARegKernel { M := C, N := dim, K := cfg.vocabSize } 0 dim)
               (("a",sScProbs)::("b",embTT)::("c",sSCC)::List.nil) ((dim+31)/32) ((C+63)/64) (hash "scmm")
             Hesper.WGSL.Execute.flushBatch device   -- WMMA → spread (Dawn drops the inter-pass barrier after subgroup-matrix at scale)
-            disp device (scSpreadB N P dim) (("ssc",sSC)::("sccc",sSCC)::List.nil) (N*dim) (hash "scspread")
+            if isDelta then
+              disp device (rowGatherB rowsN dim C) (("rows",rowsCanvasBuf)::("src",sSCC)::("dst",sSC)::List.nil) (rowsN*dim) (hash ("scspreadd",rowsN))
+            else
+              disp device (scSpreadB N P dim) (("ssc",sSC)::("sccc",sSCC)::List.nil) (N*dim) (hash "scspread")
           else
             -- gather raw embeddings of the C·K top tokens, weighted-reduce by softmax probs → sSC
             disp device (Hesper.Quantization.Q6_K.q6kEmbedGatherKernel (C*scK) cfg.vocabSize dim 1.0) (("token_ids",scTokBuf)::("embedding_table",embTable)::("output",sTempK)::List.nil) (C*scK*dim) (hash "scgath")
@@ -1604,16 +1788,22 @@ def main (args : List String) : IO Unit := do
             for v in sc do sabs := sabs + v.abs
             IO.println s!"[scdbg] step1 Σ|sSC| = {sabs} (fullSC={fullSC})"
             Hesper.GPUBackend.beginBatch device
-          Hesper.Layers.RMSNorm.forward device scPN sSC sN N
-          qK device sN N dim (hash "scqk")
-          bmm device scG sN sG N (hash "scg")
-          bmm device scU sN sU N (hash "scu")
-          disp device (geluMulB (N*ffn)) (("gate",sG)::("up",sU)::("outp",sGe)::List.nil) (N*ffn) (hash "scgg")
-          q80 device sGe N ffn (hash "scq80")
-          bmm device scD sGe sD N (hash "scd")
-          disp device (addCanvasB N P dim 1.0) (("acanvas",a)::("sig",sD)::List.nil) (N*dim) (hash "scadd")
+          Hesper.Layers.RMSNorm.forward device scPN sSC sN rowsN
+          qK device sN rowsN dim (hash ("scqk",rowsN))
+          bmm device scG sN sG rowsN (hash ("scg",rowsN))
+          bmm device scU sN sU rowsN (hash ("scu",rowsN))
+          disp device (geluMulB (rowsN*ffn)) (("gate",sG)::("up",sU)::("outp",sGe)::List.nil) (rowsN*ffn) (hash ("scgg",rowsN))
+          q80 device sGe rowsN ffn (hash ("scq80",rowsN))
+          bmm device scD sGe sD rowsN (hash ("scd",rowsN))
+          if isDelta then
+            disp device (addCanvasB rowsN 0 dim 1.0) (("acanvas",a)::("sig",sD)::List.nil) (rowsN*dim) (hash ("scaddd",rowsN))
+          else
+            disp device (addCanvasB N P dim 1.0) (("acanvas",a)::("sig",sD)::List.nil) (N*dim) (hash "scadd")
         | _, _, _, _ => pure ()
-      disp device (embNormCanvasK N P dim eps) (("emb",a)::List.nil) N (hash "embn")
+      if isDelta then
+        disp device (embNormCanvasK rowsN 0 dim eps) (("emb",a)::List.nil) rowsN (hash ("embnd",rowsN))
+      else
+        disp device (embNormCanvasK N P dim eps) (("emb",a)::List.nil) N (hash "embn")
       Hesper.GPUBackend.endBatch device
       let mut cur := a; let mut nxt := b
       let lpb := ((← IO.getEnv "DG_LPB").bind (·.toNat?)).getD 30  -- layers per GPU submission (1 batch/forward; ~12% faster)
@@ -1623,21 +1813,24 @@ def main (args : List String) : IO Unit := do
         let some blk := model.inner.blocks[li]? | throw (IO.userError "blk")
         let qDim := blk.attention.wO.config.inDim; let kvDim := blk.attention.wV.config.outDim
         let hd := qDim / nHead; let nKV := kvDim / hd
+        -- DG_DELTA: M-derived grouped-MoE sizes for this pass (buffers are N-sized ≥ these)
+        let totalTokR := rowsN*nUsed
+        let maxPaddedR := (((totalTokR + padTo*nExpert) + (padTo-1))/padTo)*padTo
         let theta : Float := if li % 6 == 5 then 1000000.0 else 10000.0
         let nRotHalf := if li % 6 == 5 then 64 else hd/2
         -- attention
-        Hesper.Layers.RMSNorm.forward device blk.attnNorm cur sN N
+        Hesper.Layers.RMSNorm.forward device blk.attnNorm cur sN rowsN
         if qkvRB then
           Hesper.WGSL.Execute.flushBatch device   -- RMSNorm → reg-matmul: batch split
           -- reg-matmul QKV on f32 sN (real dequantized f16 weights). N=outDim, K=dim.
           let rb := fun (wf16 outB : Buffer) (od : Nat) (key : UInt64) => do
             let did ← if tuned then
-                dispRBTuned device tuneWinners nP od dim (("a",sN)::("b",wf16)::("c",outB)::List.nil) key
+                dispRBTuned device tuneWinners nPR od dim (("a",sN)::("b",wf16)::("c",outB)::List.nil) key
               else pure false
             unless did do
-              dispRB device (Hesper.WGSL.MatMul.matMulTransposeF16WMMARegKernel { M := nP, N := od, K := dim } 0 od)
-                (("a",sN)::("b",wf16)::("c",outB)::List.nil) ((od+31)/32) ((N+63)/64) key
-          rb (qF16s[li]?.getD sQ) sQ qDim (hash ("rbq",li)); rb (kF16s[li]?.getD sK) sK kvDim (hash ("rbk",li)); rb (vF16s[li]?.getD sV) sV kvDim (hash ("rbv",li))
+              dispRB device (Hesper.WGSL.MatMul.matMulTransposeF16WMMARegKernel { M := nPR, N := od, K := dim } 0 od)
+                (("a",sN)::("b",wf16)::("c",outB)::List.nil) ((od+31)/32) ((rowsN+63)/64) key
+          rb (qF16s[li]?.getD sQ) sQ qDim (hash ("rbq",li,rowsN)); rb (kF16s[li]?.getD sK) sK kvDim (hash ("rbk",li,rowsN)); rb (vF16s[li]?.getD sV) sV kvDim (hash ("rbv",li,rowsN))
           Hesper.WGSL.Execute.flushBatch device   -- reg-matmul QKV → qknorm: batch split (Dawn drops the inter-pass barrier for subgroup_matrix at scale)
           if (li == 0 || li == 5) && (← IO.getEnv "DG_QKVDIAG").isSome then
             qK device sN N dim (hash ("dqk0",li))
@@ -1653,85 +1846,95 @@ def main (args : List String) : IO Unit := do
             IO.println s!"[qkvdiag] wQ reg vs MMQ5: maxDiff={md} Σ|reg|={sg} Σ|ref|={sr}; sample reg={regQ.getD 100 0.0} ref={refQ.getD 100 0.0}"
             Hesper.GPUBackend.beginBatch device
         else
-          qK device sN N dim (hash ("qN",li))
-          bmm device blk.attention.wQ sN sQ N (hash ("wq",li))
-          bmm device blk.attention.wK sN sK N (hash ("wk",li))
-          bmm device blk.attention.wV sN sV N (hash ("wv",li))
+          qK device sN rowsN dim (hash ("qN",li,rowsN))
+          bmm device blk.attention.wQ sN sQ rowsN (hash ("wq",li,rowsN))
+          bmm device blk.attention.wK sN sK rowsN (hash ("wk",li,rowsN))
+          bmm device blk.attention.wV sN sV rowsN (hash ("wv",li,rowsN))
         pmark rAttn   -- attnNorm + qK + Q/K/V matmuls (Q4_K MMQ5)
-        disp device (qkNormRopeB N nHead hd nRotHalf theta eps) (("qin",sQ)::("wnorm",blk.attention.qNormWeight)::("qout",sQr)::List.nil) (N*nHead) (hash ("qn",li))
-        disp device (qkNormRopeB N nKV hd nRotHalf theta eps) (("qin",sK)::("wnorm",blk.attention.kNormWeight)::("qout",sKr)::List.nil) (N*nKV) (hash ("kn",li))
-        disp device (vNormB N nKV hd eps) (("vin",sV)::("vout",sVn)::List.nil) (N*nKV) (hash ("vn",li))
+        if isDelta then
+          disp device (qkNormRopeDeltaB rowsN nHead hd nRotHalf theta eps) (("qin",sQ)::("wnorm",blk.attention.qNormWeight)::("rows",rowsAbsBuf)::("qout",sQr)::List.nil) (rowsN*nHead) (hash ("qnd",li,rowsN))
+          disp device (qkNormRopeDeltaB rowsN nKV hd nRotHalf theta eps) (("qin",sK)::("wnorm",blk.attention.kNormWeight)::("rows",rowsAbsBuf)::("qout",sKr)::List.nil) (rowsN*nKV) (hash ("knd",li,rowsN))
+          disp device (vNormB rowsN nKV hd eps) (("vin",sV)::("vout",sVn)::List.nil) (rowsN*nKV) (hash ("vnd",li,rowsN))
+          -- scatter the fresh K/V rows into the persistent caches at their original positions
+          disp device (rowScatterB rowsN kvDim nP) (("rows",rowsAbsBuf)::("src",sKr)::("dst",sKCs[li]?.getD sKr)::List.nil) (rowsN*kvDim) (hash ("ksct",li,rowsN))
+          disp device (rowScatterB rowsN kvDim nP) (("rows",rowsAbsBuf)::("src",sVn)::("dst",sVCs[li]?.getD sVn)::List.nil) (rowsN*kvDim) (hash ("vsct",li,rowsN))
+        else
+          disp device (qkNormRopeB N nHead hd nRotHalf theta eps) (("qin",sQ)::("wnorm",blk.attention.qNormWeight)::("qout",sQr)::List.nil) (N*nHead) (hash ("qn",li))
+          disp device (qkNormRopeB N nKV hd nRotHalf theta eps) (("qin",sK)::("wnorm",blk.attention.kNormWeight)::("qout",(if deltaOn then sKCs[li]?.getD sKr else sKr))::List.nil) (N*nKV) (hash ("kn",li))
+          disp device (vNormB N nKV hd eps) (("vin",sV)::("vout",(if deltaOn then sVCs[li]?.getD sVn else sVn))::List.nil) (N*nKV) (hash ("vn",li))
         pmark rQkn    -- qk-norm + RoPE + v-norm
         -- battnB2 (shared-Q + parallel-reduction softmax) DEFAULT; DG_NOFLASH=1 restores battnB.
-        if (← IO.getEnv "DG_NOFLASH").isSome then
-          disp2 device (battnB N P nHead hd nKV 1.0) (("q",sQr)::("k",sKr)::("v",sVn)::("ctx",sCtx)::List.nil) nHead N (hash ("at",li))
+        if isDelta then
+          disp2 device (battnDeltaB rowsN N nHead hd nKV 1.0) (("q",sQr)::("k",sKCs[li]?.getD sKr)::("v",sVCs[li]?.getD sVn)::("ctx",sCtx)::List.nil) nHead rowsN (hash ("atd",li,rowsN))
+        else if (← IO.getEnv "DG_NOFLASH").isSome then
+          disp2 device (battnB N P nHead hd nKV 1.0) (("q",sQr)::("k",(if deltaOn then sKCs[li]?.getD sKr else sKr))::("v",(if deltaOn then sVCs[li]?.getD sVn else sVn))::("ctx",sCtx)::List.nil) nHead N (hash ("at",li))
         else
-          disp2 device (battnB2 N P nHead hd nKV 1.0) (("q",sQr)::("k",sKr)::("v",sVn)::("ctx",sCtx)::List.nil) nHead N (hash ("at2",li))
+          disp2 device (battnB2 N P nHead hd nKV 1.0) (("q",sQr)::("k",(if deltaOn then sKCs[li]?.getD sKr else sKr))::("v",(if deltaOn then sVCs[li]?.getD sVn else sVn))::("ctx",sCtx)::List.nil) nHead N (hash ("at2",li))
         pmark rBattn  -- battnB: QK^T + softmax + weighted-V (matrix-vector per query)
         if qkvRB then
           -- O-proj reg-matmul: A = f32 sCtx [N, qDim], B = wO f16 [dim, qDim/2], C = sAO. K=qDim.
           let didO ← if tuned then
-              dispRBTuned device tuneWinners nP dim qDim (("a",sCtx)::("b",oF16s[li]?.getD sAO)::("c",sAO)::List.nil) (hash ("rbo",li))
+              dispRBTuned device tuneWinners nPR dim qDim (("a",sCtx)::("b",oF16s[li]?.getD sAO)::("c",sAO)::List.nil) (hash ("rbo",li,rowsN))
             else pure false
           unless didO do
-            dispRB device (Hesper.WGSL.MatMul.matMulTransposeF16WMMARegKernel { M := nP, N := dim, K := qDim } 0 dim)
-              (("a",sCtx)::("b",oF16s[li]?.getD sAO)::("c",sAO)::List.nil) ((dim+31)/32) ((N+63)/64) (hash ("rbo",li))
+            dispRB device (Hesper.WGSL.MatMul.matMulTransposeF16WMMARegKernel { M := nPR, N := dim, K := qDim } 0 dim)
+              (("a",sCtx)::("b",oF16s[li]?.getD sAO)::("c",sAO)::List.nil) ((dim+31)/32) ((rowsN+63)/64) (hash ("rbo",li,rowsN))
           Hesper.WGSL.Execute.flushBatch device
         else
-          qK device sCtx N qDim (hash ("qCtx",li))
-          bmm device blk.attention.wO sCtx sAO N (hash ("wo",li))
-        Hesper.Layers.RMSNorm.forward device blk.postAttnNorm sAO sR N
-        disp device (addB (N*dim)) (("ain",sR)::("bin",cur)::("outc",sPA)::List.nil) (N*dim) (hash ("ra",li))
+          qK device sCtx rowsN qDim (hash ("qCtx",li,rowsN))
+          bmm device blk.attention.wO sCtx sAO rowsN (hash ("wo",li,rowsN))
+        Hesper.Layers.RMSNorm.forward device blk.postAttnNorm sAO sR rowsN
+        disp device (addB (rowsN*dim)) (("ain",sR)::("bin",cur)::("outc",sPA)::List.nil) (rowsN*dim) (hash ("ra",li,rowsN))
         pmark rAttnO  -- O projection + post-norm + residual
         -- dense FFN
         if step == 0 && (← IO.getEnv "DG_QFMT").isSome then
           let qfs := fun (q : Hesper.Layers.Linear.QuantFormat) => match q with
             | .Q4_K => "Q4_K" | .Q8_0 => "Q8_0" | .Q5_0 => "Q5_0" | .Q6_K => "Q6_K" | .F16 => "F16"
           IO.println s!"[qfmt L{li}] wQ={qfs blk.attention.wQ.quantFormat} wK={qfs blk.attention.wK.quantFormat} wV={qfs blk.attention.wV.quantFormat} wO={qfs blk.attention.wO.quantFormat} | dense gate={qfs blk.ffn.gate.quantFormat} down={qfs blk.ffn.down.quantFormat}"
-        Hesper.Layers.RMSNorm.forward device blk.ffnNorm sPA sN N
-        unless qkvRB do qK device sN N dim (hash ("qNf",li))
+        Hesper.Layers.RMSNorm.forward device blk.ffnNorm sPA sN rowsN
+        unless qkvRB do qK device sN rowsN dim (hash ("qNf",li,rowsN))
         unless skipDense do
           if qkvRB then
             -- dense gate/up reg-matmul on f32 sN. N=ffn, K=dim.
             let didG ← if tuned then
-                dispRBTuned device tuneWinners nP ffn dim (("a",sN)::("b",gateF16s[li]?.getD sG)::("c",sG)::List.nil) (hash ("rbg",li))
+                dispRBTuned device tuneWinners nPR ffn dim (("a",sN)::("b",gateF16s[li]?.getD sG)::("c",sG)::List.nil) (hash ("rbg",li,rowsN))
               else pure false
             unless didG do
-              dispRB device (Hesper.WGSL.MatMul.matMulTransposeF16WMMARegKernel { M := nP, N := ffn, K := dim } 0 ffn)
-                (("a",sN)::("b",gateF16s[li]?.getD sG)::("c",sG)::List.nil) ((ffn+31)/32) ((N+63)/64) (hash ("rbg",li))
+              dispRB device (Hesper.WGSL.MatMul.matMulTransposeF16WMMARegKernel { M := nPR, N := ffn, K := dim } 0 ffn)
+                (("a",sN)::("b",gateF16s[li]?.getD sG)::("c",sG)::List.nil) ((ffn+31)/32) ((rowsN+63)/64) (hash ("rbg",li,rowsN))
             let didU ← if tuned then
-                dispRBTuned device tuneWinners nP ffn dim (("a",sN)::("b",upF16s[li]?.getD sU)::("c",sU)::List.nil) (hash ("rbu",li))
+                dispRBTuned device tuneWinners nPR ffn dim (("a",sN)::("b",upF16s[li]?.getD sU)::("c",sU)::List.nil) (hash ("rbu",li,rowsN))
               else pure false
             unless didU do
-              dispRB device (Hesper.WGSL.MatMul.matMulTransposeF16WMMARegKernel { M := nP, N := ffn, K := dim } 0 ffn)
-                (("a",sN)::("b",upF16s[li]?.getD sU)::("c",sU)::List.nil) ((ffn+31)/32) ((N+63)/64) (hash ("rbu",li))
+              dispRB device (Hesper.WGSL.MatMul.matMulTransposeF16WMMARegKernel { M := nPR, N := ffn, K := dim } 0 ffn)
+                (("a",sN)::("b",upF16s[li]?.getD sU)::("c",sU)::List.nil) ((ffn+31)/32) ((rowsN+63)/64) (hash ("rbu",li,rowsN))
             Hesper.WGSL.Execute.flushBatch device
           else
-            bmm device blk.ffn.gate sN sG N (hash ("g",li))
-            bmm device blk.ffn.up sN sU N (hash ("u",li))
-          disp device (geluMulB (N*ffn)) (("gate",sG)::("up",sU)::("outp",sGe)::List.nil) (N*ffn) (hash ("gg",li))
+            bmm device blk.ffn.gate sN sG rowsN (hash ("g",li,rowsN))
+            bmm device blk.ffn.up sN sU rowsN (hash ("u",li,rowsN))
+          disp device (geluMulB (rowsN*ffn)) (("gate",sG)::("up",sU)::("outp",sGe)::List.nil) (rowsN*ffn) (hash ("gg",li,rowsN))
           if denseF16 && (downF16s[li]?.getD none).isSome then
             -- dense down f16 WMMA reg (QKVRB rounding profile): A = f32 geglu sGe [N,ffn], B = down
             -- f16 [dim,ffn/2], C = sD [N,dim] (64-row padded alloc). No q80 needed (A read as f32).
             let some dbuf := downF16s[li]?.getD none | throw (IO.userError "downF16")
             let didD ← if tuned then
-                dispRBTuned device tuneWinners nP dim ffn (("a",sGe)::("b",dbuf)::("c",sD)::List.nil) (hash ("rbd",li))
+                dispRBTuned device tuneWinners nPR dim ffn (("a",sGe)::("b",dbuf)::("c",sD)::List.nil) (hash ("rbd",li,rowsN))
               else pure false
             unless didD do
-              dispRB device (Hesper.WGSL.MatMul.matMulTransposeF16WMMARegKernel { M := nP, N := dim, K := ffn } 0 dim)
-                (("a",sGe)::("b",dbuf)::("c",sD)::List.nil) ((dim+31)/32) ((N+63)/64) (hash ("rbd",li))
+              dispRB device (Hesper.WGSL.MatMul.matMulTransposeF16WMMARegKernel { M := nPR, N := dim, K := ffn } 0 dim)
+                (("a",sGe)::("b",dbuf)::("c",sD)::List.nil) ((dim+31)/32) ((rowsN+63)/64) (hash ("rbd",li,rowsN))
             Hesper.WGSL.Execute.flushBatch device   -- WMMA → next reader: batch split (Dawn barrier drop)
           else if denseDownRB && blk.ffn.down.quantFormat == .Q8_0 then
             -- TILED reg-matmul dense down (matrix units, in-kernel Q8_0 dequant). A=f32 geglu sGe [N,ffn],
             -- B=down Q8_0 [dim,ffn], C=sD [N,dim]. Single weight ⇒ nExpert=1, zero tileExpert.
-            dispRB device (Hesper.Quantization.Q4_K_M.q8MatmulGroupedRegKernel N dim ffn 1)
-              (("a",sGe)::("b",blk.ffn.down.weightBuf)::("c",sD)::("tileExpert",sZeroTE)::List.nil) ((dim+31)/32) ((N+31)/32) (hash ("ddrb",li))
+            dispRB device (Hesper.Quantization.Q4_K_M.q8MatmulGroupedRegKernel rowsN dim ffn 1)
+              (("a",sGe)::("b",blk.ffn.down.weightBuf)::("c",sD)::("tileExpert",sZeroTE)::List.nil) ((dim+31)/32) ((rowsN+31)/32) (hash ("ddrb",li,rowsN))
           else
-            q80 device sGe N ffn (hash ("qGe",li))
-            bmm device blk.ffn.down sGe sD N (hash ("dn",li))
+            q80 device sGe rowsN ffn (hash ("qGe",li,rowsN))
+            bmm device blk.ffn.down sGe sD rowsN (hash ("dn",li,rowsN))
         pmark rDense
         let some mpn1 := blk.moePostNorm1 | throw (IO.userError "mpn1")
-        Hesper.Layers.RMSNorm.forward device mpn1 sD sCurMlp N        -- curMlp
+        Hesper.Layers.RMSNorm.forward device mpn1 sD sCurMlp rowsN        -- curMlp
         -- MoE (router top-8 per row + batched experts)
         let some mpn2pre := blk.moePreNorm2 | throw (IO.userError "mpn2pre")
         let some mpn2post := blk.moePostNorm2 | throw (IO.userError "mpn2post")
@@ -1739,10 +1942,10 @@ def main (args : List String) : IO Unit := do
         let some rS := blk.moeRouterScale | throw (IO.userError "rS")
         let some guE := blk.moeGateUpExps | throw (IO.userError "guE")
         let some dnE := blk.moeDownExps | throw (IO.userError "dnE")
-        Hesper.Layers.RMSNorm.forward device mpn2pre sPA sMoeN N
-        disp device (routerPrepB N dim invSqrt eps) (("xin",sPA)::("rscale",rS)::("tmps",sTmpS)::List.nil) N (hash ("rp",li))
-        disp device (routerMatVecB N nExpert dim) (("rw",rW)::("tmps",sTmpS)::("rlogits",sRLogits)::List.nil) (N*nExpert) (hash ("rm",li))
-        disp2 device (top8B N nExpert nUsed) (("rlogits",sRLogits)::("idxs",sIdxs)::("wts",sWts)::List.nil) N 1 (hash ("t8",li))
+        Hesper.Layers.RMSNorm.forward device mpn2pre sPA sMoeN rowsN
+        disp device (routerPrepB rowsN dim invSqrt eps) (("xin",sPA)::("rscale",rS)::("tmps",sTmpS)::List.nil) rowsN (hash ("rp",li,rowsN))
+        disp device (routerMatVecB rowsN nExpert dim) (("rw",rW)::("tmps",sTmpS)::("rlogits",sRLogits)::List.nil) (rowsN*nExpert) (hash ("rm",li,rowsN))
+        disp2 device (top8B rowsN nExpert nUsed) (("rlogits",sRLogits)::("idxs",sIdxs)::("wts",sWts)::List.nil) rowsN 1 (hash ("t8",li,rowsN))
         if step == 0 && (li == 0 || li == 1 || li == 5 || li == 10 || li == 15 || li == 22 || li == 29) && (← IO.getEnv "DG_RDIAG").isSome then
           Hesper.GPUBackend.endBatch device
           let idxB ← mapBufferRead device sIdxs 0 (N*nUsed*4).toUSize
@@ -1759,14 +1962,14 @@ def main (args : List String) : IO Unit := do
           for v in logF do lsum := lsum + v
           IO.println s!"[rdiag] L{li} canvas0 top8={c0} | idxSum={idxSum} | rlogitSum={lsum}"
           Hesper.GPUBackend.beginBatch device
-        disp device (zeroB (N*dim)) (("data",sMoeAcc)::List.nil) (N*dim) (hash ("z",li))
+        disp device (zeroB (rowsN*dim)) (("data",sMoeAcc)::List.nil) (rowsN*dim) (hash ("z",li,rowsN))
         -- Q8_1-quantize the MoE input once for the dp4a expert matmul (replaces qK)
-        disp2w device (Hesper.Layers.Linear.quantizeQ8_1BatchKernel dim N) (("input",sMoeN)::("output",sMoeNQ8)::List.nil) (dim/32) N 32 (hash ("qmoeq8",li))
+        disp2w device (Hesper.Layers.Linear.quantizeQ8_1BatchKernel dim rowsN) (("input",sMoeN)::("output",sMoeNQ8)::List.nil) (dim/32) rowsN 32 (hash ("qmoeq8",li,rowsN))
         if (← IO.getEnv "DG_NOGROUP").isNone then   -- grouped MoE DEFAULT ON (validated); DG_NOGROUP=1 opts out
           -- expert-grouping (fused, GPU-side counting-sort grouping — no readback, stays batched)
-          unless skGrp do disp device (clearSortedB maxPadded nUsed) (("sp",sSortedPos)::("ss",sSortedSlot)::List.nil) maxPadded (hash ("clr",li))
-          unless skGrp do disp device (countExpB totalTok nExpert) (("idxs",sIdxs)::("cnt",sExpertCount)::List.nil) nExpert (hash ("cntk",li))
-          unless skGrp do disp device (offsetsExpB nExpert maxPadded padTo) (("cnt",sExpertCount)::("off",sExpertOffset)::("te",sTileExpert)::("trs",sTileRows)::List.nil) 1 (hash ("offk",li))
+          unless skGrp do disp device (clearSortedB maxPaddedR nUsed) (("sp",sSortedPos)::("ss",sSortedSlot)::List.nil) maxPaddedR (hash ("clr",li,rowsN))
+          unless skGrp do disp device (countExpB totalTokR nExpert) (("idxs",sIdxs)::("cnt",sExpertCount)::List.nil) nExpert (hash ("cntk",li,rowsN))
+          unless skGrp do disp device (offsetsExpB nExpert maxPaddedR padTo) (("cnt",sExpertCount)::("off",sExpertOffset)::("te",sTileExpert)::("trs",sTileRows)::List.nil) 1 (hash ("offk",li,rowsN))
           if li == 0 && (← IO.getEnv "DG_TILEDIAG").isSome then
             Hesper.GPUBackend.endBatch device
             let teA ← Hesper.Basic.bytesToFloatArray (← mapBufferRead device sTileExpert 0 (maxPadded/32*4).toUSize)
@@ -1780,7 +1983,7 @@ def main (args : List String) : IO Unit := do
             IO.println s!"[tilediag] active tiles={active} / maxPadded tiles={maxPadded/32} (rows: {active*32} real / {maxPadded} dispatched); waste={maxPadded - active*32} rows ({100*(maxPadded-active*32)/maxPadded}%)"
             let _ := teA
             Hesper.GPUBackend.beginBatch device
-          unless skGrp do disp device (scatterRankB totalTok nExpert nUsed maxPadded) (("idxs",sIdxs)::("off",sExpertOffset)::("sp",sSortedPos)::("ss",sSortedSlot)::List.nil) totalTok (hash ("srkk",li))
+          unless skGrp do disp device (scatterRankB totalTokR nExpert nUsed maxPaddedR) (("idxs",sIdxs)::("off",sExpertOffset)::("sp",sSortedPos)::("ss",sSortedSlot)::List.nil) totalTokR (hash ("srkk",li,rowsN))
           pmark rMoeGrp   -- router + counting-sort grouping (clear/count/offsets/scatterRank)
           if moeRB then
             if oneStream then
@@ -1796,13 +1999,13 @@ def main (args : List String) : IO Unit := do
             else
             -- INDEXED Q4_K reg-matmul gate/up (mul_mat_id-style): the A-load reads token rows IN PLACE
             -- through sSortedPos — no physical gatherF32B pass. src=sMoeN [N,dim], B=guE Q4_K, C=sGatheredGU.
-            dispRB device (Hesper.Quantization.Q4_K_M.q4kMatmulGroupedRegIndexedKernel maxPadded (2*expFF) dim nExpert N)
-              (("src",sMoeN)::("idx",sSortedPos)::("b",guE)::("c",sGatheredGU)::("tileExpert",sTileExpert)::("tileRows",raggedRows)::List.nil) ((2*expFF+31)/32) ((maxPadded+31)/32) (hash ("emmrbi",li))
+            dispRB device (Hesper.Quantization.Q4_K_M.q4kMatmulGroupedRegIndexedKernel maxPaddedR (2*expFF) dim nExpert rowsN)
+              (("src",sMoeN)::("idx",sSortedPos)::("b",guE)::("c",sGatheredGU)::("tileExpert",sTileExpert)::("tileRows",raggedRows)::List.nil) ((2*expFF+31)/32) ((maxPaddedR+31)/32) (hash ("emmrbi",li,rowsN))
           else
-            unless skGat do disp device (gatherQ8B maxPadded q8size N) (("src",sMoeNQ8)::("idx",sSortedPos)::("gathered",sGatheredQ8)::List.nil) (maxPadded*q8size) (hash ("gthr",li))
+            unless skGat do disp device (gatherQ8B maxPaddedR q8size rowsN) (("src",sMoeNQ8)::("idx",sSortedPos)::("gathered",sGatheredQ8)::List.nil) (maxPaddedR*q8size) (hash ("gthr",li,rowsN))
             unless skGU do
-              disp2 device (Hesper.Layers.Linear.q4kMatmulBatchMMQ5Kernel { inDim:=dim, outDim:=2*expFF } maxPadded 0 0 maxPadded true nExpert)
-                (("weights",guE)::("input_q8",sGatheredQ8)::("output",sGatheredGU)::("tileExpert",sTileExpert)::List.nil) ((2*expFF)/64) (maxPadded/32) (hash ("emm",li))
+              disp2 device (Hesper.Layers.Linear.q4kMatmulBatchMMQ5Kernel { inDim:=dim, outDim:=2*expFF } maxPaddedR 0 0 maxPaddedR true nExpert)
+                (("weights",guE)::("input_q8",sGatheredQ8)::("output",sGatheredGU)::("tileExpert",sTileExpert)::List.nil) ((2*expFF)/64) (maxPaddedR/32) (hash ("emm",li,rowsN))
           -- BATCH SPLIT (cheap, no CPU wait): the grouped gate/up MMQ→scatter→geglu races in a too-
           -- large single encoder (Dawn-on-Metal drops an inter-pass barrier at scale); a no-wait
           -- submit + fresh encoder here keeps Dawn's barriers correct without a sync round-trip.
@@ -1835,28 +2038,28 @@ def main (args : List String) : IO Unit := do
           -- an unresolved barrier/race when the gate/up scatter is skipped). See PERF_PLAN / commits.
           if (← IO.getEnv "DG_GROUPEDDOWN").isNone && !moeDownRB then
             -- ISOLATION: gate/up grouped, down per-slot (the pre-grouped-down state)
-            unless skSc do disp device (scatterGUB maxPadded (2*expFF) N nUsed) (("gathered",sGatheredGU)::("pos",sSortedPos)::("slot",sSortedSlot)::("dst",sGateUpAll)::List.nil) (maxPadded*2*expFF) (hash ("sctr",li))
+            unless skSc do disp device (scatterGUB maxPaddedR (2*expFF) rowsN nUsed) (("gathered",sGatheredGU)::("pos",sSortedPos)::("slot",sSortedSlot)::("dst",sGateUpAll)::List.nil) (maxPaddedR*2*expFF) (hash ("sctr",li,rowsN))
             unless moeNoFlush do Hesper.WGSL.Execute.flushBatch device   -- flush gate/up scatter→geglu (no-wait split)
             for e in [0:nUsed] do
               let sEh := sEhs[e]?.getD sMoeN
-              unless skGeg do disp device (gegluMergedB N expFF (e*N*2*expFF) (nUsed*N*2*expFF)) (("gu",sGateUpAll)::("eh",sEh)::List.nil) (N*expFF) (hash ("gm",li,e))
-              unless skQ80 do q80 device sEh N expFF (hash ("qEh",li,e))
+              unless skGeg do disp device (gegluMergedB rowsN expFF (e*rowsN*2*expFF) (nUsed*rowsN*2*expFF)) (("gu",sGateUpAll)::("eh",sEh)::List.nil) (rowsN*expFF) (hash ("gm",li,e,rowsN))
+              unless skQ80 do q80 device sEh rowsN expFF (hash ("qEh",li,e,rowsN))
               let downExpKernel := match blk.ffn.down.quantFormat with
-                | .Q5_0 => Hesper.Layers.Linear.fusedQ5_0BatchExpertF32WarpKernel { inDim:=expFF, outDim:=dim } nExpert N nUsed e
-                | _     => Hesper.Layers.Linear.fusedQ8_0BatchExpertF32WarpKernel { inDim:=expFF, outDim:=dim } nExpert N nUsed e
+                | .Q5_0 => Hesper.Layers.Linear.fusedQ5_0BatchExpertF32WarpKernel { inDim:=expFF, outDim:=dim } nExpert rowsN nUsed e
+                | _     => Hesper.Layers.Linear.fusedQ8_0BatchExpertF32WarpKernel { inDim:=expFF, outDim:=dim } nExpert rowsN nUsed e
               let sDownE := sDownEs[e]?.getD sEh
-              unless skDn do disp2w device downExpKernel (("weights",dnE)::("input",sEh)::("idxs",sIdxs)::("output",sDownE)::List.nil) dim N 32 (hash ("ed",li,e))
-              unless skWa do disp device (waccB N dim e nUsed) (("acc",sMoeAcc)::("din",sDownE)::("wts",sWts)::List.nil) (N*dim) (hash ("wa",li,e))
+              unless skDn do disp2w device downExpKernel (("weights",dnE)::("input",sEh)::("idxs",sIdxs)::("output",sDownE)::List.nil) dim rowsN 32 (hash ("ed",li,e,rowsN))
+              unless skWa do disp device (waccB rowsN dim e nUsed) (("acc",sMoeAcc)::("din",sDownE)::("wts",sWts)::List.nil) (rowsN*dim) (hash ("wa",li,e,rowsN))
           else do
             -- GROUPED down: the FUSED single-kernel (geglu+down+scatter in one dispatch — no inter-pass
             -- flushes → no Dawn race, DG_MOEDOWNFUSED) OR the staged geglu→down→scatter chain.
             let moeDownFused := (← IO.getEnv "DG_MOEDOWNFUSED").isSome && blk.ffn.down.quantFormat == .Q8_0
             if moeDownFused then
-              dispRB device (Hesper.Quantization.Q4_K_M.q8FusedGegluDownScatterKernel maxPadded dim expFF nExpert nUsed N)
-                (("gu",sGatheredGU)::("b",dnE)::("tileExpert",sTileExpert)::("pos",sSortedPos)::("slot",sSortedSlot)::("dst",sDownAll)::List.nil) ((dim+31)/32) ((maxPadded+31)/32) (hash ("fdg",li))
+              dispRB device (Hesper.Quantization.Q4_K_M.q8FusedGegluDownScatterKernel maxPaddedR dim expFF nExpert nUsed rowsN)
+                (("gu",sGatheredGU)::("b",dnE)::("tileExpert",sTileExpert)::("pos",sSortedPos)::("slot",sSortedSlot)::("dst",sDownAll)::List.nil) ((dim+31)/32) ((maxPaddedR+31)/32) (hash ("fdg",li,rowsN))
             else if fuseDown then pure ()   -- geglu is computed inline inside the fused MSL down kernel
             else
-              disp device (gegluMergedB maxPadded expFF 0 (maxPadded*2*expFF)) (("gu",sGatheredGU)::("eh",sGatheredEh)::List.nil) (maxPadded*expFF) (hash ("gmg",li))
+              disp device (gegluMergedB maxPaddedR expFF 0 (maxPaddedR*2*expFF)) (("gu",sGatheredGU)::("eh",sGatheredEh)::List.nil) (maxPaddedR*expFF) (hash ("gmg",li,rowsN))
             unless moeNoFlush do Hesper.WGSL.Execute.flushBatch device
             pmark rMoeGeglu
             if li == 0 && (← IO.getEnv "DG_MOEDOWNDIAG").isSome then
@@ -1879,7 +2082,7 @@ def main (args : List String) : IO Unit := do
               -- INDEXED-SCATTER reg-matmul down (matrix units, in-kernel Q8_0 dequant): the C store
               -- scatters dst[slot,pos,col] IN-KERNEL — no 17.5M-element scatterGUB pass. The q80
               -- round-trip both matches the warp's Q8 rounding AND acts as the geglu→down sync.
-              unless fuseDown do q80 device sGatheredEh maxPadded expFF (hash ("qgehrb",li))
+              unless fuseDown do q80 device sGatheredEh maxPaddedR expFF (hash ("qgehrb",li,rowsN))
               pmark rMoeQ80
               if useMslDown then
                 -- DG_MSLDOWN: hand-MSL port (same ordering contract as the gate/up: flushBatch
@@ -1890,36 +2093,36 @@ def main (args : List String) : IO Unit := do
                   maxPadded.toUInt32 dim.toUInt32 expFF.toUInt32 nExpert.toUInt32 nUsed.toUInt32 N.toUInt32
               else do
                 unless moeNoFlush do Hesper.WGSL.Execute.flushBatch device
-                dispRB device (Hesper.Quantization.Q4_K_M.q8MatmulGroupedRegIndexedScatterKernel maxPadded dim expFF nExpert nUsed N)
-                  (("a",sGatheredEh)::("b",dnE)::("tileExpert",sTileExpert)::("tileRows",raggedRows)::("pos",sSortedPos)::("slot",sSortedSlot)::("dst",sDownAll)::List.nil) ((dim+31)/32) ((maxPadded+31)/32) (hash ("edrbi",li))
+                dispRB device (Hesper.Quantization.Q4_K_M.q8MatmulGroupedRegIndexedScatterKernel maxPaddedR dim expFF nExpert nUsed rowsN)
+                  (("a",sGatheredEh)::("b",dnE)::("tileExpert",sTileExpert)::("tileRows",raggedRows)::("pos",sSortedPos)::("slot",sSortedSlot)::("dst",sDownAll)::List.nil) ((dim+31)/32) ((maxPaddedR+31)/32) (hash ("edrbi",li,rowsN))
             else if moeDownRB && useMslDown then
               -- Q5_0 layer, MSL port (22B/block): same recipe as the Q8_0 MSL down — q80 round-trip
               -- for rounding parity + sync, flushBatch commits producers, hazard-tracked MSL commit.
-              unless fuseDown do q80 device sGatheredEh maxPadded expFF (hash ("qgehq5",li))
+              unless fuseDown do q80 device sGatheredEh maxPaddedR expFF (hash ("qgehq5",li,rowsN))
               pmark rMoeQ80
               Hesper.WGSL.Execute.flushBatch device
               mslQ5DownDispatch device (if fuseDown then sGatheredGU else sGatheredEh) dnE sTileExpert raggedRows sSortedPos sSortedSlot sDownAll
                 maxPadded.toUInt32 dim.toUInt32 expFF.toUInt32 nExpert.toUInt32 nUsed.toUInt32 N.toUInt32
             else
-              q80 device sGatheredEh maxPadded expFF (hash ("qgeh",li))   -- match the per-slot Q8 rounding
+              q80 device sGatheredEh maxPaddedR expFF (hash ("qgeh",li,rowsN))   -- match the per-slot Q8 rounding
               pmark rMoeQ80
               let downGrpKernel := match blk.ffn.down.quantFormat with
-                | .Q5_0 => Hesper.Layers.Linear.fusedQ5_0BatchExpertF32WarpGroupedKernel { inDim:=expFF, outDim:=dim } nExpert maxPadded
-                | _     => Hesper.Layers.Linear.fusedQ8_0BatchExpertF32WarpGroupedKernel { inDim:=expFF, outDim:=dim } nExpert maxPadded
+                | .Q5_0 => Hesper.Layers.Linear.fusedQ5_0BatchExpertF32WarpGroupedKernel { inDim:=expFF, outDim:=dim } nExpert maxPaddedR
+                | _     => Hesper.Layers.Linear.fusedQ8_0BatchExpertF32WarpGroupedKernel { inDim:=expFF, outDim:=dim } nExpert maxPaddedR
               unless moeNoFlush do Hesper.WGSL.Execute.flushBatch device
-              disp2w device downGrpKernel (("weights",dnE)::("input",sGatheredEh)::("tileExpert",sTileExpert)::("output",sGatheredDown)::List.nil) dim (maxPadded/32) 32 (hash ("edg",li))
+              disp2w device downGrpKernel (("weights",dnE)::("input",sGatheredEh)::("tileExpert",sTileExpert)::("output",sGatheredDown)::List.nil) dim (maxPaddedR/32) 32 (hash ("edg",li,rowsN))
             pmark rMoeDown
             unless moeNoFlush do Hesper.WGSL.Execute.flushBatch device
             -- down scatter is maxPadded*dim = ~17.5M elems → ~68k workgroups > 65535 limit (silently
             -- dropped → sDownAll stayed 0). Use a 2D grid: flat = gid.x + gid.y*(nx*256).
-            let scN := maxPadded*dim
+            let scN := maxPaddedR*dim
             let scWG := (scN + 255)/256
             let scNx := min scWG 32768
             let scNy := (scWG + scNx - 1)/scNx
             -- when fused OR indexed-scatter down ran, sDownAll is already written in-kernel — skip
             -- the staged scatter (it only remains for the Q5_0 warp-grouped fallback path).
             unless (moeDownFused || (moeDownRB && (blk.ffn.down.quantFormat != .Q5_0 || useMslDown))) do
-              disp2 device (scatterGUB maxPadded dim N nUsed (scNx*256)) (("gathered",sGatheredDown)::("pos",sSortedPos)::("slot",sSortedSlot)::("dst",sDownAll)::List.nil) scNx scNy (hash ("sctrd",li))
+              disp2 device (scatterGUB maxPaddedR dim rowsN nUsed (scNx*256)) (("gathered",sGatheredDown)::("pos",sSortedPos)::("slot",sSortedSlot)::("dst",sDownAll)::List.nil) scNx scNy (hash ("sctrd",li,rowsN))
             -- NOTE: the grouped-down chain (geglu→q80→down→scatter→wacc) is NUMERICALLY correct (DG_MOEDIAG
             -- maxDiff 4e-6) but Dawn drops these no-wait flushes at batch scale → a routing-dependent RACE
             -- ("Paris" passes, harder prompts → garbage). endBatch here fixes ONE link but the chain has
@@ -1964,27 +2167,30 @@ def main (args : List String) : IO Unit := do
               IO.println s!"[moediag] grouped sDownAll vs per-slot down: maxDiff={maxd} nBad={cnt} | Σ|grouped|={sumG} Σ|ref|={sumR}"
               Hesper.GPUBackend.beginBatch device
             -- single-pass weighted-accumulate (no 8-way read-modify-write race on sMoeAcc)
-            disp device (waccAllB N dim nUsed) (("din",sDownAll)::("wts",sWts)::("acc",sMoeAcc)::List.nil) (N*dim) (hash ("waA",li))
+            disp device (waccAllB rowsN dim nUsed) (("din",sDownAll)::("wts",sWts)::("acc",sMoeAcc)::List.nil) (rowsN*dim) (hash ("waA",li,rowsN))
         else do
           for e in [0:nUsed] do
             let sGateUp := sGateUps[e]?.getD sMoeN
             let sEh := sEhs[e]?.getD sMoeN
-            disp2w device (Hesper.Layers.Linear.fusedQ4KMBatchExpertDP4ATiledKernel { inDim:=dim, outDim:=2*expFF } nExpert N nUsed e 4) (("weights",guE)::("input_q8",sMoeNQ8)::("idxs",sIdxs)::("output",sGateUp)::List.nil) ((2*expFF)/4) N 32 (hash ("eut",li,e))
-            disp device (gegluMergedB N expFF) (("gu",sGateUp)::("eh",sEh)::List.nil) (N*expFF) (hash ("gm",li,e))
-            q80 device sEh N expFF (hash ("qEh",li,e))
+            disp2w device (Hesper.Layers.Linear.fusedQ4KMBatchExpertDP4ATiledKernel { inDim:=dim, outDim:=2*expFF } nExpert rowsN nUsed e 4) (("weights",guE)::("input_q8",sMoeNQ8)::("idxs",sIdxs)::("output",sGateUp)::List.nil) ((2*expFF)/4) rowsN 32 (hash ("eut",li,e,rowsN))
+            disp device (gegluMergedB rowsN expFF) (("gu",sGateUp)::("eh",sEh)::List.nil) (rowsN*expFF) (hash ("gm",li,e,rowsN))
+            q80 device sEh rowsN expFF (hash ("qEh",li,e,rowsN))
             let downExpKernel := match blk.ffn.down.quantFormat with
-              | .Q5_0 => Hesper.Layers.Linear.fusedQ5_0BatchExpertF32WarpKernel { inDim:=expFF, outDim:=dim } nExpert N nUsed e
-              | _     => Hesper.Layers.Linear.fusedQ8_0BatchExpertF32WarpKernel { inDim:=expFF, outDim:=dim } nExpert N nUsed e
+              | .Q5_0 => Hesper.Layers.Linear.fusedQ5_0BatchExpertF32WarpKernel { inDim:=expFF, outDim:=dim } nExpert rowsN nUsed e
+              | _     => Hesper.Layers.Linear.fusedQ8_0BatchExpertF32WarpKernel { inDim:=expFF, outDim:=dim } nExpert rowsN nUsed e
             let sDownE := sDownEs[e]?.getD sEh
-            disp2w device downExpKernel (("weights",dnE)::("input",sEh)::("idxs",sIdxs)::("output",sDownE)::List.nil) dim N 32 (hash ("ed",li,e))
-            disp device (waccB N dim e nUsed) (("acc",sMoeAcc)::("din",sDownE)::("wts",sWts)::List.nil) (N*dim) (hash ("wa",li,e))
-        Hesper.Layers.RMSNorm.forward device mpn2post sMoeAcc sCurMoe N
+            disp2w device downExpKernel (("weights",dnE)::("input",sEh)::("idxs",sIdxs)::("output",sDownE)::List.nil) dim rowsN 32 (hash ("ed",li,e,rowsN))
+            disp device (waccB rowsN dim e nUsed) (("acc",sMoeAcc)::("din",sDownE)::("wts",sWts)::List.nil) (rowsN*dim) (hash ("wa",li,e,rowsN))
+        Hesper.Layers.RMSNorm.forward device mpn2post sMoeAcc sCurMoe rowsN
         pmark rMoe
         -- combine: curMlp + curMoe → postFFNNorm → +residual → ×out_scale
-        disp device (addB (N*dim)) (("ain",sCurMlp)::("bin",sCurMoe)::("outc",sComb)::List.nil) (N*dim) (hash ("ad",li))
-        Hesper.Layers.RMSNorm.forward device blk.postFFNNorm sComb sR N
-        disp device (addB (N*dim)) (("ain",sR)::("bin",sPA)::("outc",nxt)::List.nil) (N*dim) (hash ("rc",li))
-        disp device (scaleRegionB N P dim (scales[li]!) (encScales[li]!)) (("data",nxt)::List.nil) (N*dim) (hash ("sc",li))
+        disp device (addB (rowsN*dim)) (("ain",sCurMlp)::("bin",sCurMoe)::("outc",sComb)::List.nil) (rowsN*dim) (hash ("ad",li,rowsN))
+        Hesper.Layers.RMSNorm.forward device blk.postFFNNorm sComb sR rowsN
+        disp device (addB (rowsN*dim)) (("ain",sR)::("bin",sPA)::("outc",nxt)::List.nil) (rowsN*dim) (hash ("rc",li,rowsN))
+        if isDelta then
+          disp device (scaleRegionB rowsN 0 dim (scales[li]!) (encScales[li]!)) (("data",nxt)::List.nil) (rowsN*dim) (hash ("scr",li,rowsN))
+        else
+          disp device (scaleRegionB N P dim (scales[li]!) (encScales[li]!)) (("data",nxt)::List.nil) (N*dim) (hash ("sc",li))
         pmark rRest
         if li % lpb == lpb-1 || li == nLayers-1 then Hesper.GPUBackend.endBatch device
         let t := cur; cur := nxt; nxt := t
@@ -2003,11 +2209,12 @@ def main (args : List String) : IO Unit := do
         lmHeadDiag device model.inner.finalNorm model.inner.outputWeight cur dim cfg.vocabSize N P
       -- final norm + Q8 quant, then full-vocab tiled lm_head (helper, keeps `main` small)
       Hesper.GPUBackend.beginBatch device
-      Hesper.Layers.RMSNorm.forward device model.inner.finalNorm cur sN N
+      Hesper.Layers.RMSNorm.forward device model.inner.finalNorm cur sN rowsN
       -- lm_head reads the RAW f32 hidden (no qK): confirmed "Paris.", slightly more
       -- accurate than Q8_K, and the planned f32-warp lm_head kernel reads f32 directly.
       Hesper.GPUBackend.endBatch device
       let (cand, ktokFlat, probFlat) ← lmHeadArgmaxFullVocab device outputWeightF16 sN sLogits logitsCanvas outDenom outTok outProb dim cfg.vocabSize N C P cfg.logitSoftcapScale masked scK
+        (delta := if isDelta then some (rowsN, rowsAbsBuf) else none)
       -- DG_LOGITDUMP=<path>: dump the step-0 full-canvas post-softcap logits [C, vocab] f32 for a
       -- golden diff vs llama-diffusion-gemma-eval on the same prompt+all-mask canvas.
       if step == 0 then
