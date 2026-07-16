@@ -1634,6 +1634,10 @@ def main (args : List String) : IO Unit := do
   -- forces a periodic full pass as the drift guardrail. Requires fullSC (renoise default).
   let deltaOn := (← IO.getEnv "DG_DELTA").isSome
   let deltaRefresh := ((← IO.getEnv "DG_DELTAREFRESH").bind (·.toNat?)).getD 4
+  -- DG_DELTAHMIN=<pct>: entropy-gated recompute — ALSO recompute rows whose previous-step
+  -- entropy H > pct/100 (frozen high-H rows are what stalls acceptance; low-H stable rows
+  -- can safely stay stale). 0 = token-changed rows only.
+  let deltaHMin := (((← IO.getEnv "DG_DELTAHMIN").bind (·.toNat?)).getD 0).toFloat / 100.0
   let mut sKCs : Array Buffer := #[]
   let mut sVCs : Array Buffer := #[]
   for _ in [0:nLayers] do
@@ -1689,6 +1693,7 @@ def main (args : List String) : IO Unit := do
   let mut loopTotalMs : Nat := 0
   let mut effSteps : Nat := 0
   let mut deltaPrevToks := toks
+  let mut deltaPrevH : Array Float := Array.replicate C 1e9   -- pre-step-0: everything "high entropy"
   let mut deltaStepsRun : Nat := 0
   for step in [0:decodeSteps] do
     -- DG_TRACE_JS capture: record steps 0-2 as marker-separated streams
@@ -1720,7 +1725,8 @@ def main (args : List String) : IO Unit := do
       let mut deltaRowsA : Array Nat := #[]
       if deltaOn && step > 0 && fullSC && (deltaRefresh == 0 || step % deltaRefresh != 0) then
         for pos in [0:C] do
-          if toks[P+pos]! != deltaPrevToks[P+pos]! then deltaRowsA := deltaRowsA.push (P+pos)
+          if toks[P+pos]! != deltaPrevToks[P+pos]! || (deltaHMin > 0.0 && deltaPrevH[pos]! > deltaHMin) then
+            deltaRowsA := deltaRowsA.push (P+pos)
       let isDelta := deltaOn && step > 0 && fullSC && (deltaRefresh == 0 || step % deltaRefresh != 0)
                      && deltaRowsA.size > 0 && deltaRowsA.size ≤ 192
       let deltaM := if deltaRowsA.size ≤ 64 then 64 else if deltaRowsA.size ≤ 128 then 128 else 192
@@ -2330,6 +2336,7 @@ def main (args : List String) : IO Unit := do
               if accepted[pos]! then nAccChg := nAccChg + 1
           IO.println s!"  [deltastat] step {step}: inputChanged={nInChg}/{C} (acceptedChanged={nAccChg}, resampled={C-nAcc})"
         -- SC = softmax(prev logits / prev t): feed the TEMPERED top-K as next step's soft prediction
+        deltaPrevH := entH   -- entropy-gated delta recompute reads last step's H
         scTok := ktokFlat; scProb := qFlat
         if scTopK then
           -- sparse-SC path: renormalize per position (qFlat sums to the top-K share of zAll;
