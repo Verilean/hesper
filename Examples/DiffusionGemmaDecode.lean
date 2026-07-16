@@ -1483,7 +1483,11 @@ def main (args : List String) : IO Unit := do
   -- probs[C,vocab] @ Wᵀ[dim,vocab] → sSC. Needs a one-time transpose of the f16 embed table (+1.5GB)
   -- and a probs buffer (+268MB). The top-8 sliver is a biased approximation at high-entropy positions —
   -- full-vocab SC is the denoiser's trained conditioning signal (llama.cpp converges in 8-11 steps).
-  let fullSC := (← IO.getEnv "DG_FULLSC").isSome || modeRenoise
+  -- DG_SCTOPK=1: renoise SC uses the renormalized top-K expectation (gather K=8 embedding
+  -- rows × tempered probs) instead of the full-vocab probs[C,262k]@embTT WMMA (~200ms/step,
+  -- the single biggest dispatch). Truncation ≈ conditional expectation; eval-gated.
+  let scTopK := (← IO.getEnv "DG_SCTOPK").isSome
+  let fullSC := ((← IO.getEnv "DG_FULLSC").isSome || modeRenoise) && !scTopK
   let sScProbs ← mkBuf device (if fullSC then C*cfg.vocabSize else 1)
   let embTT ← mkBuf device (if fullSC then dim*(cfg.vocabSize/2) else 1)
   let sSCC ← mkBuf device (if fullSC then C*dim else 1)
@@ -2097,6 +2101,11 @@ def main (args : List String) : IO Unit := do
           if cumE ≤ ebBound then accepted := accepted.set! pos true; nAcc := nAcc + 1
           cumE := cumE + h
         -- renoise: accepted → sampled, rest → fresh random; the OUTPUT canvas is the argmax
+        -- DG_DELTASTAT=1: measure the delta-prop opportunity — how many canvas rows'
+        -- INPUT token actually changes step-over-step (the recompute set if forward
+        -- were change-driven). Measurement only; no behavior change.
+        let deltaStat := (← IO.getEnv "DG_DELTASTAT").isSome
+        let prevToks := toks
         let mut entSum := 0.0
         for pos in [0:C] do
           entSum := entSum + entH[pos]!
@@ -2105,8 +2114,25 @@ def main (args : List String) : IO Unit := do
           else
             ebRng := ebRng * 6364136223846793005 + 1442695040888963407
             toks := toks.set! (P+pos) ((ebRng >>> 33).toNat % cfg.vocabSize)
+        if deltaStat then
+          let mut nInChg := 0
+          let mut nAccChg := 0
+          for pos in [0:C] do
+            if toks[P+pos]! != prevToks[P+pos]! then
+              nInChg := nInChg + 1
+              if accepted[pos]! then nAccChg := nAccChg + 1
+          IO.println s!"  [deltastat] step {step}: inputChanged={nInChg}/{C} (acceptedChanged={nAccChg}, resampled={C-nAcc})"
         -- SC = softmax(prev logits / prev t): feed the TEMPERED top-K as next step's soft prediction
         scTok := ktokFlat; scProb := qFlat
+        if scTopK then
+          -- sparse-SC path: renormalize per position (qFlat sums to the top-K share of zAll;
+          -- the conditional expectation needs Σ=1 so the SC embedding keeps full magnitude)
+          for pos in [0:C] do
+            let base := pos*scK
+            let mut sq := 0.0
+            for j in [0:scK] do sq := sq + scProb[base+j]!
+            if sq > 1e-30 then
+              for j in [0:scK] do scProb := scProb.set! (base+j) (scProb[base+j]! / sq)
         -- adaptive stop: argmax stable ≥ stab steps AND mean entropy < threshold (llama.cpp rule).
         -- The OUTPUT is argmaxT, so once it stops CHANGING (within a hamming tolerance — a few
         -- flickering high-entropy tail positions must not reset stability and burn steps) further
