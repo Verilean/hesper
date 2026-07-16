@@ -578,3 +578,25 @@ barriers only on real buffers.
 Process note: the autotune loop ran end-to-end against a brand-new objective (new
 instrument → sweep → refine with incumbent guard → winners.csv deploy without rebuild
 → token gate) and correctly returned "no headroom here" — a clean negative (principle 6).
+
+---
+
+## 2026-07-16 — DG: Chrome lab complete; delta-prop landed (-6%); lab-factor hunt
+
+Detail: e4b-webgpu/DG_PORT_LOG.md R30-R50; recipes/DIFFUSIONGEMMA_PERF_PLAN.md ledger.
+
+- **Chrome trace-replay lab: DONE** (M0-M2b, 8/8 eval on Chrome, 57.2s→1.8s/step
+  = 26×; root causes: trace holes caught by the new dgtrace-validate.py, then a
+  530KB un-CSE'd Q6_K kernel = 96% of step time → DG_Q6KWARP, native also -0.9s).
+- **DG_DELTA delta-prop landed** (refresh-1 bit-identical; production
+  DG_DELTAREFRESH=2 = net -6%, 8/8). Convergence tax diagnosed as real dynamics
+  (stale frozen-row K/V at commit time) — policy-irreducible; CLOSED at ceiling.
+  Machinery (per-layer K/V caches, M-buckets, rectangular attention) reusable
+  for mask-mode decoding (sticky commits).
+- Lab constant factor 2.1× vs native: robustness -11% (recovered), fast-math
+  REFUTED (strict-math native A/B: identical 846ms), Dawn-July rebuild A/B in
+  flight. f16/WebGPU-itself ruled out (same WGSL both sides).
+- Current TPS: native ~43 canvas tok/s (llama.cpp 64), Chrome lab ~20.
+- Next candidates: measured-JIT autotune main line on the DG kernels (the 2.3×
+  WGSL-vs-llama.cpp per-kernel gap), mask-mode+delta, ternary bet, single-load
+  eval harness (measurement hygiene).
