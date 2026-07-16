@@ -1638,6 +1638,11 @@ def main (args : List String) : IO Unit := do
   -- entropy H > pct/100 (frozen high-H rows are what stalls acceptance; low-H stable rows
   -- can safely stay stale). 0 = token-changed rows only.
   let deltaHMin := (((← IO.getEnv "DG_DELTAHMIN").bind (·.toNat?)).getD 0).toFloat / 100.0
+  -- DG_DELTAMINROWS=<n>: only take a delta pass when ≥ n rows changed. DELTADIAG showed the
+  -- convergence tax comes from LATE delta steps (few changed rows, near the stop): their ms
+  -- saving (~380) is smaller than the +1 step they risk (~855), while EARLY delta steps
+  -- (many rows) are safe. Default 0 = no floor (previous behavior).
+  let deltaMinRows := ((← IO.getEnv "DG_DELTAMINROWS").bind (·.toNat?)).getD 0
   let mut sKCs : Array Buffer := #[]
   let mut sVCs : Array Buffer := #[]
   for _ in [0:nLayers] do
@@ -1734,7 +1739,7 @@ def main (args : List String) : IO Unit := do
           if toks[P+pos]! != deltaPrevToks[P+pos]! || (deltaHMin > 0.0 && deltaPrevH[pos]! > deltaHMin) then
             deltaRowsA := deltaRowsA.push (P+pos)
       let isDelta := deltaOn && step > 0 && fullSC && (deltaRefresh == 0 || step % deltaRefresh != 0)
-                     && deltaRowsA.size > 0 && deltaRowsA.size ≤ 192
+                     && deltaRowsA.size ≥ max 1 deltaMinRows && deltaRowsA.size ≤ 192
       let deltaM := if deltaRowsA.size ≤ 64 then 64 else if deltaRowsA.size ≤ 128 then 128 else 192
       deltaPrevToks := toks
       let rowsN := if isDelta then deltaM else N   -- rows this forward computes
@@ -2366,6 +2371,27 @@ def main (args : List String) : IO Unit := do
         ebFirstStep := false
         ebPrevT := tCur   -- renoise SC uses the PREV step's anneal t (llama.cpp prev_temp_inv)
         let meanH := entSum / C.toFloat
+        -- DG_DELTADIAG=1: decompose the stop criterion into fresh (recomputed this step)
+        -- vs frozen (delta-skipped, stale-logits) rows — locates the delta convergence tax.
+        if (← IO.getEnv "DG_DELTADIAG").isSome then
+          let mut frozen : Array Bool := Array.replicate C false
+          if isDelta then
+            for pos in [0:C] do frozen := frozen.set! pos true
+            for r in deltaRowsA do if r ≥ P then frozen := frozen.set! (r-P) false
+          let mut hF := 0.0; let mut nF := 0
+          let mut hZ := 0.0; let mut nZ := 0; let mut maxZ := 0.0; let mut nZhi := 0
+          let mut accZ := 0
+          for pos in [0:C] do
+            if frozen[pos]! then
+              hZ := hZ + entH[pos]!; nZ := nZ + 1
+              if entH[pos]! > maxZ then maxZ := entH[pos]!
+              if entH[pos]! > ebConfTh then nZhi := nZhi + 1
+              if accepted[pos]! then accZ := accZ + 1
+            else
+              hF := hF + entH[pos]!; nF := nF + 1
+          let mF := if nF > 0 then hF / nF.toFloat else 0.0
+          let mZ := if nZ > 0 then hZ / nZ.toFloat else 0.0
+          IO.println s!"  [deltadiag] step {step}: fresh n={nF} meanH={mF} | frozen n={nZ} meanH={mZ} maxH={maxZ} nAboveTh={nZhi} accFrozen={accZ} | meanH_all={meanH} held={ebHeld} chg={nChanged}"
         let finish := (ebHeld ≥ ebStab && meanH < ebConfTh) || step+1 ≥ decodeSteps
         if finish then
           for i in [0:C] do
