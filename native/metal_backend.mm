@@ -1,0 +1,437 @@
+// metal_backend.mm — M-Metal Stage 2: thin Metal executor (HESPER_BACKEND=metal).
+//
+// A minimal WebGPU-shaped compute backend that runs hesper's generated WGSL
+// kernels directly on Metal, bypassing Dawn in the hot path:
+//   WGSL --(pinned May tint CLI, robustness OFF)--> MSL --> MTLLibrary --> PSO
+// with a persistent on-disk MSL cache keyed by WGSL content hash (this also
+// deduplicates the 30 byte-identical per-layer kernels that Dawn compiled as
+// 30 separate pipelines).
+//
+// Ordering model = Dawn parity: one MTLCommandBuffer per batch, ONE serial
+// compute encoder per command buffer (serial dispatch type ≈ Dawn's implicit
+// per-dispatch barriers), hazard-tracked resources. flushBatch = commit
+// without wait; endBatch = commit + waitUntilCompleted.
+//
+// Buffers are MTLResourceStorageModeShared (unified memory) and explicitly
+// zero-filled on creation — Dawn zero-initializes, Metal does not, and the
+// uninitialized-read bug class is one we've already paid for once.
+//
+// Pure C ABI, no Lean dependency: bridge.cpp owns all lean_object wrapping and
+// registers finalizers that call the hm_free_* functions below.
+
+#ifdef __APPLE__
+
+#import <Metal/Metal.h>
+#import <Foundation/Foundation.h>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <cstdint>
+#include <string>
+#include <vector>
+#include <unordered_map>
+#include <mutex>
+#include <sys/stat.h>
+
+namespace {
+
+struct HMPipe {
+    id<MTLComputePipelineState> pso;   // retained
+    uint32_t tgBytes;                  // threadgroup memory at index 0 (0 = none)
+    uint32_t wgX, wgY, wgZ;            // threads per threadgroup (from @workgroup_size)
+};
+
+struct HMCtx {
+    id<MTLDevice> dev;
+    id<MTLCommandQueue> queue;
+    id<MTLCommandBuffer> lastCB;       // retained; last committed batch (for read fences)
+    std::unordered_map<uint64_t, HMPipe*> psoCache;  // wgsl-hash -> pipeline
+    std::mutex mu;
+    std::string tintPath;
+    std::string cacheDir;
+};
+
+struct HMBuf {
+    id<MTLBuffer> buf;                 // retained (new* = +1)
+    size_t size;
+};
+
+struct HMShader {
+    std::string wgsl;
+    uint32_t tgBytes;
+    uint32_t wgX, wgY, wgZ;
+};
+
+struct HMBind {
+    std::vector<std::pair<uint32_t, id<MTLBuffer>>> entries;  // (binding, buffer), buffers retained
+};
+
+struct HMEnc {
+    id<MTLCommandBuffer> cb;           // retained
+    id<MTLComputeCommandEncoder> enc;  // retained; nil after end
+};
+
+HMCtx* g_ctx = nullptr;
+std::mutex g_ctx_mu;
+
+uint64_t fnv64(const char* s, size_t n) {
+    uint64_t h = 1469598103934665603ULL;
+    for (size_t i = 0; i < n; i++) { h ^= (uint8_t)s[i]; h *= 1099511628211ULL; }
+    return h;
+}
+
+// Parse "@workgroup_size(X[, Y[, Z]])" (integer literals — the DSL always
+// emits literals).
+void parseWorkgroupSize(const std::string& wgsl, uint32_t& x, uint32_t& y, uint32_t& z) {
+    x = 1; y = 1; z = 1;
+    size_t p = wgsl.find("@workgroup_size(");
+    if (p == std::string::npos) return;
+    p += strlen("@workgroup_size(");
+    uint32_t vals[3] = {1, 1, 1};
+    int vi = 0;
+    while (p < wgsl.size() && vi < 3) {
+        while (p < wgsl.size() && (wgsl[p] == ' ' || wgsl[p] == ',')) p++;
+        if (!isdigit((unsigned char)wgsl[p])) break;
+        uint32_t v = 0;
+        while (p < wgsl.size() && isdigit((unsigned char)wgsl[p])) { v = v * 10 + (wgsl[p] - '0'); p++; }
+        vals[vi++] = v;
+        while (p < wgsl.size() && wgsl[p] == 'u') p++;
+        if (p < wgsl.size() && wgsl[p] == ')') break;
+    }
+    x = vals[0]; y = vals[1]; z = vals[2];
+}
+
+// Total threadgroup memory: sum var<workgroup> declarations. Tint packs them
+// into a single [[threadgroup(0)]] struct; we compute a safe upper bound with
+// per-member element alignment and 16-byte final rounding.
+uint32_t parseWorkgroupBytes(const std::string& wgsl) {
+    uint64_t total = 0;
+    size_t p = 0;
+    while ((p = wgsl.find("var<workgroup>", p)) != std::string::npos) {
+        size_t line_end = wgsl.find(';', p);
+        if (line_end == std::string::npos) break;
+        std::string decl = wgsl.substr(p, line_end - p);
+        p = line_end;
+        uint64_t elem = 4, count = 1;
+        size_t ap = decl.find("array<");
+        if (ap != std::string::npos) {
+            if (decl.find("f16", ap) != std::string::npos) elem = 2;
+            else elem = 4;  // u32 / i32 / f32
+            size_t comma = decl.find(',', ap);
+            if (comma != std::string::npos) {
+                count = strtoull(decl.c_str() + comma + 1, nullptr, 10);
+            }
+        } else {
+            if (decl.find(": f16") != std::string::npos) elem = 2;
+        }
+        // align member offset to element size
+        if (elem > 0 && total % elem) total += elem - (total % elem);
+        total += elem * count;
+    }
+    return (uint32_t)((total + 15) & ~15ULL);
+}
+
+bool runTint(HMCtx* ctx, const std::string& wgsl, uint64_t h, std::string& mslOut, std::string& err) {
+    char mslPath[1024], wgslPath[1024];
+    snprintf(mslPath, sizeof(mslPath), "%s/%016llx.msl", ctx->cacheDir.c_str(), (unsigned long long)h);
+    snprintf(wgslPath, sizeof(wgslPath), "%s/%016llx.wgsl", ctx->cacheDir.c_str(), (unsigned long long)h);
+
+    // cache hit?
+    if (FILE* f = fopen(mslPath, "rb")) {
+        fseek(f, 0, SEEK_END); long n = ftell(f); fseek(f, 0, SEEK_SET);
+        mslOut.resize(n);
+        size_t rd = fread(&mslOut[0], 1, n, f);
+        fclose(f);
+        if ((long)rd == n && n > 0) return true;
+    }
+
+    if (FILE* f = fopen(wgslPath, "wb")) {
+        fwrite(wgsl.data(), 1, wgsl.size(), f);
+        fclose(f);
+    } else { err = "cannot write wgsl temp"; return false; }
+
+    char cmd[2600];
+    snprintf(cmd, sizeof(cmd),
+        "'%s' --format msl --disable-robustness true --msl-version 3.2 '%s' > '%s.tmp' 2> '%s.err'",
+        ctx->tintPath.c_str(), wgslPath, mslPath, mslPath);
+    int rc = system(cmd);
+    if (rc != 0) {
+        char errPath[1060]; snprintf(errPath, sizeof(errPath), "%s.err", mslPath);
+        if (FILE* f = fopen(errPath, "rb")) {
+            char buf[512]; size_t n = fread(buf, 1, sizeof(buf) - 1, f); buf[n] = 0; fclose(f);
+            err = std::string("tint failed: ") + buf;
+        } else err = "tint failed (no stderr)";
+        return false;
+    }
+    char tmpPath[1060]; snprintf(tmpPath, sizeof(tmpPath), "%s.tmp", mslPath);
+    rename(tmpPath, mslPath);
+    if (FILE* f = fopen(mslPath, "rb")) {
+        fseek(f, 0, SEEK_END); long n = ftell(f); fseek(f, 0, SEEK_SET);
+        mslOut.resize(n);
+        size_t rd = fread(&mslOut[0], 1, n, f);
+        fclose(f);
+        return (long)rd == n && n > 0;
+    }
+    err = "tint produced no output";
+    return false;
+}
+
+std::string parseEntryPoint(const std::string& msl) {
+    size_t p = msl.find("kernel void ");
+    if (p == std::string::npos) return "main";
+    p += strlen("kernel void ");
+    size_t e = p;
+    while (e < msl.size() && (isalnum((unsigned char)msl[e]) || msl[e] == '_')) e++;
+    return msl.substr(p, e - p);
+}
+
+} // namespace
+
+extern "C" {
+
+int hm_available(void) { return 1; }
+
+void* hm_get_ctx(void) {
+    std::lock_guard<std::mutex> lk(g_ctx_mu);
+    if (g_ctx) return g_ctx;
+    HMCtx* ctx = new HMCtx();
+    ctx->dev = MTLCreateSystemDefaultDevice();  // +1
+    if (!ctx->dev) { delete ctx; return nullptr; }
+    ctx->queue = [ctx->dev newCommandQueue];    // +1
+    ctx->lastCB = nil;
+    const char* tp = getenv("HESPER_TINT");
+    if (tp) ctx->tintPath = tp;
+    else {
+        const char* home = getenv("HOME");
+        ctx->tintPath = std::string(home ? home : "") + "/git/verilean/hesper/.lake/build/tint-cli/tint";
+    }
+    const char* home = getenv("HOME");
+    ctx->cacheDir = std::string(home ? home : "/tmp") + "/.cache/hesper-msl";
+    mkdir((std::string(home ? home : "/tmp") + "/.cache").c_str(), 0755);
+    mkdir(ctx->cacheDir.c_str(), 0755);
+    fprintf(stderr, "[metal-backend] device=%s tint=%s cache=%s\n",
+            [[ctx->dev name] UTF8String], ctx->tintPath.c_str(), ctx->cacheDir.c_str());
+    g_ctx = ctx;
+    return ctx;
+}
+
+const char* hm_device_name(void* ctxp) {
+    HMCtx* ctx = (HMCtx*)ctxp;
+    return [[ctx->dev name] UTF8String];
+}
+
+// ---- buffers ---------------------------------------------------------------
+
+void* hm_create_buffer(void* ctxp, size_t size) {
+    HMCtx* ctx = (HMCtx*)ctxp;
+    @autoreleasepool {
+        size_t sz = size < 4 ? 4 : size;
+        id<MTLBuffer> b = [ctx->dev newBufferWithLength:sz options:MTLResourceStorageModeShared];
+        if (!b) return nullptr;
+        memset([b contents], 0, sz);   // Dawn zero-init parity — CRITICAL
+        HMBuf* hb = new HMBuf{b, sz};
+        return hb;
+    }
+}
+
+void hm_write_buffer(void* /*ctxp*/, void* bufp, size_t offset, const void* data, size_t n) {
+    HMBuf* hb = (HMBuf*)bufp;
+    if (offset + n > hb->size) n = (offset < hb->size) ? hb->size - offset : 0;
+    if (n) memcpy((uint8_t*)[hb->buf contents] + offset, data, n);
+}
+
+// Read AFTER fencing on the last committed batch (unified memory: direct copy).
+int hm_read_buffer(void* ctxp, void* bufp, size_t offset, void* dst, size_t n) {
+    HMCtx* ctx = (HMCtx*)ctxp;
+    HMBuf* hb = (HMBuf*)bufp;
+    id<MTLCommandBuffer> last = nil;
+    {
+        std::lock_guard<std::mutex> lk(ctx->mu);
+        last = ctx->lastCB;
+        if (last) [last retain];
+    }
+    if (last) { [last waitUntilCompleted]; [last release]; }
+    if (offset + n > hb->size) return 0;
+    memcpy(dst, (uint8_t*)[hb->buf contents] + offset, n);
+    return 1;
+}
+
+uint64_t hm_buffer_id(void* bufp) {
+    HMBuf* hb = (HMBuf*)bufp;
+    return (uint64_t)(uintptr_t)hb->buf;
+}
+
+void hm_free_buffer(void* bufp) {
+    HMBuf* hb = (HMBuf*)bufp;
+    [hb->buf release];
+    delete hb;
+}
+
+// ---- shaders / pipelines ---------------------------------------------------
+
+void* hm_create_shader(void* /*ctxp*/, const char* wgsl) {
+    HMShader* sh = new HMShader();
+    sh->wgsl = wgsl;
+    sh->tgBytes = parseWorkgroupBytes(sh->wgsl);
+    parseWorkgroupSize(sh->wgsl, sh->wgX, sh->wgY, sh->wgZ);
+    return sh;
+}
+
+void hm_free_shader(void* shp) { delete (HMShader*)shp; }
+
+// Returns HMPipe* or nullptr; err_out (static buffer) describes failures.
+static char g_pipe_err[2048];
+const char* hm_last_pipeline_error(void) { return g_pipe_err; }
+
+void* hm_create_pipeline(void* ctxp, void* shp) {
+    HMCtx* ctx = (HMCtx*)ctxp;
+    HMShader* sh = (HMShader*)shp;
+    uint64_t h = fnv64(sh->wgsl.data(), sh->wgsl.size());
+    {
+        std::lock_guard<std::mutex> lk(ctx->mu);
+        auto it = ctx->psoCache.find(h);
+        if (it != ctx->psoCache.end()) return it->second;
+    }
+    @autoreleasepool {
+        std::string msl, err;
+        if (!runTint(ctx, sh->wgsl, h, msl, err)) {
+            snprintf(g_pipe_err, sizeof(g_pipe_err), "%s", err.c_str());
+            return nullptr;
+        }
+        std::string entry = parseEntryPoint(msl);
+
+        MTLCompileOptions* opts = [[MTLCompileOptions alloc] init];
+        opts.languageVersion = MTLLanguageVersion3_2;
+        // fast math = native Dawn parity (Dawn default compiles fastMathEnabled)
+#if defined(__MAC_15_0)
+        opts.mathMode = MTLMathModeFast;
+#else
+        opts.fastMathEnabled = YES;
+#endif
+        NSError* nserr = nil;
+        NSString* src = [[NSString alloc] initWithBytes:msl.data() length:msl.size() encoding:NSUTF8StringEncoding];
+        id<MTLLibrary> lib = [ctx->dev newLibraryWithSource:src options:opts error:&nserr];
+        [src release];
+        [opts release];
+        if (!lib) {
+            snprintf(g_pipe_err, sizeof(g_pipe_err), "MSL compile: %s",
+                     nserr ? [[nserr localizedDescription] UTF8String] : "?");
+            return nullptr;
+        }
+        id<MTLFunction> fn = [lib newFunctionWithName:
+            [NSString stringWithUTF8String:entry.c_str()]];
+        if (!fn) {
+            snprintf(g_pipe_err, sizeof(g_pipe_err), "entry '%s' not found", entry.c_str());
+            [lib release];
+            return nullptr;
+        }
+        id<MTLComputePipelineState> pso = [ctx->dev newComputePipelineStateWithFunction:fn error:&nserr];
+        [fn release];
+        [lib release];
+        if (!pso) {
+            snprintf(g_pipe_err, sizeof(g_pipe_err), "PSO: %s",
+                     nserr ? [[nserr localizedDescription] UTF8String] : "?");
+            return nullptr;
+        }
+        HMPipe* hp = new HMPipe{pso, sh->tgBytes, sh->wgX, sh->wgY, sh->wgZ};
+        std::lock_guard<std::mutex> lk(ctx->mu);
+        auto it = ctx->psoCache.find(h);
+        if (it != ctx->psoCache.end()) { [pso release]; delete hp; return it->second; }
+        ctx->psoCache[h] = hp;
+        return hp;
+    }
+}
+
+// pipelines are cache-owned: Lean-side finalizer is a no-op
+void hm_free_pipeline(void* /*p*/) {}
+
+// ---- bind groups -----------------------------------------------------------
+
+void* hm_create_bindgroup(void* /*ctxp*/, uint32_t n, const uint32_t* bindings, void** bufs) {
+    HMBind* bg = new HMBind();
+    bg->entries.reserve(n);
+    for (uint32_t i = 0; i < n; i++) {
+        HMBuf* hb = (HMBuf*)bufs[i];
+        [hb->buf retain];
+        bg->entries.emplace_back(bindings[i], hb->buf);
+    }
+    return bg;
+}
+
+void hm_free_bindgroup(void* bgp) {
+    HMBind* bg = (HMBind*)bgp;
+    for (auto& e : bg->entries) [e.second release];
+    delete bg;
+}
+
+// ---- encoding / submission -------------------------------------------------
+
+void* hm_encoder_new(void* ctxp) {
+    HMCtx* ctx = (HMCtx*)ctxp;
+    @autoreleasepool {
+        HMEnc* e = new HMEnc();
+        e->cb = [[ctx->queue commandBuffer] retain];
+        e->enc = [[e->cb computeCommandEncoderWithDispatchType:MTLDispatchTypeSerial] retain];
+        return e;
+    }
+}
+
+void hm_record(void* /*ctxp*/, void* encp, void* pipep, void* bgp,
+               uint32_t wx, uint32_t wy, uint32_t wz) {
+    HMEnc* e = (HMEnc*)encp;
+    HMPipe* p = (HMPipe*)pipep;
+    HMBind* bg = (HMBind*)bgp;
+    if (!e->enc) return;
+    [e->enc setComputePipelineState:p->pso];
+    for (auto& en : bg->entries)
+        [e->enc setBuffer:en.second offset:0 atIndex:en.first];
+    if (p->tgBytes)
+        [e->enc setThreadgroupMemoryLength:p->tgBytes atIndex:0];
+    [e->enc dispatchThreadgroups:MTLSizeMake(wx, wy, wz)
+           threadsPerThreadgroup:MTLSizeMake(p->wgX, p->wgY, p->wgZ)];
+}
+
+void hm_submit(void* ctxp, void* encp, int wait) {
+    HMCtx* ctx = (HMCtx*)ctxp;
+    HMEnc* e = (HMEnc*)encp;
+    if (e->enc) { [e->enc endEncoding]; [e->enc release]; e->enc = nil; }
+    [e->cb commit];
+    {
+        std::lock_guard<std::mutex> lk(ctx->mu);
+        if (ctx->lastCB) [ctx->lastCB release];
+        ctx->lastCB = [e->cb retain];
+    }
+    if (wait) [e->cb waitUntilCompleted];
+}
+
+void hm_free_encoder(void* encp) {
+    HMEnc* e = (HMEnc*)encp;
+    if (e->enc) { [e->enc endEncoding]; [e->enc release]; }
+    if (e->cb) [e->cb release];
+    delete e;
+}
+
+// One-shot dispatch (parity-exe path): encode, commit, wait.
+int hm_dispatch_once(void* ctxp, void* pipep, void* bgp,
+                     uint32_t wx, uint32_t wy, uint32_t wz) {
+    void* e = hm_encoder_new(ctxp);
+    hm_record(ctxp, e, pipep, bgp, wx, wy, wz);
+    hm_submit(ctxp, e, 1);
+    hm_free_encoder(e);
+    return 1;
+}
+
+void hm_wait_idle(void* ctxp) {
+    HMCtx* ctx = (HMCtx*)ctxp;
+    id<MTLCommandBuffer> last = nil;
+    {
+        std::lock_guard<std::mutex> lk(ctx->mu);
+        last = ctx->lastCB;
+        if (last) [last retain];
+    }
+    if (last) { [last waitUntilCompleted]; [last release]; }
+}
+
+} // extern "C"
+
+#endif // __APPLE__

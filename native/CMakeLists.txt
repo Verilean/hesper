@@ -109,6 +109,15 @@ else()
   target_sources(hesper_native PRIVATE metal_replace_stub.cpp)
 endif()
 
+# metal_backend.mm — the M-Metal thin executor (HESPER_BACKEND=metal): runs the
+# generated WGSL kernels directly on Metal via the pinned tint CLI (WGSL→MSL,
+# robustness off), bypassing Dawn in the hot path. Same Apple/stub split.
+if(APPLE)
+  target_sources(hesper_native PRIVATE metal_backend.mm)
+else()
+  target_sources(hesper_native PRIVATE metal_backend_stub.cpp)
+endif()
+
 # macOS: bridge.cpp references Lean runtime symbols (lean_alloc_object,
 # lean_mk_string, lean_inc_heartbeat, mi_malloc_small, ...) but the
 # Lean runtime lives in the *consumer* (the lean_exe / xeus-lean

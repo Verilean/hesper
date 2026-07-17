@@ -276,6 +276,68 @@ static lean_external_class* g_webgpu_bind_group_layout_class = nullptr;
 static lean_external_class* g_webgpu_command_encoder_class = nullptr;
 static lean_external_class* g_webgpu_future_class = nullptr;
 
+
+// ============================================================================
+// M-Metal thin backend (HESPER_BACKEND=metal) — see metal_backend.mm.
+// Pure C ABI; bridge.cpp owns all lean wrapping. On non-Apple builds the
+// symbols come from metal_backend_stub.cpp (hm_available() = 0).
+// ============================================================================
+extern "C" {
+  int hm_available(void);
+  void* hm_get_ctx(void);
+  void* hm_create_buffer(void*, size_t);
+  void hm_write_buffer(void*, void*, size_t, const void*, size_t);
+  int hm_read_buffer(void*, void*, size_t, void*, size_t);
+  uint64_t hm_buffer_id(void*);
+  void hm_free_buffer(void*);
+  void* hm_create_shader(void*, const char*);
+  void hm_free_shader(void*);
+  void* hm_create_pipeline(void*, void*);
+  const char* hm_last_pipeline_error(void);
+  void* hm_create_bindgroup(void*, uint32_t, const uint32_t*, void**);
+  void hm_free_bindgroup(void*);
+  void* hm_encoder_new(void*);
+  void hm_record(void*, void*, void*, void*, uint32_t, uint32_t, uint32_t);
+  void hm_submit(void*, void*, int);
+  void hm_free_encoder(void*);
+  int hm_dispatch_once(void*, void*, void*, uint32_t, uint32_t, uint32_t);
+  void hm_wait_idle(void*);
+}
+
+static bool hesper_metal_mode() {
+    static int m = -1;
+    if (m < 0) {
+        const char* e = getenv("HESPER_BACKEND");
+        m = (e && strcmp(e, "metal") == 0 && hm_available()) ? 1 : 0;
+    }
+    return m == 1;
+}
+
+static lean_external_class* g_hm_noop_class = nullptr;
+static lean_external_class* g_hm_buffer_class = nullptr;
+static lean_external_class* g_hm_shader_class = nullptr;
+static lean_external_class* g_hm_pipeline_class = nullptr;
+static lean_external_class* g_hm_bindgroup_class = nullptr;
+static lean_external_class* g_hm_encoder_class = nullptr;
+
+static void hm_finalize_noop(void*) {}
+static void hm_finalize_buffer_cb(void* p) { if (p) hm_free_buffer(p); }
+static void hm_finalize_shader_cb(void* p) { if (p) hm_free_shader(p); }
+static void hm_finalize_pipeline_cb(void*) {}   // pipelines are cache-owned
+static void hm_finalize_bindgroup_cb(void* p) { if (p) hm_free_bindgroup(p); }
+static void hm_finalize_encoder_cb(void* p) { if (p) hm_free_encoder(p); }
+static void hm_noop_foreach(void*, b_lean_obj_arg) {}
+
+static void register_hm_classes() {
+    if (g_hm_noop_class) return;
+    g_hm_noop_class = lean_register_external_class(hm_finalize_noop, hm_noop_foreach);
+    g_hm_buffer_class = lean_register_external_class(hm_finalize_buffer_cb, hm_noop_foreach);
+    g_hm_shader_class = lean_register_external_class(hm_finalize_shader_cb, hm_noop_foreach);
+    g_hm_pipeline_class = lean_register_external_class(hm_finalize_pipeline_cb, hm_noop_foreach);
+    g_hm_bindgroup_class = lean_register_external_class(hm_finalize_bindgroup_cb, hm_noop_foreach);
+    g_hm_encoder_class = lean_register_external_class(hm_finalize_encoder_cb, hm_noop_foreach);
+}
+
 extern "C" {
 
 //=============================================================================
@@ -530,6 +592,14 @@ lean_obj_res lean_hesper_set_verbose(uint8_t verbose, lean_obj_res /* unit */) {
 lean_obj_res lean_hesper_init(lean_obj_res /* unit */) {
     // Register external classes for GC management
     register_webgpu_external_classes();
+
+    if (hesper_metal_mode()) {
+        register_hm_classes();
+        void* ctx = hm_get_ctx();
+        if (!ctx) return make_webgpu_io_error(WebGPUError::Device(DeviceError::InitializationFailed("Metal device unavailable")));
+        lean_object* external = lean_alloc_external(g_hm_noop_class, ctx);
+        return lean_io_result_mk_ok(external);
+    }
 
     // 1. Setup ProcTable (Critical for Native Dawn)
     //
@@ -943,6 +1013,14 @@ static wgpu::Device createDeviceWithMaxLimits(wgpu::Adapter& adapter) {
 // Device Management
 // Create device with advanced features (subgroup matrix, F16, etc.)
 lean_obj_res lean_hesper_get_device_with_features(b_lean_obj_arg instance_obj, lean_obj_res /* unit */) {
+    if (hesper_metal_mode()) {
+        lean_object* device_external = lean_alloc_external(g_hm_noop_class, hm_get_ctx());
+        lean_object* device_struct = lean_alloc_ctor(0, 2, 0);
+        lean_inc(instance_obj);
+        lean_ctor_set(device_struct, 0, device_external);
+        lean_ctor_set(device_struct, 1, instance_obj);
+        return lean_io_result_mk_ok(device_struct);
+    }
     dawn::native::Instance* instance = static_cast<dawn::native::Instance*>(lean_get_external_data(instance_obj));
 
     auto adapters = instance->EnumerateAdapters(togglesAdapterOptions());
@@ -972,6 +1050,14 @@ lean_obj_res lean_hesper_get_device_with_features(b_lean_obj_arg instance_obj, l
 }
 
 lean_obj_res lean_hesper_get_device(b_lean_obj_arg instance_obj, lean_obj_res /* unit */) {
+    if (hesper_metal_mode()) {
+        lean_object* device_external = lean_alloc_external(g_hm_noop_class, hm_get_ctx());
+        lean_object* device_struct = lean_alloc_ctor(0, 2, 0);
+        lean_inc(instance_obj);
+        lean_ctor_set(device_struct, 0, device_external);
+        lean_ctor_set(device_struct, 1, instance_obj);
+        return lean_io_result_mk_ok(device_struct);
+    }
     dawn::native::Instance* instance = static_cast<dawn::native::Instance*>(lean_get_external_data(instance_obj));
 
     auto adapters = instance->EnumerateAdapters(togglesAdapterOptions());
@@ -1005,6 +1091,7 @@ lean_obj_res lean_hesper_get_device(b_lean_obj_arg instance_obj, lean_obj_res /*
 
 // Get the number of available GPU adapters
 lean_obj_res lean_hesper_get_adapter_count(b_lean_obj_arg instance_obj, lean_obj_res /* unit */) {
+    if (hesper_metal_mode()) return lean_io_result_mk_ok(lean_box(1));
     dawn::native::Instance* instance = static_cast<dawn::native::Instance*>(lean_get_external_data(instance_obj));
 
     auto adapters = instance->EnumerateAdapters(togglesAdapterOptions());
@@ -1020,6 +1107,12 @@ lean_obj_res lean_hesper_get_time_ns(lean_obj_res /* unit */) {
 
 // Get GPU adapter information by index
 lean_obj_res lean_hesper_get_adapter_info(b_lean_obj_arg instance_obj, uint32_t gpuIdx, lean_obj_res /* unit */) {
+    if (hesper_metal_mode()) {
+        lean_object* result = lean_alloc_ctor(0, 2, 0);
+        lean_ctor_set(result, 0, lean_mk_string("Metal (thin backend)"));
+        lean_ctor_set(result, 1, lean_box(3));  // backendType Metal
+        return lean_io_result_mk_ok(result);
+    }
     dawn::native::Instance* instance = static_cast<dawn::native::Instance*>(lean_get_external_data(instance_obj));
 
     auto adapters = instance->EnumerateAdapters(togglesAdapterOptions());
@@ -1047,6 +1140,14 @@ lean_obj_res lean_hesper_get_adapter_info(b_lean_obj_arg instance_obj, uint32_t 
 
 // Create a device from a specific GPU adapter index
 lean_obj_res lean_hesper_get_device_by_index(b_lean_obj_arg instance_obj, uint32_t gpuIdx, lean_obj_res /* unit */) {
+    if (hesper_metal_mode()) {
+        lean_object* device_external = lean_alloc_external(g_hm_noop_class, hm_get_ctx());
+        lean_object* device_struct = lean_alloc_ctor(0, 2, 0);
+        lean_inc(instance_obj);
+        lean_ctor_set(device_struct, 0, device_external);
+        lean_ctor_set(device_struct, 1, instance_obj);
+        return lean_io_result_mk_ok(device_struct);
+    }
     dawn::native::Instance* instance = static_cast<dawn::native::Instance*>(lean_get_external_data(instance_obj));
 
     auto adapters = instance->EnumerateAdapters(togglesAdapterOptions());
@@ -1088,6 +1189,7 @@ lean_obj_res lean_hesper_get_device_by_index(b_lean_obj_arg instance_obj, uint32
 
 // Query whether the device was created with subgroup support
 lean_obj_res lean_hesper_device_has_subgroups(b_lean_obj_arg device_obj, lean_obj_res /* unit */) {
+    if (hesper_metal_mode()) return lean_io_result_mk_ok(lean_box(1));
     wgpu::Device* device = EXTRACT_DEVICE_PTR(device_obj);
     bool has = device->HasFeature(wgpu::FeatureName::Subgroups);
     return lean_io_result_mk_ok(lean_box(has ? 1 : 0));
@@ -1095,6 +1197,7 @@ lean_obj_res lean_hesper_device_has_subgroups(b_lean_obj_arg device_obj, lean_ob
 
 // Query whether the device was created with SubgroupMatrix support
 lean_obj_res lean_hesper_device_has_subgroup_matrix(b_lean_obj_arg device_obj, lean_obj_res /* unit */) {
+    if (hesper_metal_mode()) return lean_io_result_mk_ok(lean_box(1));
     wgpu::Device* device = EXTRACT_DEVICE_PTR(device_obj);
     bool has = device->HasFeature(wgpu::FeatureName::ChromiumExperimentalSubgroupMatrix);
     return lean_io_result_mk_ok(lean_box(has ? 1 : 0));
@@ -1102,6 +1205,7 @@ lean_obj_res lean_hesper_device_has_subgroup_matrix(b_lean_obj_arg device_obj, l
 
 // Query whether the device was created with ShaderF16 support
 lean_obj_res lean_hesper_device_has_shader_f16(b_lean_obj_arg device_obj, lean_obj_res /* unit */) {
+    if (hesper_metal_mode()) return lean_io_result_mk_ok(lean_box(1));
     wgpu::Device* device = EXTRACT_DEVICE_PTR(device_obj);
     bool has = device->HasFeature(wgpu::FeatureName::ShaderF16);
     return lean_io_result_mk_ok(lean_box(has ? 1 : 0));
@@ -1114,12 +1218,14 @@ lean_obj_res lean_hesper_release_device(b_lean_obj_arg /* device */, lean_obj_re
 }
 
 lean_obj_res lean_hesper_device_tick(b_lean_obj_arg device_obj, lean_obj_res /* unit */) {
+    if (hesper_metal_mode()) return lean_io_result_mk_ok(lean_box(0));
     wgpu::Device* device = EXTRACT_DEVICE_PTR(device_obj);
     device->Tick();
     return lean_io_result_mk_ok(lean_box(0));
 }
 
 lean_obj_res lean_hesper_device_wait(b_lean_obj_arg future_struct, lean_obj_res /* unit */) {
+    if (hesper_metal_mode()) { hm_wait_idle(hm_get_ctx()); return lean_io_result_mk_ok(lean_box(0)); }
     // Extract FutureData from Future structure
     FutureData* futureData = EXTRACT_FUTURE_PTR(future_struct);
 
@@ -1155,6 +1261,13 @@ lean_obj_res lean_hesper_create_buffer(b_lean_obj_arg device_obj, b_lean_obj_arg
     } BufferDescriptor_Raw;
 
     BufferDescriptor_Raw* raw_desc = (BufferDescriptor_Raw*)lean_ctor_obj_cptr(desc);
+
+    if (hesper_metal_mode()) {
+        void* hb = hm_create_buffer(hm_get_ctx(), raw_desc->size);
+        if (!hb) return make_webgpu_io_error(WebGPUError::Buffer(BufferError::AllocationFailed(raw_desc->size, "Metal buffer allocation failed")));
+        lean_object* external = lean_alloc_external(g_hm_buffer_class, hb);
+        return lean_io_result_mk_ok(make_resource_with_device(external, device_obj));
+    }
 
     if (g_verbose) std::cout << "[C++] createBuffer: size=" << raw_desc->size
               << ", mapped=" << (raw_desc->mappedAtCreation ? "true" : "false") << std::endl;
@@ -1198,6 +1311,11 @@ lean_obj_res lean_hesper_create_buffer(b_lean_obj_arg device_obj, b_lean_obj_arg
 
 lean_obj_res lean_hesper_write_buffer(b_lean_obj_arg device_obj, b_lean_obj_arg buffer_obj, size_t offset,
                                        b_lean_obj_arg data, lean_obj_res /* unit */) {
+    if (hesper_metal_mode()) {
+        void* hb = (void*)EXTRACT_BUFFER_PTR(buffer_obj);
+        hm_write_buffer(hm_get_ctx(), hb, offset, lean_sarray_cptr(data), lean_sarray_size(data));
+        return lean_io_result_mk_ok(lean_box(0));
+    }
     // Extract device and buffer from External objects
     wgpu::Device* device = EXTRACT_DEVICE_PTR(device_obj);
     wgpu::Buffer* buffer = EXTRACT_BUFFER_PTR(buffer_obj);
@@ -1378,6 +1496,15 @@ static void queueWorkDoneCallback(WGPUQueueWorkDoneStatus status, WGPUStringView
 
 lean_obj_res lean_hesper_map_buffer_read(b_lean_obj_arg device_obj, b_lean_obj_arg buffer_obj,
                                           size_t offset, size_t size, lean_obj_res /* unit */) {
+    if (hesper_metal_mode()) {
+        void* hb = (void*)EXTRACT_BUFFER_PTR(buffer_obj);
+        lean_object* arr = lean_alloc_sarray(1, size, size);
+        if (!hm_read_buffer(hm_get_ctx(), hb, offset, lean_sarray_cptr(arr), size)) {
+            lean_dec(arr);
+            return make_webgpu_io_error(WebGPUError::Buffer(BufferError::MappingFailed("Metal read out of range")));
+        }
+        return lean_io_result_mk_ok(arr);
+    }
     wgpu::Device* device = EXTRACT_DEVICE_PTR(device_obj);
     wgpu::Buffer* buffer = EXTRACT_BUFFER_PTR(buffer_obj);
 
@@ -1475,6 +1602,9 @@ lean_obj_res lean_hesper_unmap_buffer(b_lean_obj_arg buffer, lean_obj_res /* uni
 
 // Return a stable unique identifier for a GPU buffer (raw WGPUBuffer handle as UInt64)
 lean_obj_res lean_hesper_buffer_id(b_lean_obj_arg buffer_obj, lean_obj_res /* unit */) {
+    if (hesper_metal_mode()) {
+        return lean_io_result_mk_ok(lean_box_uint64(hm_buffer_id((void*)EXTRACT_BUFFER_PTR(buffer_obj))));
+    }
     wgpu::Buffer* buffer = EXTRACT_BUFFER_PTR(buffer_obj);
     uint64_t id = (uint64_t)(void*)buffer->Get();
     return lean_io_result_mk_ok(lean_box_uint64(id));
@@ -1482,6 +1612,16 @@ lean_obj_res lean_hesper_buffer_id(b_lean_obj_arg buffer_obj, lean_obj_res /* un
 
 // Hash an array of buffers into a single UInt64 key (avoids N separate FFI calls)
 lean_obj_res lean_hesper_hash_buffer_array(uint64_t seed, b_lean_obj_arg buffers_array, lean_obj_res /* unit */) {
+    if (hesper_metal_mode()) {
+        size_t n = lean_array_size(buffers_array);
+        uint64_t h = seed;
+        for (size_t i = 0; i < n; i++) {
+            lean_object* buf_obj = lean_array_get_core(buffers_array, i);
+            h ^= hm_buffer_id((void*)EXTRACT_BUFFER_PTR(buf_obj));
+            h *= 0x100000001b3ULL;
+        }
+        return lean_io_result_mk_ok(lean_box_uint64(h));
+    }
     size_t n = lean_array_size(buffers_array);
     uint64_t h = seed;
     for (size_t i = 0; i < n; i++) {
@@ -1498,6 +1638,11 @@ lean_obj_res lean_hesper_hash_buffer_array(uint64_t seed, b_lean_obj_arg buffers
 // Shader Operations
 
 lean_obj_res lean_hesper_create_shader_module(b_lean_obj_arg device_obj, b_lean_obj_arg source, lean_obj_res /* unit */) {
+    if (hesper_metal_mode()) {
+        void* sh = hm_create_shader(hm_get_ctx(), lean_string_cstr(source));
+        lean_object* external = lean_alloc_external(g_hm_shader_class, sh);
+        return lean_io_result_mk_ok(make_resource_with_device(external, device_obj));
+    }
     // Extract device from External object
     wgpu::Device* device = EXTRACT_DEVICE_PTR(device_obj);
 
@@ -1567,6 +1712,10 @@ lean_obj_res lean_hesper_create_shader_module(b_lean_obj_arg device_obj, b_lean_
 // Pipeline Operations
 
 lean_obj_res lean_hesper_create_bind_group_layout(b_lean_obj_arg device_obj, b_lean_obj_arg entries_array, lean_obj_res /* unit */) {
+    if (hesper_metal_mode()) {
+        lean_object* external = lean_alloc_external(g_hm_noop_class, nullptr);
+        return lean_io_result_mk_ok(make_resource_with_device(external, device_obj));
+    }
     // Extract device from External object
     wgpu::Device* device = EXTRACT_DEVICE_PTR(device_obj);
 
@@ -1668,6 +1817,20 @@ typedef struct {
 
 lean_obj_res lean_hesper_create_bind_group(b_lean_obj_arg device_obj, b_lean_obj_arg layout_obj,
                                             b_lean_obj_arg entries_array, lean_obj_res /* unit */) {
+    if (hesper_metal_mode()) {
+        size_t n = lean_array_size(entries_array);
+        std::vector<uint32_t> binds(n);
+        std::vector<void*> bufs(n);
+        for (size_t i = 0; i < n; i++) {
+            lean_object* entry = lean_array_get_core(entries_array, i);
+            BindGroupEntry_Raw* raw = (BindGroupEntry_Raw*)lean_ctor_obj_cptr(entry);
+            binds[i] = raw->binding;
+            bufs[i] = (void*)EXTRACT_BUFFER_PTR(raw->buffer);
+        }
+        void* bg = hm_create_bindgroup(hm_get_ctx(), (uint32_t)n, binds.data(), bufs.data());
+        lean_object* external = lean_alloc_external(g_hm_bindgroup_class, bg);
+        return lean_io_result_mk_ok(make_resource_with_device(external, device_obj));
+    }
     // Extract device and layout from External objects
     wgpu::Device* device = EXTRACT_DEVICE_PTR(device_obj);
     wgpu::BindGroupLayout* layout = EXTRACT_BIND_GROUP_LAYOUT_PTR(layout_obj);
@@ -1783,6 +1946,14 @@ lean_obj_res lean_hesper_create_bind_group(b_lean_obj_arg device_obj, b_lean_obj
 }
 
 lean_obj_res lean_hesper_create_compute_pipeline(b_lean_obj_arg device_obj, b_lean_obj_arg desc, lean_obj_res /* unit */) {
+    if (hesper_metal_mode()) {
+        lean_object* sm_obj = lean_ctor_get(desc, 0);
+        void* sh = (void*)EXTRACT_SHADER_MODULE_PTR(sm_obj);
+        void* pipe = hm_create_pipeline(hm_get_ctx(), sh);
+        if (!pipe) return make_webgpu_io_error(WebGPUError::Pipeline(PipelineError::CreationFailed("compute", hm_last_pipeline_error())));
+        lean_object* external = lean_alloc_external(g_hm_pipeline_class, pipe);
+        return lean_io_result_mk_ok(make_resource_with_device(external, device_obj));
+    }
     // Extract device from External object
     wgpu::Device* device = EXTRACT_DEVICE_PTR(device_obj);
 
@@ -1866,6 +2037,19 @@ static void dispatchWorkDoneCallback(WGPUQueueWorkDoneStatus status, WGPUStringV
 
 lean_obj_res lean_hesper_dispatch_compute(b_lean_obj_arg device_obj, b_lean_obj_arg pipeline_obj, b_lean_obj_arg bind_group_obj,
                                            uint32_t workgroupsX, uint32_t workgroupsY, uint32_t workgroupsZ, lean_obj_res /* unit */) {
+    if (hesper_metal_mode()) {
+        hm_dispatch_once(hm_get_ctx(),
+                         (void*)EXTRACT_COMPUTE_PIPELINE_PTR(pipeline_obj),
+                         (void*)EXTRACT_BIND_GROUP_PTR(bind_group_obj),
+                         workgroupsX, workgroupsY, workgroupsZ);
+        lean_object* instance_obj2 = lean_ctor_get(device_obj, 1);
+        lean_object* future_external = lean_alloc_external(g_hm_noop_class, nullptr);
+        lean_object* future_struct = lean_alloc_ctor(0, 2, 0);
+        lean_inc(instance_obj2);
+        lean_ctor_set(future_struct, 0, future_external);
+        lean_ctor_set(future_struct, 1, instance_obj2);
+        return lean_io_result_mk_ok(future_struct);
+    }
     // Extract device, pipeline and bind group from External objects
     wgpu::Device* device = EXTRACT_DEVICE_PTR(device_obj);
     wgpu::ComputePipeline* pipeline = EXTRACT_COMPUTE_PIPELINE_PTR(pipeline_obj);
@@ -2457,6 +2641,11 @@ lean_obj_res lean_f16_array_simd_mul(lean_object* a, lean_object* b, lean_object
     static_cast<wgpu::CommandEncoder*>(lean_get_external_data(lean_ctor_get(encoder_struct, 0)))
 
 lean_obj_res lean_hesper_create_command_encoder(b_lean_obj_arg device_obj, lean_obj_res /* unit */) {
+    if (hesper_metal_mode()) {
+        void* e = hm_encoder_new(hm_get_ctx());
+        lean_object* external = lean_alloc_external(g_hm_encoder_class, e);
+        return lean_io_result_mk_ok(make_resource_with_device(external, device_obj));
+    }
     wgpu::Device* device = EXTRACT_DEVICE_PTR(device_obj);
 
     if (!device || !device->Get()) {
@@ -2531,6 +2720,15 @@ lean_obj_res lean_hesper_record_dispatch(b_lean_obj_arg encoder_obj, b_lean_obj_
                                           lean_obj_res /* unit */) {
     auto _t0 = std::chrono::steady_clock::now();
     wgpu::CommandEncoder* encoder = EXTRACT_COMMAND_ENCODER_PTR(encoder_obj);
+
+    if (hesper_metal_mode()) {
+        hm_record(hm_get_ctx(), (void*)encoder,
+                  (void*)EXTRACT_COMPUTE_PIPELINE_PTR(pipeline_obj),
+                  (void*)EXTRACT_BIND_GROUP_PTR(bind_group_obj),
+                  workgroupsX, workgroupsY, workgroupsZ);
+        g_pass_count.fetch_add(1, std::memory_order_relaxed);
+        return lean_io_result_mk_ok(lean_box(0));
+    }
     wgpu::ComputePipeline* pipeline = EXTRACT_COMPUTE_PIPELINE_PTR(pipeline_obj);
     wgpu::BindGroup* bindGroup = EXTRACT_BIND_GROUP_PTR(bind_group_obj);
 
@@ -2576,6 +2774,10 @@ lean_obj_res lean_hesper_record_dispatch(b_lean_obj_arg encoder_obj, b_lean_obj_
 }
 
 lean_obj_res lean_hesper_submit_and_wait(b_lean_obj_arg device_obj, b_lean_obj_arg encoder_obj, lean_obj_res /* unit */) {
+    if (hesper_metal_mode()) {
+        hm_submit(hm_get_ctx(), (void*)EXTRACT_COMMAND_ENCODER_PTR(encoder_obj), 1);
+        return lean_io_result_mk_ok(lean_box(0));
+    }
     wgpu::Device* device = EXTRACT_DEVICE_PTR(device_obj);
     wgpu::CommandEncoder* encoder = EXTRACT_COMMAND_ENCODER_PTR(encoder_obj);
 
@@ -2625,6 +2827,10 @@ lean_obj_res lean_hesper_submit_and_wait(b_lean_obj_arg device_obj, b_lean_obj_a
 // Finish + submit the encoder WITHOUT waiting (cheap batch split; queue order + driver
 // cross-command-buffer hazard tracking preserve correctness).
 lean_obj_res lean_hesper_submit_no_wait(b_lean_obj_arg device_obj, b_lean_obj_arg encoder_obj, lean_obj_res /* unit */) {
+    if (hesper_metal_mode()) {
+        hm_submit(hm_get_ctx(), (void*)EXTRACT_COMMAND_ENCODER_PTR(encoder_obj), 0);
+        return lean_io_result_mk_ok(lean_box(0));
+    }
     wgpu::Device* device = EXTRACT_DEVICE_PTR(device_obj);
     wgpu::CommandEncoder* encoder = EXTRACT_COMMAND_ENCODER_PTR(encoder_obj);
     if (!device || !device->Get()) {
