@@ -1,6 +1,15 @@
 import Lean.Data.Json
 /-!
-# wgsl-check v0 — static write-bounds checker for WGSL compute kernels
+# wgsl-check — static bounds checker for WGSL **and MSL-subset** compute kernels
+
+M-Metal Stage 3 added an MSL front end (see the "MSL front end" section):
+hand-written Metal kernels get the same interval/taint/guard OOB analyses as
+the generated WGSL ones. MSL dispatches are routed by `"lang": "msl"` (or a
+`.metal`/`.msl` kernel path) and REQUIRE `"wg": [x,y,z]` in the manifest
+(workgroup size is not in MSL source). One-command production gate:
+`scripts/msl_check.sh` (extracts the hand kernels from native/metal_replace.mm,
+substitutes production dims, runs fixtures + kernels; fixtures live in
+specs/mslcheck/).
 
 Checks the bug class that cost weeks in commit 54a2a60: a dispatch grid
 rounded up past the logical element count launches excess threads whose
@@ -174,7 +183,9 @@ deriving Repr, BEq, Inhabited
 def genericCtors : List String :=
   ["vec2", "vec3", "vec4", "array", "bitcast", "ptr", "atomic",
    "mat2x2", "mat2x3", "mat2x4", "mat3x2", "mat3x3", "mat3x4",
-   "mat4x2", "mat4x3", "mat4x4"]
+   "mat4x2", "mat4x3", "mat4x4",
+   -- MSL front end: templated calls that appear in value positions
+   "as_type", "make_filled_simdgroup_matrix"]
 
 def binLevels : List (List String) :=
   [["||"], ["&&"], ["<", "<=", ">", ">=", "==", "!="],
@@ -458,6 +469,8 @@ def builtinComp (cx : Ctx) (bname : String) (c : Nat) : IVal :=
   | "num_workgroups" => .const (dim cx.grid c)
   | _ => .unk
 
+mutual
+
 partial def evalE (cx : Ctx) (st : WSt) : Expr → IVal
   | .num n => .const n
   | .flt => .unk
@@ -471,6 +484,9 @@ partial def evalE (cx : Ctx) (st : WSt) : Expr → IVal
           ⟨0, dim cx.wg 0 * dim cx.wg 1 * dim cx.wg 2 - 1, false⟩
         | some "subgroup_invocation_id" => ⟨0, 127, false⟩
         | some "subgroup_size" => ⟨1, 128, false⟩
+        -- MSL scalar-declared builtins (`uint gid [[thread_position_in_grid]]`):
+        -- component 0 of the corresponding WGSL builtin
+        | some b => builtinComp cx b 0
         | _ => .unk
     base.inter (refinOf st x)
   | .member (.var x) m =>
@@ -491,14 +507,26 @@ partial def evalE (cx : Ctx) (st : WSt) : Expr → IVal
     else .unk
   | .index _ _ => .unk
   | .call f args =>
+    match f, args with
+    -- WGSL select(f, t, cond): evaluate each branch under the matching
+    -- condition refinement (the MSL ternary rewrite lands here; enables
+    -- `k0 < 16 ? k0 : k0 - 16` to bound instead of wrapping to top)
+    | "select", [fe, te, ce] =>
+      (evalE cx (applyCond cx ce false st) fe).hull
+        (evalE cx (applyCond cx ce true st) te)
+    | _, _ =>
     let vs := args.map (evalE cx st)
     match f, vs with
     | "min", [a, b] => a.imin b
     | "max", [a, b] => a.imax b
     | "clamp", [_, a, b] => ⟨a.lo, b.hi, a.t ∨ b.t⟩
-    | "select", [a, b, _] => a.hull b
     | "u32", [a] => a
     | "i32", [a] => a
+    -- MSL functional casts: value-preserving for interval purposes
+    | "uint", [a] => a
+    | "int", [a] => a
+    | "ushort", [a] => a
+    | "short", [a] => a
     | "arrayLength", [_] => .unk
     | _, _ => .unk
   | .bin op a b =>
@@ -534,6 +562,12 @@ partial def applyCond (cx : Ctx) (c : Expr) (pos : Bool) (st : WSt) : WSt :=
   | .bin "&&" a b, true => applyCond cx b true (applyCond cx a true st)
   | .bin "||" a b, false => applyCond cx b false (applyCond cx a false st)
   | .un "!" a, _ => applyCond cx a (¬pos) st
+  -- a condition that is a let-bound boolean (`const bool ok = x < N; if (ok)`)
+  -- resolves to its defining expression — common in the hand-MSL kernels
+  | .var x, _ =>
+    (match st.env.lookup x with
+     | some (.expr e) => applyCond cx e pos st
+     | _ => st)
   | .bin op a b, _ =>
     -- normalize to a strict/loose upper or lower bound on `a`
     let vb := evalE cx st b
@@ -544,11 +578,20 @@ partial def applyCond (cx : Ctx) (c : Expr) (pos : Bool) (st : WSt) : WSt :=
         | none => s
       match refinKey x with
       | some k => refinAdd s k ⟨0, bound, false⟩
-      | none => s
+      | none =>
+        -- `v + c < bound` ⟹ `v < bound - c` (MSL ternary guards on k0+1u etc.)
+        match x with
+        | .bin "+" (.var v) (.num n) | .bin "+" (.num n) (.var v) =>
+          if bound ≥ n then refinAdd s v ⟨0, bound - n, false⟩ else s
+        | _ => s
     let refineLo (x : Expr) (bound : Nat) (s : WSt) : WSt :=
       match refinKey x with
       | some k => refinAdd s k ⟨bound, U32MAX, false⟩
-      | none => s
+      | none =>
+        match x with
+        | .bin "+" (.var v) (.num n) | .bin "+" (.num n) (.var v) =>
+          refinAdd s v ⟨bound - n, U32MAX, false⟩
+        | _ => s
     match op, pos with
     | "<", true => refineHi a (vb.hi - 1) (some (a, vb)) st
     | "<=", true => refineHi a vb.hi (some (a, ⟨vb.lo + 1, vb.hi + 1, vb.t⟩)) st
@@ -566,6 +609,8 @@ partial def applyCond (cx : Ctx) (c : Expr) (pos : Bool) (st : WSt) : WSt :=
       | none => st
     | _, _ => st
   | _, _ => st
+
+end
 
 /-- decide a condition statically when the intervals are decisive
 (kills template-disabled branches like `if (0u == 1u)`). -/
@@ -644,7 +689,19 @@ partial def checkReads (cx : Ctx) (st : WSt) (line : Nat) : Expr → WSt := fun 
   | .bin _ a b => checkReads cx (checkReads cx st line a) line b
   | .un _ a => checkReads cx st line a
   | .member a _ => checkReads cx st line a
-  | .call _ args => args.foldl (fun acc x => checkReads cx acc line x) st
+  | .call f args =>
+    -- a storage buffer passed BARE to an opaque (non-inlined) helper means
+    -- reads inside that helper are invisible to this analysis — surface it
+    let st := args.foldl (init := st) fun acc x =>
+      match x with
+      | .var b =>
+        if cx.storages.any (·.name = b) then
+          { acc with finds := acc.finds.push ⟨.warn, line, b,
+            s!"buffer passed to helper `{f}` — reads inside it are UNCHECKED \
+               (inline the helper or verify manually)"⟩ }
+        else acc
+      | _ => acc
+    args.foldl (fun acc x => checkReads cx acc line x) st
   | _ => st
 
 def checkStore (cx : Ctx) (st : WSt) (bufName : String) (idx : Expr)
@@ -733,6 +790,8 @@ partial def walkBlock (cx : Ctx) (st0 : WSt) (i0 : Nat) : WSt × Nat := Id.run d
         if p.isSym j "=" then
           match parseExpr p (j + 1) with
           | some (e, k) =>
+            let line := if h : j < p.ts.size then p.ts[j].line else 0
+            st := checkReads cx st line e
             st := envSetVar st x (evalE cx st e)
             i := if p.isSym k ";" then k + 1 else skipStmt p k
           | none => i := skipStmt p (j + 1)
@@ -858,6 +917,33 @@ partial def walkBlock (cx : Ctx) (st0 : WSt) (i0 : Nat) : WSt × Nat := Id.run d
     | .ident "return" | .ident "continue" | .ident "break"
     | .ident "continuing" | .ident "discard" =>
       i := skipStmt p (i + 1)
+    | .ident "simdgroup_store" | .ident "simdgroup_load" =>
+      -- MSL 8×8 fragment memory ops: footprint = base + 7·stride + 7 elements.
+      -- `simdgroup_store(frag, &buf[e], stride)` — the R32 WMMA-tail heap-stomp
+      -- class lived exactly here on the WGSL side.
+      let isStore := p.tok i == .ident "simdgroup_store"
+      let line := if h : i < p.ts.size then p.ts[i].line else 0
+      if p.isSym (i+1) "(" ∧ p.isSym (i+3) "," ∧ p.isSym (i+4) "&" then
+        match p.tok (i+5) with
+        | .ident buf =>
+          if p.isSym (i+6) "[" then
+            match parseExpr p (i + 7) with
+            | some (e, j) =>
+              if p.isSym j "]" ∧ p.isSym (j+1) "," then
+                match parseExpr p (j + 2) with
+                | some (strideE, _) =>
+                  let footMax : Expr :=
+                    .bin "+" e (.bin "+" (.bin "*" (.num 7) strideE) (.num 7))
+                  if cx.storages.any (·.name = buf) then
+                    if isStore then
+                      st := checkStore cx st buf footMax line
+                    else
+                      st := checkReads cx st line (.index (.var buf) footMax)
+                  -- threadgroup arrays: not modeled (out of scope)
+                | none => pure ()
+            | none => pure ()
+        | _ => pure ()
+      i := skipStmt p i
     | .ident x =>
       -- store `buf[e] … = …;` or assignment `x = e;` or call `f(…);`
       if p.isSym (i+1) "[" ∧ cx.storages.any (fun s => s.name = x ∧ s.readWrite) then
@@ -919,6 +1005,409 @@ partial def parseCondAfterIf (cx : Ctx) (_st : WSt) (i : Nat) :
 
 end
 
+-- ========================== MSL front end ============================
+/-! MSL-subset front end (M-Metal Stage 3): normalizes a hand-written MSL
+kernel into the token shape `walkBlock` consumes, so the interval/taint/
+guard/OOB analyses are shared verbatim with WGSL.
+
+Subset: one `kernel void` entry with `[[buffer(n)]]` / thread-position
+attributes; file-scope `constant T X = …;` (become prelude `let`s);
+single-`return` `inline` helpers (token-inlined at call sites); C
+declarations incl. multi-declarator lines; ternaries (rewritten to WGSL
+`select`, whose evaluator refines each branch under the condition);
+`for (T i = …)` headers.
+
+Workgroup size is not in MSL source — the manifest must supply `"wg"`.
+
+Unsoundness boundaries (deliberate, documented):
+ * pointer locals (`device T* p = …`) unsupported (absent from our kernels);
+ * reads inside NON-inlined (multi-statement) helpers are not analyzed —
+   a bare storage-buffer argument to one raises a WARN;
+ * threadgroup-memory bounds are unchecked (device buffers only);
+ * `simdgroup_load/store` footprint model: 8×8 fragment = base + 7·stride+7
+   elements (our kernels use default origins only);
+ * statements the walker cannot classify are skipped, never silently passed
+   as verified — the tool stays a bug-finder, not a verifier. -/
+
+def mslScalarBytes : String → Nat
+  | "float" => 4 | "uint" => 4 | "int" => 4
+  | "half" => 2 | "ushort" => 2 | "short" => 2
+  | "uchar" => 1 | "char" => 1
+  | _ => 0
+
+def mslTypeNames : List String :=
+  ["uint", "int", "float", "half", "bool", "ushort", "short", "uchar", "char",
+   "uint2", "uint3", "uint4", "int2", "int3", "int4",
+   "float2", "float3", "float4", "half2", "half4", "size_t"]
+
+def mslBuiltinMap : String → Option String
+  | "thread_position_in_grid" => some "global_invocation_id"
+  | "threadgroup_position_in_grid" => some "workgroup_id"
+  | "thread_position_in_threadgroup" => some "local_invocation_id"
+  | "thread_index_in_threadgroup" => some "local_invocation_index"
+  | "thread_index_in_simdgroup" => some "subgroup_invocation_id"
+  | _ => none
+
+structure MslHelper where
+  name : String
+  params : List String
+  body : Array PTok      -- return-expression tokens (no `return`, no `;`)
+
+/-- find the position AFTER the `)`/`]`/`}` matching the opener at `i0`. -/
+partial def mslMatch (ts : Array PTok) (i0 : Nat) (o c : String) : Nat := Id.run do
+  let p : Prs := ⟨ts⟩
+  let mut d := 0
+  let mut j := i0
+  while j < ts.size do
+    if p.isSym j o then d := d + 1
+    else if p.isSym j c then
+      d := d - 1
+      if d = 0 then return j + 1
+    j := j + 1
+  return j
+
+/-- token-level helper inlining: replace `h(a1, …)` with the helper's
+return expression, each param occurrence substituted by `( argToks )`. -/
+partial def mslInline (helpers : List MslHelper) (ts : Array PTok) : Array PTok := Id.run do
+  let p : Prs := ⟨ts⟩
+  let mut out : Array PTok := #[]
+  let mut i := 0
+  let mut changed := false
+  while i < ts.size do
+    match p.tok i with
+    | .ident nm =>
+      match helpers.find? (·.name = nm) with
+      | some h =>
+        if p.isSym (i+1) "(" then
+          -- split args at top-level commas
+          let endP := mslMatch ts (i+1) "(" ")"
+          let mut args : Array (Array PTok) := #[]
+          let mut cur : Array PTok := #[]
+          let mut d := 0
+          let mut j := i + 2
+          while j < endP - 1 do
+            if p.isSym j "(" ∨ p.isSym j "[" then d := d + 1
+            else if p.isSym j ")" ∨ p.isSym j "]" then d := d - 1
+            if p.isSym j "," ∧ d = 0 then
+              args := args.push cur; cur := #[]
+            else
+              cur := cur.push ts[j]!
+            j := j + 1
+          if cur.size > 0 then args := args.push cur
+          -- substitute
+          let ln := ts[i]!.line
+          out := out.push ⟨.sym "(", ln⟩
+          for bt in h.body do
+            match bt.tok with
+            | .ident pn =>
+              match h.params.idxOf? pn with
+              | some ai =>
+                out := out.push ⟨.sym "(", bt.line⟩
+                out := out ++ (args.getD ai #[])
+                out := out.push ⟨.sym ")", bt.line⟩
+              | none => out := out.push bt
+            | _ => out := out.push bt
+          out := out.push ⟨.sym ")", ln⟩
+          i := endP
+          changed := true
+        else
+          out := out.push ts[i]!; i := i + 1
+      | none => out := out.push ts[i]!; i := i + 1
+    | _ => out := out.push ts[i]!; i := i + 1
+  if changed then mslInline helpers out else out
+
+/-- rewrite one ternary `cond ? a : b` → `select(b, a, cond)`; returns none
+when no `?` remains. -/
+partial def mslTernaryOnce (ts : Array PTok) : Option (Array PTok) := Id.run do
+  let p : Prs := ⟨ts⟩
+  -- first `?`
+  let mut q : Option Nat := none
+  for i in [0:ts.size] do
+    if p.isSym i "?" then q := some i; break
+  let some qi := q | return none
+  -- cond start: scan left
+  let mut cs := qi
+  let mut d := 0
+  let mut k := qi
+  while k > 0 do
+    k := k - 1
+    if p.isSym k ")" ∨ p.isSym k "]" then d := d + 1
+    else if p.isSym k "(" ∨ p.isSym k "[" then
+      if d = 0 then cs := k + 1; break
+      d := d - 1
+    else if d = 0 ∧ (p.isSym k "," ∨ p.isSym k ";" ∨ p.isSym k "=" ∨
+                     p.isSym k "{" ∨ p.isSym k "}" ∨ p.isSym k ":" ∨
+                     p.tok k == .ident "return" ∨ p.tok k == .ident "let" ∨
+                     p.tok k == .ident "var") then
+      cs := k + 1; break
+    if k = 0 then cs := 0
+  -- matching `:`
+  let mut colon := qi
+  let mut pd := 0
+  let mut tn := 0
+  let mut j := qi + 1
+  while j < ts.size do
+    if p.isSym j "(" ∨ p.isSym j "[" then pd := pd + 1
+    else if p.isSym j ")" ∨ p.isSym j "]" then pd := pd - 1
+    else if p.isSym j "?" ∧ pd = 0 then tn := tn + 1
+    else if p.isSym j ":" ∧ pd = 0 then
+      if tn = 0 then colon := j; break
+      tn := tn - 1
+    j := j + 1
+  -- branch2 end
+  let mut b2e := ts.size
+  pd := 0
+  tn := 0
+  j := colon + 1
+  while j < ts.size do
+    if p.isSym j "(" ∨ p.isSym j "[" then pd := pd + 1
+    else if (p.isSym j ")" ∨ p.isSym j "]") then
+      if pd = 0 then b2e := j; break
+      pd := pd - 1
+    else if p.isSym j "?" ∧ pd = 0 then tn := tn + 1
+    else if p.isSym j ":" ∧ pd = 0 then
+      if tn = 0 then b2e := j; break
+      tn := tn - 1
+    else if (p.isSym j "," ∨ p.isSym j ";") ∧ pd = 0 then b2e := j; break
+    j := j + 1
+  let ln := ts[qi]!.line
+  let cond := ts.extract cs qi
+  let b1 := ts.extract (qi+1) colon
+  let b2 := ts.extract (colon+1) b2e
+  let mut out := ts.extract 0 cs
+  out := out.push ⟨.ident "select", ln⟩
+  out := out.push ⟨.sym "(", ln⟩
+  out := out ++ b2
+  out := out.push ⟨.sym ",", ln⟩
+  out := out ++ b1
+  out := out.push ⟨.sym ",", ln⟩
+  out := out ++ cond
+  out := out.push ⟨.sym ")", ln⟩
+  out := out ++ ts.extract b2e ts.size
+  return some out
+
+partial def mslTernary (ts : Array PTok) : Array PTok :=
+  match mslTernaryOnce ts with
+  | some ts' => mslTernary ts'
+  | none => ts
+
+/-- C declaration rewrite: `[const] T x = e[, y = e2]* ;` → `let/var x = e ;
+let/var y = e2 ; …`; `for ( [const] T i = …` → `for ( var i = …`. -/
+partial def mslDecls (ts : Array PTok) : Array PTok := Id.run do
+  let p : Prs := ⟨ts⟩
+  let mut out : Array PTok := #[]
+  let mut i := 0
+  let mut stmtStart := true
+  while i < ts.size do
+    let isForHead := p.tok i == .ident "for" ∧ p.isSym (i+1) "("
+    if isForHead then
+      out := out.push ts[i]!
+      out := out.push ts[i+1]!
+      i := i + 2
+      -- optional decl in the for-init
+      let j0 := if p.tok i == .ident "const" then i + 1 else i
+      match p.tok j0 with
+      | .ident t =>
+        if mslTypeNames.contains t then
+          match p.tok (j0+1) with
+          | .ident _ =>
+            out := out.push ⟨.ident "var", ts[i]!.line⟩
+            i := j0 + 1   -- drop const+type, keep the name onward
+          | _ => pure ()
+        else pure ()
+      | _ => pure ()
+      stmtStart := false
+    else if stmtStart then
+      let (isConst, j0) := if p.tok i == .ident "const" then (true, i + 1) else (false, i)
+      let mut consumed := false
+      match p.tok j0 with
+      | .ident t =>
+        if mslTypeNames.contains t then
+          match p.tok (j0+1) with
+          | .ident _ =>
+            -- declaration; split multi-declarators at top-level commas
+            let kw : Tok := if isConst then .ident "let" else .ident "var"
+            let ln := ts[j0]!.line
+            out := out.push ⟨kw, ln⟩
+            let mut j := j0 + 1
+            let mut d := 0
+            while j < ts.size do
+              if p.isSym j "(" ∨ p.isSym j "[" then d := d + 1
+              else if p.isSym j ")" ∨ p.isSym j "]" then d := d - 1
+              if p.isSym j ";" ∧ d = 0 then
+                out := out.push ts[j]!; j := j + 1; break
+              else if p.isSym j "," ∧ d = 0 then
+                out := out.push ⟨.sym ";", ts[j]!.line⟩
+                out := out.push ⟨kw, ts[j]!.line⟩
+                j := j + 1
+              else
+                out := out.push ts[j]!; j := j + 1
+            i := j
+            consumed := true
+          | _ => pure ()
+        else pure ()
+      | _ => pure ()
+      if ¬consumed then
+        stmtStart := p.isSym i ";" ∨ p.isSym i "{" ∨ p.isSym i "}"
+        out := out.push ts[i]!
+        i := i + 1
+      else
+        stmtStart := true
+    else
+      stmtStart := p.isSym i ";" ∨ p.isSym i "{" ∨ p.isSym i "}"
+      out := out.push ts[i]!
+      i := i + 1
+  return out
+
+/-- parse an MSL kernel file into the shared `Kernel` shape. `wg` comes from
+the manifest (MSL has no in-source workgroup size). -/
+partial def scanKernelMsl (ts : Array PTok) (wg : Nat × Nat × Nat) : Kernel := Id.run do
+  let p : Prs := ⟨ts⟩
+  let mut consts : Array (String × Array PTok) := #[]
+  let mut helpers : List MslHelper := []
+  let mut storages : List StorageVar := []
+  let mut builtins : List (String × String) := []
+  let mut entryName := ""
+  let mut body : Array PTok := #[]
+  let mut i := 0
+  while i < ts.size do
+    match p.tok i with
+    | .ident "constant" =>
+      -- constant T NAME = <toks> ;
+      match p.tok (i+2) with
+      | .ident nm =>
+        if p.isSym (i+3) "=" then
+          let mut j := i + 4
+          let mut ex : Array PTok := #[]
+          while ¬(p.isSym j ";") ∧ j < ts.size do
+            ex := ex.push ts[j]!; j := j + 1
+          consts := consts.push (nm, ex)
+          i := j + 1
+        else i := i + 1
+      | _ => i := i + 1
+    | .ident "inline" =>
+      -- inline RET name ( params ) { … }  — record single-`return` bodies
+      let mut j := i + 1
+      -- return type: one ident (float2 etc.)
+      match p.tok (j+1) with
+      | .ident nm =>
+        let po := j + 2
+        if p.isSym po "(" then
+          let pe := mslMatch ts po "(" ")"
+          -- params: last ident of each comma-group
+          let mut params : List String := []
+          let mut cur : Option String := none
+          let mut k := po + 1
+          let mut d := 0
+          while k < pe - 1 do
+            if p.isSym k "(" then d := d + 1
+            else if p.isSym k ")" then d := d - 1
+            if p.isSym k "," ∧ d = 0 then
+              if let some c := cur then params := params ++ [c]
+              cur := none
+            else if let .ident pn := p.tok k then
+              cur := some pn
+            k := k + 1
+          if let some c := cur then params := params ++ [c]
+          if p.isSym pe "{" then
+            let be := mslMatch ts pe "{" "}"
+            -- single-return body?
+            if p.tok (pe+1) == .ident "return" then
+              let mut ex : Array PTok := #[]
+              let mut m := pe + 2
+              while ¬(p.isSym m ";") ∧ m < be do
+                ex := ex.push ts[m]!; m := m + 1
+              if m + 2 ≥ be then   -- `; }` ends the body: single return
+                helpers := ⟨nm, params, ex⟩ :: helpers
+            i := be
+          else i := pe
+        else i := j + 2
+      | _ => i := i + 1
+    | .ident "kernel" =>
+      -- kernel void NAME ( params ) { body }
+      match p.tok (i+2) with
+      | .ident nm =>
+        entryName := nm
+        let po := i + 3
+        let pe := mslMatch ts po "(" ")"
+        -- split params at top commas; classify each
+        let mut groups : Array (Array PTok) := #[]
+        let mut cur : Array PTok := #[]
+        let mut d := 0
+        let mut k := po + 1
+        while k < pe - 1 do
+          if p.isSym k "(" ∨ p.isSym k "[" then d := d + 1
+          else if p.isSym k ")" ∨ p.isSym k "]" then d := d - 1
+          if p.isSym k "," ∧ d = 0 then
+            groups := groups.push cur; cur := #[]
+          else
+            cur := cur.push ts[k]!
+          k := k + 1
+        if cur.size > 0 then groups := groups.push cur
+        for g in groups do
+          let gp : Prs := ⟨g⟩
+          let idents := g.filterMap fun t =>
+            match t.tok with | .ident s => some s | _ => none
+          let hasStar := g.any (·.tok == .sym "*")
+          -- attribute contents: idents inside `[[ … ]]`
+          let mut attr : Option String := none
+          let mut bindNo : Option Nat := none
+          for ai in [0:g.size] do
+            if gp.isSym ai "[" ∧ gp.isSym (ai+1) "[" then
+              match gp.tok (ai+2) with
+              | .ident a =>
+                attr := some a
+                if gp.isSym (ai+3) "(" then
+                  if let .num n := gp.tok (ai+4) then bindNo := some n
+              | _ => pure ()
+          -- param name: last ident BEFORE the attribute brackets
+          let mut nameIdx : Option String := none
+          for ai in [0:g.size] do
+            if gp.isSym ai "[" then break
+            if let .ident s := gp.tok ai then
+              if ¬(["device", "constant", "const", "threadgroup"].contains s)
+                 ∧ ¬(mslTypeNames.contains s) then
+                nameIdx := some s
+          -- fall back: last type-ish ident before [[ is the name for
+          -- `uint tid [[…]]` (tid not in type list — covered above)
+          match attr with
+          | some "buffer" =>
+            let rw := ¬ idents.contains "const"
+            let tys := idents.filter (mslScalarBytes · > 0)
+            let eb := match tys.back? with | some t => mslScalarBytes t | none => 0
+            match nameIdx, bindNo with
+            | some nm2, some b =>
+              if hasStar then
+                storages := ⟨nm2, 0, b, rw, eb⟩ :: storages
+            | _, _ => pure ()
+          | some a =>
+            match mslBuiltinMap a, nameIdx with
+            | some wb, some nm2 => builtins := (nm2, wb) :: builtins
+            | _, _ => pure ()
+          | none => pure ()
+        if p.isSym pe "{" then
+          let be := mslMatch ts pe "{" "}"
+          body := ts.extract (pe + 1) be   -- includes the closing `}`
+          i := be
+        else i := pe
+      | _ => i := i + 1
+    | _ => i := i + 1
+  -- prelude: constants as lets (inlined + ternary-rewritten like the body)
+  let mut prelude : Array PTok := #[]
+  for (nm, ex) in consts do
+    let ln := if h : 0 < ex.size then ex[0]!.line else 1
+    prelude := prelude.push ⟨.ident "let", ln⟩
+    prelude := prelude.push ⟨.ident nm, ln⟩
+    prelude := prelude.push ⟨.sym "=", ln⟩
+    prelude := prelude ++ ex
+    prelude := prelude.push ⟨.sym ";", ln⟩
+  let normBody := mslDecls (mslTernary (mslInline helpers body))
+  let toks := (mslTernary prelude) ++ normBody
+  -- bodyStart 0: the walk covers the prelude lets THEN the body, ending at
+  -- the kernel's own closing `}` (carried inside normBody)
+  return { toks := toks, storages := storages,
+           entries := [⟨entryName, wg, builtins, 0⟩] }
+
 -- ============================== driver ===============================
 
 structure Binding where
@@ -934,6 +1423,8 @@ structure Dispatch where
   entry : String
   grid : Nat × Nat × Nat
   bindings : List Binding
+  lang : Option String := none          -- "msl" routes to the MSL front end
+  wg : Option (Nat × Nat × Nat) := none -- REQUIRED for msl (not in source)
 
 def jNat (j : Json) : Option Nat := j.getNat?.toOption
 def jStr (j : Json) : Option String := j.getStr?.toOption
@@ -961,7 +1452,12 @@ def parseManifest (j : Json) : Option (List Dispatch) := do
                group := jGet b "group" >>= jNat,
                bindingNo := jGet b "binding" >>= jNat,
                elems, bytes, values : Binding }
-    return { kernel, entry, grid, bindings : Dispatch }
+    let wg := match jGet d "wg" >>= jArr with
+      | some w => some ((w.getD 0 (Json.num 1) |> jNat).getD 1,
+                        (w.getD 1 (Json.num 1) |> jNat).getD 1,
+                        (w.getD 2 (Json.num 1) |> jNat).getD 1)
+      | none => none
+    return { kernel, entry, grid, bindings, lang := jGet d "lang" >>= jStr, wg : Dispatch }
 
 def findBinding (storages : List StorageVar) (bs : List Binding)
     (bufName : String) : Option Binding := Id.run do
@@ -1010,7 +1506,15 @@ def main (args : List String) : IO UInt32 := do
     let kpath := if System.FilePath.isAbsolute d.kernel then
         System.FilePath.mk d.kernel else mdir / d.kernel
     let src ← IO.FS.readFile kpath
-    let k := scanKernel (tokenize src)
+    let isMsl := d.lang == some "msl" ∨ d.kernel.endsWith ".metal" ∨ d.kernel.endsWith ".msl"
+    let k ← if isMsl then
+        match d.wg with
+        | some wg => pure (scanKernelMsl (tokenize src) wg)
+        | none =>
+          IO.println s!"{d.kernel}: MSL dispatch needs \"wg\" in the manifest — skipped"
+          nWarn := nWarn + 1
+          continue
+      else pure (scanKernel (tokenize src))
     let some e := k.entries.find? (·.name = d.entry)
       | IO.println s!"{d.kernel}: entry `{d.entry}` not found — skipped"
         nWarn := nWarn + 1

@@ -1,0 +1,14 @@
+{ "dispatches": [
+  { "kernel": "msl_fail_scalar_oob.metal", "entry": "fail_scalar_oob",
+    "lang": "msl", "grid": [4, 1, 1], "wg": [256, 1, 1],
+    "bindings": [ { "name": "outp", "elems": 1000 } ] },
+  { "kernel": "msl_fail_simdgroup_tail.metal", "entry": "fail_simdgroup_tail",
+    "lang": "msl", "grid": [1, 4, 1], "wg": [32, 1, 1],
+    "bindings": [ { "name": "c", "elems": 4000 } ] },
+  { "kernel": "msl_fail_excess_thread.metal", "entry": "fail_excess_thread",
+    "lang": "msl", "grid": [1, 1, 1], "wg": [128, 1, 1],
+    "bindings": [ { "name": "dst", "elems": 1000 } ] },
+  { "kernel": "msl_ok_guarded.metal", "entry": "ok_guarded",
+    "lang": "msl", "grid": [4, 1, 1], "wg": [256, 1, 1],
+    "bindings": [ { "name": "outp", "elems": 1000 } ] }
+] }
