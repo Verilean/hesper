@@ -30,7 +30,9 @@
 #include <string>
 #include <vector>
 #include <unordered_map>
+#include <unordered_set>
 #include <mutex>
+#include <atomic>
 #include <sys/stat.h>
 
 namespace {
@@ -39,6 +41,7 @@ struct HMPipe {
     id<MTLComputePipelineState> pso;   // retained
     uint32_t tgBytes;                  // threadgroup memory at index 0 (0 = none)
     uint32_t wgX, wgY, wgZ;            // threads per threadgroup (from @workgroup_size)
+    std::vector<uint8_t> writeMask;    // per BINDING index: 1 = kernel writes this buffer
 };
 
 struct HMCtx {
@@ -60,6 +63,7 @@ struct HMShader {
     std::string wgsl;
     uint32_t tgBytes;
     uint32_t wgX, wgY, wgZ;
+    std::vector<uint8_t> writeMask;    // per binding: 1 = written (declared rw AND stored-to)
 };
 
 struct HMBind {
@@ -69,6 +73,9 @@ struct HMBind {
 struct HMEnc {
     id<MTLCommandBuffer> cb;           // retained
     id<MTLComputeCommandEncoder> enc;  // retained; nil after end
+    bool concurrent;
+    std::unordered_set<void*> readSet;   // buffers read since the last barrier
+    std::unordered_set<void*> writeSet;  // buffers written since the last barrier
 };
 
 HMCtx* g_ctx = nullptr;
@@ -176,6 +183,80 @@ bool runTint(HMCtx* ctx, const std::string& wgsl, uint64_t h, std::string& mslOu
     return false;
 }
 
+// Per-binding write masks. Declared var<storage, read> is definitively read-only.
+// Declared read_write is REFINED by scanning the body for actual store sites
+// ("name[...] =", "subgroupMatrixStore(&name", "atomicXxx(&name") because the
+// generated WMMA kernels declare every buffer read_write — without refinement
+// no matmul fan-out could ever overlap. HESPER_METAL_NOREFINE=1 disables the
+// refinement (all declared-rw buffers count as writers). A wrong demotion is a
+// missed hazard and fails the bit-identity gate — that is the contract.
+std::vector<uint8_t> parseWriteMask(const std::string& wgsl) {
+    static const bool noRefine = getenv("HESPER_METAL_NOREFINE") != nullptr;
+    std::vector<uint8_t> mask;
+    size_t p = 0;
+    while ((p = wgsl.find("@binding(", p)) != std::string::npos) {
+        p += strlen("@binding(");
+        uint32_t binding = (uint32_t)strtoul(wgsl.c_str() + p, nullptr, 10);
+        size_t v = wgsl.find("var<", p);
+        if (v == std::string::npos) break;
+        size_t declEnd = wgsl.find(';', v);
+        if (declEnd == std::string::npos) break;
+        std::string decl = wgsl.substr(v, declEnd - v);
+        bool rw = decl.find("read_write") != std::string::npos;
+        bool isWrite = rw;
+        if (rw && !noRefine) {
+            // extract the variable name: "var<...> NAME:"
+            size_t gt = decl.find('>');
+            size_t colon = decl.find(':', gt);
+            if (gt != std::string::npos && colon != std::string::npos) {
+                std::string name = decl.substr(gt + 1, colon - gt - 1);
+                // trim
+                while (!name.empty() && (name.front() == ' ')) name.erase(name.begin());
+                while (!name.empty() && (name.back() == ' ')) name.pop_back();
+                if (!name.empty()) {
+                    bool stored = false;
+                    // "name[" ... "]" "=" (assignment, not ==) within one statement
+                    size_t q = 0;
+                    std::string pat = name + "[";
+                    while (!stored && (q = wgsl.find(pat, q)) != std::string::npos) {
+                        // preceding char must not be identifier (avoid suffix matches)
+                        if (q > 0 && (isalnum((unsigned char)wgsl[q-1]) || wgsl[q-1] == '_')) { q += pat.size(); continue; }
+                        size_t stmtEnd = wgsl.find(';', q);
+                        if (stmtEnd == std::string::npos) stmtEnd = wgsl.size();
+                        // find the matching close bracket then check for '=' (not '==', '<=', '>=', '!=')
+                        int depth = 0; size_t r = q + name.size();
+                        for (; r < stmtEnd; r++) {
+                            if (wgsl[r] == '[') depth++;
+                            else if (wgsl[r] == ']') { depth--; if (depth == 0) { r++; break; } }
+                        }
+                        while (r < stmtEnd && wgsl[r] == ' ') r++;
+                        if (r < stmtEnd && wgsl[r] == '=' && (r + 1 >= stmtEnd || wgsl[r+1] != '=')) {
+                            char prev = (r > 0) ? wgsl[r-1] : ' ';
+                            if (prev != '<' && prev != '>' && prev != '!') stored = true;
+                        }
+                        q += pat.size();
+                    }
+                    if (!stored && wgsl.find("subgroupMatrixStore(&" + name) != std::string::npos) stored = true;
+                    if (!stored && wgsl.find("subgroupMatrixStore(&(" + name) != std::string::npos) stored = true;
+                    if (!stored) {
+                        // atomic RMW/store through &name[
+                        size_t a = 0;
+                        while ((a = wgsl.find("(&" + name + "[", a)) != std::string::npos) {
+                            size_t as = wgsl.rfind("atomic", a > 40 ? a - 40 : 0);
+                            if (as != std::string::npos && a - as < 40) { stored = true; break; }
+                            a += 2;
+                        }
+                    }
+                    isWrite = stored;
+                }
+            }
+        }
+        if (mask.size() <= binding) mask.resize(binding + 1, 0);
+        mask[binding] = isWrite ? 1 : 0;
+    }
+    return mask;
+}
+
 std::string parseEntryPoint(const std::string& msl) {
     size_t p = msl.find("kernel void ");
     if (p == std::string::npos) return "main";
@@ -274,6 +355,7 @@ void* hm_create_shader(void* /*ctxp*/, const char* wgsl) {
     sh->wgsl = wgsl;
     sh->tgBytes = parseWorkgroupBytes(sh->wgsl);
     parseWorkgroupSize(sh->wgsl, sh->wgX, sh->wgY, sh->wgZ);
+    sh->writeMask = parseWriteMask(sh->wgsl);
     return sh;
 }
 
@@ -333,7 +415,7 @@ void* hm_create_pipeline(void* ctxp, void* shp) {
                      nserr ? [[nserr localizedDescription] UTF8String] : "?");
             return nullptr;
         }
-        HMPipe* hp = new HMPipe{pso, sh->tgBytes, sh->wgX, sh->wgY, sh->wgZ};
+        HMPipe* hp = new HMPipe{pso, sh->tgBytes, sh->wgX, sh->wgY, sh->wgZ, sh->writeMask};
         std::lock_guard<std::mutex> lk(ctx->mu);
         auto it = ctx->psoCache.find(h);
         if (it != ctx->psoCache.end()) { [pso release]; delete hp; return it->second; }
@@ -366,12 +448,18 @@ void hm_free_bindgroup(void* bgp) {
 
 // ---- encoding / submission -------------------------------------------------
 
+static std::atomic<uint64_t> g_hm_dispatches{0};
+static std::atomic<uint64_t> g_hm_barriers{0};
+
 void* hm_encoder_new(void* ctxp) {
     HMCtx* ctx = (HMCtx*)ctxp;
+    static const bool serial = getenv("HESPER_METAL_SERIAL") != nullptr;
     @autoreleasepool {
         HMEnc* e = new HMEnc();
         e->cb = [[ctx->queue commandBuffer] retain];
-        e->enc = [[e->cb computeCommandEncoderWithDispatchType:MTLDispatchTypeSerial] retain];
+        e->concurrent = !serial;
+        e->enc = [[e->cb computeCommandEncoderWithDispatchType:
+                   (serial ? MTLDispatchTypeSerial : MTLDispatchTypeConcurrent)] retain];
         return e;
     }
 }
@@ -382,6 +470,32 @@ void hm_record(void* /*ctxp*/, void* encp, void* pipep, void* bgp,
     HMPipe* p = (HMPipe*)pipep;
     HMBind* bg = (HMBind*)bgp;
     if (!e->enc) return;
+    if (e->concurrent) {
+        // static hazard analysis: full barrier only on RAW / WAW / WAR at buffer
+        // granularity; independent dispatches between barriers overlap.
+        bool conflict = false;
+        for (auto& en : bg->entries) {
+            void* key = (void*)en.second;
+            bool w = en.first < p->writeMask.size() && p->writeMask[en.first];
+            if (w) {
+                if (e->writeSet.count(key) || e->readSet.count(key)) { conflict = true; break; }
+            } else {
+                if (e->writeSet.count(key)) { conflict = true; break; }
+            }
+        }
+        if (conflict) {
+            [e->enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+            e->readSet.clear();
+            e->writeSet.clear();
+            g_hm_barriers.fetch_add(1, std::memory_order_relaxed);
+        }
+        for (auto& en : bg->entries) {
+            void* key = (void*)en.second;
+            bool w = en.first < p->writeMask.size() && p->writeMask[en.first];
+            (w ? e->writeSet : e->readSet).insert(key);
+        }
+        g_hm_dispatches.fetch_add(1, std::memory_order_relaxed);
+    }
     [e->enc setComputePipelineState:p->pso];
     for (auto& en : bg->entries)
         [e->enc setBuffer:en.second offset:0 atIndex:en.first];
@@ -401,7 +515,16 @@ void hm_submit(void* ctxp, void* encp, int wait) {
         if (ctx->lastCB) [ctx->lastCB release];
         ctx->lastCB = [e->cb retain];
     }
-    if (wait) [e->cb waitUntilCompleted];
+    if (wait) {
+        [e->cb waitUntilCompleted];
+        static const bool stats = getenv("HESPER_METAL_STATS") != nullptr;
+        if (stats) {
+            fprintf(stderr, "[metal-stats] dispatches=%llu barriers=%llu (%.1f%%)\n",
+                    (unsigned long long)g_hm_dispatches.load(),
+                    (unsigned long long)g_hm_barriers.load(),
+                    g_hm_dispatches.load() ? 100.0 * g_hm_barriers.load() / g_hm_dispatches.load() : 0.0);
+        }
+    }
 }
 
 void hm_free_encoder(void* encp) {
