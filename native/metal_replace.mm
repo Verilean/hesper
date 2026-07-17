@@ -42,6 +42,23 @@ extern "C" lean_obj_res lean_hesper_msl_busy_read(lean_obj_res /* unit */) {
 
 // Same extraction as bridge.cpp's EXTRACT_DEVICE_PTR: the device Lean struct holds the wgpu::Device* as its
 // external data at ctor field 0.
+// M-Metal (HESPER_BACKEND=metal): buffers ARE MTLBuffers (HMBuf in metal_backend.mm)
+// and the MSL kernels dispatch on the thin backend's own queue — the Dawn-internal
+// extraction and queue tricks below are bypassed entirely in that mode. The Lean-side
+// flushBatch contracts still hold: commit order on ONE queue == execution order.
+extern "C" int hm_available(void);
+extern "C" id<MTLDevice> hm_mtl_device(void);
+extern "C" id<MTLCommandQueue> hm_mtl_queue(void);
+extern "C" id<MTLBuffer> hm_mtl_buffer_of(void*);
+static bool mrMetalMode() {
+    static int m = -1;
+    if (m < 0) {
+        const char* e = getenv("HESPER_BACKEND");
+        m = (e && strcmp(e, "metal") == 0 && hm_available()) ? 1 : 0;
+    }
+    return m == 1;
+}
+
 static inline wgpu::Device* mr_extract_device(b_lean_obj_arg device_obj) {
     return static_cast<wgpu::Device*>(lean_get_external_data(lean_ctor_get(device_obj, 0)));
 }
@@ -476,16 +493,21 @@ extern "C" lean_obj_res lean_hesper_msl_q4k_dispatch(
     b_lean_obj_arg c_obj, b_lean_obj_arg te_obj, b_lean_obj_arg tr_obj,
     uint32_t Mv, uint32_t Nv, uint32_t Kv, uint32_t nExpert, uint32_t srcRows,
     lean_obj_res /* unit */) {
+    const bool hmMode = mrMetalMode();
     wgpu::Device* device = mr_extract_device(device_obj);
-    if (!device || !device->Get()) return lean_io_result_mk_error(lean_mk_string("msl_q4k_dispatch: invalid device"));
-    id<MTLDevice> mtl = dawn::native::metal::GetMTLDevice(device->Get());
+    if (!hmMode && (!device || !device->Get())) return lean_io_result_mk_error(lean_mk_string("msl_q4k_dispatch: invalid device"));
+    id<MTLDevice> mtl = hmMode ? hm_mtl_device() : dawn::native::metal::GetMTLDevice(device->Get());
     wgpu::Buffer* bufs[6] = { mr_extract_buffer(src_obj), mr_extract_buffer(idx_obj),
                               mr_extract_buffer(b_obj),   mr_extract_buffer(c_obj),
                               mr_extract_buffer(te_obj),  mr_extract_buffer(tr_obj) };
     id<MTLBuffer> mb[6];
     for (int i = 0; i < 6; i++) {
-        if (!bufs[i] || !bufs[i]->Get()) return lean_io_result_mk_error(lean_mk_string("msl_q4k_dispatch: invalid buffer"));
-        mb[i] = reinterpret_cast<dawn::native::metal::Buffer*>(bufs[i]->Get())->GetMTLBuffer();
+        if (hmMode) {
+            mb[i] = hm_mtl_buffer_of((void*)bufs[i]);
+        } else {
+            if (!bufs[i] || !bufs[i]->Get()) return lean_io_result_mk_error(lean_mk_string("msl_q4k_dispatch: invalid buffer"));
+            mb[i] = reinterpret_cast<dawn::native::metal::Buffer*>(bufs[i]->Get())->GetMTLBuffer();
+        }
         if (!mb[i]) return lean_io_result_mk_error(lean_mk_string("msl_q4k_dispatch: null MTLBuffer"));
     }
     uint32_t key[5] = {Mv, Nv, Kv, nExpert, srcRows};
@@ -516,7 +538,7 @@ extern "C" lean_obj_res lean_hesper_msl_q4k_dispatch(
     // DG_MSLSEPQUEUE to force the old separate-queue+wait path.
     auto _tw0 = std::chrono::steady_clock::now();
     static const bool sepQueue = getenv("DG_MSLSEPQUEUE") != nullptr;
-    id<MTLCommandQueue> mslQ = sepQueue ? nil : mr_dawn_queue(device);
+    id<MTLCommandQueue> mslQ = mrMetalMode() ? hm_mtl_queue() : (sepQueue ? nil : mr_dawn_queue(device));
     if (!mslQ) {
         if (!g_mslQueue) g_mslQueue = [mtl newCommandQueue];
         dawn::native::metal::WaitForCommandsToBeScheduled(device->Get());
@@ -699,17 +721,22 @@ extern "C" lean_obj_res lean_hesper_msl_q8down_dispatch(
     b_lean_obj_arg pos_obj, b_lean_obj_arg slot_obj, b_lean_obj_arg dst_obj,
     uint32_t Mv, uint32_t Nv, uint32_t Kv, uint32_t nExpert, uint32_t nUsed, uint32_t nTok,
     lean_obj_res /* unit */) {
+    const bool hmMode = mrMetalMode();
     wgpu::Device* device = mr_extract_device(device_obj);
-    if (!device || !device->Get()) return lean_io_result_mk_error(lean_mk_string("msl_q8down: invalid device"));
-    id<MTLDevice> mtl = dawn::native::metal::GetMTLDevice(device->Get());
+    if (!hmMode && (!device || !device->Get())) return lean_io_result_mk_error(lean_mk_string("msl_q8down: invalid device"));
+    id<MTLDevice> mtl = hmMode ? hm_mtl_device() : dawn::native::metal::GetMTLDevice(device->Get());
     wgpu::Buffer* bufs[7] = { mr_extract_buffer(a_obj),   mr_extract_buffer(b_obj),
                               mr_extract_buffer(te_obj),  mr_extract_buffer(tr_obj),
                               mr_extract_buffer(pos_obj), mr_extract_buffer(slot_obj),
                               mr_extract_buffer(dst_obj) };
     id<MTLBuffer> mb[7];
     for (int i = 0; i < 7; i++) {
-        if (!bufs[i] || !bufs[i]->Get()) return lean_io_result_mk_error(lean_mk_string("msl_q8down: invalid buffer"));
-        mb[i] = reinterpret_cast<dawn::native::metal::Buffer*>(bufs[i]->Get())->GetMTLBuffer();
+        if (hmMode) {
+            mb[i] = hm_mtl_buffer_of((void*)bufs[i]);
+        } else {
+            if (!bufs[i] || !bufs[i]->Get()) return lean_io_result_mk_error(lean_mk_string("msl_q8down: invalid buffer"));
+            mb[i] = reinterpret_cast<dawn::native::metal::Buffer*>(bufs[i]->Get())->GetMTLBuffer();
+        }
         if (!mb[i]) return lean_io_result_mk_error(lean_mk_string("msl_q8down: null MTLBuffer"));
     }
     uint32_t fused = getenv("DG_FUSEDOWN") != nullptr ? 1u : 0u;
@@ -739,7 +766,7 @@ extern "C" lean_obj_res lean_hesper_msl_q8down_dispatch(
     // a separate queue + WaitForCommandsToBeScheduled if Dawn's queue isn't reachable. See mr_dawn_queue.
     auto _tw0 = std::chrono::steady_clock::now();
     static const bool sepQueue = getenv("DG_MSLSEPQUEUE") != nullptr;
-    id<MTLCommandQueue> mslQ = sepQueue ? nil : mr_dawn_queue(device);
+    id<MTLCommandQueue> mslQ = mrMetalMode() ? hm_mtl_queue() : (sepQueue ? nil : mr_dawn_queue(device));
     if (!mslQ) {
         if (!g_mslQueue) g_mslQueue = [mtl newCommandQueue];
         dawn::native::metal::WaitForCommandsToBeScheduled(device->Get());
@@ -928,17 +955,22 @@ extern "C" lean_obj_res lean_hesper_msl_q5down_dispatch(
     b_lean_obj_arg pos_obj, b_lean_obj_arg slot_obj, b_lean_obj_arg dst_obj,
     uint32_t Mv, uint32_t Nv, uint32_t Kv, uint32_t nExpert, uint32_t nUsed, uint32_t nTok,
     lean_obj_res /* unit */) {
+    const bool hmMode = mrMetalMode();
     wgpu::Device* device = mr_extract_device(device_obj);
-    if (!device || !device->Get()) return lean_io_result_mk_error(lean_mk_string("msl_q5down: invalid device"));
-    id<MTLDevice> mtl = dawn::native::metal::GetMTLDevice(device->Get());
+    if (!hmMode && (!device || !device->Get())) return lean_io_result_mk_error(lean_mk_string("msl_q5down: invalid device"));
+    id<MTLDevice> mtl = hmMode ? hm_mtl_device() : dawn::native::metal::GetMTLDevice(device->Get());
     wgpu::Buffer* bufs[7] = { mr_extract_buffer(a_obj),   mr_extract_buffer(b_obj),
                               mr_extract_buffer(te_obj),  mr_extract_buffer(tr_obj),
                               mr_extract_buffer(pos_obj), mr_extract_buffer(slot_obj),
                               mr_extract_buffer(dst_obj) };
     id<MTLBuffer> mb[7];
     for (int i = 0; i < 7; i++) {
-        if (!bufs[i] || !bufs[i]->Get()) return lean_io_result_mk_error(lean_mk_string("msl_q5down: invalid buffer"));
-        mb[i] = reinterpret_cast<dawn::native::metal::Buffer*>(bufs[i]->Get())->GetMTLBuffer();
+        if (hmMode) {
+            mb[i] = hm_mtl_buffer_of((void*)bufs[i]);
+        } else {
+            if (!bufs[i] || !bufs[i]->Get()) return lean_io_result_mk_error(lean_mk_string("msl_q5down: invalid buffer"));
+            mb[i] = reinterpret_cast<dawn::native::metal::Buffer*>(bufs[i]->Get())->GetMTLBuffer();
+        }
         if (!mb[i]) return lean_io_result_mk_error(lean_mk_string("msl_q5down: null MTLBuffer"));
     }
     uint32_t fused = getenv("DG_FUSEDOWN") != nullptr ? 1u : 0u;
@@ -968,7 +1000,7 @@ extern "C" lean_obj_res lean_hesper_msl_q5down_dispatch(
     // a separate queue + WaitForCommandsToBeScheduled if Dawn's queue isn't reachable. See mr_dawn_queue.
     auto _tw0 = std::chrono::steady_clock::now();
     static const bool sepQueue = getenv("DG_MSLSEPQUEUE") != nullptr;
-    id<MTLCommandQueue> mslQ = sepQueue ? nil : mr_dawn_queue(device);
+    id<MTLCommandQueue> mslQ = mrMetalMode() ? hm_mtl_queue() : (sepQueue ? nil : mr_dawn_queue(device));
     if (!mslQ) {
         if (!g_mslQueue) g_mslQueue = [mtl newCommandQueue];
         dawn::native::metal::WaitForCommandsToBeScheduled(device->Get());
@@ -1070,7 +1102,7 @@ extern "C" lean_obj_res lean_hesper_msl_gateup_down_onecb(
     // ONE command buffer, TWO encoders, ONE commit
     auto _tw0 = std::chrono::steady_clock::now();
     static const bool sepQueue = getenv("DG_MSLSEPQUEUE") != nullptr;
-    id<MTLCommandQueue> mslQ = sepQueue ? nil : mr_dawn_queue(device);
+    id<MTLCommandQueue> mslQ = mrMetalMode() ? hm_mtl_queue() : (sepQueue ? nil : mr_dawn_queue(device));
     if (!mslQ) { if (!g_mslQueue) g_mslQueue = [mtl newCommandQueue]; dawn::native::metal::WaitForCommandsToBeScheduled(device->Get()); mslQ = g_mslQueue; }
     auto _tw1 = std::chrono::steady_clock::now();
     id<MTLCommandBuffer> cb = [mslQ commandBuffer];

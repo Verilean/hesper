@@ -421,6 +421,22 @@ int hm_dispatch_once(void* ctxp, void* pipep, void* bgp,
     return 1;
 }
 
+// ---- accessors for metal_replace.mm (hand-MSL kernels on this backend) ----
+
+id<MTLDevice> hm_mtl_device(void) {
+    HMCtx* ctx = (HMCtx*)hm_get_ctx();
+    return ctx ? ctx->dev : nil;
+}
+
+id<MTLCommandQueue> hm_mtl_queue(void) {
+    HMCtx* ctx = (HMCtx*)hm_get_ctx();
+    return ctx ? ctx->queue : nil;
+}
+
+id<MTLBuffer> hm_mtl_buffer_of(void* hmbuf) {
+    return hmbuf ? ((HMBuf*)hmbuf)->buf : nil;
+}
+
 void hm_wait_idle(void* ctxp) {
     HMCtx* ctx = (HMCtx*)ctxp;
     id<MTLCommandBuffer> last = nil;
