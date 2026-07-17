@@ -444,6 +444,9 @@ def SweepVariant.mTile (v : SweepVariant) : Nat := v.sgRows * 8 * v.tmsg
 def SweepVariant.nTile (v : SweepVariant) : Nat := v.sgCols * 8 * v.tnsg
 def SweepVariant.wgSize (v : SweepVariant) : Nat := v.sgRows * v.sgCols * 32
 def SweepVariant.sharedBytes (v : SweepVariant) : Nat := (v.mTile * v.bk + v.bk * v.nTile) * 2
+/-- shared bytes with the directB load path (no shared_B). -/
+def SweepVariant.sharedBytesDirect (v : SweepVariant) (db : Bool) : Nat :=
+  (v.mTile * v.bk + (if db then 0 else v.bk * v.nTile)) * 2
 def SweepVariant.name (v : SweepVariant) : String :=
   s!"TM{v.tmsg}xTN{v.tnsg}_sg{v.sgRows}x{v.sgCols}_BK{v.bk}"
 
@@ -493,6 +496,40 @@ def checkVariantGolden (device : Device) (v : SweepVariant) : IO (Option String)
     let d := (gpu.getD (m*N+n) 0.0 - g).abs
     if d > md then md := d
   if md > 0.5 then return some s!"maxDiff={md} @ M={M} N={N} K={K}"
+  return none
+
+/-- `checkVariantGolden` with the directB axis. -/
+def checkVariantGoldenDB (device : Device) (v : SweepVariant) (db : Bool) : IO (Option String) := do
+  let M := v.mTile * 2; let N := v.nTile * 2; let K := v.bk * 2
+  let wf := fun (n k : Nat) => (((n + k) % 7 : Nat).toFloat) - 3.0
+  let af := fun (m k : Nat) => (((m * 2 + k) % 5 : Nat).toFloat) - 2.0
+  let mut wA : Array Float := #[]
+  for n in [0:N] do for k in [0:K] do wA := wA.push (wf n k)
+  let mut aA : Array Float := #[]
+  for m in [0:M] do for k in [0:K] do aA := aA.push (af m k)
+  let wf32 ← mkBuf device (N*K); let bf16 ← mkBuf device (N*(K/2))
+  let aBuf ← mkBuf device (M*K); let cBuf ← mkBuf device (M*N)
+  writeBuffer device wf32 0 (← Hesper.Basic.floatArrayToBytes wA)
+  writeBuffer device aBuf 0 (← Hesper.Basic.floatArrayToBytes aA)
+  let rp ← IO.mkRef none
+  Hesper.GPUBackend.executeWithConfigCached device (packF32ToF16 (N*(K/2)))
+    (("fin",wf32)::("fout",bf16)::List.nil) { numWorkgroups := ((N*(K/2)+255)/256,1,1), workgroupSize := {x:=256} } 0 rp
+  let cfg : Hesper.ExecConfig := {
+    numWorkgroups := (N / v.nTile, M / v.mTile, 1), workgroupSize := {x := v.wgSize},
+    extensions := ["f16","chromium_experimental_subgroup_matrix"],
+    diagnostics := [("off","chromium.subgroup_matrix_uniformity")] }
+  let rr ← IO.mkRef none
+  Hesper.GPUBackend.executeWithConfigCached device
+    (Hesper.WGSL.MatMul.matMulTransposeF16WMMARegKernelGen { M := M, N := N, K := K } v.tmsg v.tnsg v.sgRows v.sgCols v.bk 0 db)
+    (("a",aBuf)::("b",bf16)::("c",cBuf)::List.nil) cfg 0 rr
+  let gpu ← Hesper.Basic.bytesToFloatArray (← mapBufferRead device cBuf 0 (M*N*4).toUSize)
+  let mut md := 0.0
+  for m in [0:M] do for n in [0:N] do
+    let mut g := 0.0
+    for k in [0:K] do g := g + (af m k) * (wf n k)
+    let d := (gpu.getD (m*N+n) 0.0 - g).abs
+    if d > md then md := d
+  if md > 0.5 then return some s!"maxDiff={md} @ M={M} N={N} K={K} directB={db}"
   return none
 
 /-- The reg-WMMA matmul as an Autotune FAMILY (DEVPLAN M2): ~50 lines of declaration — the sweep
@@ -662,6 +699,66 @@ def sweepTier1 (device : Device) : IO Unit := do
     | none => IO.println "  [deployed-baseline] TM4xTN2_sg2x2_BK32: not in feasible set (?)"
     stdout.flush
 
+/-- R60 recovery ① — DIRECTB=1: focused sweep of the directB load-path axis (the geometry axis
+    alone near-tied in the M2 sweep; the untested axis is B staging vs device-direct
+    simdgroup_load). Fixed variant list × the real DG WMMA shapes, golden-gated, 30-iter ranking
+    + 300×3 refine of the per-shape winner vs the staged incumbent. -/
+def directBSweep (device : Device) : IO Unit := do
+  let stdout ← IO.getStdout
+  let shapes : List (String × Nat × Nat × Nat) :=
+    [("qkv-Q",     320, 8192, 2816), ("attnO-full", 320, 2816, 8192),
+     ("dense-gu",  320, 2112, 2816), ("dense-dn",   320, 2816, 2112),
+     ("qkv-KV",    320, 1024, 2816)]
+  let vs : List (String × SweepVariant × Bool) :=
+    [("64x32-staged(deployed)", { tmsg := 4, tnsg := 2, sgRows := 2, sgCols := 2, bk := 32 }, false),
+     ("64x32-directB",          { tmsg := 4, tnsg := 2, sgRows := 2, sgCols := 2, bk := 32 }, true),
+     ("64x64-directB",          { tmsg := 4, tnsg := 4, sgRows := 2, sgCols := 2, bk := 32 }, true),
+     ("64x64-BK64-directB",     { tmsg := 4, tnsg := 4, sgRows := 2, sgCols := 2, bk := 64 }, true),
+     ("64x128-directB",         { tmsg := 4, tnsg := 4, sgRows := 2, sgCols := 4, bk := 32 }, true),
+     ("64x128-BK64-directB",    { tmsg := 4, tnsg := 4, sgRows := 2, sgCols := 4, bk := 64 }, true),
+     ("128x64-directB",         { tmsg := 8, tnsg := 4, sgRows := 2, sgCols := 2, bk := 32 }, true),
+     ("32x128-directB",         { tmsg := 4, tnsg := 4, sgRows := 1, sgCols := 4, bk := 32 }, true)]
+  for (sname, M, N, K) in shapes do
+    IO.println s!"=== DIRECTB sweep {sname} [M={M} N={N} K={K}] ==="
+    stdout.flush
+    let feas := vs.filter fun (_, v, db) =>
+      N % v.nTile == 0 && K % v.bk == 0 && (v.mTile * v.bk) % v.wgSize == 0 &&
+      (db || (v.nTile * (v.bk / 2)) % v.wgSize == 0) && v.sharedBytesDirect db ≤ 32768
+    let maxMTile := feas.foldl (fun a (_, v, _) => max a v.mTile) 64
+    let mPad := ((M + maxMTile - 1) / maxMTile) * maxMTile
+    let aBuf ← mkBuf device (mPad*K); let bBuf ← mkBuf device (N*(K/2)); let cBuf ← mkBuf device (mPad*N)
+    let bufs : List (String × Buffer) := [("a",aBuf),("b",bBuf),("c",cBuf)]
+    let flops := 2.0 * M.toFloat * N.toFloat * K.toFloat
+    let mut results : Array (String × Float) := #[]
+    for (vname, v, db) in feas do
+      match ← checkVariantGoldenDB device v db with
+      | some err => IO.println s!"  {vname}: ❌ GOLDEN FAIL {err}"; stdout.flush
+      | none =>
+        let mGrid := (M + v.mTile - 1) / v.mTile
+        let kern := Hesper.WGSL.MatMul.matMulTransposeF16WMMARegKernelGen
+          { M := mPad, N := N, K := K } v.tmsg v.tnsg v.sgRows v.sgCols v.bk 0 db
+        let cfg : Hesper.ExecConfig := {
+          numWorkgroups := (N / v.nTile, mGrid, 1), workgroupSize := {x := v.wgSize},
+          extensions := ["f16","chromium_experimental_subgroup_matrix"],
+          diagnostics := [("off","chromium.subgroup_matrix_uniformity")] }
+        let r ← IO.mkRef none
+        Hesper.GPUBackend.executeWithConfigCached device kern bufs cfg 0 r
+        let tb0 ← IO.monoMsNow
+        Hesper.GPUBackend.beginBatch device
+        for _ in [0:30] do Hesper.GPUBackend.executeWithConfigCached device kern bufs cfg 0 r
+        Hesper.GPUBackend.endBatch device
+        let tb1 ← IO.monoMsNow
+        let ms := (tb1-tb0).toFloat / 30.0
+        let gflops := flops / (ms/1000.0) / 1.0e9
+        results := results.push (vname, ms)
+        IO.println s!"  {vname}: {ms}ms | {gflops} GFLOPS"
+        stdout.flush
+    let sorted := results.qsort (fun a b => a.2 < b.2)
+    match sorted.toList.head? with
+    | some (wname, wms) => IO.println s!"--- {sname} WINNER: {wname} {wms}ms ---"
+    | none => IO.println s!"--- {sname}: no results ---"
+    stdout.flush
+
 /-- DEVPLAN M2 validity check — REBENCH=1: precise (300-iter × 3-repeat) re-measurement of the
     sweep winners AGAINST the actual deployed kernel in the SAME harness. Answers: (a) is the win
     reproducible (run-to-run variance)? (b) is the in-sweep "deployed config 0.733ms" honest vs the
@@ -733,6 +830,10 @@ def main : IO Unit := do
   if (← IO.getEnv "SWEEP").isSome then
     let inst ← Hesper.init; let device ← getDevice inst
     Examples.Compute.MatmulBench.sweepTier1' device
+    return
+  if (← IO.getEnv "DIRECTB").isSome then
+    let inst ← Hesper.init; let device ← getDevice inst
+    Examples.Compute.MatmulBench.directBSweep device
     return
   if (← IO.getEnv "TATPROBE").isSome then
     let inst ← Hesper.init; let device ← getDevice inst

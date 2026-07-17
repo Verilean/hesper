@@ -921,6 +921,23 @@ def loadMatrixRight
   let loadExpr := Exp.subgroupMatrixLoadRight bufferName offset (Exp.litBool false) stride
   emitStmt (Stmt.assignIndex arrayName (Exp.litU32 index) matTy loadExpr)
 
+/-- `loadMatrixRight` with an explicit column-major flag — for loading a right (k×n)
+    fragment DIRECTLY from a storage buffer laid out n-major (e.g. Bᵀ [N,K] row-major:
+    element (k,n) at b[n·K+k] ⇒ colMajor=true, stride=K). Buffer-space subgroupMatrixLoad
+    is supported by the pinned May Tint (verified; lowers to device simdgroup_load). -/
+def loadMatrixRightT
+    {st : ScalarType} {k n : Nat}
+    (arrayName : String)
+    (index : Nat)
+    (bufferName : String)
+    (offset : Exp (.scalar .u32))
+    (colMajor : Bool)
+    (stride : Exp (.scalar .u32))
+    : ShaderM Unit := do
+  let matTy := WGSLType.subgroupMatrixRight st k n
+  let loadExpr := Exp.subgroupMatrixLoadRight bufferName offset (Exp.litBool colMajor) stride
+  emitStmt (Stmt.assignIndex arrayName (Exp.litU32 index) matTy loadExpr)
+
 /-- Perform matrix multiply-accumulate: acc = a * b + acc
 
     Example: accxx[idx] = subgroupMatrixMultiplyAccumulate(Ax[i], Bx[j], accxx[idx])
