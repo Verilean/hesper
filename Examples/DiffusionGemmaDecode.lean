@@ -49,6 +49,42 @@ def geluMulB (n : Nat) : Hesper.WGSL.Monad.ShaderM Unit := do
   -- activation flips real/0.0 per run → chaotic layer amplification → non-deterministic decode).
   ShaderM.if_ inB (ShaderM.writeBuffer (ty := .scalar .f32) "outp" i (Exp.mul gl u)) (pure ())
 
+/-- Fused grouped geglu + Q8_0 fake-quant: `gegluMergedB` → `qActQ80` in ONE pass (DG_FUSE) —
+    no eh round trip. The 32-elem quant blocks map 1:1 onto subgroups (Apple simdgroup = 32,
+    ff % 32 == 0 so blocks never straddle): each lane computes its geglu value in a register,
+    amax via subgroupMax, then quantize-dequantizes its own element. Subgroup uniformity: the
+    OOB guard is applied to the WRITE only; OOB lanes read a clamped index and contribute
+    |0|=0 to amax (tail subgroups are fully OOB anyway since N*ff is 32-aligned).
+    Fusion map after ggml-metal's fused elementwise families (llama.cpp, MIT). -/
+def gegluMergedQ80B (N ff : Nat) (guElems : Nat := 0) : Hesper.WGSL.Monad.ShaderM Unit := do
+  let gE := if guElems == 0 then N*2*ff else guElems
+  let gid ← ShaderM.globalId; let t := Exp.vec3X gid
+  let _gu ← ShaderM.declareInputBuffer "gu" (.array (.scalar .f32) gE)
+  let _o ← ShaderM.declareOutputBuffer "eh" (.array (.scalar .f32) (N*ff))
+  let inB := Exp.lt t (Exp.litU32 (N*ff))
+  let ts := Exp.min t (Exp.litU32 (N*ff - 1))
+  let rr := Exp.div ts (Exp.litU32 ff)
+  let i := Exp.sub ts (Exp.mul rr (Exp.litU32 ff))
+  let gbase := Exp.add (Exp.mul rr (Exp.litU32 (2*ff))) i
+  let g ← ShaderM.readBuffer (ty := .scalar .f32) (n := gE) "gu" gbase
+  let u ← ShaderM.readBuffer (ty := .scalar .f32) (n := gE) "gu" (Exp.add gbase (Exp.litU32 ff))
+  let g3 := Exp.mul g (Exp.mul g g)
+  let inner := Exp.mul (Exp.litF32 0.7978845608) (Exp.add g (Exp.mul (Exp.litF32 0.044715) g3))
+  let iC := Exp.max (Exp.litF32 (-10.0)) (Exp.min (Exp.litF32 10.0) inner)
+  let gl := Exp.mul (Exp.mul (Exp.litF32 0.5) g) (Exp.add (Exp.litF32 1.0) (Exp.tanh iC))
+  let vName ← ShaderM.var (.scalar .f32) (Exp.select inB (Exp.mul gl u) (Exp.litF32 0.0))
+  let v : Exp (.scalar .f32) := Exp.var vName
+  let amaxName ← ShaderM.var (.scalar .f32) (Exp.subgroupMax (Exp.abs v))
+  let amax : Exp (.scalar .f32) := Exp.var amaxName
+  -- qActQ80 parity: amax==0 blocks keep the raw value (qActQ80 leaves data untouched there)
+  let d := Exp.div amax (Exp.litF32 127.0)
+  let idv := Exp.div (Exp.litF32 127.0) amax
+  let y := Exp.mul idv v
+  let q := Exp.mul (Exp.sign y) (Exp.floor (Exp.add (Exp.abs y) (Exp.litF32 0.5)))
+  let qv := Exp.mul q d
+  let outV := Exp.select (Exp.gt amax (Exp.litF32 0.0)) qv v
+  ShaderM.if_ inB (ShaderM.writeBuffer (ty := .scalar .f32) "eh" t outV) (pure ())
+
 /-- Identity copy out[i]=in[i]. -/
 def copyB (n : Nat) : Hesper.WGSL.Monad.ShaderM Unit := do
   let gid ← ShaderM.globalId
@@ -1474,6 +1510,10 @@ def main (args : List String) : IO Unit := do
   -- DG_MSLDOWN: MSL port of the Q8_0 MoE down (same recipe as the gate/up). Separate opt-out so
   -- the two can be A/B'd independently; both share the portable-WGSL fallback semantics.
   let useMslDown := (← IO.getEnv "DG_NOMSLDOWN").isNone
+  -- DG_FUSE=1: fused elementwise family (llama.cpp ggml-metal fusion map, MIT):
+  -- (a) post-norm+residual pairs → rmsNormAddBatchRows (2×/layer),
+  -- (b) grouped geglu+q80 → gegluMergedQ80B (1×/layer). Opt-in; eval-gated.
+  let dgFuse := (← IO.getEnv "DG_FUSE").isSome
   -- DG_FUSEDOWN: the MSL down kernel reads the raw grouped gate/up (sGatheredGU) and computes geglu
   -- inline, dropping the Dawn gegluMergedB + q80 dispatches so MSL gate/up and MSL down run
   -- back-to-back on Dawn's queue (tests the ~220ms cross-queue handoff-bubble hypothesis).
@@ -2011,8 +2051,11 @@ def main (args : List String) : IO Unit := do
         else
           qK device sCtx rowsN qDim (hash ("qCtx",li,rowsN))
           bmm device blk.attention.wO sCtx sAO rowsN (hash ("wo",li,rowsN))
-        Hesper.Layers.RMSNorm.forward device blk.postAttnNorm sAO sR rowsN
-        disp device (addB (rowsN*dim)) (("ain",sR)::("bin",cur)::("outc",sPA)::List.nil) (rowsN*dim) (hash ("ra",li,rowsN))
+        if dgFuse then
+          Hesper.Layers.RMSNorm.forwardNormThenAddBatchRows device blk.postAttnNorm sAO cur sPA rowsN
+        else
+          Hesper.Layers.RMSNorm.forward device blk.postAttnNorm sAO sR rowsN
+          disp device (addB (rowsN*dim)) (("ain",sR)::("bin",cur)::("outc",sPA)::List.nil) (rowsN*dim) (hash ("ra",li,rowsN))
         pmark rAttnO  -- O projection + post-norm + residual
         -- dense FFN
         if step == 0 && (← IO.getEnv "DG_QFMT").isSome then
@@ -2187,7 +2230,10 @@ def main (args : List String) : IO Unit := do
                 (("gu",sGatheredGU)::("b",dnE)::("tileExpert",sTileExpert)::("pos",sSortedPos)::("slot",sSortedSlot)::("dst",sDownAll)::List.nil) ((dim+31)/32) ((maxPaddedR+31)/32) (hash ("fdg",li,rowsN))
             else if fuseDown then pure ()   -- geglu is computed inline inside the fused MSL down kernel
             else
-              disp device (gegluMergedB maxPaddedR expFF 0 (maxPaddedR*2*expFF)) (("gu",sGatheredGU)::("eh",sGatheredEh)::List.nil) (maxPaddedR*expFF) (hash ("gmg",li,rowsN))
+              if dgFuse then
+                disp device (gegluMergedQ80B maxPaddedR expFF (maxPaddedR*2*expFF)) (("gu",sGatheredGU)::("eh",sGatheredEh)::List.nil) (maxPaddedR*expFF) (hash ("gmq",li,rowsN))
+              else
+                disp device (gegluMergedB maxPaddedR expFF 0 (maxPaddedR*2*expFF)) (("gu",sGatheredGU)::("eh",sGatheredEh)::List.nil) (maxPaddedR*expFF) (hash ("gmg",li,rowsN))
             unless moeNoFlush do Hesper.WGSL.Execute.flushBatch device
             pmark rMoeGeglu
             if li == 0 && (← IO.getEnv "DG_MOEDOWNDIAG").isSome then
@@ -2210,7 +2256,7 @@ def main (args : List String) : IO Unit := do
               -- INDEXED-SCATTER reg-matmul down (matrix units, in-kernel Q8_0 dequant): the C store
               -- scatters dst[slot,pos,col] IN-KERNEL — no 17.5M-element scatterGUB pass. The q80
               -- round-trip both matches the warp's Q8 rounding AND acts as the geglu→down sync.
-              unless fuseDown do q80 device sGatheredEh maxPaddedR expFF (hash ("qgehrb",li,rowsN))
+              unless (fuseDown || dgFuse) do q80 device sGatheredEh maxPaddedR expFF (hash ("qgehrb",li,rowsN))
               pmark rMoeQ80
               if useMslDown then
                 -- DG_MSLDOWN: hand-MSL port (same ordering contract as the gate/up: flushBatch
@@ -2226,13 +2272,13 @@ def main (args : List String) : IO Unit := do
             else if moeDownRB && useMslDown then
               -- Q5_0 layer, MSL port (22B/block): same recipe as the Q8_0 MSL down — q80 round-trip
               -- for rounding parity + sync, flushBatch commits producers, hazard-tracked MSL commit.
-              unless fuseDown do q80 device sGatheredEh maxPaddedR expFF (hash ("qgehq5",li,rowsN))
+              unless (fuseDown || dgFuse) do q80 device sGatheredEh maxPaddedR expFF (hash ("qgehq5",li,rowsN))
               pmark rMoeQ80
               Hesper.WGSL.Execute.flushBatch device
               mslQ5DownDispatch device (if fuseDown then sGatheredGU else sGatheredEh) dnE sTileExpert raggedRows sSortedPos sSortedSlot sDownAll
                 maxPadded.toUInt32 dim.toUInt32 expFF.toUInt32 nExpert.toUInt32 nUsed.toUInt32 N.toUInt32
             else
-              q80 device sGatheredEh maxPaddedR expFF (hash ("qgeh",li,rowsN))   -- match the per-slot Q8 rounding
+              unless dgFuse do q80 device sGatheredEh maxPaddedR expFF (hash ("qgeh",li,rowsN))   -- match the per-slot Q8 rounding (skipped under DG_FUSE: gegluMergedQ80B already applied it)
               pmark rMoeQ80
               let downGrpKernel := match blk.ffn.down.quantFormat with
                 | .Q5_0 => Hesper.Layers.Linear.fusedQ5_0BatchExpertF32WarpGroupedKernel { inDim:=expFF, outDim:=dim } nExpert maxPaddedR
@@ -2313,8 +2359,11 @@ def main (args : List String) : IO Unit := do
         pmark rMoe
         -- combine: curMlp + curMoe → postFFNNorm → +residual → ×out_scale
         disp device (addB (rowsN*dim)) (("ain",sCurMlp)::("bin",sCurMoe)::("outc",sComb)::List.nil) (rowsN*dim) (hash ("ad",li,rowsN))
-        Hesper.Layers.RMSNorm.forward device blk.postFFNNorm sComb sR rowsN
-        disp device (addB (rowsN*dim)) (("ain",sR)::("bin",sPA)::("outc",nxt)::List.nil) (rowsN*dim) (hash ("rc",li,rowsN))
+        if dgFuse then
+          Hesper.Layers.RMSNorm.forwardNormThenAddBatchRows device blk.postFFNNorm sComb sPA nxt rowsN
+        else
+          Hesper.Layers.RMSNorm.forward device blk.postFFNNorm sComb sR rowsN
+          disp device (addB (rowsN*dim)) (("ain",sR)::("bin",sPA)::("outc",nxt)::List.nil) (rowsN*dim) (hash ("rc",li,rowsN))
         if isDelta then
           disp device (scaleRegionB rowsN 0 dim (scales[li]!) (encScales[li]!)) (("data",nxt)::List.nil) (rowsN*dim) (hash ("scr",li,rowsN))
         else

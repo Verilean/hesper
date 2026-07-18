@@ -272,6 +272,45 @@ def rmsNormFusedKernel (config : Config) (numRows : Nat) (workgroupSize : Nat :=
     let result := Exp.mul (Exp.mul inputVal rsqrtRms) scaleVal
     ShaderM.writeBuffer (ty := .scalar .f32) "output" (Exp.add rowBase dimIdx) result
 
+/-- Row-major batched fused post-norm+residual:
+    `output[r,i] = RMSNorm(layer_out[r])[i]*scale[i] + residual[r,i]`.
+    Same reduction structure as `rmsNormFusedKernel` (1 WG/row, warp-shuffle
+    block sum); fuses the separate residual-add dispatch and skips the
+    intermediate normed-row round trip. Fusion pattern after ggml-metal's
+    `kernel_rms_norm_fuse_impl` (F=3; llama.cpp, MIT). -/
+def rmsNormAddBatchRowsKernel (config : Config) (numRows : Nat) (workgroupSize : Nat := 256) : ShaderM Unit := do
+  let wid ← ShaderM.workgroupId
+  let lid ← ShaderM.localId
+  let rowIdx := Exp.vec3X wid
+  let localIdx := Exp.vec3X lid
+  let totalElements := numRows * config.dim
+  ShaderM.sharedNamed "shared_sum" (.array (.scalar .f32) workgroupSize)
+  let _input ← ShaderM.declareInputBuffer "layer_out" (.array (.scalar .f32) totalElements)
+  let _res ← ShaderM.declareInputBuffer "residual" (.array (.scalar .f32) totalElements)
+  let _scale ← ShaderM.declareInputBuffer "scale" (.array (.scalar .f32) config.dim)
+  let _output ← ShaderM.declareOutputBuffer "output" (.array (.scalar .f32) totalElements)
+  let rowBase := Exp.mul rowIdx (Exp.litU32 config.dim)
+  ShaderM.varNamed "partial_sum" (.scalar .f32) (Exp.litF32 0.0)
+  let partialSum : Exp (.scalar .f32) := Exp.var "partial_sum"
+  ShaderM.loop localIdx (Exp.litU32 config.dim) (Exp.litU32 workgroupSize) fun loopIdx => do
+    let valName ← ShaderM.var (.scalar .f32)
+      (← ShaderM.readBuffer (ty := .scalar .f32) (n := totalElements) "layer_out" (Exp.add rowBase loopIdx))
+    let val : Exp (.scalar .f32) := Exp.var valName
+    ShaderM.assign "partial_sum" (Exp.add partialSum (Exp.mul val val))
+  let totalSum ← warpBlockSumReduce partialSum localIdx workgroupSize
+  let rsqrtRmsName ← ShaderM.var (.scalar .f32)
+    (Exp.inverseSqrt (Exp.add
+      (Exp.div totalSum (Exp.litF32 config.dim.toFloat))
+      (Exp.litF32 config.eps)))
+  let rsqrtRms : Exp (.scalar .f32) := Exp.var rsqrtRmsName
+  ShaderM.loop localIdx (Exp.litU32 config.dim) (Exp.litU32 workgroupSize) fun dimIdx => do
+    let inputVal ← ShaderM.readBuffer (ty := .scalar .f32) (n := totalElements) "layer_out" (Exp.add rowBase dimIdx)
+    let scaleVal ← ShaderM.readBuffer (ty := .scalar .f32) (n := config.dim) "scale" dimIdx
+    let resVal ← ShaderM.readBuffer (ty := .scalar .f32) (n := totalElements) "residual" (Exp.add rowBase dimIdx)
+    let result := Exp.add (Exp.mul (Exp.mul inputVal rsqrtRms) scaleVal) resVal
+    ShaderM.writeBuffer (ty := .scalar .f32) "output" (Exp.add rowBase dimIdx) result
+
+
 /-! ## Fused post-norm (Gemma 4 style): RMSNorm(layer_out) + residual -/
 
 /-- Computes `output = RMSNorm(layer_out) * scale + residual` in one kernel.
@@ -827,6 +866,19 @@ def forward [GPUBackend β] (ctx : β)
     { workgroupSize := { x := workgroupSize }, numWorkgroups := (numRows, 1, 1) }
     cacheKey refToUse
   logVerbose "[RMSNorm] ✓ Forward pass complete"
+
+/-- Dispatch `rmsNormAddBatchRowsKernel` (row-major [numRows, dim] buffers). -/
+def forwardNormThenAddBatchRows [GPUBackend β] (ctx : β)
+    (layer : RMSNorm (GPUBackend.Buf β) (GPUBackend.CachedDispatch β))
+    (layerOutBuf residualBuf outputBuf : GPUBackend.Buf β)
+    (numRows : Nat) (workgroupSize : Nat := 256) : IO Unit := do
+  let shader := rmsNormAddBatchRowsKernel layer.config numRows workgroupSize
+  let cacheKey : UInt64 := hash ("rms-add-batch-rows", layer.config.dim, numRows, workgroupSize)
+  let r ← IO.mkRef none
+  GPUBackend.executeWithConfigCached ctx shader
+    [("layer_out", layerOutBuf), ("residual", residualBuf), ("scale", layer.scale), ("output", outputBuf)]
+    { workgroupSize := { x := workgroupSize }, numWorkgroups := (numRows, 1, 1) }
+    cacheKey r
 
 /-- Fused post-norm: `output = RMSNorm(layer_out) * scale + residual`.
     Gemma 4's post-attention / post-FFN pattern in a single dispatch.  -/
