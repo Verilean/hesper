@@ -25,10 +25,29 @@ static std::atomic<uint64_t> g_msl_wait_ns{0};
 static std::atomic<uint64_t> g_msl_enc_ns{0};
 static std::atomic<uint64_t> g_msl_gpu_ns{0};
 
+// tagged GPU-time attribution (shared with metal_backend.mm; no-op tag 0 by default)
+extern "C" int hm_tag_get(void);
+extern "C" void hm_tag_account_ns(uint64_t ns, int tag);
+
 static inline void mslAccountGpu(id<MTLCommandBuffer> cb) {
+    int tag = hm_tag_get();
     [cb addCompletedHandler:^(id<MTLCommandBuffer> c) {
-        g_msl_gpu_ns.fetch_add((uint64_t)((c.GPUEndTime - c.GPUStartTime) * 1e9), std::memory_order_relaxed);
+        uint64_t ns = (uint64_t)((c.GPUEndTime - c.GPUStartTime) * 1e9);
+        g_msl_gpu_ns.fetch_add(ns, std::memory_order_relaxed);
+        hm_tag_account_ns(ns, tag);
     }];
+}
+
+// tagged GPU-time isolation (DG_MOEISO-class): set the current tag / read a tag's
+// accumulated GPU ns. Lean flushes at tag switches so CBs don't straddle tags.
+extern "C" uint64_t hm_tag_read_ns(int t);
+extern "C" void hm_tag_set(int t);
+extern "C" lean_obj_res lean_hesper_metal_tag_set(uint32_t t, lean_obj_res /* unit */) {
+    hm_tag_set((int)t);
+    return lean_io_result_mk_ok(lean_box(0));
+}
+extern "C" lean_obj_res lean_hesper_metal_tag_read(uint32_t t, lean_obj_res /* unit */) {
+    return lean_io_result_mk_ok(lean_box_uint64(hm_tag_read_ns((int)t)));
 }
 
 extern "C" lean_obj_res lean_hesper_msl_busy_read(lean_obj_res /* unit */) {
@@ -1656,4 +1675,152 @@ extern "C" lean_obj_res lean_hesper_mtl_device_name(b_lean_obj_arg device_obj, l
              (unsigned long)[mtl maxThreadsPerThreadgroup].width,
              (int)[mtl hasUnifiedMemory]);
     return lean_io_result_mk_ok(lean_mk_string(buf));
+}
+
+// ============================================================================
+// Vendored ggml (llama.cpp) MoE path — DG_GGMLMOE=1, metal backend only.
+// Kernels: native/ggml_kernels/ggml-moe-vendored.metal (MIT, llama.cpp — see
+// that file's header for provenance). Two host entry points:
+//   map0  — per-expert token-id mapping (replaces our counting-sort chain)
+//   mmid  — indirect matrix-matmul (gate/up: Q4_K bcast-act; down: Q8_0/Q5_0
+//           per-slot act), dst scattered to [token][slot][ne0] by the kernel.
+// Ordering: metal mode commits to the hm queue; commit order == execution
+// order. Callers flushBatch before (producers) and between geglu→down.
+// ============================================================================
+
+// verbatim field layout of ggml_metal_kargs_mul_mm_id_map0 / _mul_mm_id
+typedef struct {
+    int32_t  ne02; int32_t ne10; int32_t ne11;
+    uint64_t nb11; uint64_t nb12;
+    int32_t  ne21; int32_t ne20;
+    uint64_t nb21;
+} hm_ggml_kargs_map0;
+
+typedef struct {
+    int32_t  ne00; int32_t ne02;
+    uint64_t nb01; uint64_t nb02; uint64_t nb03;
+    int32_t  ne11;
+    uint64_t nb10; uint64_t nb11; uint64_t nb12; uint64_t nb13;
+    int32_t  ne20; int32_t ne21; int32_t ne0; int32_t ne1;
+    int16_t  r2; int16_t r3;
+} hm_ggml_kargs_mmid;
+
+static id<MTLLibrary> g_ggmlLib = nil;
+static id<MTLComputePipelineState> g_ggmlMap0 = nil;    // ne20 = 8
+static id<MTLComputePipelineState> g_ggmlMmid[3] = {nil, nil, nil}; // 0=q4_K 1=q8_0 2=q5_0
+
+static bool ggmlMoeInit(id<MTLDevice> mtl) {
+    if (g_ggmlLib) return g_ggmlMap0 && g_ggmlMmid[0];
+    NSError* err = nil;
+    const char* p = getenv("HESPER_GGML_MSL");
+    NSString* path = p ? [NSString stringWithUTF8String:p]
+                       : @"native/ggml_kernels/ggml-moe-vendored.metal";
+    NSString* src = [NSString stringWithContentsOfFile:path encoding:NSUTF8StringEncoding error:&err];
+    if (!src) { fprintf(stderr, "[ggmlmoe] cannot read %s\n", [path UTF8String]); return false; }
+    MTLCompileOptions* opts = [MTLCompileOptions new];
+    opts.languageVersion = MTLLanguageVersion3_2;
+    g_ggmlLib = [mtl newLibraryWithSource:src options:opts error:&err];
+    if (!g_ggmlLib) { fprintf(stderr, "[ggmlmoe] compile failed: %s\n", [[err localizedDescription] UTF8String]); return false; }
+    {
+        id<MTLFunction> f = [g_ggmlLib newFunctionWithName:@"kernel_mul_mm_id_map0_ne20_8"];
+        if (f) g_ggmlMap0 = [mtl newComputePipelineStateWithFunction:f error:&err];
+        if (!g_ggmlMap0) { fprintf(stderr, "[ggmlmoe] map0 PSO failed\n"); return false; }
+    }
+    const char* names[3] = {"kernel_mul_mm_id_q4_K_f32", "kernel_mul_mm_id_q8_0_f32", "kernel_mul_mm_id_q5_0_f32"};
+    for (int i = 0; i < 3; i++) {
+        MTLFunctionConstantValues* cv = [MTLFunctionConstantValues new];
+        bool bcInp = false;  // FC_MUL_MM+0: ne00 % 32 != 0 — all our K dims are 32-multiples
+        [cv setConstantValue:&bcInp type:MTLDataTypeBool atIndex:700];
+        id<MTLFunction> f = [g_ggmlLib newFunctionWithName:[NSString stringWithUTF8String:names[i]]
+                                            constantValues:cv error:&err];
+        if (f) g_ggmlMmid[i] = [mtl newComputePipelineStateWithFunction:f error:&err];
+        if (!g_ggmlMmid[i]) { fprintf(stderr, "[ggmlmoe] mmid PSO %s failed: %s\n", names[i], [[err localizedDescription] UTF8String]); return false; }
+    }
+    return true;
+}
+
+// map0: ids [nTok, nUsed] (u32 expert ids; ggml reads i32 — same bits) →
+//       tpe [nExpert] u32 counts, hids [nExpert, nTok] i32 id lists.
+extern "C" lean_obj_res lean_hesper_ggml_moe_map0(
+    b_lean_obj_arg device_obj, b_lean_obj_arg ids_obj, b_lean_obj_arg tpe_obj,
+    b_lean_obj_arg hids_obj, uint32_t nExpert, uint32_t nUsed, uint32_t nTok,
+    lean_obj_res /* unit */) {
+    if (!mrMetalMode()) return lean_io_result_mk_error(lean_mk_string("ggml_moe: metal backend only"));
+    id<MTLDevice> mtl = hm_mtl_device();
+    if (!ggmlMoeInit(mtl)) return lean_io_result_mk_error(lean_mk_string("ggml_moe: init failed"));
+    if (nUsed != 8) return lean_io_result_mk_error(lean_mk_string("ggml_moe: map0 instantiated for ne20=8"));
+    id<MTLBuffer> ids = hm_mtl_buffer_of((void*)mr_extract_buffer(ids_obj));
+    id<MTLBuffer> tpe = hm_mtl_buffer_of((void*)mr_extract_buffer(tpe_obj));
+    id<MTLBuffer> hids = hm_mtl_buffer_of((void*)mr_extract_buffer(hids_obj));
+    if (!ids || !tpe || !hids) return lean_io_result_mk_error(lean_mk_string("ggml_moe: null buffer"));
+    hm_ggml_kargs_map0 args = {
+        (int32_t)nExpert, 0, (int32_t)nUsed,
+        0, 0,
+        (int32_t)nTok, (int32_t)nUsed,
+        (uint64_t)(nUsed * 4)
+    };
+    id<MTLCommandQueue> q = hm_mtl_queue();
+    id<MTLCommandBuffer> cb = [q commandBuffer];
+    id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+    [enc setComputePipelineState:g_ggmlMap0];
+    [enc setBytes:&args length:sizeof(args) atIndex:0];
+    [enc setBuffer:ids offset:0 atIndex:1];
+    [enc setBuffer:tpe offset:0 atIndex:2];
+    [enc setBuffer:hids offset:0 atIndex:3];
+    [enc setThreadgroupMemoryLength:((nExpert * nUsed * 2 + 15) & ~15) atIndex:0];
+    [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(nExpert, 1, 1)];
+    [enc endEncoding];
+    mslAccountGpu(cb);
+    [cb commit];
+    return lean_io_result_mk_ok(lean_box(0));
+}
+
+// mmid: kind 0=q4_K 1=q8_0 2=q5_0. act layout: bcast (actPerSlot=0): [nTok, K] f32;
+// per-slot (actPerSlot=1): [nTok, nUsed, K] f32. dst: [nTok, nUsed, outRows] f32.
+extern "C" lean_obj_res lean_hesper_ggml_moe_mmid(
+    b_lean_obj_arg device_obj, uint32_t kind,
+    b_lean_obj_arg w_obj, b_lean_obj_arg act_obj, b_lean_obj_arg tpe_obj,
+    b_lean_obj_arg hids_obj, b_lean_obj_arg dst_obj,
+    uint32_t K, uint32_t outRows, uint32_t nExpert, uint32_t nUsed, uint32_t nTok,
+    uint8_t actPerSlot, lean_obj_res /* unit */) {
+    if (!mrMetalMode()) return lean_io_result_mk_error(lean_mk_string("ggml_moe: metal backend only"));
+    id<MTLDevice> mtl = hm_mtl_device();
+    if (!ggmlMoeInit(mtl) || kind > 2) return lean_io_result_mk_error(lean_mk_string("ggml_moe: init/kind"));
+    id<MTLBuffer> w = hm_mtl_buffer_of((void*)mr_extract_buffer(w_obj));
+    id<MTLBuffer> act = hm_mtl_buffer_of((void*)mr_extract_buffer(act_obj));
+    id<MTLBuffer> tpe = hm_mtl_buffer_of((void*)mr_extract_buffer(tpe_obj));
+    id<MTLBuffer> hids = hm_mtl_buffer_of((void*)mr_extract_buffer(hids_obj));
+    id<MTLBuffer> dst = hm_mtl_buffer_of((void*)mr_extract_buffer(dst_obj));
+    if (!w || !act || !tpe || !hids || !dst) return lean_io_result_mk_error(lean_mk_string("ggml_moe: null buffer"));
+    // quant row strides: q4_K 144B/256, q8_0 34B/32, q5_0 22B/32
+    uint64_t nb01 = (kind == 0) ? (uint64_t)(K / 256) * 144
+                  : (kind == 1) ? (uint64_t)(K / 32) * 34
+                                : (uint64_t)(K / 32) * 22;
+    uint64_t nb02 = nb01 * outRows;
+    uint64_t actRow = (uint64_t)K * 4;
+    hm_ggml_kargs_mmid args = {
+        (int32_t)K, (int32_t)nExpert,
+        nb01, nb02, nb02 * nExpert,
+        actPerSlot ? (int32_t)nUsed : 1,
+        4, actRow, actPerSlot ? actRow * nUsed : actRow, 0,
+        (int32_t)nUsed, (int32_t)nTok, (int32_t)outRows, (int32_t)nUsed,
+        1, 1
+    };
+    id<MTLCommandQueue> q = hm_mtl_queue();
+    id<MTLCommandBuffer> cb = [q commandBuffer];
+    id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+    [enc setComputePipelineState:g_ggmlMmid[kind]];
+    [enc setBytes:&args length:sizeof(args) atIndex:0];
+    [enc setBuffer:w offset:0 atIndex:1];
+    [enc setBuffer:act offset:0 atIndex:2];
+    [enc setBuffer:tpe offset:0 atIndex:3];
+    [enc setBuffer:hids offset:0 atIndex:4];
+    [enc setBuffer:dst offset:0 atIndex:5];
+    [enc setThreadgroupMemoryLength:8192 atIndex:0];
+    [enc dispatchThreadgroups:MTLSizeMake((nTok + 31) / 32, (outRows + 63) / 64, nExpert)
+        threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+    [enc endEncoding];
+    mslAccountGpu(cb);
+    [cb commit];
+    return lean_io_result_mk_ok(lean_box(0));
 }

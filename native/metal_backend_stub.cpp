@@ -26,4 +26,8 @@ void hm_submit(void*, void*, int) { die(); }
 void hm_free_encoder(void*) {}
 int hm_dispatch_once(void*, void*, void*, uint32_t, uint32_t, uint32_t) { die(); return 0; }
 void hm_wait_idle(void*) { die(); }
+void hm_tag_set(int) {}
+int hm_tag_get(void) { return 0; }
+void hm_tag_account_ns(unsigned long long, int) {}
+unsigned long long hm_tag_read_ns(int) { return 0; }
 }

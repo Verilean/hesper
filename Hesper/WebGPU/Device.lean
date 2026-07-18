@@ -97,6 +97,31 @@ opaque mslConcurrentProbe (device : @& Device) (msl : @& String)
 @[extern "lean_hesper_msl_busy_read"]
 opaque mslBusyRead : IO String
 
+/-- Tagged GPU-time isolation (metal backend): set the tag that subsequent command buffers'
+    GPU busy time is attributed to. Flush at tag switches so a CB never straddles tags.
+    Completion-handler based — adds NO waits, so it does not inflate the measured range. -/
+@[extern "lean_hesper_metal_tag_set"]
+opaque metalTagSet : UInt32 → IO Unit
+
+/-- Read a tag's accumulated GPU nanoseconds (cumulative since process start). -/
+@[extern "lean_hesper_metal_tag_read"]
+opaque metalTagReadNs : UInt32 → IO UInt64
+
+/-- Vendored ggml (llama.cpp, MIT) MoE id-mapping: ids [nTok,nUsed] u32 →
+    tpe [nExpert] counts + hids [nExpert,nTok] id lists. Metal backend only;
+    commits immediately to the hm queue (flushBatch producers first). -/
+@[extern "lean_hesper_ggml_moe_map0"]
+opaque ggmlMoeMap0 (device : @& Device) (ids tpe hids : @& Buffer)
+    (nExpert nUsed nTok : UInt32) : IO Unit
+
+/-- Vendored ggml indirect matmul (kernel_mul_mm_id): kind 0=Q4_K 1=Q8_0 2=Q5_0;
+    act bcast [nTok,K] (actPerSlot=0) or per-slot [nTok,nUsed,K] (=1);
+    dst [nTok,nUsed,outRows] f32 scattered by the kernel. -/
+@[extern "lean_hesper_ggml_moe_mmid"]
+opaque ggmlMoeMmid (device : @& Device) (kind : UInt32)
+    (w act tpe hids dst : @& Buffer)
+    (K outRows nExpert nUsed nTok : UInt32) (actPerSlot : UInt8) : IO Unit
+
 /-- Exp 2 Phase A (native replay): clear the recorded dispatch sequence. -/
 @[extern "lean_hesper_replay_reset"]
 opaque replayReset : IO Unit

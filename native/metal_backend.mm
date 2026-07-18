@@ -451,6 +451,22 @@ void hm_free_bindgroup(void* bgp) {
 static std::atomic<uint64_t> g_hm_dispatches{0};
 static std::atomic<uint64_t> g_hm_barriers{0};
 
+// ---- tagged GPU-time attribution (DG_MOEISO-class isolation measurements) --
+// A command buffer's GPU busy time (GPUEnd-GPUStart) is accumulated into the
+// tag that was current at commit. The Lean side flushes at tag switches so a
+// CB never spans two tags. No waits added — attribution is completion-handler
+// based, so it does not inflate the measured range (unlike pmark/DG_PROF).
+static std::atomic<int> g_hm_tag{0};
+static std::atomic<uint64_t> g_hm_tag_ns[8] = {};
+extern "C" void hm_tag_set(int t) { g_hm_tag.store(t & 7, std::memory_order_relaxed); }
+extern "C" int hm_tag_get(void) { return g_hm_tag.load(std::memory_order_relaxed); }
+extern "C" void hm_tag_account_ns(uint64_t ns, int tag) {
+    g_hm_tag_ns[tag & 7].fetch_add(ns, std::memory_order_relaxed);
+}
+extern "C" uint64_t hm_tag_read_ns(int t) {
+    return g_hm_tag_ns[t & 7].load(std::memory_order_relaxed);
+}
+
 void* hm_encoder_new(void* ctxp) {
     HMCtx* ctx = (HMCtx*)ctxp;
     static const bool serial = getenv("HESPER_METAL_SERIAL") != nullptr;
@@ -509,6 +525,13 @@ void hm_submit(void* ctxp, void* encp, int wait) {
     HMCtx* ctx = (HMCtx*)ctxp;
     HMEnc* e = (HMEnc*)encp;
     if (e->enc) { [e->enc endEncoding]; [e->enc release]; e->enc = nil; }
+    {
+        int tag = g_hm_tag.load(std::memory_order_relaxed);
+        [e->cb addCompletedHandler:^(id<MTLCommandBuffer> c) {
+            if (c.GPUEndTime > c.GPUStartTime)
+                hm_tag_account_ns((uint64_t)((c.GPUEndTime - c.GPUStartTime) * 1e9), tag);
+        }];
+    }
     [e->cb commit];
     {
         std::lock_guard<std::mutex> lk(ctx->mu);
