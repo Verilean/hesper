@@ -420,6 +420,95 @@ def battnDeltaB (M N nHead hd nKV : Nat) (scale : Float) (ws : Nat := 256) : Hes
       ShaderM.assign acc (Exp.add (Exp.var acc) (Exp.mul w vv))
     ShaderM.writeBuffer (ty := .scalar .f32) "ctx" (Exp.add qBase d) (Exp.var acc : Exp (.scalar .f32))
 
+/-- flashAttnB — FlashAttention-style online-softmax attention (DG_FLASH=1).
+    Replaces battnB2's two-pass (score row in shared → softmax → weighted-V) with a
+    single pass: one SIMDGROUP per query row (32 lanes × hd/32 = 8 f32 registers for
+    Q and the V-accumulator), `rowsPerTG` rows per threadgroup sharing K/V tiles
+    staged once in threadgroup memory (the data-reuse battnB lacks: its [head,row]
+    workgroups re-read every K/V row from device). Running max/denominator via
+    `softmaxOnlineUpdate` (llama.cpp fattn-vec recipe). Mask parity with battnB:
+    allowed(i,j) = (i≥P) || (i≥j); key j=0 is always allowed for every live row, so
+    the online max is seeded by a REAL score before any −1e30 masked score arrives
+    (the classic masked-first-key contribution bug cannot trigger).
+    Grid: [nHead, ceil(N/rowsPerTG)], ws = rowsPerTG*32. hd must be divisible by 32;
+    tileK*hd*2 f32 must fit the 32KB threadgroup budget. -/
+def flashAttnB (N P nHead hd nKV : Nat) (scale : Float)
+    (rowsPerTG : Nat := 8) (tileK : Nat := 8) : Hesper.WGSL.Monad.ShaderM Unit := do
+  let wid ← ShaderM.workgroupId
+  let lid ← ShaderM.localId
+  let h := Exp.vec3X wid; let rb := Exp.vec3Y wid; let tid := Exp.vec3X lid
+  let qDim := nHead*hd; let kvDim := nKV*hd; let groupSize := nHead/nKV
+  let epl := hd / 32                     -- elements per lane
+  let ws := rowsPerTG * 32
+  let _q ← ShaderM.declareReadOnlyBuffer "q" (.array (.scalar .f32) (N*qDim))
+  let _k ← ShaderM.declareReadOnlyBuffer "k" (.array (.scalar .f32) (N*kvDim))
+  let _v ← ShaderM.declareReadOnlyBuffer "v" (.array (.scalar .f32) (N*kvDim))
+  let _o ← ShaderM.declareOutputBuffer "ctx" (.array (.scalar .f32) (N*qDim))
+  ShaderM.sharedNamed "shK" (.array (.scalar .f32) (tileK*hd))
+  ShaderM.sharedNamed "shV" (.array (.scalar .f32) (tileK*hd))
+  let sg ← ShaderM.let' (.scalar .u32) (Exp.div tid (Exp.litU32 32))
+  let lane ← ShaderM.let' (.scalar .u32) (Exp.mod tid (Exp.litU32 32))
+  let i ← ShaderM.let' (.scalar .u32) (Exp.add (Exp.mul rb (Exp.litU32 rowsPerTG)) sg)
+  let rowValid ← ShaderM.let' (.scalar .bool) (Exp.lt i (Exp.litU32 N))
+  -- OOB-safe row index for loads (robustness is OFF in metal mode — clamp explicitly)
+  let iSafe ← ShaderM.let' (.scalar .u32) (Exp.min i (Exp.litU32 (N-1)))
+  let kvB0 ← ShaderM.let' (.scalar .u32) (Exp.mul (Exp.div h (Exp.litU32 groupSize)) (Exp.litU32 hd))
+  let qBase ← ShaderM.let' (.scalar .u32)
+    (Exp.add (Exp.add (Exp.mul iSafe (Exp.litU32 qDim)) (Exp.mul h (Exp.litU32 hd))) lane)
+  -- Q into registers (lane-strided: element d = lane + 32t → coalesced)
+  let mut qr : Array (Exp (.scalar .f32)) := #[]
+  for t in [0:epl] do
+    let qv ← ShaderM.let' (.scalar .f32)
+      (Exp.index (Exp.var "q" : Exp (.array (.scalar .f32) (N*qDim))) (Exp.add qBase (Exp.litU32 (32*t))))
+    qr := qr.push qv
+  let mut accs : Array String := #[]
+  for _ in [0:epl] do
+    accs := accs.push (← ShaderM.var (.scalar .f32) (Exp.litF32 0.0))
+  let mName ← ShaderM.var (.scalar .f32) (Exp.litF32 (-1e30))
+  let sName ← ShaderM.var (.scalar .f32) (Exp.litF32 0.0)
+  let nTiles := (N + tileK - 1) / tileK
+  let perThread := (tileK*hd) / ws
+  ShaderM.loop (Exp.litU32 0) (Exp.litU32 nTiles) (Exp.litU32 1) fun tIdx => do
+    let j0 ← ShaderM.let' (.scalar .u32) (Exp.mul tIdx (Exp.litU32 tileK))
+    -- cooperative K/V staging (all ws threads; OOB keys → 0, masked below anyway)
+    for c in [0:perThread] do
+      let e ← ShaderM.let' (.scalar .u32) (Exp.add tid (Exp.litU32 (c*ws)))
+      let jj ← ShaderM.let' (.scalar .u32) (Exp.div e (Exp.litU32 hd))
+      let d ← ShaderM.let' (.scalar .u32) (Exp.mod e (Exp.litU32 hd))
+      let jsrc ← ShaderM.let' (.scalar .u32) (Exp.add j0 jj)
+      let jcl ← ShaderM.let' (.scalar .u32) (Exp.min jsrc (Exp.litU32 (N-1)))
+      let inb ← ShaderM.let' (.scalar .bool) (Exp.lt jsrc (Exp.litU32 N))
+      let src ← ShaderM.let' (.scalar .u32) (Exp.add (Exp.add (Exp.mul jcl (Exp.litU32 kvDim)) kvB0) d)
+      ShaderM.assignIndex "shK" e (Exp.select inb
+        (Exp.index (Exp.var "k" : Exp (.array (.scalar .f32) (N*kvDim))) src) (Exp.litF32 0.0))
+      ShaderM.assignIndex "shV" e (Exp.select inb
+        (Exp.index (Exp.var "v" : Exp (.array (.scalar .f32) (N*kvDim))) src) (Exp.litF32 0.0))
+    ShaderM.barrier
+    for jj in [0:tileK] do
+      let j ← ShaderM.let' (.scalar .u32) (Exp.add j0 (Exp.litU32 jj))
+      let pName ← ShaderM.var (.scalar .f32) (Exp.litF32 0.0)
+      for t in [0:epl] do
+        let kv := Exp.index (Exp.var "shK" : Exp (.array (.scalar .f32) (tileK*hd)))
+          (Exp.add (Exp.litU32 (jj*hd + 32*t)) lane)
+        ShaderM.assign pName (Exp.add (Exp.var pName) (Exp.mul (qr[t]!) kv))
+      let dotAll ← ShaderM.warpReduceSum 32 (Exp.var pName)
+      let allowed ← ShaderM.let' (.scalar .bool)
+        (Exp.and (Exp.and (Exp.or (Exp.ge i (Exp.litU32 P)) (Exp.ge i j)) (Exp.lt j (Exp.litU32 N))) rowValid)
+      let score ← ShaderM.let' (.scalar .f32)
+        (Exp.select allowed (Exp.mul dotAll (Exp.litF32 scale)) (Exp.litF32 (-1e30)))
+      let (_, scaleF, kqExp) ← ShaderM.softmaxOnlineUpdate mName sName score
+      for t in [0:epl] do
+        let vv := Exp.index (Exp.var "shV" : Exp (.array (.scalar .f32) (tileK*hd)))
+          (Exp.add (Exp.litU32 (jj*hd + 32*t)) lane)
+        ShaderM.assign (accs[t]!) (Exp.add (Exp.mul (Exp.var (accs[t]!)) scaleF) (Exp.mul kqExp vv))
+    ShaderM.barrier
+  ShaderM.if_ rowValid (do
+    let inv ← ShaderM.let' (.scalar .f32)
+      (Exp.div (Exp.litF32 1.0) (Exp.max (Exp.var sName) (Exp.litF32 1e-30)))
+    for t in [0:epl] do
+      ShaderM.writeBuffer (ty := .scalar .f32) "ctx" (Exp.add qBase (Exp.litU32 (32*t)))
+        (Exp.mul (Exp.var (accs[t]!)) inv)) (pure ())
+
 /-- copyCanvasLogitsB with row indirection: src holds lm_head logits of the M gathered
     rows for one vocab chunk; dst rows are the gathered rows' canvas positions. -/
 def copyCanvasLogitsDeltaB (M C P vocab lmChunk chunkOff : Nat) : Hesper.WGSL.Monad.ShaderM Unit := do
@@ -1881,8 +1970,30 @@ def main (args : List String) : IO Unit := do
           disp device (vNormB N nKV hd eps) (("vin",sV)::("vout",(if deltaOn then sVCs[li]?.getD sVn else sVn))::List.nil) (N*nKV) (hash ("vn",li))
         pmark rQkn    -- qk-norm + RoPE + v-norm
         -- battnB2 (shared-Q + parallel-reduction softmax) DEFAULT; DG_NOFLASH=1 restores battnB.
+        -- DG_FLASH=1: flashAttnB (online-softmax single pass, K/V tiles shared across
+        -- rowsPerTG query rows; DG_FLASHROWS/DG_FLASHTILE tune, defaults 8/8).
         if isDelta then
           disp2 device (battnDeltaB rowsN N nHead hd nKV 1.0) (("q",sQr)::("k",sKCs[li]?.getD sKr)::("v",sVCs[li]?.getD sVn)::("ctx",sCtx)::List.nil) nHead rowsN (hash ("atd",li,rowsN))
+        else if (← IO.getEnv "DG_FLASH").isSome then
+          let fR := ((← IO.getEnv "DG_FLASHROWS").bind (·.toNat?)).getD 8
+          let fT := ((← IO.getEnv "DG_FLASHTILE").bind (·.toNat?)).getD 8
+          disp2w device (flashAttnB N P nHead hd nKV 1.0 fR fT)
+            (("q",sQr)::("k",(if deltaOn then sKCs[li]?.getD sKr else sKr))::("v",(if deltaOn then sVCs[li]?.getD sVn else sVn))::("ctx",sCtx)::List.nil)
+            nHead ((N + fR - 1) / fR) (fR*32) (hash ("fat",li,fR,fT))
+          if li == 0 && (← IO.getEnv "DG_ATTNGOLD").isSome && step == 0 then
+            -- golden: rerun battnB2 into a temp buffer, compare on the CPU
+            let sRef ← mkBuf device (N*8192)
+            disp2 device (battnB2 N P nHead hd nKV 1.0) (("q",sQr)::("k",sKr)::("v",sVn)::("ctx",sRef)::List.nil) nHead N (hash "atgold")
+            Hesper.GPUBackend.endBatch device
+            let fa ← Hesper.Basic.bytesToFloatArray (← mapBufferRead device sCtx 0 (N*8192*4).toUSize)
+            let rf ← Hesper.Basic.bytesToFloatArray (← mapBufferRead device sRef 0 (N*8192*4).toUSize)
+            let mut maxd := 0.0; let mut sumsq := 0.0; let mut refsq := 0.0
+            for idx in [0:N*8192] do
+              let d := (fa.getD idx 0.0) - (rf.getD idx 0.0)
+              sumsq := sumsq + d*d; refsq := refsq + (rf.getD idx 0.0)^2
+              if d.abs > maxd then maxd := d.abs
+            IO.println s!"[attngold] flash vs battnB2: maxDiff={maxd} relRMS={Float.sqrt (sumsq / (max refsq 1e-30))}"
+            Hesper.GPUBackend.beginBatch device
         else if (← IO.getEnv "DG_NOFLASH").isSome then
           disp2 device (battnB N P nHead hd nKV 1.0) (("q",sQr)::("k",(if deltaOn then sKCs[li]?.getD sKr else sKr))::("v",(if deltaOn then sVCs[li]?.getD sVn else sVn))::("ctx",sCtx)::List.nil) nHead N (hash ("at",li))
         else
