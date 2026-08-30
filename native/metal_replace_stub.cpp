@@ -20,6 +20,8 @@ static inline lean_obj_res msl_stub() {
 extern "C" {
 
 lean_obj_res lean_hesper_msl_busy_read(lean_obj_res) { return msl_stub(); }
+lean_obj_res lean_hesper_metal_tag_set(uint32_t, lean_obj_res) { return msl_stub(); }
+lean_obj_res lean_hesper_metal_tag_read(uint32_t, lean_obj_res) { return msl_stub(); }
 
 lean_obj_res lean_hesper_mtl_device_name(b_lean_obj_arg, lean_obj_res) { return msl_stub(); }
 
@@ -96,4 +98,6 @@ lean_obj_res lean_hesper_msl_bench_serial_rot(
 lean_obj_res lean_hesper_replay_exec(
     uint32_t, lean_obj_res) { return msl_stub(); }
 
+lean_obj_res lean_hesper_ggml_moe_map0(b_lean_obj_arg, b_lean_obj_arg, b_lean_obj_arg, b_lean_obj_arg, uint32_t, uint32_t, uint32_t, lean_obj_res) { return msl_stub(); }
+lean_obj_res lean_hesper_ggml_moe_mmid(b_lean_obj_arg, uint32_t, b_lean_obj_arg, b_lean_obj_arg, b_lean_obj_arg, b_lean_obj_arg, b_lean_obj_arg, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint8_t, lean_obj_res) { return msl_stub(); }
 }  // extern "C"

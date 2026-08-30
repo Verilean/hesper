@@ -1,0 +1,127 @@
+{
+ "dispatches": [
+  {
+   "kernel": "gelu_bug.wgsl",
+   "entry": "main",
+   "grid": [
+    2162,
+    1,
+    1
+   ],
+   "bindings": [
+    {
+     "name": "outBuf",
+     "elems": 553344
+    }
+   ]
+  },
+  {
+   "kernel": "gelu_fixed.wgsl",
+   "entry": "main",
+   "grid": [
+    2162,
+    1,
+    1
+   ],
+   "bindings": [
+    {
+     "name": "outBuf",
+     "elems": 553344
+    }
+   ]
+  },
+  {
+   "kernel": "q6k_bug.wgsl",
+   "entry": "main",
+   "grid": [
+    65535,
+    45,
+    1
+   ],
+   "bindings": [
+    {
+     "group": 0,
+     "binding": 1,
+     "elems": 2880000
+    }
+   ]
+  },
+  {
+   "kernel": "q6k_fixed.wgsl",
+   "entry": "main",
+   "grid": [
+    65535,
+    45,
+    1
+   ],
+   "bindings": [
+    {
+     "group": 0,
+     "binding": 1,
+     "elems": 2880000
+    }
+   ]
+  },
+  {
+   "kernel": "loop_ok.wgsl",
+   "entry": "main",
+   "grid": [
+    1,
+    1,
+    1
+   ],
+   "bindings": [
+    {
+     "name": "probs",
+     "elems": 8320
+    }
+   ]
+  },
+  {
+   "kernel": "geglub_real.wgsl",
+   "entry": "main",
+   "grid": [
+    2162,
+    1,
+    1
+   ],
+   "bindings": [
+    {
+     "name": "yh",
+     "elems": 553344
+    },
+    {
+     "name": "mprm",
+     "elems": 8,
+     "values": [
+      null,
+      262
+     ]
+    }
+   ]
+  },
+  {
+   "kernel": "geglub_real.wgsl",
+   "entry": "main",
+   "grid": [
+    2171,
+    1,
+    1
+   ],
+   "bindings": [
+    {
+     "name": "yh",
+     "elems": 553344
+    },
+    {
+     "name": "mprm",
+     "elems": 8,
+     "values": [
+      null,
+      263
+     ]
+    }
+   ]
+  }
+ ]
+}

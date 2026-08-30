@@ -1,6 +1,7 @@
 import Hesper.WebGPU.Types
 import Hesper.Basic
 import Hesper.Logging
+import Hesper.WGSL.JSTrace
 
 namespace Hesper.WebGPU
 
@@ -11,6 +12,16 @@ structure BufferDescriptor where
   mappedAtCreation : Bool   -- Whether to map at creation
   deriving Inhabited
 
+/-- Early alias of `getBufferId` (declared before first use; same FFI symbol). -/
+@[extern "lean_hesper_buffer_id"]
+opaque getBufferIdEarly (buffer : @& Buffer) : IO UInt64
+
+/-- JS-trace registry: uid → (buffer, size). Populated only when DG_TRACE_JS
+is set (keeps the buffers alive for the post-save dump — acceptable in a
+trace run). -/
+initialize jsTraceRegistryRef :
+    IO.Ref (Std.HashMap UInt64 (Buffer × Nat)) ← IO.mkRef {}
+
 /-- Create a GPU buffer.
     Resources are automatically cleaned up by Lean's GC via External finalizers. -/
 @[extern "lean_hesper_create_buffer"]
@@ -19,7 +30,12 @@ opaque createBufferImpl (device : @& Device) (desc : @& BufferDescriptor) : IO B
 /-- Wrapper with debug output -/
 def createBuffer (device : @& Device) (desc : @& BufferDescriptor) : IO Buffer := do
   Hesper.Logging.logVerbose s!"[Lean] createBuffer: size={desc.size}, usage={desc.usage.length} items, mapped={desc.mappedAtCreation}"
-  createBufferImpl device desc
+  let buf ← createBufferImpl device desc
+  if ← Hesper.WGSL.JSTrace.enabled then
+    let uid ← getBufferIdEarly buf
+    Hesper.WGSL.JSTrace.bufCreated uid desc.size.toNat
+    jsTraceRegistryRef.modify (·.insert uid (buf, desc.size.toNat))
+  return buf
 
 /-- Write data to a buffer from the CPU.
     @param buffer The target buffer
@@ -27,7 +43,14 @@ def createBuffer (device : @& Device) (desc : @& BufferDescriptor) : IO Buffer :
     @param data Pointer to source data (ByteArray)
 -/
 @[extern "lean_hesper_write_buffer"]
-opaque writeBuffer (device : @& Device) (buffer : @& Buffer) (offset : USize) (data : @& ByteArray) : IO Unit
+opaque writeBufferImpl (device : @& Device) (buffer : @& Buffer) (offset : USize) (data : @& ByteArray) : IO Unit
+
+/-- writeBuffer with an optional JS-trace hook (DG_TRACE_JS): records small
+writes (params, canvases) with contents so a replayer can reproduce them. -/
+def writeBuffer (device : @& Device) (buffer : @& Buffer) (offset : USize) (data : @& ByteArray) : IO Unit := do
+  if ← Hesper.WGSL.JSTrace.armed then
+    Hesper.WGSL.JSTrace.write (← getBufferIdEarly buffer) offset.toNat data
+  writeBufferImpl device buffer offset data
 
 /-- Map a buffer for reading.
     Returns the mapped data as a ByteArray.
@@ -36,7 +59,15 @@ opaque writeBuffer (device : @& Device) (buffer : @& Buffer) (offset : USize) (d
     @param size Size in bytes to map
 -/
 @[extern "lean_hesper_map_buffer_read"]
-opaque mapBufferRead (device : @& Device) (buffer : @& Buffer) (offset : USize) (size : USize) : IO ByteArray
+opaque mapBufferReadImpl (device : @& Device) (buffer : @& Buffer) (offset : USize) (size : USize) : IO ByteArray
+
+/-- mapBufferRead with a JS-trace hook: readbacks are the replayer's sync
+points (logits → CPU commit logic). -/
+def mapBufferRead (device : @& Device) (buffer : @& Buffer) (offset : USize) (size : USize) : IO ByteArray := do
+  let data ← mapBufferReadImpl device buffer offset size
+  if ← Hesper.WGSL.JSTrace.armed then
+    Hesper.WGSL.JSTrace.read (← getBufferIdEarly buffer) offset.toNat size.toNat data
+  return data
 
 /-- Unmap a previously mapped buffer -/
 @[extern "lean_hesper_unmap_buffer"]
@@ -101,5 +132,52 @@ def bytesToFloatArray (bytes : ByteArray) : Array Float :=
     let b3 := bytes.get! (offset + 3)
     let bits : UInt32 := b0.toUInt32 ||| (b1.toUInt32 <<< 8) ||| (b2.toUInt32 <<< 16) ||| (b3.toUInt32 <<< 24)
     Hesper.Basic.float32BitsToFloat64 bits
+
+end Hesper.WebGPU
+
+namespace Hesper.WebGPU
+
+/-- DG_TRACE_JS_DUMP=1: after `JSTrace.save`, dump every referenced buffer
+without provenance (derived weights: predequants, repacks — and activations,
+harmless) as `b<uid>.bin` so the JS replayer can load them directly. -/
+def jsTraceDumpWith (device : Device) (suffix : String) : IO Unit := do
+  if (← IO.getEnv "DG_TRACE_JS_DUMP").isNone then return
+  let some d ← Hesper.WGSL.JSTrace.outDirGet | return
+  let reg ← jsTraceRegistryRef.get
+  let miss ← Hesper.WGSL.JSTrace.missingUids
+  let mut dumped := 0
+  let mut bytes := 0
+  for uid in miss do
+    match reg[uid]? with
+    | some (buf, size) =>
+      let data ← mapBufferReadImpl device buf 0 size.toUSize
+      unmapBuffer buf
+      IO.FS.writeBinFile s!"{d}/b{uid}{suffix}" data
+      dumped := dumped + 1
+      bytes := bytes + size
+    | none => pure ()
+  IO.println s!"[JSTrace] dumped {dumped}/{miss.size} buffers ({bytes / 1000000} MB) as *{suffix}"
+
+def jsTraceDumpMissing (device : Device) : IO Unit := jsTraceDumpWith device ".bin"
+
+/-- dump EVERY registry buffer (no ref-set needed): call at step-0 START so
+the replayer gets the true PRE-step-0 state — pre-step-N dumps left stale
+step-(N-1) content in the unwritten tails of reused scratch buffers, which
+poisoned window-based comparisons (R19). -/
+def jsTraceDumpAllRegistry (device : Device) : IO Unit := do
+  if (← IO.getEnv "DG_TRACE_JS_DUMP").isNone then return
+  let some d ← Hesper.WGSL.JSTrace.outDirGet | return
+  let reg ← jsTraceRegistryRef.get
+  let mut bytes := 0
+  for (uid, (buf, size)) in reg do
+    let data ← mapBufferReadImpl device buf 0 size.toUSize
+    unmapBuffer buf
+    IO.FS.writeBinFile s!"{d}/b{uid}.bin" data
+    bytes := bytes + size
+  IO.println s!"[JSTrace] dumped ALL {reg.size} registry buffers ({bytes / 1000000} MB) as *.bin (pre-step-0)"
+
+/-- post-state dump (after the recorded step): the replayer compares every
+buffer against these to LOCALIZE the first diverging kernel. -/
+def jsTraceDumpPost (device : Device) : IO Unit := jsTraceDumpWith device ".post.bin"
 
 end Hesper.WebGPU

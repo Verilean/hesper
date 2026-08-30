@@ -246,7 +246,7 @@ def generateWGSL
   -- extensions don't include "subgroups", add it automatically.
   let mod := generateComputeModuleWithDiagnostics funcName workgroupSize extensions diagnostics computation
   let wgsl := mod.toWGSL
-  let needsSg := (wgsl.splitOn "subgroupAdd").length > 1
+  let needsSg := (wgsl.splitOn "subgroupAdd").length > 1 || (wgsl.splitOn "subgroupMax").length > 1
   let hasSg := extensions.any (· == "subgroups")
   if needsSg && !hasSg then
     let modWithSg := { mod with extensions := "subgroups" :: mod.extensions }

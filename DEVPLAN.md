@@ -578,3 +578,73 @@ barriers only on real buffers.
 Process note: the autotune loop ran end-to-end against a brand-new objective (new
 instrument → sweep → refine with incumbent guard → winners.csv deploy without rebuild
 → token gate) and correctly returned "no headroom here" — a clean negative (principle 6).
+
+---
+
+## 2026-07-16 — DG: Chrome lab complete; delta-prop landed (-6%); lab-factor hunt
+
+Detail: e4b-webgpu/DG_PORT_LOG.md R30-R50; recipes/DIFFUSIONGEMMA_PERF_PLAN.md ledger.
+
+- **Chrome trace-replay lab: DONE** (M0-M2b, 8/8 eval on Chrome, 57.2s→1.8s/step
+  = 26×; root causes: trace holes caught by the new dgtrace-validate.py, then a
+  530KB un-CSE'd Q6_K kernel = 96% of step time → DG_Q6KWARP, native also -0.9s).
+- **DG_DELTA delta-prop landed** (refresh-1 bit-identical; production
+  DG_DELTAREFRESH=2 = net -6%, 8/8). Convergence tax diagnosed as real dynamics
+  (stale frozen-row K/V at commit time) — policy-irreducible; CLOSED at ceiling.
+  Machinery (per-layer K/V caches, M-buckets, rectangular attention) reusable
+  for mask-mode decoding (sticky commits).
+- Lab constant factor 2.1× vs native: robustness -11% (recovered), fast-math
+  REFUTED (strict-math native A/B: identical 846ms), Dawn-July rebuild A/B in
+  flight. f16/WebGPU-itself ruled out (same WGSL both sides).
+- Current TPS: native ~43 canvas tok/s (llama.cpp 64), Chrome lab ~20.
+- Next candidates: measured-JIT autotune main line on the DG kernels (the 2.3×
+  WGSL-vs-llama.cpp per-kernel gap), mask-mode+delta, ternary bet, single-load
+  eval harness (measurement hygiene).
+
+---
+
+## M-Metal: verified thin-Metal engine (起票 2026-07-17, user-approved)
+
+**Policy reversal, recorded as such**: "MSL-hybrid expansion rejected" (earlier
+decision) is superseded. New evidence justifying the reversal: (1) hand-MSL
+kernels measured 1.61× over Tint-emitted WGSL equivalents; (2) Dawn is a moving
+liability — the May→July runtime regression (uniform 2.4× on this workload,
+R51/R52; our May pin is protective but pins us to an aging runtime); (3) the
+checker toolchain matured enough to replace Dawn's runtime safety with static
+verification (wgsl-check 0-FAIL production, dgtrace-validate, interval/taint/
+guard analyses are language-independent); (4) the WGSL DSL route has not
+produced llama.cpp-class kernels (2.35× behind at 854ms vs 363ms/step), and
+Tint's no-op transpilation means codegen depth is on us either way.
+
+**Thesis**: verify kernels statically (checker), then run them on a thin Metal
+executor that submits as aggressively as Dawn — safety from proof, not from
+runtime clamps. WGSL/Chrome lab remains the portable development+verification
+environment (pinned to Chrome 147/148, CHROME_BIN).
+
+**Stages** (each eval-gated: dg_eval 8/8 + eff-steps non-regression + golden):
+1. **Authorship probe / first hot kernel**: hand-write the MoE gate/up grouped
+   matmul (23ms Chrome / 11ms hand-MSL class) in llama.cpp-style MSL, dispatch
+   via the EXISTING bridge.cpp MSL path. Decides how much of the 2.35× is
+   kernel authorship vs runtime. (A hand-WGSL twin in the lab is a cheap
+   side-experiment answering whether Metal is even required per-kernel.)
+2. **Thin Metal backend v1**: serial compute encoder + hazard-tracked
+   resources (Metal-native ordering ≈ Dawn semantics), all buffers Metal-owned,
+   behind the existing Lean Device/Buffer/dispatch API as an alternative
+   backend (HESPER_BACKEND=metal). Long-tail kernels: offline WGSL→MSL via the
+   pinned tint CLI at build time (checker runs on the WGSL source; the
+   transpiler trust boundary is explicit). Est. 2-4 sessions. bridge.cpp =
+   MODIFY WITH EXTREME CARE.
+3. **MSL-subset checker**: port the wgsl-check parser to a disciplined MSL
+   subset; reuse the analyses. Hand-written kernels get the same 0-FAIL gate
+   as generated ones. Est. 1-2 sessions.
+4. **Concurrent submission**: relax the serial encoder using per-dispatch
+   read/write sets (already computed by the trace validator) for static hazard
+   scheduling — the "faster than Dawn" endgame, only after 1-3 are stable.
+
+**Success metrics**: stage 1 kernel ≤ 12ms native (parity with hand-MSL);
+stage 2 end-to-end ≥ baseline with zero quality loss and no Dawn dependency in
+the decode hot path; stage 4 target llama.cpp per-step class (≤ 450ms/step)
+→ with our fewer eff-steps + DG_DELTA, end-to-end beyond llama.cpp's 64 tok/s.
+
+**Non-goals**: dropping the WGSL lab (it stays the portable/verification
+substrate); upstream Dawn bisect (parked; artifacts at /tmp/dawn-july-*).

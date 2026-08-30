@@ -72,6 +72,9 @@ class GPUBackend (β : Type) where
   replayCached : β → CachedDispatch → Nat × Nat × Nat → IO Unit
   allocBuffer : β → USize → IO Buf
   allocBufferUsage : β → USize → List String → IO Buf := fun ctx size _ => allocBuffer ctx size
+  /-- Stable identity of a buffer for tracing (JS-replay provenance);
+      0 = backend has no notion of identity. -/
+  bufferUid : β → Buf → IO UInt64 := fun _ _ => pure 0
   freeBuffer : β → Buf → IO Unit
   writeBuffer : β → Buf → ByteArray → IO Unit
   writeBufferOffset : β → Buf → USize → ByteArray → IO Unit := fun ctx buf _ data => writeBuffer ctx buf data
