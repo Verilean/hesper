@@ -759,6 +759,12 @@ out: one WGSL kernel asset ships both the only working WebGPU engine for
 this model (95 tok/s, browser-distributable) and a native Metal engine that
 beats llama.cpp on its home turf.
 
+Two further campaigns applied the same discipline to MODEL-BEHAVIOR work
+(zero-training Mamba-ization of E2B; KV-cache compression and 8k context for
+the browser A4B engine). Their claims are different in kind from the kernel
+campaigns, so they are documented separately with their mathematics:
+[`MODEL_SURGERY_CAMPAIGNS.md`](MODEL_SURGERY_CAMPAIGNS.md).
+
 ---
 
 ## Appendix A. Next-architecture playbook: environment per use case
